@@ -21,7 +21,7 @@ describe('auth store bootstrap', () => {
     const auth = useAuthStore()
     let release!: () => void
     vi.mocked(authAPI.refresh).mockReturnValue(new Promise(resolve => {
-      release = () => resolve({ access_token: 'fresh', token_type: 'Bearer', expires_in: 3600, user: { id: 'u1', name: 'Teacher', email: 'teacher@example.com', role: 'teacher', status: 'active', created_at: '2026-01-01T00:00:00Z' } })
+      release = () => resolve({ access_token: 'fresh', token_type: 'Bearer', expires_in: 3600, identity: 'teacher', user: { id: 'u1', name: 'Teacher', email: 'teacher@example.com', role: 'teacher', status: 'active', created_at: '2026-01-01T00:00:00Z' } })
     }))
 
     const first = auth.bootstrap()

@@ -17,18 +17,20 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/predicate"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 )
 
 // ModelBindingQuery is the builder for querying ModelBinding entities.
 type ModelBindingQuery struct {
 	config
-	ctx          *QueryContext
-	order        []modelbinding.OrderOption
-	inters       []Interceptor
-	predicates   []predicate.ModelBinding
-	withModel    *ModelQuery
-	withProvider *ProviderQuery
-	modifiers    []func(*sql.Selector)
+	ctx            *QueryContext
+	order          []modelbinding.OrderOption
+	inters         []Interceptor
+	predicates     []predicate.ModelBinding
+	withModel      *ModelQuery
+	withProvider   *ProviderQuery
+	withCredential *ProviderCredentialQuery
+	modifiers      []func(*sql.Selector)
 	// intermediate query (i.e. traversal path).
 	sql  *sql.Selector
 	path func(context.Context) (*sql.Selector, error)
@@ -102,6 +104,28 @@ func (_q *ModelBindingQuery) QueryProvider() *ProviderQuery {
 			sqlgraph.From(modelbinding.Table, modelbinding.FieldID, selector),
 			sqlgraph.To(provider.Table, provider.FieldID),
 			sqlgraph.Edge(sqlgraph.M2O, true, modelbinding.ProviderTable, modelbinding.ProviderColumn),
+		)
+		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
+		return fromU, nil
+	}
+	return query
+}
+
+// QueryCredential chains the current query on the "credential" edge.
+func (_q *ModelBindingQuery) QueryCredential() *ProviderCredentialQuery {
+	query := (&ProviderCredentialClient{config: _q.config}).Query()
+	query.path = func(ctx context.Context) (fromU *sql.Selector, err error) {
+		if err := _q.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		selector := _q.sqlQuery(ctx)
+		if err := selector.Err(); err != nil {
+			return nil, err
+		}
+		step := sqlgraph.NewStep(
+			sqlgraph.From(modelbinding.Table, modelbinding.FieldID, selector),
+			sqlgraph.To(providercredential.Table, providercredential.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, modelbinding.CredentialTable, modelbinding.CredentialColumn),
 		)
 		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
 		return fromU, nil
@@ -296,13 +320,14 @@ func (_q *ModelBindingQuery) Clone() *ModelBindingQuery {
 		return nil
 	}
 	return &ModelBindingQuery{
-		config:       _q.config,
-		ctx:          _q.ctx.Clone(),
-		order:        append([]modelbinding.OrderOption{}, _q.order...),
-		inters:       append([]Interceptor{}, _q.inters...),
-		predicates:   append([]predicate.ModelBinding{}, _q.predicates...),
-		withModel:    _q.withModel.Clone(),
-		withProvider: _q.withProvider.Clone(),
+		config:         _q.config,
+		ctx:            _q.ctx.Clone(),
+		order:          append([]modelbinding.OrderOption{}, _q.order...),
+		inters:         append([]Interceptor{}, _q.inters...),
+		predicates:     append([]predicate.ModelBinding{}, _q.predicates...),
+		withModel:      _q.withModel.Clone(),
+		withProvider:   _q.withProvider.Clone(),
+		withCredential: _q.withCredential.Clone(),
 		// clone intermediate query.
 		sql:  _q.sql.Clone(),
 		path: _q.path,
@@ -328,6 +353,17 @@ func (_q *ModelBindingQuery) WithProvider(opts ...func(*ProviderQuery)) *ModelBi
 		opt(query)
 	}
 	_q.withProvider = query
+	return _q
+}
+
+// WithCredential tells the query-builder to eager-load the nodes that are connected to
+// the "credential" edge. The optional arguments are used to configure the query builder of the edge.
+func (_q *ModelBindingQuery) WithCredential(opts ...func(*ProviderCredentialQuery)) *ModelBindingQuery {
+	query := (&ProviderCredentialClient{config: _q.config}).Query()
+	for _, opt := range opts {
+		opt(query)
+	}
+	_q.withCredential = query
 	return _q
 }
 
@@ -409,9 +445,10 @@ func (_q *ModelBindingQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]
 	var (
 		nodes       = []*ModelBinding{}
 		_spec       = _q.querySpec()
-		loadedTypes = [2]bool{
+		loadedTypes = [3]bool{
 			_q.withModel != nil,
 			_q.withProvider != nil,
+			_q.withCredential != nil,
 		}
 	)
 	_spec.ScanValues = func(columns []string) ([]any, error) {
@@ -444,6 +481,12 @@ func (_q *ModelBindingQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]
 	if query := _q.withProvider; query != nil {
 		if err := _q.loadProvider(ctx, query, nodes, nil,
 			func(n *ModelBinding, e *Provider) { n.Edges.Provider = e }); err != nil {
+			return nil, err
+		}
+	}
+	if query := _q.withCredential; query != nil {
+		if err := _q.loadCredential(ctx, query, nodes, nil,
+			func(n *ModelBinding, e *ProviderCredential) { n.Edges.Credential = e }); err != nil {
 			return nil, err
 		}
 	}
@@ -508,6 +551,38 @@ func (_q *ModelBindingQuery) loadProvider(ctx context.Context, query *ProviderQu
 	}
 	return nil
 }
+func (_q *ModelBindingQuery) loadCredential(ctx context.Context, query *ProviderCredentialQuery, nodes []*ModelBinding, init func(*ModelBinding), assign func(*ModelBinding, *ProviderCredential)) error {
+	ids := make([]uuid.UUID, 0, len(nodes))
+	nodeids := make(map[uuid.UUID][]*ModelBinding)
+	for i := range nodes {
+		if nodes[i].CredentialID == nil {
+			continue
+		}
+		fk := *nodes[i].CredentialID
+		if _, ok := nodeids[fk]; !ok {
+			ids = append(ids, fk)
+		}
+		nodeids[fk] = append(nodeids[fk], nodes[i])
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	query.Where(providercredential.IDIn(ids...))
+	neighbors, err := query.All(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range neighbors {
+		nodes, ok := nodeids[n.ID]
+		if !ok {
+			return fmt.Errorf(`unexpected foreign-key "credential_id" returned %v`, n.ID)
+		}
+		for i := range nodes {
+			assign(nodes[i], n)
+		}
+	}
+	return nil
+}
 
 func (_q *ModelBindingQuery) sqlCount(ctx context.Context) (int, error) {
 	_spec := _q.querySpec()
@@ -542,6 +617,9 @@ func (_q *ModelBindingQuery) querySpec() *sqlgraph.QuerySpec {
 		}
 		if _q.withProvider != nil {
 			_spec.Node.AddColumnOnce(modelbinding.FieldProviderID)
+		}
+		if _q.withCredential != nil {
+			_spec.Node.AddColumnOnce(modelbinding.FieldCredentialID)
 		}
 	}
 	if ps := _q.predicates; len(ps) > 0 {

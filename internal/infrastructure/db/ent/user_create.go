@@ -13,9 +13,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikey"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeyaudit"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprojectapplication"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/organizationmember"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/projectmember"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentmodellibrary"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/user"
 )
 
@@ -78,6 +81,14 @@ func (_c *UserCreate) SetRole(v user.Role) *UserCreate {
 	return _c
 }
 
+// SetNillableRole sets the "role" field if the given value is not nil.
+func (_c *UserCreate) SetNillableRole(v *user.Role) *UserCreate {
+	if v != nil {
+		_c.SetRole(*v)
+	}
+	return _c
+}
+
 // SetStatus sets the "status" field.
 func (_c *UserCreate) SetStatus(v user.Status) *UserCreate {
 	_c.mutation.SetStatus(v)
@@ -104,6 +115,59 @@ func (_c *UserCreate) SetNillableID(v *uuid.UUID) *UserCreate {
 		_c.SetID(*v)
 	}
 	return _c
+}
+
+// SetStudentProfileID sets the "student_profile" edge to the StudentProfile entity by ID.
+func (_c *UserCreate) SetStudentProfileID(id uuid.UUID) *UserCreate {
+	_c.mutation.SetStudentProfileID(id)
+	return _c
+}
+
+// SetNillableStudentProfileID sets the "student_profile" edge to the StudentProfile entity by ID if the given value is not nil.
+func (_c *UserCreate) SetNillableStudentProfileID(id *uuid.UUID) *UserCreate {
+	if id != nil {
+		_c = _c.SetStudentProfileID(*id)
+	}
+	return _c
+}
+
+// SetStudentProfile sets the "student_profile" edge to the StudentProfile entity.
+func (_c *UserCreate) SetStudentProfile(v *StudentProfile) *UserCreate {
+	return _c.SetStudentProfileID(v.ID)
+}
+
+// SetMentorProfileID sets the "mentor_profile" edge to the MentorProfile entity by ID.
+func (_c *UserCreate) SetMentorProfileID(id uuid.UUID) *UserCreate {
+	_c.mutation.SetMentorProfileID(id)
+	return _c
+}
+
+// SetNillableMentorProfileID sets the "mentor_profile" edge to the MentorProfile entity by ID if the given value is not nil.
+func (_c *UserCreate) SetNillableMentorProfileID(id *uuid.UUID) *UserCreate {
+	if id != nil {
+		_c = _c.SetMentorProfileID(*id)
+	}
+	return _c
+}
+
+// SetMentorProfile sets the "mentor_profile" edge to the MentorProfile entity.
+func (_c *UserCreate) SetMentorProfile(v *MentorProfile) *UserCreate {
+	return _c.SetMentorProfileID(v.ID)
+}
+
+// AddGrantedMentorProfileIDs adds the "granted_mentor_profiles" edge to the MentorProfile entity by IDs.
+func (_c *UserCreate) AddGrantedMentorProfileIDs(ids ...uuid.UUID) *UserCreate {
+	_c.mutation.AddGrantedMentorProfileIDs(ids...)
+	return _c
+}
+
+// AddGrantedMentorProfiles adds the "granted_mentor_profiles" edges to the MentorProfile entity.
+func (_c *UserCreate) AddGrantedMentorProfiles(v ...*MentorProfile) *UserCreate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _c.AddGrantedMentorProfileIDs(ids...)
 }
 
 // AddOrganizationMembershipIDs adds the "organization_memberships" edge to the OrganizationMember entity by IDs.
@@ -196,6 +260,21 @@ func (_c *UserCreate) AddAPIKeyAudits(v ...*APIKeyAudit) *UserCreate {
 	return _c.AddAPIKeyAuditIDs(ids...)
 }
 
+// AddModelLibraryEntryIDs adds the "model_library_entries" edge to the StudentModelLibrary entity by IDs.
+func (_c *UserCreate) AddModelLibraryEntryIDs(ids ...uuid.UUID) *UserCreate {
+	_c.mutation.AddModelLibraryEntryIDs(ids...)
+	return _c
+}
+
+// AddModelLibraryEntries adds the "model_library_entries" edges to the StudentModelLibrary entity.
+func (_c *UserCreate) AddModelLibraryEntries(v ...*StudentModelLibrary) *UserCreate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _c.AddModelLibraryEntryIDs(ids...)
+}
+
 // Mutation returns the UserMutation object of the builder.
 func (_c *UserCreate) Mutation() *UserMutation {
 	return _c.mutation
@@ -238,6 +317,10 @@ func (_c *UserCreate) defaults() {
 	if _, ok := _c.mutation.UpdatedAt(); !ok {
 		v := user.DefaultUpdatedAt()
 		_c.mutation.SetUpdatedAt(v)
+	}
+	if _, ok := _c.mutation.Role(); !ok {
+		v := user.DefaultRole
+		_c.mutation.SetRole(v)
 	}
 	if _, ok := _c.mutation.Status(); !ok {
 		v := user.DefaultStatus
@@ -360,6 +443,54 @@ func (_c *UserCreate) createSpec() (*User, *sqlgraph.CreateSpec) {
 		_spec.SetField(user.FieldStatus, field.TypeEnum, value)
 		_node.Status = value
 	}
+	if nodes := _c.mutation.StudentProfileIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   user.StudentProfileTable,
+			Columns: []string{user.StudentProfileColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentprofile.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
+	}
+	if nodes := _c.mutation.MentorProfileIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   user.MentorProfileTable,
+			Columns: []string{user.MentorProfileColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(mentorprofile.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
+	}
+	if nodes := _c.mutation.GrantedMentorProfilesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.GrantedMentorProfilesTable,
+			Columns: []string{user.GrantedMentorProfilesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(mentorprofile.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
+	}
 	if nodes := _c.mutation.OrganizationMembershipsIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
 			Rel:     sqlgraph.O2M,
@@ -449,6 +580,22 @@ func (_c *UserCreate) createSpec() (*User, *sqlgraph.CreateSpec) {
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(apikeyaudit.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
+	}
+	if nodes := _c.mutation.ModelLibraryEntriesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.ModelLibraryEntriesTable,
+			Columns: []string{user.ModelLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
 			},
 		}
 		for _, k := range nodes {

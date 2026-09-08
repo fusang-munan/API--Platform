@@ -7,7 +7,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const refreshCookieName = "nebula_refresh_token"
+const (
+	refreshCookieName        = "nebula_refresh_token"
+	loginChallengeCookieName = "nebula_login_challenge"
+)
 
 func (s *Server) sendVerificationCode(c *gin.Context) {
 	var input struct {
@@ -52,11 +55,29 @@ func (s *Server) login(c *gin.Context) {
 	if !bindJSON(c, &input) {
 		return
 	}
-	session, err := s.service.Login(c.Request.Context(), input.Email, input.Password)
+	challenge, token, err := s.service.Login(c.Request.Context(), input.Email, input.Password)
 	if err != nil {
 		writeError(c, err)
 		return
 	}
+	s.setLoginChallengeCookie(c, token)
+	respond(c, http.StatusOK, challenge)
+}
+
+func (s *Server) createSession(c *gin.Context) {
+	var input struct {
+		Identity string `json:"identity" binding:"required"`
+	}
+	if !bindJSON(c, &input) {
+		return
+	}
+	token, _ := c.Cookie(loginChallengeCookieName)
+	session, err := s.service.CreateSession(c.Request.Context(), token, input.Identity)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	s.clearLoginChallengeCookie(c)
 	s.setRefreshCookie(c, session.RefreshToken)
 	respond(c, http.StatusOK, session)
 }
@@ -131,12 +152,12 @@ func (s *Server) activateTeacher(c *gin.Context) {
 }
 
 func (s *Server) me(c *gin.Context) {
-	user, err := s.service.CurrentUser(c.Request.Context(), identity(c))
+	view, err := s.service.Me(c.Request.Context(), identity(c))
 	if err != nil {
 		writeError(c, err)
 		return
 	}
-	respond(c, http.StatusOK, user)
+	respond(c, http.StatusOK, view)
 }
 
 func (s *Server) setRefreshCookie(c *gin.Context, token string) {
@@ -156,4 +177,22 @@ func (s *Server) clearRefreshCookie(c *gin.Context) {
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(refreshCookieName, "", -1, "/api/v1/auth", "", s.config.CookieSecure, true)
 	c.Header("Expires", time.Unix(1, 0).UTC().Format(http.TimeFormat))
+}
+
+func (s *Server) setLoginChallengeCookie(c *gin.Context, token string) {
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(
+		loginChallengeCookieName,
+		token,
+		300,
+		"/api/v1/auth",
+		"",
+		s.config.CookieSecure,
+		true,
+	)
+}
+
+func (s *Server) clearLoginChallengeCookie(c *gin.Context) {
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(loginChallengeCookieName, "", -1, "/api/v1/auth", "", s.config.CookieSecure, true)
 }

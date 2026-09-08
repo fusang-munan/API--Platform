@@ -11,7 +11,7 @@ const apiKeyStatuses = new Set<ApiKeyStatus>([
   'approved',
   'active',
   'rejected',
-  'revoked',
+  'inactive',
 ])
 
 export function parseApiKeyStatusEvent(value: unknown): ApiKeyStatusEvent | null {

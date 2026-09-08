@@ -174,20 +174,23 @@ func progressForStatus(status string, audits []AuditView) ProgressView {
 	case domain.KeyPendingMentor:
 		return ProgressView{Current: "mentor_review", CompletedSteps: []string{"submitted"}}
 	case domain.KeyPendingTeacher:
-		return ProgressView{Current: "teacher_review", CompletedSteps: []string{"submitted", "mentor_review"}}
+		return ProgressView{Current: "mentor_review", CompletedSteps: []string{"submitted"}}
 	case domain.KeyApproved:
-		return ProgressView{Current: "claim", CompletedSteps: []string{"submitted", "mentor_review", "teacher_review"}}
+		return ProgressView{Current: "claim", CompletedSteps: []string{"submitted", "mentor_review"}}
 	case domain.KeyActive:
-		return ProgressView{Current: "active", CompletedSteps: []string{"submitted", "mentor_review", "teacher_review", "claimed"}}
+		return ProgressView{Current: "active", CompletedSteps: []string{"submitted", "mentor_review", "claimed"}}
 	case domain.KeyRejected:
 		for _, audit := range audits {
+			if audit.Action == string(apikeyaudit.ActionStudentWithdrawn) {
+				return ProgressView{Current: "withdrawn", CompletedSteps: []string{"submitted"}}
+			}
 			if audit.Action == string(apikeyaudit.ActionTeacherRejected) {
 				return ProgressView{Current: "rejected_teacher", CompletedSteps: []string{"submitted", "mentor_review"}}
 			}
 		}
 		return ProgressView{Current: "rejected", CompletedSteps: []string{"submitted"}}
-	case domain.KeyRevoked:
-		return ProgressView{Current: "revoked", CompletedSteps: []string{"submitted", "mentor_review", "teacher_review", "claimed"}}
+	case domain.KeyInactive:
+		return ProgressView{Current: "inactive", CompletedSteps: []string{"submitted", "mentor_review", "claimed"}}
 	default:
 		return ProgressView{Current: status}
 	}
@@ -213,8 +216,8 @@ func keyStatus(status string) (apikey.Status, error) {
 		return apikey.StatusActive, nil
 	case domain.KeyRejected:
 		return apikey.StatusRejected, nil
-	case domain.KeyRevoked:
-		return apikey.StatusRevoked, nil
+	case domain.KeyInactive:
+		return apikey.StatusInactive, nil
 	default:
 		return "", fmt.Errorf("unknown API key status %q", status)
 	}
@@ -238,6 +241,12 @@ func (s *Service) MentorProjectUsage(ctx context.Context, mentorID, projectID uu
 func (s *Service) MentorCallLogs(ctx context.Context, mentorID uuid.UUID, filter usage.LogFilter) (usage.Page[usage.CallLog], error) {
 	return s.usage.MentorCallLogs(ctx, mentorID, filter)
 }
+func (s *Service) MentorCallTurns(ctx context.Context, mentorID uuid.UUID, filter usage.LogFilter) (usage.Page[usage.CallTurn], error) {
+	return s.usage.MentorCallTurns(ctx, mentorID, filter)
+}
+func (s *Service) MentorCallTurn(ctx context.Context, mentorID, turnID uuid.UUID) (usage.CallTurn, error) {
+	return s.usage.MentorCallTurn(ctx, mentorID, turnID)
+}
 func (s *Service) MentorCallLog(ctx context.Context, mentorID, callID uuid.UUID) (usage.CallLog, error) {
 	return s.usage.MentorCallLog(ctx, mentorID, callID)
 }
@@ -249,8 +258,8 @@ func (s *Service) MentorInput(ctx context.Context, mentorID, callID uuid.UUID) (
 }
 
 func (s *Service) UpdateMentorKeyQuota(ctx context.Context, mentorID, keyID uuid.UUID, quota int64, reason string) error {
-	if quota < 0 || quota > domain.MaxCreditMilli || strings.TrimSpace(reason) == "" {
-		return domain.NewError(domain.CodeValidation, "quota and reason are required")
+	if quota < 0 || quota > domain.MaxCreditMilli {
+		return domain.NewError(domain.CodeValidation, "quota is required")
 	}
 	if err := s.usage.UpdateKeyQuota(ctx, mentorID, keyID, quota, strings.TrimSpace(reason)); err != nil {
 		var appErr *domain.Error
@@ -260,6 +269,45 @@ func (s *Service) UpdateMentorKeyQuota(ctx context.Context, mentorID, keyID uuid
 		return domain.WrapError(domain.CodeDependencyUnavailable, "update API key quota", err)
 	}
 	return nil
+}
+
+func (s *Service) populateMemberQuota(ctx context.Context, view *APIKeyView) error {
+	switch view.Status {
+	case domain.KeyPendingMentor, domain.KeyPendingTeacher, domain.KeyRejected:
+		return nil
+	}
+	if view.Applicant.ID == "" || view.Project.ID == "" {
+		return nil
+	}
+	ownerID, err := uuid.Parse(view.Applicant.ID)
+	if err != nil {
+		return domain.NewError(domain.CodeValidation, "invalid applicant ID")
+	}
+	projectID, err := uuid.Parse(view.Project.ID)
+	if err != nil {
+		return domain.NewError(domain.CodeValidation, "invalid project ID")
+	}
+	if err := s.usage.EnsureCurrentBuckets(ctx); err != nil {
+		return domain.WrapError(domain.CodeDependencyUnavailable, "ensure credit buckets", err)
+	}
+	quota, charged, pending, err := s.usage.MemberMonthCredits(ctx, projectID, ownerID, time.Now())
+	if err != nil {
+		return domain.WrapError(domain.CodeDependencyUnavailable, "query member quota", err)
+	}
+	if quota == 0 && charged == 0 && pending == 0 {
+		return nil
+	}
+	formattedQuota := domain.FormatCredits(quota)
+	formattedUsed := domain.FormatCredits(charged)
+	formattedPending := domain.FormatCredits(pending)
+	view.MemberMonthlyCredits = &formattedQuota
+	view.MemberUsedCredits = &formattedUsed
+	view.MemberPendingCredits = &formattedPending
+	return nil
+}
+
+func (s *Service) TeacherProjectUsage(ctx context.Context, projectID uuid.UUID, month time.Time) (usage.ProjectUsage, error) {
+	return s.usage.ProjectUsage(ctx, projectID, month)
 }
 
 func (s *Service) TeacherProjectSpend(ctx context.Context, month time.Time, organizationID, query string) ([]usage.ProjectUsage, error) {
@@ -279,7 +327,6 @@ func (s *Service) TeacherProjectSpend(ctx context.Context, month time.Time, orga
 		if err != nil {
 			continue
 		}
-		item.Members = nil
 		result = append(result, item)
 	}
 	return result, nil

@@ -17,17 +17,21 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/predicate"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providermodelcatalog"
 )
 
 // ProviderQuery is the builder for querying Provider entities.
 type ProviderQuery struct {
 	config
-	ctx               *QueryContext
-	order             []provider.OrderOption
-	inters            []Interceptor
-	predicates        []predicate.Provider
-	withModelBindings *ModelBindingQuery
-	modifiers         []func(*sql.Selector)
+	ctx                     *QueryContext
+	order                   []provider.OrderOption
+	inters                  []Interceptor
+	predicates              []predicate.Provider
+	withCredentials         *ProviderCredentialQuery
+	withModelBindings       *ModelBindingQuery
+	withModelCatalogEntries *ProviderModelCatalogQuery
+	modifiers               []func(*sql.Selector)
 	// intermediate query (i.e. traversal path).
 	sql  *sql.Selector
 	path func(context.Context) (*sql.Selector, error)
@@ -64,6 +68,28 @@ func (_q *ProviderQuery) Order(o ...provider.OrderOption) *ProviderQuery {
 	return _q
 }
 
+// QueryCredentials chains the current query on the "credentials" edge.
+func (_q *ProviderQuery) QueryCredentials() *ProviderCredentialQuery {
+	query := (&ProviderCredentialClient{config: _q.config}).Query()
+	query.path = func(ctx context.Context) (fromU *sql.Selector, err error) {
+		if err := _q.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		selector := _q.sqlQuery(ctx)
+		if err := selector.Err(); err != nil {
+			return nil, err
+		}
+		step := sqlgraph.NewStep(
+			sqlgraph.From(provider.Table, provider.FieldID, selector),
+			sqlgraph.To(providercredential.Table, providercredential.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, provider.CredentialsTable, provider.CredentialsColumn),
+		)
+		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
+		return fromU, nil
+	}
+	return query
+}
+
 // QueryModelBindings chains the current query on the "model_bindings" edge.
 func (_q *ProviderQuery) QueryModelBindings() *ModelBindingQuery {
 	query := (&ModelBindingClient{config: _q.config}).Query()
@@ -79,6 +105,28 @@ func (_q *ProviderQuery) QueryModelBindings() *ModelBindingQuery {
 			sqlgraph.From(provider.Table, provider.FieldID, selector),
 			sqlgraph.To(modelbinding.Table, modelbinding.FieldID),
 			sqlgraph.Edge(sqlgraph.O2M, false, provider.ModelBindingsTable, provider.ModelBindingsColumn),
+		)
+		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
+		return fromU, nil
+	}
+	return query
+}
+
+// QueryModelCatalogEntries chains the current query on the "model_catalog_entries" edge.
+func (_q *ProviderQuery) QueryModelCatalogEntries() *ProviderModelCatalogQuery {
+	query := (&ProviderModelCatalogClient{config: _q.config}).Query()
+	query.path = func(ctx context.Context) (fromU *sql.Selector, err error) {
+		if err := _q.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		selector := _q.sqlQuery(ctx)
+		if err := selector.Err(); err != nil {
+			return nil, err
+		}
+		step := sqlgraph.NewStep(
+			sqlgraph.From(provider.Table, provider.FieldID, selector),
+			sqlgraph.To(providermodelcatalog.Table, providermodelcatalog.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, provider.ModelCatalogEntriesTable, provider.ModelCatalogEntriesColumn),
 		)
 		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
 		return fromU, nil
@@ -273,16 +321,29 @@ func (_q *ProviderQuery) Clone() *ProviderQuery {
 		return nil
 	}
 	return &ProviderQuery{
-		config:            _q.config,
-		ctx:               _q.ctx.Clone(),
-		order:             append([]provider.OrderOption{}, _q.order...),
-		inters:            append([]Interceptor{}, _q.inters...),
-		predicates:        append([]predicate.Provider{}, _q.predicates...),
-		withModelBindings: _q.withModelBindings.Clone(),
+		config:                  _q.config,
+		ctx:                     _q.ctx.Clone(),
+		order:                   append([]provider.OrderOption{}, _q.order...),
+		inters:                  append([]Interceptor{}, _q.inters...),
+		predicates:              append([]predicate.Provider{}, _q.predicates...),
+		withCredentials:         _q.withCredentials.Clone(),
+		withModelBindings:       _q.withModelBindings.Clone(),
+		withModelCatalogEntries: _q.withModelCatalogEntries.Clone(),
 		// clone intermediate query.
 		sql:  _q.sql.Clone(),
 		path: _q.path,
 	}
+}
+
+// WithCredentials tells the query-builder to eager-load the nodes that are connected to
+// the "credentials" edge. The optional arguments are used to configure the query builder of the edge.
+func (_q *ProviderQuery) WithCredentials(opts ...func(*ProviderCredentialQuery)) *ProviderQuery {
+	query := (&ProviderCredentialClient{config: _q.config}).Query()
+	for _, opt := range opts {
+		opt(query)
+	}
+	_q.withCredentials = query
+	return _q
 }
 
 // WithModelBindings tells the query-builder to eager-load the nodes that are connected to
@@ -293,6 +354,17 @@ func (_q *ProviderQuery) WithModelBindings(opts ...func(*ModelBindingQuery)) *Pr
 		opt(query)
 	}
 	_q.withModelBindings = query
+	return _q
+}
+
+// WithModelCatalogEntries tells the query-builder to eager-load the nodes that are connected to
+// the "model_catalog_entries" edge. The optional arguments are used to configure the query builder of the edge.
+func (_q *ProviderQuery) WithModelCatalogEntries(opts ...func(*ProviderModelCatalogQuery)) *ProviderQuery {
+	query := (&ProviderModelCatalogClient{config: _q.config}).Query()
+	for _, opt := range opts {
+		opt(query)
+	}
+	_q.withModelCatalogEntries = query
 	return _q
 }
 
@@ -374,8 +446,10 @@ func (_q *ProviderQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*Pro
 	var (
 		nodes       = []*Provider{}
 		_spec       = _q.querySpec()
-		loadedTypes = [1]bool{
+		loadedTypes = [3]bool{
+			_q.withCredentials != nil,
 			_q.withModelBindings != nil,
+			_q.withModelCatalogEntries != nil,
 		}
 	)
 	_spec.ScanValues = func(columns []string) ([]any, error) {
@@ -399,6 +473,13 @@ func (_q *ProviderQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*Pro
 	if len(nodes) == 0 {
 		return nodes, nil
 	}
+	if query := _q.withCredentials; query != nil {
+		if err := _q.loadCredentials(ctx, query, nodes,
+			func(n *Provider) { n.Edges.Credentials = []*ProviderCredential{} },
+			func(n *Provider, e *ProviderCredential) { n.Edges.Credentials = append(n.Edges.Credentials, e) }); err != nil {
+			return nil, err
+		}
+	}
 	if query := _q.withModelBindings; query != nil {
 		if err := _q.loadModelBindings(ctx, query, nodes,
 			func(n *Provider) { n.Edges.ModelBindings = []*ModelBinding{} },
@@ -406,9 +487,48 @@ func (_q *ProviderQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*Pro
 			return nil, err
 		}
 	}
+	if query := _q.withModelCatalogEntries; query != nil {
+		if err := _q.loadModelCatalogEntries(ctx, query, nodes,
+			func(n *Provider) { n.Edges.ModelCatalogEntries = []*ProviderModelCatalog{} },
+			func(n *Provider, e *ProviderModelCatalog) {
+				n.Edges.ModelCatalogEntries = append(n.Edges.ModelCatalogEntries, e)
+			}); err != nil {
+			return nil, err
+		}
+	}
 	return nodes, nil
 }
 
+func (_q *ProviderQuery) loadCredentials(ctx context.Context, query *ProviderCredentialQuery, nodes []*Provider, init func(*Provider), assign func(*Provider, *ProviderCredential)) error {
+	fks := make([]driver.Value, 0, len(nodes))
+	nodeids := make(map[uuid.UUID]*Provider)
+	for i := range nodes {
+		fks = append(fks, nodes[i].ID)
+		nodeids[nodes[i].ID] = nodes[i]
+		if init != nil {
+			init(nodes[i])
+		}
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(providercredential.FieldProviderID)
+	}
+	query.Where(predicate.ProviderCredential(func(s *sql.Selector) {
+		s.Where(sql.InValues(s.C(provider.CredentialsColumn), fks...))
+	}))
+	neighbors, err := query.All(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range neighbors {
+		fk := n.ProviderID
+		node, ok := nodeids[fk]
+		if !ok {
+			return fmt.Errorf(`unexpected referenced foreign-key "provider_id" returned %v for node %v`, fk, n.ID)
+		}
+		assign(node, n)
+	}
+	return nil
+}
 func (_q *ProviderQuery) loadModelBindings(ctx context.Context, query *ModelBindingQuery, nodes []*Provider, init func(*Provider), assign func(*Provider, *ModelBinding)) error {
 	fks := make([]driver.Value, 0, len(nodes))
 	nodeids := make(map[uuid.UUID]*Provider)
@@ -424,6 +544,36 @@ func (_q *ProviderQuery) loadModelBindings(ctx context.Context, query *ModelBind
 	}
 	query.Where(predicate.ModelBinding(func(s *sql.Selector) {
 		s.Where(sql.InValues(s.C(provider.ModelBindingsColumn), fks...))
+	}))
+	neighbors, err := query.All(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range neighbors {
+		fk := n.ProviderID
+		node, ok := nodeids[fk]
+		if !ok {
+			return fmt.Errorf(`unexpected referenced foreign-key "provider_id" returned %v for node %v`, fk, n.ID)
+		}
+		assign(node, n)
+	}
+	return nil
+}
+func (_q *ProviderQuery) loadModelCatalogEntries(ctx context.Context, query *ProviderModelCatalogQuery, nodes []*Provider, init func(*Provider), assign func(*Provider, *ProviderModelCatalog)) error {
+	fks := make([]driver.Value, 0, len(nodes))
+	nodeids := make(map[uuid.UUID]*Provider)
+	for i := range nodes {
+		fks = append(fks, nodes[i].ID)
+		nodeids[nodes[i].ID] = nodes[i]
+		if init != nil {
+			init(nodes[i])
+		}
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(providermodelcatalog.FieldProviderID)
+	}
+	query.Where(predicate.ProviderModelCatalog(func(s *sql.Selector) {
+		s.Where(sql.InValues(s.C(provider.ModelCatalogEntriesColumn), fks...))
 	}))
 	neighbors, err := query.All(ctx)
 	if err != nil {

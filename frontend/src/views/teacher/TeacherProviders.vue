@@ -1,2 +1,396 @@
-<script setup lang="ts">import{computed,onMounted,reactive,ref}from'vue';import{teacherAPI}from'../../api/teacher';import type{Provider}from'../../api/types';import{APIError}from'../../api/client';import StatusBadge from'../../components/StatusBadge.vue';import AppDialog from'../../components/AppDialog.vue';import LoadingRegion from'../../components/LoadingRegion.vue';import{useLoadState}from'../../composables/useLoadState';import{useToast}from'../../composables/useToast';const rows=ref<Provider[]>([]),query=ref(''),status=ref(''),drawer=ref(false),editing=ref<Provider|null>(null),credentialOpen=ref<Provider|null>(null),credential=ref(''),showCredential=ref(false),error=ref(''),routingModels=ref<string[]>([]),toast=useToast(),loadState=useLoadState(),form=reactive({name:'',base_url:'',credential:'',status:'active' as'active'|'inactive'});const filtered=computed(()=>rows.value.filter(p=>(!query.value||`${p.name} ${p.base_url}`.toLowerCase().includes(query.value.toLowerCase()))&&(!status.value||p.status===status.value)));async function load(){await loadState.run(async()=>{try{rows.value=await teacherAPI.providers()}catch(e){error.value=msg(e)}})}function open(p?:Provider){editing.value=p??null;Object.assign(form,{name:p?.name??'',base_url:p?.base_url??'',credential:'',status:p?.status??'active'});drawer.value=true}async function save(){try{if(editing.value)await teacherAPI.updateProvider(editing.value.id,{name:form.name,base_url:form.base_url,status:form.status});else await teacherAPI.createProvider(form);toast.success(editing.value?'供应商已更新':'供应商已创建');await load();if(!editing.value)drawer.value=false}catch(e){handle(e)}}async function replaceCredential(){if(!credentialOpen.value)return;try{await teacherAPI.updateProvider(credentialOpen.value.id,{credential:credential.value});toast.success('供应商凭据已替换');credentialOpen.value=null;credential.value=''}catch(e){handle(e)}}async function toggle(p:Provider){if(p.status==='active'&&!confirm('停用供应商可能影响模型路由，是否继续？'))return;try{await teacherAPI.updateProvider(p.id,{status:p.status==='active'?'inactive':'active'});await load()}catch(e){handle(e)}}function handle(e:unknown){if(e instanceof APIError&&e.code==='MODEL_ROUTING_REQUIRED'&&!Array.isArray(e.details)){const details=e.details as {model_ids?:string[]}|undefined;routingModels.value=details?.model_ids??[]}else error.value=msg(e)}function msg(e:unknown){return e instanceof APIError?e.message:'请求失败'};onMounted(load);</script>
-<template><section class="page"><div class="page-heading"><div><p class="eyebrow">TEACHER</p><h1>供应商管理</h1><p class="muted">凭据只写入不回显；普通编辑不会携带 credential。</p></div><button class="button primary" @click="open()">添加供应商</button></div><p v-if="error" class="error banner">{{error}}</p><LoadingRegion :initial-loading="loadState.initialLoading.value" :refreshing="loadState.refreshing.value" variant="list" label="正在加载供应商"><section class="panel"><div class="grid two"><label>搜索<input v-model="query" placeholder="名称或 Base URL"/></label><label>状态<select v-model="status"><option value="">全部状态</option><option value="active">启用</option><option value="inactive">停用</option></select></label></div><article v-for="p in filtered" :key="p.id" class="list-row"><div><strong>{{p.name}}</strong><p class="muted">{{p.base_url}} · 凭据{{p.credential_configured?'已配置':'未配置'}}</p></div><div class="actions"><StatusBadge :status="p.status"/><button class="button ghost" @click="open(p)">编辑</button><button class="button secondary" @click="credentialOpen=p">替换凭据</button><button class="button" :class="p.status==='active'?'danger':'secondary'" @click="toggle(p)">{{p.status==='active'?'停用':'启用'}}</button></div></article></section></LoadingRegion><AppDialog :open="drawer" :title="editing?'编辑供应商':'创建供应商'" @update:open="drawer=$event"><form @submit.prevent="save"><label>名称<input v-model="form.name" required/></label><label>Base URL<input v-model="form.base_url" type="url" required/></label><label v-if="!editing">凭据<input v-model="form.credential" type="password" required/></label><label>状态<select v-model="form.status"><option value="active">启用</option><option value="inactive">停用</option></select></label><div class="actions"><button class="button primary">保存</button></div></form></AppDialog><AppDialog :open="Boolean(credentialOpen)" title="替换供应商凭据" @update:open="credentialOpen=$event?credentialOpen:null"><label>新凭据<input v-model="credential" :type="showCredential?'text':'password'" required/></label><button class="button ghost wide" @pointerdown="showCredential=true" @pointerup="showCredential=false" @pointerleave="showCredential=false">按住临时显示</button><div class="actions"><button class="button primary" @click="replaceCredential">确认替换</button></div></AppDialog><AppDialog :open="Boolean(routingModels.length)" title="无法停用供应商" @update:open="routingModels=$event?routingModels:[]"><p>以下 ACTIVE 模型将失去最后一条可用路由：</p><div class="chip-list"><span v-for="id in routingModels" :key="id" class="chip">{{id}}</span></div></AppDialog></section></template>
+<script setup lang="ts">
+import { computed, onMounted, reactive, ref } from 'vue'
+import { teacherAPI } from '../../api/teacher'
+import type { Provider, ProviderCredential } from '../../api/types'
+import { APIError } from '../../api/client'
+import StatusBadge from '../../components/StatusBadge.vue'
+import AppDialog from '../../components/AppDialog.vue'
+import LoadingRegion from '../../components/LoadingRegion.vue'
+import { useLoadState } from '../../composables/useLoadState'
+import { useToast } from '../../composables/useToast'
+
+type KeyDraft = {
+  id?: string
+  label: string
+  key: string
+  status: 'active' | 'inactive'
+  configured: boolean
+}
+
+const rows = ref<Provider[]>([])
+const query = ref('')
+const status = ref('')
+const drawer = ref(false)
+const editing = ref<Provider | null>(null)
+const activeKeyIndex = ref(0)
+const revealKey = ref(false)
+const saving = ref(false)
+const deleting = ref('')
+const resetting = ref('')
+const error = ref('')
+const toast = useToast()
+const loadState = useLoadState()
+const form = reactive({ name: '', base_url: '', status: 'active' as 'active' | 'inactive' })
+const keyRows = ref<KeyDraft[]>([])
+const deletedCredentialIds = ref<string[]>([])
+
+const filtered = computed(() => rows.value.filter(p =>
+  (!query.value || `${p.name} ${p.base_url}`.toLowerCase().includes(query.value.toLowerCase()))
+  && (!status.value || p.status === status.value),
+))
+
+const activeKey = computed(() => keyRows.value[activeKeyIndex.value] ?? null)
+
+function activeKeyCount(provider: Provider) {
+  return (provider.credentials ?? []).filter(item => item.status === 'active').length
+}
+
+function emptyKeyRow(): KeyDraft {
+  return { label: '', key: '', status: 'active', configured: false }
+}
+
+function keyTabLabel(row: KeyDraft, index: number) {
+  const label = row.label.trim()
+  return label || `Key ${index + 1}`
+}
+
+function keyRowsFromProvider(credentials: ProviderCredential[] = []): KeyDraft[] {
+  if (!credentials.length) return [emptyKeyRow()]
+  return credentials.map(item => ({
+    id: item.id,
+    label: item.label,
+    key: '',
+    status: item.status,
+    configured: item.credential_configured,
+  }))
+}
+
+async function load() {
+  await loadState.run(async () => {
+    try {
+      rows.value = await teacherAPI.providers()
+    } catch (e) {
+      error.value = msg(e)
+    }
+  })
+}
+
+function open(p?: Provider) {
+  editing.value = p ?? null
+  deletedCredentialIds.value = []
+  Object.assign(form, { name: p?.name ?? '', base_url: p?.base_url ?? '', status: p?.status ?? 'active' })
+  keyRows.value = p ? keyRowsFromProvider(p.credentials) : [emptyKeyRow()]
+  activeKeyIndex.value = 0
+  revealKey.value = false
+  drawer.value = true
+}
+
+function selectKey(index: number) {
+  activeKeyIndex.value = index
+  revealKey.value = false
+}
+
+function addKeyRow() {
+  keyRows.value.push(emptyKeyRow())
+  activeKeyIndex.value = keyRows.value.length - 1
+  revealKey.value = false
+}
+
+function removeActiveKey() {
+  if (keyRows.value.length <= 1) {
+    toast.error('至少保留一个 Key')
+    return
+  }
+  const row = keyRows.value[activeKeyIndex.value]
+  if (row?.id && !confirm(`删除 Key「${row.label.trim() || '未命名'}」？将移除其上游目录与路由。`)) return
+  if (row?.id) deletedCredentialIds.value.push(row.id)
+  keyRows.value.splice(activeKeyIndex.value, 1)
+  activeKeyIndex.value = Math.min(activeKeyIndex.value, keyRows.value.length - 1)
+  revealKey.value = false
+}
+
+function validateKeyRows() {
+  const labels = new Set<string>()
+  for (const row of keyRows.value) {
+    if (!row.label.trim()) {
+      toast.error('每个 Key 都需要名称')
+      return false
+    }
+    const label = row.label.trim().toLowerCase()
+    if (labels.has(label)) {
+      toast.error('Key 名称不能重复')
+      return false
+    }
+    labels.add(label)
+    if (!row.id && !row.key.trim()) {
+      toast.error('新 Key 必须填写密钥')
+      return false
+    }
+  }
+  if (keyRows.value.filter(row => row.status === 'active').length === 0) {
+    toast.error('至少启用一个 Key')
+    return false
+  }
+  return true
+}
+
+async function saveKeys(providerId: string) {
+  for (const credentialId of deletedCredentialIds.value) {
+    await teacherAPI.deleteProviderCredential(providerId, credentialId)
+  }
+  for (const row of keyRows.value) {
+    const payload = {
+      label: row.label.trim(),
+      credential: row.key.trim() || undefined,
+      status: row.status,
+    }
+    if (row.id) await teacherAPI.updateProviderCredential(providerId, row.id, payload)
+    else await teacherAPI.createProviderCredential(providerId, { ...payload, credential: row.key.trim() })
+  }
+}
+
+async function save() {
+  if (!validateKeyRows()) return
+  saving.value = true
+  try {
+    if (editing.value) {
+      await teacherAPI.updateProvider(editing.value.id, { name: form.name, base_url: form.base_url, status: form.status })
+      await saveKeys(editing.value.id)
+      deletedCredentialIds.value = []
+      toast.success('供应商与 Key 已保存（仅刷新上游目录，不改动模型配置）')
+    } else {
+      const first = keyRows.value[0]
+      const result = await teacherAPI.createProvider({
+        name: form.name,
+        base_url: form.base_url,
+        credential: first.key.trim(),
+        status: form.status,
+      })
+      const defaultCred = result.credentials?.[0]
+      if (defaultCred) {
+        await teacherAPI.updateProviderCredential(result.id, defaultCred.id, {
+          label: first.label.trim() || defaultCred.label,
+          status: first.status,
+        })
+      }
+      for (const row of keyRows.value.slice(1)) {
+        await teacherAPI.createProviderCredential(result.id, {
+          label: row.label.trim(),
+          credential: row.key.trim(),
+          status: row.status,
+        })
+      }
+      toast.success(result.last_catalog_sync
+        ? `供应商已创建，已同步 ${result.last_catalog_sync.synced} 个上游模型`
+        : '供应商已创建')
+    }
+    drawer.value = false
+    await load()
+  } catch (e) {
+    error.value = msg(e)
+  } finally {
+    saving.value = false
+  }
+}
+
+async function resetCatalog(p: Provider) {
+  if (p.status !== 'active') {
+    toast.error('请先启用供应商')
+    return
+  }
+  if (activeKeyCount(p) === 0) {
+    toast.error('请先添加并启用至少一个 Key')
+    return
+  }
+  if (!confirm('重新爬取上游模型、按 Key 分别导入并重置倍率/常用标记（不会在日常改 Key 或停启服务时自动执行），是否继续？')) return
+  resetting.value = p.id
+  try {
+    const result = await teacherAPI.resetProviderCatalog(p.id)
+    toast.success(`已重置，同步 ${result.synced} 个上游模型（${result.provider_name}）`)
+    await load()
+  } catch (e) {
+    error.value = msg(e)
+  } finally {
+    resetting.value = ''
+  }
+}
+
+async function toggle(p: Provider) {
+  if (p.status === 'active' && !confirm('停用供应商将影响其模型路由，是否继续？')) return
+  try {
+    await teacherAPI.updateProvider(p.id, { status: p.status === 'active' ? 'inactive' : 'active' })
+    toast.success(p.status === 'active' ? '供应商已停用' : '供应商已启用')
+    await load()
+  } catch (e) {
+    error.value = msg(e)
+  }
+}
+
+async function remove(p: Provider) {
+  if (!confirm(`删除「${p.name}」？将同时移除 Key、上游目录及该供应商下的模型路由。`)) return
+  deleting.value = p.id
+  try {
+    await teacherAPI.deleteProvider(p.id)
+    toast.success('供应商已删除')
+    await load()
+  } catch (e) {
+    error.value = msg(e)
+  } finally {
+    deleting.value = ''
+  }
+}
+
+function msg(e: unknown) { return e instanceof APIError ? e.message : '请求失败' }
+
+onMounted(load)
+</script>
+
+<template>
+  <section class="page">
+    <div class="page-heading">
+      <div>
+        <p class="eyebrow">TEACHER</p>
+        <h1>供应商管理</h1>
+        <p class="muted">可同时启用多个供应商；每个供应商按 Key 独立同步上游目录。</p>
+      </div>
+      <button class="button primary" @click="open()">添加供应商</button>
+    </div>
+    <p v-if="error" class="error banner">{{ error }}</p>
+    <LoadingRegion :initial-loading="loadState.initialLoading.value" :refreshing="loadState.refreshing.value" variant="list" label="正在加载供应商">
+      <section class="panel">
+        <div class="grid two">
+          <label>搜索<input v-model="query" placeholder="名称或 Base URL"></label>
+          <label>状态<select v-model="status"><option value="">全部状态</option><option value="active">启用</option><option value="inactive">停用</option></select></label>
+        </div>
+        <article v-for="p in filtered" :key="p.id" class="list-row">
+          <div>
+            <strong>{{ p.name }}</strong>
+            <p class="muted">{{ p.base_url }} · {{ activeKeyCount(p) }} 个启用 Key / {{ (p.credentials ?? []).length }} 个 Key</p>
+            <div v-if="p.credentials?.length" class="chip-list">
+              <span v-for="key in p.credentials" :key="key.id" class="chip">
+                {{ key.label }} · {{ key.status === 'active' ? '启用' : '停用' }}
+              </span>
+            </div>
+          </div>
+          <div class="actions">
+            <StatusBadge :status="p.status" />
+            <button class="button secondary" :disabled="resetting === p.id" @click="resetCatalog(p)">{{ resetting === p.id ? '重置中…' : '配置重置' }}</button>
+            <button class="button ghost" @click="open(p)">编辑</button>
+            <button class="button danger" :disabled="deleting === p.id" @click="remove(p)">{{ deleting === p.id ? '删除中…' : '删除' }}</button>
+            <button class="button" :class="p.status === 'active' ? 'danger' : 'secondary'" @click="toggle(p)">{{ p.status === 'active' ? '停用' : '启用' }}</button>
+          </div>
+        </article>
+      </section>
+    </LoadingRegion>
+
+    <AppDialog :open="drawer" :title="editing ? '编辑供应商' : '创建供应商'" @update:open="drawer = $event">
+      <form class="provider-form" @submit.prevent="save">
+        <div class="grid two">
+          <label>名称<input v-model="form.name" required></label>
+          <label>状态<select v-model="form.status"><option value="active">启用</option><option value="inactive">停用</option></select></label>
+        </div>
+        <label>Base URL<input v-model="form.base_url" type="url" required></label>
+
+        <section class="key-panel">
+          <div class="key-panel-head">
+            <strong>Key</strong>
+            <button v-if="keyRows.length > 1" type="button" class="button ghost danger-text" @click="removeActiveKey">删除当前 Key</button>
+          </div>
+
+          <div class="key-tabs" role="tablist" aria-label="Key 切换">
+            <button
+              v-for="(row, index) in keyRows"
+              :key="row.id ?? `new-${index}`"
+              type="button"
+              class="key-tab"
+              :class="{ active: activeKeyIndex === index, inactive: row.status === 'inactive' }"
+              role="tab"
+              :aria-selected="activeKeyIndex === index"
+              @click="selectKey(index)"
+            >
+              {{ keyTabLabel(row, index) }}
+            </button>
+            <button type="button" class="key-tab add" aria-label="添加 Key" @click="addKeyRow">+</button>
+          </div>
+
+          <div v-if="activeKey" class="key-editor">
+            <label>Key 名称<input v-model="activeKey.label" required placeholder="例如 codex、claude"></label>
+            <label>
+              {{ activeKey.id && activeKey.configured ? '替换 Key（留空则不改）' : 'Key' }}
+              <input
+                v-model="activeKey.key"
+                :type="revealKey ? 'text' : 'password'"
+                :required="!activeKey.id"
+                :placeholder="activeKey.id && activeKey.configured ? '已配置，留空保持不变' : 'sk-...'"
+                autocomplete="off"
+              >
+            </label>
+            <div class="key-editor-row">
+              <label class="grow">状态<select v-model="activeKey.status"><option value="active">启用</option><option value="inactive">停用</option></select></label>
+              <button type="button" class="button ghost" @pointerdown="revealKey = true" @pointerup="revealKey = false" @pointerleave="revealKey = false">按住显示</button>
+            </div>
+          </div>
+        </section>
+
+        <div class="actions"><button class="button primary" :disabled="saving">{{ saving ? '保存中…' : '保存' }}</button></div>
+      </form>
+    </AppDialog>
+  </section>
+</template>
+
+<style scoped>
+.provider-form { display: grid; gap: 1rem; }
+.key-panel {
+  display: grid;
+  gap: 0.875rem;
+  padding: 1rem;
+  border: 1px solid var(--border-subtle, #dbe1ea);
+  border-radius: 14px;
+  background: var(--surface-muted, #f8fafc);
+}
+.key-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.key-panel-head p { margin: 0.25rem 0 0; font-size: 0.875rem; }
+.key-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.key-tab {
+  border: 1px solid var(--border-subtle, #dbe1ea);
+  background: #fff;
+  color: var(--text-muted, #64748b);
+  border-radius: 999px;
+  padding: 0.35rem 0.85rem;
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+.key-tab.active {
+  border-color: var(--accent, #7248f4);
+  color: var(--accent, #7248f4);
+  background: color-mix(in srgb, var(--accent, #7248f4) 8%, #fff);
+}
+.key-tab.inactive:not(.active) { opacity: 0.72; }
+.key-tab.add {
+  min-width: 2rem;
+  padding-inline: 0.65rem;
+  font-weight: 600;
+}
+.key-editor {
+  display: grid;
+  gap: 0.875rem;
+  padding-top: 0.25rem;
+}
+.key-editor-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.75rem;
+}
+.grow { flex: 1; }
+.danger-text { color: #b42318; }
+</style>

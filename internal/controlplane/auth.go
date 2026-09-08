@@ -13,6 +13,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/cache"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/user"
 )
 
@@ -35,13 +36,14 @@ type BootstrapAccount struct {
 }
 
 type preparedBootstrapAccount struct {
-	Name     string
-	Email    string
-	Password string
+	Name              string
+	Email             string
+	Password          string
+	WithMentorProfile bool
 }
 
 func (s *Service) SendRegistrationCode(ctx context.Context, email, purpose string) error {
-	if purpose != PurposeStudentRegistration && purpose != PurposeMentorRegistration {
+	if purpose != PurposeStudentRegistration {
 		return domain.NewError(domain.CodeValidation, "invalid verification purpose")
 	}
 	normalized, err := NormalizeEmail(email)
@@ -95,7 +97,7 @@ func (s *Service) sendCode(ctx context.Context, email, purpose string) error {
 }
 
 func (s *Service) Register(ctx context.Context, role, name, email, password, code string) (UserView, error) {
-	if role != string(user.RoleStudent) && role != string(user.RoleMentor) {
+	if role != string(user.RoleStudent) {
 		return UserView{}, domain.NewError(domain.CodeValidation, "invalid registration role")
 	}
 	name, err := ValidateName(name, 64)
@@ -107,9 +109,6 @@ func (s *Service) Register(ctx context.Context, role, name, email, password, cod
 		return UserView{}, err
 	}
 	purpose := PurposeStudentRegistration
-	if role == string(user.RoleMentor) {
-		purpose = PurposeMentorRegistration
-	}
 	passwordHash, err := security.HashPassword(password)
 	if err != nil {
 		return UserView{}, domain.NewError(domain.CodeValidation, err.Error())
@@ -118,11 +117,16 @@ func (s *Service) Register(ctx context.Context, role, name, email, password, cod
 	if err := s.consumeVerification(ctx, email, purpose, hash); err != nil {
 		return UserView{}, err
 	}
-	created, err := s.db.User.Create().
+	tx, err := s.db.Tx(ctx)
+	if err != nil {
+		return UserView{}, domain.WrapError(domain.CodeDependencyUnavailable, "start registration transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	created, err := tx.User.Create().
 		SetName(name).
 		SetEmail(email).
 		SetPasswordHash(passwordHash).
-		SetRole(user.Role(role)).
+		SetRole(user.RoleStudent).
 		SetStatus(user.StatusActive).
 		Save(ctx)
 	if ent.IsConstraintError(err) {
@@ -131,29 +135,82 @@ func (s *Service) Register(ctx context.Context, role, name, email, password, cod
 	if err != nil {
 		return UserView{}, domain.WrapError(domain.CodeDependencyUnavailable, "create user", err)
 	}
-	return userView(created), nil
+	if _, err := tx.StudentProfile.Create().SetUserID(created.ID).Save(ctx); err != nil {
+		return UserView{}, domain.WrapError(domain.CodeDependencyUnavailable, "create student profile", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return UserView{}, domain.WrapError(domain.CodeDependencyUnavailable, "commit registration", err)
+	}
+	return userViewWithIdentity(created, IdentityStudent), nil
 }
 
-func (s *Service) Login(ctx context.Context, email, password string) (SessionView, error) {
+func (s *Service) Login(ctx context.Context, email, password string) (LoginChallengeView, string, error) {
 	normalized, err := NormalizeEmail(email)
 	if err != nil {
-		return SessionView{}, domain.NewError(domain.CodeInvalidCredentials, "invalid email or password")
+		return LoginChallengeView{}, "", domain.NewError(domain.CodeInvalidCredentials, "invalid email or password")
 	}
 	account, err := s.db.User.Query().Where(user.EmailEQ(normalized)).Only(ctx)
 	if ent.IsNotFound(err) {
 		_ = security.VerifyPassword(dummyPasswordHash, password)
-		return SessionView{}, domain.NewError(domain.CodeInvalidCredentials, "invalid email or password")
+		return LoginChallengeView{}, "", domain.NewError(domain.CodeInvalidCredentials, "invalid email or password")
+	}
+	if err != nil {
+		return LoginChallengeView{}, "", domain.WrapError(domain.CodeDependencyUnavailable, "query user", err)
+	}
+	if !security.VerifyPassword(account.PasswordHash, password) {
+		return LoginChallengeView{}, "", domain.NewError(domain.CodeInvalidCredentials, "invalid email or password")
+	}
+	if account.Status != user.StatusActive {
+		return LoginChallengeView{}, "", domain.NewError(domain.CodeAccountDisabled, "account is not active")
+	}
+	identities, err := s.listIdentities(ctx, account)
+	if err != nil {
+		return LoginChallengeView{}, "", err
+	}
+	if len(identities) == 0 {
+		return LoginChallengeView{}, "", domain.NewError(domain.CodeAccountDisabled, "account is not active")
+	}
+	challengeToken, err := s.security.NewOpaqueToken("neb_lc_", 32)
+	if err != nil {
+		return LoginChallengeView{}, "", domain.WrapError("INTERNAL_ERROR", "generate login challenge", err)
+	}
+	hash := cache.HashKey(s.security.HashAuthState(challengeToken))
+	if err := s.cache.CreateLoginChallenge(ctx, hash, cache.LoginChallenge{UserID: account.ID.String()}, 5*time.Minute); err != nil {
+		return LoginChallengeView{}, "", domain.WrapError(domain.CodeDependencyUnavailable, "store login challenge", err)
+	}
+	view := userView(account)
+	view.Role = ""
+	return LoginChallengeView{User: view, Identities: identities}, challengeToken, nil
+}
+
+func (s *Service) CreateSession(ctx context.Context, rawChallengeToken, identity string) (SessionView, error) {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return SessionView{}, domain.NewError(domain.CodeValidation, "identity is required")
+	}
+	if rawChallengeToken == "" {
+		return SessionView{}, domain.NewError(domain.CodeAuthenticationRequired, "login challenge is required")
+	}
+	hash := cache.HashKey(s.security.HashAuthState(rawChallengeToken))
+	challenge, err := s.cache.ConsumeLoginChallenge(ctx, hash)
+	if err != nil {
+		return SessionView{}, domain.NewError(domain.CodeAuthenticationRequired, "login challenge is invalid or expired")
+	}
+	userID, err := uuid.Parse(challenge.UserID)
+	if err != nil {
+		return SessionView{}, domain.NewError(domain.CodeAuthenticationRequired, "login challenge is invalid or expired")
+	}
+	account, err := s.db.User.Query().Where(user.IDEQ(userID)).Only(ctx)
+	if ent.IsNotFound(err) {
+		return SessionView{}, domain.NewError(domain.CodeAuthenticationRequired, "login challenge is invalid or expired")
 	}
 	if err != nil {
 		return SessionView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query user", err)
 	}
-	if !security.VerifyPassword(account.PasswordHash, password) {
-		return SessionView{}, domain.NewError(domain.CodeInvalidCredentials, "invalid email or password")
+	if err := s.validateSessionIdentity(ctx, account, identity); err != nil {
+		return SessionView{}, err
 	}
-	if account.Status != user.StatusActive {
-		return SessionView{}, domain.NewError(domain.CodeAccountDisabled, "account is not active")
-	}
-	return s.issueSession(ctx, account, "")
+	return s.issueSession(ctx, account, "", identity)
 }
 
 func (s *Service) Refresh(ctx context.Context, rawRefreshToken string) (SessionView, error) {
@@ -179,23 +236,30 @@ func (s *Service) Refresh(ctx context.Context, rawRefreshToken string) (SessionV
 	if account.Status != user.StatusActive {
 		return SessionView{}, domain.NewError(domain.CodeAccountDisabled, "account is not active")
 	}
+	newSession := cache.Session{UserID: account.ID.String(), FamilyID: session.FamilyID, Identity: session.Identity}
+	if newSession.Identity == "" {
+		return SessionView{}, domain.NewError(domain.CodeAuthenticationRequired, "invalid refresh token")
+	}
 	newRaw, err := s.security.NewOpaqueToken("neb_rt_", 32)
 	if err != nil {
 		return SessionView{}, domain.WrapError("INTERNAL_ERROR", "generate refresh token", err)
 	}
 	newHash := cache.HashKey(s.security.HashAuthState(newRaw))
-	newSession := cache.Session{UserID: account.ID.String(), FamilyID: session.FamilyID}
+	if err := s.validateSessionIdentity(ctx, account, newSession.Identity); err != nil {
+		return SessionView{}, err
+	}
 	if err := s.cache.RotateSession(ctx, oldHash, newHash, newSession, s.config.RefreshTTL); err != nil {
 		return SessionView{}, domain.NewError(domain.CodeAuthenticationRequired, "invalid refresh token")
 	}
-	access, expiresAt, err := s.security.IssueAccessToken(account.ID, string(account.Role))
+	access, expiresAt, err := s.security.IssueAccessToken(account.ID, newSession.Identity)
 	if err != nil {
 		return SessionView{}, domain.WrapError("INTERNAL_ERROR", "issue access token", err)
 	}
 	return SessionView{
 		AccessToken: access, TokenType: "Bearer",
 		ExpiresIn:    int64(time.Until(expiresAt).Seconds()),
-		RefreshToken: newRaw, User: userView(account),
+		RefreshToken: newRaw, Identity: newSession.Identity,
+		User: userViewWithIdentity(account, newSession.Identity),
 	}, nil
 }
 
@@ -250,7 +314,22 @@ func (s *Service) CurrentUser(ctx context.Context, identity Identity) (UserView,
 	if account.Status != user.StatusActive {
 		return UserView{}, domain.NewError(domain.CodeAccountDisabled, "account is not active")
 	}
-	return userView(account), nil
+	if err := s.validateSessionIdentity(ctx, account, identity.Role); err != nil {
+		return UserView{}, err
+	}
+	return userViewWithIdentity(account, identity.Role), nil
+}
+
+func (s *Service) Me(ctx context.Context, identity Identity) (MeView, error) {
+	userView, err := s.CurrentUser(ctx, identity)
+	if err != nil {
+		return MeView{}, err
+	}
+	identities, err := s.accountIdentities(ctx, identity.UserID)
+	if err != nil {
+		return MeView{}, err
+	}
+	return MeView{User: userView, Identity: identity.Role, Identities: identities}, nil
 }
 
 func (s *Service) InviteTeacher(ctx context.Context, inviter Identity, email string) error {
@@ -385,13 +464,13 @@ func (s *Service) BootstrapTeacher(ctx context.Context, name, email, password st
 
 func (s *Service) BootstrapTestAccounts(ctx context.Context, accounts []BootstrapAccount) error {
 	for _, input := range accounts {
-		account, role, err := prepareBootstrapAccount(input)
+		account, err := prepareBootstrapAccount(input)
 		if err != nil {
 			return err
 		}
 		existing, err := s.db.User.Query().Where(user.EmailEQ(account.Email)).Only(ctx)
 		if err == nil {
-			if err := validateExistingBootstrapAccount(existing, role); err != nil {
+			if err := validateExistingBootstrapAccount(existing, account.WithMentorProfile); err != nil {
 				return err
 			}
 			continue
@@ -403,11 +482,16 @@ func (s *Service) BootstrapTestAccounts(ctx context.Context, accounts []Bootstra
 		if err != nil {
 			return domain.NewError(domain.CodeValidation, err.Error())
 		}
-		_, err = s.db.User.Create().
+		tx, err := s.db.Tx(ctx)
+		if err != nil {
+			return domain.WrapError(domain.CodeDependencyUnavailable, "start bootstrap test account transaction", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		created, err := tx.User.Create().
 			SetName(account.Name).
 			SetEmail(account.Email).
 			SetPasswordHash(passwordHash).
-			SetRole(role).
+			SetRole(user.RoleStudent).
 			SetStatus(user.StatusActive).
 			Save(ctx)
 		if ent.IsConstraintError(err) {
@@ -415,7 +499,7 @@ func (s *Service) BootstrapTestAccounts(ctx context.Context, accounts []Bootstra
 			if queryErr != nil {
 				return domain.WrapError(domain.CodeDependencyUnavailable, "query concurrent bootstrap test account", queryErr)
 			}
-			if err := validateExistingBootstrapAccount(existing, role); err != nil {
+			if err := validateExistingBootstrapAccount(existing, account.WithMentorProfile); err != nil {
 				return err
 			}
 			continue
@@ -423,39 +507,67 @@ func (s *Service) BootstrapTestAccounts(ctx context.Context, accounts []Bootstra
 		if err != nil {
 			return domain.WrapError(domain.CodeDependencyUnavailable, "create bootstrap test account", err)
 		}
+		if _, err := tx.StudentProfile.Create().SetUserID(created.ID).Save(ctx); err != nil {
+			return domain.WrapError(domain.CodeDependencyUnavailable, "create bootstrap student profile", err)
+		}
+		if account.WithMentorProfile {
+			now := s.now().UTC()
+			if _, err := tx.MentorProfile.Create().
+				SetUserID(created.ID).
+				SetStatus(mentorprofile.StatusActive).
+				SetGrantedAt(now).
+				Save(ctx); err != nil {
+				return domain.WrapError(domain.CodeDependencyUnavailable, "create bootstrap mentor profile", err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return domain.WrapError(domain.CodeDependencyUnavailable, "commit bootstrap test account", err)
+		}
 	}
 	return nil
 }
 
-func prepareBootstrapAccount(input BootstrapAccount) (preparedBootstrapAccount, user.Role, error) {
-	var role user.Role
+func prepareBootstrapAccount(input BootstrapAccount) (preparedBootstrapAccount, error) {
+	var withMentorProfile bool
 	switch input.Role {
 	case string(user.RoleStudent):
-		role = user.RoleStudent
+		withMentorProfile = false
 	case string(user.RoleMentor):
-		role = user.RoleMentor
+		withMentorProfile = true
 	default:
-		return preparedBootstrapAccount{}, "", domain.NewError(domain.CodeValidation, "invalid bootstrap account role")
+		return preparedBootstrapAccount{}, domain.NewError(domain.CodeValidation, "invalid bootstrap account role")
 	}
 	name, err := ValidateName(input.Name, 64)
 	if err != nil {
-		return preparedBootstrapAccount{}, "", err
+		return preparedBootstrapAccount{}, err
 	}
 	email, err := NormalizeEmail(input.Email)
 	if err != nil {
-		return preparedBootstrapAccount{}, "", err
+		return preparedBootstrapAccount{}, err
 	}
-	return preparedBootstrapAccount{Name: name, Email: email, Password: input.Password}, role, nil
+	return preparedBootstrapAccount{
+		Name: name, Email: email, Password: input.Password, WithMentorProfile: withMentorProfile,
+	}, nil
 }
 
-func validateExistingBootstrapAccount(account *ent.User, expectedRole user.Role) error {
-	if account.Role != expectedRole {
+func validateExistingBootstrapAccount(account *ent.User, withMentorProfile bool) error {
+	if account.Role == user.RoleTeacher {
 		return domain.NewError(domain.CodeValidation, "bootstrap account role conflicts with existing user")
 	}
+	if account.Role != user.RoleStudent && account.Role != user.RoleMentor {
+		return domain.NewError(domain.CodeValidation, "bootstrap account role conflicts with existing user")
+	}
+	_ = withMentorProfile
 	return nil
 }
 
-func (s *Service) issueSession(ctx context.Context, account *ent.User, familyID string) (SessionView, error) {
+func (s *Service) issueSession(ctx context.Context, account *ent.User, familyID, identity string) (SessionView, error) {
+	if strings.TrimSpace(identity) == "" {
+		return SessionView{}, domain.NewError(domain.CodeValidation, "identity is required")
+	}
+	if err := s.validateSessionIdentity(ctx, account, identity); err != nil {
+		return SessionView{}, err
+	}
 	refreshToken, err := s.security.NewOpaqueToken("neb_rt_", 32)
 	if err != nil {
 		return SessionView{}, domain.WrapError("INTERNAL_ERROR", "generate refresh token", err)
@@ -465,18 +577,19 @@ func (s *Service) issueSession(ctx context.Context, account *ent.User, familyID 
 	}
 	hash := cache.HashKey(s.security.HashAuthState(refreshToken))
 	if err := s.cache.CreateSession(ctx, hash, cache.Session{
-		UserID: account.ID.String(), FamilyID: familyID,
+		UserID: account.ID.String(), FamilyID: familyID, Identity: identity,
 	}, s.config.RefreshTTL); err != nil {
 		return SessionView{}, domain.WrapError(domain.CodeDependencyUnavailable, "store refresh session", err)
 	}
-	access, expiresAt, err := s.security.IssueAccessToken(account.ID, string(account.Role))
+	access, expiresAt, err := s.security.IssueAccessToken(account.ID, identity)
 	if err != nil {
 		return SessionView{}, domain.WrapError("INTERNAL_ERROR", "issue access token", err)
 	}
 	return SessionView{
 		AccessToken: access, TokenType: "Bearer",
 		ExpiresIn:    int64(time.Until(expiresAt).Seconds()),
-		RefreshToken: refreshToken, User: userView(account),
+		RefreshToken: refreshToken, Identity: identity,
+		User: userViewWithIdentity(account, identity),
 	}, nil
 }
 

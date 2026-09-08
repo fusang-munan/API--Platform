@@ -140,21 +140,40 @@ func (m *Manager) EncryptCredential(plaintext string) ([]byte, error) {
 	if strings.TrimSpace(plaintext) == "" {
 		return nil, fmt.Errorf("credential is required")
 	}
-	nonce := make([]byte, m.credentialAEAD.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("generate credential nonce: %w", err)
-	}
-	return m.credentialAEAD.Seal(nonce, nonce, []byte(plaintext), []byte("nebula-provider-v1")), nil
+	return m.encryptWithAAD(plaintext, "nebula-provider-v1")
 }
 
 func (m *Manager) DecryptCredential(ciphertext []byte) (string, error) {
+	return m.decryptWithAAD(ciphertext, "nebula-provider-v1")
+}
+
+func (m *Manager) EncryptAPIKey(plaintext string) ([]byte, error) {
+	if strings.TrimSpace(plaintext) == "" {
+		return nil, fmt.Errorf("API key is required")
+	}
+	return m.encryptWithAAD(plaintext, "nebula-api-key-v1")
+}
+
+func (m *Manager) DecryptAPIKey(ciphertext []byte) (string, error) {
+	return m.decryptWithAAD(ciphertext, "nebula-api-key-v1")
+}
+
+func (m *Manager) encryptWithAAD(plaintext, aad string) ([]byte, error) {
+	nonce := make([]byte, m.credentialAEAD.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("generate encryption nonce: %w", err)
+	}
+	return m.credentialAEAD.Seal(nonce, nonce, []byte(plaintext), []byte(aad)), nil
+}
+
+func (m *Manager) decryptWithAAD(ciphertext []byte, aad string) (string, error) {
 	nonceSize := m.credentialAEAD.NonceSize()
 	if len(ciphertext) < nonceSize {
-		return "", fmt.Errorf("invalid credential ciphertext")
+		return "", fmt.Errorf("invalid ciphertext")
 	}
-	plaintext, err := m.credentialAEAD.Open(nil, ciphertext[:nonceSize], ciphertext[nonceSize:], []byte("nebula-provider-v1"))
+	plaintext, err := m.credentialAEAD.Open(nil, ciphertext[:nonceSize], ciphertext[nonceSize:], []byte(aad))
 	if err != nil {
-		return "", fmt.Errorf("decrypt credential: %w", err)
+		return "", fmt.Errorf("decrypt value: %w", err)
 	}
 	return string(plaintext), nil
 }

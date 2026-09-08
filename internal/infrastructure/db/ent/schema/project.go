@@ -32,7 +32,7 @@ func (Project) Fields() []ent.Field {
 			SchemaType(map[string]string{dialect.Postgres: "citext"}),
 		field.String("description").Optional().Nillable().MaxLen(1024),
 		field.Enum("status").Values("active", "inactive").Default("active"),
-		field.Int64("monthly_credit_quota_milli").Default(20_000_000).NonNegative().Max(1_000_000_000_000),
+		field.Int64("monthly_credit_quota_milli").Default(0).NonNegative().Max(1_000_000_000_000),
 	}
 }
 

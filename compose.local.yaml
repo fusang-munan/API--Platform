@@ -1,0 +1,24 @@
+# Local override: use mirrors/images already available on this server.
+# Used by scripts/compose-local.sh only — not for production.
+services:
+  postgres:
+    image: docker.1ms.run/postgres:17.5
+  redis:
+    image: docker.m.daocloud.io/library/redis:8.2.8-alpine3.22
+  backend:
+    ports: !override
+      - "127.0.0.1:25556:8080"
+  frontend:
+    ports: !override
+      - "127.0.0.1:25555:8080"
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.30.10.0/24
+  data:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.11.0/24

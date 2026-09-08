@@ -687,6 +687,29 @@ func HasAPIKeyModelsWith(preds ...predicate.APIKeyModel) predicate.Model {
 	})
 }
 
+// HasStudentLibraryEntries applies the HasEdge predicate on the "student_library_entries" edge.
+func HasStudentLibraryEntries() predicate.Model {
+	return predicate.Model(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, StudentLibraryEntriesTable, StudentLibraryEntriesColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasStudentLibraryEntriesWith applies the HasEdge predicate on the "student_library_entries" edge with a given conditions (other predicates).
+func HasStudentLibraryEntriesWith(preds ...predicate.StudentModelLibrary) predicate.Model {
+	return predicate.Model(func(s *sql.Selector) {
+		step := newStudentLibraryEntriesStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
 // And groups predicates with the AND operator between them.
 func And(predicates ...predicate.Model) predicate.Model {
 	return predicate.Model(sql.AndPredicates(predicates...))

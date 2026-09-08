@@ -20,7 +20,7 @@ describe('console router', () => {
 
   it('uses route metadata for localized workspace titles', () => {
     expect(router.resolve('/mentor/projects').meta.title).toBe('项目管理')
-    expect(router.resolve('/mentor/reviews').meta.title).toBe('审核密钥')
+    expect(router.resolve('/mentor/reviews').meta.title).toBe('密钥管理')
     expect(router.resolve('/teacher/projects').meta.title).toBe('项目管理')
   })
 })

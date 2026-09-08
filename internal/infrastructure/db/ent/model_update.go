@@ -17,6 +17,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/predicate"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentmodellibrary"
 )
 
 // ModelUpdate is the builder for updating Model entities.
@@ -272,6 +273,12 @@ func (_u *ModelUpdate) ClearCreditMultiplierMilli() *ModelUpdate {
 	return _u
 }
 
+// SetUpstreamMetadata sets the "upstream_metadata" field.
+func (_u *ModelUpdate) SetUpstreamMetadata(v map[string]interface{}) *ModelUpdate {
+	_u.mutation.SetUpstreamMetadata(v)
+	return _u
+}
+
 // AddBindingIDs adds the "bindings" edge to the ModelBinding entity by IDs.
 func (_u *ModelUpdate) AddBindingIDs(ids ...uuid.UUID) *ModelUpdate {
 	_u.mutation.AddBindingIDs(ids...)
@@ -300,6 +307,21 @@ func (_u *ModelUpdate) AddAPIKeyModels(v ...*APIKeyModel) *ModelUpdate {
 		ids[i] = v[i].ID
 	}
 	return _u.AddAPIKeyModelIDs(ids...)
+}
+
+// AddStudentLibraryEntryIDs adds the "student_library_entries" edge to the StudentModelLibrary entity by IDs.
+func (_u *ModelUpdate) AddStudentLibraryEntryIDs(ids ...uuid.UUID) *ModelUpdate {
+	_u.mutation.AddStudentLibraryEntryIDs(ids...)
+	return _u
+}
+
+// AddStudentLibraryEntries adds the "student_library_entries" edges to the StudentModelLibrary entity.
+func (_u *ModelUpdate) AddStudentLibraryEntries(v ...*StudentModelLibrary) *ModelUpdate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddStudentLibraryEntryIDs(ids...)
 }
 
 // Mutation returns the ModelMutation object of the builder.
@@ -347,6 +369,27 @@ func (_u *ModelUpdate) RemoveAPIKeyModels(v ...*APIKeyModel) *ModelUpdate {
 		ids[i] = v[i].ID
 	}
 	return _u.RemoveAPIKeyModelIDs(ids...)
+}
+
+// ClearStudentLibraryEntries clears all "student_library_entries" edges to the StudentModelLibrary entity.
+func (_u *ModelUpdate) ClearStudentLibraryEntries() *ModelUpdate {
+	_u.mutation.ClearStudentLibraryEntries()
+	return _u
+}
+
+// RemoveStudentLibraryEntryIDs removes the "student_library_entries" edge to StudentModelLibrary entities by IDs.
+func (_u *ModelUpdate) RemoveStudentLibraryEntryIDs(ids ...uuid.UUID) *ModelUpdate {
+	_u.mutation.RemoveStudentLibraryEntryIDs(ids...)
+	return _u
+}
+
+// RemoveStudentLibraryEntries removes "student_library_entries" edges to StudentModelLibrary entities.
+func (_u *ModelUpdate) RemoveStudentLibraryEntries(v ...*StudentModelLibrary) *ModelUpdate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveStudentLibraryEntryIDs(ids...)
 }
 
 // Save executes the query and returns the number of nodes affected by the update operation.
@@ -531,6 +574,9 @@ func (_u *ModelUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if _u.mutation.CreditMultiplierMilliCleared() {
 		_spec.ClearField(model.FieldCreditMultiplierMilli, field.TypeInt64)
 	}
+	if value, ok := _u.mutation.UpstreamMetadata(); ok {
+		_spec.SetField(model.FieldUpstreamMetadata, field.TypeJSON, value)
+	}
 	if _u.mutation.BindingsCleared() {
 		edge := &sqlgraph.EdgeSpec{
 			Rel:     sqlgraph.O2M,
@@ -614,6 +660,51 @@ func (_u *ModelUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(apikeymodel.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.StudentLibraryEntriesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   model.StudentLibraryEntriesTable,
+			Columns: []string{model.StudentLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedStudentLibraryEntriesIDs(); len(nodes) > 0 && !_u.mutation.StudentLibraryEntriesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   model.StudentLibraryEntriesTable,
+			Columns: []string{model.StudentLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.StudentLibraryEntriesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   model.StudentLibraryEntriesTable,
+			Columns: []string{model.StudentLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
 			},
 		}
 		for _, k := range nodes {
@@ -881,6 +972,12 @@ func (_u *ModelUpdateOne) ClearCreditMultiplierMilli() *ModelUpdateOne {
 	return _u
 }
 
+// SetUpstreamMetadata sets the "upstream_metadata" field.
+func (_u *ModelUpdateOne) SetUpstreamMetadata(v map[string]interface{}) *ModelUpdateOne {
+	_u.mutation.SetUpstreamMetadata(v)
+	return _u
+}
+
 // AddBindingIDs adds the "bindings" edge to the ModelBinding entity by IDs.
 func (_u *ModelUpdateOne) AddBindingIDs(ids ...uuid.UUID) *ModelUpdateOne {
 	_u.mutation.AddBindingIDs(ids...)
@@ -909,6 +1006,21 @@ func (_u *ModelUpdateOne) AddAPIKeyModels(v ...*APIKeyModel) *ModelUpdateOne {
 		ids[i] = v[i].ID
 	}
 	return _u.AddAPIKeyModelIDs(ids...)
+}
+
+// AddStudentLibraryEntryIDs adds the "student_library_entries" edge to the StudentModelLibrary entity by IDs.
+func (_u *ModelUpdateOne) AddStudentLibraryEntryIDs(ids ...uuid.UUID) *ModelUpdateOne {
+	_u.mutation.AddStudentLibraryEntryIDs(ids...)
+	return _u
+}
+
+// AddStudentLibraryEntries adds the "student_library_entries" edges to the StudentModelLibrary entity.
+func (_u *ModelUpdateOne) AddStudentLibraryEntries(v ...*StudentModelLibrary) *ModelUpdateOne {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddStudentLibraryEntryIDs(ids...)
 }
 
 // Mutation returns the ModelMutation object of the builder.
@@ -956,6 +1068,27 @@ func (_u *ModelUpdateOne) RemoveAPIKeyModels(v ...*APIKeyModel) *ModelUpdateOne 
 		ids[i] = v[i].ID
 	}
 	return _u.RemoveAPIKeyModelIDs(ids...)
+}
+
+// ClearStudentLibraryEntries clears all "student_library_entries" edges to the StudentModelLibrary entity.
+func (_u *ModelUpdateOne) ClearStudentLibraryEntries() *ModelUpdateOne {
+	_u.mutation.ClearStudentLibraryEntries()
+	return _u
+}
+
+// RemoveStudentLibraryEntryIDs removes the "student_library_entries" edge to StudentModelLibrary entities by IDs.
+func (_u *ModelUpdateOne) RemoveStudentLibraryEntryIDs(ids ...uuid.UUID) *ModelUpdateOne {
+	_u.mutation.RemoveStudentLibraryEntryIDs(ids...)
+	return _u
+}
+
+// RemoveStudentLibraryEntries removes "student_library_entries" edges to StudentModelLibrary entities.
+func (_u *ModelUpdateOne) RemoveStudentLibraryEntries(v ...*StudentModelLibrary) *ModelUpdateOne {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveStudentLibraryEntryIDs(ids...)
 }
 
 // Where appends a list predicates to the ModelUpdate builder.
@@ -1170,6 +1303,9 @@ func (_u *ModelUpdateOne) sqlSave(ctx context.Context) (_node *Model, err error)
 	if _u.mutation.CreditMultiplierMilliCleared() {
 		_spec.ClearField(model.FieldCreditMultiplierMilli, field.TypeInt64)
 	}
+	if value, ok := _u.mutation.UpstreamMetadata(); ok {
+		_spec.SetField(model.FieldUpstreamMetadata, field.TypeJSON, value)
+	}
 	if _u.mutation.BindingsCleared() {
 		edge := &sqlgraph.EdgeSpec{
 			Rel:     sqlgraph.O2M,
@@ -1253,6 +1389,51 @@ func (_u *ModelUpdateOne) sqlSave(ctx context.Context) (_node *Model, err error)
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(apikeymodel.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.StudentLibraryEntriesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   model.StudentLibraryEntriesTable,
+			Columns: []string{model.StudentLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedStudentLibraryEntriesIDs(); len(nodes) > 0 && !_u.mutation.StudentLibraryEntriesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   model.StudentLibraryEntriesTable,
+			Columns: []string{model.StudentLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.StudentLibraryEntriesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   model.StudentLibraryEntriesTable,
+			Columns: []string{model.StudentLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
 			},
 		}
 		for _, k := range nodes {

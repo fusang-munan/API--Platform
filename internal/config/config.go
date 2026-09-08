@@ -64,6 +64,28 @@ func LoadDatabaseURL() (string, error) {
 	return required("DATABASE_URL")
 }
 
+type ProviderCatalogWorkerConfig struct {
+	DatabaseURL           string
+	ProviderEncryptionKey []byte
+}
+
+func LoadProviderCatalogWorker() (ProviderCatalogWorkerConfig, error) {
+	var cfg ProviderCatalogWorkerConfig
+	var err error
+	if cfg.DatabaseURL, err = required("DATABASE_URL"); err != nil {
+		return ProviderCatalogWorkerConfig{}, err
+	}
+	rawEncryptionKey, err := required("PROVIDER_CREDENTIAL_ENCRYPTION_KEY")
+	if err != nil {
+		return ProviderCatalogWorkerConfig{}, err
+	}
+	cfg.ProviderEncryptionKey, err = base64.StdEncoding.DecodeString(rawEncryptionKey)
+	if err != nil || len(cfg.ProviderEncryptionKey) != 32 {
+		return ProviderCatalogWorkerConfig{}, fmt.Errorf("PROVIDER_CREDENTIAL_ENCRYPTION_KEY must be base64 for exactly 32 bytes")
+	}
+	return cfg, nil
+}
+
 func Load() (Config, error) {
 	var cfg Config
 	cfg.AppEnv = value("APP_ENV", "development")

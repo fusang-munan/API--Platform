@@ -23,7 +23,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/gatewaycall"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/gatewaycallattempt"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/maintenancestate"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/matrixmodelcatalog"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprojectapplication"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
@@ -37,7 +37,11 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/projectmonthcreditbucket"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/promptaccessaudit"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providermodelcatalog"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/quotaadjustmentaudit"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentmodellibrary"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/user"
 )
 
@@ -60,8 +64,8 @@ type Client struct {
 	GatewayCallAttempt *GatewayCallAttemptClient
 	// MaintenanceState is the client for interacting with the MaintenanceState builders.
 	MaintenanceState *MaintenanceStateClient
-	// MatrixModelCatalog is the client for interacting with the MatrixModelCatalog builders.
-	MatrixModelCatalog *MatrixModelCatalogClient
+	// MentorProfile is the client for interacting with the MentorProfile builders.
+	MentorProfile *MentorProfileClient
 	// MentorProjectApplication is the client for interacting with the MentorProjectApplication builders.
 	MentorProjectApplication *MentorProjectApplicationClient
 	// Model is the client for interacting with the Model builders.
@@ -88,8 +92,16 @@ type Client struct {
 	PromptAccessAudit *PromptAccessAuditClient
 	// Provider is the client for interacting with the Provider builders.
 	Provider *ProviderClient
+	// ProviderCredential is the client for interacting with the ProviderCredential builders.
+	ProviderCredential *ProviderCredentialClient
+	// ProviderModelCatalog is the client for interacting with the ProviderModelCatalog builders.
+	ProviderModelCatalog *ProviderModelCatalogClient
 	// QuotaAdjustmentAudit is the client for interacting with the QuotaAdjustmentAudit builders.
 	QuotaAdjustmentAudit *QuotaAdjustmentAuditClient
+	// StudentModelLibrary is the client for interacting with the StudentModelLibrary builders.
+	StudentModelLibrary *StudentModelLibraryClient
+	// StudentProfile is the client for interacting with the StudentProfile builders.
+	StudentProfile *StudentProfileClient
 	// User is the client for interacting with the User builders.
 	User *UserClient
 }
@@ -110,7 +122,7 @@ func (c *Client) init() {
 	c.GatewayCall = NewGatewayCallClient(c.config)
 	c.GatewayCallAttempt = NewGatewayCallAttemptClient(c.config)
 	c.MaintenanceState = NewMaintenanceStateClient(c.config)
-	c.MatrixModelCatalog = NewMatrixModelCatalogClient(c.config)
+	c.MentorProfile = NewMentorProfileClient(c.config)
 	c.MentorProjectApplication = NewMentorProjectApplicationClient(c.config)
 	c.Model = NewModelClient(c.config)
 	c.ModelBinding = NewModelBindingClient(c.config)
@@ -124,7 +136,11 @@ func (c *Client) init() {
 	c.ProjectMonthCreditBucket = NewProjectMonthCreditBucketClient(c.config)
 	c.PromptAccessAudit = NewPromptAccessAuditClient(c.config)
 	c.Provider = NewProviderClient(c.config)
+	c.ProviderCredential = NewProviderCredentialClient(c.config)
+	c.ProviderModelCatalog = NewProviderModelCatalogClient(c.config)
 	c.QuotaAdjustmentAudit = NewQuotaAdjustmentAuditClient(c.config)
+	c.StudentModelLibrary = NewStudentModelLibraryClient(c.config)
+	c.StudentProfile = NewStudentProfileClient(c.config)
 	c.User = NewUserClient(c.config)
 }
 
@@ -225,7 +241,7 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		GatewayCall:              NewGatewayCallClient(cfg),
 		GatewayCallAttempt:       NewGatewayCallAttemptClient(cfg),
 		MaintenanceState:         NewMaintenanceStateClient(cfg),
-		MatrixModelCatalog:       NewMatrixModelCatalogClient(cfg),
+		MentorProfile:            NewMentorProfileClient(cfg),
 		MentorProjectApplication: NewMentorProjectApplicationClient(cfg),
 		Model:                    NewModelClient(cfg),
 		ModelBinding:             NewModelBindingClient(cfg),
@@ -239,7 +255,11 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		ProjectMonthCreditBucket: NewProjectMonthCreditBucketClient(cfg),
 		PromptAccessAudit:        NewPromptAccessAuditClient(cfg),
 		Provider:                 NewProviderClient(cfg),
+		ProviderCredential:       NewProviderCredentialClient(cfg),
+		ProviderModelCatalog:     NewProviderModelCatalogClient(cfg),
 		QuotaAdjustmentAudit:     NewQuotaAdjustmentAuditClient(cfg),
+		StudentModelLibrary:      NewStudentModelLibraryClient(cfg),
+		StudentProfile:           NewStudentProfileClient(cfg),
 		User:                     NewUserClient(cfg),
 	}, nil
 }
@@ -267,7 +287,7 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		GatewayCall:              NewGatewayCallClient(cfg),
 		GatewayCallAttempt:       NewGatewayCallAttemptClient(cfg),
 		MaintenanceState:         NewMaintenanceStateClient(cfg),
-		MatrixModelCatalog:       NewMatrixModelCatalogClient(cfg),
+		MentorProfile:            NewMentorProfileClient(cfg),
 		MentorProjectApplication: NewMentorProjectApplicationClient(cfg),
 		Model:                    NewModelClient(cfg),
 		ModelBinding:             NewModelBindingClient(cfg),
@@ -281,7 +301,11 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		ProjectMonthCreditBucket: NewProjectMonthCreditBucketClient(cfg),
 		PromptAccessAudit:        NewPromptAccessAuditClient(cfg),
 		Provider:                 NewProviderClient(cfg),
+		ProviderCredential:       NewProviderCredentialClient(cfg),
+		ProviderModelCatalog:     NewProviderModelCatalogClient(cfg),
 		QuotaAdjustmentAudit:     NewQuotaAdjustmentAuditClient(cfg),
+		StudentModelLibrary:      NewStudentModelLibraryClient(cfg),
+		StudentProfile:           NewStudentProfileClient(cfg),
 		User:                     NewUserClient(cfg),
 	}, nil
 }
@@ -313,11 +337,12 @@ func (c *Client) Close() error {
 func (c *Client) Use(hooks ...Hook) {
 	for _, n := range []interface{ Use(...Hook) }{
 		c.APIKey, c.APIKeyAudit, c.APIKeyModel, c.APIKeyMonthCreditBucket,
-		c.GatewayCall, c.GatewayCallAttempt, c.MaintenanceState, c.MatrixModelCatalog,
+		c.GatewayCall, c.GatewayCallAttempt, c.MaintenanceState, c.MentorProfile,
 		c.MentorProjectApplication, c.Model, c.ModelBinding, c.ModelMultiplierAudit,
 		c.MonitoredInput, c.MonthlyUsageCube, c.Organization, c.OrganizationMember,
 		c.Project, c.ProjectMember, c.ProjectMonthCreditBucket, c.PromptAccessAudit,
-		c.Provider, c.QuotaAdjustmentAudit, c.User,
+		c.Provider, c.ProviderCredential, c.ProviderModelCatalog,
+		c.QuotaAdjustmentAudit, c.StudentModelLibrary, c.StudentProfile, c.User,
 	} {
 		n.Use(hooks...)
 	}
@@ -328,11 +353,12 @@ func (c *Client) Use(hooks ...Hook) {
 func (c *Client) Intercept(interceptors ...Interceptor) {
 	for _, n := range []interface{ Intercept(...Interceptor) }{
 		c.APIKey, c.APIKeyAudit, c.APIKeyModel, c.APIKeyMonthCreditBucket,
-		c.GatewayCall, c.GatewayCallAttempt, c.MaintenanceState, c.MatrixModelCatalog,
+		c.GatewayCall, c.GatewayCallAttempt, c.MaintenanceState, c.MentorProfile,
 		c.MentorProjectApplication, c.Model, c.ModelBinding, c.ModelMultiplierAudit,
 		c.MonitoredInput, c.MonthlyUsageCube, c.Organization, c.OrganizationMember,
 		c.Project, c.ProjectMember, c.ProjectMonthCreditBucket, c.PromptAccessAudit,
-		c.Provider, c.QuotaAdjustmentAudit, c.User,
+		c.Provider, c.ProviderCredential, c.ProviderModelCatalog,
+		c.QuotaAdjustmentAudit, c.StudentModelLibrary, c.StudentProfile, c.User,
 	} {
 		n.Intercept(interceptors...)
 	}
@@ -355,8 +381,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.GatewayCallAttempt.mutate(ctx, m)
 	case *MaintenanceStateMutation:
 		return c.MaintenanceState.mutate(ctx, m)
-	case *MatrixModelCatalogMutation:
-		return c.MatrixModelCatalog.mutate(ctx, m)
+	case *MentorProfileMutation:
+		return c.MentorProfile.mutate(ctx, m)
 	case *MentorProjectApplicationMutation:
 		return c.MentorProjectApplication.mutate(ctx, m)
 	case *ModelMutation:
@@ -383,8 +409,16 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.PromptAccessAudit.mutate(ctx, m)
 	case *ProviderMutation:
 		return c.Provider.mutate(ctx, m)
+	case *ProviderCredentialMutation:
+		return c.ProviderCredential.mutate(ctx, m)
+	case *ProviderModelCatalogMutation:
+		return c.ProviderModelCatalog.mutate(ctx, m)
 	case *QuotaAdjustmentAuditMutation:
 		return c.QuotaAdjustmentAudit.mutate(ctx, m)
+	case *StudentModelLibraryMutation:
+		return c.StudentModelLibrary.mutate(ctx, m)
+	case *StudentProfileMutation:
+		return c.StudentProfile.mutate(ctx, m)
 	case *UserMutation:
 		return c.User.mutate(ctx, m)
 	default:
@@ -1547,107 +1581,107 @@ func (c *MaintenanceStateClient) mutate(ctx context.Context, m *MaintenanceState
 	}
 }
 
-// MatrixModelCatalogClient is a client for the MatrixModelCatalog schema.
-type MatrixModelCatalogClient struct {
+// MentorProfileClient is a client for the MentorProfile schema.
+type MentorProfileClient struct {
 	config
 }
 
-// NewMatrixModelCatalogClient returns a client for the MatrixModelCatalog from the given config.
-func NewMatrixModelCatalogClient(c config) *MatrixModelCatalogClient {
-	return &MatrixModelCatalogClient{config: c}
+// NewMentorProfileClient returns a client for the MentorProfile from the given config.
+func NewMentorProfileClient(c config) *MentorProfileClient {
+	return &MentorProfileClient{config: c}
 }
 
 // Use adds a list of mutation hooks to the hooks stack.
-// A call to `Use(f, g, h)` equals to `matrixmodelcatalog.Hooks(f(g(h())))`.
-func (c *MatrixModelCatalogClient) Use(hooks ...Hook) {
-	c.hooks.MatrixModelCatalog = append(c.hooks.MatrixModelCatalog, hooks...)
+// A call to `Use(f, g, h)` equals to `mentorprofile.Hooks(f(g(h())))`.
+func (c *MentorProfileClient) Use(hooks ...Hook) {
+	c.hooks.MentorProfile = append(c.hooks.MentorProfile, hooks...)
 }
 
 // Intercept adds a list of query interceptors to the interceptors stack.
-// A call to `Intercept(f, g, h)` equals to `matrixmodelcatalog.Intercept(f(g(h())))`.
-func (c *MatrixModelCatalogClient) Intercept(interceptors ...Interceptor) {
-	c.inters.MatrixModelCatalog = append(c.inters.MatrixModelCatalog, interceptors...)
+// A call to `Intercept(f, g, h)` equals to `mentorprofile.Intercept(f(g(h())))`.
+func (c *MentorProfileClient) Intercept(interceptors ...Interceptor) {
+	c.inters.MentorProfile = append(c.inters.MentorProfile, interceptors...)
 }
 
-// Create returns a builder for creating a MatrixModelCatalog entity.
-func (c *MatrixModelCatalogClient) Create() *MatrixModelCatalogCreate {
-	mutation := newMatrixModelCatalogMutation(c.config, OpCreate)
-	return &MatrixModelCatalogCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+// Create returns a builder for creating a MentorProfile entity.
+func (c *MentorProfileClient) Create() *MentorProfileCreate {
+	mutation := newMentorProfileMutation(c.config, OpCreate)
+	return &MentorProfileCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
 }
 
-// CreateBulk returns a builder for creating a bulk of MatrixModelCatalog entities.
-func (c *MatrixModelCatalogClient) CreateBulk(builders ...*MatrixModelCatalogCreate) *MatrixModelCatalogCreateBulk {
-	return &MatrixModelCatalogCreateBulk{config: c.config, builders: builders}
+// CreateBulk returns a builder for creating a bulk of MentorProfile entities.
+func (c *MentorProfileClient) CreateBulk(builders ...*MentorProfileCreate) *MentorProfileCreateBulk {
+	return &MentorProfileCreateBulk{config: c.config, builders: builders}
 }
 
 // MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
 // a builder and applies setFunc on it.
-func (c *MatrixModelCatalogClient) MapCreateBulk(slice any, setFunc func(*MatrixModelCatalogCreate, int)) *MatrixModelCatalogCreateBulk {
+func (c *MentorProfileClient) MapCreateBulk(slice any, setFunc func(*MentorProfileCreate, int)) *MentorProfileCreateBulk {
 	rv := reflect.ValueOf(slice)
 	if rv.Kind() != reflect.Slice {
-		return &MatrixModelCatalogCreateBulk{err: fmt.Errorf("calling to MatrixModelCatalogClient.MapCreateBulk with wrong type %T, need slice", slice)}
+		return &MentorProfileCreateBulk{err: fmt.Errorf("calling to MentorProfileClient.MapCreateBulk with wrong type %T, need slice", slice)}
 	}
-	builders := make([]*MatrixModelCatalogCreate, rv.Len())
+	builders := make([]*MentorProfileCreate, rv.Len())
 	for i := 0; i < rv.Len(); i++ {
 		builders[i] = c.Create()
 		setFunc(builders[i], i)
 	}
-	return &MatrixModelCatalogCreateBulk{config: c.config, builders: builders}
+	return &MentorProfileCreateBulk{config: c.config, builders: builders}
 }
 
-// Update returns an update builder for MatrixModelCatalog.
-func (c *MatrixModelCatalogClient) Update() *MatrixModelCatalogUpdate {
-	mutation := newMatrixModelCatalogMutation(c.config, OpUpdate)
-	return &MatrixModelCatalogUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+// Update returns an update builder for MentorProfile.
+func (c *MentorProfileClient) Update() *MentorProfileUpdate {
+	mutation := newMentorProfileMutation(c.config, OpUpdate)
+	return &MentorProfileUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
 }
 
 // UpdateOne returns an update builder for the given entity.
-func (c *MatrixModelCatalogClient) UpdateOne(_m *MatrixModelCatalog) *MatrixModelCatalogUpdateOne {
-	mutation := newMatrixModelCatalogMutation(c.config, OpUpdateOne, withMatrixModelCatalog(_m))
-	return &MatrixModelCatalogUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+func (c *MentorProfileClient) UpdateOne(_m *MentorProfile) *MentorProfileUpdateOne {
+	mutation := newMentorProfileMutation(c.config, OpUpdateOne, withMentorProfile(_m))
+	return &MentorProfileUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
 }
 
 // UpdateOneID returns an update builder for the given id.
-func (c *MatrixModelCatalogClient) UpdateOneID(id uuid.UUID) *MatrixModelCatalogUpdateOne {
-	mutation := newMatrixModelCatalogMutation(c.config, OpUpdateOne, withMatrixModelCatalogID(id))
-	return &MatrixModelCatalogUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+func (c *MentorProfileClient) UpdateOneID(id uuid.UUID) *MentorProfileUpdateOne {
+	mutation := newMentorProfileMutation(c.config, OpUpdateOne, withMentorProfileID(id))
+	return &MentorProfileUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
 }
 
-// Delete returns a delete builder for MatrixModelCatalog.
-func (c *MatrixModelCatalogClient) Delete() *MatrixModelCatalogDelete {
-	mutation := newMatrixModelCatalogMutation(c.config, OpDelete)
-	return &MatrixModelCatalogDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+// Delete returns a delete builder for MentorProfile.
+func (c *MentorProfileClient) Delete() *MentorProfileDelete {
+	mutation := newMentorProfileMutation(c.config, OpDelete)
+	return &MentorProfileDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
 }
 
 // DeleteOne returns a builder for deleting the given entity.
-func (c *MatrixModelCatalogClient) DeleteOne(_m *MatrixModelCatalog) *MatrixModelCatalogDeleteOne {
+func (c *MentorProfileClient) DeleteOne(_m *MentorProfile) *MentorProfileDeleteOne {
 	return c.DeleteOneID(_m.ID)
 }
 
 // DeleteOneID returns a builder for deleting the given entity by its id.
-func (c *MatrixModelCatalogClient) DeleteOneID(id uuid.UUID) *MatrixModelCatalogDeleteOne {
-	builder := c.Delete().Where(matrixmodelcatalog.ID(id))
+func (c *MentorProfileClient) DeleteOneID(id uuid.UUID) *MentorProfileDeleteOne {
+	builder := c.Delete().Where(mentorprofile.ID(id))
 	builder.mutation.id = &id
 	builder.mutation.op = OpDeleteOne
-	return &MatrixModelCatalogDeleteOne{builder}
+	return &MentorProfileDeleteOne{builder}
 }
 
-// Query returns a query builder for MatrixModelCatalog.
-func (c *MatrixModelCatalogClient) Query() *MatrixModelCatalogQuery {
-	return &MatrixModelCatalogQuery{
+// Query returns a query builder for MentorProfile.
+func (c *MentorProfileClient) Query() *MentorProfileQuery {
+	return &MentorProfileQuery{
 		config: c.config,
-		ctx:    &QueryContext{Type: TypeMatrixModelCatalog},
+		ctx:    &QueryContext{Type: TypeMentorProfile},
 		inters: c.Interceptors(),
 	}
 }
 
-// Get returns a MatrixModelCatalog entity by its id.
-func (c *MatrixModelCatalogClient) Get(ctx context.Context, id uuid.UUID) (*MatrixModelCatalog, error) {
-	return c.Query().Where(matrixmodelcatalog.ID(id)).Only(ctx)
+// Get returns a MentorProfile entity by its id.
+func (c *MentorProfileClient) Get(ctx context.Context, id uuid.UUID) (*MentorProfile, error) {
+	return c.Query().Where(mentorprofile.ID(id)).Only(ctx)
 }
 
 // GetX is like Get, but panics if an error occurs.
-func (c *MatrixModelCatalogClient) GetX(ctx context.Context, id uuid.UUID) *MatrixModelCatalog {
+func (c *MentorProfileClient) GetX(ctx context.Context, id uuid.UUID) *MentorProfile {
 	obj, err := c.Get(ctx, id)
 	if err != nil {
 		panic(err)
@@ -1655,28 +1689,60 @@ func (c *MatrixModelCatalogClient) GetX(ctx context.Context, id uuid.UUID) *Matr
 	return obj
 }
 
+// QueryUser queries the user edge of a MentorProfile.
+func (c *MentorProfileClient) QueryUser(_m *MentorProfile) *UserQuery {
+	query := (&UserClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(mentorprofile.Table, mentorprofile.FieldID, id),
+			sqlgraph.To(user.Table, user.FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, true, mentorprofile.UserTable, mentorprofile.UserColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryGrantor queries the grantor edge of a MentorProfile.
+func (c *MentorProfileClient) QueryGrantor(_m *MentorProfile) *UserQuery {
+	query := (&UserClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(mentorprofile.Table, mentorprofile.FieldID, id),
+			sqlgraph.To(user.Table, user.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, mentorprofile.GrantorTable, mentorprofile.GrantorColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
 // Hooks returns the client hooks.
-func (c *MatrixModelCatalogClient) Hooks() []Hook {
-	return c.hooks.MatrixModelCatalog
+func (c *MentorProfileClient) Hooks() []Hook {
+	return c.hooks.MentorProfile
 }
 
 // Interceptors returns the client interceptors.
-func (c *MatrixModelCatalogClient) Interceptors() []Interceptor {
-	return c.inters.MatrixModelCatalog
+func (c *MentorProfileClient) Interceptors() []Interceptor {
+	return c.inters.MentorProfile
 }
 
-func (c *MatrixModelCatalogClient) mutate(ctx context.Context, m *MatrixModelCatalogMutation) (Value, error) {
+func (c *MentorProfileClient) mutate(ctx context.Context, m *MentorProfileMutation) (Value, error) {
 	switch m.Op() {
 	case OpCreate:
-		return (&MatrixModelCatalogCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+		return (&MentorProfileCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
 	case OpUpdate:
-		return (&MatrixModelCatalogUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+		return (&MentorProfileUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
 	case OpUpdateOne:
-		return (&MatrixModelCatalogUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+		return (&MentorProfileUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
 	case OpDelete, OpDeleteOne:
-		return (&MatrixModelCatalogDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+		return (&MentorProfileDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
-		return nil, fmt.Errorf("ent: unknown MatrixModelCatalog mutation op: %q", m.Op())
+		return nil, fmt.Errorf("ent: unknown MentorProfile mutation op: %q", m.Op())
 	}
 }
 
@@ -2001,6 +2067,22 @@ func (c *ModelClient) QueryAPIKeyModels(_m *Model) *APIKeyModelQuery {
 	return query
 }
 
+// QueryStudentLibraryEntries queries the student_library_entries edge of a Model.
+func (c *ModelClient) QueryStudentLibraryEntries(_m *Model) *StudentModelLibraryQuery {
+	query := (&StudentModelLibraryClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(model.Table, model.FieldID, id),
+			sqlgraph.To(studentmodellibrary.Table, studentmodellibrary.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, model.StudentLibraryEntriesTable, model.StudentLibraryEntriesColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
 // Hooks returns the client hooks.
 func (c *ModelClient) Hooks() []Hook {
 	return c.hooks.Model
@@ -2159,6 +2241,22 @@ func (c *ModelBindingClient) QueryProvider(_m *ModelBinding) *ProviderQuery {
 			sqlgraph.From(modelbinding.Table, modelbinding.FieldID, id),
 			sqlgraph.To(provider.Table, provider.FieldID),
 			sqlgraph.Edge(sqlgraph.M2O, true, modelbinding.ProviderTable, modelbinding.ProviderColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryCredential queries the credential edge of a ModelBinding.
+func (c *ModelBindingClient) QueryCredential(_m *ModelBinding) *ProviderCredentialQuery {
+	query := (&ProviderCredentialClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(modelbinding.Table, modelbinding.FieldID, id),
+			sqlgraph.To(providercredential.Table, providercredential.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, modelbinding.CredentialTable, modelbinding.CredentialColumn),
 		)
 		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
 		return fromV, nil
@@ -3720,6 +3818,22 @@ func (c *ProviderClient) GetX(ctx context.Context, id uuid.UUID) *Provider {
 	return obj
 }
 
+// QueryCredentials queries the credentials edge of a Provider.
+func (c *ProviderClient) QueryCredentials(_m *Provider) *ProviderCredentialQuery {
+	query := (&ProviderCredentialClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(provider.Table, provider.FieldID, id),
+			sqlgraph.To(providercredential.Table, providercredential.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, provider.CredentialsTable, provider.CredentialsColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
 // QueryModelBindings queries the model_bindings edge of a Provider.
 func (c *ProviderClient) QueryModelBindings(_m *Provider) *ModelBindingQuery {
 	query := (&ModelBindingClient{config: c.config}).Query()
@@ -3729,6 +3843,22 @@ func (c *ProviderClient) QueryModelBindings(_m *Provider) *ModelBindingQuery {
 			sqlgraph.From(provider.Table, provider.FieldID, id),
 			sqlgraph.To(modelbinding.Table, modelbinding.FieldID),
 			sqlgraph.Edge(sqlgraph.O2M, false, provider.ModelBindingsTable, provider.ModelBindingsColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryModelCatalogEntries queries the model_catalog_entries edge of a Provider.
+func (c *ProviderClient) QueryModelCatalogEntries(_m *Provider) *ProviderModelCatalogQuery {
+	query := (&ProviderModelCatalogClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(provider.Table, provider.FieldID, id),
+			sqlgraph.To(providermodelcatalog.Table, providermodelcatalog.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, provider.ModelCatalogEntriesTable, provider.ModelCatalogEntriesColumn),
 		)
 		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
 		return fromV, nil
@@ -3758,6 +3888,352 @@ func (c *ProviderClient) mutate(ctx context.Context, m *ProviderMutation) (Value
 		return (&ProviderDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown Provider mutation op: %q", m.Op())
+	}
+}
+
+// ProviderCredentialClient is a client for the ProviderCredential schema.
+type ProviderCredentialClient struct {
+	config
+}
+
+// NewProviderCredentialClient returns a client for the ProviderCredential from the given config.
+func NewProviderCredentialClient(c config) *ProviderCredentialClient {
+	return &ProviderCredentialClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `providercredential.Hooks(f(g(h())))`.
+func (c *ProviderCredentialClient) Use(hooks ...Hook) {
+	c.hooks.ProviderCredential = append(c.hooks.ProviderCredential, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `providercredential.Intercept(f(g(h())))`.
+func (c *ProviderCredentialClient) Intercept(interceptors ...Interceptor) {
+	c.inters.ProviderCredential = append(c.inters.ProviderCredential, interceptors...)
+}
+
+// Create returns a builder for creating a ProviderCredential entity.
+func (c *ProviderCredentialClient) Create() *ProviderCredentialCreate {
+	mutation := newProviderCredentialMutation(c.config, OpCreate)
+	return &ProviderCredentialCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of ProviderCredential entities.
+func (c *ProviderCredentialClient) CreateBulk(builders ...*ProviderCredentialCreate) *ProviderCredentialCreateBulk {
+	return &ProviderCredentialCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *ProviderCredentialClient) MapCreateBulk(slice any, setFunc func(*ProviderCredentialCreate, int)) *ProviderCredentialCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &ProviderCredentialCreateBulk{err: fmt.Errorf("calling to ProviderCredentialClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*ProviderCredentialCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &ProviderCredentialCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for ProviderCredential.
+func (c *ProviderCredentialClient) Update() *ProviderCredentialUpdate {
+	mutation := newProviderCredentialMutation(c.config, OpUpdate)
+	return &ProviderCredentialUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *ProviderCredentialClient) UpdateOne(_m *ProviderCredential) *ProviderCredentialUpdateOne {
+	mutation := newProviderCredentialMutation(c.config, OpUpdateOne, withProviderCredential(_m))
+	return &ProviderCredentialUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *ProviderCredentialClient) UpdateOneID(id uuid.UUID) *ProviderCredentialUpdateOne {
+	mutation := newProviderCredentialMutation(c.config, OpUpdateOne, withProviderCredentialID(id))
+	return &ProviderCredentialUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for ProviderCredential.
+func (c *ProviderCredentialClient) Delete() *ProviderCredentialDelete {
+	mutation := newProviderCredentialMutation(c.config, OpDelete)
+	return &ProviderCredentialDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *ProviderCredentialClient) DeleteOne(_m *ProviderCredential) *ProviderCredentialDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *ProviderCredentialClient) DeleteOneID(id uuid.UUID) *ProviderCredentialDeleteOne {
+	builder := c.Delete().Where(providercredential.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &ProviderCredentialDeleteOne{builder}
+}
+
+// Query returns a query builder for ProviderCredential.
+func (c *ProviderCredentialClient) Query() *ProviderCredentialQuery {
+	return &ProviderCredentialQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeProviderCredential},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a ProviderCredential entity by its id.
+func (c *ProviderCredentialClient) Get(ctx context.Context, id uuid.UUID) (*ProviderCredential, error) {
+	return c.Query().Where(providercredential.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *ProviderCredentialClient) GetX(ctx context.Context, id uuid.UUID) *ProviderCredential {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryProvider queries the provider edge of a ProviderCredential.
+func (c *ProviderCredentialClient) QueryProvider(_m *ProviderCredential) *ProviderQuery {
+	query := (&ProviderClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(providercredential.Table, providercredential.FieldID, id),
+			sqlgraph.To(provider.Table, provider.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, providercredential.ProviderTable, providercredential.ProviderColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryModelCatalogEntries queries the model_catalog_entries edge of a ProviderCredential.
+func (c *ProviderCredentialClient) QueryModelCatalogEntries(_m *ProviderCredential) *ProviderModelCatalogQuery {
+	query := (&ProviderModelCatalogClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(providercredential.Table, providercredential.FieldID, id),
+			sqlgraph.To(providermodelcatalog.Table, providermodelcatalog.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, providercredential.ModelCatalogEntriesTable, providercredential.ModelCatalogEntriesColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryModelBindings queries the model_bindings edge of a ProviderCredential.
+func (c *ProviderCredentialClient) QueryModelBindings(_m *ProviderCredential) *ModelBindingQuery {
+	query := (&ModelBindingClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(providercredential.Table, providercredential.FieldID, id),
+			sqlgraph.To(modelbinding.Table, modelbinding.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, providercredential.ModelBindingsTable, providercredential.ModelBindingsColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *ProviderCredentialClient) Hooks() []Hook {
+	return c.hooks.ProviderCredential
+}
+
+// Interceptors returns the client interceptors.
+func (c *ProviderCredentialClient) Interceptors() []Interceptor {
+	return c.inters.ProviderCredential
+}
+
+func (c *ProviderCredentialClient) mutate(ctx context.Context, m *ProviderCredentialMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&ProviderCredentialCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&ProviderCredentialUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&ProviderCredentialUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&ProviderCredentialDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown ProviderCredential mutation op: %q", m.Op())
+	}
+}
+
+// ProviderModelCatalogClient is a client for the ProviderModelCatalog schema.
+type ProviderModelCatalogClient struct {
+	config
+}
+
+// NewProviderModelCatalogClient returns a client for the ProviderModelCatalog from the given config.
+func NewProviderModelCatalogClient(c config) *ProviderModelCatalogClient {
+	return &ProviderModelCatalogClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `providermodelcatalog.Hooks(f(g(h())))`.
+func (c *ProviderModelCatalogClient) Use(hooks ...Hook) {
+	c.hooks.ProviderModelCatalog = append(c.hooks.ProviderModelCatalog, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `providermodelcatalog.Intercept(f(g(h())))`.
+func (c *ProviderModelCatalogClient) Intercept(interceptors ...Interceptor) {
+	c.inters.ProviderModelCatalog = append(c.inters.ProviderModelCatalog, interceptors...)
+}
+
+// Create returns a builder for creating a ProviderModelCatalog entity.
+func (c *ProviderModelCatalogClient) Create() *ProviderModelCatalogCreate {
+	mutation := newProviderModelCatalogMutation(c.config, OpCreate)
+	return &ProviderModelCatalogCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of ProviderModelCatalog entities.
+func (c *ProviderModelCatalogClient) CreateBulk(builders ...*ProviderModelCatalogCreate) *ProviderModelCatalogCreateBulk {
+	return &ProviderModelCatalogCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *ProviderModelCatalogClient) MapCreateBulk(slice any, setFunc func(*ProviderModelCatalogCreate, int)) *ProviderModelCatalogCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &ProviderModelCatalogCreateBulk{err: fmt.Errorf("calling to ProviderModelCatalogClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*ProviderModelCatalogCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &ProviderModelCatalogCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for ProviderModelCatalog.
+func (c *ProviderModelCatalogClient) Update() *ProviderModelCatalogUpdate {
+	mutation := newProviderModelCatalogMutation(c.config, OpUpdate)
+	return &ProviderModelCatalogUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *ProviderModelCatalogClient) UpdateOne(_m *ProviderModelCatalog) *ProviderModelCatalogUpdateOne {
+	mutation := newProviderModelCatalogMutation(c.config, OpUpdateOne, withProviderModelCatalog(_m))
+	return &ProviderModelCatalogUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *ProviderModelCatalogClient) UpdateOneID(id uuid.UUID) *ProviderModelCatalogUpdateOne {
+	mutation := newProviderModelCatalogMutation(c.config, OpUpdateOne, withProviderModelCatalogID(id))
+	return &ProviderModelCatalogUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for ProviderModelCatalog.
+func (c *ProviderModelCatalogClient) Delete() *ProviderModelCatalogDelete {
+	mutation := newProviderModelCatalogMutation(c.config, OpDelete)
+	return &ProviderModelCatalogDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *ProviderModelCatalogClient) DeleteOne(_m *ProviderModelCatalog) *ProviderModelCatalogDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *ProviderModelCatalogClient) DeleteOneID(id uuid.UUID) *ProviderModelCatalogDeleteOne {
+	builder := c.Delete().Where(providermodelcatalog.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &ProviderModelCatalogDeleteOne{builder}
+}
+
+// Query returns a query builder for ProviderModelCatalog.
+func (c *ProviderModelCatalogClient) Query() *ProviderModelCatalogQuery {
+	return &ProviderModelCatalogQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeProviderModelCatalog},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a ProviderModelCatalog entity by its id.
+func (c *ProviderModelCatalogClient) Get(ctx context.Context, id uuid.UUID) (*ProviderModelCatalog, error) {
+	return c.Query().Where(providermodelcatalog.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *ProviderModelCatalogClient) GetX(ctx context.Context, id uuid.UUID) *ProviderModelCatalog {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryProvider queries the provider edge of a ProviderModelCatalog.
+func (c *ProviderModelCatalogClient) QueryProvider(_m *ProviderModelCatalog) *ProviderQuery {
+	query := (&ProviderClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(providermodelcatalog.Table, providermodelcatalog.FieldID, id),
+			sqlgraph.To(provider.Table, provider.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, providermodelcatalog.ProviderTable, providermodelcatalog.ProviderColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryCredential queries the credential edge of a ProviderModelCatalog.
+func (c *ProviderModelCatalogClient) QueryCredential(_m *ProviderModelCatalog) *ProviderCredentialQuery {
+	query := (&ProviderCredentialClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(providermodelcatalog.Table, providermodelcatalog.FieldID, id),
+			sqlgraph.To(providercredential.Table, providercredential.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, providermodelcatalog.CredentialTable, providermodelcatalog.CredentialColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *ProviderModelCatalogClient) Hooks() []Hook {
+	return c.hooks.ProviderModelCatalog
+}
+
+// Interceptors returns the client interceptors.
+func (c *ProviderModelCatalogClient) Interceptors() []Interceptor {
+	return c.inters.ProviderModelCatalog
+}
+
+func (c *ProviderModelCatalogClient) mutate(ctx context.Context, m *ProviderModelCatalogMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&ProviderModelCatalogCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&ProviderModelCatalogUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&ProviderModelCatalogUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&ProviderModelCatalogDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown ProviderModelCatalog mutation op: %q", m.Op())
 	}
 }
 
@@ -3894,6 +4370,320 @@ func (c *QuotaAdjustmentAuditClient) mutate(ctx context.Context, m *QuotaAdjustm
 	}
 }
 
+// StudentModelLibraryClient is a client for the StudentModelLibrary schema.
+type StudentModelLibraryClient struct {
+	config
+}
+
+// NewStudentModelLibraryClient returns a client for the StudentModelLibrary from the given config.
+func NewStudentModelLibraryClient(c config) *StudentModelLibraryClient {
+	return &StudentModelLibraryClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `studentmodellibrary.Hooks(f(g(h())))`.
+func (c *StudentModelLibraryClient) Use(hooks ...Hook) {
+	c.hooks.StudentModelLibrary = append(c.hooks.StudentModelLibrary, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `studentmodellibrary.Intercept(f(g(h())))`.
+func (c *StudentModelLibraryClient) Intercept(interceptors ...Interceptor) {
+	c.inters.StudentModelLibrary = append(c.inters.StudentModelLibrary, interceptors...)
+}
+
+// Create returns a builder for creating a StudentModelLibrary entity.
+func (c *StudentModelLibraryClient) Create() *StudentModelLibraryCreate {
+	mutation := newStudentModelLibraryMutation(c.config, OpCreate)
+	return &StudentModelLibraryCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of StudentModelLibrary entities.
+func (c *StudentModelLibraryClient) CreateBulk(builders ...*StudentModelLibraryCreate) *StudentModelLibraryCreateBulk {
+	return &StudentModelLibraryCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *StudentModelLibraryClient) MapCreateBulk(slice any, setFunc func(*StudentModelLibraryCreate, int)) *StudentModelLibraryCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &StudentModelLibraryCreateBulk{err: fmt.Errorf("calling to StudentModelLibraryClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*StudentModelLibraryCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &StudentModelLibraryCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for StudentModelLibrary.
+func (c *StudentModelLibraryClient) Update() *StudentModelLibraryUpdate {
+	mutation := newStudentModelLibraryMutation(c.config, OpUpdate)
+	return &StudentModelLibraryUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *StudentModelLibraryClient) UpdateOne(_m *StudentModelLibrary) *StudentModelLibraryUpdateOne {
+	mutation := newStudentModelLibraryMutation(c.config, OpUpdateOne, withStudentModelLibrary(_m))
+	return &StudentModelLibraryUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *StudentModelLibraryClient) UpdateOneID(id uuid.UUID) *StudentModelLibraryUpdateOne {
+	mutation := newStudentModelLibraryMutation(c.config, OpUpdateOne, withStudentModelLibraryID(id))
+	return &StudentModelLibraryUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for StudentModelLibrary.
+func (c *StudentModelLibraryClient) Delete() *StudentModelLibraryDelete {
+	mutation := newStudentModelLibraryMutation(c.config, OpDelete)
+	return &StudentModelLibraryDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *StudentModelLibraryClient) DeleteOne(_m *StudentModelLibrary) *StudentModelLibraryDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *StudentModelLibraryClient) DeleteOneID(id uuid.UUID) *StudentModelLibraryDeleteOne {
+	builder := c.Delete().Where(studentmodellibrary.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &StudentModelLibraryDeleteOne{builder}
+}
+
+// Query returns a query builder for StudentModelLibrary.
+func (c *StudentModelLibraryClient) Query() *StudentModelLibraryQuery {
+	return &StudentModelLibraryQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeStudentModelLibrary},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a StudentModelLibrary entity by its id.
+func (c *StudentModelLibraryClient) Get(ctx context.Context, id uuid.UUID) (*StudentModelLibrary, error) {
+	return c.Query().Where(studentmodellibrary.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *StudentModelLibraryClient) GetX(ctx context.Context, id uuid.UUID) *StudentModelLibrary {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryUser queries the user edge of a StudentModelLibrary.
+func (c *StudentModelLibraryClient) QueryUser(_m *StudentModelLibrary) *UserQuery {
+	query := (&UserClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(studentmodellibrary.Table, studentmodellibrary.FieldID, id),
+			sqlgraph.To(user.Table, user.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, studentmodellibrary.UserTable, studentmodellibrary.UserColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryModel queries the model edge of a StudentModelLibrary.
+func (c *StudentModelLibraryClient) QueryModel(_m *StudentModelLibrary) *ModelQuery {
+	query := (&ModelClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(studentmodellibrary.Table, studentmodellibrary.FieldID, id),
+			sqlgraph.To(model.Table, model.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, studentmodellibrary.ModelTable, studentmodellibrary.ModelColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *StudentModelLibraryClient) Hooks() []Hook {
+	return c.hooks.StudentModelLibrary
+}
+
+// Interceptors returns the client interceptors.
+func (c *StudentModelLibraryClient) Interceptors() []Interceptor {
+	return c.inters.StudentModelLibrary
+}
+
+func (c *StudentModelLibraryClient) mutate(ctx context.Context, m *StudentModelLibraryMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&StudentModelLibraryCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&StudentModelLibraryUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&StudentModelLibraryUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&StudentModelLibraryDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown StudentModelLibrary mutation op: %q", m.Op())
+	}
+}
+
+// StudentProfileClient is a client for the StudentProfile schema.
+type StudentProfileClient struct {
+	config
+}
+
+// NewStudentProfileClient returns a client for the StudentProfile from the given config.
+func NewStudentProfileClient(c config) *StudentProfileClient {
+	return &StudentProfileClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `studentprofile.Hooks(f(g(h())))`.
+func (c *StudentProfileClient) Use(hooks ...Hook) {
+	c.hooks.StudentProfile = append(c.hooks.StudentProfile, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `studentprofile.Intercept(f(g(h())))`.
+func (c *StudentProfileClient) Intercept(interceptors ...Interceptor) {
+	c.inters.StudentProfile = append(c.inters.StudentProfile, interceptors...)
+}
+
+// Create returns a builder for creating a StudentProfile entity.
+func (c *StudentProfileClient) Create() *StudentProfileCreate {
+	mutation := newStudentProfileMutation(c.config, OpCreate)
+	return &StudentProfileCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of StudentProfile entities.
+func (c *StudentProfileClient) CreateBulk(builders ...*StudentProfileCreate) *StudentProfileCreateBulk {
+	return &StudentProfileCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *StudentProfileClient) MapCreateBulk(slice any, setFunc func(*StudentProfileCreate, int)) *StudentProfileCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &StudentProfileCreateBulk{err: fmt.Errorf("calling to StudentProfileClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*StudentProfileCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &StudentProfileCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for StudentProfile.
+func (c *StudentProfileClient) Update() *StudentProfileUpdate {
+	mutation := newStudentProfileMutation(c.config, OpUpdate)
+	return &StudentProfileUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *StudentProfileClient) UpdateOne(_m *StudentProfile) *StudentProfileUpdateOne {
+	mutation := newStudentProfileMutation(c.config, OpUpdateOne, withStudentProfile(_m))
+	return &StudentProfileUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *StudentProfileClient) UpdateOneID(id uuid.UUID) *StudentProfileUpdateOne {
+	mutation := newStudentProfileMutation(c.config, OpUpdateOne, withStudentProfileID(id))
+	return &StudentProfileUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for StudentProfile.
+func (c *StudentProfileClient) Delete() *StudentProfileDelete {
+	mutation := newStudentProfileMutation(c.config, OpDelete)
+	return &StudentProfileDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *StudentProfileClient) DeleteOne(_m *StudentProfile) *StudentProfileDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *StudentProfileClient) DeleteOneID(id uuid.UUID) *StudentProfileDeleteOne {
+	builder := c.Delete().Where(studentprofile.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &StudentProfileDeleteOne{builder}
+}
+
+// Query returns a query builder for StudentProfile.
+func (c *StudentProfileClient) Query() *StudentProfileQuery {
+	return &StudentProfileQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeStudentProfile},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a StudentProfile entity by its id.
+func (c *StudentProfileClient) Get(ctx context.Context, id uuid.UUID) (*StudentProfile, error) {
+	return c.Query().Where(studentprofile.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *StudentProfileClient) GetX(ctx context.Context, id uuid.UUID) *StudentProfile {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryUser queries the user edge of a StudentProfile.
+func (c *StudentProfileClient) QueryUser(_m *StudentProfile) *UserQuery {
+	query := (&UserClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(studentprofile.Table, studentprofile.FieldID, id),
+			sqlgraph.To(user.Table, user.FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, true, studentprofile.UserTable, studentprofile.UserColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *StudentProfileClient) Hooks() []Hook {
+	return c.hooks.StudentProfile
+}
+
+// Interceptors returns the client interceptors.
+func (c *StudentProfileClient) Interceptors() []Interceptor {
+	return c.inters.StudentProfile
+}
+
+func (c *StudentProfileClient) mutate(ctx context.Context, m *StudentProfileMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&StudentProfileCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&StudentProfileUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&StudentProfileUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&StudentProfileDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown StudentProfile mutation op: %q", m.Op())
+	}
+}
+
 // UserClient is a client for the User schema.
 type UserClient struct {
 	config
@@ -4002,6 +4792,54 @@ func (c *UserClient) GetX(ctx context.Context, id uuid.UUID) *User {
 	return obj
 }
 
+// QueryStudentProfile queries the student_profile edge of a User.
+func (c *UserClient) QueryStudentProfile(_m *User) *StudentProfileQuery {
+	query := (&StudentProfileClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(user.Table, user.FieldID, id),
+			sqlgraph.To(studentprofile.Table, studentprofile.FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, false, user.StudentProfileTable, user.StudentProfileColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryMentorProfile queries the mentor_profile edge of a User.
+func (c *UserClient) QueryMentorProfile(_m *User) *MentorProfileQuery {
+	query := (&MentorProfileClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(user.Table, user.FieldID, id),
+			sqlgraph.To(mentorprofile.Table, mentorprofile.FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, false, user.MentorProfileTable, user.MentorProfileColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryGrantedMentorProfiles queries the granted_mentor_profiles edge of a User.
+func (c *UserClient) QueryGrantedMentorProfiles(_m *User) *MentorProfileQuery {
+	query := (&MentorProfileClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(user.Table, user.FieldID, id),
+			sqlgraph.To(mentorprofile.Table, mentorprofile.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, user.GrantedMentorProfilesTable, user.GrantedMentorProfilesColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
 // QueryOrganizationMemberships queries the organization_memberships edge of a User.
 func (c *UserClient) QueryOrganizationMemberships(_m *User) *OrganizationMemberQuery {
 	query := (&OrganizationMemberClient{config: c.config}).Query()
@@ -4098,6 +4936,22 @@ func (c *UserClient) QueryAPIKeyAudits(_m *User) *APIKeyAuditQuery {
 	return query
 }
 
+// QueryModelLibraryEntries queries the model_library_entries edge of a User.
+func (c *UserClient) QueryModelLibraryEntries(_m *User) *StudentModelLibraryQuery {
+	query := (&StudentModelLibraryClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(user.Table, user.FieldID, id),
+			sqlgraph.To(studentmodellibrary.Table, studentmodellibrary.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, user.ModelLibraryEntriesTable, user.ModelLibraryEntriesColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
 // Hooks returns the client hooks.
 func (c *UserClient) Hooks() []Hook {
 	return c.hooks.User
@@ -4127,18 +4981,20 @@ func (c *UserClient) mutate(ctx context.Context, m *UserMutation) (Value, error)
 type (
 	hooks struct {
 		APIKey, APIKeyAudit, APIKeyModel, APIKeyMonthCreditBucket, GatewayCall,
-		GatewayCallAttempt, MaintenanceState, MatrixModelCatalog,
-		MentorProjectApplication, Model, ModelBinding, ModelMultiplierAudit,
-		MonitoredInput, MonthlyUsageCube, Organization, OrganizationMember, Project,
-		ProjectMember, ProjectMonthCreditBucket, PromptAccessAudit, Provider,
-		QuotaAdjustmentAudit, User []ent.Hook
+		GatewayCallAttempt, MaintenanceState, MentorProfile, MentorProjectApplication,
+		Model, ModelBinding, ModelMultiplierAudit, MonitoredInput, MonthlyUsageCube,
+		Organization, OrganizationMember, Project, ProjectMember,
+		ProjectMonthCreditBucket, PromptAccessAudit, Provider, ProviderCredential,
+		ProviderModelCatalog, QuotaAdjustmentAudit, StudentModelLibrary,
+		StudentProfile, User []ent.Hook
 	}
 	inters struct {
 		APIKey, APIKeyAudit, APIKeyModel, APIKeyMonthCreditBucket, GatewayCall,
-		GatewayCallAttempt, MaintenanceState, MatrixModelCatalog,
-		MentorProjectApplication, Model, ModelBinding, ModelMultiplierAudit,
-		MonitoredInput, MonthlyUsageCube, Organization, OrganizationMember, Project,
-		ProjectMember, ProjectMonthCreditBucket, PromptAccessAudit, Provider,
-		QuotaAdjustmentAudit, User []ent.Interceptor
+		GatewayCallAttempt, MaintenanceState, MentorProfile, MentorProjectApplication,
+		Model, ModelBinding, ModelMultiplierAudit, MonitoredInput, MonthlyUsageCube,
+		Organization, OrganizationMember, Project, ProjectMember,
+		ProjectMonthCreditBucket, PromptAccessAudit, Provider, ProviderCredential,
+		ProviderModelCatalog, QuotaAdjustmentAudit, StudentModelLibrary,
+		StudentProfile, User []ent.Interceptor
 	}
 )

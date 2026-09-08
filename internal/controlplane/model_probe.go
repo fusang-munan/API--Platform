@@ -17,10 +17,12 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 )
 
 type ProbeInput struct {
 	ProviderID                             *uuid.UUID
+	CredentialID                           *uuid.UUID
 	BaseURL, Credential, UpstreamModelName string
 	Endpoints                              []string
 }
@@ -76,6 +78,9 @@ func buildProbeRequest(endpoint, model string) (probeRequest, error) {
 	case "rerank":
 		path = "/v2/rerank"
 		payload = map[string]any{"model": model, "query": "probe", "documents": []string{"probe"}, "top_n": 1}
+	case "images":
+		path = "/v1/images/generations"
+		payload = map[string]any{"model": model, "prompt": "probe", "size": "256x256", "n": 1}
 	default:
 		return probeRequest{}, domain.NewError(domain.CodeValidation, "invalid probe endpoint")
 	}
@@ -208,22 +213,21 @@ func extractProbeConfiguration(body []byte, modelID string) ProbeConfiguration {
 		if runes := []rune(description); len(runes) > 2048 {
 			description = string(runes[:2048])
 		}
-		item := catalog.Item{ModelID: id, Description: description}
-		item.ModelTypes = stringsFromProbeValue(record["model_types"])
-		if len(item.ModelTypes) == 0 {
-			item.ModelTypes = stringsFromProbeValue(record["model_type"])
+		explicit := catalog.ParseUpstreamMetadata(record)
+		limits := ProbeLimits{}
+		if explicit.ContextWindow != nil {
+			limits.ContextWindow = explicit.ContextWindow
 		}
-		item.Tags = stringsFromProbeValue(record["tags"])
-		item.SupportedEndpointTypes = stringsFromProbeValue(record["supported_endpoint_types"])
-		suggestion := catalog.SuggestConfiguration(item)
+		if explicit.MaxInputTokens != nil {
+			limits.MaxInputTokens = explicit.MaxInputTokens
+		}
+		if explicit.MaxOutputTokens != nil {
+			limits.MaxOutputTokens = explicit.MaxOutputTokens
+		}
 		raw, _ := json.Marshal(record)
-		limits := ProbeLimits{ContextWindow: &suggestion.ContextWindow, MaxInputTokens: &suggestion.MaxInputTokens, MaxOutputTokens: &suggestion.MaxOutputTokens}
 		explicitLimits := extractProbeLimits(raw)
 		if explicitLimits.ContextWindow != nil {
 			limits.ContextWindow = explicitLimits.ContextWindow
-			if explicitLimits.MaxInputTokens == nil {
-				limits.MaxInputTokens = explicitLimits.ContextWindow
-			}
 		}
 		if explicitLimits.MaxInputTokens != nil {
 			limits.MaxInputTokens = explicitLimits.MaxInputTokens
@@ -231,10 +235,14 @@ func extractProbeConfiguration(body []byte, modelID string) ProbeConfiguration {
 		if explicitLimits.MaxOutputTokens != nil {
 			limits.MaxOutputTokens = explicitLimits.MaxOutputTokens
 		}
+		category := ""
+		if explicit.Category != nil {
+			category = string(*explicit.Category)
+		}
 		return ProbeConfiguration{
 			Description: description,
-			Category:    suggestion.Category, Capabilities: suggestion.Capabilities,
-			InputModalities: suggestion.InputModalities, OutputModalities: suggestion.OutputModalities,
+			Category:    category, Capabilities: explicit.Capabilities,
+			InputModalities: explicit.InputModalities, OutputModalities: explicit.OutputModalities,
 			ProbeLimits: limits,
 		}
 	}
@@ -300,13 +308,34 @@ func (s *Service) ProbeModel(ctx context.Context, input ProbeInput) (ProbeRespon
 	}
 	baseURL, credential := strings.TrimSpace(input.BaseURL), input.Credential
 	client := publicHTTPClient()
-	if input.ProviderID != nil {
+	if input.CredentialID != nil {
+		row, err := s.db.ProviderCredential.Query().
+			Where(providercredential.IDEQ(*input.CredentialID)).
+			WithProvider().
+			Only(ctx)
+		if err != nil {
+			return ProbeResponse{}, domain.NewError(domain.CodeNotFound, "provider credential not found")
+		}
+		if row.Edges.Provider == nil {
+			return ProbeResponse{}, domain.NewError(domain.CodeNotFound, "provider not found")
+		}
+		baseURL = row.Edges.Provider.BaseURL
+		credential, err = s.security.DecryptCredential(row.CredentialCiphertext)
+		if err != nil {
+			return ProbeResponse{}, domain.WrapError(domain.CodeDependencyUnavailable, "decrypt provider credential", err)
+		}
+		client = &http.Client{Timeout: 40 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	} else if input.ProviderID != nil {
 		row, err := s.db.Provider.Query().Where(provider.IDEQ(*input.ProviderID)).Only(ctx)
 		if err != nil {
 			return ProbeResponse{}, domain.NewError(domain.CodeNotFound, "provider not found")
 		}
 		baseURL = row.BaseURL
-		credential, err = s.security.DecryptCredential(row.CredentialCiphertext)
+		credentials, err := catalog.ActiveCredentials(ctx, s.db, input.ProviderID)
+		if err != nil || len(credentials) == 0 {
+			return ProbeResponse{}, domain.NewError(domain.CodeValidation, "provider has no active credentials")
+		}
+		credential, err = s.security.DecryptCredential(credentials[0].CredentialCiphertext)
 		if err != nil {
 			return ProbeResponse{}, domain.WrapError(domain.CodeDependencyUnavailable, "decrypt provider credential", err)
 		}

@@ -69,7 +69,7 @@ body {
     font-size: 15px;
     line-height: 1.75;
     color: var(--text);
-    background: var(--bg);
+    background: var(--bg-secondary);
 }
 
 a {
@@ -84,25 +84,81 @@ a:hover {
     text-decoration-color: var(--link-color);
 }
 
-/* ===== Layout ===== */
-.page-wrapper {
+/* ===== Topbar ===== */
+.topbar {
+    background: linear-gradient(135deg, #121e39, #1e3766 58%, #0d849b);
+    color: #fff;
+    padding: 16px 24px;
+    position: sticky;
+    top: 0;
+    z-index: 200;
+    box-shadow: 0 4px 18px rgba(14, 28, 54, .16);
+}
+
+.topbar-inner {
+    max-width: 1240px;
+    margin: 0 auto;
     display: flex;
-    min-height: 100vh;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.topbar .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 800;
+    letter-spacing: .02em;
+}
+
+.topbar .brand-mark {
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border: 1px solid rgba(255, 255, 255, .45);
+    border-radius: 10px;
+    font-weight: 900;
+}
+
+.topbar-back {
+    color: #dbe9ff;
+    text-decoration: none;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.topbar-back:hover {
+    color: #fff;
+    text-decoration: underline;
+}
+
+/* ===== Layout ===== */
+.doc-layout {
+    max-width: 1240px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+    gap: 30px;
+    padding: 30px 24px 72px;
+    align-items: start;
 }
 
 /* ===== Sidebar TOC ===== */
 .sidebar {
-    width: var(--sidebar-width);
-    background: var(--sidebar-bg);
-    border-right: 1px solid var(--border);
-    position: fixed;
-    top: 0;
-    left: 0;
-    height: 100vh;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    position: sticky;
+    top: 78px;
+    align-self: start;
+    max-height: calc(100vh - 100px);
     overflow-y: auto;
     padding: 24px 20px;
     z-index: 100;
     font-size: 13px;
+    box-shadow: 0 16px 42px rgba(20, 33, 61, .06);
 }
 
 .sidebar h3 {
@@ -160,11 +216,12 @@ a:hover {
 
 /* ===== Main Content ===== */
 .main-content {
-    margin-left: var(--sidebar-width);
-    flex: 1;
-    max-width: var(--max-content-width);
+    min-width: 0;
     padding: 48px 40px 80px;
-    width: calc(100% - var(--sidebar-width));
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 22px;
+    box-shadow: 0 16px 42px rgba(20, 33, 61, .06);
 }
 
 /* ===== Page Header ===== */
@@ -434,10 +491,24 @@ li {
 }
 
 /* ===== Responsive ===== */
-@media (max-width: 860px) {
+@media (max-width: 900px) {
+    .doc-layout {
+        grid-template-columns: 1fr;
+        padding: 18px 14px 48px;
+        gap: 0;
+    }
+
     .sidebar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: var(--sidebar-width);
+        height: 100vh;
+        max-height: none;
+        border-radius: 0;
         transform: translateX(-100%);
         transition: transform 0.25s;
+        z-index: 300;
     }
 
     .sidebar.open {
@@ -446,12 +517,11 @@ li {
 
     .sidebar-toggle {
         display: block;
+        top: 72px;
     }
 
     .main-content {
-        margin-left: 0;
         padding: 24px 16px 60px;
-        width: 100%;
     }
 
     .page-header h1 {
@@ -499,6 +569,15 @@ html {
 </style>
 </head>
 <body>
+
+<header class="topbar">
+    <div class="topbar-inner">
+        <div class="brand"><span class="brand-mark">⚙</span><span>CC-switch 使用指南</span></div>
+        <a class="topbar-back" href="/login">← 返回登录</a>
+    </div>
+</header>
+
+<div class="doc-layout">
 
 <!-- Sidebar TOC -->
 <aside class="sidebar" id="sidebar">
@@ -753,6 +832,8 @@ wire_api = "responses"</code></pre>
         <p>💡 <strong>提示：</strong>如遇到其他问题，请查看 <a href="https://github.com/farion1231/cc-switch/releases" target="_blank" rel="noopener noreferrer">CC-switch 官方发布页</a> 或联系技术支持。</p>
     </footer>
 </main>
+
+</div>
 
 <!-- Scripts -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>

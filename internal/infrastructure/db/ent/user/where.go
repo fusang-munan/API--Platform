@@ -396,6 +396,75 @@ func StatusNotIn(vs ...Status) predicate.User {
 	return predicate.User(sql.FieldNotIn(FieldStatus, vs...))
 }
 
+// HasStudentProfile applies the HasEdge predicate on the "student_profile" edge.
+func HasStudentProfile() predicate.User {
+	return predicate.User(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, false, StudentProfileTable, StudentProfileColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasStudentProfileWith applies the HasEdge predicate on the "student_profile" edge with a given conditions (other predicates).
+func HasStudentProfileWith(preds ...predicate.StudentProfile) predicate.User {
+	return predicate.User(func(s *sql.Selector) {
+		step := newStudentProfileStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
+// HasMentorProfile applies the HasEdge predicate on the "mentor_profile" edge.
+func HasMentorProfile() predicate.User {
+	return predicate.User(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, false, MentorProfileTable, MentorProfileColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasMentorProfileWith applies the HasEdge predicate on the "mentor_profile" edge with a given conditions (other predicates).
+func HasMentorProfileWith(preds ...predicate.MentorProfile) predicate.User {
+	return predicate.User(func(s *sql.Selector) {
+		step := newMentorProfileStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
+// HasGrantedMentorProfiles applies the HasEdge predicate on the "granted_mentor_profiles" edge.
+func HasGrantedMentorProfiles() predicate.User {
+	return predicate.User(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, GrantedMentorProfilesTable, GrantedMentorProfilesColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasGrantedMentorProfilesWith applies the HasEdge predicate on the "granted_mentor_profiles" edge with a given conditions (other predicates).
+func HasGrantedMentorProfilesWith(preds ...predicate.MentorProfile) predicate.User {
+	return predicate.User(func(s *sql.Selector) {
+		step := newGrantedMentorProfilesStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
 // HasOrganizationMemberships applies the HasEdge predicate on the "organization_memberships" edge.
 func HasOrganizationMemberships() predicate.User {
 	return predicate.User(func(s *sql.Selector) {
@@ -526,6 +595,29 @@ func HasAPIKeyAudits() predicate.User {
 func HasAPIKeyAuditsWith(preds ...predicate.APIKeyAudit) predicate.User {
 	return predicate.User(func(s *sql.Selector) {
 		step := newAPIKeyAuditsStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
+// HasModelLibraryEntries applies the HasEdge predicate on the "model_library_entries" edge.
+func HasModelLibraryEntries() predicate.User {
+	return predicate.User(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, ModelLibraryEntriesTable, ModelLibraryEntriesColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasModelLibraryEntriesWith applies the HasEdge predicate on the "model_library_entries" edge with a given conditions (other predicates).
+func HasModelLibraryEntriesWith(preds ...predicate.StudentModelLibrary) predicate.User {
+	return predicate.User(func(s *sql.Selector) {
+		step := newModelLibraryEntriesStep()
 		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
 			for _, p := range preds {
 				p(s)

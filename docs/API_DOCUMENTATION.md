@@ -129,16 +129,16 @@
 
 | 方法 | 路由 | 鉴权 | 用途 |
 | --- | --- | --- | --- |
-| POST | `/api/v1/auth/verification-codes` | 无 | 发送学生/导师注册验证码 |
-| POST | `/api/v1/auth/register/student` | 无 | 学生注册 |
-| POST | `/api/v1/auth/register/mentor` | 无 | 导师注册 |
-| POST | `/api/v1/auth/login` | 无 | 三种角色统一登录 |
-| POST | `/api/v1/auth/refresh` | Refresh Cookie | 轮换 refresh token 并签发 access token |
+| POST | `/api/v1/auth/verification-codes` | 无 | 发送学生注册验证码 |
+| POST | `/api/v1/auth/register/student` | 无 | 学生注册（仅创建 student profile） |
+| POST | `/api/v1/auth/login` | 无 | 校验账号密码，返回可选身份列表并写入 login challenge cookie |
+| POST | `/api/v1/auth/session` | Login Challenge Cookie | 选择 `student` / `mentor` / `teacher` 身份并签发 JWT + refresh cookie |
+| POST | `/api/v1/auth/refresh` | Refresh Cookie | 轮换 refresh token 并签发 access token（保留 session 身份） |
 | POST | `/api/v1/auth/logout` | Refresh Cookie，可带 Access token | 撤销当前 refresh session 并清除 Cookie |
 | POST | `/api/v1/auth/password/forgot` | 无 | 向已注册邮箱发送重置验证码；始终返回同一结果以避免枚举用户 |
 | POST | `/api/v1/auth/password/reset` | 无 | 使用验证码重置密码并撤销全部 refresh session |
 | POST | `/api/v1/auth/teacher-invitations/activate` | 无 | 受邀老师设置姓名和密码并激活账户 |
-| GET | `/api/v1/me` | 任意登录用户 | 获取当前用户资料与角色 |
+| GET | `/api/v1/me` | 任意登录用户 | 获取当前用户、session 身份与全部可用身份 |
 
 ### 3.1 请求与响应
 
@@ -148,9 +148,9 @@
 {"email":"alice@example.com","purpose":"student_registration"}
 ```
 
-`purpose` 只能为 `student_registration` 或 `mentor_registration`。成功返回 `202 Accepted`，响应不包含验证码。
+`purpose` 只能为 `student_registration`。成功返回 `202 Accepted`，响应不包含验证码。
 
-学生/导师注册请求：
+学生注册请求：
 
 ```json
 {
@@ -161,17 +161,28 @@
 }
 ```
 
-注册成功返回 `201 Created` 和 `user`，不自动改变客户端提交的角色；路由本身决定角色。
+注册成功返回 `201 Created` 和 `user`（`role=student`），并创建 `student_profiles` 行。导师身份只能由老师后续授予。
 
-部署可通过运行时 Secret 配置固定学生/导师测试账号。该初始化不增加 HTTP 路由，也不绕过公开注册接口的验证码契约；backend 只在启动时为尚不存在的邮箱创建对应角色的 `active` 用户。已有同邮箱用户不会被 Secret 覆盖，角色冲突会阻止服务启动。
+部署可通过运行时 Secret 配置固定学生/导师测试账号。bootstrap 会为 mentor 测试账号创建 `users.role=student` 及 student + mentor profile；已有同邮箱用户不会被 Secret 覆盖。
 
-统一登录请求：
+登录第一步返回可选身份列表（不签发 JWT）：
 
 ```json
-{"email":"alice@example.com","password":"user-provided-password"}
+{
+  "data": {
+    "user": {"id":"uuid","name":"Alice","email":"alice@example.com","role":"student","status":"active"},
+    "identities": ["student", "mentor"]
+  }
+}
 ```
 
-登录和 refresh 成功均设置新的 Refresh Cookie，并返回：
+同时写入 httpOnly `nebula_login_challenge` cookie。第二步选择身份：
+
+```json
+{"identity":"mentor"}
+```
+
+成功后清除 challenge cookie，设置 refresh cookie，并返回 session：
 
 ```json
 {
@@ -179,11 +190,33 @@
     "access_token": "jwt",
     "token_type": "Bearer",
     "expires_in": 900,
-    "user": {"id":"uuid","name":"Alice","email":"alice@example.com","role":"student","status":"active"}
-  },
-  "request_id": "01K2..."
+    "identity": "mentor",
+    "user": {"id":"uuid","name":"Alice","email":"alice@example.com","role":"mentor","status":"active"}
+  }
 }
 ```
+
+`user.role` 与 JWT `role` claim 均为当前 session 身份，不是 `users.role` 列（非 teacher 账号该列恒为 `student`）。
+
+`/me` 返回：
+
+```json
+{
+  "data": {
+    "user": {"id":"uuid","name":"Alice","email":"alice@example.com","role":"mentor","status":"active"},
+    "identity": "mentor",
+    "identities": ["student", "mentor"]
+  }
+}
+```
+
+统一登录请求：
+
+```json
+{"email":"alice@example.com","password":"user-provided-password"}
+```
+
+登录和 refresh 成功均设置新的 Refresh Cookie，并返回带 `identity` 的 session（见上）。
 
 忘记密码请求只包含 `email`。重置请求包含 `email`、`verification_code`、`new_password`。老师邀请激活请求包含 `token`、`name`、`password`。
 
@@ -316,6 +349,9 @@ data: {"revision":"01K2..."}
 
 | 模块 | 方法 | 路由 | 用途 |
 | --- | --- | --- | --- |
+| 学生 | GET | `/api/v1/teacher/students?q=` | 列出全部学生账号及 mentor profile 状态 |
+| 学生 | POST | `/api/v1/teacher/students/{student_id}/mentor-profile` | 授予导师身份（创建或激活 mentor_profiles） |
+| 学生 | POST | `/api/v1/teacher/students/{student_id}/mentor-profile/revoke` | 撤销导师身份 |
 | 邀请 | POST | `/api/v1/teacher/invitations` | 邀请老师 |
 | 组织 | GET | `/api/v1/teacher/organizations` | 组织列表 |
 | 组织 | POST | `/api/v1/teacher/organizations` | 添加组织 |

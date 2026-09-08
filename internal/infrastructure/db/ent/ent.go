@@ -19,7 +19,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/gatewaycall"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/gatewaycallattempt"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/maintenancestate"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/matrixmodelcatalog"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprojectapplication"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
@@ -33,7 +33,11 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/projectmonthcreditbucket"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/promptaccessaudit"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providermodelcatalog"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/quotaadjustmentaudit"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentmodellibrary"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/user"
 )
 
@@ -102,7 +106,7 @@ func checkColumn(t, c string) error {
 			gatewaycall.Table:              gatewaycall.ValidColumn,
 			gatewaycallattempt.Table:       gatewaycallattempt.ValidColumn,
 			maintenancestate.Table:         maintenancestate.ValidColumn,
-			matrixmodelcatalog.Table:       matrixmodelcatalog.ValidColumn,
+			mentorprofile.Table:            mentorprofile.ValidColumn,
 			mentorprojectapplication.Table: mentorprojectapplication.ValidColumn,
 			model.Table:                    model.ValidColumn,
 			modelbinding.Table:             modelbinding.ValidColumn,
@@ -116,7 +120,11 @@ func checkColumn(t, c string) error {
 			projectmonthcreditbucket.Table: projectmonthcreditbucket.ValidColumn,
 			promptaccessaudit.Table:        promptaccessaudit.ValidColumn,
 			provider.Table:                 provider.ValidColumn,
+			providercredential.Table:       providercredential.ValidColumn,
+			providermodelcatalog.Table:     providermodelcatalog.ValidColumn,
 			quotaadjustmentaudit.Table:     quotaadjustmentaudit.ValidColumn,
+			studentmodellibrary.Table:      studentmodellibrary.ValidColumn,
+			studentprofile.Table:           studentprofile.ValidColumn,
 			user.Table:                     user.ValidColumn,
 		})
 	})

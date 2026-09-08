@@ -10,6 +10,8 @@ import (
 	"entgo.io/ent"
 	"entgo.io/ent/dialect/sql"
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprofile"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/user"
 )
 
@@ -40,6 +42,12 @@ type User struct {
 
 // UserEdges holds the relations/edges for other nodes in the graph.
 type UserEdges struct {
+	// StudentProfile holds the value of the student_profile edge.
+	StudentProfile *StudentProfile `json:"student_profile,omitempty"`
+	// MentorProfile holds the value of the mentor_profile edge.
+	MentorProfile *MentorProfile `json:"mentor_profile,omitempty"`
+	// GrantedMentorProfiles holds the value of the granted_mentor_profiles edge.
+	GrantedMentorProfiles []*MentorProfile `json:"granted_mentor_profiles,omitempty"`
 	// OrganizationMemberships holds the value of the organization_memberships edge.
 	OrganizationMemberships []*OrganizationMember `json:"organization_memberships,omitempty"`
 	// ProjectMemberships holds the value of the project_memberships edge.
@@ -52,15 +60,48 @@ type UserEdges struct {
 	APIKeys []*APIKey `json:"api_keys,omitempty"`
 	// APIKeyAudits holds the value of the api_key_audits edge.
 	APIKeyAudits []*APIKeyAudit `json:"api_key_audits,omitempty"`
+	// ModelLibraryEntries holds the value of the model_library_entries edge.
+	ModelLibraryEntries []*StudentModelLibrary `json:"model_library_entries,omitempty"`
 	// loadedTypes holds the information for reporting if a
 	// type was loaded (or requested) in eager-loading or not.
-	loadedTypes [6]bool
+	loadedTypes [10]bool
+}
+
+// StudentProfileOrErr returns the StudentProfile value or an error if the edge
+// was not loaded in eager-loading, or loaded but was not found.
+func (e UserEdges) StudentProfileOrErr() (*StudentProfile, error) {
+	if e.StudentProfile != nil {
+		return e.StudentProfile, nil
+	} else if e.loadedTypes[0] {
+		return nil, &NotFoundError{label: studentprofile.Label}
+	}
+	return nil, &NotLoadedError{edge: "student_profile"}
+}
+
+// MentorProfileOrErr returns the MentorProfile value or an error if the edge
+// was not loaded in eager-loading, or loaded but was not found.
+func (e UserEdges) MentorProfileOrErr() (*MentorProfile, error) {
+	if e.MentorProfile != nil {
+		return e.MentorProfile, nil
+	} else if e.loadedTypes[1] {
+		return nil, &NotFoundError{label: mentorprofile.Label}
+	}
+	return nil, &NotLoadedError{edge: "mentor_profile"}
+}
+
+// GrantedMentorProfilesOrErr returns the GrantedMentorProfiles value or an error if the edge
+// was not loaded in eager-loading.
+func (e UserEdges) GrantedMentorProfilesOrErr() ([]*MentorProfile, error) {
+	if e.loadedTypes[2] {
+		return e.GrantedMentorProfiles, nil
+	}
+	return nil, &NotLoadedError{edge: "granted_mentor_profiles"}
 }
 
 // OrganizationMembershipsOrErr returns the OrganizationMemberships value or an error if the edge
 // was not loaded in eager-loading.
 func (e UserEdges) OrganizationMembershipsOrErr() ([]*OrganizationMember, error) {
-	if e.loadedTypes[0] {
+	if e.loadedTypes[3] {
 		return e.OrganizationMemberships, nil
 	}
 	return nil, &NotLoadedError{edge: "organization_memberships"}
@@ -69,7 +110,7 @@ func (e UserEdges) OrganizationMembershipsOrErr() ([]*OrganizationMember, error)
 // ProjectMembershipsOrErr returns the ProjectMemberships value or an error if the edge
 // was not loaded in eager-loading.
 func (e UserEdges) ProjectMembershipsOrErr() ([]*ProjectMember, error) {
-	if e.loadedTypes[1] {
+	if e.loadedTypes[4] {
 		return e.ProjectMemberships, nil
 	}
 	return nil, &NotLoadedError{edge: "project_memberships"}
@@ -78,7 +119,7 @@ func (e UserEdges) ProjectMembershipsOrErr() ([]*ProjectMember, error) {
 // MentorProjectApplicationsOrErr returns the MentorProjectApplications value or an error if the edge
 // was not loaded in eager-loading.
 func (e UserEdges) MentorProjectApplicationsOrErr() ([]*MentorProjectApplication, error) {
-	if e.loadedTypes[2] {
+	if e.loadedTypes[5] {
 		return e.MentorProjectApplications, nil
 	}
 	return nil, &NotLoadedError{edge: "mentor_project_applications"}
@@ -87,7 +128,7 @@ func (e UserEdges) MentorProjectApplicationsOrErr() ([]*MentorProjectApplication
 // ReviewedProjectApplicationsOrErr returns the ReviewedProjectApplications value or an error if the edge
 // was not loaded in eager-loading.
 func (e UserEdges) ReviewedProjectApplicationsOrErr() ([]*MentorProjectApplication, error) {
-	if e.loadedTypes[3] {
+	if e.loadedTypes[6] {
 		return e.ReviewedProjectApplications, nil
 	}
 	return nil, &NotLoadedError{edge: "reviewed_project_applications"}
@@ -96,7 +137,7 @@ func (e UserEdges) ReviewedProjectApplicationsOrErr() ([]*MentorProjectApplicati
 // APIKeysOrErr returns the APIKeys value or an error if the edge
 // was not loaded in eager-loading.
 func (e UserEdges) APIKeysOrErr() ([]*APIKey, error) {
-	if e.loadedTypes[4] {
+	if e.loadedTypes[7] {
 		return e.APIKeys, nil
 	}
 	return nil, &NotLoadedError{edge: "api_keys"}
@@ -105,10 +146,19 @@ func (e UserEdges) APIKeysOrErr() ([]*APIKey, error) {
 // APIKeyAuditsOrErr returns the APIKeyAudits value or an error if the edge
 // was not loaded in eager-loading.
 func (e UserEdges) APIKeyAuditsOrErr() ([]*APIKeyAudit, error) {
-	if e.loadedTypes[5] {
+	if e.loadedTypes[8] {
 		return e.APIKeyAudits, nil
 	}
 	return nil, &NotLoadedError{edge: "api_key_audits"}
+}
+
+// ModelLibraryEntriesOrErr returns the ModelLibraryEntries value or an error if the edge
+// was not loaded in eager-loading.
+func (e UserEdges) ModelLibraryEntriesOrErr() ([]*StudentModelLibrary, error) {
+	if e.loadedTypes[9] {
+		return e.ModelLibraryEntries, nil
+	}
+	return nil, &NotLoadedError{edge: "model_library_entries"}
 }
 
 // scanValues returns the types for scanning values from sql.Rows.
@@ -198,6 +248,21 @@ func (_m *User) Value(name string) (ent.Value, error) {
 	return _m.selectValues.Get(name)
 }
 
+// QueryStudentProfile queries the "student_profile" edge of the User entity.
+func (_m *User) QueryStudentProfile() *StudentProfileQuery {
+	return NewUserClient(_m.config).QueryStudentProfile(_m)
+}
+
+// QueryMentorProfile queries the "mentor_profile" edge of the User entity.
+func (_m *User) QueryMentorProfile() *MentorProfileQuery {
+	return NewUserClient(_m.config).QueryMentorProfile(_m)
+}
+
+// QueryGrantedMentorProfiles queries the "granted_mentor_profiles" edge of the User entity.
+func (_m *User) QueryGrantedMentorProfiles() *MentorProfileQuery {
+	return NewUserClient(_m.config).QueryGrantedMentorProfiles(_m)
+}
+
 // QueryOrganizationMemberships queries the "organization_memberships" edge of the User entity.
 func (_m *User) QueryOrganizationMemberships() *OrganizationMemberQuery {
 	return NewUserClient(_m.config).QueryOrganizationMemberships(_m)
@@ -226,6 +291,11 @@ func (_m *User) QueryAPIKeys() *APIKeyQuery {
 // QueryAPIKeyAudits queries the "api_key_audits" edge of the User entity.
 func (_m *User) QueryAPIKeyAudits() *APIKeyAuditQuery {
 	return NewUserClient(_m.config).QueryAPIKeyAudits(_m)
+}
+
+// QueryModelLibraryEntries queries the "model_library_entries" edge of the User entity.
+func (_m *User) QueryModelLibraryEntries() *StudentModelLibraryQuery {
+	return NewUserClient(_m.config).QueryModelLibraryEntries(_m)
 }
 
 // Update returns a builder for updating this User.

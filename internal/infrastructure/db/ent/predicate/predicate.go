@@ -27,8 +27,8 @@ type GatewayCallAttempt func(*sql.Selector)
 // MaintenanceState is the predicate function for maintenancestate builders.
 type MaintenanceState func(*sql.Selector)
 
-// MatrixModelCatalog is the predicate function for matrixmodelcatalog builders.
-type MatrixModelCatalog func(*sql.Selector)
+// MentorProfile is the predicate function for mentorprofile builders.
+type MentorProfile func(*sql.Selector)
 
 // MentorProjectApplication is the predicate function for mentorprojectapplication builders.
 type MentorProjectApplication func(*sql.Selector)
@@ -69,8 +69,20 @@ type PromptAccessAudit func(*sql.Selector)
 // Provider is the predicate function for provider builders.
 type Provider func(*sql.Selector)
 
+// ProviderCredential is the predicate function for providercredential builders.
+type ProviderCredential func(*sql.Selector)
+
+// ProviderModelCatalog is the predicate function for providermodelcatalog builders.
+type ProviderModelCatalog func(*sql.Selector)
+
 // QuotaAdjustmentAudit is the predicate function for quotaadjustmentaudit builders.
 type QuotaAdjustmentAudit func(*sql.Selector)
+
+// StudentModelLibrary is the predicate function for studentmodellibrary builders.
+type StudentModelLibrary func(*sql.Selector)
+
+// StudentProfile is the predicate function for studentprofile builders.
+type StudentProfile func(*sql.Selector)
 
 // User is the predicate function for user builders.
 type User func(*sql.Selector)

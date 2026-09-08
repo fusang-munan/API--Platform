@@ -4,14 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikey"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeyaudit"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprojectapplication"
 	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
@@ -20,7 +18,8 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/project"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/projectmember"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/user"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providermodelcatalog"
 )
 
 type OrganizationInput struct {
@@ -96,6 +95,7 @@ type BindingInput struct {
 	Adapter           string
 	Priority          int
 	Status            string
+	ProbedAdapters    []string
 }
 
 func (s *Service) TeacherOrganizations(ctx context.Context) ([]OrganizationView, error) {
@@ -108,63 +108,6 @@ func (s *Service) TeacherOrganizations(ctx context.Context) ([]OrganizationView,
 		result = append(result, organizationView(row))
 	}
 	return result, nil
-}
-
-func (s *Service) MentorCandidates(
-	ctx context.Context,
-	organizationID uuid.UUID,
-	search string,
-	cursor *MentorCandidateCursor,
-	limit int,
-) ([]MentorCandidateView, *string, error) {
-	if limit < 1 || limit > 50 {
-		return nil, nil, domain.NewError(domain.CodeValidation, "limit must be between 1 and 50")
-	}
-	exists, err := s.db.Organization.Query().Where(organization.IDEQ(organizationID)).Exist(ctx)
-	if err != nil {
-		return nil, nil, domain.WrapError(domain.CodeDependencyUnavailable, "query organization", err)
-	}
-	if !exists {
-		return nil, nil, domain.NewError(domain.CodeNotFound, "organization not found")
-	}
-	query := s.db.User.Query().Where(
-		user.RoleEQ(user.RoleMentor),
-		user.StatusEQ(user.StatusActive),
-	).Order(ent.Asc(user.FieldName), ent.Asc(user.FieldID))
-	if search = strings.TrimSpace(search); search != "" {
-		query.Where(user.Or(user.NameContainsFold(search), user.EmailContainsFold(search)))
-	}
-	if cursor != nil {
-		query.Where(user.Or(
-			user.NameGT(cursor.Name),
-			user.And(user.NameEQ(cursor.Name), user.IDGT(cursor.ID)),
-		))
-	}
-	rows, err := query.Limit(limit + 1).All(ctx)
-	if err != nil {
-		return nil, nil, domain.WrapError(domain.CodeDependencyUnavailable, "list mentor candidates", err)
-	}
-	var nextCursor *string
-	if len(rows) > limit {
-		last := rows[limit-1]
-		encoded := encodeMentorCandidateCursor(last.Name, last.ID)
-		nextCursor = &encoded
-		rows = rows[:limit]
-	}
-	result := make([]MentorCandidateView, 0, len(rows))
-	for _, row := range rows {
-		member, err := s.db.OrganizationMember.Query().Where(
-			organizationmember.OrganizationIDEQ(organizationID),
-			organizationmember.UserIDEQ(row.ID),
-		).Exist(ctx)
-		if err != nil {
-			return nil, nil, domain.WrapError(domain.CodeDependencyUnavailable, "query mentor membership", err)
-		}
-		result = append(result, MentorCandidateView{
-			ID: row.ID.String(), Name: row.Name, Email: row.Email, IsMember: member,
-		})
-	}
-	return result, nextCursor, nil
 }
 
 func (s *Service) CreateOrganization(ctx context.Context, input OrganizationInput) (OrganizationView, error) {
@@ -228,44 +171,6 @@ func (s *Service) UpdateOrganization(ctx context.Context, id uuid.UUID, input Or
 	return organizationView(row), nil
 }
 
-func (s *Service) AssignMentorToOrganization(ctx context.Context, organizationID, mentorID uuid.UUID) error {
-	orgExists, err := s.db.Organization.Query().Where(organization.IDEQ(organizationID)).Exist(ctx)
-	if err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "query organization", err)
-	}
-	if !orgExists {
-		return domain.NewError(domain.CodeNotFound, "organization not found")
-	}
-	mentorExists, err := s.db.User.Query().Where(
-		user.IDEQ(mentorID),
-		user.RoleEQ(user.RoleMentor),
-		user.StatusEQ(user.StatusActive),
-	).Exist(ctx)
-	if err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "query mentor", err)
-	}
-	if !mentorExists {
-		return domain.NewError(domain.CodeNotFound, "mentor not found")
-	}
-	exists, err := s.db.OrganizationMember.Query().Where(
-		organizationmember.OrganizationIDEQ(organizationID),
-		organizationmember.UserIDEQ(mentorID),
-	).Exist(ctx)
-	if err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "query organization membership", err)
-	}
-	if exists {
-		return nil
-	}
-	if _, err := s.db.OrganizationMember.Create().
-		SetOrganizationID(organizationID).
-		SetUserID(mentorID).
-		Save(ctx); err != nil && !ent.IsConstraintError(err) {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "assign mentor to organization", err)
-	}
-	return nil
-}
-
 func (s *Service) TeacherProjects(ctx context.Context, organizationID *uuid.UUID, status *string) ([]ProjectView, error) {
 	query := s.db.Project.Query().Order(ent.Asc(project.FieldName))
 	if organizationID != nil {
@@ -282,11 +187,7 @@ func (s *Service) TeacherProjects(ctx context.Context, organizationID *uuid.UUID
 	if err != nil {
 		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list projects", err)
 	}
-	result := make([]ProjectView, 0, len(rows))
-	for _, row := range rows {
-		result = append(result, projectView(row, false))
-	}
-	return result, nil
+	return s.enrichTeacherProjectViews(ctx, rows)
 }
 
 func (s *Service) CreateProject(ctx context.Context, input ProjectInput) (ProjectView, error) {
@@ -309,9 +210,10 @@ func (s *Service) CreateProject(ctx context.Context, input ProjectInput) (Projec
 		SetOrganizationID(input.OrganizationID).
 		SetName(name).
 		SetStatus(project.Status(status))
-	if input.MonthlyCreditQuotaMilli != nil {
-		builder.SetMonthlyCreditQuotaMilli(*input.MonthlyCreditQuotaMilli)
+	if input.MonthlyCreditQuotaMilli == nil {
+		return ProjectView{}, domain.NewError(domain.CodeValidation, "monthly credit quota is required")
 	}
+	builder.SetMonthlyCreditQuotaMilli(*input.MonthlyCreditQuotaMilli)
 	if input.Description != nil && strings.TrimSpace(*input.Description) != "" {
 		builder.SetDescription(strings.TrimSpace(*input.Description))
 	}
@@ -326,19 +228,6 @@ func (s *Service) CreateProject(ctx context.Context, input ProjectInput) (Projec
 }
 
 func (s *Service) UpdateProject(ctx context.Context, actorID, id uuid.UUID, input ProjectInput) (ProjectView, error) {
-	if input.MonthlyCreditQuotaMilli != nil {
-		if strings.TrimSpace(input.QuotaChangeReason) == "" {
-			return ProjectView{}, domain.NewError(domain.CodeValidation, "quota change reason is required")
-		}
-		if err := s.usage.UpdateProjectQuota(ctx, actorID, id, *input.MonthlyCreditQuotaMilli, input.QuotaChangeReason); err != nil {
-			var appErr *domain.Error
-			if errors.As(err, &appErr) {
-				return ProjectView{}, err
-			}
-			return ProjectView{}, domain.WrapError(domain.CodeDependencyUnavailable, "update project quota", err)
-		}
-		input.MonthlyCreditQuotaMilli = nil
-	}
 	builder := s.db.Project.UpdateOneID(id)
 	if input.Name != "" {
 		name, err := ValidateName(input.Name, 128)
@@ -434,16 +323,6 @@ func (s *Service) ReviewMentorApplication(
 		if application.Edges.Project == nil {
 			return domain.NewError(domain.CodeNotFound, "project not found")
 		}
-		organizationMember, err := tx.OrganizationMember.Query().Where(
-			organizationmember.OrganizationIDEQ(application.Edges.Project.OrganizationID),
-			organizationmember.UserIDEQ(application.MentorID),
-		).Exist(ctx)
-		if err != nil {
-			return domain.WrapError(domain.CodeDependencyUnavailable, "query mentor organization membership", err)
-		}
-		if !organizationMember {
-			return domain.NewError(domain.CodeMentorNotInOrganization, "mentor is no longer a member of the project organization")
-		}
 		projectMember, err := tx.ProjectMember.Query().Where(
 			projectmember.ProjectIDEQ(application.ProjectID),
 			projectmember.UserIDEQ(application.MentorID),
@@ -453,6 +332,9 @@ func (s *Service) ReviewMentorApplication(
 		}
 		if projectMember {
 			return domain.NewError(domain.CodeMentorAlreadyProjectMember, "mentor already belongs to the project")
+		}
+		if err := ensureOrganizationMember(ctx, tx, application.Edges.Project.OrganizationID, application.MentorID); err != nil {
+			return err
 		}
 		if err := ensureProjectMember(ctx, tx, application.ProjectID, application.MentorID); err != nil {
 			return err
@@ -480,13 +362,18 @@ func (s *Service) ReviewMentorApplication(
 }
 
 func (s *Service) TeacherProviders(ctx context.Context) ([]ProviderView, error) {
-	rows, err := s.db.Provider.Query().Order(ent.Asc(provider.FieldName)).All(ctx)
+	rows, err := s.db.Provider.Query().
+		WithCredentials(func(query *ent.ProviderCredentialQuery) {
+			query.Order(ent.Asc(providercredential.FieldLabel))
+		}).
+		Order(ent.Asc(provider.FieldName)).
+		All(ctx)
 	if err != nil {
 		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list providers", err)
 	}
 	result := make([]ProviderView, 0, len(rows))
 	for _, row := range rows {
-		result = append(result, providerView(row))
+		result = append(result, providerViewWithCredentials(row, row.Edges.Credentials))
 	}
 	return result, nil
 }
@@ -503,18 +390,24 @@ func (s *Service) CreateProvider(ctx context.Context, input ProviderInput) (Prov
 	if input.Credential == nil {
 		return ProviderView{}, domain.NewError(domain.CodeValidation, "credential is required")
 	}
-	ciphertext, err := s.security.EncryptCredential(*input.Credential)
-	if err != nil {
-		return ProviderView{}, domain.NewError(domain.CodeValidation, err.Error())
-	}
 	status, err := resourceStatus(input.Status, string(provider.StatusActive))
 	if err != nil {
 		return ProviderView{}, err
 	}
-	row, err := s.db.Provider.Create().
+	ciphertext, err := s.security.EncryptCredential(*input.Credential)
+	if err != nil {
+		return ProviderView{}, domain.NewError(domain.CodeValidation, err.Error())
+	}
+
+	tx, err := s.db.Tx(ctx)
+	if err != nil {
+		return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "start provider create transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	row, err := tx.Provider.Create().
 		SetName(name).
 		SetBaseURL(baseURL).
-		SetCredentialCiphertext(ciphertext).
 		SetStatus(provider.Status(status)).
 		Save(ctx)
 	if ent.IsConstraintError(err) {
@@ -523,18 +416,46 @@ func (s *Service) CreateProvider(ctx context.Context, input ProviderInput) (Prov
 	if err != nil {
 		return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "create provider", err)
 	}
-	return providerView(row), nil
+	credentialRow, err := tx.ProviderCredential.Create().
+		SetProviderID(row.ID).
+		SetLabel("default").
+		SetCredentialCiphertext(ciphertext).
+		SetStatus(providercredential.StatusActive).
+		Save(ctx)
+	if err != nil {
+		return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "create provider credential", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "commit provider create", err)
+	}
+
+	view := providerView(row)
+	view.Credentials = []ProviderCredentialView{providerCredentialView(credentialRow)}
+	if row.Status == provider.StatusActive {
+		syncView, syncErr := s.SyncProviderCatalog(ctx, row.ID)
+		if syncErr != nil {
+			_ = s.DeleteProvider(ctx, row.ID)
+			return ProviderView{}, syncErr
+		}
+		view.LastCatalogSync = &syncView
+	}
+	return view, nil
 }
 
 func (s *Service) TeacherProvider(ctx context.Context, id uuid.UUID) (ProviderView, error) {
-	row, err := s.db.Provider.Get(ctx, id)
+	row, err := s.db.Provider.Query().
+		Where(provider.IDEQ(id)).
+		WithCredentials(func(query *ent.ProviderCredentialQuery) {
+			query.Order(ent.Asc(providercredential.FieldLabel))
+		}).
+		Only(ctx)
 	if ent.IsNotFound(err) {
 		return ProviderView{}, domain.NewError(domain.CodeNotFound, "provider not found")
 	}
 	if err != nil {
 		return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query provider", err)
 	}
-	return providerView(row), nil
+	return providerViewWithCredentials(row, row.Edges.Credentials), nil
 }
 
 func (s *Service) UpdateProvider(ctx context.Context, id uuid.UUID, input ProviderInput) (ProviderView, error) {
@@ -550,11 +471,6 @@ func (s *Service) UpdateProvider(ctx context.Context, id uuid.UUID, input Provid
 	if err != nil {
 		return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query provider", err)
 	}
-	if input.Status != nil && *input.Status == string(provider.StatusInactive) && current.Status == provider.StatusActive {
-		if err := ensureProviderCanBeDisabledTx(ctx, tx, id); err != nil {
-			return ProviderView{}, err
-		}
-	}
 	builder := current.Update()
 	if input.Name != "" {
 		name, err := ValidateName(input.Name, 128)
@@ -569,13 +485,6 @@ func (s *Service) UpdateProvider(ctx context.Context, id uuid.UUID, input Provid
 			return ProviderView{}, err
 		}
 		builder.SetBaseURL(baseURL)
-	}
-	if input.Credential != nil {
-		ciphertext, err := s.security.EncryptCredential(*input.Credential)
-		if err != nil {
-			return ProviderView{}, domain.NewError(domain.CodeValidation, err.Error())
-		}
-		builder.SetCredentialCiphertext(ciphertext)
 	}
 	if input.Status != nil {
 		status, err := resourceStatus(input.Status, "")
@@ -594,28 +503,244 @@ func (s *Service) UpdateProvider(ctx context.Context, id uuid.UUID, input Provid
 	if err != nil {
 		return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "update provider", err)
 	}
+	if row.Status == provider.StatusInactive && current.Status == provider.StatusActive {
+		if err := catalog.DeactivateProviderResources(ctx, tx.Client(), row.ID); err != nil {
+			return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "deactivate provider routes", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "commit provider update", err)
 	}
-	return providerView(row), nil
+	view := providerView(row)
+	if refreshed, refreshErr := s.TeacherProvider(ctx, row.ID); refreshErr == nil {
+		view = refreshed
+	}
+	if shouldSyncProviderCatalog(current, row, input) {
+		syncView, syncErr := s.SyncProviderCatalog(ctx, row.ID)
+		if syncErr != nil {
+			return ProviderView{}, syncErr
+		}
+		view.LastCatalogSync = &syncView
+	}
+	return view, nil
+}
+
+func (s *Service) DeleteProvider(ctx context.Context, id uuid.UUID) error {
+	tx, err := s.db.Tx(ctx)
+	if err != nil {
+		return domain.WrapError(domain.CodeDependencyUnavailable, "start provider delete transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if exists, err := tx.Provider.Query().Where(provider.IDEQ(id)).Exist(ctx); err != nil {
+		return domain.WrapError(domain.CodeDependencyUnavailable, "query provider", err)
+	} else if !exists {
+		return domain.NewError(domain.CodeNotFound, "provider not found")
+	}
+	if _, err := tx.ModelBinding.Delete().Where(modelbinding.ProviderIDEQ(id)).Exec(ctx); err != nil {
+		return domain.WrapError(domain.CodeDependencyUnavailable, "delete provider bindings", err)
+	}
+	if err := tx.Provider.DeleteOneID(id).Exec(ctx); err != nil {
+		return domain.WrapError(domain.CodeDependencyUnavailable, "delete provider", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.WrapError(domain.CodeDependencyUnavailable, "commit provider delete", err)
+	}
+	return nil
+}
+
+func shouldSyncProviderCatalog(before, after *ent.Provider, input ProviderInput) bool {
+	if after.Status != provider.StatusActive {
+		return false
+	}
+	if before == nil {
+		return true
+	}
+	if before.Status != provider.StatusActive {
+		return true
+	}
+	return input.BaseURL != "" && strings.TrimSpace(input.BaseURL) != before.BaseURL
 }
 
 func (s *Service) TeacherModels(ctx context.Context) ([]ModelView, error) {
-	rows, err := s.db.Model.Query().Order(ent.Asc(entmodel.FieldModelID)).All(ctx)
+	activeProviders, err := s.db.Provider.Query().
+		Where(provider.StatusEQ(provider.StatusActive)).
+		Order(ent.Asc(provider.FieldName)).
+		All(ctx)
 	if err != nil {
-		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list models", err)
+		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list active providers", err)
 	}
-	result := make([]ModelView, 0, len(rows))
-	for _, row := range rows {
-		item := modelView(row)
-		ready, err := s.modelHasActiveRoute(ctx, row.ID)
-		if err != nil {
-			return nil, err
+	if len(activeProviders) == 0 {
+		return []ModelView{}, nil
+	}
+	result := make([]ModelView, 0)
+	for _, providerRow := range activeProviders {
+		lines, lineErr := s.teacherModelLinesForProvider(ctx, providerRow)
+		if lineErr != nil {
+			return nil, lineErr
 		}
-		item.RouteReady = ready
+		result = append(result, lines...)
+	}
+	return result, nil
+}
+
+func (s *Service) teacherModelLinesForProvider(ctx context.Context, providerRow *ent.Provider) ([]ModelView, error) {
+	if err := catalog.RestoreReadyGovernedModels(ctx, s.db, providerRow.ID); err != nil {
+		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "restore governed models", err)
+	}
+	needsSync, err := s.activeProviderCatalogNeedsSync(ctx, providerRow.ID)
+	if err != nil {
+		return nil, err
+	}
+	if needsSync {
+		if _, syncErr := s.SyncProviderCatalog(ctx, providerRow.ID); syncErr != nil {
+			return nil, syncErr
+		}
+	}
+	credentials, err := s.db.ProviderCredential.Query().
+		Where(
+			providercredential.ProviderIDEQ(providerRow.ID),
+			providercredential.StatusEQ(providercredential.StatusActive),
+		).
+		Order(ent.Asc(providercredential.FieldLabel)).
+		All(ctx)
+	if err != nil {
+		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list provider credentials", err)
+	}
+	result := make([]ModelView, 0)
+	for _, credential := range credentials {
+		lines, lineErr := s.teacherModelLinesForCredential(ctx, credential, providerRow)
+		if lineErr != nil {
+			return nil, lineErr
+		}
+		result = append(result, lines...)
+	}
+	return result, nil
+}
+
+func (s *Service) activeProviderCatalogNeedsSync(ctx context.Context, providerID uuid.UUID) (bool, error) {
+	count, err := s.db.ProviderModelCatalog.Query().
+		Where(
+			providermodelcatalog.ProviderIDEQ(providerID),
+			providermodelcatalog.StatusEQ(providermodelcatalog.StatusActive),
+			providermodelcatalog.HasCredentialWith(
+				providercredential.StatusEQ(providercredential.StatusActive),
+			),
+		).
+		Count(ctx)
+	if err != nil {
+		return false, domain.WrapError(domain.CodeDependencyUnavailable, "count provider catalog", err)
+	}
+	return count == 0, nil
+}
+
+func (s *Service) teacherModelLinesForCredential(
+	ctx context.Context,
+	credential *ent.ProviderCredential,
+	providerRow *ent.Provider,
+) ([]ModelView, error) {
+	catalogRows, err := s.db.ProviderModelCatalog.Query().
+		Where(
+			providermodelcatalog.CredentialIDEQ(credential.ID),
+			providermodelcatalog.StatusEQ(providermodelcatalog.StatusActive),
+		).
+		Order(ent.Asc(providermodelcatalog.FieldModelID)).
+		All(ctx)
+	if err != nil {
+		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list provider catalog", err)
+	}
+	if len(catalogRows) == 0 {
+		return []ModelView{}, nil
+	}
+	uniqueCatalogRows := dedupeCatalogRows(catalogRows)
+	publicModelIDs := make([]string, 0, len(uniqueCatalogRows))
+	for _, row := range uniqueCatalogRows {
+		publicModelIDs = append(publicModelIDs, row.ModelID)
+	}
+	modelByPublicID, err := s.modelsByPublicID(ctx, publicModelIDs)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]ModelView, 0, len(uniqueCatalogRows))
+	for _, catalogRow := range uniqueCatalogRows {
+		modelID := strings.TrimSpace(catalogRow.ModelID)
+		item := teacherModelLineView(catalogRow, credential, providerRow, modelByPublicID[modelID])
+		if modelRow := modelByPublicID[modelID]; modelRow != nil {
+			ready, readyErr := catalog.CredentialLineHasActiveRoute(ctx, s.db, modelRow.ID, credential.ID)
+			if readyErr != nil {
+				return nil, domain.WrapError(domain.CodeDependencyUnavailable, "query model route", readyErr)
+			}
+			item.RouteReady = ready
+		}
 		result = append(result, item)
 	}
 	return result, nil
+}
+
+func (s *Service) modelsByPublicID(ctx context.Context, publicModelIDs []string) (map[string]*ent.Model, error) {
+	if len(publicModelIDs) == 0 {
+		return map[string]*ent.Model{}, nil
+	}
+	modelRows, err := s.db.Model.Query().Where(entmodel.ModelIDIn(publicModelIDs...)).All(ctx)
+	if err != nil {
+		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list models", err)
+	}
+	modelByPublicID := make(map[string]*ent.Model, len(modelRows))
+	for _, row := range modelRows {
+		modelByPublicID[row.ModelID] = row
+	}
+	return modelByPublicID, nil
+}
+
+func teacherModelLineView(
+	catalogRow *ent.ProviderModelCatalog,
+	credential *ent.ProviderCredential,
+	providerRow *ent.Provider,
+	modelRow *ent.Model,
+) ModelView {
+	if modelRow != nil {
+		view := modelView(modelRow)
+		view.ProviderID = providerRow.ID.String()
+		view.ProviderName = providerRow.Name
+		view.CredentialID = credential.ID.String()
+		view.CredentialLabel = credential.Label
+		return view
+	}
+	displayName := catalogRow.ModelID
+	if catalogRow.DisplayName != nil && strings.TrimSpace(*catalogRow.DisplayName) != "" {
+		displayName = strings.TrimSpace(*catalogRow.DisplayName)
+	}
+	view := ModelView{
+		ModelID:         catalogRow.ModelID,
+		DisplayName:     displayName,
+		Category:        string(entmodel.DefaultCategory),
+		Status:          string(entmodel.StatusPendingConfiguration),
+		ProviderID:      providerRow.ID.String(),
+		ProviderName:    providerRow.Name,
+		CredentialID:    credential.ID.String(),
+		CredentialLabel: credential.Label,
+	}
+	if catalogRow.Description != nil && strings.TrimSpace(*catalogRow.Description) != "" {
+		description := strings.TrimSpace(*catalogRow.Description)
+		view.Description = &description
+	}
+	return view
+}
+
+func dedupeCatalogRows(rows []*ent.ProviderModelCatalog) []*ent.ProviderModelCatalog {
+	seen := make(map[string]struct{}, len(rows))
+	result := make([]*ent.ProviderModelCatalog, 0, len(rows))
+	for _, row := range rows {
+		modelID := strings.TrimSpace(row.ModelID)
+		if modelID == "" {
+			continue
+		}
+		if _, ok := seen[modelID]; ok {
+			continue
+		}
+		seen[modelID] = struct{}{}
+		result = append(result, row)
+	}
+	return result
 }
 
 func (s *Service) CreateModel(ctx context.Context, input ModelInput) (ModelView, error) {
@@ -684,7 +809,7 @@ func (s *Service) CreateModel(ctx context.Context, input ModelInput) (ModelView,
 	return modelView(row), nil
 }
 
-func (s *Service) TeacherModel(ctx context.Context, publicModelID string) (ModelView, []BindingView, error) {
+func (s *Service) TeacherModel(ctx context.Context, publicModelID string, credentialID *uuid.UUID) (ModelView, []BindingView, error) {
 	modelID, err := normalizeSingleModelID(publicModelID)
 	if err != nil {
 		return ModelView{}, nil, err
@@ -696,9 +821,11 @@ func (s *Service) TeacherModel(ctx context.Context, publicModelID string) (Model
 	if err != nil {
 		return ModelView{}, nil, domain.WrapError(domain.CodeDependencyUnavailable, "query model", err)
 	}
-	bindings, err := s.db.ModelBinding.Query().Where(
-		modelbinding.ModelIDEQ(row.ID),
-	).Order(ent.Asc(modelbinding.FieldPriority), ent.Asc(modelbinding.FieldID)).All(ctx)
+	bindingQuery := s.db.ModelBinding.Query().Where(modelbinding.ModelIDEQ(row.ID))
+	if credentialID != nil {
+		bindingQuery = bindingQuery.Where(modelbinding.CredentialIDEQ(*credentialID))
+	}
+	bindings, err := bindingQuery.Order(ent.Asc(modelbinding.FieldPriority), ent.Asc(modelbinding.FieldID)).All(ctx)
 	if err != nil {
 		return ModelView{}, nil, domain.WrapError(domain.CodeDependencyUnavailable, "query model bindings", err)
 	}
@@ -707,15 +834,23 @@ func (s *Service) TeacherModel(ctx context.Context, publicModelID string) (Model
 		result = append(result, s.bindingView(ctx, binding))
 	}
 	view := modelView(row)
-	view.RouteReady, err = s.modelHasActiveRoute(ctx, row.ID)
+	if credentialID != nil {
+		view.CredentialID = credentialID.String()
+		if credentialRow, credErr := s.db.ProviderCredential.Get(ctx, *credentialID); credErr == nil {
+			view.CredentialLabel = credentialRow.Label
+			if providerRow, provErr := s.db.Provider.Get(ctx, credentialRow.ProviderID); provErr == nil {
+				view.ProviderID = providerRow.ID.String()
+				view.ProviderName = providerRow.Name
+			}
+		}
+		view.RouteReady, err = catalog.CredentialLineHasActiveRoute(ctx, s.db, row.ID, *credentialID)
+	} else {
+		view.RouteReady, err = s.modelHasActiveRoute(ctx, row.ID)
+	}
 	if err != nil {
 		return ModelView{}, nil, err
 	}
 	return view, result, nil
-}
-
-func multiplierChangeRequiresReason(current, next *int64) bool {
-	return current != nil && next != nil && *current != *next
 }
 
 func (s *Service) UpdateModel(ctx context.Context, actorID uuid.UUID, publicModelID string, input ModelInput) (ModelView, error) {
@@ -737,13 +872,8 @@ func (s *Service) UpdateModel(ctx context.Context, actorID uuid.UUID, publicMode
 	}
 	builder := current.Update()
 	multiplierChanged := input.CreditMultiplierMilli != nil && (current.CreditMultiplierMilli == nil || *current.CreditMultiplierMilli != *input.CreditMultiplierMilli)
-	if input.CreditMultiplierMilli != nil {
-		if multiplierChangeRequiresReason(current.CreditMultiplierMilli, input.CreditMultiplierMilli) && strings.TrimSpace(input.MultiplierChangeReason) == "" {
-			return ModelView{}, domain.NewError(domain.CodeValidation, "multiplier change reason is required")
-		}
-		if multiplierChanged {
-			builder.SetCreditMultiplierMilli(*input.CreditMultiplierMilli)
-		}
+	if input.CreditMultiplierMilli != nil && multiplierChanged {
+		builder.SetCreditMultiplierMilli(*input.CreditMultiplierMilli)
 	}
 	if input.DisplayName != "" {
 		name, err := ValidateName(input.DisplayName, 256)
@@ -818,8 +948,12 @@ func (s *Service) UpdateModel(ctx context.Context, actorID uuid.UUID, publicMode
 			return ModelView{}, err
 		}
 		if status == entmodel.StatusActive {
-			if current.CreditMultiplierMilli == nil && input.CreditMultiplierMilli == nil {
-				return ModelView{}, domain.NewError(domain.CodeModelNotReady, "model credit multiplier is required")
+			multiplier := current.CreditMultiplierMilli
+			if input.CreditMultiplierMilli != nil {
+				multiplier = input.CreditMultiplierMilli
+			}
+			if multiplier == nil || *multiplier <= 0 {
+				return ModelView{}, domain.NewError(domain.CodeModelNotReady, "configure a positive credit multiplier before activating the model")
 			}
 			ready, err := modelHasActiveRouteTx(ctx, tx, current.ID)
 			if err != nil {
@@ -838,7 +972,11 @@ func (s *Service) UpdateModel(ctx context.Context, actorID uuid.UUID, publicMode
 		return ModelView{}, domain.WrapError(domain.CodeDependencyUnavailable, "update model", err)
 	}
 	if multiplierChanged && current.CreditMultiplierMilli != nil {
-		audit := tx.ModelMultiplierAudit.Create().SetModelID(current.ID).SetActorUserID(actorID).SetNewMultiplierMilli(*input.CreditMultiplierMilli).SetReason(input.MultiplierChangeReason)
+		reason := strings.TrimSpace(input.MultiplierChangeReason)
+		if reason == "" {
+			reason = "update"
+		}
+		audit := tx.ModelMultiplierAudit.Create().SetModelID(current.ID).SetActorUserID(actorID).SetNewMultiplierMilli(*input.CreditMultiplierMilli).SetReason(reason)
 		audit.SetOldMultiplierMilli(*current.CreditMultiplierMilli)
 		if _, err := audit.Save(ctx); err != nil {
 			return ModelView{}, domain.WrapError(domain.CodeDependencyUnavailable, "create model multiplier audit", err)
@@ -876,21 +1014,155 @@ func (s *Service) CreateBinding(ctx context.Context, publicModelID string, input
 	if !providerExists {
 		return BindingView{}, domain.NewError(domain.CodeNotFound, "provider not found")
 	}
-	row, err := s.db.ModelBinding.Create().
-		SetModelID(modelRow.ID).
-		SetProviderID(input.ProviderID).
-		SetUpstreamModelName(strings.TrimSpace(input.UpstreamModelName)).
-		SetAdapter(modelbinding.Adapter(input.Adapter)).
-		SetPriority(input.Priority).
-		SetStatus(modelbinding.Status(input.Status)).
-		Save(ctx)
-	if ent.IsConstraintError(err) {
-		return BindingView{}, domain.NewError(domain.CodeNameConflict, "model binding already exists")
+	credentialID, err := s.resolveProbeCredentialID(ctx, input.ProviderID, input.UpstreamModelName)
+	if err != nil {
+		return BindingView{}, err
+	}
+	adapters, err := bindingAdaptersFromInput(modelRow.ModelID, input)
+	if err != nil {
+		return BindingView{}, err
+	}
+	var primary *ent.ModelBinding
+	for _, adapter := range adapters {
+		exists, err := s.db.ModelBinding.Query().Where(
+			modelbinding.ModelIDEQ(modelRow.ID),
+			modelbinding.ProviderIDEQ(input.ProviderID),
+			modelbinding.AdapterEQ(adapter),
+		).Only(ctx)
+		if err == nil {
+			update := exists.Update().
+				SetUpstreamModelName(strings.TrimSpace(input.UpstreamModelName)).
+				SetPriority(catalog.DefaultBindingPriority(adapter)).
+				SetStatus(modelbinding.Status(input.Status))
+			if credentialID != nil {
+				update.SetCredentialID(*credentialID)
+			}
+			row, saveErr := update.Save(ctx)
+			if saveErr != nil {
+				return BindingView{}, domain.WrapError(domain.CodeDependencyUnavailable, "update model binding", saveErr)
+			}
+			if primary == nil {
+				primary = row
+			}
+			continue
+		}
+		if !ent.IsNotFound(err) {
+			return BindingView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query model binding", err)
+		}
+		builder := s.db.ModelBinding.Create().
+			SetModelID(modelRow.ID).
+			SetProviderID(input.ProviderID).
+			SetUpstreamModelName(strings.TrimSpace(input.UpstreamModelName)).
+			SetAdapter(adapter).
+			SetPriority(catalog.DefaultBindingPriority(adapter)).
+			SetStatus(modelbinding.Status(input.Status))
+		if credentialID != nil {
+			builder.SetCredentialID(*credentialID)
+		}
+		row, saveErr := builder.Save(ctx)
+		if ent.IsConstraintError(saveErr) {
+			return BindingView{}, domain.NewError(domain.CodeNameConflict, "model binding already exists")
+		}
+		if saveErr != nil {
+			return BindingView{}, domain.WrapError(domain.CodeDependencyUnavailable, "create model binding", saveErr)
+		}
+		if primary == nil {
+			primary = row
+		}
+	}
+	if primary == nil {
+		return BindingView{}, domain.NewError(domain.CodeDependencyUnavailable, "create model binding")
+	}
+	return s.bindingView(ctx, primary), nil
+}
+
+type BindingRouteProbeInput struct {
+	ProviderID        uuid.UUID
+	UpstreamModelName string
+	Endpoint          string
+}
+
+func (s *Service) ProbeModelBindingRoute(ctx context.Context, input BindingRouteProbeInput) (catalog.RouteProbeStep, error) {
+	endpoint := catalog.BindingRouteProbeEndpoint(strings.TrimSpace(input.Endpoint))
+	switch endpoint {
+	case catalog.BindingRouteProbeChatCompletions, catalog.BindingRouteProbeResponses, catalog.BindingRouteProbeMessages, catalog.BindingRouteProbeImagesGenerations:
+	default:
+		return catalog.RouteProbeStep{}, domain.NewError(domain.CodeValidation, "invalid binding route probe endpoint")
+	}
+	upstreamModelName := strings.TrimSpace(input.UpstreamModelName)
+	if upstreamModelName == "" {
+		return catalog.RouteProbeStep{}, domain.NewError(domain.CodeValidation, "upstream_model_name is required")
+	}
+	providerRow, err := s.db.Provider.Query().Where(provider.IDEQ(input.ProviderID)).Only(ctx)
+	if ent.IsNotFound(err) {
+		return catalog.RouteProbeStep{}, domain.NewError(domain.CodeNotFound, "provider not found")
 	}
 	if err != nil {
-		return BindingView{}, domain.WrapError(domain.CodeDependencyUnavailable, "create model binding", err)
+		return catalog.RouteProbeStep{}, domain.WrapError(domain.CodeDependencyUnavailable, "query provider", err)
 	}
-	return s.bindingView(ctx, row), nil
+	credentialPlain, _, err := s.probeCredentialForProvider(ctx, input.ProviderID, upstreamModelName)
+	if err != nil {
+		return catalog.RouteProbeStep{}, err
+	}
+	probe := catalog.NewRouteProbe(providerRow.BaseURL, credentialPlain)
+	return probe.ProbeStep(ctx, upstreamModelName, endpoint)
+}
+
+func bindingAdaptersFromInput(modelID string, input BindingInput) ([]modelbinding.Adapter, error) {
+	if len(input.ProbedAdapters) == 0 {
+		return nil, domain.NewError(domain.CodeValidation, "probed_adapters is required; run route probe before saving bindings")
+	}
+	seen := map[modelbinding.Adapter]struct{}{}
+	result := make([]modelbinding.Adapter, 0, len(input.ProbedAdapters))
+	for _, raw := range input.ProbedAdapters {
+		adapter := modelbinding.Adapter(strings.TrimSpace(raw))
+		if !validBindingAdapter(string(adapter)) {
+			return nil, domain.NewError(domain.CodeValidation, "invalid probed adapter")
+		}
+		if _, ok := seen[adapter]; ok {
+			continue
+		}
+		seen[adapter] = struct{}{}
+		result = append(result, adapter)
+	}
+	if len(result) == 0 {
+		return nil, domain.NewError(domain.CodeValidation, "probed_adapters is required; run route probe before saving bindings")
+	}
+	return catalog.ExpandChatGatewayAdapters(modelID, result), nil
+}
+
+func (s *Service) resolveProbeCredentialID(ctx context.Context, providerID uuid.UUID, upstreamModelName string) (*uuid.UUID, error) {
+	_, credentialID, err := s.probeCredentialForProvider(ctx, providerID, upstreamModelName)
+	return credentialID, err
+}
+
+func (s *Service) probeCredentialForProvider(ctx context.Context, providerID uuid.UUID, upstreamModelName string) (string, *uuid.UUID, error) {
+	if credentialID, resolveErr := s.ResolveCredentialForUpstream(ctx, providerID, upstreamModelName); resolveErr != nil {
+		return "", nil, resolveErr
+	} else if credentialID != nil {
+		row, err := s.db.ProviderCredential.Get(ctx, *credentialID)
+		if err != nil {
+			return "", nil, domain.WrapError(domain.CodeDependencyUnavailable, "query provider credential", err)
+		}
+		plain, err := s.security.DecryptCredential(row.CredentialCiphertext)
+		if err != nil {
+			return "", nil, domain.WrapError(domain.CodeDependencyUnavailable, "decrypt provider credential", err)
+		}
+		return plain, credentialID, nil
+	}
+	credentials, err := catalog.ActiveCredentials(ctx, s.db, &providerID)
+	if err != nil {
+		return "", nil, domain.WrapError(domain.CodeDependencyUnavailable, "list active provider credentials", err)
+	}
+	if len(credentials) == 0 {
+		return "", nil, domain.NewError(domain.CodeValidation, "provider has no active credentials")
+	}
+	plain, err := s.security.DecryptCredential(credentials[0].CredentialCiphertext)
+	if err != nil {
+		return "", nil, domain.WrapError(domain.CodeDependencyUnavailable, "decrypt provider credential", err)
+	}
+	id := credentials[0].ID
+	return plain, &id, nil
 }
 
 func (s *Service) UpdateBinding(ctx context.Context, bindingID uuid.UUID, input BindingInput) (BindingView, error) {
@@ -905,11 +1177,6 @@ func (s *Service) UpdateBinding(ctx context.Context, bindingID uuid.UUID, input 
 	}
 	if err != nil {
 		return BindingView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query model binding", err)
-	}
-	if input.Status == string(modelbinding.StatusInactive) && current.Status == modelbinding.StatusActive {
-		if err := ensureBindingCanBeDisabledTx(ctx, tx, current); err != nil {
-			return BindingView{}, err
-		}
 	}
 	builder := current.Update()
 	if input.UpstreamModelName != "" {
@@ -943,260 +1210,43 @@ func (s *Service) UpdateBinding(ctx context.Context, bindingID uuid.UUID, input 
 	return s.bindingView(ctx, row), nil
 }
 
-func ensureProviderCanBeDisabledTx(ctx context.Context, tx *ent.Tx, providerID uuid.UUID) error {
-	bindings, err := tx.ModelBinding.Query().Where(
-		modelbinding.ProviderIDEQ(providerID),
-		modelbinding.StatusEQ(modelbinding.StatusActive),
-	).All(ctx)
-	if err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "query provider bindings", err)
-	}
-	modelIDs := make([]uuid.UUID, 0, len(bindings))
-	seen := make(map[uuid.UUID]struct{}, len(bindings))
-	for _, binding := range bindings {
-		if _, exists := seen[binding.ModelID]; !exists {
-			seen[binding.ModelID] = struct{}{}
-			modelIDs = append(modelIDs, binding.ModelID)
-		}
-	}
-	if len(modelIDs) == 0 {
-		return nil
-	}
-	models, err := tx.Model.Query().Where(
-		entmodel.IDIn(modelIDs...),
-		entmodel.StatusEQ(entmodel.StatusActive),
-	).All(ctx)
-	if err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "lock provider models", err)
-	}
-	affected := make([]string, 0)
-	for _, row := range models {
-		ready, err := modelHasActiveRouteExcluding(ctx, tx, row.ID, providerID, uuid.Nil)
-		if err != nil {
-			return err
-		}
-		if !ready {
-			affected = append(affected, row.ModelID)
-		}
-	}
-	if len(affected) > 0 {
-		appErr := domain.NewError(domain.CodeModelRoutingRequired, "provider is required by active models")
-		appErr.Details = map[string]any{"model_ids": affected}
-		return appErr
-	}
-	return nil
-}
-
-func ensureBindingCanBeDisabledTx(ctx context.Context, tx *ent.Tx, binding *ent.ModelBinding) error {
-	modelRow, err := tx.Model.Query().Where(entmodel.IDEQ(binding.ModelID)).Only(ctx)
-	if err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "lock binding model", err)
-	}
-	if modelRow.Status != entmodel.StatusActive {
-		return nil
-	}
-	ready, err := modelHasActiveRouteExcluding(ctx, tx, binding.ModelID, uuid.Nil, binding.ID)
-	if err != nil {
-		return err
-	}
-	if !ready {
-		appErr := domain.NewError(domain.CodeModelRoutingRequired, "binding is required by an active model")
-		appErr.Details = map[string]any{"model_ids": []string{modelRow.ModelID}}
-		return appErr
-	}
-	return nil
-}
-
-func modelHasActiveRouteExcluding(
-	ctx context.Context,
-	tx *ent.Tx,
-	modelID, excludedProviderID, excludedBindingID uuid.UUID,
-) (bool, error) {
-	query := tx.ModelBinding.Query().Where(
-		modelbinding.ModelIDEQ(modelID),
-		modelbinding.StatusEQ(modelbinding.StatusActive),
-		modelbinding.HasProviderWith(provider.StatusEQ(provider.StatusActive)),
-	)
-	if excludedProviderID != uuid.Nil {
-		query.Where(modelbinding.ProviderIDNEQ(excludedProviderID))
-	}
-	if excludedBindingID != uuid.Nil {
-		query.Where(modelbinding.IDNEQ(excludedBindingID))
-	}
-	ready, err := query.Exist(ctx)
-	if err != nil {
-		return false, domain.WrapError(domain.CodeDependencyUnavailable, "query alternate model routes", err)
-	}
-	return ready, nil
-}
-
-func (s *Service) TeacherKeyReviews(ctx context.Context) ([]APIKeyView, error) {
-	rows, err := s.db.APIKey.Query().Where(
-		apikey.StatusEQ(apikey.StatusPendingTeacher),
-	).Order(ent.Asc(apikey.FieldCreatedAt)).All(ctx)
-	if err != nil {
-		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list teacher key reviews", err)
-	}
-	views, err := s.keyViews(ctx, rows)
-	if err != nil {
-		return nil, err
-	}
-	for i := range views {
-		if err := s.populateRouteReadiness(ctx, &views[i]); err != nil {
-			return nil, err
-		}
-	}
-	return views, nil
-}
-
-func (s *Service) TeacherKeyReview(ctx context.Context, keyID uuid.UUID) (APIKeyView, error) {
-	view, err := s.keyView(ctx, s.db.APIKey.Query().Where(
-		apikey.IDEQ(keyID),
-		apikey.StatusEQ(apikey.StatusPendingTeacher),
-	))
-	if err != nil {
-		return APIKeyView{}, err
-	}
-	if err := s.populateRouteReadiness(ctx, &view); err != nil {
-		return APIKeyView{}, err
-	}
-	return view, nil
-}
-
 func (s *Service) populateRouteReadiness(ctx context.Context, view *APIKeyView) error {
 	for i := range view.Models {
 		modelRow, err := s.db.Model.Query().Where(entmodel.ModelIDEQ(view.Models[i].ModelID)).Only(ctx)
 		if err != nil {
 			return domain.WrapError(domain.CodeDependencyUnavailable, "query model route identity", err)
 		}
-		ready, err := s.modelHasActiveRoute(ctx, modelRow.ID)
+		enriched, err := s.enrichStudentModelView(ctx, view.Models[i], modelRow.ID)
 		if err != nil {
 			return err
 		}
-		view.Models[i].RouteReady = ready
+		view.Models[i] = enriched
 	}
 	return nil
 }
 
-func (s *Service) ReviewKeyAsTeacher(ctx context.Context, teacherID, keyID uuid.UUID, approve bool, comment string, monthly ...int64) error {
-	action := "teacher_approved"
-	nextStatus := apikey.StatusApproved
-	auditAction := apikeyaudit.ActionTeacherApproved
-	if !approve {
-		action = "teacher_rejected"
-		nextStatus = apikey.StatusRejected
-		auditAction = apikeyaudit.ActionTeacherRejected
-	}
-	comment, err := ValidateComment(action, comment)
+func (s *Service) populateKeyAvailability(ctx context.Context, view *APIKeyView) error {
+	hasProvider, err := s.hasActiveProvider(ctx)
 	if err != nil {
-		return err
+		return domain.WrapError(domain.CodeDependencyUnavailable, "query active providers", err)
 	}
-	if approve {
-		if len(monthly) != 1 {
-			return domain.NewError(domain.CodeValidation, "monthly credits are required")
+	if !hasProvider {
+		view.RouteReady = false
+		for i := range view.Models {
+			view.Models[i].RouteReady = false
 		}
-		ownerID, approveErr := s.usage.ApproveKey(ctx, teacherID, keyID, monthly[0], comment)
-		if approveErr != nil {
-			var appErr *domain.Error
-			if errors.As(approveErr, &appErr) {
-				return approveErr
-			}
-			dependencyErr := domain.WrapError(domain.CodeDependencyUnavailable, "approve API key allocation", approveErr)
-			dependencyErr.Details = map[string]any{"operation": "api_key_approval", "state_changed": false}
-			return dependencyErr
-		}
-		s.publishKeyStatus(ctx, ownerID, keyID, string(apikey.StatusApproved), s.now().UTC())
 		return nil
 	}
-	tx, err := s.db.Tx(ctx)
-	if err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "start teacher review transaction", err)
+	if err := s.populateRouteReadiness(ctx, view); err != nil {
+		return err
 	}
-	defer func() { _ = tx.Rollback() }()
-	key, err := tx.APIKey.Query().Where(
-		apikey.IDEQ(keyID),
-		apikey.StatusEQ(apikey.StatusPendingTeacher),
-	).WithProject().WithModels(func(query *ent.APIKeyModelQuery) {
-		query.WithModel()
-	}).Only(ctx)
-	if ent.IsNotFound(err) {
-		return domain.NewError(domain.CodeInvalidTransition, "API key is no longer pending teacher review")
-	}
-	if err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "query API key", err)
-	}
-	if approve {
-		if len(key.Edges.Models) == 0 {
-			return domain.NewError(domain.CodeModelNotReady, "API key has no model whitelist")
-		}
-		notReady := make([]string, 0)
-		for _, link := range key.Edges.Models {
-			if link.Edges.Model == nil || link.Edges.Model.Status != entmodel.StatusActive {
-				if link.Edges.Model != nil {
-					notReady = append(notReady, link.Edges.Model.ModelID)
-				}
-				continue
-			}
-			ready, err := modelHasActiveRouteTx(ctx, tx, link.ModelID)
-			if err != nil {
-				return err
-			}
-			if !ready {
-				notReady = append(notReady, link.Edges.Model.ModelID)
-			}
-		}
-		if len(notReady) > 0 {
-			appErr := domain.NewError(domain.CodeModelNotReady, "one or more models are not ready")
-			appErr.Details = map[string]any{"model_ids": notReady}
-			return appErr
-		}
-		if key.Edges.Project == nil {
-			return domain.NewError(domain.CodeNotFound, "project not found")
-		}
-		quota := key.RequestedMonthlyCreditQuotaMilli
-		if key.MentorMonthlyCreditQuotaMilli != nil {
-			quota = *key.MentorMonthlyCreditQuotaMilli
-		}
-		if len(monthly) > 0 {
-			quota = monthly[0]
-		}
-		if quota < 0 || quota > 1_000_000_000_000 {
-			return domain.NewError(domain.CodeValidation, "monthly credits are out of range")
-		}
-		if _, err := tx.APIKey.UpdateOneID(keyID).SetMonthlyCreditQuotaMilli(quota).Save(ctx); err != nil {
-			return domain.WrapError(domain.CodeDependencyUnavailable, "set final key quota", err)
-		}
-		if err := ensureOrganizationMember(ctx, tx, key.Edges.Project.OrganizationID, key.OwnerUserID); err != nil {
-			return err
-		}
-		if err := ensureProjectMember(ctx, tx, key.ProjectID, key.OwnerUserID); err != nil {
-			return err
+	view.RouteReady = false
+	for _, model := range view.Models {
+		if model.Status == string(entmodel.StatusActive) && model.RouteReady {
+			view.RouteReady = true
+			return nil
 		}
 	}
-	updated, err := tx.APIKey.Update().Where(
-		apikey.IDEQ(keyID),
-		apikey.StatusEQ(apikey.StatusPendingTeacher),
-	).SetStatus(nextStatus).Save(ctx)
-	if err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "update teacher key review", err)
-	}
-	if updated != 1 {
-		return domain.NewError(domain.CodeInvalidTransition, "API key was reviewed concurrently")
-	}
-	audit := tx.APIKeyAudit.Create().
-		SetAPIKeyID(keyID).
-		SetActorUserID(teacherID).
-		SetAction(auditAction)
-	if comment != "" {
-		audit.SetComment(comment)
-	}
-	if _, err := audit.Save(ctx); err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "create teacher key audit", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "commit teacher key review", err)
-	}
-	s.publishKeyStatus(ctx, key.OwnerUserID, keyID, string(nextStatus), s.now().UTC())
 	return nil
 }
 
@@ -1241,35 +1291,39 @@ func ensureProjectMember(ctx context.Context, tx *ent.Tx, projectID, userID uuid
 }
 
 func (s *Service) modelHasActiveRoute(ctx context.Context, modelID uuid.UUID) (bool, error) {
-	exists, err := s.db.ModelBinding.Query().Where(
-		modelbinding.ModelIDEQ(modelID),
-		modelbinding.StatusEQ(modelbinding.StatusActive),
-		modelbinding.HasProviderWith(provider.StatusEQ(provider.StatusActive)),
-	).Exist(ctx)
-	if err != nil {
-		return false, domain.WrapError(domain.CodeDependencyUnavailable, "query model route", err)
-	}
-	return exists, nil
+	return catalog.ModelHasActiveRoute(ctx, s.db, modelID)
 }
 
 func modelHasActiveRouteTx(ctx context.Context, tx *ent.Tx, modelID uuid.UUID) (bool, error) {
-	exists, err := tx.ModelBinding.Query().Where(
-		modelbinding.ModelIDEQ(modelID),
-		modelbinding.StatusEQ(modelbinding.StatusActive),
-		modelbinding.HasProviderWith(provider.StatusEQ(provider.StatusActive)),
-	).Exist(ctx)
-	if err != nil {
-		return false, domain.WrapError(domain.CodeDependencyUnavailable, "query model route", err)
+	return catalog.ModelHasActiveRoute(ctx, tx.Client(), modelID)
+}
+
+func credentialIDString(value *uuid.UUID) *string {
+	if value == nil {
+		return nil
 	}
-	return exists, nil
+	text := value.String()
+	return &text
 }
 
 func providerView(row *ent.Provider) ProviderView {
 	return ProviderView{
 		ID: row.ID.String(), Name: row.Name, BaseURL: row.BaseURL,
-		CredentialConfigured: len(row.CredentialCiphertext) > 0,
+		CredentialConfigured: false,
 		Status:               string(row.Status), CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}
+}
+
+func providerViewWithCredentials(row *ent.Provider, credentials []*ent.ProviderCredential) ProviderView {
+	view := providerView(row)
+	view.Credentials = make([]ProviderCredentialView, 0, len(credentials))
+	for _, credential := range credentials {
+		view.Credentials = append(view.Credentials, providerCredentialView(credential))
+		if credential.Status == providercredential.StatusActive && len(credential.CredentialCiphertext) > 0 {
+			view.CredentialConfigured = true
+		}
+	}
+	return view
 }
 
 func (s *Service) bindingView(ctx context.Context, row *ent.ModelBinding) BindingView {
@@ -1277,12 +1331,19 @@ func (s *Service) bindingView(ctx context.Context, row *ent.ModelBinding) Bindin
 	if modelRow, err := s.db.Model.Get(ctx, row.ModelID); err == nil {
 		publicModelID = modelRow.ModelID
 	}
-	return BindingView{
+	view := BindingView{
 		ID: row.ID.String(), ModelID: publicModelID, ProviderID: row.ProviderID.String(),
+		CredentialID: credentialIDString(row.CredentialID),
 		UpstreamModelName: row.UpstreamModelName, Adapter: string(row.Adapter),
 		Priority: row.Priority, Status: string(row.Status),
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}
+	if row.CredentialID != nil {
+		if cred, err := s.db.ProviderCredential.Get(ctx, *row.CredentialID); err == nil {
+			view.CredentialLabel = cred.Label
+		}
+	}
+	return view
 }
 
 var allowedModelCapabilities = map[string]struct{}{"reasoning": {}, "vision": {}, "tool_calling": {}, "structured_output": {}, "web_search": {}, "coding": {}, "embeddings": {}, "rerank": {}, "realtime": {}, "image_generation": {}, "video_generation": {}, "speech_to_text": {}, "text_to_speech": {}}

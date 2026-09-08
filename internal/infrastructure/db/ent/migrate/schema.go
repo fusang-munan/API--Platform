@@ -305,35 +305,6 @@ var (
 		Columns:    MaintenanceStateColumns,
 		PrimaryKey: []*schema.Column{MaintenanceStateColumns[0]},
 	}
-	// MatrixModelCatalogColumns holds the columns for the "matrix_model_catalog" table.
-	MatrixModelCatalogColumns = []*schema.Column{
-		{Name: "id", Type: field.TypeUUID},
-		{Name: "created_at", Type: field.TypeTime},
-		{Name: "updated_at", Type: field.TypeTime},
-		{Name: "model_id", Type: field.TypeString, Unique: true, Size: 256, SchemaType: map[string]string{"postgres": "citext"}},
-		{Name: "description", Type: field.TypeString, Nullable: true, Size: 4096},
-		{Name: "owned_by", Type: field.TypeJSON},
-		{Name: "model_types", Type: field.TypeJSON},
-		{Name: "supported_endpoint_types", Type: field.TypeJSON},
-		{Name: "tags", Type: field.TypeJSON},
-		{Name: "raw_entries", Type: field.TypeJSON},
-		{Name: "status", Type: field.TypeEnum, Enums: []string{"active", "inactive"}, Default: "active"},
-		{Name: "last_seen_at", Type: field.TypeTime},
-		{Name: "synced_at", Type: field.TypeTime},
-	}
-	// MatrixModelCatalogTable holds the schema information for the "matrix_model_catalog" table.
-	MatrixModelCatalogTable = &schema.Table{
-		Name:       "matrix_model_catalog",
-		Columns:    MatrixModelCatalogColumns,
-		PrimaryKey: []*schema.Column{MatrixModelCatalogColumns[0]},
-		Indexes: []*schema.Index{
-			{
-				Name:    "matrixmodelcatalog_status_model_id",
-				Unique:  false,
-				Columns: []*schema.Column{MatrixModelCatalogColumns[10], MatrixModelCatalogColumns[3]},
-			},
-		},
-	}
 	// MentorProjectApplicationsColumns holds the columns for the "mentor_project_applications" table.
 	MentorProjectApplicationsColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeUUID},
@@ -409,6 +380,7 @@ var (
 		{Name: "is_common", Type: field.TypeBool, Default: false},
 		{Name: "status", Type: field.TypeEnum, Enums: []string{"pending_configuration", "active", "inactive"}, Default: "pending_configuration"},
 		{Name: "credit_multiplier_milli", Type: field.TypeInt64, Nullable: true},
+		{Name: "upstream_metadata", Type: field.TypeJSON},
 	}
 	// ModelsTable holds the schema information for the "models" table.
 	ModelsTable = &schema.Table{
@@ -439,6 +411,7 @@ var (
 		{Name: "status", Type: field.TypeEnum, Enums: []string{"active", "inactive"}, Default: "active"},
 		{Name: "model_id", Type: field.TypeUUID},
 		{Name: "provider_id", Type: field.TypeUUID},
+		{Name: "credential_id", Type: field.TypeUUID, Nullable: true},
 	}
 	// ModelBindingsTable holds the schema information for the "model_bindings" table.
 	ModelBindingsTable = &schema.Table{
@@ -457,6 +430,12 @@ var (
 				Columns:    []*schema.Column{ModelBindingsColumns[8]},
 				RefColumns: []*schema.Column{ProvidersColumns[0]},
 				OnDelete:   schema.NoAction,
+			},
+			{
+				Symbol:     "model_bindings_provider_credentials_model_bindings",
+				Columns:    []*schema.Column{ModelBindingsColumns[9]},
+				RefColumns: []*schema.Column{ProviderCredentialsColumns[0]},
+				OnDelete:   schema.SetNull,
 			},
 		},
 		Indexes: []*schema.Index{
@@ -655,7 +634,7 @@ var (
 		{Name: "name", Type: field.TypeString, Size: 128, SchemaType: map[string]string{"postgres": "citext"}},
 		{Name: "description", Type: field.TypeString, Nullable: true, Size: 1024},
 		{Name: "status", Type: field.TypeEnum, Enums: []string{"active", "inactive"}, Default: "active"},
-		{Name: "monthly_credit_quota_milli", Type: field.TypeInt64, Default: 20000000},
+		{Name: "monthly_credit_quota_milli", Type: field.TypeInt64, Default: 0},
 		{Name: "organization_id", Type: field.TypeUUID},
 	}
 	// ProjectsTable holds the schema information for the "projects" table.
@@ -798,7 +777,6 @@ var (
 		{Name: "updated_at", Type: field.TypeTime},
 		{Name: "name", Type: field.TypeString, Unique: true, Size: 128, SchemaType: map[string]string{"postgres": "citext"}},
 		{Name: "base_url", Type: field.TypeString, Size: 2048},
-		{Name: "credential_ciphertext", Type: field.TypeBytes},
 		{Name: "status", Type: field.TypeEnum, Enums: []string{"active", "inactive"}, Default: "active"},
 	}
 	// ProvidersTable holds the schema information for the "providers" table.
@@ -810,7 +788,94 @@ var (
 			{
 				Name:    "provider_status",
 				Unique:  false,
-				Columns: []*schema.Column{ProvidersColumns[6]},
+				Columns: []*schema.Column{ProvidersColumns[5]},
+			},
+		},
+	}
+	// ProviderCredentialsColumns holds the columns for the "provider_credentials" table.
+	ProviderCredentialsColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "created_at", Type: field.TypeTime},
+		{Name: "updated_at", Type: field.TypeTime},
+		{Name: "label", Type: field.TypeString, Size: 128, SchemaType: map[string]string{"postgres": "citext"}},
+		{Name: "group_hint", Type: field.TypeString, Nullable: true, Size: 128},
+		{Name: "credential_ciphertext", Type: field.TypeBytes},
+		{Name: "status", Type: field.TypeEnum, Enums: []string{"active", "inactive"}, Default: "active"},
+		{Name: "provider_id", Type: field.TypeUUID},
+	}
+	// ProviderCredentialsTable holds the schema information for the "provider_credentials" table.
+	ProviderCredentialsTable = &schema.Table{
+		Name:       "provider_credentials",
+		Columns:    ProviderCredentialsColumns,
+		PrimaryKey: []*schema.Column{ProviderCredentialsColumns[0]},
+		ForeignKeys: []*schema.ForeignKey{
+			{
+				Symbol:     "provider_credentials_providers_credentials",
+				Columns:    []*schema.Column{ProviderCredentialsColumns[7]},
+				RefColumns: []*schema.Column{ProvidersColumns[0]},
+				OnDelete:   schema.NoAction,
+			},
+		},
+		Indexes: []*schema.Index{
+			{
+				Name:    "providercredential_provider_id_label",
+				Unique:  true,
+				Columns: []*schema.Column{ProviderCredentialsColumns[7], ProviderCredentialsColumns[3]},
+			},
+			{
+				Name:    "providercredential_provider_id_status",
+				Unique:  false,
+				Columns: []*schema.Column{ProviderCredentialsColumns[7], ProviderCredentialsColumns[6]},
+			},
+		},
+	}
+	// ProviderModelCatalogColumns holds the columns for the "provider_model_catalog" table.
+	ProviderModelCatalogColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "created_at", Type: field.TypeTime},
+		{Name: "updated_at", Type: field.TypeTime},
+		{Name: "model_id", Type: field.TypeString, Size: 256, SchemaType: map[string]string{"postgres": "citext"}},
+		{Name: "display_name", Type: field.TypeString, Nullable: true, Size: 256},
+		{Name: "description", Type: field.TypeString, Nullable: true, Size: 4096},
+		{Name: "owned_by", Type: field.TypeString, Nullable: true, Size: 256},
+		{Name: "upstream_object", Type: field.TypeString, Nullable: true, Size: 64},
+		{Name: "upstream_created_at", Type: field.TypeString, Nullable: true, Size: 64},
+		{Name: "raw_entry", Type: field.TypeJSON},
+		{Name: "status", Type: field.TypeEnum, Enums: []string{"active", "inactive"}, Default: "active"},
+		{Name: "last_seen_at", Type: field.TypeTime},
+		{Name: "synced_at", Type: field.TypeTime},
+		{Name: "provider_id", Type: field.TypeUUID},
+		{Name: "credential_id", Type: field.TypeUUID},
+	}
+	// ProviderModelCatalogTable holds the schema information for the "provider_model_catalog" table.
+	ProviderModelCatalogTable = &schema.Table{
+		Name:       "provider_model_catalog",
+		Columns:    ProviderModelCatalogColumns,
+		PrimaryKey: []*schema.Column{ProviderModelCatalogColumns[0]},
+		ForeignKeys: []*schema.ForeignKey{
+			{
+				Symbol:     "provider_model_catalog_providers_model_catalog_entries",
+				Columns:    []*schema.Column{ProviderModelCatalogColumns[13]},
+				RefColumns: []*schema.Column{ProvidersColumns[0]},
+				OnDelete:   schema.NoAction,
+			},
+			{
+				Symbol:     "provider_model_catalog_provider_credentials_model_catalog_entries",
+				Columns:    []*schema.Column{ProviderModelCatalogColumns[14]},
+				RefColumns: []*schema.Column{ProviderCredentialsColumns[0]},
+				OnDelete:   schema.NoAction,
+			},
+		},
+		Indexes: []*schema.Index{
+			{
+				Name:    "providermodelcatalog_credential_id_model_id",
+				Unique:  true,
+				Columns: []*schema.Column{ProviderModelCatalogColumns[14], ProviderModelCatalogColumns[3]},
+			},
+			{
+				Name:    "providermodelcatalog_provider_id_status_model_id",
+				Unique:  false,
+				Columns: []*schema.Column{ProviderModelCatalogColumns[13], ProviderModelCatalogColumns[10], ProviderModelCatalogColumns[3]},
 			},
 		},
 	}
@@ -840,6 +905,46 @@ var (
 				Name:    "quotaadjustmentaudit_actor_user_id_created_at",
 				Unique:  false,
 				Columns: []*schema.Column{QuotaAdjustmentAuditsColumns[4], QuotaAdjustmentAuditsColumns[1]},
+			},
+		},
+	}
+	// StudentModelLibrariesColumns holds the columns for the "student_model_libraries" table.
+	StudentModelLibrariesColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "created_at", Type: field.TypeTime},
+		{Name: "updated_at", Type: field.TypeTime},
+		{Name: "model_id", Type: field.TypeUUID},
+		{Name: "user_id", Type: field.TypeUUID},
+	}
+	// StudentModelLibrariesTable holds the schema information for the "student_model_libraries" table.
+	StudentModelLibrariesTable = &schema.Table{
+		Name:       "student_model_libraries",
+		Columns:    StudentModelLibrariesColumns,
+		PrimaryKey: []*schema.Column{StudentModelLibrariesColumns[0]},
+		ForeignKeys: []*schema.ForeignKey{
+			{
+				Symbol:     "student_model_libraries_models_student_library_entries",
+				Columns:    []*schema.Column{StudentModelLibrariesColumns[3]},
+				RefColumns: []*schema.Column{ModelsColumns[0]},
+				OnDelete:   schema.NoAction,
+			},
+			{
+				Symbol:     "student_model_libraries_users_model_library_entries",
+				Columns:    []*schema.Column{StudentModelLibrariesColumns[4]},
+				RefColumns: []*schema.Column{UsersColumns[0]},
+				OnDelete:   schema.NoAction,
+			},
+		},
+		Indexes: []*schema.Index{
+			{
+				Name:    "studentmodellibrary_user_id_model_id",
+				Unique:  true,
+				Columns: []*schema.Column{StudentModelLibrariesColumns[4], StudentModelLibrariesColumns[3]},
+			},
+			{
+				Name:    "studentmodellibrary_user_id",
+				Unique:  false,
+				Columns: []*schema.Column{StudentModelLibrariesColumns[4]},
 			},
 		},
 	}
@@ -876,7 +981,6 @@ var (
 		GatewayCallsTable,
 		GatewayCallAttemptsTable,
 		MaintenanceStateTable,
-		MatrixModelCatalogTable,
 		MentorProjectApplicationsTable,
 		ModelsTable,
 		ModelBindingsTable,
@@ -890,7 +994,10 @@ var (
 		ProjectMonthCreditBucketsTable,
 		PromptAccessAuditsTable,
 		ProvidersTable,
+		ProviderCredentialsTable,
+		ProviderModelCatalogTable,
 		QuotaAdjustmentAuditsTable,
+		StudentModelLibrariesTable,
 		UsersTable,
 	}
 )
@@ -932,9 +1039,6 @@ func init() {
 	MaintenanceStateTable.Annotation = &entsql.Annotation{
 		Table: "maintenance_state",
 	}
-	MatrixModelCatalogTable.Annotation = &entsql.Annotation{
-		Table: "matrix_model_catalog",
-	}
 	MentorProjectApplicationsTable.ForeignKeys[0].RefTable = ProjectsTable
 	MentorProjectApplicationsTable.ForeignKeys[1].RefTable = UsersTable
 	MentorProjectApplicationsTable.ForeignKeys[2].RefTable = UsersTable
@@ -953,6 +1057,7 @@ func init() {
 	}
 	ModelBindingsTable.ForeignKeys[0].RefTable = ModelsTable
 	ModelBindingsTable.ForeignKeys[1].RefTable = ProvidersTable
+	ModelBindingsTable.ForeignKeys[2].RefTable = ProviderCredentialsTable
 	ModelBindingsTable.Annotation = &entsql.Annotation{
 		Table: "model_bindings",
 	}
@@ -993,8 +1098,22 @@ func init() {
 	ProvidersTable.Annotation = &entsql.Annotation{
 		Table: "providers",
 	}
+	ProviderCredentialsTable.ForeignKeys[0].RefTable = ProvidersTable
+	ProviderCredentialsTable.Annotation = &entsql.Annotation{
+		Table: "provider_credentials",
+	}
+	ProviderModelCatalogTable.ForeignKeys[0].RefTable = ProvidersTable
+	ProviderModelCatalogTable.ForeignKeys[1].RefTable = ProviderCredentialsTable
+	ProviderModelCatalogTable.Annotation = &entsql.Annotation{
+		Table: "provider_model_catalog",
+	}
 	QuotaAdjustmentAuditsTable.Annotation = &entsql.Annotation{
 		Table: "quota_adjustment_audits",
+	}
+	StudentModelLibrariesTable.ForeignKeys[0].RefTable = ModelsTable
+	StudentModelLibrariesTable.ForeignKeys[1].RefTable = UsersTable
+	StudentModelLibrariesTable.Annotation = &entsql.Annotation{
+		Table: "student_model_libraries",
 	}
 	UsersTable.Annotation = &entsql.Annotation{
 		Table: "users",

@@ -49,6 +49,8 @@ type Model struct {
 	Status model.Status `json:"status,omitempty"`
 	// CreditMultiplierMilli holds the value of the "credit_multiplier_milli" field.
 	CreditMultiplierMilli *int64 `json:"credit_multiplier_milli,omitempty"`
+	// UpstreamMetadata holds the value of the "upstream_metadata" field.
+	UpstreamMetadata map[string]interface{} `json:"upstream_metadata,omitempty"`
 	// Edges holds the relations/edges for other nodes in the graph.
 	// The values are being populated by the ModelQuery when eager-loading is set.
 	Edges        ModelEdges `json:"edges"`
@@ -61,9 +63,11 @@ type ModelEdges struct {
 	Bindings []*ModelBinding `json:"bindings,omitempty"`
 	// APIKeyModels holds the value of the api_key_models edge.
 	APIKeyModels []*APIKeyModel `json:"api_key_models,omitempty"`
+	// StudentLibraryEntries holds the value of the student_library_entries edge.
+	StudentLibraryEntries []*StudentModelLibrary `json:"student_library_entries,omitempty"`
 	// loadedTypes holds the information for reporting if a
 	// type was loaded (or requested) in eager-loading or not.
-	loadedTypes [2]bool
+	loadedTypes [3]bool
 }
 
 // BindingsOrErr returns the Bindings value or an error if the edge
@@ -84,12 +88,21 @@ func (e ModelEdges) APIKeyModelsOrErr() ([]*APIKeyModel, error) {
 	return nil, &NotLoadedError{edge: "api_key_models"}
 }
 
+// StudentLibraryEntriesOrErr returns the StudentLibraryEntries value or an error if the edge
+// was not loaded in eager-loading.
+func (e ModelEdges) StudentLibraryEntriesOrErr() ([]*StudentModelLibrary, error) {
+	if e.loadedTypes[2] {
+		return e.StudentLibraryEntries, nil
+	}
+	return nil, &NotLoadedError{edge: "student_library_entries"}
+}
+
 // scanValues returns the types for scanning values from sql.Rows.
 func (*Model) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
-		case model.FieldCapabilities, model.FieldInputModalities, model.FieldOutputModalities:
+		case model.FieldCapabilities, model.FieldInputModalities, model.FieldOutputModalities, model.FieldUpstreamMetadata:
 			values[i] = new([]byte)
 		case model.FieldIsCommon:
 			values[i] = new(sql.NullBool)
@@ -223,6 +236,14 @@ func (_m *Model) assignValues(columns []string, values []any) error {
 				_m.CreditMultiplierMilli = new(int64)
 				*_m.CreditMultiplierMilli = value.Int64
 			}
+		case model.FieldUpstreamMetadata:
+			if value, ok := values[i].(*[]byte); !ok {
+				return fmt.Errorf("unexpected type %T for field upstream_metadata", values[i])
+			} else if value != nil && len(*value) > 0 {
+				if err := json.Unmarshal(*value, &_m.UpstreamMetadata); err != nil {
+					return fmt.Errorf("unmarshal field upstream_metadata: %w", err)
+				}
+			}
 		default:
 			_m.selectValues.Set(columns[i], values[i])
 		}
@@ -244,6 +265,11 @@ func (_m *Model) QueryBindings() *ModelBindingQuery {
 // QueryAPIKeyModels queries the "api_key_models" edge of the Model entity.
 func (_m *Model) QueryAPIKeyModels() *APIKeyModelQuery {
 	return NewModelClient(_m.config).QueryAPIKeyModels(_m)
+}
+
+// QueryStudentLibraryEntries queries the "student_library_entries" edge of the Model entity.
+func (_m *Model) QueryStudentLibraryEntries() *StudentModelLibraryQuery {
+	return NewModelClient(_m.config).QueryStudentLibraryEntries(_m)
 }
 
 // Update returns a builder for updating this Model.
@@ -323,6 +349,9 @@ func (_m *Model) String() string {
 		builder.WriteString("credit_multiplier_milli=")
 		builder.WriteString(fmt.Sprintf("%v", *v))
 	}
+	builder.WriteString(", ")
+	builder.WriteString("upstream_metadata=")
+	builder.WriteString(fmt.Sprintf("%v", _m.UpstreamMetadata))
 	builder.WriteByte(')')
 	return builder.String()
 }

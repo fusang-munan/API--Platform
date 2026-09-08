@@ -20,12 +20,16 @@ func TestBootstrapTestAccountsCreatesMissingUser(t *testing.T) {
 	mock.ExpectQuery(`SELECT .* FROM "users" WHERE "users"\."email" = \$1 LIMIT 2`).
 		WithArgs("student.one@example.com").
 		WillReturnRows(sqlmock.NewRows(user.Columns))
+	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO "users"`).
 		WithArgs(
 			sqlmock.AnyArg(), sqlmock.AnyArg(), "Student One", "student.one@example.com",
 			sqlmock.AnyArg(), user.RoleStudent, user.StatusActive, sqlmock.AnyArg(),
 		).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO "student_profiles"`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
 
 	err := service.BootstrapTestAccounts(context.Background(), []BootstrapAccount{{
 		Role: string(user.RoleStudent), Name: "Student One", Email: "student.one@example.com", Password: "student-password-one",
@@ -61,19 +65,31 @@ func TestBootstrapTestAccountsLeavesMatchingExistingUserUnchanged(t *testing.T) 
 }
 
 func TestPrepareBootstrapAccountNormalizesConfiguredUser(t *testing.T) {
-	account, role, err := prepareBootstrapAccount(BootstrapAccount{
+	account, err := prepareBootstrapAccount(BootstrapAccount{
 		Role: "student", Name: " Student One ", Email: " STUDENT.ONE@EXAMPLE.COM ", Password: "student-password-one",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if role != user.RoleStudent || account.Name != "Student One" || account.Email != "student.one@example.com" {
-		t.Fatalf("unexpected prepared bootstrap account: %#v, role=%q", account, role)
+	if account.WithMentorProfile || account.Name != "Student One" || account.Email != "student.one@example.com" {
+		t.Fatalf("unexpected prepared bootstrap account: %#v", account)
+	}
+}
+
+func TestPrepareBootstrapAccountMarksMentorBootstrap(t *testing.T) {
+	account, err := prepareBootstrapAccount(BootstrapAccount{
+		Role: "mentor", Name: "Mentor One", Email: "mentor.one@example.com", Password: "mentor-password-one",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !account.WithMentorProfile {
+		t.Fatal("expected mentor bootstrap to request mentor profile")
 	}
 }
 
 func TestPrepareBootstrapAccountRejectsUnsupportedRole(t *testing.T) {
-	_, _, err := prepareBootstrapAccount(BootstrapAccount{
+	_, err := prepareBootstrapAccount(BootstrapAccount{
 		Role: "teacher", Name: "Teacher", Email: "teacher@example.com", Password: "teacher-password-one",
 	})
 	if err == nil {
@@ -81,15 +97,15 @@ func TestPrepareBootstrapAccountRejectsUnsupportedRole(t *testing.T) {
 	}
 }
 
-func TestValidateExistingBootstrapAccountRejectsRoleConflict(t *testing.T) {
-	err := validateExistingBootstrapAccount(&ent.User{Role: user.RoleMentor}, user.RoleStudent)
+func TestValidateExistingBootstrapAccountRejectsTeacherConflict(t *testing.T) {
+	err := validateExistingBootstrapAccount(&ent.User{Role: user.RoleTeacher}, false)
 	if err == nil {
-		t.Fatal("expected role conflict to fail")
+		t.Fatal("expected teacher conflict to fail")
 	}
 }
 
-func TestValidateExistingBootstrapAccountAcceptsMatchingRole(t *testing.T) {
-	if err := validateExistingBootstrapAccount(&ent.User{Role: user.RoleMentor}, user.RoleMentor); err != nil {
+func TestValidateExistingBootstrapAccountAcceptsLegacyMentor(t *testing.T) {
+	if err := validateExistingBootstrapAccount(&ent.User{Role: user.RoleMentor}, true); err != nil {
 		t.Fatal(err)
 	}
 }

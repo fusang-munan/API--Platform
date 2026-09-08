@@ -30,13 +30,16 @@ func (Provider) Fields() []ent.Field {
 			SchemaType(map[string]string{dialect.Postgres: "citext"}).
 			Unique(),
 		field.String("base_url").NotEmpty().MaxLen(2048),
-		field.Bytes("credential_ciphertext").NotEmpty().Sensitive(),
 		field.Enum("status").Values("active", "inactive").Default("active"),
 	}
 }
 
 func (Provider) Edges() []ent.Edge {
-	return []ent.Edge{edge.To("model_bindings", ModelBinding.Type)}
+	return []ent.Edge{
+		edge.To("credentials", ProviderCredential.Type),
+		edge.To("model_bindings", ModelBinding.Type),
+		edge.To("model_catalog_entries", ProviderModelCatalog.Type),
+	}
 }
 
 func (Provider) Indexes() []ent.Index {

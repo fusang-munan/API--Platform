@@ -377,6 +377,19 @@ func TestExtractInputSnapshotUsesLastUserText(t *testing.T) {
 	}
 }
 
+func TestExtractInputSnapshotResponsesMessageInput(t *testing.T) {
+	t.Parallel()
+	replay, err := captureBody(io.NopCloser(strings.NewReader(`{"model":"gpt-5.6-luna","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"请联网检索隐式规划论文"}]}]}`)), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replay.Close()
+	text, source := extractInputSnapshot("/v1/responses", "application/json", replay)
+	if text != "请联网检索隐式规划论文" || source != "input_text" {
+		t.Fatalf("unexpected snapshot %q (%s)", text, source)
+	}
+}
+
 func TestExtractInputSnapshotSkipsUnmonitoredRoutes(t *testing.T) {
 	t.Parallel()
 	for _, path := range []string{"/v1/embeddings", "/v1/moderations", "/v2/rerank", "/v1/responses/compact", "/v1/images/variations", "/v1/audio/transcriptions", "/v1/audio/translations"} {

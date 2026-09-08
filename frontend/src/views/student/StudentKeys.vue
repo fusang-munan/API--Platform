@@ -1,39 +1,293 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { studentAPI } from '../../api/student'
-import type { ApiKey, Model, Organization, Project, RequestedModel } from '../../api/types'
+import type { ApiKey, Model, Organization, RequestedModel, StudentProject } from '../../api/types'
 import { APIError } from '../../api/client'
 import StatusProgress from '../../components/StatusProgress.vue'
 import StatusBadge from '../../components/StatusBadge.vue'
 import AppDialog from '../../components/AppDialog.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
+import StudentHarnessConfig from '../../components/StudentHarnessConfig.vue'
 import { useLoadState } from '../../composables/useLoadState'
 import { useToast } from '../../composables/useToast'
 import { changedApiKeyID } from '../../utils/keyStatusEvents'
+import { sortModelsByRecency } from '../../utils/modelSort'
+import { mergeStudentPlazaModels } from '../../utils/studentModels'
+import { harnessDialogTitle, keyHarnessSupport } from '../../utils/studentHarnessConfig'
 
-const orgs=ref<Organization[]>([]),projects=ref<Project[]>([]),models=ref<Model[]>([]),keys=ref<ApiKey[]>([]),detail=ref<ApiKey|null>(null),secret=ref(''),copied=ref(false),claimConfirm=ref<ApiKey|null>(null),modelDialog=ref(false),marketOpen=ref(false),error=ref(''),modelQuery=ref(''),marketPage=ref(1),nameTouched=ref(false)
-const toast=useToast(),loadState=useLoadState()
-const form=reactive({organization_id:'',project_id:'',models:[] as RequestedModel[],name:'',requested_monthly_credits:'2000.000'})
-const custom=reactive({model_id:'',display_name:''})
-const selectedKeys=computed(()=>new Set(form.models.map(model=>model.model_id.toLowerCase())))
-const commonModels=computed(()=>models.value.filter(model=>model.is_common))
-const filteredModels=computed(()=>models.value.filter(model=>!modelQuery.value||`${model.display_name} ${model.model_id} ${model.capabilities.join(' ')}`.toLowerCase().includes(modelQuery.value.toLowerCase())))
-const pageSize=10,totalPages=computed(()=>Math.max(1,Math.ceil(filteredModels.value.length/pageSize))),pageModels=computed(()=>filteredModels.value.slice((marketPage.value-1)*pageSize,marketPage.value*pageSize))
-const canSubmit=computed(()=>Boolean(form.organization_id&&form.project_id&&form.name.trim()&&form.requested_monthly_credits&&form.models.length>0&&form.models.length<=100))
-watch(()=>custom.model_id,value=>{if(!nameTouched.value)custom.display_name=value});watch(modelQuery,()=>marketPage.value=1)
-async function load(){await loadState.run(async()=>{try{[orgs.value,models.value,keys.value]=await Promise.all([studentAPI.organizations(),studentAPI.models(),studentAPI.keys()]);error.value=''}catch(caught){error.value=msg(caught)}})}
-async function chooseOrg(){if(form.models.length&&!confirm('切换组织将清空项目和已选模型，是否继续？'))return;form.project_id='';form.models=[];projects.value=form.organization_id?await studentAPI.projects(form.organization_id):[]}
-function selected(modelID:string){return selectedKeys.value.has(modelID.toLowerCase())}
-function toggleModel(model:Model){const index=form.models.findIndex(value=>value.model_id.toLowerCase()===model.model_id.toLowerCase());if(index>=0)form.models.splice(index,1);else if(form.models.length<100)form.models.push({model_id:model.model_id})}
-function resetCustom(){Object.assign(custom,{model_id:'',display_name:''});nameTouched.value=false}
-function acceptModel(){const modelID=custom.model_id.trim();if(!modelID){error.value='模型 ID 必填';return}const existing=models.value.find(model=>model.model_id.toLowerCase()===modelID.toLowerCase());if(existing){toggleModel(existing)}else if(!selected(modelID)&&form.models.length<100){form.models.push({model_id:modelID,...(custom.display_name.trim()?{display_name:custom.display_name.trim()}:{})})}modelDialog.value=false;resetCustom()}
-async function submit(){if(!canSubmit.value)return;try{await studentAPI.submit({...form});Object.assign(form,{organization_id:'',project_id:'',models:[],name:'',requested_monthly_credits:'2000.000'});projects.value=[];await load();toast.success('密钥申请已提交')}catch(caught){error.value=msg(caught)}}
-async function show(id:string){try{detail.value=await studentAPI.key(id);secret.value='';copied.value=false}catch(caught){error.value=msg(caught)}}
-async function claim(){if(!claimConfirm.value)return;try{const result=await studentAPI.claim(claimConfirm.value.id);secret.value=result.api_key;detail.value=claimConfirm.value;claimConfirm.value=null;await load()}catch(caught){error.value=msg(caught)}}
-async function copy(){try{await navigator.clipboard.writeText(secret.value);copied.value=true;toast.success('已复制密钥')}catch{toast.error('复制失败，请手动复制')}}
-function closeSecret(){if(secret.value&&!copied.value&&!confirm('密钥尚未复制，关闭后无法再次查看。确定关闭？'))return;secret.value='';detail.value=null}
-async function refresh(event:Event){const payload=(event as CustomEvent).detail,changedID=payload?.event==='api_key.status_changed'?changedApiKeyID(keys.value,payload.data):null;await load();if(changedID)await show(changedID)}
-function msg(caught:unknown){return caught instanceof APIError?caught.message:'请求失败，请稍后重试'}
-onMounted(()=>{void load();window.addEventListener('nebula:refresh',refresh)});onBeforeUnmount(()=>window.removeEventListener('nebula:refresh',refresh))
+const orgs = ref<Organization[]>([])
+const projects = ref<StudentProject[]>([])
+const models = ref<Model[]>([])
+const keys = ref<ApiKey[]>([])
+const detail = ref<ApiKey | null>(null)
+const claimConfirm = ref<ApiKey | null>(null)
+const withdrawConfirm = ref<ApiKey | null>(null)
+const configKey = ref<ApiKey | null>(null)
+const regeneratingId = ref('')
+const error = ref('')
+const modelQuery = ref('')
+const toast = useToast()
+const loadState = useLoadState()
+const form = reactive({ organization_id: '', project_id: '', models: [] as RequestedModel[], name: '', requested_monthly_credits: '200.000' })
+
+const selectedKeys = computed(() => new Set(form.models.map(model => model.model_id.toLowerCase())))
+const activeLibrary = computed(() => sortModelsByRecency(models.value.filter(model => model.status === 'active' && model.route_ready)))
+const keyDisplayStatus = (key: ApiKey) => {
+  if (key.status === 'active' && !key.route_ready) return 'inactive'
+  if (key.status === 'rejected' && key.audits?.some(audit => audit.action === 'student_withdrawn')) return 'withdrawn'
+  return key.status
+}
+const canWithdraw = (key: ApiKey) => ['pending_mentor', 'pending_teacher'].includes(key.status)
+const filteredModels = computed(() => activeLibrary.value.filter(model =>
+  !modelQuery.value || `${model.display_name} ${model.model_id} ${model.capabilities.join(' ')}`.toLowerCase().includes(modelQuery.value.toLowerCase()),
+))
+const liveKeyStatuses = new Set<ApiKey['status']>(['pending_mentor', 'pending_teacher', 'approved', 'active', 'inactive'])
+const blockedProjectIds = computed(() => new Set(keys.value.filter(key => liveKeyStatuses.has(key.status)).map(key => key.project.id)))
+const selectableProjects = computed(() => projects.value.filter(project =>
+  project.status === 'active' && !blockedProjectIds.value.has(project.id),
+))
+const canSubmit = computed(() => Boolean(form.organization_id && form.project_id && form.name.trim() && form.requested_monthly_credits && form.models.length > 0 && form.models.length <= 100))
+const hasMaterializedKey = (key: ApiKey) => Boolean(key.api_key && ['active', 'inactive'].includes(key.status))
+const keySupportsHarness = (key: ApiKey) => {
+  const support = keyHarnessSupport(key.models)
+  return support.codex || support.claude
+}
+const harnessTitle = computed(() => harnessDialogTitle(keyHarnessSupport(configKey.value?.models ?? [])))
+const harnessWide = computed(() => {
+  const support = keyHarnessSupport(configKey.value?.models ?? [])
+  return support.codex && support.claude
+})
+
+function openHarness(key: ApiKey) {
+  configKey.value = key
+}
+
+function closeHarness() {
+  configKey.value = null
+}
+
+async function load() {
+  await loadState.run(async () => {
+    try {
+      [orgs.value, keys.value] = await Promise.all([studentAPI.organizations(), studentAPI.keys()])
+      models.value = mergeStudentPlazaModels(await studentAPI.models())
+      error.value = ''
+    } catch (caught) {
+      error.value = msg(caught)
+    }
+  })
+}
+
+async function chooseOrg() {
+  if (form.models.length && !confirm('切换组织将清空项目和已选模型，是否继续？')) return
+  form.project_id = ''
+  form.models = []
+  projects.value = form.organization_id ? await studentAPI.projects(form.organization_id) : []
+}
+
+function selected(modelID: string) { return selectedKeys.value.has(modelID.toLowerCase()) }
+
+function toggleModel(model: Model) {
+  const index = form.models.findIndex(value => value.model_id.toLowerCase() === model.model_id.toLowerCase())
+  if (index >= 0) form.models.splice(index, 1)
+  else if (form.models.length < 100) form.models.push({ model_id: model.model_id })
+}
+
+async function submit() {
+  if (!canSubmit.value) return
+  try {
+    await studentAPI.submit({ ...form })
+    Object.assign(form, { organization_id: '', project_id: '', models: [], name: '', requested_monthly_credits: '200.000' })
+    projects.value = []
+    await load()
+    toast.success('密钥申请已提交')
+  } catch (caught) {
+    error.value = msg(caught)
+  }
+}
+
+async function show(id: string) {
+  try {
+    detail.value = await studentAPI.key(id)
+  } catch (caught) {
+    error.value = msg(caught)
+  }
+}
+
+async function claim() {
+  if (!claimConfirm.value) return
+  const keyId = claimConfirm.value.id
+  try {
+    await studentAPI.claim(keyId)
+    claimConfirm.value = null
+    await load()
+    detail.value = await studentAPI.key(keyId)
+    toast.success('密钥已启用，可随时查看与复制')
+  } catch (caught) {
+    error.value = msg(caught)
+  }
+}
+
+async function withdraw() {
+  if (!withdrawConfirm.value) return
+  const keyId = withdrawConfirm.value.id
+  try {
+    await studentAPI.withdraw(keyId)
+    withdrawConfirm.value = null
+    detail.value = null
+    await load()
+    toast.success('申请已撤回')
+  } catch (caught) {
+    error.value = msg(caught)
+  }
+}
+
+async function regenerate(key: ApiKey) {
+  if (!confirm('重新生成会使旧密钥立即失效，需在所有客户端更新为新密钥。继续？')) return
+  regeneratingId.value = key.id
+  try {
+    const result = await studentAPI.regenerate(key.id)
+    await load()
+    detail.value = keys.value.find(item => item.id === key.id) ?? { ...key, api_key: result.api_key, key_prefix: result.key_prefix, status: key.status }
+    toast.success('密钥已重新生成')
+  } catch (caught) {
+    error.value = msg(caught)
+  } finally {
+    regeneratingId.value = ''
+  }
+}
+
+async function copy(text: string) {
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    toast.success('已复制密钥')
+  } catch {
+    toast.error('复制失败，请手动复制')
+  }
+}
+
+async function refresh(event: Event) {
+  const payload = (event as CustomEvent).detail
+  const changedID = payload?.event === 'api_key.status_changed' ? changedApiKeyID(keys.value, payload.data) : null
+  await load()
+  if (changedID) await show(changedID)
+}
+
+function msg(caught: unknown) { return caught instanceof APIError ? caught.message : '请求失败，请稍后重试' }
+
+onMounted(() => {
+  void load()
+  window.addEventListener('nebula:refresh', refresh)
+})
+onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
 </script>
-<template><section class="page"><div class="page-heading"><div><p class="eyebrow">STUDENT</p><h1>申请密钥</h1><p class="muted">提交模型白名单与月度 credit 额度申请。</p></div><button class="button secondary" @click="load">刷新</button></div><p v-if="error" class="error banner">{{error}}</p><LoadingRegion :initial-loading="loadState.initialLoading.value" :refreshing="loadState.refreshing.value" variant="split" label="正在加载申请"><div class="grid two"><section class="panel"><h2>新申请</h2><form @submit.prevent="submit"><label>1. 组织<select v-model="form.organization_id" @change="chooseOrg"><option value="">请选择</option><option v-for="org in orgs" :key="org.id" :value="org.id">{{org.name}}</option></select></label><label>2. 项目<select v-model="form.project_id" :disabled="!form.organization_id"><option value="">请选择</option><option v-for="project in projects" :key="project.id" :value="project.id" :disabled="project.status!=='active'||!project.has_mentor">{{project.name}} · 项目额度 {{project.monthly_credit_quota}}</option></select></label><fieldset :disabled="!form.project_id"><legend>3. 模型白名单（{{form.models.length}}/100）</legend><input v-model="modelQuery" placeholder="搜索模型" @click="marketOpen=true"><div class="model-quick-list"><div v-for="model in commonModels" :key="model.model_id" class="list-row"><div><strong>{{model.display_name}}</strong><p class="muted">{{model.model_id}} · {{model.credit_multiplier??'未配置'}}x</p></div><button type="button" class="button ghost" @click="toggleModel(model)">{{selected(model.model_id)?'取消':'选择'}}</button></div></div><div class="chip-list"><span v-for="model in form.models" :key="model.model_id" class="chip">{{model.display_name||model.model_id}}</span></div><button type="button" class="button secondary" @click="modelDialog=true;resetCustom()">申请新模型</button></fieldset><label>4. Key 名称<input v-model="form.name" maxlength="128" required></label><label>5. 申请月额度（credits）<input v-model="form.requested_monthly_credits" inputmode="decimal" required><small class="muted">导师初审和老师终审时可调整；按北京时间自然月刷新。</small></label><button class="button primary wide" :disabled="!canSubmit">提交申请</button></form></section><section class="panel"><h2>我的申请</h2><article v-for="key in keys" :key="key.id" class="key-card"><div class="row"><div><strong>{{key.name}}</strong><p class="muted">{{key.project.name}} · 申请 {{key.requested_monthly_credits}} credits</p></div><StatusBadge :status="key.status"/></div><StatusProgress :current="key.progress.current" :completed="key.progress.completed_steps"/><div class="actions"><button class="button ghost" @click="show(key.id)">审核状态</button><button v-if="key.status==='approved'" class="button primary" @click="claimConfirm=key">一次性领取</button></div></article></section></div></LoadingRegion><AppDialog :open="marketOpen" title="选择模型广场模型" wide @update:open="marketOpen=$event"><input v-model="modelQuery" autofocus placeholder="名称、模型 ID 或能力"><div v-for="model in pageModels" :key="model.model_id" class="list-row"><div><strong>{{model.display_name}}</strong><p class="muted">{{model.model_id}} · {{model.credit_multiplier??'未配置'}}x</p></div><button type="button" class="button ghost" @click="toggleModel(model)">{{selected(model.model_id)?'取消':'选择'}}</button></div><div class="pagination"><button class="button ghost" :disabled="marketPage<=1" @click="marketPage--">←</button><span>{{marketPage}} / {{totalPages}}</span><button class="button ghost" :disabled="marketPage>=totalPages" @click="marketPage++">→</button></div></AppDialog><AppDialog :open="modelDialog" title="申请新模型" @update:open="modelDialog=$event"><form @submit.prevent="acceptModel"><div class="grid two"><label>模型 ID<input v-model="custom.model_id" required></label><label>模型名称（选填）<input v-model="custom.display_name" @input="nameTouched=true"></label></div><div class="actions"><button class="button primary">加入白名单</button></div></form></AppDialog><AppDialog :open="Boolean(claimConfirm)" title="确认一次性领取" @update:open="claimConfirm=$event?claimConfirm:null"><p>完整 API Key 仅显示一次。</p><button class="button primary" @click="claim">确认领取</button></AppDialog><AppDialog :open="Boolean(detail)" :title="secret?'立即保存 API Key':'申请详情'" @update:open="secret?closeSecret():detail=null"><template v-if="secret"><p class="secret">{{secret}}</p><button class="button secondary" @click="copy">{{copied?'已复制':'复制密钥'}}</button></template><template v-else-if="detail"><StatusProgress :current="detail.progress.current" :completed="detail.progress.completed_steps"/><p>学生申请 {{detail.requested_monthly_credits}} · 导师审核 {{detail.mentor_monthly_credits??'—'}} · 最终额度 {{detail.monthly_credits??'—'}} credits</p><p>{{detail.models.map(model=>`${model.model_id} (${model.credit_multiplier??'未配置'}x)`).join('、')}}</p></template></AppDialog></section></template>
+
+<template>
+  <section class="page">
+    <div class="page-heading">
+      <div>
+        <p class="eyebrow">STUDENT</p>
+        <h1>申请密钥</h1>
+      </div>
+      <button class="button secondary" @click="load">刷新</button>
+    </div>
+    <p v-if="error" class="error banner">{{ error }}</p>
+    <LoadingRegion :initial-loading="loadState.initialLoading.value" :refreshing="loadState.refreshing.value" variant="split" label="正在加载申请">
+      <div class="grid two">
+        <section class="panel">
+          <h2>新申请</h2>
+          <form @submit.prevent="submit">
+            <label>1. 组织<select v-model="form.organization_id" @change="chooseOrg"><option value="">请选择</option><option v-for="org in orgs" :key="org.id" :value="org.id">{{ org.name }}</option></select></label>
+            <label>2. 项目<select v-model="form.project_id" :disabled="!form.organization_id"><option value="">请选择</option><option v-for="project in selectableProjects" :key="project.id" :value="project.id">{{ project.name }}</option></select></label>
+            <fieldset :disabled="!form.project_id">
+              <legend>3. 模型白名单（{{ form.models.length }}/100）</legend>
+              <template v-if="activeLibrary.length">
+                <input v-model="modelQuery" placeholder="搜索我的模型">
+                <div class="model-quick-list">
+                  <div v-for="model in filteredModels" :key="model.model_id" class="list-row">
+                    <div><strong>{{ model.display_name }}</strong><p class="muted">{{ model.model_id }} · {{ model.credit_multiplier ?? '未配置' }}x</p></div>
+                    <button type="button" class="button ghost" @click="toggleModel(model)">{{ selected(model.model_id) ? '取消' : '选择' }}</button>
+                  </div>
+                </div>
+                <div class="chip-list"><span v-for="model in form.models" :key="model.model_id" class="chip">{{ model.model_id }}</span></div>
+              </template>
+            </fieldset>
+            <label>4. Key 名称<input v-model="form.name" maxlength="128" required></label>
+            <label>5. 个人申请月额度（credits）<input v-model="form.requested_monthly_credits" inputmode="decimal" required></label>
+            <button class="button primary wide" :disabled="!canSubmit">提交申请</button>
+          </form>
+        </section>
+        <section class="panel">
+          <h2>我的申请</h2>
+          <p v-if="!keys.length" class="muted">暂无进行中的申请，可在左侧提交新申请。</p>
+          <article v-for="key in keys" :key="key.id" class="key-card">
+            <div class="row">
+              <div>
+                <strong>{{ key.name }}</strong>
+                <p class="muted">{{ key.project.name }} · 申请 {{ key.requested_monthly_credits }} credits</p>
+              </div>
+              <StatusBadge :status="keyDisplayStatus(key)" />
+            </div>
+            <StatusProgress :current="key.progress.current" :completed="key.progress.completed_steps" />
+            <div v-if="hasMaterializedKey(key)" class="key-material">
+              <p class="secret">{{ key.api_key }}</p>
+            </div>
+            <p v-else-if="['active', 'inactive'].includes(key.status)" class="muted">
+              当前密钥无法读取（可能是旧版领取记录）。
+              <button class="button ghost" :disabled="regeneratingId === key.id" @click="regenerate(key)">重新生成密钥</button>
+            </p>
+            <div class="actions key-card-actions">
+              <button v-if="hasMaterializedKey(key)" class="button secondary" @click="copy(key.api_key!)">复制密钥</button>
+              <button v-if="hasMaterializedKey(key) && keySupportsHarness(key)" class="button secondary" @click="openHarness(key)">一键配置</button>
+              <button class="button ghost" @click="show(key.id)">审核状态</button>
+              <button v-if="canWithdraw(key)" class="button ghost" @click="withdrawConfirm = key">撤回申请</button>
+              <button v-if="key.status === 'approved'" class="button primary" @click="claimConfirm = key">领取并启用</button>
+            </div>
+          </article>
+        </section>
+      </div>
+    </LoadingRegion>
+
+    <AppDialog :open="Boolean(claimConfirm)" title="确认领取密钥" @update:open="claimConfirm = $event ? claimConfirm : null">
+      <p>领取后密钥会保存在平台中，你随时可以在「我的申请」里查看、复制，并通过 CC-switch 一键导入到 Codex 或 Claude Code。</p>
+      <button class="button primary" @click="claim">确认领取</button>
+    </AppDialog>
+
+    <AppDialog :open="Boolean(withdrawConfirm)" title="确认撤回申请" @update:open="withdrawConfirm = $event ? withdrawConfirm : null">
+      <p>撤回后该申请将结束，你可以重新为同一项目提交新的申请。</p>
+      <button class="button primary" @click="withdraw">确认撤回</button>
+    </AppDialog>
+
+    <AppDialog :open="Boolean(detail)" title="申请详情" @update:open="detail = $event ? detail : null">
+      <template v-if="detail">
+        <StatusProgress :current="detail.progress.current" :completed="detail.progress.completed_steps" />
+        <p>学生申请 {{ detail.requested_monthly_credits }} · 导师审核 {{ detail.mentor_monthly_credits ?? '—' }} · 最终额度 {{ detail.monthly_credits ?? '—' }} credits</p>
+        <p>{{ detail.models.map(model => `${model.model_id} (${model.credit_multiplier ?? '未配置'}x)`).join('、') }}</p>
+        <div v-if="canWithdraw(detail)" class="actions key-card-actions">
+          <button class="button ghost" @click="withdrawConfirm = detail">撤回申请</button>
+        </div>
+        <div v-if="detail.api_key" class="key-material">
+          <p class="secret">{{ detail.api_key }}</p>
+          <div class="actions key-card-actions">
+            <button class="button secondary" @click="copy(detail.api_key!)">复制密钥</button>
+            <button v-if="keySupportsHarness(detail)" class="button secondary" @click="openHarness(detail)">一键配置</button>
+          </div>
+        </div>
+        <p v-else-if="['active', 'inactive'].includes(detail.status)" class="muted">
+          密钥暂不可读，请点击下方按钮重新生成。
+          <button class="button ghost" :disabled="regeneratingId === detail.id" @click="regenerate(detail)">重新生成密钥</button>
+        </p>
+      </template>
+    </AppDialog>
+
+    <AppDialog :open="Boolean(configKey)" :title="harnessTitle" :wide="harnessWide" @update:open="open => { if (!open) closeHarness() }">
+      <StudentHarnessConfig
+        v-if="configKey?.api_key"
+        :api-key="configKey.api_key"
+        :models="configKey.models"
+        :key-prefix="configKey.key_prefix"
+      />
+    </AppDialog>
+  </section>
+</template>

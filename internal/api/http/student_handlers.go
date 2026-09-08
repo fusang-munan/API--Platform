@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -31,12 +32,72 @@ func (s *Server) studentProjects(c *gin.Context) {
 }
 
 func (s *Server) studentModels(c *gin.Context) {
-	rows, err := s.service.StudentModels(c.Request.Context(), identity(c).UserID)
+	view, err := s.service.StudentModels(c.Request.Context(), identity(c).UserID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
+}
+
+func (s *Server) studentCommonModels(c *gin.Context) {
+	rows, err := s.service.StudentCommonModels(c.Request.Context())
 	if err != nil {
 		writeError(c, err)
 		return
 	}
 	respondList(c, rows)
+}
+
+func (s *Server) studentModelCatalog(c *gin.Context) {
+	page, pageSize := 1, 20
+	if raw := c.Query("page"); raw != "" {
+		if _, err := fmt.Sscan(raw, &page); err != nil {
+			writeError(c, domain.NewError(domain.CodeValidation, "invalid page"))
+			return
+		}
+	}
+	if raw := c.Query("page_size"); raw != "" {
+		if _, err := fmt.Sscan(raw, &pageSize); err != nil {
+			writeError(c, domain.NewError(domain.CodeValidation, "invalid page_size"))
+			return
+		}
+	}
+	result, err := s.service.StudentCatalogSearch(c.Request.Context(), c.Query("q"), page, pageSize)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, result)
+}
+
+func (s *Server) addStudentModel(c *gin.Context) {
+	var input struct {
+		ModelID string `json:"model_id" binding:"required"`
+	}
+	if !bindJSON(c, &input) {
+		return
+	}
+	view, err := s.service.AddStudentModel(c.Request.Context(), identity(c).UserID, input.ModelID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusCreated, view)
+}
+
+func (s *Server) removeStudentModel(c *gin.Context) {
+	var input struct {
+		ModelID string `json:"model_id" binding:"required"`
+	}
+	if !bindJSON(c, &input) {
+		return
+	}
+	if err := s.service.RemoveStudentModel(c.Request.Context(), identity(c).UserID, input.ModelID); err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, gin.H{"removed": true})
 }
 
 func (s *Server) submitAPIKey(c *gin.Context) {
@@ -112,6 +173,32 @@ func (s *Server) claimAPIKey(c *gin.Context) {
 		return
 	}
 	view, err := s.service.ClaimAPIKey(c.Request.Context(), identity(c).UserID, keyID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
+}
+
+func (s *Server) withdrawAPIKey(c *gin.Context) {
+	keyID, ok := pathID(c, "api_key_id")
+	if !ok {
+		return
+	}
+	err := s.service.WithdrawAPIKey(c.Request.Context(), identity(c).UserID, keyID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, gin.H{"withdrawn": true})
+}
+
+func (s *Server) regenerateAPIKey(c *gin.Context) {
+	keyID, ok := pathID(c, "api_key_id")
+	if !ok {
+		return
+	}
+	view, err := s.service.RegenerateAPIKey(c.Request.Context(), identity(c).UserID, keyID)
 	if err != nil {
 		writeError(c, err)
 		return

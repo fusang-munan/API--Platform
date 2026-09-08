@@ -76,11 +76,6 @@ func BaseURL(v string) predicate.Provider {
 	return predicate.Provider(sql.FieldEQ(FieldBaseURL, v))
 }
 
-// CredentialCiphertext applies equality check predicate on the "credential_ciphertext" field. It's identical to CredentialCiphertextEQ.
-func CredentialCiphertext(v []byte) predicate.Provider {
-	return predicate.Provider(sql.FieldEQ(FieldCredentialCiphertext, v))
-}
-
 // CreatedAtEQ applies the EQ predicate on the "created_at" field.
 func CreatedAtEQ(v time.Time) predicate.Provider {
 	return predicate.Provider(sql.FieldEQ(FieldCreatedAt, v))
@@ -291,46 +286,6 @@ func BaseURLContainsFold(v string) predicate.Provider {
 	return predicate.Provider(sql.FieldContainsFold(FieldBaseURL, v))
 }
 
-// CredentialCiphertextEQ applies the EQ predicate on the "credential_ciphertext" field.
-func CredentialCiphertextEQ(v []byte) predicate.Provider {
-	return predicate.Provider(sql.FieldEQ(FieldCredentialCiphertext, v))
-}
-
-// CredentialCiphertextNEQ applies the NEQ predicate on the "credential_ciphertext" field.
-func CredentialCiphertextNEQ(v []byte) predicate.Provider {
-	return predicate.Provider(sql.FieldNEQ(FieldCredentialCiphertext, v))
-}
-
-// CredentialCiphertextIn applies the In predicate on the "credential_ciphertext" field.
-func CredentialCiphertextIn(vs ...[]byte) predicate.Provider {
-	return predicate.Provider(sql.FieldIn(FieldCredentialCiphertext, vs...))
-}
-
-// CredentialCiphertextNotIn applies the NotIn predicate on the "credential_ciphertext" field.
-func CredentialCiphertextNotIn(vs ...[]byte) predicate.Provider {
-	return predicate.Provider(sql.FieldNotIn(FieldCredentialCiphertext, vs...))
-}
-
-// CredentialCiphertextGT applies the GT predicate on the "credential_ciphertext" field.
-func CredentialCiphertextGT(v []byte) predicate.Provider {
-	return predicate.Provider(sql.FieldGT(FieldCredentialCiphertext, v))
-}
-
-// CredentialCiphertextGTE applies the GTE predicate on the "credential_ciphertext" field.
-func CredentialCiphertextGTE(v []byte) predicate.Provider {
-	return predicate.Provider(sql.FieldGTE(FieldCredentialCiphertext, v))
-}
-
-// CredentialCiphertextLT applies the LT predicate on the "credential_ciphertext" field.
-func CredentialCiphertextLT(v []byte) predicate.Provider {
-	return predicate.Provider(sql.FieldLT(FieldCredentialCiphertext, v))
-}
-
-// CredentialCiphertextLTE applies the LTE predicate on the "credential_ciphertext" field.
-func CredentialCiphertextLTE(v []byte) predicate.Provider {
-	return predicate.Provider(sql.FieldLTE(FieldCredentialCiphertext, v))
-}
-
 // StatusEQ applies the EQ predicate on the "status" field.
 func StatusEQ(v Status) predicate.Provider {
 	return predicate.Provider(sql.FieldEQ(FieldStatus, v))
@@ -351,6 +306,29 @@ func StatusNotIn(vs ...Status) predicate.Provider {
 	return predicate.Provider(sql.FieldNotIn(FieldStatus, vs...))
 }
 
+// HasCredentials applies the HasEdge predicate on the "credentials" edge.
+func HasCredentials() predicate.Provider {
+	return predicate.Provider(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, CredentialsTable, CredentialsColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasCredentialsWith applies the HasEdge predicate on the "credentials" edge with a given conditions (other predicates).
+func HasCredentialsWith(preds ...predicate.ProviderCredential) predicate.Provider {
+	return predicate.Provider(func(s *sql.Selector) {
+		step := newCredentialsStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
 // HasModelBindings applies the HasEdge predicate on the "model_bindings" edge.
 func HasModelBindings() predicate.Provider {
 	return predicate.Provider(func(s *sql.Selector) {
@@ -366,6 +344,29 @@ func HasModelBindings() predicate.Provider {
 func HasModelBindingsWith(preds ...predicate.ModelBinding) predicate.Provider {
 	return predicate.Provider(func(s *sql.Selector) {
 		step := newModelBindingsStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
+// HasModelCatalogEntries applies the HasEdge predicate on the "model_catalog_entries" edge.
+func HasModelCatalogEntries() predicate.Provider {
+	return predicate.Provider(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, ModelCatalogEntriesTable, ModelCatalogEntriesColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasModelCatalogEntriesWith applies the HasEdge predicate on the "model_catalog_entries" edge with a given conditions (other predicates).
+func HasModelCatalogEntriesWith(preds ...predicate.ProviderModelCatalog) predicate.Provider {
+	return predicate.Provider(func(s *sql.Selector) {
+		step := newModelCatalogEntriesStep()
 		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
 			for _, p := range preds {
 				p(s)

@@ -11,15 +11,14 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeyaudit"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprojectapplication"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/organization"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/organizationmember"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/project"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/projectmember"
 )
 
 func (s *Service) MentorOrganizations(ctx context.Context, mentorID uuid.UUID) ([]OrganizationView, error) {
+	_ = mentorID
 	rows, err := s.db.Organization.Query().Where(
 		organization.StatusEQ(organization.StatusActive),
-		organization.HasMembershipsWith(organizationmember.UserIDEQ(mentorID)),
 	).Order(ent.Asc(organization.FieldName)).All(ctx)
 	if err != nil {
 		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list mentor organizations", err)
@@ -32,14 +31,14 @@ func (s *Service) MentorOrganizations(ctx context.Context, mentorID uuid.UUID) (
 }
 
 func (s *Service) MentorProjects(ctx context.Context, mentorID, organizationID uuid.UUID) ([]ProjectView, error) {
-	member, err := s.db.OrganizationMember.Query().Where(
-		organizationmember.OrganizationIDEQ(organizationID),
-		organizationmember.UserIDEQ(mentorID),
+	orgExists, err := s.db.Organization.Query().Where(
+		organization.IDEQ(organizationID),
+		organization.StatusEQ(organization.StatusActive),
 	).Exist(ctx)
 	if err != nil {
-		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "query organization membership", err)
+		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "query organization", err)
 	}
-	if !member {
+	if !orgExists {
 		return nil, domain.NewError(domain.CodeNotFound, "organization not found")
 	}
 	rows, err := s.db.Project.Query().Where(
@@ -92,6 +91,9 @@ func (s *Service) MentorProjects(ctx context.Context, mentorID, organizationID u
 }
 
 func (s *Service) ApplyMentorProject(ctx context.Context, mentorID, projectID uuid.UUID) (MentorProjectApplicationView, error) {
+	if _, err := s.requireActiveMentorUser(ctx, mentorID); err != nil {
+		return MentorProjectApplicationView{}, err
+	}
 	target, err := s.db.Project.Query().Where(
 		project.IDEQ(projectID),
 		project.StatusEQ(project.StatusActive),
@@ -104,16 +106,6 @@ func (s *Service) ApplyMentorProject(ctx context.Context, mentorID, projectID uu
 	}
 	if target.Edges.Organization == nil || target.Edges.Organization.Status != organization.StatusActive {
 		return MentorProjectApplicationView{}, domain.NewError(domain.CodeNotFound, "project not found")
-	}
-	isOrganizationMember, err := s.db.OrganizationMember.Query().Where(
-		organizationmember.OrganizationIDEQ(target.OrganizationID),
-		organizationmember.UserIDEQ(mentorID),
-	).Exist(ctx)
-	if err != nil {
-		return MentorProjectApplicationView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query mentor organization", err)
-	}
-	if !isOrganizationMember {
-		return MentorProjectApplicationView{}, domain.NewError(domain.CodeForbidden, "mentor does not belong to the project organization")
 	}
 	isProjectMember, err := s.db.ProjectMember.Query().Where(
 		projectmember.ProjectIDEQ(projectID),
@@ -186,6 +178,45 @@ func (s *Service) MentorKeyReviews(ctx context.Context, mentorID uuid.UUID) ([]A
 	return s.keyViews(ctx, rows)
 }
 
+func (s *Service) MentorAPIKeys(ctx context.Context, mentorID uuid.UUID) ([]APIKeyView, error) {
+	projectIDs, err := s.mentorProjectIDs(ctx, mentorID)
+	if err != nil {
+		return nil, err
+	}
+	if len(projectIDs) == 0 {
+		return []APIKeyView{}, nil
+	}
+	rows, err := s.db.APIKey.Query().Where(
+		apikey.ProjectIDIn(projectIDs...),
+		apikey.StatusIn(
+			apikey.StatusPendingMentor,
+			apikey.StatusPendingTeacher,
+			apikey.StatusApproved,
+			apikey.StatusActive,
+			apikey.StatusInactive,
+			apikey.StatusRejected,
+		),
+	).Order(ent.Desc(apikey.FieldUpdatedAt), ent.Desc(apikey.FieldCreatedAt)).All(ctx)
+	if err != nil {
+		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list mentor API keys", err)
+	}
+	return s.keyViews(ctx, rows)
+}
+
+func (s *Service) MentorAPIKey(ctx context.Context, mentorID, keyID uuid.UUID) (APIKeyView, error) {
+	projectIDs, err := s.mentorProjectIDs(ctx, mentorID)
+	if err != nil {
+		return APIKeyView{}, err
+	}
+	if len(projectIDs) == 0 {
+		return APIKeyView{}, domain.NewError(domain.CodeNotFound, "API key not found")
+	}
+	return s.keyView(ctx, s.db.APIKey.Query().Where(
+		apikey.IDEQ(keyID),
+		apikey.ProjectIDIn(projectIDs...),
+	))
+}
+
 func (s *Service) MentorKeyReview(ctx context.Context, mentorID, keyID uuid.UUID) (APIKeyView, error) {
 	projectIDs, err := s.mentorProjectIDs(ctx, mentorID)
 	if err != nil {
@@ -203,16 +234,29 @@ func (s *Service) MentorKeyReview(ctx context.Context, mentorID, keyID uuid.UUID
 
 func (s *Service) ReviewKeyAsMentor(ctx context.Context, mentorID, keyID uuid.UUID, approve bool, comment string, monthly ...int64) error {
 	action := "mentor_approved"
-	nextStatus := apikey.StatusPendingTeacher
 	auditAction := apikeyaudit.ActionMentorApproved
 	if !approve {
 		action = "mentor_rejected"
-		nextStatus = apikey.StatusRejected
 		auditAction = apikeyaudit.ActionMentorRejected
 	}
 	comment, err := ValidateComment(action, comment)
 	if err != nil {
 		return err
+	}
+	if approve {
+		var quota int64
+		if len(monthly) == 1 {
+			quota = monthly[0]
+			if quota < 0 || quota > 1_000_000_000_000 {
+				return domain.NewError(domain.CodeValidation, "monthly credits are out of range")
+			}
+		}
+		ownerID, approveErr := s.FinalizeKeyApproval(ctx, mentorID, keyID, quota, comment)
+		if approveErr != nil {
+			return approveErr
+		}
+		s.publishKeyStatus(ctx, ownerID, keyID, string(apikey.StatusApproved), s.now().UTC())
+		return nil
 	}
 	tx, err := s.db.Tx(ctx)
 	if err != nil {
@@ -229,11 +273,6 @@ func (s *Service) ReviewKeyAsMentor(ctx context.Context, mentorID, keyID uuid.UU
 	if err != nil {
 		return domain.WrapError(domain.CodeDependencyUnavailable, "query API key", err)
 	}
-	if approve && len(monthly) > 0 {
-		if monthly[0] < 0 {
-			return domain.NewError(domain.CodeValidation, "monthly credits must be non-negative")
-		}
-	}
 	responsible, err := tx.ProjectMember.Query().Where(
 		projectmember.ProjectIDEQ(key.ProjectID),
 		projectmember.UserIDEQ(mentorID),
@@ -244,18 +283,10 @@ func (s *Service) ReviewKeyAsMentor(ctx context.Context, mentorID, keyID uuid.UU
 	if !responsible {
 		return domain.NewError(domain.CodeNotFound, "API key application not found")
 	}
-	if approve && len(monthly) > 0 {
-		if monthly[0] < 0 || monthly[0] > 1_000_000_000_000 {
-			return domain.NewError(domain.CodeValidation, "monthly credits are out of range")
-		}
-		if _, err := tx.APIKey.UpdateOneID(keyID).SetMentorMonthlyCreditQuotaMilli(monthly[0]).Save(ctx); err != nil {
-			return domain.WrapError(domain.CodeDependencyUnavailable, "set mentor quota", err)
-		}
-	}
 	updated, err := tx.APIKey.Update().Where(
 		apikey.IDEQ(keyID),
 		apikey.StatusEQ(apikey.StatusPendingMentor),
-	).SetStatus(nextStatus).Save(ctx)
+	).SetStatus(apikey.StatusRejected).Save(ctx)
 	if err != nil {
 		return domain.WrapError(domain.CodeDependencyUnavailable, "update API key review", err)
 	}
@@ -275,7 +306,7 @@ func (s *Service) ReviewKeyAsMentor(ctx context.Context, mentorID, keyID uuid.UU
 	if err := tx.Commit(); err != nil {
 		return domain.WrapError(domain.CodeDependencyUnavailable, "commit mentor review", err)
 	}
-	s.publishKeyStatus(ctx, key.OwnerUserID, keyID, string(nextStatus), s.now().UTC())
+	s.publishKeyStatus(ctx, key.OwnerUserID, keyID, string(apikey.StatusRejected), s.now().UTC())
 	return nil
 }
 
@@ -300,21 +331,35 @@ func (s *Service) MentorActiveKeys(ctx context.Context, mentorID, projectID uuid
 	return s.keyViews(ctx, rows)
 }
 
-func (s *Service) RevokeKeyAsMentor(ctx context.Context, mentorID, keyID uuid.UUID, comment string) error {
-	comment, err := ValidateComment("mentor_revoked", comment)
+func (s *Service) DeactivateKeyAsMentor(ctx context.Context, mentorID, keyID uuid.UUID, comment string) error {
+	comment, err := ValidateComment("mentor_deactivated", comment)
 	if err != nil {
 		return err
 	}
-	ownerID, err := s.usage.RevokeKey(ctx, mentorID, keyID, comment)
+	ownerID, err := s.usage.DeactivateKey(ctx, mentorID, keyID, comment)
 	if err != nil {
 		var appErr *domain.Error
 		if errors.As(err, &appErr) {
 			return err
 		}
-		return domain.WrapError(domain.CodeDependencyUnavailable, "revoke API key", err)
+		return domain.WrapError(domain.CodeDependencyUnavailable, "deactivate API key", err)
 	}
-	revokedAt := s.now().UTC()
-	s.publishKeyStatus(ctx, ownerID, keyID, domain.KeyRevoked, revokedAt)
+	deactivatedAt := s.now().UTC()
+	s.publishKeyStatus(ctx, ownerID, keyID, domain.KeyInactive, deactivatedAt)
+	return nil
+}
+
+func (s *Service) ActivateKeyAsMentor(ctx context.Context, mentorID, keyID uuid.UUID) error {
+	ownerID, err := s.usage.ActivateKey(ctx, mentorID, keyID)
+	if err != nil {
+		var appErr *domain.Error
+		if errors.As(err, &appErr) {
+			return err
+		}
+		return domain.WrapError(domain.CodeDependencyUnavailable, "activate API key", err)
+	}
+	activatedAt := s.now().UTC()
+	s.publishKeyStatus(ctx, ownerID, keyID, domain.KeyActive, activatedAt)
 	return nil
 }
 
@@ -337,6 +382,12 @@ func (s *Service) keyViews(ctx context.Context, rows []*ent.APIKey) ([]APIKeyVie
 	for _, row := range rows {
 		view, err := s.keyView(ctx, s.db.APIKey.Query().Where(apikey.IDEQ(row.ID)))
 		if err != nil {
+			return nil, err
+		}
+		if err := s.populateKeyAvailability(ctx, &view); err != nil {
+			return nil, err
+		}
+		if err := s.populateMemberQuota(ctx, &view); err != nil {
 			return nil, err
 		}
 		result = append(result, view)

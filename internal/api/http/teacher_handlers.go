@@ -79,8 +79,8 @@ func (s *Server) updateOrganization(c *gin.Context) {
 	respond(c, http.StatusOK, view)
 }
 
-func (s *Server) mentorCandidates(c *gin.Context) {
-	organizationID, ok := pathID(c, "organization_id")
+func (s *Server) projectMentorCandidates(c *gin.Context) {
+	projectID, ok := pathID(c, "project_id")
 	if !ok {
 		return
 	}
@@ -98,30 +98,14 @@ func (s *Server) mentorCandidates(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	rows, nextCursor, err := s.service.MentorCandidates(
-		c.Request.Context(), organizationID, c.Query("q"), cursor, limit,
+	rows, nextCursor, err := s.service.ProjectMentorCandidates(
+		c.Request.Context(), projectID, c.Query("q"), cursor, limit,
 	)
 	if err != nil {
 		writeError(c, err)
 		return
 	}
 	respondPage(c, rows, nextCursor)
-}
-
-func (s *Server) assignMentor(c *gin.Context) {
-	organizationID, ok := pathID(c, "organization_id")
-	if !ok {
-		return
-	}
-	mentorID, ok := pathID(c, "mentor_id")
-	if !ok {
-		return
-	}
-	if err := s.service.AssignMentorToOrganization(c.Request.Context(), organizationID, mentorID); err != nil {
-		writeError(c, err)
-		return
-	}
-	c.Status(http.StatusNoContent)
 }
 
 func (s *Server) teacherProjects(c *gin.Context) {
@@ -156,7 +140,7 @@ func (s *Server) createProject(c *gin.Context) {
 		Name               string  `json:"name" binding:"required"`
 		Description        *string `json:"description"`
 		Status             *string `json:"status"`
-		MonthlyCreditQuota string  `json:"monthly_credit_quota"`
+		MonthlyCreditQuota string `json:"monthly_credit_quota" binding:"required"`
 	}
 	if !bindJSON(c, &input) {
 		return
@@ -166,15 +150,12 @@ func (s *Server) createProject(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	var quota *int64
-	if input.MonthlyCreditQuota != "" {
-		value, parseErr := domain.ParseCredits(input.MonthlyCreditQuota)
-		if parseErr != nil {
-			writeError(c, parseErr)
-			return
-		}
-		quota = &value
+	value, parseErr := domain.ParseCredits(input.MonthlyCreditQuota)
+	if parseErr != nil {
+		writeError(c, parseErr)
+		return
 	}
+	quota := &value
 	view, err := s.service.CreateProject(c.Request.Context(), controlplane.ProjectInput{
 		OrganizationID: organizationID, Name: input.Name,
 		Description: input.Description, Status: input.Status,
@@ -193,27 +174,15 @@ func (s *Server) updateProject(c *gin.Context) {
 		return
 	}
 	var input struct {
-		Name               string  `json:"name"`
-		Description        *string `json:"description"`
-		Status             *string `json:"status"`
-		MonthlyCreditQuota string  `json:"monthly_credit_quota"`
-		QuotaChangeReason  string  `json:"quota_change_reason"`
+		Name        string  `json:"name"`
+		Description *string `json:"description"`
+		Status      *string `json:"status"`
 	}
 	if !bindJSON(c, &input) {
 		return
 	}
-	var quota *int64
-	if input.MonthlyCreditQuota != "" {
-		value, parseErr := domain.ParseCredits(input.MonthlyCreditQuota)
-		if parseErr != nil {
-			writeError(c, parseErr)
-			return
-		}
-		quota = &value
-	}
 	view, err := s.service.UpdateProject(c.Request.Context(), identity(c).UserID, projectID, controlplane.ProjectInput{
 		Name: input.Name, Description: input.Description, Status: input.Status,
-		MonthlyCreditQuotaMilli: quota, QuotaChangeReason: input.QuotaChangeReason,
 	})
 	if err != nil {
 		writeError(c, err)
@@ -321,6 +290,139 @@ func (s *Server) updateProvider(c *gin.Context) {
 	respond(c, http.StatusOK, view)
 }
 
+func (s *Server) deleteProvider(c *gin.Context) {
+	providerID, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	if err := s.service.DeleteProvider(c.Request.Context(), providerID); err != nil {
+		writeError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) providerCredentials(c *gin.Context) {
+	providerID, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	rows, err := s.service.ProviderCredentials(c.Request.Context(), providerID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respondList(c, rows)
+}
+
+func (s *Server) createProviderCredential(c *gin.Context) {
+	providerID, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	var input struct {
+		Label      string  `json:"label" binding:"required"`
+		GroupHint  *string `json:"group_hint"`
+		Credential string  `json:"credential" binding:"required"`
+		Status     *string `json:"status"`
+	}
+	if !bindJSON(c, &input) {
+		return
+	}
+	view, err := s.service.CreateProviderCredential(c.Request.Context(), providerID, controlplane.ProviderCredentialInput{
+		Label: input.Label, GroupHint: input.GroupHint, Credential: &input.Credential, Status: input.Status,
+	})
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusCreated, view)
+}
+
+func (s *Server) updateProviderCredential(c *gin.Context) {
+	providerID, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	credentialID, ok := pathID(c, "credential_id")
+	if !ok {
+		return
+	}
+	var input struct {
+		Label      string  `json:"label"`
+		GroupHint  *string `json:"group_hint"`
+		Credential *string `json:"credential"`
+		Status     *string `json:"status"`
+	}
+	if !bindJSON(c, &input) {
+		return
+	}
+	view, err := s.service.UpdateProviderCredential(c.Request.Context(), providerID, credentialID, controlplane.ProviderCredentialInput{
+		Label: input.Label, GroupHint: input.GroupHint, Credential: input.Credential, Status: input.Status,
+	})
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
+}
+
+func (s *Server) deleteProviderCredential(c *gin.Context) {
+	providerID, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	credentialID, ok := pathID(c, "credential_id")
+	if !ok {
+		return
+	}
+	if err := s.service.DeleteProviderCredential(c.Request.Context(), providerID, credentialID); err != nil {
+		writeError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) resetProviderCatalog(c *gin.Context) {
+	providerID, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	result, err := s.service.ResetProviderCatalog(c.Request.Context(), providerID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, result)
+}
+
+func (s *Server) teacherProviderCatalogCandidates(c *gin.Context) {
+	providerID, err := controlplane.UUID(c.Query("provider_id"))
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	page, pageSize := 1, 20
+	if raw := c.Query("page"); raw != "" {
+		if _, err := fmt.Sscan(raw, &page); err != nil {
+			writeError(c, domain.NewError(domain.CodeValidation, "invalid page"))
+			return
+		}
+	}
+	if raw := c.Query("page_size"); raw != "" {
+		if _, err := fmt.Sscan(raw, &pageSize); err != nil {
+			writeError(c, domain.NewError(domain.CodeValidation, "invalid page_size"))
+			return
+		}
+	}
+	result, err := s.service.ProviderCatalogCandidates(c.Request.Context(), providerID, c.Query("q"), page, pageSize)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, result)
+}
+
 type modelPayload struct {
 	ModelID                string   `json:"model_id"`
 	DisplayName            string   `json:"display_name"`
@@ -376,7 +478,7 @@ type modelPatchPayload struct {
 func (payload modelPayload) input() controlplane.ModelInput {
 	var multiplier *int64
 	if payload.CreditMultiplier != "" {
-		value, err := domain.ParseCredits(payload.CreditMultiplier)
+		value, err := domain.ParseMultiplier(payload.CreditMultiplier)
 		if err == nil {
 			multiplier = &value
 		}
@@ -399,28 +501,6 @@ func (s *Server) teacherModels(c *gin.Context) {
 		return
 	}
 	respondList(c, rows)
-}
-
-func (s *Server) teacherModelCatalogCandidates(c *gin.Context) {
-	page, pageSize := 1, 20
-	if raw := c.Query("page"); raw != "" {
-		if _, err := fmt.Sscan(raw, &page); err != nil {
-			writeError(c, domain.NewError(domain.CodeValidation, "invalid page"))
-			return
-		}
-	}
-	if raw := c.Query("page_size"); raw != "" {
-		if _, err := fmt.Sscan(raw, &pageSize); err != nil {
-			writeError(c, domain.NewError(domain.CodeValidation, "invalid page_size"))
-			return
-		}
-	}
-	result, err := s.service.ModelCatalogCandidates(c.Request.Context(), c.Query("q"), page, pageSize)
-	if err != nil {
-		writeError(c, err)
-		return
-	}
-	respond(c, http.StatusOK, result)
 }
 
 func (s *Server) probeModel(c *gin.Context) {
@@ -461,7 +541,7 @@ func (s *Server) createModel(c *gin.Context) {
 		return
 	}
 	if input.CreditMultiplier != "" {
-		if _, err := domain.ParseCredits(input.CreditMultiplier); err != nil {
+		if _, err := domain.ParseMultiplier(input.CreditMultiplier); err != nil {
 			writeError(c, err)
 			return
 		}
@@ -480,7 +560,16 @@ func (s *Server) teacherModel(c *gin.Context) {
 		writeError(c, domain.NewError(domain.CodeValidation, "model_id is required"))
 		return
 	}
-	model, bindings, err := s.service.TeacherModel(c.Request.Context(), modelID)
+	var credentialID *uuid.UUID
+	if rawCredentialID := strings.TrimSpace(c.Query("credential_id")); rawCredentialID != "" {
+		id, err := controlplane.UUID(rawCredentialID)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		credentialID = &id
+	}
+	model, bindings, err := s.service.TeacherModel(c.Request.Context(), modelID, credentialID)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -498,7 +587,7 @@ func (s *Server) updateModel(c *gin.Context) {
 	}
 	var multiplier *int64
 	if input.CreditMultiplier != "" {
-		value, err := domain.ParseCredits(input.CreditMultiplier)
+		value, err := domain.ParseMultiplier(input.CreditMultiplier)
 		if err != nil {
 			writeError(c, err)
 			return
@@ -521,14 +610,39 @@ func (s *Server) updateModel(c *gin.Context) {
 	respond(c, http.StatusOK, view)
 }
 
-func (s *Server) createBinding(c *gin.Context) {
+func (s *Server) probeModelBindingRoute(c *gin.Context) {
 	var input struct {
-		ModelID           string `json:"model_id" binding:"required"`
 		ProviderID        string `json:"provider_id" binding:"required"`
 		UpstreamModelName string `json:"upstream_model_name" binding:"required"`
-		Adapter           string `json:"adapter" binding:"required"`
-		Priority          *int   `json:"priority"`
-		Status            string `json:"status"`
+		Endpoint          string `json:"endpoint" binding:"required"`
+	}
+	if !bindJSON(c, &input) {
+		return
+	}
+	providerID, err := controlplane.UUID(input.ProviderID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	step, err := s.service.ProbeModelBindingRoute(c.Request.Context(), controlplane.BindingRouteProbeInput{
+		ProviderID: providerID, UpstreamModelName: input.UpstreamModelName, Endpoint: input.Endpoint,
+	})
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, step)
+}
+
+func (s *Server) createBinding(c *gin.Context) {
+	var input struct {
+		ModelID           string   `json:"model_id" binding:"required"`
+		ProviderID        string   `json:"provider_id" binding:"required"`
+		UpstreamModelName string   `json:"upstream_model_name" binding:"required"`
+		Adapter           string   `json:"adapter"`
+		Priority          *int     `json:"priority"`
+		Status            string   `json:"status"`
+		ProbedAdapters    []string `json:"probed_adapters"`
 	}
 	if !bindJSON(c, &input) {
 		return
@@ -545,9 +659,12 @@ func (s *Server) createBinding(c *gin.Context) {
 	if input.Status == "" {
 		input.Status = "active"
 	}
+	if input.Adapter == "" {
+		input.Adapter = "openai_compatible"
+	}
 	view, err := s.service.CreateBinding(c.Request.Context(), input.ModelID, controlplane.BindingInput{
 		ProviderID: providerID, UpstreamModelName: input.UpstreamModelName,
-		Adapter: input.Adapter, Priority: priority, Status: input.Status,
+		Adapter: input.Adapter, Priority: priority, Status: input.Status, ProbedAdapters: input.ProbedAdapters,
 	})
 	if err != nil {
 		writeError(c, err)
@@ -585,8 +702,13 @@ func (s *Server) updateBinding(c *gin.Context) {
 	respond(c, http.StatusOK, view)
 }
 
-func (s *Server) teacherKeyReviews(c *gin.Context) {
-	rows, err := s.service.TeacherKeyReviews(c.Request.Context())
+func (s *Server) teacherProjectBudgets(c *gin.Context) {
+	month, err := monthQuery(c)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	rows, err := s.service.ListProjectBudgets(c.Request.Context(), month, c.Query("organization_id"), c.Query("q"))
 	if err != nil {
 		writeError(c, err)
 		return
@@ -594,12 +716,23 @@ func (s *Server) teacherKeyReviews(c *gin.Context) {
 	respondList(c, rows)
 }
 
-func (s *Server) teacherKeyReview(c *gin.Context) {
-	keyID, ok := pathID(c, "api_key_id")
+func (s *Server) updateProjectBudget(c *gin.Context) {
+	projectID, ok := pathID(c, "project_id")
 	if !ok {
 		return
 	}
-	view, err := s.service.TeacherKeyReview(c.Request.Context(), keyID)
+	var input struct {
+		MonthlyCreditQuota string `json:"monthly_credit_quota" binding:"required"`
+	}
+	if !bindJSON(c, &input) {
+		return
+	}
+	quota, err := domain.ParseCredits(input.MonthlyCreditQuota)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	view, err := s.service.UpdateProjectBudget(c.Request.Context(), identity(c).UserID, projectID, quota, "update")
 	if err != nil {
 		writeError(c, err)
 		return
@@ -607,41 +740,69 @@ func (s *Server) teacherKeyReview(c *gin.Context) {
 	respond(c, http.StatusOK, view)
 }
 
-func (s *Server) reviewKeyAsTeacher(approve bool) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		keyID, ok := pathID(c, "api_key_id")
-		if !ok {
-			return
-		}
-		var input struct {
-			Comment        string `json:"comment"`
-			MonthlyCredits string `json:"monthly_credits"`
-		}
-		if c.Request.ContentLength != 0 {
-			if !bindJSON(c, &input) {
-				return
-			}
-		}
-		comment := input.Comment
-		var quota []int64
-		if approve && strings.TrimSpace(input.MonthlyCredits) == "" {
-			writeError(c, domain.NewError(domain.CodeValidation, "monthly_credits is required"))
-			return
-		}
-		if approve {
-			value, err := domain.ParseCredits(input.MonthlyCredits)
-			if err != nil {
-				writeError(c, err)
-				return
-			}
-			quota = []int64{value}
-		}
-		if err := s.service.ReviewKeyAsTeacher(
-			c.Request.Context(), identity(c).UserID, keyID, approve, comment, quota...,
-		); err != nil {
-			writeError(c, err)
-			return
-		}
-		c.Status(http.StatusNoContent)
+func (s *Server) assignProjectMentor(c *gin.Context) {
+	projectID, ok := pathID(c, "project_id")
+	if !ok {
+		return
 	}
+	mentorID, ok := pathID(c, "mentor_id")
+	if !ok {
+		return
+	}
+	if err := s.service.AssignProjectMentor(c.Request.Context(), projectID, mentorID); err != nil {
+		writeError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) removeProjectMentor(c *gin.Context) {
+	projectID, ok := pathID(c, "project_id")
+	if !ok {
+		return
+	}
+	mentorID, ok := pathID(c, "mentor_id")
+	if !ok {
+		return
+	}
+	if err := s.service.RemoveProjectMentor(c.Request.Context(), projectID, mentorID); err != nil {
+		writeError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) teacherStudents(c *gin.Context) {
+	rows, err := s.service.TeacherStudents(c.Request.Context(), c.Query("q"))
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respondList(c, rows)
+}
+
+func (s *Server) grantMentorProfile(c *gin.Context) {
+	studentID, ok := pathID(c, "student_id")
+	if !ok {
+		return
+	}
+	view, err := s.service.GrantMentorProfile(c.Request.Context(), identity(c).UserID, studentID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
+}
+
+func (s *Server) revokeMentorProfile(c *gin.Context) {
+	studentID, ok := pathID(c, "student_id")
+	if !ok {
+		return
+	}
+	view, err := s.service.RevokeMentorProfile(c.Request.Context(), studentID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
 }

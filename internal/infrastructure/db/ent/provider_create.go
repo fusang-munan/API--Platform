@@ -13,6 +13,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providermodelcatalog"
 )
 
 // ProviderCreate is the builder for creating a Provider entity.
@@ -62,12 +64,6 @@ func (_c *ProviderCreate) SetBaseURL(v string) *ProviderCreate {
 	return _c
 }
 
-// SetCredentialCiphertext sets the "credential_ciphertext" field.
-func (_c *ProviderCreate) SetCredentialCiphertext(v []byte) *ProviderCreate {
-	_c.mutation.SetCredentialCiphertext(v)
-	return _c
-}
-
 // SetStatus sets the "status" field.
 func (_c *ProviderCreate) SetStatus(v provider.Status) *ProviderCreate {
 	_c.mutation.SetStatus(v)
@@ -96,6 +92,21 @@ func (_c *ProviderCreate) SetNillableID(v *uuid.UUID) *ProviderCreate {
 	return _c
 }
 
+// AddCredentialIDs adds the "credentials" edge to the ProviderCredential entity by IDs.
+func (_c *ProviderCreate) AddCredentialIDs(ids ...uuid.UUID) *ProviderCreate {
+	_c.mutation.AddCredentialIDs(ids...)
+	return _c
+}
+
+// AddCredentials adds the "credentials" edges to the ProviderCredential entity.
+func (_c *ProviderCreate) AddCredentials(v ...*ProviderCredential) *ProviderCreate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _c.AddCredentialIDs(ids...)
+}
+
 // AddModelBindingIDs adds the "model_bindings" edge to the ModelBinding entity by IDs.
 func (_c *ProviderCreate) AddModelBindingIDs(ids ...uuid.UUID) *ProviderCreate {
 	_c.mutation.AddModelBindingIDs(ids...)
@@ -109,6 +120,21 @@ func (_c *ProviderCreate) AddModelBindings(v ...*ModelBinding) *ProviderCreate {
 		ids[i] = v[i].ID
 	}
 	return _c.AddModelBindingIDs(ids...)
+}
+
+// AddModelCatalogEntryIDs adds the "model_catalog_entries" edge to the ProviderModelCatalog entity by IDs.
+func (_c *ProviderCreate) AddModelCatalogEntryIDs(ids ...uuid.UUID) *ProviderCreate {
+	_c.mutation.AddModelCatalogEntryIDs(ids...)
+	return _c
+}
+
+// AddModelCatalogEntries adds the "model_catalog_entries" edges to the ProviderModelCatalog entity.
+func (_c *ProviderCreate) AddModelCatalogEntries(v ...*ProviderModelCatalog) *ProviderCreate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _c.AddModelCatalogEntryIDs(ids...)
 }
 
 // Mutation returns the ProviderMutation object of the builder.
@@ -188,14 +214,6 @@ func (_c *ProviderCreate) check() error {
 			return &ValidationError{Name: "base_url", err: fmt.Errorf(`ent: validator failed for field "Provider.base_url": %w`, err)}
 		}
 	}
-	if _, ok := _c.mutation.CredentialCiphertext(); !ok {
-		return &ValidationError{Name: "credential_ciphertext", err: errors.New(`ent: missing required field "Provider.credential_ciphertext"`)}
-	}
-	if v, ok := _c.mutation.CredentialCiphertext(); ok {
-		if err := provider.CredentialCiphertextValidator(v); err != nil {
-			return &ValidationError{Name: "credential_ciphertext", err: fmt.Errorf(`ent: validator failed for field "Provider.credential_ciphertext": %w`, err)}
-		}
-	}
 	if _, ok := _c.mutation.Status(); !ok {
 		return &ValidationError{Name: "status", err: errors.New(`ent: missing required field "Provider.status"`)}
 	}
@@ -255,13 +273,25 @@ func (_c *ProviderCreate) createSpec() (*Provider, *sqlgraph.CreateSpec) {
 		_spec.SetField(provider.FieldBaseURL, field.TypeString, value)
 		_node.BaseURL = value
 	}
-	if value, ok := _c.mutation.CredentialCiphertext(); ok {
-		_spec.SetField(provider.FieldCredentialCiphertext, field.TypeBytes, value)
-		_node.CredentialCiphertext = value
-	}
 	if value, ok := _c.mutation.Status(); ok {
 		_spec.SetField(provider.FieldStatus, field.TypeEnum, value)
 		_node.Status = value
+	}
+	if nodes := _c.mutation.CredentialsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.CredentialsTable,
+			Columns: []string{provider.CredentialsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providercredential.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
 	}
 	if nodes := _c.mutation.ModelBindingsIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
@@ -272,6 +302,22 @@ func (_c *ProviderCreate) createSpec() (*Provider, *sqlgraph.CreateSpec) {
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(modelbinding.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
+	}
+	if nodes := _c.mutation.ModelCatalogEntriesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.ModelCatalogEntriesTable,
+			Columns: []string{provider.ModelCatalogEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providermodelcatalog.FieldID, field.TypeUUID),
 			},
 		}
 		for _, k := range nodes {

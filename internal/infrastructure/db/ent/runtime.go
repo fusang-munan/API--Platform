@@ -13,7 +13,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/gatewaycall"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/gatewaycallattempt"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/maintenancestate"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/matrixmodelcatalog"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprojectapplication"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
@@ -27,8 +27,12 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/projectmonthcreditbucket"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/promptaccessaudit"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providermodelcatalog"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/quotaadjustmentaudit"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/schema"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentmodellibrary"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/user"
 )
 
@@ -355,69 +359,27 @@ func init() {
 	maintenancestateDescID := maintenancestateMixinFields0[0].Descriptor()
 	// maintenancestate.DefaultID holds the default value on creation for the id field.
 	maintenancestate.DefaultID = maintenancestateDescID.Default.(func() uuid.UUID)
-	matrixmodelcatalogMixin := schema.MatrixModelCatalog{}.Mixin()
-	matrixmodelcatalogMixinFields0 := matrixmodelcatalogMixin[0].Fields()
-	_ = matrixmodelcatalogMixinFields0
-	matrixmodelcatalogMixinFields1 := matrixmodelcatalogMixin[1].Fields()
-	_ = matrixmodelcatalogMixinFields1
-	matrixmodelcatalogFields := schema.MatrixModelCatalog{}.Fields()
-	_ = matrixmodelcatalogFields
-	// matrixmodelcatalogDescCreatedAt is the schema descriptor for created_at field.
-	matrixmodelcatalogDescCreatedAt := matrixmodelcatalogMixinFields1[0].Descriptor()
-	// matrixmodelcatalog.DefaultCreatedAt holds the default value on creation for the created_at field.
-	matrixmodelcatalog.DefaultCreatedAt = matrixmodelcatalogDescCreatedAt.Default.(func() time.Time)
-	// matrixmodelcatalogDescUpdatedAt is the schema descriptor for updated_at field.
-	matrixmodelcatalogDescUpdatedAt := matrixmodelcatalogMixinFields1[1].Descriptor()
-	// matrixmodelcatalog.DefaultUpdatedAt holds the default value on creation for the updated_at field.
-	matrixmodelcatalog.DefaultUpdatedAt = matrixmodelcatalogDescUpdatedAt.Default.(func() time.Time)
-	// matrixmodelcatalog.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
-	matrixmodelcatalog.UpdateDefaultUpdatedAt = matrixmodelcatalogDescUpdatedAt.UpdateDefault.(func() time.Time)
-	// matrixmodelcatalogDescModelID is the schema descriptor for model_id field.
-	matrixmodelcatalogDescModelID := matrixmodelcatalogFields[0].Descriptor()
-	// matrixmodelcatalog.ModelIDValidator is a validator for the "model_id" field. It is called by the builders before save.
-	matrixmodelcatalog.ModelIDValidator = func() func(string) error {
-		validators := matrixmodelcatalogDescModelID.Validators
-		fns := [...]func(string) error{
-			validators[0].(func(string) error),
-			validators[1].(func(string) error),
-		}
-		return func(model_id string) error {
-			for _, fn := range fns {
-				if err := fn(model_id); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-	}()
-	// matrixmodelcatalogDescDescription is the schema descriptor for description field.
-	matrixmodelcatalogDescDescription := matrixmodelcatalogFields[1].Descriptor()
-	// matrixmodelcatalog.DescriptionValidator is a validator for the "description" field. It is called by the builders before save.
-	matrixmodelcatalog.DescriptionValidator = matrixmodelcatalogDescDescription.Validators[0].(func(string) error)
-	// matrixmodelcatalogDescOwnedBy is the schema descriptor for owned_by field.
-	matrixmodelcatalogDescOwnedBy := matrixmodelcatalogFields[2].Descriptor()
-	// matrixmodelcatalog.DefaultOwnedBy holds the default value on creation for the owned_by field.
-	matrixmodelcatalog.DefaultOwnedBy = matrixmodelcatalogDescOwnedBy.Default.([]string)
-	// matrixmodelcatalogDescModelTypes is the schema descriptor for model_types field.
-	matrixmodelcatalogDescModelTypes := matrixmodelcatalogFields[3].Descriptor()
-	// matrixmodelcatalog.DefaultModelTypes holds the default value on creation for the model_types field.
-	matrixmodelcatalog.DefaultModelTypes = matrixmodelcatalogDescModelTypes.Default.([]string)
-	// matrixmodelcatalogDescSupportedEndpointTypes is the schema descriptor for supported_endpoint_types field.
-	matrixmodelcatalogDescSupportedEndpointTypes := matrixmodelcatalogFields[4].Descriptor()
-	// matrixmodelcatalog.DefaultSupportedEndpointTypes holds the default value on creation for the supported_endpoint_types field.
-	matrixmodelcatalog.DefaultSupportedEndpointTypes = matrixmodelcatalogDescSupportedEndpointTypes.Default.([]string)
-	// matrixmodelcatalogDescTags is the schema descriptor for tags field.
-	matrixmodelcatalogDescTags := matrixmodelcatalogFields[5].Descriptor()
-	// matrixmodelcatalog.DefaultTags holds the default value on creation for the tags field.
-	matrixmodelcatalog.DefaultTags = matrixmodelcatalogDescTags.Default.([]string)
-	// matrixmodelcatalogDescRawEntries is the schema descriptor for raw_entries field.
-	matrixmodelcatalogDescRawEntries := matrixmodelcatalogFields[6].Descriptor()
-	// matrixmodelcatalog.DefaultRawEntries holds the default value on creation for the raw_entries field.
-	matrixmodelcatalog.DefaultRawEntries = matrixmodelcatalogDescRawEntries.Default.([]map[string]interface{})
-	// matrixmodelcatalogDescID is the schema descriptor for id field.
-	matrixmodelcatalogDescID := matrixmodelcatalogMixinFields0[0].Descriptor()
-	// matrixmodelcatalog.DefaultID holds the default value on creation for the id field.
-	matrixmodelcatalog.DefaultID = matrixmodelcatalogDescID.Default.(func() uuid.UUID)
+	mentorprofileMixin := schema.MentorProfile{}.Mixin()
+	mentorprofileMixinFields0 := mentorprofileMixin[0].Fields()
+	_ = mentorprofileMixinFields0
+	mentorprofileMixinFields1 := mentorprofileMixin[1].Fields()
+	_ = mentorprofileMixinFields1
+	mentorprofileFields := schema.MentorProfile{}.Fields()
+	_ = mentorprofileFields
+	// mentorprofileDescCreatedAt is the schema descriptor for created_at field.
+	mentorprofileDescCreatedAt := mentorprofileMixinFields1[0].Descriptor()
+	// mentorprofile.DefaultCreatedAt holds the default value on creation for the created_at field.
+	mentorprofile.DefaultCreatedAt = mentorprofileDescCreatedAt.Default.(func() time.Time)
+	// mentorprofileDescUpdatedAt is the schema descriptor for updated_at field.
+	mentorprofileDescUpdatedAt := mentorprofileMixinFields1[1].Descriptor()
+	// mentorprofile.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	mentorprofile.DefaultUpdatedAt = mentorprofileDescUpdatedAt.Default.(func() time.Time)
+	// mentorprofile.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	mentorprofile.UpdateDefaultUpdatedAt = mentorprofileDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// mentorprofileDescID is the schema descriptor for id field.
+	mentorprofileDescID := mentorprofileMixinFields0[0].Descriptor()
+	// mentorprofile.DefaultID holds the default value on creation for the id field.
+	mentorprofile.DefaultID = mentorprofileDescID.Default.(func() uuid.UUID)
 	mentorprojectapplicationMixin := schema.MentorProjectApplication{}.Mixin()
 	mentorprojectapplicationMixinFields0 := mentorprojectapplicationMixin[0].Fields()
 	_ = mentorprojectapplicationMixinFields0
@@ -540,6 +502,10 @@ func init() {
 			return nil
 		}
 	}()
+	// modelDescUpstreamMetadata is the schema descriptor for upstream_metadata field.
+	modelDescUpstreamMetadata := modelFields[13].Descriptor()
+	// model.DefaultUpstreamMetadata holds the default value on creation for the upstream_metadata field.
+	model.DefaultUpstreamMetadata = modelDescUpstreamMetadata.Default.(map[string]interface{})
 	// modelDescID is the schema descriptor for id field.
 	modelDescID := modelMixinFields0[0].Descriptor()
 	// model.DefaultID holds the default value on creation for the id field.
@@ -562,7 +528,7 @@ func init() {
 	// modelbinding.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
 	modelbinding.UpdateDefaultUpdatedAt = modelbindingDescUpdatedAt.UpdateDefault.(func() time.Time)
 	// modelbindingDescUpstreamModelName is the schema descriptor for upstream_model_name field.
-	modelbindingDescUpstreamModelName := modelbindingFields[2].Descriptor()
+	modelbindingDescUpstreamModelName := modelbindingFields[3].Descriptor()
 	// modelbinding.UpstreamModelNameValidator is a validator for the "upstream_model_name" field. It is called by the builders before save.
 	modelbinding.UpstreamModelNameValidator = func() func(string) error {
 		validators := modelbindingDescUpstreamModelName.Validators
@@ -580,7 +546,7 @@ func init() {
 		}
 	}()
 	// modelbindingDescPriority is the schema descriptor for priority field.
-	modelbindingDescPriority := modelbindingFields[4].Descriptor()
+	modelbindingDescPriority := modelbindingFields[5].Descriptor()
 	// modelbinding.DefaultPriority holds the default value on creation for the priority field.
 	modelbinding.DefaultPriority = modelbindingDescPriority.Default.(int)
 	// modelbinding.PriorityValidator is a validator for the "priority" field. It is called by the builders before save.
@@ -973,14 +939,120 @@ func init() {
 			return nil
 		}
 	}()
-	// providerDescCredentialCiphertext is the schema descriptor for credential_ciphertext field.
-	providerDescCredentialCiphertext := providerFields[2].Descriptor()
-	// provider.CredentialCiphertextValidator is a validator for the "credential_ciphertext" field. It is called by the builders before save.
-	provider.CredentialCiphertextValidator = providerDescCredentialCiphertext.Validators[0].(func([]byte) error)
 	// providerDescID is the schema descriptor for id field.
 	providerDescID := providerMixinFields0[0].Descriptor()
 	// provider.DefaultID holds the default value on creation for the id field.
 	provider.DefaultID = providerDescID.Default.(func() uuid.UUID)
+	providercredentialMixin := schema.ProviderCredential{}.Mixin()
+	providercredentialMixinFields0 := providercredentialMixin[0].Fields()
+	_ = providercredentialMixinFields0
+	providercredentialMixinFields1 := providercredentialMixin[1].Fields()
+	_ = providercredentialMixinFields1
+	providercredentialFields := schema.ProviderCredential{}.Fields()
+	_ = providercredentialFields
+	// providercredentialDescCreatedAt is the schema descriptor for created_at field.
+	providercredentialDescCreatedAt := providercredentialMixinFields1[0].Descriptor()
+	// providercredential.DefaultCreatedAt holds the default value on creation for the created_at field.
+	providercredential.DefaultCreatedAt = providercredentialDescCreatedAt.Default.(func() time.Time)
+	// providercredentialDescUpdatedAt is the schema descriptor for updated_at field.
+	providercredentialDescUpdatedAt := providercredentialMixinFields1[1].Descriptor()
+	// providercredential.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	providercredential.DefaultUpdatedAt = providercredentialDescUpdatedAt.Default.(func() time.Time)
+	// providercredential.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	providercredential.UpdateDefaultUpdatedAt = providercredentialDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// providercredentialDescLabel is the schema descriptor for label field.
+	providercredentialDescLabel := providercredentialFields[1].Descriptor()
+	// providercredential.LabelValidator is a validator for the "label" field. It is called by the builders before save.
+	providercredential.LabelValidator = func() func(string) error {
+		validators := providercredentialDescLabel.Validators
+		fns := [...]func(string) error{
+			validators[0].(func(string) error),
+			validators[1].(func(string) error),
+		}
+		return func(label string) error {
+			for _, fn := range fns {
+				if err := fn(label); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}()
+	// providercredentialDescGroupHint is the schema descriptor for group_hint field.
+	providercredentialDescGroupHint := providercredentialFields[2].Descriptor()
+	// providercredential.GroupHintValidator is a validator for the "group_hint" field. It is called by the builders before save.
+	providercredential.GroupHintValidator = providercredentialDescGroupHint.Validators[0].(func(string) error)
+	// providercredentialDescCredentialCiphertext is the schema descriptor for credential_ciphertext field.
+	providercredentialDescCredentialCiphertext := providercredentialFields[3].Descriptor()
+	// providercredential.CredentialCiphertextValidator is a validator for the "credential_ciphertext" field. It is called by the builders before save.
+	providercredential.CredentialCiphertextValidator = providercredentialDescCredentialCiphertext.Validators[0].(func([]byte) error)
+	// providercredentialDescID is the schema descriptor for id field.
+	providercredentialDescID := providercredentialMixinFields0[0].Descriptor()
+	// providercredential.DefaultID holds the default value on creation for the id field.
+	providercredential.DefaultID = providercredentialDescID.Default.(func() uuid.UUID)
+	providermodelcatalogMixin := schema.ProviderModelCatalog{}.Mixin()
+	providermodelcatalogMixinFields0 := providermodelcatalogMixin[0].Fields()
+	_ = providermodelcatalogMixinFields0
+	providermodelcatalogMixinFields1 := providermodelcatalogMixin[1].Fields()
+	_ = providermodelcatalogMixinFields1
+	providermodelcatalogFields := schema.ProviderModelCatalog{}.Fields()
+	_ = providermodelcatalogFields
+	// providermodelcatalogDescCreatedAt is the schema descriptor for created_at field.
+	providermodelcatalogDescCreatedAt := providermodelcatalogMixinFields1[0].Descriptor()
+	// providermodelcatalog.DefaultCreatedAt holds the default value on creation for the created_at field.
+	providermodelcatalog.DefaultCreatedAt = providermodelcatalogDescCreatedAt.Default.(func() time.Time)
+	// providermodelcatalogDescUpdatedAt is the schema descriptor for updated_at field.
+	providermodelcatalogDescUpdatedAt := providermodelcatalogMixinFields1[1].Descriptor()
+	// providermodelcatalog.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	providermodelcatalog.DefaultUpdatedAt = providermodelcatalogDescUpdatedAt.Default.(func() time.Time)
+	// providermodelcatalog.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	providermodelcatalog.UpdateDefaultUpdatedAt = providermodelcatalogDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// providermodelcatalogDescModelID is the schema descriptor for model_id field.
+	providermodelcatalogDescModelID := providermodelcatalogFields[2].Descriptor()
+	// providermodelcatalog.ModelIDValidator is a validator for the "model_id" field. It is called by the builders before save.
+	providermodelcatalog.ModelIDValidator = func() func(string) error {
+		validators := providermodelcatalogDescModelID.Validators
+		fns := [...]func(string) error{
+			validators[0].(func(string) error),
+			validators[1].(func(string) error),
+		}
+		return func(model_id string) error {
+			for _, fn := range fns {
+				if err := fn(model_id); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}()
+	// providermodelcatalogDescDisplayName is the schema descriptor for display_name field.
+	providermodelcatalogDescDisplayName := providermodelcatalogFields[3].Descriptor()
+	// providermodelcatalog.DisplayNameValidator is a validator for the "display_name" field. It is called by the builders before save.
+	providermodelcatalog.DisplayNameValidator = providermodelcatalogDescDisplayName.Validators[0].(func(string) error)
+	// providermodelcatalogDescDescription is the schema descriptor for description field.
+	providermodelcatalogDescDescription := providermodelcatalogFields[4].Descriptor()
+	// providermodelcatalog.DescriptionValidator is a validator for the "description" field. It is called by the builders before save.
+	providermodelcatalog.DescriptionValidator = providermodelcatalogDescDescription.Validators[0].(func(string) error)
+	// providermodelcatalogDescOwnedBy is the schema descriptor for owned_by field.
+	providermodelcatalogDescOwnedBy := providermodelcatalogFields[5].Descriptor()
+	// providermodelcatalog.OwnedByValidator is a validator for the "owned_by" field. It is called by the builders before save.
+	providermodelcatalog.OwnedByValidator = providermodelcatalogDescOwnedBy.Validators[0].(func(string) error)
+	// providermodelcatalogDescUpstreamObject is the schema descriptor for upstream_object field.
+	providermodelcatalogDescUpstreamObject := providermodelcatalogFields[6].Descriptor()
+	// providermodelcatalog.UpstreamObjectValidator is a validator for the "upstream_object" field. It is called by the builders before save.
+	providermodelcatalog.UpstreamObjectValidator = providermodelcatalogDescUpstreamObject.Validators[0].(func(string) error)
+	// providermodelcatalogDescUpstreamCreatedAt is the schema descriptor for upstream_created_at field.
+	providermodelcatalogDescUpstreamCreatedAt := providermodelcatalogFields[7].Descriptor()
+	// providermodelcatalog.UpstreamCreatedAtValidator is a validator for the "upstream_created_at" field. It is called by the builders before save.
+	providermodelcatalog.UpstreamCreatedAtValidator = providermodelcatalogDescUpstreamCreatedAt.Validators[0].(func(string) error)
+	// providermodelcatalogDescRawEntry is the schema descriptor for raw_entry field.
+	providermodelcatalogDescRawEntry := providermodelcatalogFields[8].Descriptor()
+	// providermodelcatalog.DefaultRawEntry holds the default value on creation for the raw_entry field.
+	providermodelcatalog.DefaultRawEntry = providermodelcatalogDescRawEntry.Default.(map[string]interface{})
+	// providermodelcatalogDescID is the schema descriptor for id field.
+	providermodelcatalogDescID := providermodelcatalogMixinFields0[0].Descriptor()
+	// providermodelcatalog.DefaultID holds the default value on creation for the id field.
+	providermodelcatalog.DefaultID = providermodelcatalogDescID.Default.(func() uuid.UUID)
 	quotaadjustmentauditMixin := schema.QuotaAdjustmentAudit{}.Mixin()
 	quotaadjustmentauditMixinFields0 := quotaadjustmentauditMixin[0].Fields()
 	_ = quotaadjustmentauditMixinFields0
@@ -1022,6 +1094,48 @@ func init() {
 	quotaadjustmentauditDescID := quotaadjustmentauditMixinFields0[0].Descriptor()
 	// quotaadjustmentaudit.DefaultID holds the default value on creation for the id field.
 	quotaadjustmentaudit.DefaultID = quotaadjustmentauditDescID.Default.(func() uuid.UUID)
+	studentmodellibraryMixin := schema.StudentModelLibrary{}.Mixin()
+	studentmodellibraryMixinFields0 := studentmodellibraryMixin[0].Fields()
+	_ = studentmodellibraryMixinFields0
+	studentmodellibraryMixinFields1 := studentmodellibraryMixin[1].Fields()
+	_ = studentmodellibraryMixinFields1
+	studentmodellibraryFields := schema.StudentModelLibrary{}.Fields()
+	_ = studentmodellibraryFields
+	// studentmodellibraryDescCreatedAt is the schema descriptor for created_at field.
+	studentmodellibraryDescCreatedAt := studentmodellibraryMixinFields1[0].Descriptor()
+	// studentmodellibrary.DefaultCreatedAt holds the default value on creation for the created_at field.
+	studentmodellibrary.DefaultCreatedAt = studentmodellibraryDescCreatedAt.Default.(func() time.Time)
+	// studentmodellibraryDescUpdatedAt is the schema descriptor for updated_at field.
+	studentmodellibraryDescUpdatedAt := studentmodellibraryMixinFields1[1].Descriptor()
+	// studentmodellibrary.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	studentmodellibrary.DefaultUpdatedAt = studentmodellibraryDescUpdatedAt.Default.(func() time.Time)
+	// studentmodellibrary.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	studentmodellibrary.UpdateDefaultUpdatedAt = studentmodellibraryDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// studentmodellibraryDescID is the schema descriptor for id field.
+	studentmodellibraryDescID := studentmodellibraryMixinFields0[0].Descriptor()
+	// studentmodellibrary.DefaultID holds the default value on creation for the id field.
+	studentmodellibrary.DefaultID = studentmodellibraryDescID.Default.(func() uuid.UUID)
+	studentprofileMixin := schema.StudentProfile{}.Mixin()
+	studentprofileMixinFields0 := studentprofileMixin[0].Fields()
+	_ = studentprofileMixinFields0
+	studentprofileMixinFields1 := studentprofileMixin[1].Fields()
+	_ = studentprofileMixinFields1
+	studentprofileFields := schema.StudentProfile{}.Fields()
+	_ = studentprofileFields
+	// studentprofileDescCreatedAt is the schema descriptor for created_at field.
+	studentprofileDescCreatedAt := studentprofileMixinFields1[0].Descriptor()
+	// studentprofile.DefaultCreatedAt holds the default value on creation for the created_at field.
+	studentprofile.DefaultCreatedAt = studentprofileDescCreatedAt.Default.(func() time.Time)
+	// studentprofileDescUpdatedAt is the schema descriptor for updated_at field.
+	studentprofileDescUpdatedAt := studentprofileMixinFields1[1].Descriptor()
+	// studentprofile.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	studentprofile.DefaultUpdatedAt = studentprofileDescUpdatedAt.Default.(func() time.Time)
+	// studentprofile.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	studentprofile.UpdateDefaultUpdatedAt = studentprofileDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// studentprofileDescID is the schema descriptor for id field.
+	studentprofileDescID := studentprofileMixinFields0[0].Descriptor()
+	// studentprofile.DefaultID holds the default value on creation for the id field.
+	studentprofile.DefaultID = studentprofileDescID.Default.(func() uuid.UUID)
 	userMixin := schema.User{}.Mixin()
 	userMixinFields0 := userMixin[0].Fields()
 	_ = userMixinFields0

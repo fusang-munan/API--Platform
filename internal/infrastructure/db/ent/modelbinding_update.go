@@ -11,8 +11,10 @@ import (
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"entgo.io/ent/schema/field"
+	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/predicate"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 )
 
 // ModelBindingUpdate is the builder for updating ModelBinding entities.
@@ -31,6 +33,26 @@ func (_u *ModelBindingUpdate) Where(ps ...predicate.ModelBinding) *ModelBindingU
 // SetUpdatedAt sets the "updated_at" field.
 func (_u *ModelBindingUpdate) SetUpdatedAt(v time.Time) *ModelBindingUpdate {
 	_u.mutation.SetUpdatedAt(v)
+	return _u
+}
+
+// SetCredentialID sets the "credential_id" field.
+func (_u *ModelBindingUpdate) SetCredentialID(v uuid.UUID) *ModelBindingUpdate {
+	_u.mutation.SetCredentialID(v)
+	return _u
+}
+
+// SetNillableCredentialID sets the "credential_id" field if the given value is not nil.
+func (_u *ModelBindingUpdate) SetNillableCredentialID(v *uuid.UUID) *ModelBindingUpdate {
+	if v != nil {
+		_u.SetCredentialID(*v)
+	}
+	return _u
+}
+
+// ClearCredentialID clears the value of the "credential_id" field.
+func (_u *ModelBindingUpdate) ClearCredentialID() *ModelBindingUpdate {
+	_u.mutation.ClearCredentialID()
 	return _u
 }
 
@@ -97,9 +119,20 @@ func (_u *ModelBindingUpdate) SetNillableStatus(v *modelbinding.Status) *ModelBi
 	return _u
 }
 
+// SetCredential sets the "credential" edge to the ProviderCredential entity.
+func (_u *ModelBindingUpdate) SetCredential(v *ProviderCredential) *ModelBindingUpdate {
+	return _u.SetCredentialID(v.ID)
+}
+
 // Mutation returns the ModelBindingMutation object of the builder.
 func (_u *ModelBindingUpdate) Mutation() *ModelBindingMutation {
 	return _u.mutation
+}
+
+// ClearCredential clears the "credential" edge to the ProviderCredential entity.
+func (_u *ModelBindingUpdate) ClearCredential() *ModelBindingUpdate {
+	_u.mutation.ClearCredential()
+	return _u
 }
 
 // Save executes the query and returns the number of nodes affected by the update operation.
@@ -199,6 +232,35 @@ func (_u *ModelBindingUpdate) sqlSave(ctx context.Context) (_node int, err error
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(modelbinding.FieldStatus, field.TypeEnum, value)
 	}
+	if _u.mutation.CredentialCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.M2O,
+			Inverse: true,
+			Table:   modelbinding.CredentialTable,
+			Columns: []string{modelbinding.CredentialColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providercredential.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.CredentialIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.M2O,
+			Inverse: true,
+			Table:   modelbinding.CredentialTable,
+			Columns: []string{modelbinding.CredentialColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providercredential.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
 	if _node, err = sqlgraph.UpdateNodes(ctx, _u.driver, _spec); err != nil {
 		if _, ok := err.(*sqlgraph.NotFoundError); ok {
 			err = &NotFoundError{modelbinding.Label}
@@ -222,6 +284,26 @@ type ModelBindingUpdateOne struct {
 // SetUpdatedAt sets the "updated_at" field.
 func (_u *ModelBindingUpdateOne) SetUpdatedAt(v time.Time) *ModelBindingUpdateOne {
 	_u.mutation.SetUpdatedAt(v)
+	return _u
+}
+
+// SetCredentialID sets the "credential_id" field.
+func (_u *ModelBindingUpdateOne) SetCredentialID(v uuid.UUID) *ModelBindingUpdateOne {
+	_u.mutation.SetCredentialID(v)
+	return _u
+}
+
+// SetNillableCredentialID sets the "credential_id" field if the given value is not nil.
+func (_u *ModelBindingUpdateOne) SetNillableCredentialID(v *uuid.UUID) *ModelBindingUpdateOne {
+	if v != nil {
+		_u.SetCredentialID(*v)
+	}
+	return _u
+}
+
+// ClearCredentialID clears the value of the "credential_id" field.
+func (_u *ModelBindingUpdateOne) ClearCredentialID() *ModelBindingUpdateOne {
+	_u.mutation.ClearCredentialID()
 	return _u
 }
 
@@ -288,9 +370,20 @@ func (_u *ModelBindingUpdateOne) SetNillableStatus(v *modelbinding.Status) *Mode
 	return _u
 }
 
+// SetCredential sets the "credential" edge to the ProviderCredential entity.
+func (_u *ModelBindingUpdateOne) SetCredential(v *ProviderCredential) *ModelBindingUpdateOne {
+	return _u.SetCredentialID(v.ID)
+}
+
 // Mutation returns the ModelBindingMutation object of the builder.
 func (_u *ModelBindingUpdateOne) Mutation() *ModelBindingMutation {
 	return _u.mutation
+}
+
+// ClearCredential clears the "credential" edge to the ProviderCredential entity.
+func (_u *ModelBindingUpdateOne) ClearCredential() *ModelBindingUpdateOne {
+	_u.mutation.ClearCredential()
+	return _u
 }
 
 // Where appends a list predicates to the ModelBindingUpdate builder.
@@ -419,6 +512,35 @@ func (_u *ModelBindingUpdateOne) sqlSave(ctx context.Context) (_node *ModelBindi
 	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(modelbinding.FieldStatus, field.TypeEnum, value)
+	}
+	if _u.mutation.CredentialCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.M2O,
+			Inverse: true,
+			Table:   modelbinding.CredentialTable,
+			Columns: []string{modelbinding.CredentialColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providercredential.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.CredentialIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.M2O,
+			Inverse: true,
+			Table:   modelbinding.CredentialTable,
+			Columns: []string{modelbinding.CredentialColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providercredential.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
 	_node = &ModelBinding{config: _u.config}
 	_spec.Assign = _node.assignValues

@@ -24,14 +24,23 @@ const (
 	FieldName = "name"
 	// FieldBaseURL holds the string denoting the base_url field in the database.
 	FieldBaseURL = "base_url"
-	// FieldCredentialCiphertext holds the string denoting the credential_ciphertext field in the database.
-	FieldCredentialCiphertext = "credential_ciphertext"
 	// FieldStatus holds the string denoting the status field in the database.
 	FieldStatus = "status"
+	// EdgeCredentials holds the string denoting the credentials edge name in mutations.
+	EdgeCredentials = "credentials"
 	// EdgeModelBindings holds the string denoting the model_bindings edge name in mutations.
 	EdgeModelBindings = "model_bindings"
+	// EdgeModelCatalogEntries holds the string denoting the model_catalog_entries edge name in mutations.
+	EdgeModelCatalogEntries = "model_catalog_entries"
 	// Table holds the table name of the provider in the database.
 	Table = "providers"
+	// CredentialsTable is the table that holds the credentials relation/edge.
+	CredentialsTable = "provider_credentials"
+	// CredentialsInverseTable is the table name for the ProviderCredential entity.
+	// It exists in this package in order to avoid circular dependency with the "providercredential" package.
+	CredentialsInverseTable = "provider_credentials"
+	// CredentialsColumn is the table column denoting the credentials relation/edge.
+	CredentialsColumn = "provider_id"
 	// ModelBindingsTable is the table that holds the model_bindings relation/edge.
 	ModelBindingsTable = "model_bindings"
 	// ModelBindingsInverseTable is the table name for the ModelBinding entity.
@@ -39,6 +48,13 @@ const (
 	ModelBindingsInverseTable = "model_bindings"
 	// ModelBindingsColumn is the table column denoting the model_bindings relation/edge.
 	ModelBindingsColumn = "provider_id"
+	// ModelCatalogEntriesTable is the table that holds the model_catalog_entries relation/edge.
+	ModelCatalogEntriesTable = "provider_model_catalog"
+	// ModelCatalogEntriesInverseTable is the table name for the ProviderModelCatalog entity.
+	// It exists in this package in order to avoid circular dependency with the "providermodelcatalog" package.
+	ModelCatalogEntriesInverseTable = "provider_model_catalog"
+	// ModelCatalogEntriesColumn is the table column denoting the model_catalog_entries relation/edge.
+	ModelCatalogEntriesColumn = "provider_id"
 )
 
 // Columns holds all SQL columns for provider fields.
@@ -48,7 +64,6 @@ var Columns = []string{
 	FieldUpdatedAt,
 	FieldName,
 	FieldBaseURL,
-	FieldCredentialCiphertext,
 	FieldStatus,
 }
 
@@ -73,8 +88,6 @@ var (
 	NameValidator func(string) error
 	// BaseURLValidator is a validator for the "base_url" field. It is called by the builders before save.
 	BaseURLValidator func(string) error
-	// CredentialCiphertextValidator is a validator for the "credential_ciphertext" field. It is called by the builders before save.
-	CredentialCiphertextValidator func([]byte) error
 	// DefaultID holds the default value on creation for the "id" field.
 	DefaultID func() uuid.UUID
 )
@@ -138,6 +151,20 @@ func ByStatus(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldStatus, opts...).ToFunc()
 }
 
+// ByCredentialsCount orders the results by credentials count.
+func ByCredentialsCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newCredentialsStep(), opts...)
+	}
+}
+
+// ByCredentials orders the results by credentials terms.
+func ByCredentials(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newCredentialsStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
+
 // ByModelBindingsCount orders the results by model_bindings count.
 func ByModelBindingsCount(opts ...sql.OrderTermOption) OrderOption {
 	return func(s *sql.Selector) {
@@ -151,10 +178,38 @@ func ByModelBindings(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
 		sqlgraph.OrderByNeighborTerms(s, newModelBindingsStep(), append([]sql.OrderTerm{term}, terms...)...)
 	}
 }
+
+// ByModelCatalogEntriesCount orders the results by model_catalog_entries count.
+func ByModelCatalogEntriesCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newModelCatalogEntriesStep(), opts...)
+	}
+}
+
+// ByModelCatalogEntries orders the results by model_catalog_entries terms.
+func ByModelCatalogEntries(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newModelCatalogEntriesStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
+func newCredentialsStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(CredentialsInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2M, false, CredentialsTable, CredentialsColumn),
+	)
+}
 func newModelBindingsStep() *sqlgraph.Step {
 	return sqlgraph.NewStep(
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(ModelBindingsInverseTable, FieldID),
 		sqlgraph.Edge(sqlgraph.O2M, false, ModelBindingsTable, ModelBindingsColumn),
+	)
+}
+func newModelCatalogEntriesStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(ModelCatalogEntriesInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2M, false, ModelCatalogEntriesTable, ModelCatalogEntriesColumn),
 	)
 }

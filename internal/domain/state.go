@@ -8,19 +8,21 @@ const (
 	KeyApproved       = "approved"
 	KeyActive         = "active"
 	KeyRejected       = "rejected"
-	KeyRevoked        = "revoked"
+	KeyInactive       = "inactive"
 )
 
 func ValidKeyTransition(from, to string) bool {
 	switch from {
 	case KeyPendingMentor:
-		return to == KeyPendingTeacher || to == KeyRejected
+		return to == KeyApproved || to == KeyRejected || to == KeyPendingTeacher
 	case KeyPendingTeacher:
-		return to == KeyApproved || to == KeyRejected
+		return to == KeyApproved || to == KeyRejected || to == KeyPendingMentor
 	case KeyApproved:
 		return to == KeyActive
 	case KeyActive:
-		return to == KeyRevoked
+		return to == KeyInactive
+	case KeyInactive:
+		return to == KeyActive
 	default:
 		return false
 	}
@@ -28,7 +30,7 @@ func ValidKeyTransition(from, to string) bool {
 
 func RequiresAuditReason(action string) bool {
 	switch action {
-	case "mentor_rejected", "teacher_rejected", "mentor_revoked":
+	case "mentor_rejected", "teacher_rejected":
 		return true
 	default:
 		return false

@@ -50,6 +50,7 @@ func (Model) Fields() []ent.Field {
 			Values("pending_configuration", "active", "inactive").
 			Default("pending_configuration"),
 		field.Int64("credit_multiplier_milli").Optional().Nillable().NonNegative().Max(1_000_000_000_000),
+		field.JSON("upstream_metadata", map[string]any{}).Default(map[string]any{}),
 	}
 }
 
@@ -57,6 +58,7 @@ func (Model) Edges() []ent.Edge {
 	return []ent.Edge{
 		edge.To("bindings", ModelBinding.Type),
 		edge.To("api_key_models", APIKeyModel.Type),
+		edge.To("student_library_entries", StudentModelLibrary.Type),
 	}
 }
 

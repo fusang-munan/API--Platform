@@ -68,7 +68,7 @@ func cors(allowedOrigin string) gin.HandlerFunc {
 			c.Header("Access-Control-Allow-Origin", allowedOrigin)
 			c.Header("Access-Control-Allow-Credentials", "true")
 			c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID")
-			c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+			c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 			c.Header("Access-Control-Expose-Headers", "X-Request-ID")
 			c.Header("Vary", "Origin")
 		}
@@ -112,7 +112,7 @@ func (s *Server) authenticate() gin.HandlerFunc {
 			return
 		}
 		if current.Role != claims.Role {
-			writeError(c, domain.NewError(domain.CodeAuthenticationRequired, "access token role is stale"))
+			writeError(c, domain.NewError(domain.CodeAuthenticationRequired, "access token identity is stale"))
 			c.Abort()
 			return
 		}
@@ -125,6 +125,28 @@ func requireRole(role string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if identity(c).Role != role {
 			writeError(c, domain.NewError(domain.CodeForbidden, "role is not allowed"))
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+func (s *Server) requireMentorProfile() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if err := s.service.EnsureActiveMentorProfile(c.Request.Context(), identity(c).UserID); err != nil {
+			writeError(c, err)
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+func (s *Server) requireStudentProfile() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if err := s.service.EnsureActiveStudentProfile(c.Request.Context(), identity(c).UserID); err != nil {
+			writeError(c, err)
 			c.Abort()
 			return
 		}
@@ -215,7 +237,7 @@ func errorStatus(code string) int {
 	case domain.CodeNotFound:
 		return http.StatusNotFound
 	case domain.CodeEmailRegistered, domain.CodeNameConflict, domain.CodeInvalidTransition,
-		domain.CodeProjectNoMentor, domain.CodeMentorNotInOrganization, domain.CodeMentorAlreadyProjectMember,
+		domain.CodeProjectNoMentor, domain.CodeMentorNotInOrganization, domain.CodeMentorAlreadyProjectMember, domain.CodeMentorNotProjectMember,
 		domain.CodeModelNotReady, domain.CodeModelRoutingRequired,
 		domain.CodeKeyAlreadyClaimed, domain.CodeProjectQuotaAllocation:
 		return http.StatusConflict

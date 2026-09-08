@@ -24,6 +24,8 @@ const (
 	FieldModelID = "model_id"
 	// FieldProviderID holds the string denoting the provider_id field in the database.
 	FieldProviderID = "provider_id"
+	// FieldCredentialID holds the string denoting the credential_id field in the database.
+	FieldCredentialID = "credential_id"
 	// FieldUpstreamModelName holds the string denoting the upstream_model_name field in the database.
 	FieldUpstreamModelName = "upstream_model_name"
 	// FieldAdapter holds the string denoting the adapter field in the database.
@@ -36,6 +38,8 @@ const (
 	EdgeModel = "model"
 	// EdgeProvider holds the string denoting the provider edge name in mutations.
 	EdgeProvider = "provider"
+	// EdgeCredential holds the string denoting the credential edge name in mutations.
+	EdgeCredential = "credential"
 	// Table holds the table name of the modelbinding in the database.
 	Table = "model_bindings"
 	// ModelTable is the table that holds the model relation/edge.
@@ -52,6 +56,13 @@ const (
 	ProviderInverseTable = "providers"
 	// ProviderColumn is the table column denoting the provider relation/edge.
 	ProviderColumn = "provider_id"
+	// CredentialTable is the table that holds the credential relation/edge.
+	CredentialTable = "model_bindings"
+	// CredentialInverseTable is the table name for the ProviderCredential entity.
+	// It exists in this package in order to avoid circular dependency with the "providercredential" package.
+	CredentialInverseTable = "provider_credentials"
+	// CredentialColumn is the table column denoting the credential relation/edge.
+	CredentialColumn = "credential_id"
 )
 
 // Columns holds all SQL columns for modelbinding fields.
@@ -61,6 +72,7 @@ var Columns = []string{
 	FieldUpdatedAt,
 	FieldModelID,
 	FieldProviderID,
+	FieldCredentialID,
 	FieldUpstreamModelName,
 	FieldAdapter,
 	FieldPriority,
@@ -180,6 +192,11 @@ func ByProviderID(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldProviderID, opts...).ToFunc()
 }
 
+// ByCredentialID orders the results by the credential_id field.
+func ByCredentialID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldCredentialID, opts...).ToFunc()
+}
+
 // ByUpstreamModelName orders the results by the upstream_model_name field.
 func ByUpstreamModelName(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldUpstreamModelName, opts...).ToFunc()
@@ -213,6 +230,13 @@ func ByProviderField(field string, opts ...sql.OrderTermOption) OrderOption {
 		sqlgraph.OrderByNeighborTerms(s, newProviderStep(), sql.OrderByField(field, opts...))
 	}
 }
+
+// ByCredentialField orders the results by credential field.
+func ByCredentialField(field string, opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newCredentialStep(), sql.OrderByField(field, opts...))
+	}
+}
 func newModelStep() *sqlgraph.Step {
 	return sqlgraph.NewStep(
 		sqlgraph.From(Table, FieldID),
@@ -225,5 +249,12 @@ func newProviderStep() *sqlgraph.Step {
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(ProviderInverseTable, FieldID),
 		sqlgraph.Edge(sqlgraph.M2O, true, ProviderTable, ProviderColumn),
+	)
+}
+func newCredentialStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(CredentialInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.M2O, true, CredentialTable, CredentialColumn),
 	)
 }

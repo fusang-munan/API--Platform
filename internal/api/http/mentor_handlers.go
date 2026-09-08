@@ -69,6 +69,28 @@ func (s *Server) mentorKeyReviews(c *gin.Context) {
 	respondList(c, rows)
 }
 
+func (s *Server) mentorAPIKeys(c *gin.Context) {
+	rows, err := s.service.MentorAPIKeys(c.Request.Context(), identity(c).UserID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respondList(c, rows)
+}
+
+func (s *Server) mentorAPIKey(c *gin.Context) {
+	keyID, ok := pathID(c, "api_key_id")
+	if !ok {
+		return
+	}
+	view, err := s.service.MentorAPIKey(c.Request.Context(), identity(c).UserID, keyID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
+}
+
 func (s *Server) mentorKeyReview(c *gin.Context) {
 	keyID, ok := pathID(c, "api_key_id")
 	if !ok {
@@ -99,11 +121,7 @@ func (s *Server) reviewKeyAsMentor(approve bool) gin.HandlerFunc {
 		}
 		comment := input.Comment
 		var quota []int64
-		if approve && strings.TrimSpace(input.MonthlyCredits) == "" {
-			writeError(c, domain.NewError(domain.CodeValidation, "monthly_credits is required"))
-			return
-		}
-		if approve {
+		if approve && strings.TrimSpace(input.MonthlyCredits) != "" {
 			value, err := domain.ParseCredits(input.MonthlyCredits)
 			if err != nil {
 				writeError(c, err)
@@ -132,7 +150,7 @@ func (s *Server) mentorActiveKeys(c *gin.Context) {
 	respondList(c, rows)
 }
 
-func (s *Server) revokeKeyAsMentor(c *gin.Context) {
+func (s *Server) deactivateKeyAsMentor(c *gin.Context) {
 	keyID, ok := pathID(c, "api_key_id")
 	if !ok {
 		return
@@ -141,7 +159,19 @@ func (s *Server) revokeKeyAsMentor(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := s.service.RevokeKeyAsMentor(c.Request.Context(), identity(c).UserID, keyID, comment); err != nil {
+	if err := s.service.DeactivateKeyAsMentor(c.Request.Context(), identity(c).UserID, keyID, comment); err != nil {
+		writeError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) activateKeyAsMentor(c *gin.Context) {
+	keyID, ok := pathID(c, "api_key_id")
+	if !ok {
+		return
+	}
+	if err := s.service.ActivateKeyAsMentor(c.Request.Context(), identity(c).UserID, keyID); err != nil {
 		writeError(c, err)
 		return
 	}

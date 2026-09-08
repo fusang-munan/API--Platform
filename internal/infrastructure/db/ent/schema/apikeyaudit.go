@@ -35,7 +35,7 @@ func (APIKeyAudit) Fields() []ent.Field {
 		field.UUID("api_key_id", uuid.UUID{}).Immutable(),
 		field.UUID("actor_user_id", uuid.UUID{}).Immutable(),
 		field.Enum("action").
-			Values("mentor_approved", "mentor_rejected", "teacher_approved", "teacher_rejected", "mentor_revoked").
+			Values("mentor_approved", "mentor_rejected", "teacher_approved", "teacher_rejected", "mentor_revoked", "mentor_deactivated", "mentor_activated", "student_withdrawn").
 			Immutable(),
 		field.String("comment").Optional().Nillable().MaxLen(1000).Immutable(),
 	}

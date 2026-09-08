@@ -13,6 +13,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 )
 
 // ModelBinding is the model entity for the ModelBinding schema.
@@ -28,6 +29,8 @@ type ModelBinding struct {
 	ModelID uuid.UUID `json:"model_id,omitempty"`
 	// ProviderID holds the value of the "provider_id" field.
 	ProviderID uuid.UUID `json:"provider_id,omitempty"`
+	// CredentialID holds the value of the "credential_id" field.
+	CredentialID *uuid.UUID `json:"credential_id,omitempty"`
 	// UpstreamModelName holds the value of the "upstream_model_name" field.
 	UpstreamModelName string `json:"upstream_model_name,omitempty"`
 	// Adapter holds the value of the "adapter" field.
@@ -48,9 +51,11 @@ type ModelBindingEdges struct {
 	Model *Model `json:"model,omitempty"`
 	// Provider holds the value of the provider edge.
 	Provider *Provider `json:"provider,omitempty"`
+	// Credential holds the value of the credential edge.
+	Credential *ProviderCredential `json:"credential,omitempty"`
 	// loadedTypes holds the information for reporting if a
 	// type was loaded (or requested) in eager-loading or not.
-	loadedTypes [2]bool
+	loadedTypes [3]bool
 }
 
 // ModelOrErr returns the Model value or an error if the edge
@@ -75,11 +80,24 @@ func (e ModelBindingEdges) ProviderOrErr() (*Provider, error) {
 	return nil, &NotLoadedError{edge: "provider"}
 }
 
+// CredentialOrErr returns the Credential value or an error if the edge
+// was not loaded in eager-loading, or loaded but was not found.
+func (e ModelBindingEdges) CredentialOrErr() (*ProviderCredential, error) {
+	if e.Credential != nil {
+		return e.Credential, nil
+	} else if e.loadedTypes[2] {
+		return nil, &NotFoundError{label: providercredential.Label}
+	}
+	return nil, &NotLoadedError{edge: "credential"}
+}
+
 // scanValues returns the types for scanning values from sql.Rows.
 func (*ModelBinding) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
+		case modelbinding.FieldCredentialID:
+			values[i] = &sql.NullScanner{S: new(uuid.UUID)}
 		case modelbinding.FieldPriority:
 			values[i] = new(sql.NullInt64)
 		case modelbinding.FieldUpstreamModelName, modelbinding.FieldAdapter, modelbinding.FieldStatus:
@@ -133,6 +151,13 @@ func (_m *ModelBinding) assignValues(columns []string, values []any) error {
 			} else if value != nil {
 				_m.ProviderID = *value
 			}
+		case modelbinding.FieldCredentialID:
+			if value, ok := values[i].(*sql.NullScanner); !ok {
+				return fmt.Errorf("unexpected type %T for field credential_id", values[i])
+			} else if value.Valid {
+				_m.CredentialID = new(uuid.UUID)
+				*_m.CredentialID = *value.S.(*uuid.UUID)
+			}
 		case modelbinding.FieldUpstreamModelName:
 			if value, ok := values[i].(*sql.NullString); !ok {
 				return fmt.Errorf("unexpected type %T for field upstream_model_name", values[i])
@@ -180,6 +205,11 @@ func (_m *ModelBinding) QueryProvider() *ProviderQuery {
 	return NewModelBindingClient(_m.config).QueryProvider(_m)
 }
 
+// QueryCredential queries the "credential" edge of the ModelBinding entity.
+func (_m *ModelBinding) QueryCredential() *ProviderCredentialQuery {
+	return NewModelBindingClient(_m.config).QueryCredential(_m)
+}
+
 // Update returns a builder for updating this ModelBinding.
 // Note that you need to call ModelBinding.Unwrap() before calling this method if this ModelBinding
 // was returned from a transaction, and the transaction was committed or rolled back.
@@ -214,6 +244,11 @@ func (_m *ModelBinding) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("provider_id=")
 	builder.WriteString(fmt.Sprintf("%v", _m.ProviderID))
+	builder.WriteString(", ")
+	if v := _m.CredentialID; v != nil {
+		builder.WriteString("credential_id=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
+	}
 	builder.WriteString(", ")
 	builder.WriteString("upstream_model_name=")
 	builder.WriteString(_m.UpstreamModelName)

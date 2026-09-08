@@ -16,10 +16,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikey"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeyaudit"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprojectapplication"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/organizationmember"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/predicate"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/projectmember"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentmodellibrary"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/user"
 )
 
@@ -30,12 +33,16 @@ type UserQuery struct {
 	order                           []user.OrderOption
 	inters                          []Interceptor
 	predicates                      []predicate.User
+	withStudentProfile              *StudentProfileQuery
+	withMentorProfile               *MentorProfileQuery
+	withGrantedMentorProfiles       *MentorProfileQuery
 	withOrganizationMemberships     *OrganizationMemberQuery
 	withProjectMemberships          *ProjectMemberQuery
 	withMentorProjectApplications   *MentorProjectApplicationQuery
 	withReviewedProjectApplications *MentorProjectApplicationQuery
 	withAPIKeys                     *APIKeyQuery
 	withAPIKeyAudits                *APIKeyAuditQuery
+	withModelLibraryEntries         *StudentModelLibraryQuery
 	modifiers                       []func(*sql.Selector)
 	// intermediate query (i.e. traversal path).
 	sql  *sql.Selector
@@ -71,6 +78,72 @@ func (_q *UserQuery) Unique(unique bool) *UserQuery {
 func (_q *UserQuery) Order(o ...user.OrderOption) *UserQuery {
 	_q.order = append(_q.order, o...)
 	return _q
+}
+
+// QueryStudentProfile chains the current query on the "student_profile" edge.
+func (_q *UserQuery) QueryStudentProfile() *StudentProfileQuery {
+	query := (&StudentProfileClient{config: _q.config}).Query()
+	query.path = func(ctx context.Context) (fromU *sql.Selector, err error) {
+		if err := _q.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		selector := _q.sqlQuery(ctx)
+		if err := selector.Err(); err != nil {
+			return nil, err
+		}
+		step := sqlgraph.NewStep(
+			sqlgraph.From(user.Table, user.FieldID, selector),
+			sqlgraph.To(studentprofile.Table, studentprofile.FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, false, user.StudentProfileTable, user.StudentProfileColumn),
+		)
+		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
+		return fromU, nil
+	}
+	return query
+}
+
+// QueryMentorProfile chains the current query on the "mentor_profile" edge.
+func (_q *UserQuery) QueryMentorProfile() *MentorProfileQuery {
+	query := (&MentorProfileClient{config: _q.config}).Query()
+	query.path = func(ctx context.Context) (fromU *sql.Selector, err error) {
+		if err := _q.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		selector := _q.sqlQuery(ctx)
+		if err := selector.Err(); err != nil {
+			return nil, err
+		}
+		step := sqlgraph.NewStep(
+			sqlgraph.From(user.Table, user.FieldID, selector),
+			sqlgraph.To(mentorprofile.Table, mentorprofile.FieldID),
+			sqlgraph.Edge(sqlgraph.O2O, false, user.MentorProfileTable, user.MentorProfileColumn),
+		)
+		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
+		return fromU, nil
+	}
+	return query
+}
+
+// QueryGrantedMentorProfiles chains the current query on the "granted_mentor_profiles" edge.
+func (_q *UserQuery) QueryGrantedMentorProfiles() *MentorProfileQuery {
+	query := (&MentorProfileClient{config: _q.config}).Query()
+	query.path = func(ctx context.Context) (fromU *sql.Selector, err error) {
+		if err := _q.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		selector := _q.sqlQuery(ctx)
+		if err := selector.Err(); err != nil {
+			return nil, err
+		}
+		step := sqlgraph.NewStep(
+			sqlgraph.From(user.Table, user.FieldID, selector),
+			sqlgraph.To(mentorprofile.Table, mentorprofile.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, user.GrantedMentorProfilesTable, user.GrantedMentorProfilesColumn),
+		)
+		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
+		return fromU, nil
+	}
+	return query
 }
 
 // QueryOrganizationMemberships chains the current query on the "organization_memberships" edge.
@@ -198,6 +271,28 @@ func (_q *UserQuery) QueryAPIKeyAudits() *APIKeyAuditQuery {
 			sqlgraph.From(user.Table, user.FieldID, selector),
 			sqlgraph.To(apikeyaudit.Table, apikeyaudit.FieldID),
 			sqlgraph.Edge(sqlgraph.O2M, false, user.APIKeyAuditsTable, user.APIKeyAuditsColumn),
+		)
+		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
+		return fromU, nil
+	}
+	return query
+}
+
+// QueryModelLibraryEntries chains the current query on the "model_library_entries" edge.
+func (_q *UserQuery) QueryModelLibraryEntries() *StudentModelLibraryQuery {
+	query := (&StudentModelLibraryClient{config: _q.config}).Query()
+	query.path = func(ctx context.Context) (fromU *sql.Selector, err error) {
+		if err := _q.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		selector := _q.sqlQuery(ctx)
+		if err := selector.Err(); err != nil {
+			return nil, err
+		}
+		step := sqlgraph.NewStep(
+			sqlgraph.From(user.Table, user.FieldID, selector),
+			sqlgraph.To(studentmodellibrary.Table, studentmodellibrary.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, user.ModelLibraryEntriesTable, user.ModelLibraryEntriesColumn),
 		)
 		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
 		return fromU, nil
@@ -397,16 +492,53 @@ func (_q *UserQuery) Clone() *UserQuery {
 		order:                           append([]user.OrderOption{}, _q.order...),
 		inters:                          append([]Interceptor{}, _q.inters...),
 		predicates:                      append([]predicate.User{}, _q.predicates...),
+		withStudentProfile:              _q.withStudentProfile.Clone(),
+		withMentorProfile:               _q.withMentorProfile.Clone(),
+		withGrantedMentorProfiles:       _q.withGrantedMentorProfiles.Clone(),
 		withOrganizationMemberships:     _q.withOrganizationMemberships.Clone(),
 		withProjectMemberships:          _q.withProjectMemberships.Clone(),
 		withMentorProjectApplications:   _q.withMentorProjectApplications.Clone(),
 		withReviewedProjectApplications: _q.withReviewedProjectApplications.Clone(),
 		withAPIKeys:                     _q.withAPIKeys.Clone(),
 		withAPIKeyAudits:                _q.withAPIKeyAudits.Clone(),
+		withModelLibraryEntries:         _q.withModelLibraryEntries.Clone(),
 		// clone intermediate query.
 		sql:  _q.sql.Clone(),
 		path: _q.path,
 	}
+}
+
+// WithStudentProfile tells the query-builder to eager-load the nodes that are connected to
+// the "student_profile" edge. The optional arguments are used to configure the query builder of the edge.
+func (_q *UserQuery) WithStudentProfile(opts ...func(*StudentProfileQuery)) *UserQuery {
+	query := (&StudentProfileClient{config: _q.config}).Query()
+	for _, opt := range opts {
+		opt(query)
+	}
+	_q.withStudentProfile = query
+	return _q
+}
+
+// WithMentorProfile tells the query-builder to eager-load the nodes that are connected to
+// the "mentor_profile" edge. The optional arguments are used to configure the query builder of the edge.
+func (_q *UserQuery) WithMentorProfile(opts ...func(*MentorProfileQuery)) *UserQuery {
+	query := (&MentorProfileClient{config: _q.config}).Query()
+	for _, opt := range opts {
+		opt(query)
+	}
+	_q.withMentorProfile = query
+	return _q
+}
+
+// WithGrantedMentorProfiles tells the query-builder to eager-load the nodes that are connected to
+// the "granted_mentor_profiles" edge. The optional arguments are used to configure the query builder of the edge.
+func (_q *UserQuery) WithGrantedMentorProfiles(opts ...func(*MentorProfileQuery)) *UserQuery {
+	query := (&MentorProfileClient{config: _q.config}).Query()
+	for _, opt := range opts {
+		opt(query)
+	}
+	_q.withGrantedMentorProfiles = query
+	return _q
 }
 
 // WithOrganizationMemberships tells the query-builder to eager-load the nodes that are connected to
@@ -472,6 +604,17 @@ func (_q *UserQuery) WithAPIKeyAudits(opts ...func(*APIKeyAuditQuery)) *UserQuer
 		opt(query)
 	}
 	_q.withAPIKeyAudits = query
+	return _q
+}
+
+// WithModelLibraryEntries tells the query-builder to eager-load the nodes that are connected to
+// the "model_library_entries" edge. The optional arguments are used to configure the query builder of the edge.
+func (_q *UserQuery) WithModelLibraryEntries(opts ...func(*StudentModelLibraryQuery)) *UserQuery {
+	query := (&StudentModelLibraryClient{config: _q.config}).Query()
+	for _, opt := range opts {
+		opt(query)
+	}
+	_q.withModelLibraryEntries = query
 	return _q
 }
 
@@ -553,13 +696,17 @@ func (_q *UserQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*User, e
 	var (
 		nodes       = []*User{}
 		_spec       = _q.querySpec()
-		loadedTypes = [6]bool{
+		loadedTypes = [10]bool{
+			_q.withStudentProfile != nil,
+			_q.withMentorProfile != nil,
+			_q.withGrantedMentorProfiles != nil,
 			_q.withOrganizationMemberships != nil,
 			_q.withProjectMemberships != nil,
 			_q.withMentorProjectApplications != nil,
 			_q.withReviewedProjectApplications != nil,
 			_q.withAPIKeys != nil,
 			_q.withAPIKeyAudits != nil,
+			_q.withModelLibraryEntries != nil,
 		}
 	)
 	_spec.ScanValues = func(columns []string) ([]any, error) {
@@ -582,6 +729,27 @@ func (_q *UserQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*User, e
 	}
 	if len(nodes) == 0 {
 		return nodes, nil
+	}
+	if query := _q.withStudentProfile; query != nil {
+		if err := _q.loadStudentProfile(ctx, query, nodes, nil,
+			func(n *User, e *StudentProfile) { n.Edges.StudentProfile = e }); err != nil {
+			return nil, err
+		}
+	}
+	if query := _q.withMentorProfile; query != nil {
+		if err := _q.loadMentorProfile(ctx, query, nodes, nil,
+			func(n *User, e *MentorProfile) { n.Edges.MentorProfile = e }); err != nil {
+			return nil, err
+		}
+	}
+	if query := _q.withGrantedMentorProfiles; query != nil {
+		if err := _q.loadGrantedMentorProfiles(ctx, query, nodes,
+			func(n *User) { n.Edges.GrantedMentorProfiles = []*MentorProfile{} },
+			func(n *User, e *MentorProfile) {
+				n.Edges.GrantedMentorProfiles = append(n.Edges.GrantedMentorProfiles, e)
+			}); err != nil {
+			return nil, err
+		}
 	}
 	if query := _q.withOrganizationMemberships; query != nil {
 		if err := _q.loadOrganizationMemberships(ctx, query, nodes,
@@ -631,9 +799,105 @@ func (_q *UserQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*User, e
 			return nil, err
 		}
 	}
+	if query := _q.withModelLibraryEntries; query != nil {
+		if err := _q.loadModelLibraryEntries(ctx, query, nodes,
+			func(n *User) { n.Edges.ModelLibraryEntries = []*StudentModelLibrary{} },
+			func(n *User, e *StudentModelLibrary) {
+				n.Edges.ModelLibraryEntries = append(n.Edges.ModelLibraryEntries, e)
+			}); err != nil {
+			return nil, err
+		}
+	}
 	return nodes, nil
 }
 
+func (_q *UserQuery) loadStudentProfile(ctx context.Context, query *StudentProfileQuery, nodes []*User, init func(*User), assign func(*User, *StudentProfile)) error {
+	fks := make([]driver.Value, 0, len(nodes))
+	nodeids := make(map[uuid.UUID]*User)
+	for i := range nodes {
+		fks = append(fks, nodes[i].ID)
+		nodeids[nodes[i].ID] = nodes[i]
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(studentprofile.FieldUserID)
+	}
+	query.Where(predicate.StudentProfile(func(s *sql.Selector) {
+		s.Where(sql.InValues(s.C(user.StudentProfileColumn), fks...))
+	}))
+	neighbors, err := query.All(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range neighbors {
+		fk := n.UserID
+		node, ok := nodeids[fk]
+		if !ok {
+			return fmt.Errorf(`unexpected referenced foreign-key "user_id" returned %v for node %v`, fk, n.ID)
+		}
+		assign(node, n)
+	}
+	return nil
+}
+func (_q *UserQuery) loadMentorProfile(ctx context.Context, query *MentorProfileQuery, nodes []*User, init func(*User), assign func(*User, *MentorProfile)) error {
+	fks := make([]driver.Value, 0, len(nodes))
+	nodeids := make(map[uuid.UUID]*User)
+	for i := range nodes {
+		fks = append(fks, nodes[i].ID)
+		nodeids[nodes[i].ID] = nodes[i]
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(mentorprofile.FieldUserID)
+	}
+	query.Where(predicate.MentorProfile(func(s *sql.Selector) {
+		s.Where(sql.InValues(s.C(user.MentorProfileColumn), fks...))
+	}))
+	neighbors, err := query.All(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range neighbors {
+		fk := n.UserID
+		node, ok := nodeids[fk]
+		if !ok {
+			return fmt.Errorf(`unexpected referenced foreign-key "user_id" returned %v for node %v`, fk, n.ID)
+		}
+		assign(node, n)
+	}
+	return nil
+}
+func (_q *UserQuery) loadGrantedMentorProfiles(ctx context.Context, query *MentorProfileQuery, nodes []*User, init func(*User), assign func(*User, *MentorProfile)) error {
+	fks := make([]driver.Value, 0, len(nodes))
+	nodeids := make(map[uuid.UUID]*User)
+	for i := range nodes {
+		fks = append(fks, nodes[i].ID)
+		nodeids[nodes[i].ID] = nodes[i]
+		if init != nil {
+			init(nodes[i])
+		}
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(mentorprofile.FieldGrantedBy)
+	}
+	query.Where(predicate.MentorProfile(func(s *sql.Selector) {
+		s.Where(sql.InValues(s.C(user.GrantedMentorProfilesColumn), fks...))
+	}))
+	neighbors, err := query.All(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range neighbors {
+		fk := n.GrantedBy
+		if fk == nil {
+			return fmt.Errorf(`foreign-key "granted_by" is nil for node %v`, n.ID)
+		}
+		node, ok := nodeids[*fk]
+		if !ok {
+			return fmt.Errorf(`unexpected referenced foreign-key "granted_by" returned %v for node %v`, *fk, n.ID)
+		}
+		assign(node, n)
+	}
+	return nil
+}
 func (_q *UserQuery) loadOrganizationMemberships(ctx context.Context, query *OrganizationMemberQuery, nodes []*User, init func(*User), assign func(*User, *OrganizationMember)) error {
 	fks := make([]driver.Value, 0, len(nodes))
 	nodeids := make(map[uuid.UUID]*User)
@@ -812,6 +1076,36 @@ func (_q *UserQuery) loadAPIKeyAudits(ctx context.Context, query *APIKeyAuditQue
 		node, ok := nodeids[fk]
 		if !ok {
 			return fmt.Errorf(`unexpected referenced foreign-key "actor_user_id" returned %v for node %v`, fk, n.ID)
+		}
+		assign(node, n)
+	}
+	return nil
+}
+func (_q *UserQuery) loadModelLibraryEntries(ctx context.Context, query *StudentModelLibraryQuery, nodes []*User, init func(*User), assign func(*User, *StudentModelLibrary)) error {
+	fks := make([]driver.Value, 0, len(nodes))
+	nodeids := make(map[uuid.UUID]*User)
+	for i := range nodes {
+		fks = append(fks, nodes[i].ID)
+		nodeids[nodes[i].ID] = nodes[i]
+		if init != nil {
+			init(nodes[i])
+		}
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(studentmodellibrary.FieldUserID)
+	}
+	query.Where(predicate.StudentModelLibrary(func(s *sql.Selector) {
+		s.Where(sql.InValues(s.C(user.ModelLibraryEntriesColumn), fks...))
+	}))
+	neighbors, err := query.All(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range neighbors {
+		fk := n.UserID
+		node, ok := nodeids[fk]
+		if !ok {
+			return fmt.Errorf(`unexpected referenced foreign-key "user_id" returned %v for node %v`, fk, n.ID)
 		}
 		assign(node, n)
 	}

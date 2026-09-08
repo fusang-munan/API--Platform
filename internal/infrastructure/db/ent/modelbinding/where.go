@@ -76,6 +76,11 @@ func ProviderID(v uuid.UUID) predicate.ModelBinding {
 	return predicate.ModelBinding(sql.FieldEQ(FieldProviderID, v))
 }
 
+// CredentialID applies equality check predicate on the "credential_id" field. It's identical to CredentialIDEQ.
+func CredentialID(v uuid.UUID) predicate.ModelBinding {
+	return predicate.ModelBinding(sql.FieldEQ(FieldCredentialID, v))
+}
+
 // UpstreamModelName applies equality check predicate on the "upstream_model_name" field. It's identical to UpstreamModelNameEQ.
 func UpstreamModelName(v string) predicate.ModelBinding {
 	return predicate.ModelBinding(sql.FieldEQ(FieldUpstreamModelName, v))
@@ -204,6 +209,36 @@ func ProviderIDIn(vs ...uuid.UUID) predicate.ModelBinding {
 // ProviderIDNotIn applies the NotIn predicate on the "provider_id" field.
 func ProviderIDNotIn(vs ...uuid.UUID) predicate.ModelBinding {
 	return predicate.ModelBinding(sql.FieldNotIn(FieldProviderID, vs...))
+}
+
+// CredentialIDEQ applies the EQ predicate on the "credential_id" field.
+func CredentialIDEQ(v uuid.UUID) predicate.ModelBinding {
+	return predicate.ModelBinding(sql.FieldEQ(FieldCredentialID, v))
+}
+
+// CredentialIDNEQ applies the NEQ predicate on the "credential_id" field.
+func CredentialIDNEQ(v uuid.UUID) predicate.ModelBinding {
+	return predicate.ModelBinding(sql.FieldNEQ(FieldCredentialID, v))
+}
+
+// CredentialIDIn applies the In predicate on the "credential_id" field.
+func CredentialIDIn(vs ...uuid.UUID) predicate.ModelBinding {
+	return predicate.ModelBinding(sql.FieldIn(FieldCredentialID, vs...))
+}
+
+// CredentialIDNotIn applies the NotIn predicate on the "credential_id" field.
+func CredentialIDNotIn(vs ...uuid.UUID) predicate.ModelBinding {
+	return predicate.ModelBinding(sql.FieldNotIn(FieldCredentialID, vs...))
+}
+
+// CredentialIDIsNil applies the IsNil predicate on the "credential_id" field.
+func CredentialIDIsNil() predicate.ModelBinding {
+	return predicate.ModelBinding(sql.FieldIsNull(FieldCredentialID))
+}
+
+// CredentialIDNotNil applies the NotNil predicate on the "credential_id" field.
+func CredentialIDNotNil() predicate.ModelBinding {
+	return predicate.ModelBinding(sql.FieldNotNull(FieldCredentialID))
 }
 
 // UpstreamModelNameEQ applies the EQ predicate on the "upstream_model_name" field.
@@ -389,6 +424,29 @@ func HasProvider() predicate.ModelBinding {
 func HasProviderWith(preds ...predicate.Provider) predicate.ModelBinding {
 	return predicate.ModelBinding(func(s *sql.Selector) {
 		step := newProviderStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
+// HasCredential applies the HasEdge predicate on the "credential" edge.
+func HasCredential() predicate.ModelBinding {
+	return predicate.ModelBinding(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, CredentialTable, CredentialColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasCredentialWith applies the HasEdge predicate on the "credential" edge with a given conditions (other predicates).
+func HasCredentialWith(preds ...predicate.ProviderCredential) predicate.ModelBinding {
+	return predicate.ModelBinding(func(s *sql.Selector) {
+		step := newCredentialStep()
 		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
 			for _, p := range preds {
 				p(s)

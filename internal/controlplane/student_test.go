@@ -25,3 +25,10 @@ func TestProgressForTeacherRejection(t *testing.T) {
 		t.Fatalf("unexpected progress: %#v", progress)
 	}
 }
+
+func TestProgressForStudentWithdrawn(t *testing.T) {
+	progress := progressForStatus("rejected", []AuditView{{Action: "student_withdrawn"}})
+	if progress.Current != "withdrawn" || len(progress.CompletedSteps) != 1 || progress.CompletedSteps[0] != "submitted" {
+		t.Fatalf("unexpected progress: %#v", progress)
+	}
+}

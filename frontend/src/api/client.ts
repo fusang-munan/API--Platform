@@ -35,11 +35,12 @@ const errorMessages: Record<string, string> = {
   RESOURCE_NAME_CONFLICT: '名称已存在，请更换后重试',
   INVALID_STATE_TRANSITION: '申请状态已发生变化，请刷新页面后重试',
   PROJECT_HAS_NO_MENTOR: '该项目尚未分配有效导师，暂时不能提交申请',
-  MENTOR_NOT_IN_ORGANIZATION: '该导师未加入项目所属组织，请先在“组织管理”中分配导师',
-  MENTOR_ALREADY_PROJECT_MEMBER: '该导师已经加入此项目，无需重复审批',
+  MENTOR_ALREADY_PROJECT_MEMBER: '该导师已在项目中',
+  MENTOR_NOT_PROJECT_MEMBER: '该导师不在此项目中',
   MODEL_NOT_READY: '所选模型尚未完成可用配置',
   MODEL_ROUTING_REQUIRED: '操作会导致模型失去可用路由，请先保留至少一个有效 binding',
   KEY_ALREADY_CLAIMED: '该 API Key 已领取，不能重复领取',
+  PROJECT_KEY_ALREADY_EXISTS: '该项目已有进行中的密钥申请或有效 Key，每个项目只能申请一个',
   VERIFICATION_CODE_INVALID: '验证码不正确，请检查后重试',
   VERIFICATION_CODE_EXPIRED: '验证码已过期，请重新获取',
   INVITATION_INVALID: '邀请链接无效或已过期',
@@ -58,6 +59,8 @@ function actionableErrorMessage(code: string, message: string, details?: ApiErro
     if (!Array.isArray(details) && details?.operation === 'api_key_approval' && details.state_changed === false) {
       return `终审未完成，额度和申请状态均未变更。请联系管理员并提供请求编号 ${requestId ?? '（响应未提供）'}`
     }
+    const upstream = message.trim() && message !== 'fetch upstream models' ? message : undefined
+    if (upstream) return `${upstream}${requestReference(requestId)}`
     return `${errorMessages.DEPENDENCY_UNAVAILABLE}${requestReference(requestId)}`
   }
   if (code === 'INTERNAL_ERROR') {
@@ -108,10 +111,14 @@ function translateServerMessage(message: string): string | undefined {
 	[/max_output_tokens must be positive/, '最大输出 Token 必须为正整数'],
 	[/invalid model capability/, '模型能力不在允许列表中'],
     [/API key name is already in use/, 'Key 名称已存在，请更换名称'],
+    [/project already has an active api key application/, '该项目已有进行中的密钥申请或有效 Key，每个项目只能申请一个'],
     [/project has no active mentor/, '该项目暂无有效导师，请等待导师加入并由老师批准'],
     [/organization not found/, '组织不存在或已停用'],
     [/project not found/, '项目不存在或已停用'],
     [/mentor does not belong to the project organization/, '该导师尚未加入项目所属组织，请先在“组织管理”中分配导师'],
+    [/mentor already belongs to the project/, '该导师已在项目中'],
+    [/mentor does not belong to the project/, '该导师不在此项目中'],
+    [/mentor has student quota on this project/, '该用户在本项目有学生额度，无法移除导师身份'],
     [/mentor already manages this project/, '该导师已经负责此项目，无需重复审批'],
     [/project application is already pending/, '该项目已有待审核申请，请勿重复提交'],
     [/project application is no longer pending|project application was reviewed concurrently/, '该申请已被其他操作处理，请刷新页面查看最新状态'],
@@ -181,6 +188,7 @@ export async function page<T>(path: string): Promise<{ data: T; meta: PageMeta }
 export const get = <T>(path: string) => request<T>(path)
 export const post = <T>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) })
 export const patch = <T>(path: string, body: unknown) => request<T>(path, { method: 'PATCH', body: JSON.stringify(body) })
+export const del = <T = void>(path: string) => request<T>(path, { method: 'DELETE' })
 
 export type EventConnectionState = 'connecting' | 'connected' | 'disconnected'
 export const EVENT_RETRY_DELAYS = [1000, 2000, 5000, 10000, 30000] as const

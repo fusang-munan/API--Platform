@@ -15,6 +15,8 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/predicate"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providermodelcatalog"
 )
 
 // ProviderUpdate is the builder for updating Provider entities.
@@ -64,12 +66,6 @@ func (_u *ProviderUpdate) SetNillableBaseURL(v *string) *ProviderUpdate {
 	return _u
 }
 
-// SetCredentialCiphertext sets the "credential_ciphertext" field.
-func (_u *ProviderUpdate) SetCredentialCiphertext(v []byte) *ProviderUpdate {
-	_u.mutation.SetCredentialCiphertext(v)
-	return _u
-}
-
 // SetStatus sets the "status" field.
 func (_u *ProviderUpdate) SetStatus(v provider.Status) *ProviderUpdate {
 	_u.mutation.SetStatus(v)
@@ -82,6 +78,21 @@ func (_u *ProviderUpdate) SetNillableStatus(v *provider.Status) *ProviderUpdate 
 		_u.SetStatus(*v)
 	}
 	return _u
+}
+
+// AddCredentialIDs adds the "credentials" edge to the ProviderCredential entity by IDs.
+func (_u *ProviderUpdate) AddCredentialIDs(ids ...uuid.UUID) *ProviderUpdate {
+	_u.mutation.AddCredentialIDs(ids...)
+	return _u
+}
+
+// AddCredentials adds the "credentials" edges to the ProviderCredential entity.
+func (_u *ProviderUpdate) AddCredentials(v ...*ProviderCredential) *ProviderUpdate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddCredentialIDs(ids...)
 }
 
 // AddModelBindingIDs adds the "model_bindings" edge to the ModelBinding entity by IDs.
@@ -99,9 +110,45 @@ func (_u *ProviderUpdate) AddModelBindings(v ...*ModelBinding) *ProviderUpdate {
 	return _u.AddModelBindingIDs(ids...)
 }
 
+// AddModelCatalogEntryIDs adds the "model_catalog_entries" edge to the ProviderModelCatalog entity by IDs.
+func (_u *ProviderUpdate) AddModelCatalogEntryIDs(ids ...uuid.UUID) *ProviderUpdate {
+	_u.mutation.AddModelCatalogEntryIDs(ids...)
+	return _u
+}
+
+// AddModelCatalogEntries adds the "model_catalog_entries" edges to the ProviderModelCatalog entity.
+func (_u *ProviderUpdate) AddModelCatalogEntries(v ...*ProviderModelCatalog) *ProviderUpdate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddModelCatalogEntryIDs(ids...)
+}
+
 // Mutation returns the ProviderMutation object of the builder.
 func (_u *ProviderUpdate) Mutation() *ProviderMutation {
 	return _u.mutation
+}
+
+// ClearCredentials clears all "credentials" edges to the ProviderCredential entity.
+func (_u *ProviderUpdate) ClearCredentials() *ProviderUpdate {
+	_u.mutation.ClearCredentials()
+	return _u
+}
+
+// RemoveCredentialIDs removes the "credentials" edge to ProviderCredential entities by IDs.
+func (_u *ProviderUpdate) RemoveCredentialIDs(ids ...uuid.UUID) *ProviderUpdate {
+	_u.mutation.RemoveCredentialIDs(ids...)
+	return _u
+}
+
+// RemoveCredentials removes "credentials" edges to ProviderCredential entities.
+func (_u *ProviderUpdate) RemoveCredentials(v ...*ProviderCredential) *ProviderUpdate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveCredentialIDs(ids...)
 }
 
 // ClearModelBindings clears all "model_bindings" edges to the ModelBinding entity.
@@ -123,6 +170,27 @@ func (_u *ProviderUpdate) RemoveModelBindings(v ...*ModelBinding) *ProviderUpdat
 		ids[i] = v[i].ID
 	}
 	return _u.RemoveModelBindingIDs(ids...)
+}
+
+// ClearModelCatalogEntries clears all "model_catalog_entries" edges to the ProviderModelCatalog entity.
+func (_u *ProviderUpdate) ClearModelCatalogEntries() *ProviderUpdate {
+	_u.mutation.ClearModelCatalogEntries()
+	return _u
+}
+
+// RemoveModelCatalogEntryIDs removes the "model_catalog_entries" edge to ProviderModelCatalog entities by IDs.
+func (_u *ProviderUpdate) RemoveModelCatalogEntryIDs(ids ...uuid.UUID) *ProviderUpdate {
+	_u.mutation.RemoveModelCatalogEntryIDs(ids...)
+	return _u
+}
+
+// RemoveModelCatalogEntries removes "model_catalog_entries" edges to ProviderModelCatalog entities.
+func (_u *ProviderUpdate) RemoveModelCatalogEntries(v ...*ProviderModelCatalog) *ProviderUpdate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveModelCatalogEntryIDs(ids...)
 }
 
 // Save executes the query and returns the number of nodes affected by the update operation.
@@ -173,11 +241,6 @@ func (_u *ProviderUpdate) check() error {
 			return &ValidationError{Name: "base_url", err: fmt.Errorf(`ent: validator failed for field "Provider.base_url": %w`, err)}
 		}
 	}
-	if v, ok := _u.mutation.CredentialCiphertext(); ok {
-		if err := provider.CredentialCiphertextValidator(v); err != nil {
-			return &ValidationError{Name: "credential_ciphertext", err: fmt.Errorf(`ent: validator failed for field "Provider.credential_ciphertext": %w`, err)}
-		}
-	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := provider.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Provider.status": %w`, err)}
@@ -207,11 +270,53 @@ func (_u *ProviderUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.BaseURL(); ok {
 		_spec.SetField(provider.FieldBaseURL, field.TypeString, value)
 	}
-	if value, ok := _u.mutation.CredentialCiphertext(); ok {
-		_spec.SetField(provider.FieldCredentialCiphertext, field.TypeBytes, value)
-	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(provider.FieldStatus, field.TypeEnum, value)
+	}
+	if _u.mutation.CredentialsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.CredentialsTable,
+			Columns: []string{provider.CredentialsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providercredential.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedCredentialsIDs(); len(nodes) > 0 && !_u.mutation.CredentialsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.CredentialsTable,
+			Columns: []string{provider.CredentialsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providercredential.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.CredentialsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.CredentialsTable,
+			Columns: []string{provider.CredentialsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providercredential.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
 	if _u.mutation.ModelBindingsCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -251,6 +356,51 @@ func (_u *ProviderUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(modelbinding.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.ModelCatalogEntriesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.ModelCatalogEntriesTable,
+			Columns: []string{provider.ModelCatalogEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providermodelcatalog.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedModelCatalogEntriesIDs(); len(nodes) > 0 && !_u.mutation.ModelCatalogEntriesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.ModelCatalogEntriesTable,
+			Columns: []string{provider.ModelCatalogEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providermodelcatalog.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.ModelCatalogEntriesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.ModelCatalogEntriesTable,
+			Columns: []string{provider.ModelCatalogEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providermodelcatalog.FieldID, field.TypeUUID),
 			},
 		}
 		for _, k := range nodes {
@@ -312,12 +462,6 @@ func (_u *ProviderUpdateOne) SetNillableBaseURL(v *string) *ProviderUpdateOne {
 	return _u
 }
 
-// SetCredentialCiphertext sets the "credential_ciphertext" field.
-func (_u *ProviderUpdateOne) SetCredentialCiphertext(v []byte) *ProviderUpdateOne {
-	_u.mutation.SetCredentialCiphertext(v)
-	return _u
-}
-
 // SetStatus sets the "status" field.
 func (_u *ProviderUpdateOne) SetStatus(v provider.Status) *ProviderUpdateOne {
 	_u.mutation.SetStatus(v)
@@ -330,6 +474,21 @@ func (_u *ProviderUpdateOne) SetNillableStatus(v *provider.Status) *ProviderUpda
 		_u.SetStatus(*v)
 	}
 	return _u
+}
+
+// AddCredentialIDs adds the "credentials" edge to the ProviderCredential entity by IDs.
+func (_u *ProviderUpdateOne) AddCredentialIDs(ids ...uuid.UUID) *ProviderUpdateOne {
+	_u.mutation.AddCredentialIDs(ids...)
+	return _u
+}
+
+// AddCredentials adds the "credentials" edges to the ProviderCredential entity.
+func (_u *ProviderUpdateOne) AddCredentials(v ...*ProviderCredential) *ProviderUpdateOne {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddCredentialIDs(ids...)
 }
 
 // AddModelBindingIDs adds the "model_bindings" edge to the ModelBinding entity by IDs.
@@ -347,9 +506,45 @@ func (_u *ProviderUpdateOne) AddModelBindings(v ...*ModelBinding) *ProviderUpdat
 	return _u.AddModelBindingIDs(ids...)
 }
 
+// AddModelCatalogEntryIDs adds the "model_catalog_entries" edge to the ProviderModelCatalog entity by IDs.
+func (_u *ProviderUpdateOne) AddModelCatalogEntryIDs(ids ...uuid.UUID) *ProviderUpdateOne {
+	_u.mutation.AddModelCatalogEntryIDs(ids...)
+	return _u
+}
+
+// AddModelCatalogEntries adds the "model_catalog_entries" edges to the ProviderModelCatalog entity.
+func (_u *ProviderUpdateOne) AddModelCatalogEntries(v ...*ProviderModelCatalog) *ProviderUpdateOne {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddModelCatalogEntryIDs(ids...)
+}
+
 // Mutation returns the ProviderMutation object of the builder.
 func (_u *ProviderUpdateOne) Mutation() *ProviderMutation {
 	return _u.mutation
+}
+
+// ClearCredentials clears all "credentials" edges to the ProviderCredential entity.
+func (_u *ProviderUpdateOne) ClearCredentials() *ProviderUpdateOne {
+	_u.mutation.ClearCredentials()
+	return _u
+}
+
+// RemoveCredentialIDs removes the "credentials" edge to ProviderCredential entities by IDs.
+func (_u *ProviderUpdateOne) RemoveCredentialIDs(ids ...uuid.UUID) *ProviderUpdateOne {
+	_u.mutation.RemoveCredentialIDs(ids...)
+	return _u
+}
+
+// RemoveCredentials removes "credentials" edges to ProviderCredential entities.
+func (_u *ProviderUpdateOne) RemoveCredentials(v ...*ProviderCredential) *ProviderUpdateOne {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveCredentialIDs(ids...)
 }
 
 // ClearModelBindings clears all "model_bindings" edges to the ModelBinding entity.
@@ -371,6 +566,27 @@ func (_u *ProviderUpdateOne) RemoveModelBindings(v ...*ModelBinding) *ProviderUp
 		ids[i] = v[i].ID
 	}
 	return _u.RemoveModelBindingIDs(ids...)
+}
+
+// ClearModelCatalogEntries clears all "model_catalog_entries" edges to the ProviderModelCatalog entity.
+func (_u *ProviderUpdateOne) ClearModelCatalogEntries() *ProviderUpdateOne {
+	_u.mutation.ClearModelCatalogEntries()
+	return _u
+}
+
+// RemoveModelCatalogEntryIDs removes the "model_catalog_entries" edge to ProviderModelCatalog entities by IDs.
+func (_u *ProviderUpdateOne) RemoveModelCatalogEntryIDs(ids ...uuid.UUID) *ProviderUpdateOne {
+	_u.mutation.RemoveModelCatalogEntryIDs(ids...)
+	return _u
+}
+
+// RemoveModelCatalogEntries removes "model_catalog_entries" edges to ProviderModelCatalog entities.
+func (_u *ProviderUpdateOne) RemoveModelCatalogEntries(v ...*ProviderModelCatalog) *ProviderUpdateOne {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveModelCatalogEntryIDs(ids...)
 }
 
 // Where appends a list predicates to the ProviderUpdate builder.
@@ -434,11 +650,6 @@ func (_u *ProviderUpdateOne) check() error {
 			return &ValidationError{Name: "base_url", err: fmt.Errorf(`ent: validator failed for field "Provider.base_url": %w`, err)}
 		}
 	}
-	if v, ok := _u.mutation.CredentialCiphertext(); ok {
-		if err := provider.CredentialCiphertextValidator(v); err != nil {
-			return &ValidationError{Name: "credential_ciphertext", err: fmt.Errorf(`ent: validator failed for field "Provider.credential_ciphertext": %w`, err)}
-		}
-	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := provider.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Provider.status": %w`, err)}
@@ -485,11 +696,53 @@ func (_u *ProviderUpdateOne) sqlSave(ctx context.Context) (_node *Provider, err 
 	if value, ok := _u.mutation.BaseURL(); ok {
 		_spec.SetField(provider.FieldBaseURL, field.TypeString, value)
 	}
-	if value, ok := _u.mutation.CredentialCiphertext(); ok {
-		_spec.SetField(provider.FieldCredentialCiphertext, field.TypeBytes, value)
-	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(provider.FieldStatus, field.TypeEnum, value)
+	}
+	if _u.mutation.CredentialsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.CredentialsTable,
+			Columns: []string{provider.CredentialsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providercredential.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedCredentialsIDs(); len(nodes) > 0 && !_u.mutation.CredentialsCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.CredentialsTable,
+			Columns: []string{provider.CredentialsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providercredential.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.CredentialsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.CredentialsTable,
+			Columns: []string{provider.CredentialsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providercredential.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
 	if _u.mutation.ModelBindingsCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -529,6 +782,51 @@ func (_u *ProviderUpdateOne) sqlSave(ctx context.Context) (_node *Provider, err 
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(modelbinding.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.ModelCatalogEntriesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.ModelCatalogEntriesTable,
+			Columns: []string{provider.ModelCatalogEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providermodelcatalog.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedModelCatalogEntriesIDs(); len(nodes) > 0 && !_u.mutation.ModelCatalogEntriesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.ModelCatalogEntriesTable,
+			Columns: []string{provider.ModelCatalogEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providermodelcatalog.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.ModelCatalogEntriesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   provider.ModelCatalogEntriesTable,
+			Columns: []string{provider.ModelCatalogEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providermodelcatalog.FieldID, field.TypeUUID),
 			},
 		}
 		for _, k := range nodes {

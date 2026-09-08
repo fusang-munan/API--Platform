@@ -31,7 +31,7 @@ func (User) Fields() []ent.Field {
 			SchemaType(map[string]string{dialect.Postgres: "citext"}).
 			Unique(),
 		field.String("password_hash").NotEmpty().MaxLen(255).Sensitive(),
-		field.Enum("role").Values("student", "mentor", "teacher").Immutable(),
+		field.Enum("role").Values("student", "mentor", "teacher").Default("student"),
 		field.Enum("status").
 			Values("pending_invite", "active", "disabled").
 			Default("active"),
@@ -40,12 +40,16 @@ func (User) Fields() []ent.Field {
 
 func (User) Edges() []ent.Edge {
 	return []ent.Edge{
+		edge.To("student_profile", StudentProfile.Type).Unique(),
+		edge.To("mentor_profile", MentorProfile.Type).Unique(),
+		edge.To("granted_mentor_profiles", MentorProfile.Type),
 		edge.To("organization_memberships", OrganizationMember.Type),
 		edge.To("project_memberships", ProjectMember.Type),
 		edge.To("mentor_project_applications", MentorProjectApplication.Type),
 		edge.To("reviewed_project_applications", MentorProjectApplication.Type),
 		edge.To("api_keys", APIKey.Type),
 		edge.To("api_key_audits", APIKeyAudit.Type),
+		edge.To("model_library_entries", StudentModelLibrary.Type),
 	}
 }
 

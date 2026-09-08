@@ -18,18 +18,20 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/predicate"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentmodellibrary"
 )
 
 // ModelQuery is the builder for querying Model entities.
 type ModelQuery struct {
 	config
-	ctx              *QueryContext
-	order            []model.OrderOption
-	inters           []Interceptor
-	predicates       []predicate.Model
-	withBindings     *ModelBindingQuery
-	withAPIKeyModels *APIKeyModelQuery
-	modifiers        []func(*sql.Selector)
+	ctx                       *QueryContext
+	order                     []model.OrderOption
+	inters                    []Interceptor
+	predicates                []predicate.Model
+	withBindings              *ModelBindingQuery
+	withAPIKeyModels          *APIKeyModelQuery
+	withStudentLibraryEntries *StudentModelLibraryQuery
+	modifiers                 []func(*sql.Selector)
 	// intermediate query (i.e. traversal path).
 	sql  *sql.Selector
 	path func(context.Context) (*sql.Selector, error)
@@ -103,6 +105,28 @@ func (_q *ModelQuery) QueryAPIKeyModels() *APIKeyModelQuery {
 			sqlgraph.From(model.Table, model.FieldID, selector),
 			sqlgraph.To(apikeymodel.Table, apikeymodel.FieldID),
 			sqlgraph.Edge(sqlgraph.O2M, false, model.APIKeyModelsTable, model.APIKeyModelsColumn),
+		)
+		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
+		return fromU, nil
+	}
+	return query
+}
+
+// QueryStudentLibraryEntries chains the current query on the "student_library_entries" edge.
+func (_q *ModelQuery) QueryStudentLibraryEntries() *StudentModelLibraryQuery {
+	query := (&StudentModelLibraryClient{config: _q.config}).Query()
+	query.path = func(ctx context.Context) (fromU *sql.Selector, err error) {
+		if err := _q.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		selector := _q.sqlQuery(ctx)
+		if err := selector.Err(); err != nil {
+			return nil, err
+		}
+		step := sqlgraph.NewStep(
+			sqlgraph.From(model.Table, model.FieldID, selector),
+			sqlgraph.To(studentmodellibrary.Table, studentmodellibrary.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, model.StudentLibraryEntriesTable, model.StudentLibraryEntriesColumn),
 		)
 		fromU = sqlgraph.SetNeighbors(_q.driver.Dialect(), step)
 		return fromU, nil
@@ -297,13 +321,14 @@ func (_q *ModelQuery) Clone() *ModelQuery {
 		return nil
 	}
 	return &ModelQuery{
-		config:           _q.config,
-		ctx:              _q.ctx.Clone(),
-		order:            append([]model.OrderOption{}, _q.order...),
-		inters:           append([]Interceptor{}, _q.inters...),
-		predicates:       append([]predicate.Model{}, _q.predicates...),
-		withBindings:     _q.withBindings.Clone(),
-		withAPIKeyModels: _q.withAPIKeyModels.Clone(),
+		config:                    _q.config,
+		ctx:                       _q.ctx.Clone(),
+		order:                     append([]model.OrderOption{}, _q.order...),
+		inters:                    append([]Interceptor{}, _q.inters...),
+		predicates:                append([]predicate.Model{}, _q.predicates...),
+		withBindings:              _q.withBindings.Clone(),
+		withAPIKeyModels:          _q.withAPIKeyModels.Clone(),
+		withStudentLibraryEntries: _q.withStudentLibraryEntries.Clone(),
 		// clone intermediate query.
 		sql:  _q.sql.Clone(),
 		path: _q.path,
@@ -329,6 +354,17 @@ func (_q *ModelQuery) WithAPIKeyModels(opts ...func(*APIKeyModelQuery)) *ModelQu
 		opt(query)
 	}
 	_q.withAPIKeyModels = query
+	return _q
+}
+
+// WithStudentLibraryEntries tells the query-builder to eager-load the nodes that are connected to
+// the "student_library_entries" edge. The optional arguments are used to configure the query builder of the edge.
+func (_q *ModelQuery) WithStudentLibraryEntries(opts ...func(*StudentModelLibraryQuery)) *ModelQuery {
+	query := (&StudentModelLibraryClient{config: _q.config}).Query()
+	for _, opt := range opts {
+		opt(query)
+	}
+	_q.withStudentLibraryEntries = query
 	return _q
 }
 
@@ -410,9 +446,10 @@ func (_q *ModelQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*Model,
 	var (
 		nodes       = []*Model{}
 		_spec       = _q.querySpec()
-		loadedTypes = [2]bool{
+		loadedTypes = [3]bool{
 			_q.withBindings != nil,
 			_q.withAPIKeyModels != nil,
+			_q.withStudentLibraryEntries != nil,
 		}
 	)
 	_spec.ScanValues = func(columns []string) ([]any, error) {
@@ -447,6 +484,15 @@ func (_q *ModelQuery) sqlAll(ctx context.Context, hooks ...queryHook) ([]*Model,
 		if err := _q.loadAPIKeyModels(ctx, query, nodes,
 			func(n *Model) { n.Edges.APIKeyModels = []*APIKeyModel{} },
 			func(n *Model, e *APIKeyModel) { n.Edges.APIKeyModels = append(n.Edges.APIKeyModels, e) }); err != nil {
+			return nil, err
+		}
+	}
+	if query := _q.withStudentLibraryEntries; query != nil {
+		if err := _q.loadStudentLibraryEntries(ctx, query, nodes,
+			func(n *Model) { n.Edges.StudentLibraryEntries = []*StudentModelLibrary{} },
+			func(n *Model, e *StudentModelLibrary) {
+				n.Edges.StudentLibraryEntries = append(n.Edges.StudentLibraryEntries, e)
+			}); err != nil {
 			return nil, err
 		}
 	}
@@ -498,6 +544,36 @@ func (_q *ModelQuery) loadAPIKeyModels(ctx context.Context, query *APIKeyModelQu
 	}
 	query.Where(predicate.APIKeyModel(func(s *sql.Selector) {
 		s.Where(sql.InValues(s.C(model.APIKeyModelsColumn), fks...))
+	}))
+	neighbors, err := query.All(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range neighbors {
+		fk := n.ModelID
+		node, ok := nodeids[fk]
+		if !ok {
+			return fmt.Errorf(`unexpected referenced foreign-key "model_id" returned %v for node %v`, fk, n.ID)
+		}
+		assign(node, n)
+	}
+	return nil
+}
+func (_q *ModelQuery) loadStudentLibraryEntries(ctx context.Context, query *StudentModelLibraryQuery, nodes []*Model, init func(*Model), assign func(*Model, *StudentModelLibrary)) error {
+	fks := make([]driver.Value, 0, len(nodes))
+	nodeids := make(map[uuid.UUID]*Model)
+	for i := range nodes {
+		fks = append(fks, nodes[i].ID)
+		nodeids[nodes[i].ID] = nodes[i]
+		if init != nil {
+			init(nodes[i])
+		}
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(studentmodellibrary.FieldModelID)
+	}
+	query.Where(predicate.StudentModelLibrary(func(s *sql.Selector) {
+		s.Where(sql.InValues(s.C(model.StudentLibraryEntriesColumn), fks...))
 	}))
 	neighbors, err := query.All(ctx)
 	if err != nil {

@@ -14,10 +14,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikey"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeyaudit"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprojectapplication"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/organizationmember"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/predicate"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/projectmember"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentmodellibrary"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentprofile"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/user"
 )
 
@@ -82,6 +85,20 @@ func (_u *UserUpdate) SetNillablePasswordHash(v *string) *UserUpdate {
 	return _u
 }
 
+// SetRole sets the "role" field.
+func (_u *UserUpdate) SetRole(v user.Role) *UserUpdate {
+	_u.mutation.SetRole(v)
+	return _u
+}
+
+// SetNillableRole sets the "role" field if the given value is not nil.
+func (_u *UserUpdate) SetNillableRole(v *user.Role) *UserUpdate {
+	if v != nil {
+		_u.SetRole(*v)
+	}
+	return _u
+}
+
 // SetStatus sets the "status" field.
 func (_u *UserUpdate) SetStatus(v user.Status) *UserUpdate {
 	_u.mutation.SetStatus(v)
@@ -94,6 +111,59 @@ func (_u *UserUpdate) SetNillableStatus(v *user.Status) *UserUpdate {
 		_u.SetStatus(*v)
 	}
 	return _u
+}
+
+// SetStudentProfileID sets the "student_profile" edge to the StudentProfile entity by ID.
+func (_u *UserUpdate) SetStudentProfileID(id uuid.UUID) *UserUpdate {
+	_u.mutation.SetStudentProfileID(id)
+	return _u
+}
+
+// SetNillableStudentProfileID sets the "student_profile" edge to the StudentProfile entity by ID if the given value is not nil.
+func (_u *UserUpdate) SetNillableStudentProfileID(id *uuid.UUID) *UserUpdate {
+	if id != nil {
+		_u = _u.SetStudentProfileID(*id)
+	}
+	return _u
+}
+
+// SetStudentProfile sets the "student_profile" edge to the StudentProfile entity.
+func (_u *UserUpdate) SetStudentProfile(v *StudentProfile) *UserUpdate {
+	return _u.SetStudentProfileID(v.ID)
+}
+
+// SetMentorProfileID sets the "mentor_profile" edge to the MentorProfile entity by ID.
+func (_u *UserUpdate) SetMentorProfileID(id uuid.UUID) *UserUpdate {
+	_u.mutation.SetMentorProfileID(id)
+	return _u
+}
+
+// SetNillableMentorProfileID sets the "mentor_profile" edge to the MentorProfile entity by ID if the given value is not nil.
+func (_u *UserUpdate) SetNillableMentorProfileID(id *uuid.UUID) *UserUpdate {
+	if id != nil {
+		_u = _u.SetMentorProfileID(*id)
+	}
+	return _u
+}
+
+// SetMentorProfile sets the "mentor_profile" edge to the MentorProfile entity.
+func (_u *UserUpdate) SetMentorProfile(v *MentorProfile) *UserUpdate {
+	return _u.SetMentorProfileID(v.ID)
+}
+
+// AddGrantedMentorProfileIDs adds the "granted_mentor_profiles" edge to the MentorProfile entity by IDs.
+func (_u *UserUpdate) AddGrantedMentorProfileIDs(ids ...uuid.UUID) *UserUpdate {
+	_u.mutation.AddGrantedMentorProfileIDs(ids...)
+	return _u
+}
+
+// AddGrantedMentorProfiles adds the "granted_mentor_profiles" edges to the MentorProfile entity.
+func (_u *UserUpdate) AddGrantedMentorProfiles(v ...*MentorProfile) *UserUpdate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddGrantedMentorProfileIDs(ids...)
 }
 
 // AddOrganizationMembershipIDs adds the "organization_memberships" edge to the OrganizationMember entity by IDs.
@@ -186,9 +256,57 @@ func (_u *UserUpdate) AddAPIKeyAudits(v ...*APIKeyAudit) *UserUpdate {
 	return _u.AddAPIKeyAuditIDs(ids...)
 }
 
+// AddModelLibraryEntryIDs adds the "model_library_entries" edge to the StudentModelLibrary entity by IDs.
+func (_u *UserUpdate) AddModelLibraryEntryIDs(ids ...uuid.UUID) *UserUpdate {
+	_u.mutation.AddModelLibraryEntryIDs(ids...)
+	return _u
+}
+
+// AddModelLibraryEntries adds the "model_library_entries" edges to the StudentModelLibrary entity.
+func (_u *UserUpdate) AddModelLibraryEntries(v ...*StudentModelLibrary) *UserUpdate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddModelLibraryEntryIDs(ids...)
+}
+
 // Mutation returns the UserMutation object of the builder.
 func (_u *UserUpdate) Mutation() *UserMutation {
 	return _u.mutation
+}
+
+// ClearStudentProfile clears the "student_profile" edge to the StudentProfile entity.
+func (_u *UserUpdate) ClearStudentProfile() *UserUpdate {
+	_u.mutation.ClearStudentProfile()
+	return _u
+}
+
+// ClearMentorProfile clears the "mentor_profile" edge to the MentorProfile entity.
+func (_u *UserUpdate) ClearMentorProfile() *UserUpdate {
+	_u.mutation.ClearMentorProfile()
+	return _u
+}
+
+// ClearGrantedMentorProfiles clears all "granted_mentor_profiles" edges to the MentorProfile entity.
+func (_u *UserUpdate) ClearGrantedMentorProfiles() *UserUpdate {
+	_u.mutation.ClearGrantedMentorProfiles()
+	return _u
+}
+
+// RemoveGrantedMentorProfileIDs removes the "granted_mentor_profiles" edge to MentorProfile entities by IDs.
+func (_u *UserUpdate) RemoveGrantedMentorProfileIDs(ids ...uuid.UUID) *UserUpdate {
+	_u.mutation.RemoveGrantedMentorProfileIDs(ids...)
+	return _u
+}
+
+// RemoveGrantedMentorProfiles removes "granted_mentor_profiles" edges to MentorProfile entities.
+func (_u *UserUpdate) RemoveGrantedMentorProfiles(v ...*MentorProfile) *UserUpdate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveGrantedMentorProfileIDs(ids...)
 }
 
 // ClearOrganizationMemberships clears all "organization_memberships" edges to the OrganizationMember entity.
@@ -317,6 +435,27 @@ func (_u *UserUpdate) RemoveAPIKeyAudits(v ...*APIKeyAudit) *UserUpdate {
 	return _u.RemoveAPIKeyAuditIDs(ids...)
 }
 
+// ClearModelLibraryEntries clears all "model_library_entries" edges to the StudentModelLibrary entity.
+func (_u *UserUpdate) ClearModelLibraryEntries() *UserUpdate {
+	_u.mutation.ClearModelLibraryEntries()
+	return _u
+}
+
+// RemoveModelLibraryEntryIDs removes the "model_library_entries" edge to StudentModelLibrary entities by IDs.
+func (_u *UserUpdate) RemoveModelLibraryEntryIDs(ids ...uuid.UUID) *UserUpdate {
+	_u.mutation.RemoveModelLibraryEntryIDs(ids...)
+	return _u
+}
+
+// RemoveModelLibraryEntries removes "model_library_entries" edges to StudentModelLibrary entities.
+func (_u *UserUpdate) RemoveModelLibraryEntries(v ...*StudentModelLibrary) *UserUpdate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveModelLibraryEntryIDs(ids...)
+}
+
 // Save executes the query and returns the number of nodes affected by the update operation.
 func (_u *UserUpdate) Save(ctx context.Context) (int, error) {
 	_u.defaults()
@@ -370,6 +509,11 @@ func (_u *UserUpdate) check() error {
 			return &ValidationError{Name: "password_hash", err: fmt.Errorf(`ent: validator failed for field "User.password_hash": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.Role(); ok {
+		if err := user.RoleValidator(v); err != nil {
+			return &ValidationError{Name: "role", err: fmt.Errorf(`ent: validator failed for field "User.role": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := user.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "User.status": %w`, err)}
@@ -402,8 +546,114 @@ func (_u *UserUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.PasswordHash(); ok {
 		_spec.SetField(user.FieldPasswordHash, field.TypeString, value)
 	}
+	if value, ok := _u.mutation.Role(); ok {
+		_spec.SetField(user.FieldRole, field.TypeEnum, value)
+	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(user.FieldStatus, field.TypeEnum, value)
+	}
+	if _u.mutation.StudentProfileCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   user.StudentProfileTable,
+			Columns: []string{user.StudentProfileColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentprofile.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.StudentProfileIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   user.StudentProfileTable,
+			Columns: []string{user.StudentProfileColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentprofile.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.MentorProfileCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   user.MentorProfileTable,
+			Columns: []string{user.MentorProfileColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(mentorprofile.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.MentorProfileIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   user.MentorProfileTable,
+			Columns: []string{user.MentorProfileColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(mentorprofile.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.GrantedMentorProfilesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.GrantedMentorProfilesTable,
+			Columns: []string{user.GrantedMentorProfilesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(mentorprofile.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedGrantedMentorProfilesIDs(); len(nodes) > 0 && !_u.mutation.GrantedMentorProfilesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.GrantedMentorProfilesTable,
+			Columns: []string{user.GrantedMentorProfilesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(mentorprofile.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.GrantedMentorProfilesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.GrantedMentorProfilesTable,
+			Columns: []string{user.GrantedMentorProfilesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(mentorprofile.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
 	if _u.mutation.OrganizationMembershipsCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -675,6 +925,51 @@ func (_u *UserUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 		}
 		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
+	if _u.mutation.ModelLibraryEntriesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.ModelLibraryEntriesTable,
+			Columns: []string{user.ModelLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedModelLibraryEntriesIDs(); len(nodes) > 0 && !_u.mutation.ModelLibraryEntriesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.ModelLibraryEntriesTable,
+			Columns: []string{user.ModelLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.ModelLibraryEntriesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.ModelLibraryEntriesTable,
+			Columns: []string{user.ModelLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
 	if _node, err = sqlgraph.UpdateNodes(ctx, _u.driver, _spec); err != nil {
 		if _, ok := err.(*sqlgraph.NotFoundError); ok {
 			err = &NotFoundError{user.Label}
@@ -743,6 +1038,20 @@ func (_u *UserUpdateOne) SetNillablePasswordHash(v *string) *UserUpdateOne {
 	return _u
 }
 
+// SetRole sets the "role" field.
+func (_u *UserUpdateOne) SetRole(v user.Role) *UserUpdateOne {
+	_u.mutation.SetRole(v)
+	return _u
+}
+
+// SetNillableRole sets the "role" field if the given value is not nil.
+func (_u *UserUpdateOne) SetNillableRole(v *user.Role) *UserUpdateOne {
+	if v != nil {
+		_u.SetRole(*v)
+	}
+	return _u
+}
+
 // SetStatus sets the "status" field.
 func (_u *UserUpdateOne) SetStatus(v user.Status) *UserUpdateOne {
 	_u.mutation.SetStatus(v)
@@ -755,6 +1064,59 @@ func (_u *UserUpdateOne) SetNillableStatus(v *user.Status) *UserUpdateOne {
 		_u.SetStatus(*v)
 	}
 	return _u
+}
+
+// SetStudentProfileID sets the "student_profile" edge to the StudentProfile entity by ID.
+func (_u *UserUpdateOne) SetStudentProfileID(id uuid.UUID) *UserUpdateOne {
+	_u.mutation.SetStudentProfileID(id)
+	return _u
+}
+
+// SetNillableStudentProfileID sets the "student_profile" edge to the StudentProfile entity by ID if the given value is not nil.
+func (_u *UserUpdateOne) SetNillableStudentProfileID(id *uuid.UUID) *UserUpdateOne {
+	if id != nil {
+		_u = _u.SetStudentProfileID(*id)
+	}
+	return _u
+}
+
+// SetStudentProfile sets the "student_profile" edge to the StudentProfile entity.
+func (_u *UserUpdateOne) SetStudentProfile(v *StudentProfile) *UserUpdateOne {
+	return _u.SetStudentProfileID(v.ID)
+}
+
+// SetMentorProfileID sets the "mentor_profile" edge to the MentorProfile entity by ID.
+func (_u *UserUpdateOne) SetMentorProfileID(id uuid.UUID) *UserUpdateOne {
+	_u.mutation.SetMentorProfileID(id)
+	return _u
+}
+
+// SetNillableMentorProfileID sets the "mentor_profile" edge to the MentorProfile entity by ID if the given value is not nil.
+func (_u *UserUpdateOne) SetNillableMentorProfileID(id *uuid.UUID) *UserUpdateOne {
+	if id != nil {
+		_u = _u.SetMentorProfileID(*id)
+	}
+	return _u
+}
+
+// SetMentorProfile sets the "mentor_profile" edge to the MentorProfile entity.
+func (_u *UserUpdateOne) SetMentorProfile(v *MentorProfile) *UserUpdateOne {
+	return _u.SetMentorProfileID(v.ID)
+}
+
+// AddGrantedMentorProfileIDs adds the "granted_mentor_profiles" edge to the MentorProfile entity by IDs.
+func (_u *UserUpdateOne) AddGrantedMentorProfileIDs(ids ...uuid.UUID) *UserUpdateOne {
+	_u.mutation.AddGrantedMentorProfileIDs(ids...)
+	return _u
+}
+
+// AddGrantedMentorProfiles adds the "granted_mentor_profiles" edges to the MentorProfile entity.
+func (_u *UserUpdateOne) AddGrantedMentorProfiles(v ...*MentorProfile) *UserUpdateOne {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddGrantedMentorProfileIDs(ids...)
 }
 
 // AddOrganizationMembershipIDs adds the "organization_memberships" edge to the OrganizationMember entity by IDs.
@@ -847,9 +1209,57 @@ func (_u *UserUpdateOne) AddAPIKeyAudits(v ...*APIKeyAudit) *UserUpdateOne {
 	return _u.AddAPIKeyAuditIDs(ids...)
 }
 
+// AddModelLibraryEntryIDs adds the "model_library_entries" edge to the StudentModelLibrary entity by IDs.
+func (_u *UserUpdateOne) AddModelLibraryEntryIDs(ids ...uuid.UUID) *UserUpdateOne {
+	_u.mutation.AddModelLibraryEntryIDs(ids...)
+	return _u
+}
+
+// AddModelLibraryEntries adds the "model_library_entries" edges to the StudentModelLibrary entity.
+func (_u *UserUpdateOne) AddModelLibraryEntries(v ...*StudentModelLibrary) *UserUpdateOne {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddModelLibraryEntryIDs(ids...)
+}
+
 // Mutation returns the UserMutation object of the builder.
 func (_u *UserUpdateOne) Mutation() *UserMutation {
 	return _u.mutation
+}
+
+// ClearStudentProfile clears the "student_profile" edge to the StudentProfile entity.
+func (_u *UserUpdateOne) ClearStudentProfile() *UserUpdateOne {
+	_u.mutation.ClearStudentProfile()
+	return _u
+}
+
+// ClearMentorProfile clears the "mentor_profile" edge to the MentorProfile entity.
+func (_u *UserUpdateOne) ClearMentorProfile() *UserUpdateOne {
+	_u.mutation.ClearMentorProfile()
+	return _u
+}
+
+// ClearGrantedMentorProfiles clears all "granted_mentor_profiles" edges to the MentorProfile entity.
+func (_u *UserUpdateOne) ClearGrantedMentorProfiles() *UserUpdateOne {
+	_u.mutation.ClearGrantedMentorProfiles()
+	return _u
+}
+
+// RemoveGrantedMentorProfileIDs removes the "granted_mentor_profiles" edge to MentorProfile entities by IDs.
+func (_u *UserUpdateOne) RemoveGrantedMentorProfileIDs(ids ...uuid.UUID) *UserUpdateOne {
+	_u.mutation.RemoveGrantedMentorProfileIDs(ids...)
+	return _u
+}
+
+// RemoveGrantedMentorProfiles removes "granted_mentor_profiles" edges to MentorProfile entities.
+func (_u *UserUpdateOne) RemoveGrantedMentorProfiles(v ...*MentorProfile) *UserUpdateOne {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveGrantedMentorProfileIDs(ids...)
 }
 
 // ClearOrganizationMemberships clears all "organization_memberships" edges to the OrganizationMember entity.
@@ -978,6 +1388,27 @@ func (_u *UserUpdateOne) RemoveAPIKeyAudits(v ...*APIKeyAudit) *UserUpdateOne {
 	return _u.RemoveAPIKeyAuditIDs(ids...)
 }
 
+// ClearModelLibraryEntries clears all "model_library_entries" edges to the StudentModelLibrary entity.
+func (_u *UserUpdateOne) ClearModelLibraryEntries() *UserUpdateOne {
+	_u.mutation.ClearModelLibraryEntries()
+	return _u
+}
+
+// RemoveModelLibraryEntryIDs removes the "model_library_entries" edge to StudentModelLibrary entities by IDs.
+func (_u *UserUpdateOne) RemoveModelLibraryEntryIDs(ids ...uuid.UUID) *UserUpdateOne {
+	_u.mutation.RemoveModelLibraryEntryIDs(ids...)
+	return _u
+}
+
+// RemoveModelLibraryEntries removes "model_library_entries" edges to StudentModelLibrary entities.
+func (_u *UserUpdateOne) RemoveModelLibraryEntries(v ...*StudentModelLibrary) *UserUpdateOne {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveModelLibraryEntryIDs(ids...)
+}
+
 // Where appends a list predicates to the UserUpdate builder.
 func (_u *UserUpdateOne) Where(ps ...predicate.User) *UserUpdateOne {
 	_u.mutation.Where(ps...)
@@ -1044,6 +1475,11 @@ func (_u *UserUpdateOne) check() error {
 			return &ValidationError{Name: "password_hash", err: fmt.Errorf(`ent: validator failed for field "User.password_hash": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.Role(); ok {
+		if err := user.RoleValidator(v); err != nil {
+			return &ValidationError{Name: "role", err: fmt.Errorf(`ent: validator failed for field "User.role": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := user.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "User.status": %w`, err)}
@@ -1093,8 +1529,114 @@ func (_u *UserUpdateOne) sqlSave(ctx context.Context) (_node *User, err error) {
 	if value, ok := _u.mutation.PasswordHash(); ok {
 		_spec.SetField(user.FieldPasswordHash, field.TypeString, value)
 	}
+	if value, ok := _u.mutation.Role(); ok {
+		_spec.SetField(user.FieldRole, field.TypeEnum, value)
+	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(user.FieldStatus, field.TypeEnum, value)
+	}
+	if _u.mutation.StudentProfileCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   user.StudentProfileTable,
+			Columns: []string{user.StudentProfileColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentprofile.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.StudentProfileIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   user.StudentProfileTable,
+			Columns: []string{user.StudentProfileColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentprofile.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.MentorProfileCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   user.MentorProfileTable,
+			Columns: []string{user.MentorProfileColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(mentorprofile.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.MentorProfileIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   user.MentorProfileTable,
+			Columns: []string{user.MentorProfileColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(mentorprofile.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.GrantedMentorProfilesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.GrantedMentorProfilesTable,
+			Columns: []string{user.GrantedMentorProfilesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(mentorprofile.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedGrantedMentorProfilesIDs(); len(nodes) > 0 && !_u.mutation.GrantedMentorProfilesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.GrantedMentorProfilesTable,
+			Columns: []string{user.GrantedMentorProfilesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(mentorprofile.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.GrantedMentorProfilesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.GrantedMentorProfilesTable,
+			Columns: []string{user.GrantedMentorProfilesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(mentorprofile.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
 	if _u.mutation.OrganizationMembershipsCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -1359,6 +1901,51 @@ func (_u *UserUpdateOne) sqlSave(ctx context.Context) (_node *User, err error) {
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(apikeyaudit.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.ModelLibraryEntriesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.ModelLibraryEntriesTable,
+			Columns: []string{user.ModelLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedModelLibraryEntriesIDs(); len(nodes) > 0 && !_u.mutation.ModelLibraryEntriesCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.ModelLibraryEntriesTable,
+			Columns: []string{user.ModelLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.ModelLibraryEntriesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   user.ModelLibraryEntriesTable,
+			Columns: []string{user.ModelLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
 			},
 		}
 		for _, k := range nodes {

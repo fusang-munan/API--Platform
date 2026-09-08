@@ -14,6 +14,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeymodel"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentmodellibrary"
 )
 
 // ModelCreate is the builder for creating a Model entity.
@@ -193,6 +194,12 @@ func (_c *ModelCreate) SetNillableCreditMultiplierMilli(v *int64) *ModelCreate {
 	return _c
 }
 
+// SetUpstreamMetadata sets the "upstream_metadata" field.
+func (_c *ModelCreate) SetUpstreamMetadata(v map[string]interface{}) *ModelCreate {
+	_c.mutation.SetUpstreamMetadata(v)
+	return _c
+}
+
 // SetID sets the "id" field.
 func (_c *ModelCreate) SetID(v uuid.UUID) *ModelCreate {
 	_c.mutation.SetID(v)
@@ -235,6 +242,21 @@ func (_c *ModelCreate) AddAPIKeyModels(v ...*APIKeyModel) *ModelCreate {
 		ids[i] = v[i].ID
 	}
 	return _c.AddAPIKeyModelIDs(ids...)
+}
+
+// AddStudentLibraryEntryIDs adds the "student_library_entries" edge to the StudentModelLibrary entity by IDs.
+func (_c *ModelCreate) AddStudentLibraryEntryIDs(ids ...uuid.UUID) *ModelCreate {
+	_c.mutation.AddStudentLibraryEntryIDs(ids...)
+	return _c
+}
+
+// AddStudentLibraryEntries adds the "student_library_entries" edges to the StudentModelLibrary entity.
+func (_c *ModelCreate) AddStudentLibraryEntries(v ...*StudentModelLibrary) *ModelCreate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _c.AddStudentLibraryEntryIDs(ids...)
 }
 
 // Mutation returns the ModelMutation object of the builder.
@@ -303,6 +325,10 @@ func (_c *ModelCreate) defaults() {
 	if _, ok := _c.mutation.Status(); !ok {
 		v := model.DefaultStatus
 		_c.mutation.SetStatus(v)
+	}
+	if _, ok := _c.mutation.UpstreamMetadata(); !ok {
+		v := model.DefaultUpstreamMetadata
+		_c.mutation.SetUpstreamMetadata(v)
 	}
 	if _, ok := _c.mutation.ID(); !ok {
 		v := model.DefaultID()
@@ -386,6 +412,9 @@ func (_c *ModelCreate) check() error {
 		if err := model.CreditMultiplierMilliValidator(v); err != nil {
 			return &ValidationError{Name: "credit_multiplier_milli", err: fmt.Errorf(`ent: validator failed for field "Model.credit_multiplier_milli": %w`, err)}
 		}
+	}
+	if _, ok := _c.mutation.UpstreamMetadata(); !ok {
+		return &ValidationError{Name: "upstream_metadata", err: errors.New(`ent: missing required field "Model.upstream_metadata"`)}
 	}
 	return nil
 }
@@ -482,6 +511,10 @@ func (_c *ModelCreate) createSpec() (*Model, *sqlgraph.CreateSpec) {
 		_spec.SetField(model.FieldCreditMultiplierMilli, field.TypeInt64, value)
 		_node.CreditMultiplierMilli = &value
 	}
+	if value, ok := _c.mutation.UpstreamMetadata(); ok {
+		_spec.SetField(model.FieldUpstreamMetadata, field.TypeJSON, value)
+		_node.UpstreamMetadata = value
+	}
 	if nodes := _c.mutation.BindingsIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
 			Rel:     sqlgraph.O2M,
@@ -507,6 +540,22 @@ func (_c *ModelCreate) createSpec() (*Model, *sqlgraph.CreateSpec) {
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(apikeymodel.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
+	}
+	if nodes := _c.mutation.StudentLibraryEntriesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   model.StudentLibraryEntriesTable,
+			Columns: []string{model.StudentLibraryEntriesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(studentmodellibrary.FieldID, field.TypeUUID),
 			},
 		}
 		for _, k := range nodes {

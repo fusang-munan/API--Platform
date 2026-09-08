@@ -26,8 +26,6 @@ type Provider struct {
 	Name string `json:"name,omitempty"`
 	// BaseURL holds the value of the "base_url" field.
 	BaseURL string `json:"base_url,omitempty"`
-	// CredentialCiphertext holds the value of the "credential_ciphertext" field.
-	CredentialCiphertext []byte `json:"-"`
 	// Status holds the value of the "status" field.
 	Status provider.Status `json:"status,omitempty"`
 	// Edges holds the relations/edges for other nodes in the graph.
@@ -38,20 +36,42 @@ type Provider struct {
 
 // ProviderEdges holds the relations/edges for other nodes in the graph.
 type ProviderEdges struct {
+	// Credentials holds the value of the credentials edge.
+	Credentials []*ProviderCredential `json:"credentials,omitempty"`
 	// ModelBindings holds the value of the model_bindings edge.
 	ModelBindings []*ModelBinding `json:"model_bindings,omitempty"`
+	// ModelCatalogEntries holds the value of the model_catalog_entries edge.
+	ModelCatalogEntries []*ProviderModelCatalog `json:"model_catalog_entries,omitempty"`
 	// loadedTypes holds the information for reporting if a
 	// type was loaded (or requested) in eager-loading or not.
-	loadedTypes [1]bool
+	loadedTypes [3]bool
+}
+
+// CredentialsOrErr returns the Credentials value or an error if the edge
+// was not loaded in eager-loading.
+func (e ProviderEdges) CredentialsOrErr() ([]*ProviderCredential, error) {
+	if e.loadedTypes[0] {
+		return e.Credentials, nil
+	}
+	return nil, &NotLoadedError{edge: "credentials"}
 }
 
 // ModelBindingsOrErr returns the ModelBindings value or an error if the edge
 // was not loaded in eager-loading.
 func (e ProviderEdges) ModelBindingsOrErr() ([]*ModelBinding, error) {
-	if e.loadedTypes[0] {
+	if e.loadedTypes[1] {
 		return e.ModelBindings, nil
 	}
 	return nil, &NotLoadedError{edge: "model_bindings"}
+}
+
+// ModelCatalogEntriesOrErr returns the ModelCatalogEntries value or an error if the edge
+// was not loaded in eager-loading.
+func (e ProviderEdges) ModelCatalogEntriesOrErr() ([]*ProviderModelCatalog, error) {
+	if e.loadedTypes[2] {
+		return e.ModelCatalogEntries, nil
+	}
+	return nil, &NotLoadedError{edge: "model_catalog_entries"}
 }
 
 // scanValues returns the types for scanning values from sql.Rows.
@@ -59,8 +79,6 @@ func (*Provider) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
-		case provider.FieldCredentialCiphertext:
-			values[i] = new([]byte)
 		case provider.FieldName, provider.FieldBaseURL, provider.FieldStatus:
 			values[i] = new(sql.NullString)
 		case provider.FieldCreatedAt, provider.FieldUpdatedAt:
@@ -112,12 +130,6 @@ func (_m *Provider) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.BaseURL = value.String
 			}
-		case provider.FieldCredentialCiphertext:
-			if value, ok := values[i].(*[]byte); !ok {
-				return fmt.Errorf("unexpected type %T for field credential_ciphertext", values[i])
-			} else if value != nil {
-				_m.CredentialCiphertext = *value
-			}
 		case provider.FieldStatus:
 			if value, ok := values[i].(*sql.NullString); !ok {
 				return fmt.Errorf("unexpected type %T for field status", values[i])
@@ -137,9 +149,19 @@ func (_m *Provider) Value(name string) (ent.Value, error) {
 	return _m.selectValues.Get(name)
 }
 
+// QueryCredentials queries the "credentials" edge of the Provider entity.
+func (_m *Provider) QueryCredentials() *ProviderCredentialQuery {
+	return NewProviderClient(_m.config).QueryCredentials(_m)
+}
+
 // QueryModelBindings queries the "model_bindings" edge of the Provider entity.
 func (_m *Provider) QueryModelBindings() *ModelBindingQuery {
 	return NewProviderClient(_m.config).QueryModelBindings(_m)
+}
+
+// QueryModelCatalogEntries queries the "model_catalog_entries" edge of the Provider entity.
+func (_m *Provider) QueryModelCatalogEntries() *ProviderModelCatalogQuery {
+	return NewProviderClient(_m.config).QueryModelCatalogEntries(_m)
 }
 
 // Update returns a builder for updating this Provider.
@@ -176,8 +198,6 @@ func (_m *Provider) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("base_url=")
 	builder.WriteString(_m.BaseURL)
-	builder.WriteString(", ")
-	builder.WriteString("credential_ciphertext=<sensitive>")
 	builder.WriteString(", ")
 	builder.WriteString("status=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Status))

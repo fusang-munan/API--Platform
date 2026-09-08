@@ -30,6 +30,12 @@ const (
 	FieldRole = "role"
 	// FieldStatus holds the string denoting the status field in the database.
 	FieldStatus = "status"
+	// EdgeStudentProfile holds the string denoting the student_profile edge name in mutations.
+	EdgeStudentProfile = "student_profile"
+	// EdgeMentorProfile holds the string denoting the mentor_profile edge name in mutations.
+	EdgeMentorProfile = "mentor_profile"
+	// EdgeGrantedMentorProfiles holds the string denoting the granted_mentor_profiles edge name in mutations.
+	EdgeGrantedMentorProfiles = "granted_mentor_profiles"
 	// EdgeOrganizationMemberships holds the string denoting the organization_memberships edge name in mutations.
 	EdgeOrganizationMemberships = "organization_memberships"
 	// EdgeProjectMemberships holds the string denoting the project_memberships edge name in mutations.
@@ -42,8 +48,31 @@ const (
 	EdgeAPIKeys = "api_keys"
 	// EdgeAPIKeyAudits holds the string denoting the api_key_audits edge name in mutations.
 	EdgeAPIKeyAudits = "api_key_audits"
+	// EdgeModelLibraryEntries holds the string denoting the model_library_entries edge name in mutations.
+	EdgeModelLibraryEntries = "model_library_entries"
 	// Table holds the table name of the user in the database.
 	Table = "users"
+	// StudentProfileTable is the table that holds the student_profile relation/edge.
+	StudentProfileTable = "student_profiles"
+	// StudentProfileInverseTable is the table name for the StudentProfile entity.
+	// It exists in this package in order to avoid circular dependency with the "studentprofile" package.
+	StudentProfileInverseTable = "student_profiles"
+	// StudentProfileColumn is the table column denoting the student_profile relation/edge.
+	StudentProfileColumn = "user_id"
+	// MentorProfileTable is the table that holds the mentor_profile relation/edge.
+	MentorProfileTable = "mentor_profiles"
+	// MentorProfileInverseTable is the table name for the MentorProfile entity.
+	// It exists in this package in order to avoid circular dependency with the "mentorprofile" package.
+	MentorProfileInverseTable = "mentor_profiles"
+	// MentorProfileColumn is the table column denoting the mentor_profile relation/edge.
+	MentorProfileColumn = "user_id"
+	// GrantedMentorProfilesTable is the table that holds the granted_mentor_profiles relation/edge.
+	GrantedMentorProfilesTable = "mentor_profiles"
+	// GrantedMentorProfilesInverseTable is the table name for the MentorProfile entity.
+	// It exists in this package in order to avoid circular dependency with the "mentorprofile" package.
+	GrantedMentorProfilesInverseTable = "mentor_profiles"
+	// GrantedMentorProfilesColumn is the table column denoting the granted_mentor_profiles relation/edge.
+	GrantedMentorProfilesColumn = "granted_by"
 	// OrganizationMembershipsTable is the table that holds the organization_memberships relation/edge.
 	OrganizationMembershipsTable = "organization_members"
 	// OrganizationMembershipsInverseTable is the table name for the OrganizationMember entity.
@@ -86,6 +115,13 @@ const (
 	APIKeyAuditsInverseTable = "api_key_audits"
 	// APIKeyAuditsColumn is the table column denoting the api_key_audits relation/edge.
 	APIKeyAuditsColumn = "actor_user_id"
+	// ModelLibraryEntriesTable is the table that holds the model_library_entries relation/edge.
+	ModelLibraryEntriesTable = "student_model_libraries"
+	// ModelLibraryEntriesInverseTable is the table name for the StudentModelLibrary entity.
+	// It exists in this package in order to avoid circular dependency with the "studentmodellibrary" package.
+	ModelLibraryEntriesInverseTable = "student_model_libraries"
+	// ModelLibraryEntriesColumn is the table column denoting the model_library_entries relation/edge.
+	ModelLibraryEntriesColumn = "user_id"
 )
 
 // Columns holds all SQL columns for user fields.
@@ -129,6 +165,9 @@ var (
 
 // Role defines the type for the "role" enum field.
 type Role string
+
+// RoleStudent is the default value of the Role enum.
+const DefaultRole = RoleStudent
 
 // Role values.
 const (
@@ -221,6 +260,34 @@ func ByStatus(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldStatus, opts...).ToFunc()
 }
 
+// ByStudentProfileField orders the results by student_profile field.
+func ByStudentProfileField(field string, opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newStudentProfileStep(), sql.OrderByField(field, opts...))
+	}
+}
+
+// ByMentorProfileField orders the results by mentor_profile field.
+func ByMentorProfileField(field string, opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newMentorProfileStep(), sql.OrderByField(field, opts...))
+	}
+}
+
+// ByGrantedMentorProfilesCount orders the results by granted_mentor_profiles count.
+func ByGrantedMentorProfilesCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newGrantedMentorProfilesStep(), opts...)
+	}
+}
+
+// ByGrantedMentorProfiles orders the results by granted_mentor_profiles terms.
+func ByGrantedMentorProfiles(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newGrantedMentorProfilesStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
+
 // ByOrganizationMembershipsCount orders the results by organization_memberships count.
 func ByOrganizationMembershipsCount(opts ...sql.OrderTermOption) OrderOption {
 	return func(s *sql.Selector) {
@@ -304,6 +371,41 @@ func ByAPIKeyAudits(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
 		sqlgraph.OrderByNeighborTerms(s, newAPIKeyAuditsStep(), append([]sql.OrderTerm{term}, terms...)...)
 	}
 }
+
+// ByModelLibraryEntriesCount orders the results by model_library_entries count.
+func ByModelLibraryEntriesCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newModelLibraryEntriesStep(), opts...)
+	}
+}
+
+// ByModelLibraryEntries orders the results by model_library_entries terms.
+func ByModelLibraryEntries(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newModelLibraryEntriesStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
+func newStudentProfileStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(StudentProfileInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2O, false, StudentProfileTable, StudentProfileColumn),
+	)
+}
+func newMentorProfileStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(MentorProfileInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2O, false, MentorProfileTable, MentorProfileColumn),
+	)
+}
+func newGrantedMentorProfilesStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(GrantedMentorProfilesInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2M, false, GrantedMentorProfilesTable, GrantedMentorProfilesColumn),
+	)
+}
 func newOrganizationMembershipsStep() *sqlgraph.Step {
 	return sqlgraph.NewStep(
 		sqlgraph.From(Table, FieldID),
@@ -344,5 +446,12 @@ func newAPIKeyAuditsStep() *sqlgraph.Step {
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(APIKeyAuditsInverseTable, FieldID),
 		sqlgraph.Edge(sqlgraph.O2M, false, APIKeyAuditsTable, APIKeyAuditsColumn),
+	)
+}
+func newModelLibraryEntriesStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(ModelLibraryEntriesInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2M, false, ModelLibraryEntriesTable, ModelLibraryEntriesColumn),
 	)
 }

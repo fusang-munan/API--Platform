@@ -21,6 +21,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/cache"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
@@ -29,6 +30,7 @@ import (
 	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
@@ -136,13 +138,19 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProtocolError(w, r.URL.Path, http.StatusBadRequest, "invalid_request_error", "invalid_model", extractErr.Error(), "model")
 		return
 	}
-	routes, err := g.routesForModel(r.Context(), key.ID, modelID, adapter)
+	var routes []route
+	if r.URL.Path == "/v1/messages" {
+		routes, err = g.routesForMessages(r.Context(), key.ID, modelID)
+	} else {
+		routes, err = g.routesForModel(r.Context(), key.ID, modelID, adapter)
+	}
 	if err != nil || len(routes) == 0 {
 		writeProtocolError(w, r.URL.Path, http.StatusBadRequest, "invalid_request_error", "model_not_allowed", "The requested model is not allowed or is unavailable for this API key.", "model")
 		return
 	}
 	prompt, promptSource := extractInputSnapshot(r.URL.Path, r.Header.Get("Content-Type"), replay)
-	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, routes[0].Binding.ModelID, requestIDFromContext(r), string(adapter), r.URL.Path, prompt, promptSource)
+	correlation := extractCallCorrelation(r.URL.Path, r.Header.Get("Content-Type"), replay, r.Header)
+	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, routes[0].Binding.ModelID, requestIDFromContext(r), string(adapter), r.URL.Path, prompt, promptSource, toUsageCorrelation(correlation))
 	if reserveErr != nil {
 		var quotaErr *usage.QuotaError
 		if errors.As(reserveErr, &quotaErr) {
@@ -153,6 +161,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g.proxyHTTP(w, r, replay, routes, reservation)
+}
+
+func (g *Gateway) routesForMessages(ctx context.Context, keyID uuid.UUID, modelID string) ([]route, error) {
+	return g.routesForModel(ctx, keyID, modelID, modelbinding.AdapterAnthropic)
 }
 
 func requestIDFromContext(r *http.Request) string {
@@ -234,7 +246,7 @@ func (g *Gateway) routesForModel(
 	if err != nil {
 		return nil, err
 	}
-	return g.decryptRoutes(bindings), nil
+	return g.decryptRoutes(ctx, bindings), nil
 }
 
 func (g *Gateway) resourceRoutes(ctx context.Context, keyID uuid.UUID, resourceType, resourceID string, adapter modelbinding.Adapter) ([]route, error) {
@@ -259,23 +271,60 @@ func (g *Gateway) resourceRoutes(ctx context.Context, keyID uuid.UUID, resourceT
 	if err != nil {
 		return nil, err
 	}
-	return g.decryptRoutes([]*ent.ModelBinding{binding}), nil
+	return g.decryptRoutes(ctx, []*ent.ModelBinding{binding}), nil
 }
 
-func (g *Gateway) decryptRoutes(bindings []*ent.ModelBinding) []route {
+func (g *Gateway) decryptRoutes(ctx context.Context, bindings []*ent.ModelBinding) []route {
 	routes := make([]route, 0, len(bindings))
 	for _, binding := range bindings {
+		ready, err := catalog.BindingRouteReady(ctx, g.db, binding)
+		if err != nil || !ready {
+			continue
+		}
 		upstream := binding.Edges.Provider
 		if upstream == nil || upstream.Status != provider.StatusActive {
 			continue
 		}
-		credential, err := g.security.DecryptCredential(upstream.CredentialCiphertext)
+		credential, err := g.resolveBindingCredential(ctx, binding)
 		if err != nil || strings.TrimSpace(credential) == "" {
 			continue
 		}
 		routes = append(routes, route{Binding: binding, Provider: upstream, Credential: credential})
 	}
 	return routes
+}
+
+func (g *Gateway) resolveBindingCredential(ctx context.Context, binding *ent.ModelBinding) (string, error) {
+	if binding.CredentialID != nil {
+		row, err := g.db.ProviderCredential.Query().
+			Where(
+				providercredential.IDEQ(*binding.CredentialID),
+				providercredential.StatusEQ(providercredential.StatusActive),
+			).
+			Only(ctx)
+		if err != nil {
+			return "", err
+		}
+		ready, err := catalog.BindingRouteReady(ctx, g.db, binding)
+		if err != nil || !ready {
+			return "", errors.New("provider credential is unavailable")
+		}
+		return g.security.DecryptCredential(row.CredentialCiphertext)
+	}
+	credentialID, found, err := catalog.FindActiveCatalogCredential(ctx, g.db, binding.ProviderID, binding.UpstreamModelName, uuid.Nil)
+	if err != nil || !found || credentialID == nil {
+		return "", errors.New("provider credential is unavailable")
+	}
+	row, err := g.db.ProviderCredential.Query().
+		Where(
+			providercredential.IDEQ(*credentialID),
+			providercredential.StatusEQ(providercredential.StatusActive),
+		).
+		Only(ctx)
+	if err != nil {
+		return "", err
+	}
+	return g.security.DecryptCredential(row.CredentialCiphertext)
 }
 
 func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, replay *replayBody, routes []route, reservation any) {
@@ -320,14 +369,20 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 		}
 		if r, ok := reservation.(usage.Reservation); ok {
 			success := response.StatusCode >= 200 && response.StatusCode < 300
+			bodyBytes, readErr := io.ReadAll(io.LimitReader(response.Body, 8<<20))
+			response.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			metrics := usage.CallMetrics{}
+			if success && readErr == nil {
+				metrics = toUsageMetrics(parseResponseMetrics(response.Header.Get("Content-Type"), bodyBytes))
+			}
 			if success {
-				if err := g.usage.Finalize(original.Context(), r, true, "succeeded", "", "", &candidate.Provider.ID, candidate.Provider.Name); err != nil {
+				if err := g.usage.Finalize(original.Context(), r, true, "succeeded", "", "", &candidate.Provider.ID, candidate.Provider.Name, metrics); err != nil {
 					response.Body.Close()
 					writeProtocolError(w, original.URL.Path, http.StatusServiceUnavailable, "server_error", "billing_unavailable", "Unable to finalize model usage.", "")
 					return
 				}
 			} else {
-				if err := g.usage.Finalize(original.Context(), r, false, "upstream_failed", "http", response.Status, &candidate.Provider.ID, candidate.Provider.Name); err != nil {
+				if err := g.usage.Finalize(original.Context(), r, false, "upstream_failed", "http", response.Status, &candidate.Provider.ID, candidate.Provider.Name, metrics); err != nil {
 					response.Body.Close()
 					writeProtocolError(w, original.URL.Path, http.StatusServiceUnavailable, "server_error", "billing_unavailable", "Unable to finalize model usage.", "")
 					return
@@ -343,14 +398,14 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 	}
 	if lastResponse != nil {
 		if r, ok := reservation.(usage.Reservation); ok {
-			_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "http", fmt.Sprintf("HTTP %d", lastResponse.StatusCode), nil, "")
+			_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "http", fmt.Sprintf("HTTP %d", lastResponse.StatusCode), nil, "", usage.CallMetrics{})
 		}
 		copyUpstreamResponse(w, lastResponse)
 		return
 	}
 	writeProtocolError(w, original.URL.Path, http.StatusBadGateway, "server_error", "upstream_unavailable", "No upstream provider is available.", "")
 	if r, ok := reservation.(usage.Reservation); ok {
-		_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "connection", "No upstream provider is available.", nil, "")
+		_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "connection", "No upstream provider is available.", nil, "", usage.CallMetrics{})
 	}
 }
 
@@ -374,7 +429,7 @@ func (g *Gateway) proxySSE(w http.ResponseWriter, original *http.Request, respon
 		}
 		if err != nil {
 			if !confirmed {
-				_ = g.usage.Finalize(original.Context(), reservation, false, "upstream_failed", "stream", "stream ended before a successful event", nil, provider.Name)
+				_ = g.usage.Finalize(original.Context(), reservation, false, "upstream_failed", "stream", "stream ended before a successful event", nil, provider.Name, usage.CallMetrics{})
 			}
 			copyHeaders(w.Header(), response.Header)
 			w.WriteHeader(response.StatusCode)
@@ -382,7 +437,7 @@ func (g *Gateway) proxySSE(w http.ResponseWriter, original *http.Request, respon
 			return
 		}
 	}
-	if err := g.usage.Finalize(original.Context(), reservation, true, "succeeded", "", "", &provider.ID, provider.Name); err != nil {
+	if err := g.usage.Finalize(original.Context(), reservation, true, "succeeded", "", "", &provider.ID, provider.Name, usage.CallMetrics{}); err != nil {
 		writeProtocolError(w, original.URL.Path, http.StatusServiceUnavailable, "server_error", "billing_unavailable", "Unable to finalize model usage.", "")
 		return
 	}
@@ -392,7 +447,10 @@ func (g *Gateway) proxySSE(w http.ResponseWriter, original *http.Request, respon
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
-	_, _ = io.Copy(w, reader)
+	var streamed bytes.Buffer
+	_, _ = io.Copy(io.MultiWriter(w, &streamed), reader)
+	body := append(buffered.Bytes(), streamed.Bytes()...)
+	_ = g.usage.CompleteCallMetrics(original.Context(), reservation.CallID, toUsageMetrics(parseResponseMetrics(response.Header.Get("Content-Type"), body)))
 }
 
 func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, candidate route) (*http.Request, func(), error) {
@@ -583,17 +641,19 @@ func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request
 	}
 	defer upstream.Close()
 	upstream.SetReadLimit(g.config.MaxRequestBytes)
-	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, routes[0].Binding.ModelID, requestIDFromContext(r), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", "", "")
+	wsCorrelation := extractCallCorrelationFromJSON(firstMessage)
+	wsPrompt, wsPromptSource := extractPromptFromJSON(firstMessage)
+	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, routes[0].Binding.ModelID, requestIDFromContext(r), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, toUsageCorrelation(wsCorrelation))
 	if reserveErr != nil {
 		_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "rate_limit_error", "code": "quota_exceeded", "message": "The API key or project credit quota is exhausted."}})
 		return
 	}
 	if err := upstream.WriteMessage(messageType, rewritten); err != nil {
-		_ = g.usage.Finalize(r.Context(), reservation, false, "outcome_unknown", "connection", err.Error(), nil, "")
+		_ = g.usage.Finalize(r.Context(), reservation, false, "outcome_unknown", "connection", err.Error(), nil, "", usage.CallMetrics{})
 		return
 	}
 	_ = g.usage.MarkSent(r.Context(), reservation.CallID)
-	_ = g.usage.Finalize(r.Context(), reservation, true, "succeeded", "", "", &routes[0].Provider.ID, routes[0].Provider.Name)
+	_ = g.usage.Finalize(r.Context(), reservation, true, "succeeded", "", "", &routes[0].Provider.ID, routes[0].Provider.Name, usage.CallMetrics{})
 	proxyResponsesWebSockets(client, upstream, upstreamModel, g, key.ID, routes[0].Binding.ModelID)
 }
 
@@ -665,7 +725,9 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, upstreamModel st
 					Type string `json:"type"`
 				}
 				if json.Unmarshal(data, &envelope) == nil && envelope.Type == "response.create" {
-					reservation, reserveErr := gateway.usage.Reserve(context.Background(), keyID, modelID, uuid.Must(uuid.NewV7()).String(), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", "", "")
+					wsCorrelation := extractCallCorrelationFromJSON(data)
+					wsPrompt, wsPromptSource := extractPromptFromJSON(data)
+					reservation, reserveErr := gateway.usage.Reserve(context.Background(), keyID, modelID, uuid.Must(uuid.NewV7()).String(), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, toUsageCorrelation(wsCorrelation))
 					if reserveErr != nil {
 						_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "rate_limit_error", "code": "quota_exceeded", "message": "The API key or project credit quota is exhausted."}})
 						continue
@@ -676,12 +738,12 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, upstreamModel st
 						return
 					}
 					if err := upstream.WriteMessage(messageType, data); err != nil {
-						_ = gateway.usage.Finalize(context.Background(), reservation, false, "outcome_unknown", "connection", err.Error(), nil, "")
+						_ = gateway.usage.Finalize(context.Background(), reservation, false, "outcome_unknown", "connection", err.Error(), nil, "", usage.CallMetrics{})
 						errs <- err
 						return
 					}
 					_ = gateway.usage.MarkSent(context.Background(), reservation.CallID)
-					_ = gateway.usage.Finalize(context.Background(), reservation, true, "succeeded", "", "", nil, "")
+					_ = gateway.usage.Finalize(context.Background(), reservation, true, "succeeded", "", "", nil, "", usage.CallMetrics{})
 					continue
 				}
 			}
@@ -721,18 +783,20 @@ func proxyRealtimeWebSocket(client, upstream *websocket.Conn, gateway *Gateway, 
 					Type string `json:"type"`
 				}
 				if json.Unmarshal(data, &event) == nil && event.Type == "response.create" {
-					reservation, reserveErr := gateway.usage.Reserve(context.Background(), keyID, modelID, uuid.Must(uuid.NewV7()).String(), string(modelbinding.AdapterOpenaiRealtime), "/v1/realtime", "", "")
+					wsCorrelation := extractCallCorrelationFromJSON(data)
+					wsPrompt, wsPromptSource := extractPromptFromJSON(data)
+					reservation, reserveErr := gateway.usage.Reserve(context.Background(), keyID, modelID, uuid.Must(uuid.NewV7()).String(), string(modelbinding.AdapterOpenaiRealtime), "/v1/realtime", wsPrompt, wsPromptSource, toUsageCorrelation(wsCorrelation))
 					if reserveErr != nil {
 						_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "rate_limit_error", "code": "quota_exceeded", "message": "The API key or project credit quota is exhausted."}})
 						continue
 					}
 					if err := upstream.WriteMessage(messageType, data); err != nil {
-						_ = gateway.usage.Finalize(context.Background(), reservation, false, "outcome_unknown", "connection", err.Error(), nil, "")
+						_ = gateway.usage.Finalize(context.Background(), reservation, false, "outcome_unknown", "connection", err.Error(), nil, "", usage.CallMetrics{})
 						errs <- err
 						return
 					}
 					_ = gateway.usage.MarkSent(context.Background(), reservation.CallID)
-					_ = gateway.usage.Finalize(context.Background(), reservation, true, "succeeded", "", "", nil, "")
+					_ = gateway.usage.Finalize(context.Background(), reservation, true, "succeeded", "", "", nil, "", usage.CallMetrics{})
 					continue
 				}
 			}
@@ -857,30 +921,7 @@ func supportedRoute(method, requestPath string) bool {
 }
 
 func adapterForPath(requestPath string) modelbinding.Adapter {
-	switch {
-	case requestPath == "/v1/responses" || requestPath == "/v1/responses/compact":
-		return modelbinding.AdapterOpenaiResponses
-	case requestPath == "/v1/embeddings":
-		return modelbinding.AdapterOpenaiEmbeddings
-	case strings.HasPrefix(requestPath, "/v1/images/"):
-		return modelbinding.AdapterOpenaiImages
-	case strings.HasPrefix(requestPath, "/v1/audio/"):
-		return modelbinding.AdapterOpenaiAudio
-	case requestPath == "/v1/videos" || strings.HasPrefix(requestPath, "/v1/videos/"):
-		return modelbinding.AdapterOpenaiVideo
-	case requestPath == "/v1/realtime" || strings.HasPrefix(requestPath, "/v1/realtime/"):
-		return modelbinding.AdapterOpenaiRealtime
-	case requestPath == "/v1/moderations":
-		return modelbinding.AdapterOpenaiModerations
-	case requestPath == "/v1/messages":
-		return modelbinding.AdapterAnthropic
-	case requestPath == "/v2/rerank":
-		return modelbinding.AdapterCohereRerankV2
-	case isGeminiPath(requestPath):
-		return modelbinding.AdapterGoogleGeminiV1beta
-	default:
-		return modelbinding.AdapterOpenaiCompatible
-	}
+	return catalog.ResolveAdapterFromRequestPath(requestPath)
 }
 
 func isWebSocketUpgrade(r *http.Request) bool {
@@ -1334,42 +1375,7 @@ func extractInputSnapshot(requestPath, contentType string, replay *replayBody) (
 	if json.NewDecoder(reader).Decode(&payload) != nil {
 		return "", ""
 	}
-	if value, ok := payload["prompt"].(string); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value), "prompt"
-	}
-	if value, ok := payload["input"].(string); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value), "input"
-	}
-	if messages, ok := payload["messages"].([]any); ok {
-		for i := len(messages) - 1; i >= 0; i-- {
-			if m, ok := messages[i].(map[string]any); ok && strings.EqualFold(fmt.Sprint(m["role"]), "user") {
-				if text := allTextFromJSONValue(m["content"]); text != "" {
-					return text, "user_message"
-				}
-			}
-		}
-	}
-	if contents, ok := payload["contents"].([]any); ok {
-		for i := len(contents) - 1; i >= 0; i-- {
-			if item, ok := contents[i].(map[string]any); ok && strings.EqualFold(fmt.Sprint(item["role"]), "user") {
-				if text := allTextFromJSONValue(item["parts"]); text != "" {
-					return text, "user_message"
-				}
-			}
-		}
-	}
-	if input, ok := payload["input"].([]any); ok {
-		for i := len(input) - 1; i >= 0; i-- {
-			item, isObject := input[i].(map[string]any)
-			if isObject && item["role"] != nil && !strings.EqualFold(fmt.Sprint(item["role"]), "user") {
-				continue
-			}
-			if text := allTextFromJSONValue(input[i]); text != "" {
-				return text, "input_text"
-			}
-		}
-	}
-	return "", ""
+	return extractUserPromptFromPayload(payload)
 }
 
 func allTextFromJSONValue(value any) string {
@@ -1386,6 +1392,14 @@ func allTextFromJSONValue(value any) string {
 		return strings.Join(parts, "\n")
 	case map[string]any:
 		typeName, _ := v["type"].(string)
+		if typeName == "message" {
+			for _, key := range []string{"content", "text", "input_text"} {
+				if text := allTextFromJSONValue(v[key]); text != "" {
+					return text
+				}
+			}
+			return ""
+		}
 		if typeName != "" && typeName != "text" && typeName != "input_text" {
 			return ""
 		}

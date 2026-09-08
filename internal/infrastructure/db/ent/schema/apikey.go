@@ -24,7 +24,7 @@ func (APIKey) Annotations() []entschema.Annotation {
 					AND key_hash IS NULL AND key_prefix IS NULL AND claimed_at IS NULL AND revoked_at IS NULL)
 				OR (status = 'active'
 					AND key_hash IS NOT NULL AND key_prefix IS NOT NULL AND claimed_at IS NOT NULL AND revoked_at IS NULL)
-				OR (status = 'revoked'
+				OR (status = 'inactive'
 					AND key_hash IS NOT NULL AND key_prefix IS NOT NULL AND claimed_at IS NOT NULL AND revoked_at IS NOT NULL)
 			`,
 		},
@@ -44,7 +44,7 @@ func (APIKey) Fields() []ent.Field {
 			MaxLen(128).
 			SchemaType(map[string]string{dialect.Postgres: "citext"}),
 		field.Enum("status").
-			Values("pending_mentor", "pending_teacher", "approved", "active", "rejected", "revoked").
+			Values("pending_mentor", "pending_teacher", "approved", "active", "rejected", "inactive").
 			Default("pending_mentor"),
 		field.Bytes("key_hash").Optional().Nillable().Sensitive().Unique(),
 		field.String("key_prefix").Optional().Nillable().MaxLen(32),
@@ -82,7 +82,10 @@ func (APIKey) Indexes() []ent.Index {
 	return []ent.Index{
 		index.Fields("owner_user_id", "name").
 			Unique().
-			Annotations(entsql.IndexWhere("status IN ('pending_mentor', 'pending_teacher', 'approved', 'active')")),
+			Annotations(entsql.IndexWhere("status IN ('pending_mentor', 'pending_teacher', 'approved', 'active', 'inactive')")),
+		index.Fields("owner_user_id", "project_id").
+			Unique().
+			Annotations(entsql.IndexWhere("status IN ('pending_mentor', 'pending_teacher', 'approved', 'active', 'inactive')")),
 		index.Fields("owner_user_id", "created_at"),
 		index.Fields("project_id", "status", "created_at"),
 		index.Fields("status", "created_at"),

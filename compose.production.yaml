@@ -144,12 +144,12 @@ services:
     read_only: true
     restart: unless-stopped
 
-  model-catalog:
+  provider-catalog:
     <<: *application-image
-    entrypoint: ["/app/nebula-model-catalog"]
+    entrypoint: ["/app/nebula-provider-catalog"]
     environment:
       DATABASE_URL:
-      MATRIX_APIKEY:
+      PROVIDER_CREDENTIAL_ENCRYPTION_KEY:
     networks: [edge, data]
     depends_on:
       migrate: {condition: service_completed_successfully}

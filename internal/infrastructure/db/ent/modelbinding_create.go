@@ -14,6 +14,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 )
 
 // ModelBindingCreate is the builder for creating a ModelBinding entity.
@@ -60,6 +61,20 @@ func (_c *ModelBindingCreate) SetModelID(v uuid.UUID) *ModelBindingCreate {
 // SetProviderID sets the "provider_id" field.
 func (_c *ModelBindingCreate) SetProviderID(v uuid.UUID) *ModelBindingCreate {
 	_c.mutation.SetProviderID(v)
+	return _c
+}
+
+// SetCredentialID sets the "credential_id" field.
+func (_c *ModelBindingCreate) SetCredentialID(v uuid.UUID) *ModelBindingCreate {
+	_c.mutation.SetCredentialID(v)
+	return _c
+}
+
+// SetNillableCredentialID sets the "credential_id" field if the given value is not nil.
+func (_c *ModelBindingCreate) SetNillableCredentialID(v *uuid.UUID) *ModelBindingCreate {
+	if v != nil {
+		_c.SetCredentialID(*v)
+	}
 	return _c
 }
 
@@ -125,6 +140,11 @@ func (_c *ModelBindingCreate) SetModel(v *Model) *ModelBindingCreate {
 // SetProvider sets the "provider" edge to the Provider entity.
 func (_c *ModelBindingCreate) SetProvider(v *Provider) *ModelBindingCreate {
 	return _c.SetProviderID(v.ID)
+}
+
+// SetCredential sets the "credential" edge to the ProviderCredential entity.
+func (_c *ModelBindingCreate) SetCredential(v *ProviderCredential) *ModelBindingCreate {
+	return _c.SetCredentialID(v.ID)
 }
 
 // Mutation returns the ModelBindingMutation object of the builder.
@@ -327,6 +347,23 @@ func (_c *ModelBindingCreate) createSpec() (*ModelBinding, *sqlgraph.CreateSpec)
 			edge.Target.Nodes = append(edge.Target.Nodes, k)
 		}
 		_node.ProviderID = nodes[0]
+		_spec.Edges = append(_spec.Edges, edge)
+	}
+	if nodes := _c.mutation.CredentialIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.M2O,
+			Inverse: true,
+			Table:   modelbinding.CredentialTable,
+			Columns: []string{modelbinding.CredentialColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(providercredential.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_node.CredentialID = &nodes[0]
 		_spec.Edges = append(_spec.Edges, edge)
 	}
 	return _node, _spec

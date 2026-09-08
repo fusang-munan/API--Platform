@@ -26,6 +26,7 @@ func (ModelBinding) Fields() []ent.Field {
 	return []ent.Field{
 		field.UUID("model_id", uuid.UUID{}).Immutable(),
 		field.UUID("provider_id", uuid.UUID{}).Immutable(),
+		field.UUID("credential_id", uuid.UUID{}).Optional().Nillable(),
 		field.String("upstream_model_name").NotEmpty().MaxLen(256),
 		field.Enum("adapter").Values(
 			"openai_compatible",
@@ -60,6 +61,11 @@ func (ModelBinding) Edges() []ent.Edge {
 			Unique().
 			Required().
 			Immutable().
+			Annotations(entsql.OnDelete(entsql.Restrict)),
+		edge.From("credential", ProviderCredential.Type).
+			Ref("model_bindings").
+			Field("credential_id").
+			Unique().
 			Annotations(entsql.OnDelete(entsql.Restrict)),
 	}
 }

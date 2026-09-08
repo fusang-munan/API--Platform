@@ -1,13 +1,16 @@
 import { get, post } from './client'
-import type { Session, User } from './types'
+import type { LoginChallenge, MeView, Role, Session, User } from './types'
+
 export const authAPI = {
   sendCode: (email: string, purpose: string) => post<{ sent: boolean }>('/api/v1/auth/verification-codes', { email, purpose }),
-  register: (role: 'student' | 'mentor', body: { name: string; email: string; password: string; verification_code: string }) => post<User>(`/api/v1/auth/register/${role}`, { name: body.name, email: body.email, password: body.password, verification_code: body.verification_code }),
-  login: (body: { email: string; password: string }) => post<Session>('/api/v1/auth/login', body),
+  register: (body: { name: string; email: string; password: string; verification_code: string }) =>
+    post<User>('/api/v1/auth/register/student', body),
+  login: (body: { email: string; password: string }) => post<LoginChallenge>('/api/v1/auth/login', body),
+  createSession: (identity: Role) => post<Session>('/api/v1/auth/session', { identity }),
   refresh: () => post<Session>('/api/v1/auth/refresh'),
   logout: () => post<void>('/api/v1/auth/logout'),
   forgot: (email: string) => post<{ accepted: boolean }>('/api/v1/auth/password/forgot', { email }),
   reset: (body: { email: string; verification_code: string; new_password: string }) => post<void>('/api/v1/auth/password/reset', body),
   activateTeacher: (body: { token: string; name: string; password: string }) => post<User>('/api/v1/auth/teacher-invitations/activate', body),
-  me: () => get<User>('/api/v1/me')
+  me: () => get<MeView>('/api/v1/me'),
 }

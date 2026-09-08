@@ -26,8 +26,8 @@ type Tx struct {
 	GatewayCallAttempt *GatewayCallAttemptClient
 	// MaintenanceState is the client for interacting with the MaintenanceState builders.
 	MaintenanceState *MaintenanceStateClient
-	// MatrixModelCatalog is the client for interacting with the MatrixModelCatalog builders.
-	MatrixModelCatalog *MatrixModelCatalogClient
+	// MentorProfile is the client for interacting with the MentorProfile builders.
+	MentorProfile *MentorProfileClient
 	// MentorProjectApplication is the client for interacting with the MentorProjectApplication builders.
 	MentorProjectApplication *MentorProjectApplicationClient
 	// Model is the client for interacting with the Model builders.
@@ -54,8 +54,16 @@ type Tx struct {
 	PromptAccessAudit *PromptAccessAuditClient
 	// Provider is the client for interacting with the Provider builders.
 	Provider *ProviderClient
+	// ProviderCredential is the client for interacting with the ProviderCredential builders.
+	ProviderCredential *ProviderCredentialClient
+	// ProviderModelCatalog is the client for interacting with the ProviderModelCatalog builders.
+	ProviderModelCatalog *ProviderModelCatalogClient
 	// QuotaAdjustmentAudit is the client for interacting with the QuotaAdjustmentAudit builders.
 	QuotaAdjustmentAudit *QuotaAdjustmentAuditClient
+	// StudentModelLibrary is the client for interacting with the StudentModelLibrary builders.
+	StudentModelLibrary *StudentModelLibraryClient
+	// StudentProfile is the client for interacting with the StudentProfile builders.
+	StudentProfile *StudentProfileClient
 	// User is the client for interacting with the User builders.
 	User *UserClient
 
@@ -196,7 +204,7 @@ func (tx *Tx) init() {
 	tx.GatewayCall = NewGatewayCallClient(tx.config)
 	tx.GatewayCallAttempt = NewGatewayCallAttemptClient(tx.config)
 	tx.MaintenanceState = NewMaintenanceStateClient(tx.config)
-	tx.MatrixModelCatalog = NewMatrixModelCatalogClient(tx.config)
+	tx.MentorProfile = NewMentorProfileClient(tx.config)
 	tx.MentorProjectApplication = NewMentorProjectApplicationClient(tx.config)
 	tx.Model = NewModelClient(tx.config)
 	tx.ModelBinding = NewModelBindingClient(tx.config)
@@ -210,7 +218,11 @@ func (tx *Tx) init() {
 	tx.ProjectMonthCreditBucket = NewProjectMonthCreditBucketClient(tx.config)
 	tx.PromptAccessAudit = NewPromptAccessAuditClient(tx.config)
 	tx.Provider = NewProviderClient(tx.config)
+	tx.ProviderCredential = NewProviderCredentialClient(tx.config)
+	tx.ProviderModelCatalog = NewProviderModelCatalogClient(tx.config)
 	tx.QuotaAdjustmentAudit = NewQuotaAdjustmentAuditClient(tx.config)
+	tx.StudentModelLibrary = NewStudentModelLibraryClient(tx.config)
+	tx.StudentProfile = NewStudentProfileClient(tx.config)
 	tx.User = NewUserClient(tx.config)
 }
 

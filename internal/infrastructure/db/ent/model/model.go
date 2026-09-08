@@ -46,10 +46,14 @@ const (
 	FieldStatus = "status"
 	// FieldCreditMultiplierMilli holds the string denoting the credit_multiplier_milli field in the database.
 	FieldCreditMultiplierMilli = "credit_multiplier_milli"
+	// FieldUpstreamMetadata holds the string denoting the upstream_metadata field in the database.
+	FieldUpstreamMetadata = "upstream_metadata"
 	// EdgeBindings holds the string denoting the bindings edge name in mutations.
 	EdgeBindings = "bindings"
 	// EdgeAPIKeyModels holds the string denoting the api_key_models edge name in mutations.
 	EdgeAPIKeyModels = "api_key_models"
+	// EdgeStudentLibraryEntries holds the string denoting the student_library_entries edge name in mutations.
+	EdgeStudentLibraryEntries = "student_library_entries"
 	// Table holds the table name of the model in the database.
 	Table = "models"
 	// BindingsTable is the table that holds the bindings relation/edge.
@@ -66,6 +70,13 @@ const (
 	APIKeyModelsInverseTable = "api_key_models"
 	// APIKeyModelsColumn is the table column denoting the api_key_models relation/edge.
 	APIKeyModelsColumn = "model_id"
+	// StudentLibraryEntriesTable is the table that holds the student_library_entries relation/edge.
+	StudentLibraryEntriesTable = "student_model_libraries"
+	// StudentLibraryEntriesInverseTable is the table name for the StudentModelLibrary entity.
+	// It exists in this package in order to avoid circular dependency with the "studentmodellibrary" package.
+	StudentLibraryEntriesInverseTable = "student_model_libraries"
+	// StudentLibraryEntriesColumn is the table column denoting the student_library_entries relation/edge.
+	StudentLibraryEntriesColumn = "model_id"
 )
 
 // Columns holds all SQL columns for model fields.
@@ -86,6 +97,7 @@ var Columns = []string{
 	FieldIsCommon,
 	FieldStatus,
 	FieldCreditMultiplierMilli,
+	FieldUpstreamMetadata,
 }
 
 // ValidColumn reports if the column name is valid (part of the table columns).
@@ -127,6 +139,8 @@ var (
 	DefaultIsCommon bool
 	// CreditMultiplierMilliValidator is a validator for the "credit_multiplier_milli" field. It is called by the builders before save.
 	CreditMultiplierMilliValidator func(int64) error
+	// DefaultUpstreamMetadata holds the default value on creation for the "upstream_metadata" field.
+	DefaultUpstreamMetadata map[string]interface{}
 	// DefaultID holds the default value on creation for the "id" field.
 	DefaultID func() uuid.UUID
 )
@@ -284,6 +298,20 @@ func ByAPIKeyModels(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
 		sqlgraph.OrderByNeighborTerms(s, newAPIKeyModelsStep(), append([]sql.OrderTerm{term}, terms...)...)
 	}
 }
+
+// ByStudentLibraryEntriesCount orders the results by student_library_entries count.
+func ByStudentLibraryEntriesCount(opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborsCount(s, newStudentLibraryEntriesStep(), opts...)
+	}
+}
+
+// ByStudentLibraryEntries orders the results by student_library_entries terms.
+func ByStudentLibraryEntries(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newStudentLibraryEntriesStep(), append([]sql.OrderTerm{term}, terms...)...)
+	}
+}
 func newBindingsStep() *sqlgraph.Step {
 	return sqlgraph.NewStep(
 		sqlgraph.From(Table, FieldID),
@@ -296,5 +324,12 @@ func newAPIKeyModelsStep() *sqlgraph.Step {
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(APIKeyModelsInverseTable, FieldID),
 		sqlgraph.Edge(sqlgraph.O2M, false, APIKeyModelsTable, APIKeyModelsColumn),
+	)
+}
+func newStudentLibraryEntriesStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(StudentLibraryEntriesInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2M, false, StudentLibraryEntriesTable, StudentLibraryEntriesColumn),
 	)
 }

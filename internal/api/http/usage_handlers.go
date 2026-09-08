@@ -54,7 +54,7 @@ func (s *Server) updateMentorKeyQuota(c *gin.Context) {
 	}
 	var input struct {
 		MonthlyCredits    string `json:"monthly_credits" binding:"required"`
-		QuotaChangeReason string `json:"quota_change_reason" binding:"required"`
+		QuotaChangeReason string `json:"quota_change_reason"`
 	}
 	if !bindJSON(c, &input) {
 		return
@@ -130,6 +130,33 @@ func (s *Server) mentorCallLog(c *gin.Context) {
 	}
 	respond(c, http.StatusOK, v)
 }
+func (s *Server) mentorCallTurns(c *gin.Context) {
+	f, err := parseLogFilter(c)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	v, err := s.service.MentorCallTurns(c.Request.Context(), identity(c).UserID, f)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	respond(c, http.StatusOK, v)
+}
+func (s *Server) mentorCallTurn(c *gin.Context) {
+	id, ok := pathID(c, "turn_id")
+	if !ok {
+		return
+	}
+	v, err := s.service.MentorCallTurn(c.Request.Context(), identity(c).UserID, id)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	respond(c, http.StatusOK, v)
+}
 func (s *Server) mentorInputs(c *gin.Context) {
 	f, err := parseLogFilter(c)
 	if err != nil {
@@ -157,6 +184,24 @@ func (s *Server) mentorInput(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	respond(c, http.StatusOK, v)
 }
+func (s *Server) teacherProjectUsage(c *gin.Context) {
+	id, ok := pathID(c, "project_id")
+	if !ok {
+		return
+	}
+	month, err := monthQuery(c)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	v, err := s.service.TeacherProjectUsage(c.Request.Context(), id, month)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, v)
+}
+
 func (s *Server) teacherProjectSpend(c *gin.Context) {
 	month, err := monthQuery(c)
 	if err != nil {

@@ -38,6 +38,11 @@ type verificationState struct {
 type Session struct {
 	UserID   string `json:"user_id"`
 	FamilyID string `json:"family_id"`
+	Identity string `json:"identity,omitempty"`
+}
+
+type LoginChallenge struct {
+	UserID string `json:"user_id"`
 }
 
 type Invitation struct {
@@ -181,6 +186,33 @@ func (s *Store) CreateSession(ctx context.Context, tokenHash string, session Ses
 		return nil
 	})
 	return err
+}
+
+func (s *Store) CreateLoginChallenge(ctx context.Context, tokenHash string, challenge LoginChallenge, ttl time.Duration) error {
+	payload, err := json.Marshal(challenge)
+	if err != nil {
+		return fmt.Errorf("encode login challenge: %w", err)
+	}
+	return s.client.Set(ctx, loginChallengeKey(tokenHash), payload, ttl).Err()
+}
+
+func (s *Store) ConsumeLoginChallenge(ctx context.Context, tokenHash string) (LoginChallenge, error) {
+	key := loginChallengeKey(tokenHash)
+	raw, err := s.client.Get(ctx, key).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return LoginChallenge{}, ErrSessionMissing
+	}
+	if err != nil {
+		return LoginChallenge{}, err
+	}
+	var challenge LoginChallenge
+	if err := json.Unmarshal(raw, &challenge); err != nil {
+		return LoginChallenge{}, fmt.Errorf("decode login challenge: %w", err)
+	}
+	if err := s.client.Del(ctx, key).Err(); err != nil {
+		return LoginChallenge{}, err
+	}
+	return challenge, nil
 }
 
 func (s *Store) RotateSession(
@@ -395,6 +427,10 @@ func verificationCooldownKey(email, purpose string) string {
 
 func refreshKey(hash string) string {
 	return "auth:refresh:" + hash
+}
+
+func loginChallengeKey(hash string) string {
+	return "auth:login-challenge:" + hash
 }
 
 func usedRefreshKey(hash string) string {

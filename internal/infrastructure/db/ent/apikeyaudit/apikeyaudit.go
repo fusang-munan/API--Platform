@@ -86,7 +86,10 @@ const (
 	ActionMentorRejected  Action = "mentor_rejected"
 	ActionTeacherApproved Action = "teacher_approved"
 	ActionTeacherRejected Action = "teacher_rejected"
-	ActionMentorRevoked   Action = "mentor_revoked"
+	ActionMentorRevoked     Action = "mentor_revoked"
+	ActionMentorDeactivated Action = "mentor_deactivated"
+	ActionMentorActivated   Action = "mentor_activated"
+	ActionStudentWithdrawn  Action = "student_withdrawn"
 )
 
 func (a Action) String() string {
@@ -96,7 +99,7 @@ func (a Action) String() string {
 // ActionValidator is a validator for the "action" field enum values. It is called by the builders before save.
 func ActionValidator(a Action) error {
 	switch a {
-	case ActionMentorApproved, ActionMentorRejected, ActionTeacherApproved, ActionTeacherRejected, ActionMentorRevoked:
+	case ActionMentorApproved, ActionMentorRejected, ActionTeacherApproved, ActionTeacherRejected, ActionMentorRevoked, ActionMentorDeactivated, ActionMentorActivated, ActionStudentWithdrawn:
 		return nil
 	default:
 		return fmt.Errorf("apikeyaudit: invalid enum value for action field: %q", a)
