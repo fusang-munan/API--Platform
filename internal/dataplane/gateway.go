@@ -106,6 +106,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.serveModels(w, r, key)
 		return
 	}
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/codex/model_catalog" {
+		g.serveCodexModelCatalog(w, r, key)
+		return
+	}
 	var replay *replayBody
 	if r.Body != nil {
 		replay, err = captureBody(r.Body, g.config.MaxRequestBytes)
@@ -149,8 +153,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prompt, promptSource := extractInputSnapshot(r.URL.Path, r.Header.Get("Content-Type"), replay)
-	correlation := extractCallCorrelation(r.URL.Path, r.Header.Get("Content-Type"), replay, r.Header)
-	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, routes[0].Binding.ModelID, requestIDFromContext(r), string(adapter), r.URL.Path, prompt, promptSource, toUsageCorrelation(correlation))
+	prompt, usageCorrelation := turnCorrelation(prompt, extractCallCorrelation(r.URL.Path, r.Header.Get("Content-Type"), replay, r.Header), uuid.Nil)
+	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, routes[0].Binding.ModelID, requestIDFromContext(r), string(adapter), r.URL.Path, prompt, promptSource, usageCorrelation)
 	if reserveErr != nil {
 		var quotaErr *usage.QuotaError
 		if errors.As(reserveErr, &quotaErr) {
@@ -211,11 +215,43 @@ func (g *Gateway) serveModels(w http.ResponseWriter, r *http.Request, key *ent.A
 	}
 	data := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
+		if !catalog.IsOpenAIModelsListable(row.ModelID) {
+			continue
+		}
 		data = append(data, map[string]any{
 			"id": row.ModelID, "object": "model", "created": row.CreatedAt.Unix(), "owned_by": "nebula",
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+func (g *Gateway) serveCodexModelCatalog(w http.ResponseWriter, r *http.Request, key *ent.APIKey) {
+	rows, err := g.db.Model.Query().Where(
+		entmodel.HasAPIKeyModelsWith(apikeymodel.APIKeyIDEQ(key.ID)),
+	).Order(ent.Asc(entmodel.FieldModelID)).All(r.Context())
+	if err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "server_error", "dependency_unavailable", "Model catalog is unavailable.", "")
+		return
+	}
+	modelIDs := make([]string, 0, len(rows))
+	displayNames := make(map[string]string, len(rows))
+	for _, row := range rows {
+		if !catalog.IsOpenAIModelsListable(row.ModelID) {
+			continue
+		}
+		modelIDs = append(modelIDs, row.ModelID)
+		if name := strings.TrimSpace(row.DisplayName); name != "" {
+			displayNames[row.ModelID] = name
+		}
+	}
+	payload, err := catalog.MarshalCodexModelCatalog(modelIDs, displayNames)
+	if err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "server_error", "dependency_unavailable", "Model catalog is unavailable.", "")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(payload)
 }
 
 func (g *Gateway) routesForModel(
@@ -328,15 +364,29 @@ func (g *Gateway) resolveBindingCredential(ctx context.Context, binding *ent.Mod
 }
 
 func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, replay *replayBody, routes []route, reservation any) {
+	if len(routes) == 0 {
+		writeProtocolError(w, original.URL.Path, http.StatusBadGateway, "server_error", "upstream_unavailable", "No upstream provider is available.", "")
+		if r, ok := reservation.(usage.Reservation); ok {
+			_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "connection", "No upstream provider is available.", nil, "", usage.CallMetrics{})
+		}
+		return
+	}
+	candidate := routes[0]
+
 	var lastResponse *http.Response
-	for index, candidate := range routes {
+	var lastConnectionErr error
+	for attempt := 0; attempt < upstreamRetryAttempts; attempt++ {
+		if attempt > 0 && !sleepUpstreamRetry(original.Context(), attempt) {
+			break
+		}
 		attemptStarted := time.Now()
 		var attemptID uuid.UUID
-		if _, ok := reservation.(usage.Reservation); ok {
-			attemptID, _ = g.usage.StartAttempt(original.Context(), reservation.(usage.Reservation).CallID, candidate.Provider.ID, candidate.Binding.ID, candidate.Provider.Name)
+		if r, ok := reservation.(usage.Reservation); ok {
+			attemptID, _ = g.usage.StartAttempt(original.Context(), r.CallID, candidate.Provider.ID, candidate.Binding.ID, candidate.Provider.Name)
 		}
 		request, cleanup, err := g.upstreamRequest(original, replay, candidate)
 		if err != nil {
+			lastConnectionErr = err
 			if attemptID != uuid.Nil {
 				_ = g.usage.FinishAttempt(original.Context(), attemptID, false, nil, "request_rewrite", err.Error(), attemptStarted)
 			}
@@ -345,6 +395,7 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 		response, err := g.client.Do(request)
 		cleanup()
 		if err != nil {
+			lastConnectionErr = err
 			if attemptID != uuid.Nil {
 				_ = g.usage.FinishAttempt(original.Context(), attemptID, false, nil, "connection", err.Error(), attemptStarted)
 			}
@@ -357,16 +408,33 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 			_ = g.usage.FinishAttempt(original.Context(), attemptID, response.StatusCode >= 200 && response.StatusCode < 300, &response.StatusCode, "", "", attemptStarted)
 		}
 		lastResponse = response
-		canRetry := response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500
-		if canRetry && index < len(routes)-1 {
-			_, _ = io.CopyN(io.Discard, response.Body, 64<<10)
-			_ = response.Body.Close()
-			continue
-		}
+
 		if r, ok := reservation.(usage.Reservation); ok && isSSEResponse(response) {
+			prefix, remainder, peekErr := peekSSEBody(response.Body, ssePeekLimit)
+			if peekErr != nil {
+				discardResponseBody(response, 0)
+				if attempt < upstreamRetryAttempts-1 {
+					continue
+				}
+				writeProtocolError(w, original.URL.Path, http.StatusBadGateway, "server_error", "upstream_unavailable", "Upstream stream ended before a response was delivered.", "")
+				_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "stream", peekErr.Error(), &candidate.Provider.ID, candidate.Provider.Name, usage.CallMetrics{})
+				return
+			}
+			if sseStreamRetryable(prefix) && attempt < upstreamRetryAttempts-1 {
+				_, _ = io.Copy(io.Discard, remainder)
+				_ = remainder.Close()
+				continue
+			}
+			response.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), remainder))
 			g.proxySSE(w, original, response, r, candidate.Provider)
 			return
 		}
+
+		if upstreamHTTPRetryable(response.StatusCode) && attempt < upstreamRetryAttempts-1 {
+			discardResponseBody(response, 64<<10)
+			continue
+		}
+
 		if r, ok := reservation.(usage.Reservation); ok {
 			success := response.StatusCode >= 200 && response.StatusCode < 300
 			bodyBytes, readErr := io.ReadAll(io.LimitReader(response.Body, 8<<20))
@@ -396,6 +464,7 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 		copyUpstreamResponse(w, response)
 		return
 	}
+
 	if lastResponse != nil {
 		if r, ok := reservation.(usage.Reservation); ok {
 			_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "http", fmt.Sprintf("HTTP %d", lastResponse.StatusCode), nil, "", usage.CallMetrics{})
@@ -403,9 +472,13 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 		copyUpstreamResponse(w, lastResponse)
 		return
 	}
-	writeProtocolError(w, original.URL.Path, http.StatusBadGateway, "server_error", "upstream_unavailable", "No upstream provider is available.", "")
+	message := "No upstream provider is available."
+	if lastConnectionErr != nil {
+		message = lastConnectionErr.Error()
+	}
+	writeProtocolError(w, original.URL.Path, http.StatusBadGateway, "server_error", "upstream_unavailable", message, "")
 	if r, ok := reservation.(usage.Reservation); ok {
-		_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "connection", "No upstream provider is available.", nil, "", usage.CallMetrics{})
+		_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "connection", message, nil, "", usage.CallMetrics{})
 	}
 }
 
@@ -458,12 +531,12 @@ func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, ca
 	if err != nil {
 		return nil, func() {}, err
 	}
-	target, err := joinUpstreamURL(candidate.Provider.BaseURL, requestPath, original.URL.RawQuery)
+	target, err := joinUpstreamURL(catalog.UpstreamBaseForAdapter(candidate.Provider.BaseURL, candidate.Binding.Adapter), requestPath, original.URL.RawQuery)
 	if err != nil {
 		return nil, func() {}, err
 	}
 	body, contentType, contentLength, cleanup, err := rewriteUpstreamBody(
-		original.Header.Get("Content-Type"), replay, candidate.Binding.UpstreamModelName, candidate.Binding.Adapter,
+		original.Header.Get("Content-Type"), replay, candidate.Binding.UpstreamModelName, candidate.Binding.Adapter, candidate.Provider.BaseURL,
 	)
 	if err != nil {
 		return nil, func() {}, err
@@ -492,6 +565,11 @@ func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, ca
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
 	}
+	// DeepSeek mixes compressed bytes into deepseek-flash SSE when the client
+	// offers gzip or brotli. An uncompressed stream keeps data: lines intact for
+	// the harness and for usage parsing. Leaving this header unset would let
+	// Go's transport add gzip on its own.
+	request.Header.Set("Accept-Encoding", "identity")
 	request.Host = request.URL.Host
 	request.ContentLength = contentLength
 	return request, cleanup, nil
@@ -580,7 +658,7 @@ func (g *Gateway) serveRealtimeWebSocket(w http.ResponseWriter, r *http.Request)
 	defer client.Close()
 	client.SetReadLimit(g.config.MaxRequestBytes)
 	upstream.SetReadLimit(g.config.MaxRequestBytes)
-	proxyRealtimeWebSocket(client, upstream, g, key.ID, routes[0].Binding.ModelID)
+	proxyRealtimeWebSocket(client, upstream, g, key.ID, routes[0].Binding.ModelID, uuid.Nil)
 }
 
 func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -641,9 +719,9 @@ func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request
 	}
 	defer upstream.Close()
 	upstream.SetReadLimit(g.config.MaxRequestBytes)
-	wsCorrelation := extractCallCorrelationFromJSON(firstMessage)
 	wsPrompt, wsPromptSource := extractPromptFromJSON(firstMessage)
-	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, routes[0].Binding.ModelID, requestIDFromContext(r), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, toUsageCorrelation(wsCorrelation))
+	wsPrompt, usageCorrelation := turnCorrelation(wsPrompt, extractCallCorrelationFromJSON(firstMessage), uuid.Nil)
+	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, routes[0].Binding.ModelID, requestIDFromContext(r), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, usageCorrelation)
 	if reserveErr != nil {
 		_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "rate_limit_error", "code": "quota_exceeded", "message": "The API key or project credit quota is exhausted."}})
 		return
@@ -654,7 +732,7 @@ func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request
 	}
 	_ = g.usage.MarkSent(r.Context(), reservation.CallID)
 	_ = g.usage.Finalize(r.Context(), reservation, true, "succeeded", "", "", &routes[0].Provider.ID, routes[0].Provider.Name, usage.CallMetrics{})
-	proxyResponsesWebSockets(client, upstream, upstreamModel, g, key.ID, routes[0].Binding.ModelID)
+	proxyResponsesWebSockets(client, upstream, upstreamModel, g, key.ID, routes[0].Binding.ModelID, reservation.TurnID)
 }
 
 func (g *Gateway) validWebSocketOrigin(request *http.Request) bool {
@@ -711,8 +789,9 @@ func rewriteResponsesWebSocketModel(message []byte, upstreamModel string) ([]byt
 	return json.Marshal(payload)
 }
 
-func proxyResponsesWebSockets(client, upstream *websocket.Conn, upstreamModel string, gateway *Gateway, keyID, modelID uuid.UUID) {
+func proxyResponsesWebSockets(client, upstream *websocket.Conn, upstreamModel string, gateway *Gateway, keyID, modelID, sessionTurnID uuid.UUID) {
 	errs := make(chan error, 2)
+	activeTurnID := sessionTurnID
 	go func() {
 		for {
 			messageType, data, err := client.ReadMessage()
@@ -725,9 +804,12 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, upstreamModel st
 					Type string `json:"type"`
 				}
 				if json.Unmarshal(data, &envelope) == nil && envelope.Type == "response.create" {
-					wsCorrelation := extractCallCorrelationFromJSON(data)
 					wsPrompt, wsPromptSource := extractPromptFromJSON(data)
-					reservation, reserveErr := gateway.usage.Reserve(context.Background(), keyID, modelID, uuid.Must(uuid.NewV7()).String(), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, toUsageCorrelation(wsCorrelation))
+					wsPrompt, usageCorrelation := turnCorrelation(wsPrompt, extractCallCorrelationFromJSON(data), activeTurnID)
+					reservation, reserveErr := gateway.usage.Reserve(context.Background(), keyID, modelID, uuid.Must(uuid.NewV7()).String(), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, usageCorrelation)
+					if reserveErr == nil {
+						activeTurnID = reservation.TurnID
+					}
 					if reserveErr != nil {
 						_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "rate_limit_error", "code": "quota_exceeded", "message": "The API key or project credit quota is exhausted."}})
 						continue
@@ -769,8 +851,9 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, upstreamModel st
 	<-errs
 }
 
-func proxyRealtimeWebSocket(client, upstream *websocket.Conn, gateway *Gateway, keyID, modelID uuid.UUID) {
+func proxyRealtimeWebSocket(client, upstream *websocket.Conn, gateway *Gateway, keyID, modelID, sessionTurnID uuid.UUID) {
 	errs := make(chan error, 2)
+	activeTurnID := sessionTurnID
 	go func() {
 		for {
 			messageType, data, err := client.ReadMessage()
@@ -783,9 +866,12 @@ func proxyRealtimeWebSocket(client, upstream *websocket.Conn, gateway *Gateway, 
 					Type string `json:"type"`
 				}
 				if json.Unmarshal(data, &event) == nil && event.Type == "response.create" {
-					wsCorrelation := extractCallCorrelationFromJSON(data)
 					wsPrompt, wsPromptSource := extractPromptFromJSON(data)
-					reservation, reserveErr := gateway.usage.Reserve(context.Background(), keyID, modelID, uuid.Must(uuid.NewV7()).String(), string(modelbinding.AdapterOpenaiRealtime), "/v1/realtime", wsPrompt, wsPromptSource, toUsageCorrelation(wsCorrelation))
+					wsPrompt, usageCorrelation := turnCorrelation(wsPrompt, extractCallCorrelationFromJSON(data), activeTurnID)
+					reservation, reserveErr := gateway.usage.Reserve(context.Background(), keyID, modelID, uuid.Must(uuid.NewV7()).String(), string(modelbinding.AdapterOpenaiRealtime), "/v1/realtime", wsPrompt, wsPromptSource, usageCorrelation)
+					if reserveErr == nil {
+						activeTurnID = reservation.TurnID
+					}
 					if reserveErr != nil {
 						_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "rate_limit_error", "code": "quota_exceeded", "message": "The API key or project credit quota is exhausted."}})
 						continue
@@ -876,6 +962,8 @@ func supportedRoute(method, requestPath string) bool {
 	case method == http.MethodGet && requestPath == "/v1/realtime":
 		return true
 	case method == http.MethodGet && requestPath == "/v1/models":
+		return true
+	case method == http.MethodGet && requestPath == "/v1/codex/model_catalog":
 		return true
 	case method == http.MethodPost && requestPath == "/v1/chat/completions":
 		return true
@@ -1089,7 +1177,7 @@ func upstreamPath(requestPath, upstreamModel string, adapter modelbinding.Adapte
 	}
 }
 
-func rewriteUpstreamBody(contentType string, replay *replayBody, upstreamModel string, adapter modelbinding.Adapter) (
+func rewriteUpstreamBody(contentType string, replay *replayBody, upstreamModel string, adapter modelbinding.Adapter, baseURL string) (
 	io.ReadCloser,
 	string,
 	int64,
@@ -1103,7 +1191,11 @@ func rewriteUpstreamBody(contentType string, replay *replayBody, upstreamModel s
 				return rewriteRealtimeBody(contentType, replay, upstreamModel)
 			}
 		}
-		return rewriteRequestBody(contentType, replay, upstreamModel)
+		var adjust func(map[string]json.RawMessage) error
+		if adapter == modelbinding.AdapterAnthropic && deepseekHost(baseURL) {
+			adjust = repairDeepSeekAnthropicThinking
+		}
+		return rewriteRequestBodyAdjusted(contentType, replay, upstreamModel, adjust)
 	}
 	if replay == nil {
 		return nil, contentType, 0, func() {}, nil
@@ -1400,6 +1492,9 @@ func allTextFromJSONValue(value any) string {
 			}
 			return ""
 		}
+		if typeName == "tool_result" || typeName == "tool_use" || typeName == "thinking" {
+			return ""
+		}
 		if typeName != "" && typeName != "text" && typeName != "input_text" {
 			return ""
 		}
@@ -1439,6 +1534,16 @@ func rewriteRequestBody(contentType string, replay *replayBody, upstreamModel st
 	func(),
 	error,
 ) {
+	return rewriteRequestBodyAdjusted(contentType, replay, upstreamModel, nil)
+}
+
+func rewriteRequestBodyAdjusted(contentType string, replay *replayBody, upstreamModel string, adjust func(map[string]json.RawMessage) error) (
+	io.ReadCloser,
+	string,
+	int64,
+	func(),
+	error,
+) {
 	if replay == nil {
 		return nil, contentType, 0, func() {}, nil
 	}
@@ -1461,6 +1566,11 @@ func rewriteRequestBody(contentType string, replay *replayBody, upstreamModel st
 			return nil, "", 0, func() {}, err
 		}
 		payload["model"] = modelValue
+		if adjust != nil {
+			if err := adjust(payload); err != nil {
+				return nil, "", 0, func() {}, err
+			}
+		}
 		body, err := json.Marshal(payload)
 		if err != nil {
 			return nil, "", 0, func() {}, err

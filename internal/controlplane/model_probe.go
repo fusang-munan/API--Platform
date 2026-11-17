@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 )
@@ -335,7 +336,19 @@ func (s *Service) ProbeModel(ctx context.Context, input ProbeInput) (ProbeRespon
 		if err != nil || len(credentials) == 0 {
 			return ProbeResponse{}, domain.NewError(domain.CodeValidation, "provider has no active credentials")
 		}
-		credential, err = s.security.DecryptCredential(credentials[0].CredentialCiphertext)
+		var picked *ent.ProviderCredential
+		if credentialID, found, findErr := catalog.FindActiveCatalogCredential(ctx, s.db, *input.ProviderID, model, uuid.Nil); findErr == nil && found && credentialID != nil {
+			for _, row := range credentials {
+				if row.ID == *credentialID {
+					picked = row
+					break
+				}
+			}
+		}
+		if picked == nil {
+			picked = catalog.PickCredentialForUpstreamModel(credentials, model, baseURL)
+		}
+		credential, err = s.security.DecryptCredential(picked.CredentialCiphertext)
 		if err != nil {
 			return ProbeResponse{}, domain.WrapError(domain.CodeDependencyUnavailable, "decrypt provider credential", err)
 		}
@@ -370,7 +383,11 @@ func (s *Service) ProbeModel(ctx context.Context, input ProbeInput) (ProbeRespon
 	}
 	for _, probe := range definitions {
 		endpoint, definition := probe.endpoint, probe.definition
-		target, err := probeTarget(baseURL, definition.Path)
+		probeBase := baseURL
+		if definition.Anthropic {
+			probeBase = catalog.AnthropicUpstreamBase(baseURL)
+		}
+		target, err := probeTarget(probeBase, definition.Path)
 		if err != nil {
 			return ProbeResponse{}, domain.NewError(domain.CodeValidation, "invalid probe target")
 		}

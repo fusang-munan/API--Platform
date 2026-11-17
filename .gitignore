@@ -5,6 +5,7 @@
 coverage.out
 bin/
 tmp/
+lab-tls/
 .idea/
 .vscode/
 frontend/node_modules/

@@ -323,16 +323,8 @@ func (s *Service) ReviewMentorApplication(
 		if application.Edges.Project == nil {
 			return domain.NewError(domain.CodeNotFound, "project not found")
 		}
-		projectMember, err := tx.ProjectMember.Query().Where(
-			projectmember.ProjectIDEQ(application.ProjectID),
-			projectmember.UserIDEQ(application.MentorID),
-		).Exist(ctx)
-		if err != nil {
-			return domain.WrapError(domain.CodeDependencyUnavailable, "query mentor project membership", err)
-		}
-		if projectMember {
-			return domain.NewError(domain.CodeMentorAlreadyProjectMember, "mentor already belongs to the project")
-		}
+		// Already a member means the teacher assigned them directly. Approving
+		// still closes the pending application instead of leaving it under review.
 		if err := ensureOrganizationMember(ctx, tx, application.Edges.Project.OrganizationID, application.MentorID); err != nil {
 			return err
 		}
@@ -1041,6 +1033,11 @@ func (s *Service) CreateBinding(ctx context.Context, publicModelID string, input
 			if saveErr != nil {
 				return BindingView{}, domain.WrapError(domain.CodeDependencyUnavailable, "update model binding", saveErr)
 			}
+			if modelbinding.Status(input.Status) == modelbinding.StatusActive {
+				if err := catalog.EnforceSingleActiveBinding(ctx, s.db, modelRow.ID, adapter, row.ID); err != nil {
+					return BindingView{}, domain.WrapError(domain.CodeDependencyUnavailable, "enforce single active binding", err)
+				}
+			}
 			if primary == nil {
 				primary = row
 			}
@@ -1065,6 +1062,11 @@ func (s *Service) CreateBinding(ctx context.Context, publicModelID string, input
 		}
 		if saveErr != nil {
 			return BindingView{}, domain.WrapError(domain.CodeDependencyUnavailable, "create model binding", saveErr)
+		}
+		if modelbinding.Status(input.Status) == modelbinding.StatusActive {
+			if err := catalog.EnforceSingleActiveBinding(ctx, s.db, modelRow.ID, adapter, row.ID); err != nil {
+				return BindingView{}, domain.WrapError(domain.CodeDependencyUnavailable, "enforce single active binding", err)
+			}
 		}
 		if primary == nil {
 			primary = row
@@ -1204,6 +1206,11 @@ func (s *Service) UpdateBinding(ctx context.Context, bindingID uuid.UUID, input 
 	if err != nil {
 		return BindingView{}, domain.WrapError(domain.CodeDependencyUnavailable, "update model binding", err)
 	}
+	if row.Status == modelbinding.StatusActive {
+		if err := catalog.EnforceSingleActiveBinding(ctx, tx.Client(), current.ModelID, row.Adapter, row.ID); err != nil {
+			return BindingView{}, domain.WrapError(domain.CodeDependencyUnavailable, "enforce single active binding", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return BindingView{}, domain.WrapError(domain.CodeDependencyUnavailable, "commit binding update", err)
 	}
@@ -1333,7 +1340,7 @@ func (s *Service) bindingView(ctx context.Context, row *ent.ModelBinding) Bindin
 	}
 	view := BindingView{
 		ID: row.ID.String(), ModelID: publicModelID, ProviderID: row.ProviderID.String(),
-		CredentialID: credentialIDString(row.CredentialID),
+		CredentialID:      credentialIDString(row.CredentialID),
 		UpstreamModelName: row.UpstreamModelName, Adapter: string(row.Adapter),
 		Priority: row.Priority, Status: string(row.Status),
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,

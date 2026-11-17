@@ -136,6 +136,7 @@ onMounted(() => {
             <tr>
               <th>#</th>
               <th>时间</th>
+              <th>模型</th>
               <th>路径</th>
               <th>Token</th>
               <th>credits</th>
@@ -146,6 +147,7 @@ onMounted(() => {
             <tr v-for="call in selected.calls || []" :key="call.id">
               <td>{{ call.call_index || '—' }}</td>
               <td>{{ new Date(call.created_at).toLocaleString() }}</td>
+              <td>{{ call.model_name || '—' }}</td>
               <td>{{ call.path }}</td>
               <td>{{ formatTokens(call.total_tokens ?? 0) }}</td>
               <td>{{ call.credits }}</td>

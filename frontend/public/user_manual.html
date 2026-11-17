@@ -153,7 +153,7 @@
       <a href="#auth">一、统一登录 / 注册</a>
       <a class="sub" href="#auth-login">登录控制台</a>
       <a class="sub" href="#auth-register">注册学生 / 导师</a>
-      <a class="sub" href="#auth-teacher">老师激活与找回密码</a>
+      <a class="sub" href="#auth-recovery">找回密码</a>
       <a href="#keys">二、密钥申请流程</a>
       <a class="sub" href="#key-student">学生提交申请</a>
       <a class="sub" href="#key-mentor">导师初审</a>
@@ -183,7 +183,7 @@
 
       <section class="section" id="auth">
         <h2><span class="section-number">一、</span>统一登录 / 注册</h2>
-        <p>Nebula 使用同一个登录页面识别三种角色。学生和导师可以公开注册；老师账号由系统初始化或由已有老师邀请后激活。</p>
+        <p>Nebula 使用同一个登录页面识别三种角色。学生可以公开注册；老师账号由系统初始化。</p>
 
         <h3 id="auth-login">1. 登录控制台</h3>
         <div class="step"><span class="step-no">1</span><div class="step-body"><h4>填写邮箱和密码</h4><p>在“邮箱”输入注册邮箱，在“密码”输入当前密码。邮箱格式由浏览器校验，密码不会在页面上明文显示。</p></div></div>
@@ -215,13 +215,7 @@
           <div>点击“注册”，看到成功提示后使用新账号登录。</div>
         </div>
 
-        <h3 id="auth-teacher">3. 老师激活账号</h3>
-        <p>老师不能在公开注册页自行创建。已有老师在“组织管理”点击“邀请老师”，填写对方邮箱后发送邀请。被邀请人打开邀请链接进入“激活老师账号”。</p>
-        <div class="step"><span class="step-no">1</span><div class="step-body"><h4>确认邀请 Token</h4><p>如果邀请链接已带 Token，页面会自动使用它；如果没有，填写“邀请 Token”。邀请无效或已过期时，需让邀请方重新发送。</p></div></div>
-        <div class="step"><span class="step-no">2</span><div class="step-body"><h4>填写姓名、设置密码、确认密码</h4><p>密码同样要求 12–128 个字符且两次一致。</p></div></div>
-        <div class="step"><span class="step-no">3</span><div class="step-body"><h4>点击“完成激活”</h4><p>成功后返回登录页。按钮在激活请求期间显示“激活中…”，不要重复点击。</p></div></div>
-
-        <h3>4. 找回密码</h3>
+        <h3 id="auth-recovery">3. 找回密码</h3>
         <p>登录页点击“忘记密码”，流程分两步：</p>
         <ol><li>第一步填写“注册邮箱”，点击“发送重置验证码”。</li><li>第二步确认邮箱，填写“验证码”“新密码”“确认新密码”，点击“重置密码”。成功后返回登录页。</li></ol>
         <div class="callout danger"><strong>安全提示</strong><p>不要向任何人提供密码、验证码、JWT、refresh token 或完整 API Key。系统不会在页面上显示这些敏感值，也不会通过 URL 查询参数传递它们。</p></div>
@@ -232,7 +226,6 @@
           <tr><td>提示邮箱已注册</td><td>不要重复注册。回到登录页直接登录；忘记密码则使用“忘记密码”。</td></tr>
           <tr><td>提示验证码错误或过期</td><td>使用最近一次邮件中的验证码；重新发送后只使用新验证码。连续失败过多可能暂时锁定。</td></tr>
           <tr><td>提示邮箱或密码不正确</td><td>确认登录角色无需手动选择，系统按账号识别角色；检查输入后仍失败就走找回密码。</td></tr>
-          <tr><td>老师邀请链接打不开或激活失败</td><td>确认 Token 完整、没有过期；让现有老师在“组织管理”重新发送邀请。</td></tr>
         </tbody></table></div>
       </section>
 
@@ -304,7 +297,6 @@
           <li><span class="screen-label">添加组织</span>：填写名称、说明和状态后保存。名称在平台中必须唯一。</li>
           <li><span class="screen-label">编辑</span>：修改组织名称、说明或状态。</li>
           <li><span class="screen-label">分配导师</span>：在弹窗中用“搜索姓名或邮箱”查找 ACTIVE 导师，点击“搜索”，对候选点击“分配”。已加入的候选会显示“已加入”并禁用按钮；需要更多结果时点击“加载更多”。</li>
-          <li><span class="screen-label">邀请老师</span>：填写老师邮箱并点击“发送邀请”。这只负责创建邀请，不会自动激活对方账号。</li>
           <li><span class="screen-label">停用 / 启用</span>：停用组织会阻止新的学生申请，但不删除历史成员和记录；停用前页面会要求确认。</li>
         </ul>
         <h4>3.2 项目管理：建立学生可申请的项目</h4>

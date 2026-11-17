@@ -3,7 +3,6 @@ import { useAuthStore } from '../store/auth'
 import Login from '../views/auth/Login.vue'
 import Register from '../views/auth/Register.vue'
 import Recovery from '../views/auth/Recovery.vue'
-import TeacherActivation from '../views/auth/TeacherActivation.vue'
 import StudentKeys from '../views/student/StudentKeys.vue'
 import StudentModels from '../views/student/StudentModels.vue'
 import StudentUsage from '../views/student/StudentUsage.vue'
@@ -22,7 +21,6 @@ export const routes: RouteRecordRaw[] = [
   { path: '/login', component: Login, meta: { public: true } },
   { path: '/register', component: Register, meta: { public: true } },
   { path: '/recovery', component: Recovery, meta: { public: true } },
-  { path: '/teacher/activate', component: TeacherActivation, meta: { public: true } },
   { path: '/', component: AppLayout, children: [
     { path: '', component: { template: '<div />' } },
     { path: 'student/api-keys', name: 'student-api-keys', component: StudentKeys, meta: { role: 'student', title: '申请密钥' } },

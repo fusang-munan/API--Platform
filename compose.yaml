@@ -33,6 +33,8 @@ x-application-environment: &application-environment
   TEST_MENTOR_3_NAME:
   TEST_MENTOR_3_EMAIL:
   TEST_MENTOR_3_PASSWORD:
+  SMTP_MODE:
+  EXPOSE_VERIFICATION_CODE_IN_RESPONSE:
   SMTP_HOST:
   SMTP_PORT:
   SMTP_USER:

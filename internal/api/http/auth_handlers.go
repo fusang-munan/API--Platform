@@ -20,11 +20,16 @@ func (s *Server) sendVerificationCode(c *gin.Context) {
 	if !bindJSON(c, &input) {
 		return
 	}
-	if err := s.service.SendRegistrationCode(c.Request.Context(), input.Email, input.Purpose); err != nil {
+	devCode, err := s.service.SendRegistrationCode(c.Request.Context(), input.Email, input.Purpose)
+	if err != nil {
 		writeError(c, err)
 		return
 	}
-	respond(c, http.StatusAccepted, gin.H{"sent": true})
+	payload := gin.H{"sent": true}
+	if devCode != "" {
+		payload["verification_code"] = devCode
+	}
+	respond(c, http.StatusAccepted, payload)
 }
 
 func (s *Server) register(role string) gin.HandlerFunc {

@@ -219,7 +219,12 @@ SELECT $1,k.id,k.project_id,$2,0,true,0,0,$3,$3 FROM api_keys k WHERE k.id=$4 ON
 	if r.MultiplierMilli > 0 && projectCharged+projectPending >= projectQuota {
 		return Reservation{}, &QuotaError{Code: "project_quota_exceeded", Name: r.ProjectName, EndsAt: ends}
 	}
-	turnID, callIndex, createTurn, err := resolveTurn(ctx, tx, keyID, correlation, prompt)
+	correlation.ModelID = modelID
+	storedPrompt := prompt
+	if !DefinesUserTurn(prompt) {
+		storedPrompt = ""
+	}
+	turnID, callIndex, createTurn, err := resolveTurn(ctx, tx, keyID, correlation, storedPrompt)
 	if err != nil {
 		return Reservation{}, err
 	}
@@ -228,13 +233,12 @@ SELECT $1,k.id,k.project_id,$2,0,true,0,0,$3,$3 FROM api_keys k WHERE k.id=$4 ON
 	taskKey := sql.NullString{String: strings.TrimSpace(correlation.TaskKey), Valid: strings.TrimSpace(correlation.TaskKey) != ""}
 	previousResponseID := sql.NullString{String: strings.TrimSpace(correlation.PreviousResponseID), Valid: strings.TrimSpace(correlation.PreviousResponseID) != ""}
 	if createTurn {
-		rootPrompt := prompt
 		if _, err = tx.ExecContext(ctx, `INSERT INTO gateway_call_turns(id,project_id,user_id,api_key_id,model_id,task_key,project_name,user_name,api_key_name,model_name,root_prompt,root_prompt_bytes,call_count,credit_milli,outcome,started_at,created_at,updated_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,'pending',$13,$13,$13)`, turnID, r.ProjectID, r.UserID, r.APIKeyID, r.ModelID, taskKey, r.ProjectName, r.UserName, r.APIKeyName, r.ModelName, rootPrompt, len([]byte(rootPrompt)), now); err != nil {
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,'pending',$13,$13,$13)`, turnID, r.ProjectID, r.UserID, r.APIKeyID, r.ModelID, taskKey, r.ProjectName, r.UserName, r.APIKeyName, r.ModelName, storedPrompt, len([]byte(storedPrompt)), now); err != nil {
 			return Reservation{}, err
 		}
-	} else if prompt != "" {
-		if _, err = tx.ExecContext(ctx, `UPDATE gateway_call_turns SET root_prompt=$1,root_prompt_bytes=$2,updated_at=$3 WHERE id=$4 AND root_prompt=''`, prompt, len([]byte(prompt)), now, turnID); err != nil {
+	} else if storedPrompt != "" {
+		if _, err = tx.ExecContext(ctx, `UPDATE gateway_call_turns SET root_prompt=$1,root_prompt_bytes=$2,updated_at=$3 WHERE id=$4 AND root_prompt=''`, storedPrompt, len([]byte(storedPrompt)), now, turnID); err != nil {
 			return Reservation{}, err
 		}
 	}
@@ -243,8 +247,8 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16,'pending','pen
 	if err != nil {
 		return Reservation{}, err
 	}
-	if prompt != "" {
-		_, err = tx.ExecContext(ctx, `INSERT INTO monitored_inputs(id,call_id,project_id,user_id,source,content,content_bytes,visible,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,false,$8)`, uuid.Must(uuid.NewV7()), r.CallID, r.ProjectID, r.UserID, promptSource, prompt, len([]byte(prompt)), now)
+	if storedPrompt != "" {
+		_, err = tx.ExecContext(ctx, `INSERT INTO monitored_inputs(id,call_id,project_id,user_id,source,content,content_bytes,visible,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,false,$8)`, uuid.Must(uuid.NewV7()), r.CallID, r.ProjectID, r.UserID, promptSource, storedPrompt, len([]byte(storedPrompt)), now)
 		if err != nil {
 			return Reservation{}, err
 		}
@@ -610,7 +614,7 @@ func (s *Store) Finalize(ctx context.Context, r Reservation, success bool, outco
 	if metrics.TotalTokens > 0 {
 		totalTokens = sql.NullInt64{Int64: int64(metrics.TotalTokens), Valid: true}
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE gateway_calls SET billing_state=$1,outcome=$2,error_category=NULLIF($3,''),error_message=NULLIF($4,''),provider_id=$5,provider_name=NULLIF($6,''),finalized_at=now(),lease_expires_at=NULL,upstream_response_id=COALESCE($8,upstream_response_id),prompt_tokens=COALESCE($9,prompt_tokens),completion_tokens=COALESCE($10,completion_tokens),total_tokens=COALESCE($11,total_tokens) WHERE id=$7 AND billing_state='pending'`, state, outcome, category, sanitize(message), providerID, providerName, r.CallID, upstreamResponseID, promptTokens, completionTokens, totalTokens)
+	result, err := tx.ExecContext(ctx, `UPDATE gateway_calls SET billing_state=$1,outcome=$2,error_category=NULLIF($3,''),error_message=NULLIF($4,''),provider_id=$5,provider_name=NULLIF($6,''),finalized_at=now(),lease_expires_at=NULL,upstream_response_id=COALESCE($8,upstream_response_id),prompt_tokens=COALESCE($9,prompt_tokens),completion_tokens=COALESCE($10,completion_tokens),total_tokens=COALESCE($11,total_tokens),reply_closed=COALESCE($12,reply_closed) WHERE id=$7 AND billing_state='pending'`, state, outcome, category, sanitize(message), providerID, providerName, r.CallID, upstreamResponseID, promptTokens, completionTokens, totalTokens, nullBool(metrics.ReplyClosed))
 	if err != nil {
 		return err
 	}
@@ -670,7 +674,7 @@ func (s *Store) Finalize(ctx context.Context, r Reservation, success bool, outco
 }
 
 func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metrics CallMetrics) error {
-	if !metrics.HasTokens() && strings.TrimSpace(metrics.UpstreamResponseID) == "" {
+	if !metrics.HasTokens() && strings.TrimSpace(metrics.UpstreamResponseID) == "" && metrics.ReplyClosed == nil {
 		return nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -697,7 +701,7 @@ func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metri
 	if err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET upstream_response_id=COALESCE($2,upstream_response_id),prompt_tokens=COALESCE($3,prompt_tokens),completion_tokens=COALESCE($4,completion_tokens),total_tokens=COALESCE($5,total_tokens) WHERE id=$1`, callID, upstreamResponseID, promptTokens, completionTokens, totalTokens); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET upstream_response_id=COALESCE($2,upstream_response_id),prompt_tokens=COALESCE($3,prompt_tokens),completion_tokens=COALESCE($4,completion_tokens),total_tokens=COALESCE($5,total_tokens),reply_closed=COALESCE($6,reply_closed) WHERE id=$1`, callID, upstreamResponseID, promptTokens, completionTokens, totalTokens, nullBool(metrics.ReplyClosed)); err != nil {
 		return err
 	}
 	if err = applyTurnTokenMetrics(ctx, tx, turnID, metrics); err != nil {
@@ -705,6 +709,13 @@ func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metri
 	}
 	return tx.Commit()
 }
+func nullBool(value *bool) sql.NullBool {
+	if value == nil {
+		return sql.NullBool{}
+	}
+	return sql.NullBool{Bool: *value, Valid: true}
+}
+
 func boolInt(v bool) int {
 	if v {
 		return 1
@@ -841,11 +852,11 @@ type MemberUsage struct {
 	FreeModels []UsageSlice     `json:"free_models"`
 }
 type KeyMemberUsage struct {
-	ID         string       `json:"id"`
-	Name       string       `json:"name"`
-	Status     string       `json:"status"`
-	Used       string       `json:"used"`
-	Models     []UsageSlice `json:"models"`
+	ID     string       `json:"id"`
+	Name   string       `json:"name"`
+	Status string       `json:"status"`
+	Used   string       `json:"used"`
+	Models []UsageSlice `json:"models"`
 }
 
 func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month time.Time) (ProjectUsage, error) {

@@ -1,2 +1,32 @@
-<script setup lang="ts">import { KeyRound, Route, ShieldCheck, SlidersHorizontal } from 'lucide-vue-next';</script>
-<template><main class="auth-shell"><aside class="auth-brand"><div class="brand-lockup auth-reveal auth-reveal-1"><span class="nebula-mark">N</span><span>Nebula</span></div><div class="auth-reveal auth-reveal-2"><p class="eyebrow">AI ACCESS, GOVERNED</p><h1>让模型能力在清晰的审批边界内流动。</h1><p>面向学生、导师与老师的安全 AI API 中转站。</p></div><ul class="auth-reveal auth-reveal-3"><li><SlidersHorizontal :size="19"/><span><strong>模型白名单</strong><small>按项目精确选择可用模型</small></span></li><li><ShieldCheck :size="19"/><span><strong>双级审批</strong><small>导师初审与老师终审</small></span></li><li><KeyRound :size="19"/><span><strong>平台 API Key</strong><small>领取后随时查看与复制</small></span></li><li><Route :size="19"/><span><strong>标准模型网关</strong><small>OpenAI 与 Anthropic 原生协议</small></span></li></ul></aside><section class="auth-form-area"><nav class="auth-tools" aria-label="配置文档"><a class="auth-tool" href="/codex-guide.html">codex及claudecode配置</a><a class="auth-tool" href="/cc-switch-guide.html">cc-switch配置</a></nav><div class="mobile-brand"><span class="nebula-mark">N</span>Nebula</div><div class="auth-form-reveal"><slot/></div></section></main></template>
+<script setup lang="ts">
+import BrandLogo from './BrandLogo.vue'
+</script>
+<template>
+  <main class="auth-shell">
+    <aside class="auth-brand">
+      <div class="brand-lockup auth-reveal auth-reveal-1">
+        <BrandLogo />
+      </div>
+      <div class="auth-reveal auth-reveal-2">
+        <p class="eyebrow">AI ACCESS, GOVERNED</p>
+        <h1>让模型能力<br>在清晰的边界内流动。</h1>
+        <p>安全、可控、可审计的 AI API 中转站。</p>
+      </div>
+      <ul class="auth-reveal auth-reveal-3">
+        <li>模型白名单</li>
+        <li>双级审批</li>
+        <li>标准协议网关</li>
+      </ul>
+    </aside>
+    <section class="auth-form-area">
+      <nav class="auth-tools" aria-label="配置文档">
+        <a class="auth-tool" href="/codex-guide.html">codex及claudecode配置</a>
+        <a class="auth-tool" href="/cc-switch-guide.html">cc-switch配置</a>
+      </nav>
+      <div class="mobile-brand">
+        <BrandLogo />
+      </div>
+      <div class="auth-form-reveal"><slot /></div>
+    </section>
+  </main>
+</template>

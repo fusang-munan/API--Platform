@@ -65,6 +65,64 @@ func TestJoinUpstreamURL(t *testing.T) {
 	}
 }
 
+func TestDeepSeekAnthropicUpstreamUsesOfficialPrefix(t *testing.T) {
+	t.Parallel()
+	replay, err := captureBody(io.NopCloser(strings.NewReader(`{"model":"deepseek-flash","max_tokens":1,"messages":[{"role":"user","content":"OK"}]}`)), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replay.Close()
+	original := httptest.NewRequest(http.MethodPost, "https://nebula.example/v1/messages", nil)
+	original.Header.Set("Content-Type", "application/json")
+	original.Header.Set("x-api-key", "nebula-key")
+	original.Header.Set("anthropic-version", "2023-06-01")
+	request, cleanup, err := (&Gateway{}).upstreamRequest(original, replay, route{
+		Binding:  &ent.ModelBinding{UpstreamModelName: "deepseek-flash", Adapter: modelbinding.AdapterAnthropic},
+		Provider: &ent.Provider{BaseURL: "https://api.deepseek.com"}, Credential: "provider-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if request.URL.String() != "https://api.deepseek.com/anthropic/v1/messages" {
+		t.Fatalf("unexpected upstream URL %q", request.URL.String())
+	}
+	if request.Header.Get("x-api-key") != "provider-key" {
+		t.Fatalf("upstream key was not applied")
+	}
+	if request.Header.Get("Accept-Encoding") != "identity" {
+		t.Fatalf("upstream Accept-Encoding = %q", request.Header.Get("Accept-Encoding"))
+	}
+}
+
+func TestUpstreamRequestDisablesResponseCompression(t *testing.T) {
+	t.Parallel()
+	replay, err := captureBody(io.NopCloser(strings.NewReader(`{"model":"deepseek-flash","stream":true,"messages":[{"role":"user","content":"OK"}]}`)), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replay.Close()
+	original := httptest.NewRequest(http.MethodPost, "https://nebula.example/v1/chat/completions", nil)
+	original.Header.Set("Content-Type", "application/json")
+	original.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	original.Header.Set("Authorization", "Bearer nebula-key")
+	request, cleanup, err := (&Gateway{}).upstreamRequest(original, replay, route{
+		Binding:    &ent.ModelBinding{UpstreamModelName: "deepseek-flash", Adapter: modelbinding.AdapterOpenaiCompatible},
+		Provider:   &ent.Provider{BaseURL: "https://api.deepseek.com"},
+		Credential: "provider-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if request.Header.Get("Accept-Encoding") != "identity" {
+		t.Fatalf("client compression was forwarded: %q", request.Header.Get("Accept-Encoding"))
+	}
+	if request.Header.Get("Authorization") != "Bearer provider-key" {
+		t.Fatalf("provider credential was not applied")
+	}
+}
+
 func TestAdapterForPath(t *testing.T) {
 	t.Parallel()
 	tests := map[string]string{
@@ -188,7 +246,7 @@ func TestRewriteGeminiBatchModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replay.Close()
-	body, _, _, cleanup, err := rewriteUpstreamBody("application/json", replay, "gemini-embedding-001", "google_gemini_v1beta")
+	body, _, _, cleanup, err := rewriteUpstreamBody("application/json", replay, "gemini-embedding-001", "google_gemini_v1beta", "https://generativelanguage.googleapis.com")
 	if err != nil {
 		t.Fatal(err)
 	}

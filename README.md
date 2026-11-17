@@ -6,6 +6,8 @@ Nebula 是使用 Go 重构的现代 AI API 中转站。首期围绕学生、导�
 
 ## 首期能力
 
+- 登录入口采用「星轨夜」紫色星空视觉，包含纯 CSS 动态星球、环绕光点、响应式登录卡片、配置文档入口与减少动态效果适配；独立 `LoginShell.vue` 与 `LoginPlanet.vue` 仅用于登录页。品牌采用图像生成工具制作的紫色几何 N 字标 Logo，原图为 `nebula-n-generated.png`，登录、其他认证页、加载页、控制台及浏览器图标均从同一原图导出；页面使用 128px PNG，浏览器提供 32/192px PNG 与 180px Apple 图标。生成提示词记录于 `docs/reports/login-night/brand-generation.md`。
+
 - 学生和导师邮箱验证码注册，三种角色统一登录，JWT access token 与 Redis refresh token 轮换。
 - 页面刷新时通过 HttpOnly refresh Cookie 恢复内存 access token；启动阶段的 refresh 使用 single-flight，避免并发轮换导致会话被误判为重用。
 - 老师 bootstrap、邀请与邀请激活；可从运行时 Secret 幂等初始化固定的学生/导师测试账号。

@@ -49,9 +49,37 @@ func NewManager(jwtKey, authPepper, apiKeyPepper, encryptionKey []byte, accessTT
 	}, nil
 }
 
+const (
+	passwordMinLength = 8
+	passwordMaxLength = 128
+)
+
+func ValidatePassword(password string) error {
+	if len(password) < passwordMinLength {
+		return fmt.Errorf("password must be at least 8 characters and include letters and numbers")
+	}
+	if len(password) > passwordMaxLength {
+		return fmt.Errorf("password must be at most 128 characters")
+	}
+	var hasLetter, hasDigit bool
+	for i := 0; i < len(password); i++ {
+		r := password[i]
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+			hasLetter = true
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		}
+	}
+	if !hasLetter || !hasDigit {
+		return fmt.Errorf("password must be at least 8 characters and include letters and numbers")
+	}
+	return nil
+}
+
 func HashPassword(password string) (string, error) {
-	if len(password) < 12 || len(password) > 128 {
-		return "", fmt.Errorf("password must contain 12 to 128 characters")
+	if err := ValidatePassword(password); err != nil {
+		return "", err
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {

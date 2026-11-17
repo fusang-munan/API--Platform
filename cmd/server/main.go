@@ -64,12 +64,23 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	mailer, err := mail.NewSMTP(
-		cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUser, cfg.SMTPPass,
-		cfg.SMTPFrom, cfg.SMTPFromName, cfg.SMTPTLSMode, cfg.SMTPTimeout,
-	)
-	if err != nil {
-		return err
+	var mailer mail.Sender
+	switch cfg.SMTPMode {
+	case "log":
+		mailer = mail.NewLogSender()
+		slog.Warn("SMTP_MODE=log: verification emails are written to server logs only")
+		if cfg.ExposeVerificationCodeInResponse {
+			slog.Warn("EXPOSE_VERIFICATION_CODE_IN_RESPONSE=true: registration codes are returned in API responses (demo only)")
+		}
+	default:
+		smtpMailer, err := mail.NewSMTP(
+			cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUser, cfg.SMTPPass,
+			cfg.SMTPFrom, cfg.SMTPFromName, cfg.SMTPTLSMode, cfg.SMTPTimeout,
+		)
+		if err != nil {
+			return err
+		}
+		mailer = smtpMailer
 	}
 	controlService := controlplane.NewService(
 		dbClient, sqlDB, cacheStore, securityManager, mailer,
@@ -78,6 +89,7 @@ func run() error {
 			VerificationTTL: cfg.VerificationTTL, SendCooldown: cfg.SendCooldown,
 			MaxAttempts: cfg.MaxAttempts, Lockout: cfg.Lockout,
 			InvitationTTL: cfg.InvitationTTL, PublicAppURL: cfg.PublicAppURL,
+			ExposeVerificationCodeInResponse: cfg.ExposeVerificationCodeInResponse,
 		},
 	)
 	if err := controlService.BootstrapTeacher(

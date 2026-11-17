@@ -59,6 +59,9 @@ function actionableErrorMessage(code: string, message: string, details?: ApiErro
     if (!Array.isArray(details) && details?.operation === 'api_key_approval' && details.state_changed === false) {
       return `终审未完成，额度和申请状态均未变更。请联系管理员并提供请求编号 ${requestId ?? '（响应未提供）'}`
     }
+    if (message.trim().toLowerCase() === 'send verification email') {
+      return `验证码邮件未能发出：平台尚未配置可用的 SMTP 发信服务。请联系管理员配置 SMTP，或在开发环境将 SMTP_MODE 设为 log 后从服务器日志查看验证码${requestReference(requestId)}`
+    }
     const upstream = message.trim() && message !== 'fetch upstream models' ? message : undefined
     if (upstream) return `${upstream}${requestReference(requestId)}`
     return `${errorMessages.DEPENDENCY_UNAVAILABLE}${requestReference(requestId)}`
@@ -75,7 +78,7 @@ function validationReason(reason: string): string {
   if (unknownField) return `请求包含不支持的字段“${unknownField[1]}”，请刷新页面后重试`
   if (/required/i.test(value)) return '必填项不能为空'
   if (/invalid.*(email|format)|must be a valid email/i.test(value)) return '格式不正确，请按要求填写后重试'
-  if (/password.*(length|between)|at least .*characters/i.test(value)) return '密码长度不符合要求，请使用 12–128 个字符'
+  if (/password must/i.test(value)) return '密码不符合要求'
   if (/invalid.*(code|verification)|verification.*invalid/i.test(value)) return '验证码不正确或已失效，请重新获取验证码'
   if (/unexpected end|unexpected eof|eof/i.test(value)) return '请求内容不完整'
   return value

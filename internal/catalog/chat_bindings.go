@@ -58,9 +58,39 @@ func UsesDualChatBindings(modelID string) bool {
 	return strings.TrimSpace(modelID) != "" && !IsImageGenerationModel(modelID)
 }
 
+// IsOpenAIModelsListable reports models that should appear in GET /v1/models for Codex/CC-switch.
+// Claude-family models are routed via /v1/messages and belong in the Claude Code harness only.
+func IsOpenAIModelsListable(modelID string) bool {
+	return !IsAnthropicFamilyModel(modelID)
+}
+
+// IsAnthropicFamilyModel reports Claude Code model IDs that require /v1/messages routing.
+func IsAnthropicFamilyModel(modelID string) bool {
+	normalized := NormalizeSignal(modelID)
+	if normalized == "" || IsImageGenerationModel(modelID) {
+		return false
+	}
+	if strings.HasPrefix(normalized, "gpt") {
+		return false
+	}
+	for _, token := range []string{"claude", "opus", "sonnet", "haiku"} {
+		if containsToken(normalized, token) {
+			return true
+		}
+	}
+	return false
+}
+
 func DefaultAdaptersForModel(modelID string) []modelbinding.Adapter {
 	if IsImageGenerationModel(modelID) {
 		return []modelbinding.Adapter{modelbinding.AdapterOpenaiImages}
+	}
+	if IsAnthropicFamilyModel(modelID) {
+		return []modelbinding.Adapter{
+			modelbinding.AdapterAnthropic,
+			modelbinding.AdapterOpenaiResponses,
+			modelbinding.AdapterOpenaiCompatible,
+		}
 	}
 	return ChatGatewayAdapterSet()
 }

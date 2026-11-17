@@ -173,7 +173,7 @@ func (p *RouteProbe) ProbeStep(ctx context.Context, upstreamModelID string, endp
 	if client == nil {
 		client = NewRouteProbe(p.BaseURL, p.Credential).Client
 	}
-	target, err := probeTargetURL(p.BaseURL, item.path)
+	target, err := probeTargetURL(probeBaseForRequest(p.BaseURL, item.anthropic), item.path)
 	if err != nil {
 		step.Error = err.Error()
 		return step, nil
@@ -226,7 +226,7 @@ func (p *RouteProbe) Discover(ctx context.Context, upstreamModelID string) ([]mo
 		if err != nil {
 			return nil, err
 		}
-		target, err := probeTargetURL(p.BaseURL, item.path)
+		target, err := probeTargetURL(probeBaseForRequest(p.BaseURL, item.anthropic), item.path)
 		if err != nil {
 			return nil, err
 		}
@@ -261,6 +261,13 @@ func (p *RouteProbe) Discover(ctx context.Context, upstreamModelID string) ([]mo
 
 func probeEndpointSuccess(statusCode int) bool {
 	return statusCode >= 200 && statusCode < 300
+}
+
+func probeBaseForRequest(baseURL string, anthropic bool) string {
+	if anthropic {
+		return AnthropicUpstreamBase(baseURL)
+	}
+	return baseURL
 }
 
 func probeTargetURL(baseURL, requestPath string) (string, error) {

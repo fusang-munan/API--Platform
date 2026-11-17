@@ -8,13 +8,36 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestValidatePassword(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		password string
+		ok       bool
+	}{
+		{"abc12345", true},
+		{"Pass1234", true},
+		{"short1", false},
+		{"allletters", false},
+		{"12345678", false},
+	}
+	for _, tc := range cases {
+		err := ValidatePassword(tc.password)
+		if tc.ok && err != nil {
+			t.Fatalf("expected valid password %q: %v", tc.password, err)
+		}
+		if !tc.ok && err == nil {
+			t.Fatalf("expected invalid password %q", tc.password)
+		}
+	}
+}
+
 func TestPasswordHashAndVerify(t *testing.T) {
 	t.Parallel()
-	hash, err := HashPassword("correct-horse-battery-staple")
+	hash, err := HashPassword("correct1horse")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !VerifyPassword(hash, "correct-horse-battery-staple") {
+	if !VerifyPassword(hash, "correct1horse") {
 		t.Fatal("valid password did not verify")
 	}
 	if VerifyPassword(hash, "wrong-password") {

@@ -1,6 +1,23 @@
 # Local override: use mirrors/images already available on this server.
 # Used by scripts/compose-local.sh only — not for production.
+#
+# proxy-relay: exposes host Clash (127.0.0.1:7890) on docker0 for backend outbound.
+# Override with LOCAL_PROXY_PORT / LOCAL_PROXY_TARGET if your client uses another port.
 services:
+  proxy-relay:
+    image: docker.1ms.run/alpine:3.22
+    network_mode: host
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache socat >/dev/null
+        exec socat "TCP-LISTEN:$${LOCAL_PROXY_RELAY_PORT:-17890},fork,reuseaddr,bind=$${LOCAL_PROXY_BIND:-172.30.10.1}" "TCP:127.0.0.1:$${LOCAL_PROXY_TARGET_PORT:-7890}"
+    environment:
+      LOCAL_PROXY_RELAY_PORT: ${LOCAL_PROXY_RELAY_PORT:-17890}
+      LOCAL_PROXY_BIND: ${LOCAL_PROXY_BIND:-172.30.10.1}
+      LOCAL_PROXY_TARGET_PORT: ${LOCAL_PROXY_TARGET_PORT:-7890}
+    restart: unless-stopped
   postgres:
     image: docker.1ms.run/postgres:17.5
   redis:
@@ -8,6 +25,13 @@ services:
   backend:
     ports: !override
       - "127.0.0.1:25556:8080"
+    depends_on:
+      proxy-relay:
+        condition: service_started
+    environment:
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost,postgres,redis,172.30.10.1}
   frontend:
     ports: !override
       - "127.0.0.1:25555:8080"

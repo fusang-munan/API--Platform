@@ -8,6 +8,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strings"
+
+	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
 type CallCorrelation struct {
@@ -15,6 +17,7 @@ type CallCorrelation struct {
 	PreviousResponseID string
 	ExplicitTurnID     string
 	AgentTurnHeader    string
+	QuestionState      string
 }
 
 func extractCallCorrelation(requestPath, contentType string, replay *replayBody, headers http.Header) CallCorrelation {
@@ -68,10 +71,12 @@ func extractCallCorrelation(requestPath, contentType string, replay *replayBody,
 		stringField(payload, "prompt_cache_key"),
 		nestedStringField(payload, "client_metadata", "session_id"),
 		nestedStringField(payload, "metadata", "session_id"),
+		nestedStringField(payload, "metadata", "user_id"),
 		nestedStringField(payload, "metadata", "agent_task_id"),
 		stringField(payload, "user"),
 		strings.TrimSpace(headers.Get("X-Agent-Task-Id")),
 	)
+	correlation.QuestionState = questionStateFromPayload(payload)
 	return correlation
 }
 
@@ -83,39 +88,22 @@ func extractPromptFromJSON(message []byte) (string, string) {
 	return extractUserPromptFromPayload(payload)
 }
 
-func isInjectedAgentContent(text string) bool {
-	trimmed := strings.TrimSpace(text)
-	return strings.HasPrefix(trimmed, "<system-reminder>") ||
-		strings.HasPrefix(trimmed, "<local-command-") ||
-		strings.HasPrefix(trimmed, "<command-message>")
+func normalizeMonitoredUserPrompt(text string) string {
+	return usage.HumanTurnText(text)
 }
 
 func extractUserPromptFromPayload(payload map[string]any) (string, string) {
-	if value, ok := payload["prompt"].(string); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value), "prompt"
-	}
-	if value, ok := payload["instructions"].(string); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value), "instructions"
-	}
-	if value, ok := payload["input"].(string); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value), "input"
-	}
 	if messages, ok := payload["messages"].([]any); ok {
-		for i := len(messages) - 1; i >= 0; i-- {
-			if m, ok := messages[i].(map[string]any); ok && strings.EqualFold(fmt.Sprint(m["role"]), "user") {
-				if text := allTextFromJSONValue(m["content"]); text != "" && !isInjectedAgentContent(text) {
-					return text, "user_message"
-				}
-			}
+		if text, source := lastUserTextFromRoleMessages(messages, "content"); text != "" {
+			return text, source
+		}
+		if text, source := firstUserTextFromRoleMessages(messages, "content"); text != "" {
+			return text, source
 		}
 	}
 	if contents, ok := payload["contents"].([]any); ok {
-		for i := len(contents) - 1; i >= 0; i-- {
-			if item, ok := contents[i].(map[string]any); ok && strings.EqualFold(fmt.Sprint(item["role"]), "user") {
-				if text := allTextFromJSONValue(item["parts"]); text != "" {
-					return text, "user_message"
-				}
-			}
+		if text, source := lastUserTextFromRoleMessages(contents, "parts"); text != "" {
+			return text, source
 		}
 	}
 	if input, ok := payload["input"].([]any); ok {
@@ -123,25 +111,59 @@ func extractUserPromptFromPayload(payload map[string]any) (string, string) {
 			return text, source
 		}
 	}
+	if value, ok := payload["input"].(string); ok {
+		if text := normalizeMonitoredUserPrompt(value); text != "" {
+			return text, "input"
+		}
+	}
+	if value, ok := payload["prompt"].(string); ok {
+		if text := normalizeMonitoredUserPrompt(value); text != "" {
+			return text, "prompt"
+		}
+	}
+	return "", ""
+}
+
+func lastUserTextFromRoleMessages(items []any, contentKey string) (string, string) {
+	for i := len(items) - 1; i >= 0; i-- {
+		if text, source := userTextFromMessageItem(items[i], contentKey); text != "" {
+			return text, source
+		}
+	}
+	return "", ""
+}
+
+func firstUserTextFromRoleMessages(items []any, contentKey string) (string, string) {
+	for i := 0; i < len(items); i++ {
+		if text, source := userTextFromMessageItem(items[i], contentKey); text != "" {
+			return text, source
+		}
+	}
+	return "", ""
+}
+
+func userTextFromMessageItem(item any, contentKey string) (string, string) {
+	m, ok := item.(map[string]any)
+	if !ok || !strings.EqualFold(fmt.Sprint(m["role"]), "user") {
+		return "", ""
+	}
+	if text := normalizeMonitoredUserPrompt(allTextFromJSONValue(m[contentKey])); text != "" {
+		return text, "user_message"
+	}
 	return "", ""
 }
 
 func extractPromptInputArray(input []any) (string, string) {
-	for _, raw := range input {
-		item, isObject := raw.(map[string]any)
-		if !isObject {
-			if text := allTextFromJSONValue(raw); text != "" {
-				return text, "input_text"
-			}
+	for i := len(input) - 1; i >= 0; i-- {
+		item, isObject := input[i].(map[string]any)
+		if !isObject || !promptInputItem(item) {
 			continue
 		}
-		if !promptInputItem(item) {
+		role := strings.TrimSpace(fmt.Sprint(item["role"]))
+		if role != "" && !strings.EqualFold(role, "user") {
 			continue
 		}
-		if role := strings.TrimSpace(fmt.Sprint(item["role"])); role != "" && !strings.EqualFold(role, "user") && !strings.EqualFold(role, "developer") {
-			continue
-		}
-		if text := allTextFromJSONValue(raw); text != "" {
+		if text := normalizeMonitoredUserPrompt(allTextFromJSONValue(item)); text != "" {
 			return text, "input_text"
 		}
 	}
@@ -174,9 +196,11 @@ func extractCallCorrelationFromJSON(message []byte) CallCorrelation {
 			stringField(payload, "prompt_cache_key"),
 			nestedStringField(payload, "client_metadata", "session_id"),
 			nestedStringField(payload, "metadata", "session_id"),
+			nestedStringField(payload, "metadata", "user_id"),
 			nestedStringField(payload, "metadata", "agent_task_id"),
 			stringField(payload, "user"),
 		),
+		QuestionState: questionStateFromPayload(payload),
 	}
 }
 

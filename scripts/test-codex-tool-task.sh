@@ -28,7 +28,7 @@ login_session() {
 
 api() { curl -sS -H "Authorization: Bearer $1" "${@:2}"; }
 
-echo "== 1. provision key ($MODEL) =="
+echo "== 1. provision or reuse key ($MODEL) =="
 STU="$(login_session student@megaflow student123456 student)"
 api "$STU" -X POST "$BASE/api/v1/student/models" -H 'Content-Type: application/json' \
   -d "{\"model_id\":\"$MODEL\"}" >/dev/null || true
@@ -39,13 +39,28 @@ SUBMIT="$(api "$STU" -X POST "$BASE/api/v1/student/api-keys" -H 'Content-Type: a
   \"requested_monthly_credits\": \"50.000\",
   \"models\": [{\"model_id\": \"$MODEL\"}]
 }")"
-KEY_ID="$(echo "$SUBMIT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")"
-MEN="$(login_session mentor@megaflow mentor123456 mentor)"
-api "$MEN" -X POST "$BASE/api/v1/mentor/api-key-reviews/$KEY_ID/approve" \
-  -H 'Content-Type: application/json' -d '{"monthly_credits":"50.000"}' >/dev/null
-STU="$(login_session student@megaflow student123456 student)"
-API_KEY="$(api "$STU" -X POST "$BASE/api/v1/student/api-keys/$KEY_ID/claim" \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['api_key'])")"
+if echo "$SUBMIT" | python3 -c "import sys,json; sys.exit(0 if json.load(sys.stdin).get('data') else 1)"; then
+  KEY_ID="$(echo "$SUBMIT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")"
+  MEN="$(login_session mentor@megaflow mentor123456 mentor)"
+  api "$MEN" -X POST "$BASE/api/v1/mentor/api-key-reviews/$KEY_ID/approve" \
+    -H 'Content-Type: application/json' -d '{"monthly_credits":"50.000"}' >/dev/null
+  STU="$(login_session student@megaflow student123456 student)"
+  API_KEY="$(api "$STU" -X POST "$BASE/api/v1/student/api-keys/$KEY_ID/claim" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['api_key'])")"
+else
+  STU="$(login_session student@megaflow student123456 student)"
+  KEY_ID="$(api "$STU" "$BASE/api/v1/student/api-keys" | python3 -c "
+import sys,json
+keys=[k for k in json.load(sys.stdin).get('data',[]) if k.get('status')=='active']
+print(keys[0]['id'] if keys else '')
+")"
+  if [[ -z "$KEY_ID" ]]; then
+    echo "no active API key and create failed: $SUBMIT" >&2
+    exit 1
+  fi
+  API_KEY="$(api "$STU" -X POST "$BASE/api/v1/student/api-keys/$KEY_ID/regenerate" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['api_key'])")"
+fi
 KEY_PREFIX="${API_KEY:0:16}"
 echo "key_prefix=$KEY_PREFIX marker=$MARKER magic=$MAGIC"
 

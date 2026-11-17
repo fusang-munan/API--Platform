@@ -5,7 +5,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../../store/auth'
 import { APIError } from '../../api/client'
 import type { Role } from '../../api/types'
-import AuthShell from '../../components/AuthShell.vue'
+import AuthShell from '../../components/LoginShell.vue'
 import LoadingButton from '../../components/LoadingButton.vue'
 
 const form = reactive({ email: '', password: '' })
@@ -124,12 +124,13 @@ function resetPicker() {
 
         <div v-else key="login">
           <h1>登录控制台</h1>
+          <p class="login-description">连接模型，让下一个灵感成为可能。</p>
           <form @submit.prevent="submit">
             <fieldset :disabled="auth.loading">
-              <label>邮箱<input v-model="form.email" type="email" autocomplete="email" required /></label>
+              <label>邮箱<input v-model="form.email" type="email" autocomplete="email" placeholder="输入你的邮箱" required /></label>
               <label>密码
                 <div class="row">
-                  <input v-model="form.password" :type="show ? 'text' : 'password'" autocomplete="current-password" required />
+                  <input v-model="form.password" :type="show ? 'text' : 'password'" autocomplete="current-password" placeholder="输入你的密码" required />
                   <button type="button" class="icon-button" :aria-label="show ? '隐藏密码' : '显示密码'" @click="show = !show">
                     <EyeOff v-if="show" :size="18" />
                     <Eye v-else :size="18" />
@@ -137,13 +138,12 @@ function resetPicker() {
                 </div>
               </label>
             </fieldset>
-            <p v-if="error" class="error">{{ error }}</p>
-            <LoadingButton class="button primary wide" type="submit" :pending="auth.loading" pending-label="登录中…">登录</LoadingButton>
+            <p v-if="error" class="error" role="alert">{{ error }}</p>
+            <LoadingButton class="button primary wide" type="submit" :pending="auth.loading" pending-label="登录中…">进入 Nebula <ChevronRight :size="17" aria-hidden="true" /></LoadingButton>
           </form>
           <div class="actions">
             <RouterLink to="/register">注册学生账号</RouterLink>
             <RouterLink to="/recovery">忘记密码</RouterLink>
-            <RouterLink to="/teacher/activate">老师激活</RouterLink>
           </div>
         </div>
       </Transition>

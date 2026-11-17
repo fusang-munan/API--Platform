@@ -287,6 +287,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
         :api-key="configKey.api_key"
         :models="configKey.models"
         :key-prefix="configKey.key_prefix"
+        :key-name="configKey.name"
       />
     </AppDialog>
   </section>

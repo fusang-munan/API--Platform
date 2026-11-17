@@ -1,19 +1,24 @@
 <script setup lang="ts">
 import { onBeforeUnmount, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { authAPI } from '../../api/auth'
+import { useAuthStore } from '../../store/auth'
 import { APIError } from '../../api/client'
 import AuthShell from '../../components/AuthShell.vue'
 import LoadingButton from '../../components/LoadingButton.vue'
 import { useToast } from '../../composables/useToast'
+import { isPasswordValid } from '../../utils/passwordPolicy'
 
 const form = reactive({ name: '', email: '', password: '', confirm: '', verification_code: '' })
 const error = ref('')
+const demoCodeHint = ref('')
 const seconds = ref(0)
 const sentFor = ref('')
 const sending = ref(false)
 const submitting = ref(false)
 const router = useRouter()
+const route = useRoute()
+const auth = useAuthStore()
 const toast = useToast()
 let timer = 0
 
@@ -24,8 +29,15 @@ async function send() {
   error.value = ''
   sending.value = true
   try {
-    await authAPI.sendCode(form.email, 'student_registration')
+    const result = await authAPI.sendCode(form.email, 'student_registration')
     sentFor.value = form.email
+    if (result.verification_code) {
+      form.verification_code = result.verification_code
+      demoCodeHint.value =
+        '当前平台未配置真实邮件服务：验证码已直接显示（正式环境会发到您填写的邮箱，与发件邮箱无关）。'
+    } else {
+      demoCodeHint.value = ''
+    }
     seconds.value = 60
     clearInterval(timer)
     timer = window.setInterval(() => {
@@ -42,8 +54,8 @@ async function send() {
 async function submit() {
   if (submitting.value) return
   error.value = ''
-  if (form.password.length < 12 || form.password.length > 128) {
-    error.value = '密码长度必须为 12–128 个字符'
+  if (!isPasswordValid(form.password)) {
+    error.value = '密码不符合要求'
     return
   }
   if (form.password !== form.confirm) {
@@ -56,9 +68,18 @@ async function submit() {
   }
   submitting.value = true
   try {
-    await authAPI.register(form)
-    toast.success('注册成功，请登录')
-    await router.replace('/login')
+    await authAPI.register({
+      name: form.name,
+      email: form.email,
+      password: form.password,
+      verification_code: form.verification_code,
+    })
+    const challenge = await auth.login(form.email, form.password)
+    if (challenge) {
+      await auth.completeSession('student')
+    }
+    toast.success('注册成功')
+    await router.replace(String(route.query.redirect || '/'))
   } catch (e) {
     error.value = e instanceof APIError ? e.message : '注册失败'
   } finally {
@@ -72,13 +93,14 @@ async function submit() {
     <section class="auth-card panel">
       <RouterLink to="/login">← 返回登录</RouterLink>
       <h1>注册学生账号</h1>
-      <p class="muted">导师身份需由老师授予，注册后仅创建学生身份。</p>
+      <p class="muted">导师身份需由老师授予，注册后仅创建学生身份。验证码会发到您填写的邮箱（只需平台配置一个发信账号即可）。</p>
+      <p v-if="demoCodeHint" class="muted">{{ demoCodeHint }}</p>
       <form @submit.prevent="submit">
         <fieldset :disabled="submitting">
           <label>姓名<input v-model="form.name" maxlength="64" required /></label>
           <label>邮箱<input v-model="form.email" type="email" required /></label>
-          <label>密码<input v-model="form.password" type="password" minlength="12" maxlength="128" required /></label>
-          <label>确认密码<input v-model="form.confirm" type="password" minlength="12" maxlength="128" required /></label>
+          <label>密码<input v-model="form.password" type="password" minlength="8" required /></label>
+          <label>确认密码<input v-model="form.confirm" type="password" minlength="8" required /></label>
           <label>邮箱验证码
             <div class="row">
               <input v-model="form.verification_code" required />

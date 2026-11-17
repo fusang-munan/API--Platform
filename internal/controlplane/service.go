@@ -24,14 +24,15 @@ import (
 )
 
 type Config struct {
-	AccessTTL       time.Duration
-	RefreshTTL      time.Duration
-	VerificationTTL time.Duration
-	SendCooldown    time.Duration
-	MaxAttempts     int
-	Lockout         time.Duration
-	InvitationTTL   time.Duration
-	PublicAppURL    string
+	AccessTTL                        time.Duration
+	RefreshTTL                       time.Duration
+	VerificationTTL                  time.Duration
+	SendCooldown                     time.Duration
+	MaxAttempts                      int
+	Lockout                          time.Duration
+	InvitationTTL                    time.Duration
+	PublicAppURL                     string
+	ExposeVerificationCodeInResponse bool
 }
 
 type Service struct {

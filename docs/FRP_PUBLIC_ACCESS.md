@@ -23,6 +23,8 @@
 
 **公网入口**：`http://106.55.103.208:25555`
 
+可选 HTTPS（自签，多机访问不推荐）：见 `scripts/generate-lab-tls.sh` 与 `frontend/nginx.lab-ssl.conf`，在 `compose.local.yaml` 为 frontend 挂载证书与 SSL 配置。
+
 ## 维护命令
 
 ```bash

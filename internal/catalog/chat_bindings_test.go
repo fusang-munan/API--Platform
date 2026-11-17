@@ -44,6 +44,20 @@ func TestDefaultAdaptersForModel(t *testing.T) {
 	if !found[modelbinding.AdapterOpenaiCompatible] || !found[modelbinding.AdapterOpenaiResponses] {
 		t.Fatalf("expected chat pair, got %#v", chatAdapters)
 	}
+	claudeAdapters := DefaultAdaptersForModel("claude-sonnet-5")
+	found = map[modelbinding.Adapter]bool{}
+	for _, adapter := range claudeAdapters {
+		found[adapter] = true
+	}
+	if !found[modelbinding.AdapterAnthropic] || !found[modelbinding.AdapterOpenaiCompatible] || !found[modelbinding.AdapterOpenaiResponses] {
+		t.Fatalf("expected claude harness trio, got %#v", claudeAdapters)
+	}
+	if !IsAnthropicFamilyModel("claude-sonnet-5") || IsAnthropicFamilyModel("gpt-5.6-luna") {
+		t.Fatal("unexpected anthropic family classification")
+	}
+	if !IsOpenAIModelsListable("gpt-5.6-luna") || IsOpenAIModelsListable("claude-sonnet-5") {
+		t.Fatal("openai models list should exclude claude family")
+	}
 }
 
 func TestExpandChatGatewayAdapters(t *testing.T) {

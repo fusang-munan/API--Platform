@@ -1,5 +1,25 @@
 # Nebula 测试与故障排查
 
+## 登录页星轨夜视觉验证
+
+0.8.6 根据用户要求将代码绘制的 Logo 替换为内置 imagegen 生成的几何 N 字标素材 `nebula-n-generated.png`，不使用手绘 SVG。所有入口统一引用其 PNG 尺寸衍生图（页面 128px、favicon 32/192px、Apple 180px），仅缩放导出，不重新绘制图形。验证所有图片返回 image/png，32px 下仍可辨识，页面不再引用 nebula-star.svg。上一版移除的英文引导标签保持删除。原图和生成提示词保留在仓库，可据此追溯素材来源。
+
+0.8.6 验证：类型检查、生产构建、四种屏宽、模拟登录和身份选择、星球动画、减少动态效果及 PNG 图标响应检查通过。前端发布镜像为 `nebula-api-frontend:0.8.6`。
+
+0.8.5 移除登录卡片的英文引导标签；新品牌源文件为 `frontend/public/assets/brand/nebula-star.svg`，使用雪青紫星核、倾斜轨道与卫星光点。登录、其他认证页、会话加载页和控制台使用同一 SVG，浏览器提供同源 SVG、32px PNG fallback 和 180px Apple 图标。验证登录页不含 `YOUR NEXT CHAPTER`，所有品牌图片成功加载，HTML 图标链接指向新素材且返回正确 MIME 类型；新文件名避免沿用旧 favicon 缓存。SVG 缩小至 16/32px 时应仍可识别星核与轨道。
+
+0.8.5 验证结果：类型检查、生产镜像构建、四种屏宽布局、模拟登录交互、星球动画及减少动态效果检查通过；新 SVG/PNG/Apple 图标均返回 200 和正确 MIME，注册页品牌素材加载通过。前端单独更新为 `nebula-api-frontend:0.8.5`。32px 和 180px PNG 由同一 SVG 通过 Chromium 按目标尺寸透明截图导出。
+
+0.8.4 登录页移除治理标语、功能标签及页脚文案，品牌图形使用与 favicon 相同的高清素材。`LoginPlanet.vue` 通过 CSS 实现球面转动、光晕呼吸、星环倾斜与光点公转；无需动画依赖和逐帧 JavaScript。浏览器已确认动画前后球面 transform 与光点 offset-distance 变化；减少动态效果模式下所有星球动画停止。品牌图片加载成功且 src 为 `/assets/brand/favicon-512.png`，移除的文案不再出现在页面。类型检查、生产构建和四种宽度的布局与模拟交互检查通过，前端单独发布为 `nebula-api-frontend:0.8.4`。
+
+登录页使用独立 `frontend/src/components/LoginShell.vue`，保留邮箱密码、密码显隐、多身份选择和原有认证调用。在 frontend 执行 `npm run build` 与 `npm run test`；浏览器检查 1440px、768px、390px 和 320px 宽度，确认无横向溢出、表单与文档入口可用、键盘焦点清晰。启用 `prefers-reduced-motion: reduce` 时不播放星光与入场动画。不使用真实账号测试。
+
+0.8.3 验证：类型检查及 Docker 生产构建通过；上述四种宽度无横向溢出，模拟 API 下密码显隐、三身份展示、返回登录、减少动画及无 JavaScript 运行错误检查通过。截图保存在 `docs/reports/login-night/`。前端单独更新到 `nebula-api-frontend:0.8.3`。
+
+若登录页仍显示旧样式，检查页面加载的带 hash JS/CSS 是否与最新 frontend/dist/index.html 一致，并重新部署前端静态产物。若其他认证页发生视觉变化，检查是否误将独立 LoginShell 用于其他页面；公共 AuthShell 保留原有用途。此变更不涉及 API 或数据库契约。
+
+本次验证中，现有 `auth.test.ts` 的会话恢复断言和 `client.test.ts` 的导师重复指派文案断言失败；恢复改造前的 Login.vue 后仍可复现。前者的 mock 未覆盖当前 bootstrap 的 `/me` 读取，后者的期望文案与现实现不一致，需在对应认证/API 工作中同步。排查命令：`npm run test -- src/store/auth.test.ts src/api/client.test.ts`。本机 node_modules 若由其他用户拥有，Vue 类型缓存可能报 EACCES；可复制前端到当前用户可写的临时目录后执行构建，避免改动共享依赖目录权限。
+
 ## 1. 文档职责
 
 本文档用于统一测试入口和支持排查口径，避免通过反复问答才能定位常见问题。新增、修改或删除任何功能时，必须在同一 Task 更新：
@@ -249,6 +269,9 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 | 前端 SSE 无状态更新 | 使用 EventSource 无法带 Bearer，或 fetch stream 中断 | 使用内置 fetch streaming，重连后重新拉取列表 | 检查 `/api/v1/events` Authorization 与响应 Content-Type；不要把 token 放 query |
 | 领取弹窗关闭后找不到完整 Key | 明文按契约只在首次响应与当前内存弹窗出现 | 使用首次领取时复制的值；遗失后只能重新申请 | 数据库和浏览器存储都不应存在明文，禁止增加“再次显示”功能 |
 | 8081 端口被占用 | 本机其他进程占用前端入口 | 停止冲突进程或按正式变更流程修改端口和文档 | `Get-NetTCPConnection -LocalPort 8081 -State Listen` |
+| DeepSeek harness 已完成回答，调用审查仍是 `upstream_failed` 且没有 token | 客户端携带 `gzip`/`br` 时，`deepseek-flash` 的 SSE 会混入二进制；网关原样转发该压缩头，流里没有可解析的 `data:` 事件和 `usage` | 向上游请求 `Accept-Encoding: identity`。学生提问的失败轮次仍保留；历史失败记录没有用量，不能补记 token | 运行 `go test ./internal/dataplane -run 'TestUpstreamRequestDisablesResponseCompression|TestDeepSeekAnthropicUpstreamUsesOfficialPrefix'` |
+| 调用审查出现成串 `upstream_failed`，用户 prompt 为「—」或客户端标题/时钟文本 | 上游以 HTTP 200 结束 SSE，且在正常 `data:` 事件前断开；这类请求没有学生句子，也没有会话编号，每次重试都新开一轮 | 审查列表只保留存有学生提问的轮次。空标题，以及「Generate the session title」和「Time sampled while preparing turn」开头的客户端请求不列出。学生提问失败的轮次仍保留 | 运行 `go test ./internal/usage -run 'TestHumanTurnTextDropsClientBookkeeping|TestCallReviewPromptSQLHidesEmptyAndClientBookkeeping'`；不要把响应正文补进审查列表 |
+| 同一句用户提示词换了模型，调用审查只显示先用的模型 | 没有新提示词的后续调用只在同一模型的行里查找，换模型后新开了空标题行，审查列表把空标题丢掉 | 没有新用户提示词时，换模型的调用留在已有提示词那一行。这一行按实际调用顺序列出用过的模型。新的用户提示词仍另开一行 | 运行 `go test ./internal/usage -run 'TestModelSwitchWithoutNewPromptJoinsThePromptRow|TestModelSwitchWithNewQuestionOpensARow'` |
 | `down` 后数据仍存在 | 命名卷按设计持久化 | 重新启动即可恢复；不要把持久化误判为清理失败 | `docker volume ls --filter name=nebula-api_`；`down -v` 会永久删除数据 |
 
 ## 4. 分层排查顺序

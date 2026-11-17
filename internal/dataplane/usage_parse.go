@@ -11,6 +11,11 @@ type ResponseMetrics struct {
 	PromptTokens       int
 	CompletionTokens   int
 	TotalTokens        int
+	// ReplyClosed is nil until a stop flag is seen. False means the model
+	// asked for a tool, so the question is still open.
+	ReplyClosed   *bool
+	toolRequested bool
+	stopExplicit  bool
 }
 
 func parseResponseMetrics(contentType string, body []byte) ResponseMetrics {
@@ -57,6 +62,7 @@ func parseSSEResponseMetrics(body []byte) ResponseMetrics {
 }
 
 func applyPayloadMetrics(metrics *ResponseMetrics, payload map[string]json.RawMessage) {
+	applyReplyState(metrics, payload)
 	if id := rawString(payload["id"]); id != "" {
 		metrics.UpstreamResponseID = id
 	}
@@ -102,6 +108,110 @@ func applyUsageRaw(metrics *ResponseMetrics, usageRaw json.RawMessage) {
 	metrics.PromptTokens = prompt
 	metrics.CompletionTokens = completion
 	metrics.TotalTokens = total
+}
+
+func applyReplyState(metrics *ResponseMetrics, payload map[string]json.RawMessage) {
+	if responseRaw, ok := payload["response"]; ok {
+		var nested map[string]json.RawMessage
+		if json.Unmarshal(responseRaw, &nested) == nil {
+			applyReplyState(metrics, nested)
+		}
+	}
+	noteToolRequest(metrics, payload["content"])
+	noteToolRequest(metrics, payload["output"])
+	noteToolRequest(metrics, payload["content_block"])
+	noteToolRequest(metrics, payload["item"])
+	if choicesRaw, ok := payload["choices"]; ok {
+		var choices []map[string]json.RawMessage
+		if json.Unmarshal(choicesRaw, &choices) == nil {
+			for _, choice := range choices {
+				noteStopReason(metrics, rawString(choice["finish_reason"]))
+				noteToolRequest(metrics, choice["message"])
+				noteToolRequest(metrics, choice["delta"])
+				var delta map[string]json.RawMessage
+				if json.Unmarshal(choice["delta"], &delta) == nil {
+					noteStopReason(metrics, rawString(delta["finish_reason"]))
+				}
+			}
+		}
+	}
+	if deltaRaw, ok := payload["delta"]; ok {
+		var delta map[string]json.RawMessage
+		if json.Unmarshal(deltaRaw, &delta) == nil {
+			noteStopReason(metrics, rawString(delta["stop_reason"]))
+			noteStopReason(metrics, rawString(delta["finish_reason"]))
+			noteToolRequest(metrics, deltaRaw)
+		}
+	}
+	noteStopReason(metrics, rawString(payload["stop_reason"]))
+	noteStopReason(metrics, rawString(payload["finish_reason"]))
+	eventType := strings.ToLower(rawString(payload["type"]))
+	status := strings.ToLower(rawString(payload["status"]))
+	if metrics.ReplyClosed == nil && (eventType == "message_stop" || eventType == "response.completed" || status == "completed" || status == "incomplete") {
+		closed := true
+		metrics.ReplyClosed = &closed
+	}
+}
+
+func noteStopReason(metrics *ResponseMetrics, reason string) {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "tool_use", "tool_calls", "pause_turn":
+		metrics.stopExplicit = true
+		metrics.toolRequested = true
+		closed := false
+		metrics.ReplyClosed = &closed
+	case "end_turn", "stop", "stop_sequence", "refusal", "max_tokens", "length":
+		metrics.stopExplicit = true
+		metrics.toolRequested = false
+		closed := true
+		metrics.ReplyClosed = &closed
+	}
+}
+
+func noteToolRequest(metrics *ResponseMetrics, raw json.RawMessage) {
+	if metrics.stopExplicit || len(raw) == 0 || !jsonHasToolRequest(raw) {
+		return
+	}
+	metrics.toolRequested = true
+	closed := false
+	metrics.ReplyClosed = &closed
+}
+
+func jsonHasToolRequest(raw json.RawMessage) bool {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return false
+	}
+	return valueHasToolRequest(value)
+}
+
+func valueHasToolRequest(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		typeName, _ := typed["type"].(string)
+		switch strings.ToLower(typeName) {
+		case "tool_use", "server_tool_use", "tool_call", "function_call", "custom_tool_call", "computer_call":
+			return true
+		}
+		if calls, ok := typed["tool_calls"].([]any); ok && len(calls) > 0 {
+			return true
+		}
+		if _, ok := typed["functionCall"]; ok {
+			return true
+		}
+		for _, child := range typed {
+			if valueHasToolRequest(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if valueHasToolRequest(child) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func rawString(raw json.RawMessage) string {

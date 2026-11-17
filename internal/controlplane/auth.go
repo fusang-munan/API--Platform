@@ -42,22 +42,29 @@ type preparedBootstrapAccount struct {
 	WithMentorProfile bool
 }
 
-func (s *Service) SendRegistrationCode(ctx context.Context, email, purpose string) error {
+func (s *Service) SendRegistrationCode(ctx context.Context, email, purpose string) (devCode string, err error) {
 	if purpose != PurposeStudentRegistration {
-		return domain.NewError(domain.CodeValidation, "invalid verification purpose")
+		return "", domain.NewError(domain.CodeValidation, "invalid verification purpose")
 	}
 	normalized, err := NormalizeEmail(email)
 	if err != nil {
-		return err
+		return "", err
 	}
 	exists, err := s.db.User.Query().Where(user.EmailEQ(normalized)).Exist(ctx)
 	if err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "query user", err)
+		return "", domain.WrapError(domain.CodeDependencyUnavailable, "query user", err)
 	}
 	if exists {
-		return domain.NewError(domain.CodeEmailRegistered, "email is already registered")
+		return "", domain.NewError(domain.CodeEmailRegistered, "email is already registered")
 	}
-	return s.sendCode(ctx, normalized, purpose)
+	code, err := s.sendCode(ctx, normalized, purpose)
+	if err != nil {
+		return "", err
+	}
+	if s.config.ExposeVerificationCodeInResponse {
+		return code, nil
+	}
+	return "", nil
 }
 
 func (s *Service) ForgotPassword(ctx context.Context, email string) error {
@@ -72,28 +79,29 @@ func (s *Service) ForgotPassword(ctx context.Context, email string) error {
 	if !exists {
 		return nil
 	}
-	return s.sendCode(ctx, normalized, PurposePasswordReset)
+	_, err = s.sendCode(ctx, normalized, PurposePasswordReset)
+	return err
 }
 
-func (s *Service) sendCode(ctx context.Context, email, purpose string) error {
+func (s *Service) sendCode(ctx context.Context, email, purpose string) (string, error) {
 	code, err := randomCode()
 	if err != nil {
-		return domain.WrapError("INTERNAL_ERROR", "generate verification code", err)
+		return "", domain.WrapError("INTERNAL_ERROR", "generate verification code", err)
 	}
 	hash := s.security.HashAuthState(email + "|" + purpose + "|" + code)
 	if err := s.cache.PutVerification(ctx, email, purpose, hash, s.config.VerificationTTL, s.config.SendCooldown); err != nil {
 		if err == cache.ErrRateLimited {
-			return domain.NewError(domain.CodeRateLimited, "verification code was sent recently")
+			return "", domain.NewError(domain.CodeRateLimited, "verification code was sent recently")
 		}
-		return domain.WrapError(domain.CodeDependencyUnavailable, "store verification code", err)
+		return "", domain.WrapError(domain.CodeDependencyUnavailable, "store verification code", err)
 	}
 	subject := "Nebula verification code"
 	body := fmt.Sprintf("Your Nebula verification code is %s. It expires in %d minutes.", code, int(s.config.VerificationTTL.Minutes()))
 	if err := s.mailer.Send(ctx, email, subject, body); err != nil {
 		_ = s.cache.DeleteVerification(ctx, email, purpose)
-		return domain.WrapError(domain.CodeDependencyUnavailable, "send verification email", err)
+		return "", domain.WrapError(domain.CodeDependencyUnavailable, "send verification email", err)
 	}
-	return nil
+	return code, nil
 }
 
 func (s *Service) Register(ctx context.Context, role, name, email, password, code string) (UserView, error) {

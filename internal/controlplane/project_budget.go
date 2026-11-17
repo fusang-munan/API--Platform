@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprojectapplication"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/project"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/projectmember"
 )
@@ -89,7 +90,7 @@ func (s *Service) UpdateProjectBudget(ctx context.Context, actorID, projectID uu
 	}, nil
 }
 
-func (s *Service) AssignProjectMentor(ctx context.Context, projectID, mentorID uuid.UUID) error {
+func (s *Service) AssignProjectMentor(ctx context.Context, teacherID, projectID, mentorID uuid.UUID) error {
 	target, err := s.db.Project.Query().Where(project.IDEQ(projectID)).Only(ctx)
 	if ent.IsNotFound(err) {
 		return domain.NewError(domain.CodeNotFound, "project not found")
@@ -120,6 +121,17 @@ func (s *Service) AssignProjectMentor(ctx context.Context, projectID, mentorID u
 	}
 	if err := ensureProjectMember(ctx, tx, projectID, mentorID); err != nil {
 		return err
+	}
+	if _, err := tx.MentorProjectApplication.Update().Where(
+		mentorprojectapplication.ProjectIDEQ(projectID),
+		mentorprojectapplication.MentorIDEQ(mentorID),
+		mentorprojectapplication.StatusEQ(mentorprojectapplication.StatusPending),
+	).
+		SetStatus(mentorprojectapplication.StatusApproved).
+		SetReviewedBy(teacherID).
+		SetReviewedAt(s.now().UTC()).
+		Save(ctx); err != nil {
+		return domain.WrapError(domain.CodeDependencyUnavailable, "close pending mentor application", err)
 	}
 	return tx.Commit()
 }

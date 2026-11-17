@@ -19,7 +19,8 @@ RUN --mount=type=cache,id=nebula-go-mod,target=/go/pkg/mod,sharing=locked \
     test -n "$VERSION" && \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/nebula-server ./cmd/server && \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/nebula-migrate ./cmd/migrate && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/nebula-maintenance ./cmd/maintenance
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/nebula-maintenance ./cmd/maintenance && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/nebula-repair-call-turns ./cmd/repair-call-turns
 RUN --mount=type=cache,id=nebula-go-mod,target=/go/pkg/mod,sharing=locked \
     --mount=type=cache,id=nebula-go-build,target=/root/.cache/go-build,sharing=locked \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/nebula-provider-catalog ./cmd/providercatalog
@@ -29,6 +30,7 @@ WORKDIR /app
 COPY --from=builder --chown=10001:10001 /out/nebula-server /app/nebula-server
 COPY --from=builder --chown=10001:10001 /out/nebula-migrate /app/nebula-migrate
 COPY --from=builder --chown=10001:10001 /out/nebula-maintenance /app/nebula-maintenance
+COPY --from=builder --chown=10001:10001 /out/nebula-repair-call-turns /app/nebula-repair-call-turns
 COPY --from=builder --chown=10001:10001 /out/nebula-provider-catalog /app/nebula-provider-catalog
 
 RUN apk add --no-cache ca-certificates tzdata && \

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" fill="none">
+  <defs>
+    <linearGradient id="night" x1="12" y1="4" x2="83" y2="96" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#39304F"/><stop offset="1" stop-color="#151321"/>
+    </linearGradient>
+    <linearGradient id="orbit" x1="13" y1="69" x2="83" y2="25" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#937497"/><stop offset=".5" stop-color="#CFB8D8"/><stop offset="1" stop-color="#F4E7FC"/>
+    </linearGradient>
+    <linearGradient id="star" x1="35" y1="26" x2="60" y2="73" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF4FF"/><stop offset=".55" stop-color="#E5CDED"/><stop offset="1" stop-color="#AB8CC6"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="94" height="94" rx="25" fill="url(#night)"/>
+  <rect x="1.5" y="1.5" width="93" height="93" rx="24.5" stroke="#CFB8D8" stroke-opacity=".22"/>
+  <ellipse cx="48" cy="49" rx="37" ry="15" transform="rotate(-34 48 49)" stroke="url(#orbit)" stroke-width="3.5"/>
+  <path d="M48 21C51 39 55 44 69 48C55 52 51 57 48 75C45 57 41 52 27 48C41 44 45 39 48 21Z" fill="url(#star)"/>
+  <circle cx="77" cy="26" r="5" fill="#F0DDF7" stroke="#292237" stroke-width="2"/>
+</svg>

@@ -140,7 +140,7 @@ func (s *Server) createProject(c *gin.Context) {
 		Name               string  `json:"name" binding:"required"`
 		Description        *string `json:"description"`
 		Status             *string `json:"status"`
-		MonthlyCreditQuota string `json:"monthly_credit_quota" binding:"required"`
+		MonthlyCreditQuota string  `json:"monthly_credit_quota" binding:"required"`
 	}
 	if !bindJSON(c, &input) {
 		return
@@ -749,7 +749,7 @@ func (s *Server) assignProjectMentor(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := s.service.AssignProjectMentor(c.Request.Context(), projectID, mentorID); err != nil {
+	if err := s.service.AssignProjectMentor(c.Request.Context(), identity(c).UserID, projectID, mentorID); err != nil {
 		writeError(c, err)
 		return
 	}

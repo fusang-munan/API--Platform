@@ -30,7 +30,9 @@ type Config struct {
 	BootstrapTeacherPassword string
 	BootstrapTestAccounts    []BootstrapAccount
 
-	SMTPHost        string
+	SMTPMode                             string
+	ExposeVerificationCodeInResponse     bool
+	SMTPHost                             string
 	SMTPPort        int
 	SMTPUser        string
 	SMTPPass        string
@@ -160,6 +162,16 @@ func Load() (Config, error) {
 		}
 	}
 
+	cfg.SMTPMode = strings.ToLower(value("SMTP_MODE", "smtp"))
+	if cfg.SMTPMode != "smtp" && cfg.SMTPMode != "log" {
+		return Config{}, fmt.Errorf("SMTP_MODE must be smtp or log")
+	}
+	if cfg.ExposeVerificationCodeInResponse, err = boolValue("EXPOSE_VERIFICATION_CODE_IN_RESPONSE", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.ExposeVerificationCodeInResponse && cfg.SMTPMode != "log" {
+		return Config{}, fmt.Errorf("EXPOSE_VERIFICATION_CODE_IN_RESPONSE requires SMTP_MODE=log")
+	}
 	cfg.SMTPHost = strings.TrimSpace(os.Getenv("SMTP_HOST"))
 	if cfg.SMTPPort, err = intValue("SMTP_PORT", 587); err != nil {
 		return Config{}, err
@@ -250,6 +262,21 @@ func value(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func boolValue(name string, fallback bool) (bool, error) {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback, nil
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be a boolean (true/false)", name)
+	}
 }
 
 func intValue(name string, fallback int) (int, error) {

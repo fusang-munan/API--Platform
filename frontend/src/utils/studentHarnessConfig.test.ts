@@ -2,17 +2,22 @@ import { describe, expect, it } from 'vitest'
 import type { BindingAdapter, Model } from '../api/types'
 import {
   buildCCSwitchClaudeLink,
-  buildCCSwitchCodexLink,
   buildCCSwitchCodexInlineConfig,
-  buildCodexCatalogPatchScript,
-  buildCodexInstallScript,
+  buildCCSwitchCodexLink,
+  buildCCSwitchProviderName,
+  buildCodexSetupScript,
+  decodeBase64UTF8,
+  encodeBase64UTF8,
   buildCodexModelCatalogJson,
+  buildMinimalCodexConfigToml,
   buildStudentHarnessConfig,
   CODEX_MODEL_CATALOG_FILENAME,
-  CODEX_MODEL_CATALOG_TOML_PATH,
-  decodeBase64UTF8,
+  orderCodexCatalogModels,
   claudeHarnessModels,
+  claudeHarnessReady,
   codexHarnessModels,
+  codexHarnessReady,
+  codexSupportedReasoningEfforts,
   defaultHarnessModel,
   harnessDialogTitle,
   harnessModelOptions,
@@ -41,64 +46,156 @@ describe('studentHarnessConfig', () => {
     expect(claudeHarnessModels(models).map(model => model.model_id)).toEqual(['claude-sonnet-4-5-20250929'])
     expect(defaultHarnessModel(models, 'codex')).toBe('gpt-5.3-codex')
     expect(defaultHarnessModel(models, 'claude')).toBe('claude-sonnet-4-5-20250929')
+    expect(defaultHarnessModel([
+      { model_id: 'gpt-5.6-luna', display_name: 'Luna', route_ready: true },
+      { model_id: 'gpt-5.3-codex', display_name: 'Codex', route_ready: true },
+    ], 'codex')).toBe('gpt-5.6-luna')
     expect(harnessModelSummary(models[0])).toContain('Relay A')
     expect(harnessModelSummary(models[0])).toContain(bindingAdapterMeta('openai_responses').label)
   })
 
-  it('builds gateway-relative harness snippets', () => {
-    const config = buildStudentHarnessConfig('neb_sk_test_key', [{ model_id: 'gpt-5.3-codex', display_name: 'GPT Codex', responses_ready: true }], 'https://gateway.example')
+  it('builds gateway-relative harness snippets with key-aligned defaults', () => {
+    const config = buildStudentHarnessConfig(
+      'neb_sk_test_key',
+      [{ model_id: 'gpt-5.3-codex', display_name: 'GPT Codex', responses_ready: true }],
+      'https://gateway.example',
+      { codexModel: 'gpt-5.3-codex' },
+    )
     expect(config.gateway_api_base).toBe('https://gateway.example/v1')
     expect(config.anthropic_base_url).toBe('https://gateway.example')
     expect(config.codex_auth_json).toContain('neb_sk_test_key')
-    expect(config.codex_config_toml).toContain('base_url = "https://gateway.example/v1"')
-    expect(config.codex_config_toml).toContain('wire_api = "responses"')
-    expect(config.codex_config_toml).toContain(`model_catalog_json = "${CODEX_MODEL_CATALOG_TOML_PATH}"`)
+    expect(config.codex_config_toml).toBe(buildMinimalCodexConfigToml('https://gateway.example/v1', {
+      defaultModel: 'gpt-5.3-codex',
+    }))
+    expect(config.codex_config_toml).not.toContain('model_reasoning_effort')
+    expect(config.codex_config_toml).not.toContain('preferred_auth_method')
+    expect(config.codex_config_toml).not.toContain('name = ')
     expect(JSON.parse(config.codex_model_catalog_json).models[0].slug).toBe('gpt-5.3-codex')
-    expect(JSON.parse(config.codex_model_catalog_json).models[0].shell_type).toBe('unified_exec')
+    expect(JSON.parse(config.codex_model_catalog_json).models[0].supported_reasoning_levels).toHaveLength(3)
+    expect(codexSupportedReasoningEfforts('gpt-5.6-luna')).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    expect(codexSupportedReasoningEfforts('gpt-5.6-sol')).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+    expect(codexSupportedReasoningEfforts('gpt-5.3-codex')).toEqual(['low', 'medium', 'high'])
+    expect(JSON.parse(config.codex_model_catalog_json).models[0].base_instructions).toBeTruthy()
+    expect(JSON.parse(config.codex_model_catalog_json).models[0].default_reasoning_level).toBeUndefined()
     expect(JSON.parse(config.codex_model_catalog_json).models[0].context_window).toBe(272000)
     expect(config.claude_env_bash).toContain('ANTHROPIC_AUTH_TOKEN="neb_sk_test_key"')
   })
 
-  it('writes model catalog in codex install script', () => {
+  it('writes codex setup script with auth, catalog fallback, and minimal config', () => {
     const config = buildStudentHarnessConfig('neb_sk_test_key', [{ model_id: 'gpt-5.6-luna', display_name: 'Luna', responses_ready: true }], 'https://gateway.example')
-    const script = buildCodexCatalogPatchScript(config, 'bash')
+    const script = buildCodexSetupScript(config, 'neb_sk_test_key')
+    expect(script).toContain('auth.json')
+    expect(script).toContain('catalogFallback')
+    expect(script).toContain('configToml')
     expect(script).toContain(CODEX_MODEL_CATALOG_FILENAME)
+    expect(script).toContain('/v1/codex/model_catalog')
     expect(script).toContain('model_catalog_json')
-    expect(script).toContain('"slug": "gpt-5.6-luna"')
+    expect(script).toContain('disable_response_storage = true')
+    expect(script).toContain('网关 catalog 刷新跳过')
     expect(buildCodexModelCatalogJson('gpt-5.6-luna', 'Luna')).toContain('"display_name": "Luna"')
   })
 
-  it('builds CC-switch deep links for one-click import', () => {
-    const config = buildStudentHarnessConfig('neb_sk_test_key', models, 'https://gateway.example')
-    const codex = buildCCSwitchCodexLink(config, 'neb_sk_test_key', codexHarnessModels(models))
-    const claude = buildCCSwitchClaudeLink(config, 'neb_sk_test_key')
-    expect(codex).toMatch(/^ccswitch:\/\/v1\/import\?/)
-    expect(codex).toContain('app=codex')
-    expect(codex).toContain('apiKey=neb_sk_test_key')
-    expect(codex).toContain('endpoint=https%3A%2F%2Fgateway.example%2Fv1')
-    expect(codex).toContain('configFormat=json')
-    const configParam = new URL(codex.replace('ccswitch://', 'https://ccswitch.local/')).searchParams.get('config')
-    expect(configParam).toBeTruthy()
-    const inline = JSON.parse(decodeBase64UTF8(configParam!))
+  it('builds cc-switch codex deeplink with all key codex models in modelCatalog', () => {
+    const multi = [
+      { model_id: 'gpt-5.6-luna', display_name: 'Luna', route_ready: true, responses_ready: true },
+      { model_id: 'gpt-5.6-terra', display_name: 'Terra', route_ready: true, responses_ready: true },
+      { model_id: 'claude-sonnet-5', display_name: 'Claude', route_ready: true, anthropic_ready: true },
+    ]
+    const config = buildStudentHarnessConfig('neb_sk_test_key', multi, 'https://gateway.example', {
+      codexModel: 'gpt-5.6-luna',
+    })
+    const codex = buildCCSwitchCodexLink(
+      config,
+      'neb_sk_test_key',
+      codexHarnessModels(multi),
+      '齐爱农',
+      'gpt-5.6-luna',
+      { includeInlineConfig: true },
+    )
+    const params = new URL(codex.replace('ccswitch://v1/import?', 'http://local/?')).searchParams
+    const inline = JSON.parse(decodeBase64UTF8(params.get('config') ?? ''))
+    expect(inline.modelCatalog.models.map((entry: { model: string }) => entry.model))
+      .toEqual(['gpt-5.6-luna', 'gpt-5.6-terra'])
     expect(inline.apiFormat).toBe('openai_responses')
-    expect(inline.modelCatalog.models).toEqual([{ model: 'gpt-5.3-codex', displayName: 'GPT Codex' }])
-    expect(buildCCSwitchCodexInlineConfig('neb_sk_test_key', [{ model_id: 'gpt-5.6-luna', display_name: 'Luna' }]))
-      .toEqual({
-        auth: { OPENAI_API_KEY: 'neb_sk_test_key' },
-        apiFormat: 'openai_responses',
-        modelCatalog: { models: [{ model: 'gpt-5.6-luna', displayName: 'Luna' }] },
-      })
-    expect(claude).toContain('app=claude')
-    expect(claude).toContain('model=claude-sonnet-4-5-20250929')
+    expect(inline.config).toContain('model = "gpt-5.6-luna"')
+    expect(inline.config).not.toContain('model_reasoning_effort')
+    expect(inline.config).not.toContain('model_catalog_json')
+    expect(params.get('model')).toBe('gpt-5.6-luna')
   })
 
-  it('honours selected models in generated config', () => {
+  it('builds cc-switch codex deeplink matching cc-switch-codex-import.html base shape', () => {
+    const config = buildStudentHarnessConfig('neb_sk_test_key', models, 'https://gateway.example', {
+      codexModel: 'gpt-5.3-codex',
+    })
+    const codex = buildCCSwitchCodexLink(
+      config,
+      'neb_sk_test_key',
+      codexHarnessModels(models),
+      '齐爱农',
+      'gpt-5.3-codex',
+      { includeInlineConfig: true },
+    )
+    const claude = buildCCSwitchClaudeLink(config, 'neb_sk_test_key', '齐爱农')
+    expect(codex).toMatch(/^ccswitch:\/\/v1\/import\?/)
+    expect(codex).toContain('enabled=true')
+    const params = new URL(codex.replace('ccswitch://v1/import?', 'http://local/?')).searchParams
+    const inline = JSON.parse(decodeBase64UTF8(params.get('config') ?? ''))
+    expect(inline.auth).toEqual({ OPENAI_API_KEY: 'neb_sk_test_key' })
+    expect(inline.config).toContain('model_provider = "custom"')
+    expect(inline.config).toContain('name = "custom"')
+    expect(inline.modelCatalog.models.map((entry: { model: string }) => entry.model)).toEqual(['gpt-5.3-codex'])
+    expect(claude).toContain('name=Nebula-%E9%BD%90%E7%88%B1%E5%86%9C')
+  })
+
+  it('lists every gpt model on the key for codex harness', () => {
+    const multi = [
+      { model_id: 'gpt-5.6-luna', display_name: 'Luna', route_ready: true, responses_ready: false },
+      { model_id: 'gpt-5.3-codex', display_name: 'Codex', route_ready: true, responses_ready: true },
+    ]
+    expect(codexHarnessModels(multi).map(model => model.model_id)).toEqual(['gpt-5.6-luna', 'gpt-5.3-codex'])
+    expect(codexHarnessReady(multi[0])).toBe(true)
+    const config = buildStudentHarnessConfig('neb_sk_test_key', multi, 'https://gateway.example')
+    expect(JSON.parse(config.codex_model_catalog_json).models.map((model: { slug: string }) => model.slug))
+      .toEqual(['gpt-5.6-luna', 'gpt-5.3-codex'])
+  })
+
+  it('orders codex catalog with selected default model first', () => {
+    const multi = [
+      { model_id: 'gpt-5.6-luna', display_name: 'Luna' },
+      { model_id: 'gpt-5.3-codex', display_name: 'Codex' },
+    ]
+    expect(orderCodexCatalogModels(multi, 'gpt-5.3-codex').map(model => model.model_id))
+      .toEqual(['gpt-5.3-codex', 'gpt-5.6-luna'])
+  })
+
+  it('honours optional default model for claude only', () => {
     const config = buildStudentHarnessConfig('neb_sk_test_key', models, 'https://gateway.example', {
       codexModel: 'gpt-5.3-codex',
       claudeModel: 'claude-sonnet-4-5-20250929',
     })
     expect(config.codex_config_toml).toContain('model = "gpt-5.3-codex"')
+    expect(config.codex_config_toml).not.toContain('model_reasoning_effort')
     expect(buildCCSwitchClaudeLink(config, 'neb_sk_test_key')).toContain('model=claude-sonnet-4-5-20250929')
+  })
+
+  it('excludes claude models from codex harness when dual routes exist', () => {
+    const dual = [
+      { model_id: 'claude-sonnet-5', display_name: 'Claude Sonnet 5', route_ready: true, responses_ready: true, anthropic_ready: false },
+      { model_id: 'gpt-5.6-luna', display_name: 'Luna', route_ready: true, responses_ready: true },
+    ]
+    expect(codexHarnessModels(dual).map(model => model.model_id)).toEqual(['gpt-5.6-luna'])
+    expect(claudeHarnessModels(dual).map(model => model.model_id)).toEqual(['claude-sonnet-5'])
+    expect(claudeHarnessReady(dual[0])).toBe(true)
+    expect(keyHarnessSupport(dual)).toEqual({ codex: true, claude: true })
+  })
+
+  it('includes DeepSeek responses and anthropic routes in one-click setup', () => {
+    const deepseek = [
+      { model_id: 'deepseek-flash', display_name: 'deepseek-flash', route_ready: true, responses_ready: true, anthropic_ready: true },
+    ]
+    expect(codexHarnessModels(deepseek).map(model => model.model_id)).toEqual(['deepseek-flash'])
+    expect(claudeHarnessModels(deepseek).map(model => model.model_id)).toEqual(['deepseek-flash'])
+    expect(keyHarnessSupport(deepseek)).toEqual({ codex: true, claude: true })
   })
 
   it('limits harness imports to routable adapter kinds', () => {
