@@ -14,8 +14,8 @@ func TestDefaultBeichenProviderMigration(t *testing.T) {
 	}{
 		{"clean", nil, "北辰"},
 		{"existing VulcanAPI", []providerRow{{"VulcanAPI", "https://vulcanapi.com", "active"}}, "北辰"},
-		{"existing canonical URL", []providerRow{{"历史北辰", canonical, "inactive"}}, ""},
-		{"existing root slash URL", []providerRow{{"历史北辰", canonical + "/", "active"}}, ""},
+		{"preserve inactive Beichen", []providerRow{{"北辰", canonical, "inactive"}}, ""},
+		{"preserve active Beichen", []providerRow{{"历史北辰", canonical + "/", "active"}}, ""},
 		{"existing v1 URL", []providerRow{{"历史北辰", canonical + "/v1", "active"}}, ""},
 		{"existing v1 slash URL", []providerRow{{"历史北辰", " HTTPS://API.BEICHENAPI.COM/v1/ ", "active"}}, ""},
 		{"unsupported URL variants", []providerRow{
@@ -86,16 +86,6 @@ JOIN providers p ON p.id=b.provider_id WHERE p.name='VulcanAPI'`).Scan(&state); 
 			if err := Migrate(ctx, conn); err != nil {
 				t.Fatal(err)
 			}
-			if tc.addedName != "" {
-				var id, baseURL, status string
-				if err := conn.QueryRowContext(ctx, "SELECT id, base_url, status FROM providers WHERE name=$1", tc.addedName).
-					Scan(&id, &baseURL, &status); err != nil {
-					t.Fatal(err)
-				}
-				if baseURL != canonical || status != "inactive" || len(id) != 36 || id[14] != '7' {
-					t.Fatalf("unexpected seed: id=%s url=%s status=%s", id, baseURL, status)
-				}
-			}
 			verify := func() {
 				t.Helper()
 				for name, want := range before {
@@ -116,6 +106,16 @@ JOIN providers p ON p.id=b.provider_id WHERE p.name='VulcanAPI'`).Scan(&state); 
 				wantProviders := len(tc.existing)
 				if tc.addedName != "" {
 					wantProviders++
+					var id, baseURL, status string
+					if err := conn.QueryRowContext(ctx, "SELECT id, base_url, status FROM providers WHERE name=$1", tc.addedName).
+						Scan(&id, &baseURL, &status); err != nil {
+						t.Fatal(err)
+					}
+					if baseURL != canonical || status != "active" || len(id) != 36 || id[14] != '7' {
+						t.Fatalf("unexpected seed: id=%s url=%s status=%s", id, baseURL, status)
+					}
+					count("SELECT count(*) FROM provider_credentials WHERE provider_id=$1", 0, id)
+					count("SELECT count(*) FROM model_bindings WHERE provider_id=$1", 0, id)
 				}
 				count("SELECT count(*) FROM providers", wantProviders)
 				wantBindings := 0

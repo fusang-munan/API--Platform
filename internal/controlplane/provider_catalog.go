@@ -50,9 +50,15 @@ type ProviderCredentialView struct {
 	UpdatedAt            time.Time `json:"updated_at"`
 }
 
+func (s *Service) providersWithActiveCredentials() *ent.ProviderQuery {
+	return s.db.Provider.Query().Where(
+		provider.StatusEQ(provider.StatusActive),
+		provider.HasCredentialsWith(providercredential.StatusEQ(providercredential.StatusActive)),
+	)
+}
+
 func (s *Service) ActiveProvider(ctx context.Context) (*ent.Provider, error) {
-	rows, err := s.db.Provider.Query().
-		Where(provider.StatusEQ(provider.StatusActive)).
+	rows, err := s.providersWithActiveCredentials().
 		Order(ent.Asc(provider.FieldName)).
 		All(ctx)
 	if err != nil {
@@ -65,7 +71,7 @@ func (s *Service) ActiveProvider(ctx context.Context) (*ent.Provider, error) {
 }
 
 func (s *Service) hasActiveProvider(ctx context.Context) (bool, error) {
-	return s.db.Provider.Query().Where(provider.StatusEQ(provider.StatusActive)).Exist(ctx)
+	return s.providersWithActiveCredentials().Exist(ctx)
 }
 
 func (s *Service) ProviderCredentials(ctx context.Context, providerID uuid.UUID) ([]ProviderCredentialView, error) {

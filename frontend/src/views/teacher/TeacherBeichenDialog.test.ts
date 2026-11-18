@@ -138,15 +138,36 @@ describe('北辰教师面板', () => {
       'https://api.beichenapi.com/v1?foo=1',
       'https://api.beichenapi.com/#here',
     ]
-    providers = [...supported, ...unsupported].map((base_url, i) => ({ ...provider, id: String(i), name: base_url, base_url }))
+    providers = [...supported, ...unsupported].map((base_url, i) => ({
+      ...provider, id: String(i), name: base_url, base_url, credentials: [], credential_configured: false,
+    }))
     widget = mount(TeacherProviders)
     await flushPromises()
-    const rowsWithButton = widget.findAll('article').filter(row => row.findAll('button').some(item => item.text() === '同步与对账'))
+    const rows = widget.findAll('article')
+    const rowsWithButton = rows.filter(row => row.findAll('button').some(item => item.text() === '同步与对账'))
     expect(rowsWithButton.map(row => row.get('strong').text())).toEqual(supported)
+    expect(rows.filter(row => row.text().includes('待配置 Key')).map(row => row.get('strong').text())).toEqual(supported)
+  })
+
+  it('北辰零 Key 时显示待配置提示，保留停用状态和对账入口', async () => {
+    providers = [{ ...provider, credentials: [], credential_configured: false, status: 'inactive' }]
+    request.mockImplementation(async url => {
+      if (url === '/api/v1/teacher/providers') return reply(providers)
+      if (url.startsWith(`${path}?day=`)) return reply({ datasets: [], models: [], comparison: [] })
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    const dialog = await openPanel()
+    const row = widget!.get('article')
+    expect(row.text()).toContain('0 个启用 Key / 0 个 Key')
+    expect(row.text()).toContain('待配置 Key')
+    expect(row.get('.status-badge').classes()).toContain('inactive')
+    expect(dialog.text()).toContain('暂无同步记录')
   })
 
   it('展示同步状态，手动同步并按所选日期展示对账结果', async () => {
     const dialog = await openPanel()
+    expect(widget!.get('article').text()).not.toContain('待配置 Key')
     expect(dialog.text()).toContain('模型目录')
     expect(dialog.text()).toContain('计费倍率')
     expect(dialog.text()).toContain('暂时无法读取倍率')

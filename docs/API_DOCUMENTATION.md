@@ -398,7 +398,7 @@ data: {"revision":"01K2..."}
 {"email":"teacher2@example.com"}
 ```
 
-显式迁移会预置北辰。教师在现有 `GET /api/v1/teacher/providers` 列表即可发现该记录。首次预置显示 `status: inactive`、`credential_configured: false`，凭据数为 0。对账概览可打开，此时同步状态、报价和日账列表均为空。教师手动创建其他供应商仍使用以下接口。
+显式迁移会预置北辰。教师在现有 `GET /api/v1/teacher/providers` 列表即可发现该记录。首次预置返回 `status: active`、`credential_configured: false`，凭据数为 0。教师模型列表和自动选择供应商的目录接口仅使用至少有一把启用凭据的启用供应商。对账概览可打开，此时同步状态、报价和日账列表均为空。教师手动创建其他供应商仍使用以下接口。
 
 供应商创建：
 

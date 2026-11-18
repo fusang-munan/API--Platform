@@ -26,5 +26,5 @@ BEGIN
   -- Migration 0008 already moved secrets out of providers. Leave credentials empty.
   INSERT INTO providers (id, name, base_url, status, created_at, updated_at)
   VALUES ('01a1ee54-fd9a-7028-9fb2-24d9989952a9', provider_name,
-    'https://api.beichenapi.com', 'inactive', now(), now());
+    'https://api.beichenapi.com', 'active', now(), now());
 END $$;
