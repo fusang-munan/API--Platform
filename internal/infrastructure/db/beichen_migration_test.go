@@ -14,6 +14,23 @@ import (
 )
 
 func TestBeichenMigrationUpgrade(t *testing.T) {
+	ctx, conn := openMigrationTestDB(t)
+	applyMigrationTestBaseline(t, ctx, conn, "0029")
+
+	const callID = "9f2c01a6-a2c0-4b8c-9008-de2e90bfb8bb"
+	if _, err := conn.ExecContext(ctx, `
+INSERT INTO gateway_calls(id, request_id, month, organization_id, project_id, user_id,
+  api_key_id, model_id, organization_name, project_name, user_name, api_key_name,
+  model_name, protocol, request_path, multiplier_milli, credit_milli, billing_state, created_at)
+VALUES ($1, 'legacy-call', now(), $1, $1, $1, $1, $1,
+  'org', 'project', 'user', 'key', 'model', 'openai', '/v1/chat/completions', 1000, 1000, 'charged', now())`, callID); err != nil {
+		t.Fatal(err)
+	}
+	verifyBeichenMigrationUpgrade(t, ctx, conn, callID)
+}
+
+func openMigrationTestDB(t *testing.T) (context.Context, *sql.DB) {
+	t.Helper()
 	dsn := os.Getenv("NEBULA_TEST_POSTGRES")
 	if dsn == "" {
 		t.Skip("NEBULA_TEST_POSTGRES requires a disposable local nebula_test database")
@@ -29,25 +46,43 @@ func TestBeichenMigrationUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatal("could not open test database")
 	}
-	defer conn.Close()
+	t.Cleanup(func() { _ = conn.Close() })
 	conn.SetMaxOpenConns(1)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	empty, err := databaseIsEmpty(ctx, conn)
 	if err != nil || !empty {
 		t.Fatalf("expected a new empty test database, empty=%v, err=%v", empty, err)
 	}
+	schema := pgx.Identifier{"migration_" + strings.ReplaceAll(uuid.NewString(), "-", "")}.Sanitize()
+	if _, err := conn.ExecContext(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := conn.ExecContext(cleanupCtx, "DROP SCHEMA "+schema+" CASCADE"); err != nil {
+			t.Errorf("drop isolated schema: %v", err)
+		}
+	})
+	if _, err := conn.ExecContext(ctx, "SET search_path TO "+schema+", public"); err != nil {
+		t.Fatal(err)
+	}
+	return ctx, conn
+}
+
+func applyMigrationTestBaseline(t *testing.T, ctx context.Context, conn *sql.DB, before string) {
+	t.Helper()
 	if _, err := conn.ExecContext(ctx, "CREATE TABLE schema_migrations(version varchar(128) PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"); err != nil {
 		t.Fatal(err)
 	}
-
 	entries, err := migrationFiles.ReadDir("migrations")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".sql") || name >= "0029" {
+		if entry.IsDir() || !strings.HasSuffix(name, ".sql") || name >= before {
 			continue
 		}
 		migration, err := migrationFiles.ReadFile("migrations/" + name)
@@ -61,16 +96,10 @@ func TestBeichenMigrationUpgrade(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
 
-	const callID = "9f2c01a6-a2c0-4b8c-9008-de2e90bfb8bb"
-	if _, err := conn.ExecContext(ctx, `
-INSERT INTO gateway_calls(id, request_id, month, organization_id, project_id, user_id,
-  api_key_id, model_id, organization_name, project_name, user_name, api_key_name,
-  model_name, protocol, request_path, multiplier_milli, credit_milli, billing_state, created_at)
-VALUES ($1, 'legacy-call', now(), $1, $1, $1, $1, $1,
-  'org', 'project', 'user', 'key', 'model', 'openai', '/v1/chat/completions', 1000, 1000, 'charged', now())`, callID); err != nil {
-		t.Fatal(err)
-	}
+func verifyBeichenMigrationUpgrade(t *testing.T, ctx context.Context, conn *sql.DB, callID string) {
+	t.Helper()
 	for i := 0; i < 2; i++ {
 		if err := Migrate(ctx, conn); err != nil {
 			t.Fatalf("apply upgrade %d: %v", i+1, err)

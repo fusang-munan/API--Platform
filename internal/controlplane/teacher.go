@@ -554,8 +554,7 @@ func shouldSyncProviderCatalog(before, after *ent.Provider, input ProviderInput)
 }
 
 func (s *Service) TeacherModels(ctx context.Context) ([]ModelView, error) {
-	activeProviders, err := s.db.Provider.Query().
-		Where(provider.StatusEQ(provider.StatusActive)).
+	activeProviders, err := s.providersWithActiveCredentials().
 		Order(ent.Asc(provider.FieldName)).
 		All(ctx)
 	if err != nil {

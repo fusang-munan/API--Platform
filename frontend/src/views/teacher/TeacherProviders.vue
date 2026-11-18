@@ -275,6 +275,7 @@ onMounted(load)
           <div>
             <strong>{{ p.name }}</strong>
             <p class="muted">{{ p.base_url }} · {{ activeKeyCount(p) }} 个启用 Key / {{ (p.credentials ?? []).length }} 个 Key</p>
+            <span v-if="isBeichenProvider(p.base_url) && !p.credentials?.some(key => key.credential_configured)" class="chip">待配置 Key</span>
             <div v-if="p.credentials?.length" class="chip-list">
               <span v-for="key in p.credentials" :key="key.id" class="chip">
                 {{ key.label }} · {{ key.status === 'active' ? '启用' : '停用' }}

@@ -140,12 +140,13 @@
 | `id` | uuid | 否 | UUIDv7 | 主键 |
 | `name` | citext | 否 | - | 最大 128 字符，全局唯一 |
 | `base_url` | varchar(2048) | 否 | - | 上游基础 URL |
-| `credential_ciphertext` | bytea | 否 | - | 使用配置主密钥加密的一份供应商凭据 |
 | `status` | enum | 否 | `active` | `active/inactive` |
 | `created_at` | timestamptz | 否 | 当前时间 | 不可变 |
 | `updated_at` | timestamptz | 否 | 当前时间 | 更新时刷新 |
 
 索引：唯一索引 `name`；普通索引 `status`。不保存接口类型、超时、自定义 Header JSON。
+
+迁移 0008 已将加密凭据移至 `provider_credentials`，一条供应商记录可以暂时没有凭据。迁移 0037 仅在缺少控制台能识别的北辰记录时，插入名称为「北辰」、地址为 `https://api.beichenapi.com` 的启用行。同名已被占用时给新行加数字后缀。已有北辰按地址识别并保留其名称、状态、凭据与绑定。该迁移不创建凭据、模型、绑定或账单。
 
 ### 4.8 `models`
 
