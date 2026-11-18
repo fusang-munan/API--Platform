@@ -1,0 +1,32 @@
+name: Lab backend TLS integration
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/lab-backend-tls.yml'
+      - 'scripts/test-lab-backend-tls.sh'
+      - 'compose.yaml'
+      - 'compose.local.yaml'
+      - 'Dockerfile'
+      - 'VERSION'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/**'
+      - 'internal/**'
+
+permissions:
+  contents: read
+
+jobs:
+  backend-tls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test the school backend with disposable databases
+        run: bash scripts/test-lab-backend-tls.sh
