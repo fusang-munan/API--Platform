@@ -5,12 +5,14 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/starprince1234/Nebula-api/internal/domain"
 )
 
 func TestBeichenLedgerPostgres(t *testing.T) {
@@ -215,6 +217,64 @@ func TestBeichenLedgerPostgres(t *testing.T) {
 			}
 		}
 		g3, bill := makeReceipt(route, uuid.New(), 501, 91)
+		assertStudentReceipt := func(requestID, state, credits, cost string, applied *bool) {
+			t.Helper()
+			got, err := store.StudentCallReceipt(ctx, student, requestID)
+			if err != nil || got.RequestID != requestID || got.ModelID != "model" ||
+				got.Channel != "北辰" || got.BillingState != state {
+				t.Fatalf("receipt identity/state = %+v, err %v", got, err)
+			}
+			checkDecimal := func(field string, got *string, want string) {
+				t.Helper()
+				if (want == "" && got != nil) || (want != "" && (got == nil || *got != want)) {
+					t.Errorf("%s: want %q (empty means null), got %v", field, want, got)
+				}
+			}
+			checkDecimal("charged_credits", got.ChargedCredits, credits)
+			checkDecimal("actual_cost", got.ActualCost, cost)
+			if (applied == nil && got.ReceiptApplied != nil) ||
+				(applied != nil && (got.ReceiptApplied == nil || *got.ReceiptApplied != *applied)) {
+				t.Errorf("unexpected receipt_applied: %v", got.ReceiptApplied)
+			}
+		}
+		assertNotFound := func(userID uuid.UUID, requestID string) {
+			t.Helper()
+			_, err := store.StudentCallReceipt(ctx, userID, requestID)
+			if domain.ErrorCode(err) != domain.CodeNotFound || err.Error() != "call receipt not found" {
+				t.Fatalf("expected uniform not found, got %v", err)
+			}
+		}
+		assertStudentReceipt(g3.RequestID, "pending_review", "", "", nil)
+		assertNotFound(uuid.New(), g3.RequestID)
+		assertNotFound(student, uuid.NewString())
+		inconsistent := reserve()
+		assertNotFound(student, inconsistent.RequestID)
+		otherStudent := uuid.New()
+		ledgerTestExec(t, ctx, isolated, `UPDATE gateway_calls SET request_id=$2, user_id=$3,
+			beichen_dispatch_kind='beichen' WHERE id=$1`, inconsistent.CallID, g3.RequestID, otherStudent)
+		assertNotFound(otherStudent, g3.RequestID)
+		assertStudentReceipt(g3.RequestID, "pending_review", "", "", nil)
+		ledgerTestExec(t, ctx, isolated, `UPDATE gateway_calls SET user_id=$2 WHERE id=$1`, inconsistent.CallID, student)
+		assertNotFound(student, g3.RequestID)
+		ledgerTestExec(t, ctx, isolated, `UPDATE gateway_calls SET request_id=$2 WHERE id=$1`,
+			inconsistent.CallID, inconsistent.RequestID)
+		t.Run("student receipt uses lookup index", func(t *testing.T) {
+			tx, err := isolated.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			// The small fixture otherwise makes a sequential scan cheaper.
+			if _, err := tx.ExecContext(ctx, "SET LOCAL enable_seqscan = off"); err != nil {
+				t.Fatal(err)
+			}
+			var plan string
+			err = tx.QueryRowContext(ctx, "EXPLAIN (FORMAT JSON) "+studentCallReceiptSQL,
+				student, g3.RequestID).Scan(&plan)
+			if err != nil || !strings.Contains(plan, "gateway_calls_student_receipt_lookup") {
+				t.Fatalf("expected receipt lookup index: %v\n%s", err, plan)
+			}
+		})
 		wrong := bill
 		wrong.APIKeyID = 92
 		apply(route.CredentialID, wrong, false)
@@ -247,6 +307,8 @@ func TestBeichenLedgerPostgres(t *testing.T) {
 			t.Fatalf("expected one booking from concurrent replays, got %d", bookings)
 		}
 		check(g3.CallID, "charged", "0.014352")
+		applied := true
+		assertStudentReceipt(g3.RequestID, "charged", "0.014352", "0.00014352", &applied)
 		gm1, second := makeReceipt(other, uuid.New(), bill.RowID, 92)
 		second.ActualCost, second.InputTokens, second.OutputTokens, second.CacheReadTokens = "0.00001136", 59, 3, 0
 		apply(other.CredentialID, second, false)
@@ -291,6 +353,8 @@ func TestBeichenLedgerPostgres(t *testing.T) {
 			t.Fatalf("already-charged difference was not archived: %v", err)
 		}
 		check(estimated.CallID, "charged", "0.0005")
+		applied = false
+		assertStudentReceipt(estimated.RequestID, "charged", "0.0005", "0.00014352", &applied)
 
 		stale, old := makeReceipt(route, uuid.New(), 504, 91)
 		ledgerTestExec(t, ctx, isolated, `UPDATE provider_credentials SET updated_at=updated_at+interval '1 second' WHERE id=$1`, route.CredentialID)

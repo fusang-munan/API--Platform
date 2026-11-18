@@ -2,7 +2,15 @@
 
 学校证书通知使用 `Lab backend TLS integration` 中的本地 SMTP 接收器验收。通过维护 HTTPS 提交单份已批准申请，验证邮件只含实际版本、入口和监听证书的指纹，重复请求和后端重建均不会再发。202 表示已处理公开请求；若尚未收信，请先检查收件箱和垃圾箱、学校发件地址、批准的版本及到期时间。勿重复使用注册、邀请或密码找回流程查询投递。
 
+## 查询某一笔学生扣分
+
+保存学校网关返回的 `X-Request-ID`，用发起调用的学生账号查询 `GET /api/v1/student/usage/calls/{request_id}`。404 时核对账号、请求编号和实际供应商；本人重复使用编号也会得到 404。收到 2xx 推理响应后仍可能暂时没有北辰流水，保留原编号稍后重查即可。一次超时也可能已入账，应先读同一编号的回执。金额为 `null` 表示该项尚无数字可核对。
+
+执行 `go test ./internal/usage ./internal/api/http -run StudentCallReceipt -count=1` 检查回执、输入限制和匿名鉴权。配置隔离 PostgreSQL 后，`go test ./internal/usage -run TestBeichenLedgerPostgres -count=1 -v` 同时覆盖本人范围、编号歧义及精确金额。
+
 ## 学校网页能打开，维护用 HTTPS 握手失败
+
+0.12.0 起实验室配置默认关闭单次证书邮件批准。后续获同意的通知可在发布时配置 `LAB_CERTIFICATE_NOTICE_REQUEST_SHA256` 和 `LAB_CERTIFICATE_NOTICE_EXPIRES_AT`，两项为空时通知路径返回 404。维护 HTTPS 和正常登录可以继续使用。
 
 学校自动更新由校内程序执行。先访问 `/.well-known/nebula-release.txt`。0.10.3 起前端镜像会返回构建时的版本；旧镜像的网页回退规则会返回 HTML。该值只能用来识别镜像。HTTPS 的证书和受保护接口须另行检查。
 

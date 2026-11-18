@@ -242,6 +242,10 @@ func (s *Service) StudentUsage(ctx context.Context, userID uuid.UUID, month time
 	return s.usage.StudentUsage(ctx, userID, month)
 }
 
+func (s *Service) StudentCallReceipt(ctx context.Context, userID uuid.UUID, requestID string) (usage.StudentCallReceipt, error) {
+	return s.usage.StudentCallReceipt(ctx, userID, requestID)
+}
+
 func (s *Service) MentorProjectUsage(ctx context.Context, mentorID, projectID uuid.UUID, month time.Time) (usage.ProjectUsage, error) {
 	responsible, err := s.db.ProjectMember.Query().Where(projectmember.ProjectIDEQ(projectID), projectmember.UserIDEQ(mentorID)).Exist(ctx)
 	if err != nil {

@@ -603,6 +603,10 @@ Anthropic-compatible 示例：
 
 学生使用 `GET /api/v1/student/usage?month=YYYY-MM` 查看每个 API Key 的模型 credit 分解。
 
+已登录的学生使用 `GET /api/v1/student/usage/calls/{request_id}` 读取自己的一笔北辰调用。使用网关响应的 `X-Request-ID`，按一个 URL 路径段编码。返回 `request_id`、`model_id`、`channel`（北辰）、`billing_state`、`charged_credits`、`actual_cost`、`receipt_applied`。状态为 `pending`、`pending_review`、`charged` 或 `released`。校内实际扣分与北辰余额单位均为十进制字符串。只有已扣时才返回扣分，已确认零用字符串 `"0"` 表示。上游金额及流水标记在尚未匹配时为 `null`。标记为 `true` 表示流水补记扣款，为 `false` 表示流水与已处置的调用关联。核账时比较 `charged_credits` 和 `actual_cost × 100`。具体上游渠道可凭北辰流水编号与该渠道的 Key 数字 ID 独立确认。
+
+匿名返回 401，其他身份返回 403。在本人范围内找不到唯一、可读的北辰调用时统一返回 404，包含本人请求编号重用、他人的调用和其他供应商的调用。
+
 导师使用 `GET /api/v1/mentor/projects/{project_id}/usage` 查看项目额度分配、成员 Key 进度与实际开销；`GET /api/v1/mentor/call-logs` 和 `GET /api/v1/mentor/input-monitor` 使用游标分页与项目范围授权。完整输入仅在详情读取时返回并写访问审计。
 
 导师可通过 `PATCH /api/v1/mentor/api-keys/{api_key_id}/monthly-credit-quota` 调整负责项目内 Key 的月额度，请求包含 `monthly_credits` 与必填 `reason`。

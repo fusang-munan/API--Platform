@@ -50,6 +50,7 @@ func TestRegistersControlPlaneAndGatewayRoutes(t *testing.T) {
 		"POST /api/v1/student/models",
 		"POST /api/v1/student/models/remove",
 		"GET /api/v1/student/usage",
+		"GET /api/v1/student/usage/calls/:request_id",
 		"POST /api/v1/student/api-keys",
 		"GET /api/v1/student/api-keys",
 		"GET /api/v1/student/api-keys/:api_key_id",
@@ -129,6 +130,16 @@ func TestRegistersControlPlaneAndGatewayRoutes(t *testing.T) {
 		if _, exists := routes[route]; !exists {
 			t.Fatalf("expected route %s is not registered", route)
 		}
+	}
+}
+
+func TestStudentCallReceiptRequiresAuthentication(t *testing.T) {
+	server := NewServer(nil, nil, nil, nil, HealthDependencies{}, Config{})
+	w := httptest.NewRecorder()
+	server.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet,
+		"/api/v1/student/usage/calls/018a0000-0000-7000-8000-000000000001", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d, want 401", w.Code)
 	}
 }
 
