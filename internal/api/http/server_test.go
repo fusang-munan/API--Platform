@@ -102,6 +102,8 @@ func TestRegistersControlPlaneAndGatewayRoutes(t *testing.T) {
 		"POST /api/v1/teacher/providers/:provider_id/reset-catalog",
 		"GET /api/v1/teacher/providers/:provider_id/beichen",
 		"POST /api/v1/teacher/providers/:provider_id/beichen/sync",
+		"GET /api/v1/teacher/providers/:provider_id/beichen/access/:credential_id",
+		"PATCH /api/v1/teacher/providers/:provider_id/beichen/access/:credential_id",
 		"PATCH /api/v1/teacher/providers/:provider_id/beichen/price",
 		"POST /api/v1/teacher/providers/:provider_id/beichen/import",
 		"GET /api/v1/teacher/provider-catalog-candidates",

@@ -174,9 +174,13 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 ### 北辰接入验收
 
+逐笔核账使用已授权的用户面板与推理响应。选择已配数字 Key ID 的渠道，保存普通 HTTP 响应上的 `X-Client-Request-ID`。检查北辰账号的逐笔明细是否有同把 Key、同模型、时间相符并带 `client:<该编号>` 的记录。缺少可归属明细时保持待核。WebSocket 的响应编号及日汇总不具备这一关联含义。北辰页面显示版本 v0.2.15，可对照该版本的[请求头生成](https://github.com/Wei-Shaw/sub2api/blob/v0.2.15/backend/internal/server/middleware/client_request_id.go)和[账单编号选择](https://github.com/Wei-Shaw/sub2api/blob/v0.2.15/backend/internal/service/gateway_usage_billing.go)。
+
 1. 在一次性测试数据库上应用迁移并重复执行一次。测试数据库必须新建、只监听回环地址、数据库名为 `nebula_test`。设置 `NEBULA_TEST_POSTGRES` 指向该测试库并使用 `sslmode=disable`，执行 `go test ./internal/infrastructure/db -run TestBeichenMigrationUpgrade -count=1 -v`。
 2. 用虚构凭据和模拟上游执行 `go test ./internal/beichen ./internal/dataplane ./internal/usage ./internal/api/http`。覆盖流式回填、零和缺失、用量中断、同步结果及教师端权限。控制台执行 `npm run typecheck` 和 `npm run test`。
-   - 贯通验证使用 `NEBULA_TEST_POSTGRES=postgres://nebula_qa@127.0.0.1:55439/nebula_test?sslmode=disable`，执行 `go test ./internal/dataplane -run '^TestBeichenPostgresGatewayReconciliation$' -count=1 -v`。测试在独立模式内验证模拟流式响应、网关入账、按次扣额度和北辰账单对比。数据库和角色必须是专用的本机测试实例。
+   - 设置专用本地测试数据库的 `NEBULA_TEST_POSTGRES` 后，执行 `go test ./internal/dataplane -run '^TestBeichenPostgresGatewayReconciliation$' -count=1 -v`。用例分别重放 Responses 返回的原始用量字段和两笔已确认账单。GM1 的未命中输入 59、命中 0、输出 3，乘 0.08 后实付 0.00001136 单位，应扣 0.001136 积分。G3 的未命中输入 129、命中 4096、写入 0、输出 5，乘 0.2 后实付 0.00014352 单位，应扣 0.014352 积分。两笔共 0.015488 积分。日汇总仅用于核对，不能据此分摊给学生。
+   - 运行 `go test ./internal/usage -run TestBeichenLedgerPostgres -count=1 -v` 检查缺明细、重复回执和小额累计。`go test ./internal/beichen -run TestReceiptSweepPostgresG3 -count=1 -v` 覆盖后台分页读取模拟北辰流水、在 PostgreSQL 中关联请求和实际扣分。看到「待核账」时先查看同一把凭据、同一模型在调用时刻的报价，再检查最终回执是否给出各项用量。回包缺失的缓存字段不能自动填零。多请求共享一个日账时须保留待核状态。
+   - 采价异常时，在教师「自动采价授权」核对分组及面板读取凭据，然后执行手动同步。后台用该组报价与推理 Key 的模型目录取交集。核对授权到期、模型下架及高峰时段切换可运行 `go test ./internal/beichen -run Panel -count=1 -v`。PostgreSQL 用例需使用专用的本地测试库。
 3. 校方在加密管理入口录入专用北辰凭据后，教师页按凭据执行手动同步，再用各待验收渠道的一次短文本调用核对实际的输入、输出、缓存明细与账单。对比时使用同一凭据、模型和北京时间日期。
 4. 若模型可见但没有倍率，分别检查计费接口状态和供应商开放范围。若缺少可确认报价或单日用量，使用教师面板的 CSV 导入。含未结算、断流或缺失用量的对账区间需要查看采集状态；当天上游账单可能晚于请求完成。
 5. 如果模型调用正常而目录、倍率和用量同时报网络超时，检查后端的 `HTTPS_PROXY`、`NO_PROXY` 与服务器实际出网路线，再在教师页手动同步。运行 `go test ./internal/beichen -run TestSyncUsesConfiguredHTTPSProxy -count=1` 可用本机模拟代理验证北辰同步走同一出网路线。代理只收到建立 HTTPS 隧道的请求，北辰认证头随隧道里的 HTTPS 请求发送。

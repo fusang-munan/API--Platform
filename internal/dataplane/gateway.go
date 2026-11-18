@@ -15,7 +15,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -154,7 +153,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	prompt, promptSource := extractInputSnapshot(r.URL.Path, r.Header.Get("Content-Type"), replay)
 	prompt, usageCorrelation := turnCorrelation(prompt, extractCallCorrelation(r.URL.Path, r.Header.Get("Content-Type"), replay, r.Header), uuid.Nil)
-	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, routes[0].Binding.ModelID, requestIDFromContext(r), string(adapter), r.URL.Path, prompt, promptSource, usageCorrelation)
+	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, routes[0].Binding.ModelID, requestIDFromContext(r), string(adapter), r.URL.Path, prompt, promptSource, usageCorrelation, beichenReservationRoutes(routes)...)
 	if reserveErr != nil {
 		var quotaErr *usage.QuotaError
 		if errors.As(reserveErr, &quotaErr) {
@@ -379,6 +378,13 @@ func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, ca
 	}
 	request.Header = original.Header.Clone()
 	removeHopByHop(request.Header)
+	if isBeichenAPI(candidate.Provider.BaseURL) {
+		for header := range request.Header {
+			if strings.EqualFold(header, beichenReceiptHeader) {
+				delete(request.Header, header)
+			}
+		}
+	}
 	request.Header.Del("Content-Length")
 	request.Header.Del("Authorization")
 	request.Header.Del("x-api-key")
@@ -438,18 +444,19 @@ func (g *Gateway) serveRealtimeWebSocket(w http.ResponseWriter, r *http.Request)
 		query.Set("model", candidate.Binding.UpstreamModelName)
 		target, err := joinUpstreamURL(candidate.Provider.BaseURL, r.URL.Path, query.Encode())
 		if err != nil {
+			if isBeichenAPI(candidate.Provider.BaseURL) {
+				writeOpenAIError(w, http.StatusBadGateway, "server_error", "upstream_unavailable", "Unable to prepare the Realtime upstream.", "")
+				return
+			}
 			continue
 		}
 		target = strings.Replace(target, "https://", "wss://", 1)
 		target = strings.Replace(target, "http://", "ws://", 1)
-		headers := r.Header.Clone()
-		removeHopByHop(headers)
-		headers.Del("Authorization")
-		headers.Del("Sec-WebSocket-Key")
-		headers.Del("Sec-WebSocket-Version")
-		headers.Del("Sec-WebSocket-Extensions")
-		headers.Del("Sec-WebSocket-Protocol")
-		headers.Set("Authorization", "Bearer "+candidate.Credential)
+		headers := upstreamWebSocketHeaders(r.Header, candidate.Credential)
+		if isBeichenAPI(candidate.Provider.BaseURL) {
+			g.serveBeichenRealtime(w, r, candidate, key.ID, target, headers)
+			return
+		}
 		upstream, _, err = g.dialer.DialContext(r.Context(), target, headers)
 		if err == nil {
 			selected = candidate
@@ -530,11 +537,18 @@ func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request
 	}
 	defer upstream.Close()
 	upstream.SetReadLimit(g.config.MaxRequestBytes)
+	if isBeichenAPI(selected.Provider.BaseURL) && messageType != websocket.TextMessage {
+		return
+	}
 	wsPrompt, wsPromptSource := extractPromptFromJSON(firstMessage)
 	wsPrompt, usageCorrelation := turnCorrelation(wsPrompt, extractCallCorrelationFromJSON(firstMessage), uuid.Nil)
-	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, selected.Binding.ModelID, requestIDFromContext(r), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, usageCorrelation)
+	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, selected.Binding.ModelID, requestIDFromContext(r), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, usageCorrelation, beichenReservationRoutes([]route{selected})...)
 	if reserveErr != nil {
 		_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "rate_limit_error", "code": "quota_exceeded", "message": "The API key or project credit quota is exhausted."}})
+		return
+	}
+	if isBeichenAPI(selected.Provider.BaseURL) {
+		g.proxyBeichenWebSocket(r.Context(), client, upstream, selected, key.ID, reservation, rewritten)
 		return
 	}
 	if err := upstream.WriteMessage(messageType, rewritten); err != nil {
@@ -743,29 +757,42 @@ func (g *Gateway) authenticateRealtime(r *http.Request) (*ent.APIKey, error) {
 	).Only(r.Context())
 }
 
-func proxyWebSockets(left, right *websocket.Conn) {
-	errs := make(chan error, 2)
-	var once sync.Once
-	copyFrames := func(dst, src *websocket.Conn) {
+func proxyWebSockets(left, right *websocket.Conn, observeUpstream func(int, []byte), renewLease func()) {
+	done := make(chan struct{}, 2)
+	copyFrames := func(dst, src *websocket.Conn, observe func(int, []byte)) {
+		defer func() { done <- struct{}{} }()
 		for {
 			messageType, data, err := src.ReadMessage()
 			if err != nil {
-				errs <- err
 				return
 			}
+			if observe != nil {
+				observe(messageType, data)
+			}
 			if err := dst.WriteMessage(messageType, data); err != nil {
-				errs <- err
 				return
 			}
 		}
 	}
-	go copyFrames(right, left)
-	go copyFrames(left, right)
-	<-errs
-	once.Do(func() {
-		_ = left.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
-		_ = right.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
-	})
+	go copyFrames(right, left, nil)
+	go copyFrames(left, right, observeUpstream)
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			renewLease()
+		case <-done:
+			deadline := time.Now().Add(time.Second)
+			message := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+			_ = left.WriteControl(websocket.CloseMessage, message, deadline)
+			_ = right.WriteControl(websocket.CloseMessage, message, deadline)
+			_ = left.Close()
+			_ = right.Close()
+			<-done
+			return
+		}
+	}
 }
 
 func supportedRoute(method, requestPath string) bool {

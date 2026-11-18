@@ -8,6 +8,23 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 )
 
+func TestBeichenResponsesTerminalUsageDoesNotInheritEarlierCacheCounts(t *testing.T) {
+	observer := sseObserver{adapter: modelbinding.AdapterOpenaiResponses, beichen: true}
+	observer.observe([]byte(`data: {"type":"response.created","response":{"id":"resp_fixture","usage":{"input_tokens":59,"input_tokens_details":{"cached_tokens":17,"cache_write_tokens":0}}}}
+
+data: {"type":"response.completed","response":{"id":"resp_fixture","status":"completed","usage":{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cached_tokens":0}}}}
+
+data: {"type":"response.completed","response":{"id":"other","usage":{"input_tokens":100,"output_tokens":5}}}
+
+`))
+	metrics := observer.metrics
+	if !observer.terminal || observer.incomplete || metrics.UpstreamResponseID != "resp_fixture" ||
+		metrics.CacheHitTokens == nil || *metrics.CacheHitTokens != 0 || metrics.CacheWriteTokens != nil ||
+		metrics.CompletionTokens == nil || *metrics.CompletionTokens != 3 {
+		t.Fatalf("unexpected terminal SSE usage: %+v", metrics)
+	}
+}
+
 func TestSSEOverloadCanRetryOnlyBeforeOutput(t *testing.T) {
 	const overload = "event: error\r\ndata: {\"error\":{\"code\":\"server_is_overloaded\"}}\r\n\r\n"
 	observer := observeSSE(modelbinding.AdapterOpenaiResponses, []byte(overload))

@@ -2,7 +2,7 @@
 
 ## 1. 文档范围与状态
 
-`0.7.0` credits 字段统一返回最多三位小数的定点字符串，usage/call/input DTO 统一使用 snake_case。学生申请、导师 approve、老师 approve 的 `requested_monthly_credits` / `monthly_credits` 均为当前必填契约，不提供旧 approve body 兼容。
+额度设置以千分之一积分为单位。从 `0.10.0` 开始，北辰用量和调用金额返回精确十进制字符串，可能超过三位小数。待核账调用的状态值为 `pending_review`，计入已扣金额的部分为零。usage/call/input DTO 使用 snake_case。学生申请、导师 approve、老师 approve 的 `requested_monthly_credits` / `monthly_credits` 均为必填字段。
 
 导师项目用量响应同时返回顶层 `free_models` 项目汇总和 `members[].free_models` 成员明细；两者的每个模型均包含 `id`、`name`、固定 `credits: "0.000"` 与 `calls`。同一模型的项目 `calls` 必须等于全部成员对应 `calls` 之和。
 
@@ -378,6 +378,7 @@ data: {"revision":"01K2..."}
 | Binding | PATCH | `/api/v1/teacher/model-bindings/{binding_id}` | 修改上游名、adapter、priority 或状态 |
 | 北辰同步与对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen?day=YYYY-MM-DD` | 按北京时间查看同步状态、模型报价和日对账 |
 | 北辰手动同步 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/sync` | 执行一次有时限的同步，页面按数据类别显示各自结果 |
+| 北辰采价授权 | GET / PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/access/{credential_id}` | 读取配置状态，设置、轮换或停用该凭据的面板读取授权 |
 | 北辰校内试算价 | PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/price` | 指定模型手动设价或恢复跟随 |
 | 北辰报价或账单导入 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/import` | 按凭据导入受支持的 CSV |
 | Key 终审 | GET | `/api/v1/teacher/api-key-reviews` | 只列出 `pending_teacher` 摘要 |
@@ -409,11 +410,13 @@ data: {"revision":"01K2..."}
 
 `credential` 只作为写入字段；服务端加密后保存，所有读取响应只返回 `credential_configured: true/false`。
 
-北辰接口限老师访问，凭据必须属于指定的北辰供应商。更换北辰 Key 时新增一条凭据并重新绑定，以保留原 Key 的账单归属。手动同步接受空请求体或 `{}`。概览中的 `datasets`、`models`、`comparison` 分别提供同步状态、报价和本日对账。无法确认的数字使用 `null`，显式零使用 `0`。成本字段以百万分之一美元表示，`trial_credit_milli` 以千分之一校内 credit 表示。
+北辰接口限老师访问，凭据必须属于指定的北辰供应商。更换北辰 Key 时新增一条凭据并重新绑定，以保留原 Key 的账单归属。手动同步接受空请求体或 `{}`。概览中的 `datasets`、`models`、`comparison` 分别提供同步状态、报价和当日对账。成本的 `_micros` 字段以百万分之一北辰余额单位表示。`trial_credits` 和 `charged_credits` 用十进制字符串分别返回试算与实际结算积分，`pending_review_calls` 给出待核账笔数。未知值为 `null`，可确认的零单独返回。原有 `trial_credit_milli` 保留千分之一积分精度。
 
-价格请求包含 `credential_id`、`model`、`mode`。设置 `manual` 时同时提供 `rates`，其中 `input`、`output` 必填，`cache_read`、`cache_write` 可空，四项均为每百万 Token 的价格，以百万分之一校内 credit 表示。恢复 `follow` 时省略 `rates`。跟随试算采用 1 美元换算 1 校内 credit。
+采价授权 GET 返回 `configured` 以及已配置的 `group_id`、`upstream_key_id`。PATCH 启用或轮换时提交 `enabled: true`、正整数 `group_id` 和写入专用字段 `token`。逐笔账单匹配还需填写北辰 Key 的数字编号 `upstream_key_id`，可省略以仅同步报价。停用时只提交 `{"enabled":false}`。面板授权与推理 Key 分开保管。学校 HTTPS 入口可供教师配置，改组或撤权会使旧授权下的报价失效。
 
-导入请求包含 `credential_id`、`kind`、`csv`。报价表头为 `model,input,output,cache_read,cache_write`，整数单位为微美元/百万 Token。用 `prices` 导入已应用倍率的最终报价，用 `prices_base` 导入需乘北辰倍率的已确认基础报价。日用量 `usage` 表头为 `date,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros`，日期为北京时间，缓存和实际扣款留空表示缺失。
+价格请求包含 `credential_id`、`model`、`mode`。设置 `manual` 时同时提供 `rates`，其中 `input`、`output` 必填，`cache_read`、`cache_write` 可空，四项均为每百万 Token 的试算价格，以百万分之一校内积分表示。恢复 `follow` 时省略 `rates`。跟随试算和学生正式扣费均以 1 北辰余额单位折合 100 积分；手填校内试算价只影响试算列。
+
+导入请求包含 `credential_id`、`kind`、`csv`。报价表头为 `model,input,output,cache_read,cache_write`，价格为每百万 Token 的百万分之一北辰余额单位。用 `prices` 导入已应用倍率的最终报价，用 `prices_base` 导入需乘北辰倍率的已确认基础报价。日用量 `usage` 表头为 `date,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros`，日期为北京时间，缓存和实际扣款留空表示缺失。
 
 `usage_export` 接受北辰用量页的逐笔导出原始表头，并要求 `full_day_confirmed: true`。先在北辰选择一把 Key 和一个已结束的完整北京时间账日，取消模型、请求类别等可能使记录不完整的筛选，再导出。每行 `Time` 须含时区，换算出的北京时间日期须一致。每行 `API Key Name` 须与所选供应商凭据标签匹配。行数和文件大小仍受 CSV 限制。服务按模型汇总 Token 和以裸十进制表示的美元实付 `Billed Cost`，再统一换算成微美元。某字段在任一记录中缺失时，该模型日汇总的字段保持为空。记录内的 IP 和请求细节不入库。
 
@@ -548,7 +551,7 @@ data: {"revision":"01K2..."}
 
 - 保持协议原生 request/response、状态码、SSE 事件、multipart 文件和 WebSocket frame，不使用控制面 envelope。每类协议只选择同协议 adapter，不做跨协议 DTO 转换。
 - `/v1/responses/compact` 是独立无状态 compact：网关不得裁剪返回 `output`，也不得解析或替换 opaque `encrypted_content`；Codex CLI 使用的 tools、reasoning、text、prompt cache 与 service tier 字段仅改写顶层 model。
-- Responses 与 Realtime WebSocket 的每个 `response.create` 都是独立计费操作；额度不足时发送协议内 error event 并保持连接。
+- Responses WebSocket 的每个 `response.create` 单独记账。北辰按对应响应的终止用量结算，同一连接同时只接受一个正在生成的请求。北辰 Realtime 以连接为单位记录待核账，服务端触发的多次生成不按纯文本单价扣积分。其他供应商的 Realtime 仍按 `response.create` 计费。
 - Videos 创建成功后，Redis 保存 `video_id -> binding_id`；查询、内容下载和 remix 必须回到创建该资源的上游，不能按 priority 重新选择供应商。
 - OpenAI 和 Cohere 请求体中的公共 `model` 会替换为 Binding 的上游模型名；Gemini 的路径模型会替换为上游模型名，`batchEmbedContents.requests[*].model` 同步改写为 `models/{upstream_model_name}`。
 - 候选 binding 按 `priority ASC, id ASC` 排序。

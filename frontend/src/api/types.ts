@@ -22,10 +22,10 @@ export type Project = { id: string; organization_id: string; name: string; descr
 export type Model = { model_id: string; display_name: string; description?: string | null; category: ModelCategory; capabilities: ModelCapability[]; input_modalities: string[]; output_modalities: string[]; context_window?: number | null; max_input_tokens?: number | null; max_output_tokens?: number | null; is_common: boolean; status: ModelStatus; route_ready: boolean; credit_multiplier: string | null; upstream_metadata?: Record<string, unknown>; provider_id?: string; provider_name?: string; primary_adapter?: BindingAdapter | null; anthropic_ready?: boolean; responses_ready?: boolean; credential_id?: string; credential_label?: string }
 export type StudentModelPlaza = { common_models: Model[]; library_models: Model[] }
 export type UsageSlice = { id: string; name: string; credits: string; calls?: number }
-export type KeyUsage = { id: string; name: string; status: ApiKeyStatus; used: string; pending: string; models: UsageSlice[] }
-export type StudentProjectUsage = { project_id: string; project_name: string; quota: string; used: string; pending: string; available: string; keys: KeyUsage[] }
+export type KeyUsage = { id: string; name: string; status: ApiKeyStatus; used: string; available?: string; pending: string; pending_review?: boolean; models: UsageSlice[] }
+export type StudentProjectUsage = { project_id: string; project_name: string; quota: string; used: string; pending: string; available: string; pending_review?: boolean; keys: KeyUsage[] }
 export type StudentUsage = { month: string; projects: StudentProjectUsage[] }
-export type ProjectUsage = { month: string; project_id: string; project_name: string; quota: string; allocated: string; charged: string; pending: string; available: string; members: Array<{ user_id: string; user_name: string; quota: string; available: string; credits: string; keys: Array<{ id: string; name: string; status: ApiKeyStatus; used: string; models: UsageSlice[] }>; free_models: UsageSlice[] }>; models: UsageSlice[]; free_models: UsageSlice[] }
+export type ProjectUsage = { month: string; project_id: string; project_name: string; quota: string; allocated: string; charged: string; pending: string; available: string; pending_review?: boolean; members: Array<{ user_id: string; user_name: string; quota: string; available: string; credits: string; pending_review?: boolean; keys: Array<{ id: string; name: string; status: ApiKeyStatus; used: string; pending_review?: boolean; models: UsageSlice[] }>; free_models: UsageSlice[] }>; models: UsageSlice[]; free_models: UsageSlice[] }
 export type CallLog = { id: string; request_id: string; turn_id?: string; call_index?: number; project_id: string; project_name: string; user_id: string; user_name: string; api_key_id: string; api_key_name: string; model_id: string; model_name: string; provider_name: string; protocol: string; path: string; multiplier: string; credits: string; prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; billing_state: string; outcome: string; error_category: string; error_message: string; created_at: string; attempts?: Array<{ provider_name: string; status: string; error_category: string; error_message: string; http_status?: number; latency_ms: number }> }
 export type CallTurn = { id: string; project_id: string; project_name: string; user_id: string; user_name: string; api_key_id: string; api_key_name: string; model_id: string; model_name: string; task_key?: string; root_prompt: string; root_prompt_preview: string; root_prompt_bytes: number; call_count: number; credits: string; prompt_tokens: number; completion_tokens: number; total_tokens: number; outcome: string; started_at: string; finished_at?: string; calls?: CallLog[] }
 export type InputMonitorItem = { call_id: string; project_id: string; project_name: string; user_id: string; user_name: string; api_key_name: string; model_name: string; provider_name: string; credits: string; outcome: string; preview: string; content_bytes: number; truncated: boolean; created_at: string; content?: string }
@@ -105,6 +105,9 @@ export type BeichenComparison = {
   estimated_upstream_micros: number | null
   billed_upstream_micros: number | null
   trial_credit_milli: number | null
+  trial_credits?: string | null
+  charged_credits?: string | null
+  pending_review_calls?: number | null
   trial_unpriced_calls: number | null
 }
 export type BeichenOverview = {

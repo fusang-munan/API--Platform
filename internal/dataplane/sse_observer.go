@@ -13,19 +13,24 @@ const maxSSEEventBytes = 64 << 10
 // sseObserver keeps one line and one event. Overflow discards only the
 // current event from observation. The proxy forwards all original bytes.
 type sseObserver struct {
-	adapter    modelbinding.Adapter
-	metrics    ResponseMetrics
-	line       []byte
-	data       []byte
-	eventName  string
-	skipLF     bool
-	started    bool
-	overflow   bool
-	longLine   bool
-	outputSeen bool
-	terminal   bool
-	failed     bool
-	retryable  bool
+	adapter       modelbinding.Adapter
+	beichen       bool
+	expectedModel string
+	modelReported bool
+	review        string
+	metrics       ResponseMetrics
+	line          []byte
+	data          []byte
+	eventName     string
+	skipLF        bool
+	started       bool
+	overflow      bool
+	longLine      bool
+	outputSeen    bool
+	terminal      bool
+	incomplete    bool
+	failed        bool
+	retryable     bool
 }
 
 func (s *sseObserver) billable() bool {
@@ -112,7 +117,15 @@ func (s *sseObserver) endLine() {
 }
 
 func (s *sseObserver) endEvent() {
+	if s.beichen && s.terminal && s.adapter != modelbinding.AdapterGoogleGeminiV1beta {
+		return
+	}
 	if s.overflow {
+		if s.beichen {
+			s.metrics = ResponseMetrics{}
+			s.incomplete = true
+			s.review = beichenUnsupportedPrice
+		}
 		// Trust a protocol terminal event name even if its JSON body exceeds the
 		// observation limit. Its metrics remain unavailable.
 		if s.eventName == "error" || s.eventName == "response.failed" {
@@ -142,7 +155,26 @@ func (s *sseObserver) endEvent() {
 		return
 	}
 	if payload == nil || eventType == "ping" || s.failed {
+		if s.beichen && payload == nil && s.review == "" {
+			s.review = beichenUnsupportedPrice
+		}
 		return
+	}
+	if s.beichen && s.review == "" {
+		s.review = beichenPayloadReview(data, s.expectedModel, false)
+		s.modelReported = s.modelReported || beichenModelReported(payload, s.expectedModel)
+	}
+	if s.beichen && (s.adapter == modelbinding.AdapterOpenaiCompatible || s.adapter == modelbinding.AdapterOpenaiResponses) &&
+		(jsonObject(payload["usage"]) != nil || eventType == "response.completed" || s.eventName == "response.completed") {
+		// A complete usage object replaces earlier snapshots. Missing fields in
+		// it cannot inherit values from an earlier, partial usage report.
+		responseID := s.metrics.UpstreamResponseID
+		s.metrics = ResponseMetrics{}
+		s.metrics.UpstreamResponseID = responseID
+	}
+	if s.beichen && (eventType == "response.completed" || s.eventName == "response.completed") {
+		status := rawString(jsonObject(payload["response"])["status"])
+		s.incomplete = s.incomplete || (status != "" && status != "completed")
 	}
 	s.metrics.applyPayload(s.adapter, payload)
 	s.noteTerminal(eventType)
@@ -168,6 +200,9 @@ func (s *sseObserver) endEvent() {
 func (s *sseObserver) noteTerminal(eventType string) {
 	if s.failed {
 		return
+	}
+	if eventType == "response.incomplete" {
+		s.incomplete = true
 	}
 	if (s.adapter == modelbinding.AdapterAnthropic && eventType == "message_stop") ||
 		(s.adapter == modelbinding.AdapterOpenaiResponses && (eventType == "response.completed" || eventType == "response.incomplete")) {

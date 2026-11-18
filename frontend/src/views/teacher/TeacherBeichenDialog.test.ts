@@ -41,9 +41,13 @@ const overview: BeichenOverview = {
   comparison: [
     comparisonRow,
     { ...comparisonRow, model: 'manual-model', upstream_usage_source: 'csv' },
-    { ...comparisonRow, model: 'export-model', upstream_usage_source: 'export' },
+    {
+      ...comparisonRow, model: 'export-model', upstream_usage_source: 'export',
+      trial_credits: '0.00000043', charged_credits: '0.000000123456789', pending_review_calls: 2,
+    },
     {
       ...comparisonRow, model: 'local-only', upstream_usage_source: null, billed_upstream_micros: null,
+      trial_credits: null, charged_credits: null, pending_review_calls: 0,
       upstream_requests: null, upstream_output_tokens: null, upstream_cache_read_tokens: null, upstream_cache_write_tokens: null,
     },
   ],
@@ -155,11 +159,17 @@ describe('北辰教师面板', () => {
     await flushPromises()
     expect(request).toHaveBeenCalledWith(path + '?day=2026-11-16', expect.anything())
     expect(compare.text()).toContain('账期 2026-11-16')
-    expect(compare.text()).toContain('估算 $0.00001')
-    expect(compare.text()).toContain('账单 $0')
+    expect(compare.text()).toContain('估算 0.00001 单位')
+    expect(compare.text()).toContain('账单 0 单位')
     expect(compare.text()).toContain('0.003 credit')
     expect(compare.text()).toContain('北辰 —')
-    const billCells = compare.findAll('tbody tr').map(row => row.get('td:nth-last-child(2)'))
+    const rows = compare.findAll('tbody tr')
+    expect(rows[2].get('td:nth-last-child(2)').text()).toContain('0.00000043 credit')
+    expect(rows[2].get('td:last-child').text()).toContain('0.000000123456789 credit')
+    expect(rows[2].get('td:last-child').text()).toContain('待核账 2 条')
+    expect(rows[3].get('td:nth-last-child(2)').text()).toContain('—')
+    expect(rows[3].get('td:last-child').text()).toContain('待核账 0 条')
+    const billCells = rows.map(row => row.get('td:nth-last-child(3)'))
     expect(billCells.slice(0, 3).map(cell => cell.get('small').text())).toEqual(['自动同步', '手工汇总', '导入明细（待核对）'])
     expect(billCells[3].text()).toContain('账单 —')
     expect(billCells[3].find('small').exists()).toBe(false)
@@ -181,7 +191,7 @@ describe('北辰教师面板', () => {
   it('保留手填零值和六位小数，恢复跟随时省略 rates', async () => {
     const dialog = await openPanel()
     const prices = section(dialog, '模型价格')
-    expect(prices.text()).toContain('$1.2')
+    expect(prices.text()).toContain('1.2 单位')
     expect(prices.text()).toContain('0.000001 credit')
     expect(prices.text()).toContain('上游 —')
     await button(prices, '编辑价格').trigger('click')
@@ -232,7 +242,7 @@ describe('北辰教师面板', () => {
     })
 
     await kind.setValue('prices_base')
-    expect(importer.text()).toContain('基础价乘以该凭据的北辰实际倍率')
+    expect(importer.text()).toContain('乘一次该渠道的实际倍率')
     expect(importer.text()).toContain('当前凭据实际倍率 0.125×')
     await credential.setValue('key-zero')
     expect(importer.text()).toContain('当前凭据实际倍率 0×')

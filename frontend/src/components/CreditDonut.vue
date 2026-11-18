@@ -7,7 +7,7 @@ import { SVGRenderer } from 'echarts/renderers'
 
 echarts.use([PieChart, TooltipComponent, LegendComponent, AriaComponent, SVGRenderer])
 
-export type CreditSegment = { name: string; value: number; color?: string }
+export type CreditSegment = { name: string; value: number; color?: string; displayValue?: string }
 
 const props = withDefaults(defineProps<{
   segments: CreditSegment[]
@@ -34,7 +34,11 @@ function render() {
   chart?.setOption({
     animation: !window.matchMedia('(prefers-reduced-motion: reduce)').matches,
     aria: { enabled: true, description: props.label },
-    tooltip: { trigger: 'item', confine: true, valueFormatter: (value: number) => `${value.toFixed(3)} credits` },
+    tooltip: {
+      trigger: 'item',
+      confine: true,
+      valueFormatter: (value: number, index: number) => `${chartSegments.value[index]?.displayValue ?? value.toFixed(3)} credits`,
+    },
     legend: { show: false },
     series: [{ type: 'pie', radius: props.mini ? ['62%', '88%'] : ['58%', '82%'], silent: props.mini, label: { show: false }, data: chartSegments.value.map(item => ({ name: item.name, value: item.value, itemStyle: { color: item.color } })) }],
   }, true)
@@ -58,13 +62,13 @@ onBeforeUnmount(() => { resizeObserver?.disconnect(); chart?.dispose(); chart = 
       <li v-for="segment in positiveSegments" :key="segment.name">
         <span class="credit-legend-swatch" :style="{ backgroundColor: segment.color }" />
         <span class="credit-legend-name">{{ segment.name }}</span>
-        <strong>{{ segment.value.toFixed(3) }}</strong>
+        <strong>{{ segment.displayValue ?? segment.value.toFixed(3) }}</strong>
       </li>
     </ul>
     <table v-if="!mini" class="sr-only">
       <caption>{{ label }}</caption>
       <thead><tr><th>分项</th><th>credits</th></tr></thead>
-      <tbody><tr v-for="segment in positiveSegments" :key="segment.name"><td>{{ segment.name }}</td><td>{{ segment.value.toFixed(3) }}</td></tr></tbody>
+      <tbody><tr v-for="segment in positiveSegments" :key="segment.name"><td>{{ segment.name }}</td><td>{{ segment.displayValue ?? segment.value.toFixed(3) }}</td></tr></tbody>
     </table>
   </div>
 </template>

@@ -56,6 +56,8 @@ const (
 )
 
 type CallRoute struct {
+	Beichen           bool
+	DefinitelyNotSent bool
 	ProviderID        uuid.UUID
 	ProviderName      string
 	CredentialID      uuid.UUID

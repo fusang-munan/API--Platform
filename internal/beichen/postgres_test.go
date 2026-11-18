@@ -47,7 +47,9 @@ CREATE TABLE users (id uuid PRIMARY KEY);
 CREATE TABLE gateway_calls (
   provider_id uuid, provider_credential_id uuid, binding_id uuid, upstream_model_name text,
   created_at timestamptz, sent_at timestamptz, outcome text, protocol text, usage_state text,
-  prompt_tokens int, completion_tokens int, cache_hit_tokens bigint, cache_miss_tokens bigint, cache_write_tokens bigint
+  prompt_tokens int, completion_tokens int, cache_hit_tokens bigint, cache_miss_tokens bigint, cache_write_tokens bigint,
+  beichen_state text, beichen_credit_exact numeric, beichen_dispatch_kind text, beichen_dispatch_at timestamptz,
+  beichen_dispatch_credential_id uuid, beichen_dispatch_model text, beichen_price_at timestamptz
 )`)
 	migration, err := os.ReadFile("../infrastructure/db/migrations/0030_beichen.sql")
 	if err != nil {
@@ -70,10 +72,22 @@ VALUES ($1,'2026-11-17 15:59:30+00',0.5)`, job.credential)
 INSERT INTO gateway_calls (provider_id, provider_credential_id, binding_id, upstream_model_name,
   created_at, sent_at, outcome, protocol, usage_state, prompt_tokens, completion_tokens, cache_hit_tokens, cache_write_tokens)
 VALUES
-  ($1,$2,$3,'priced','2026-11-17 15:59:00+00','2026-11-17 16:00:00+00','succeeded','openai_responses','reported',170000000,0,0,NULL),
+  ($1,$2,$3,'priced','2026-11-17 15:59:00+00','2026-11-17 16:00:00+00','succeeded','openai_responses','reported',170000000,0,0,0),
   ($1,$2,$3,'explicit','2026-11-17 16:00:00+00','2026-11-17 16:00:01+00','succeeded','openai_compatible','reported',20,1,0,2),
   ($1,$2,$3,'unknown','2026-11-17 16:00:00+00','2026-11-17 16:00:01+00','succeeded','anthropic','reported',20,1,0,NULL)
 `, job.provider, job.credential, uuid.New())
+	execTestSQL(t, ctx, tx, `
+INSERT INTO gateway_calls (provider_id, outcome, beichen_state, beichen_credit_exact,
+  beichen_dispatch_kind, beichen_dispatch_at, beichen_dispatch_credential_id, beichen_dispatch_model,
+  protocol, usage_state, prompt_tokens, completion_tokens, cache_hit_tokens, cache_write_tokens)
+VALUES
+  ($1,'succeeded','charged',0.000000123456789,'beichen','2026-11-18 03:00:00+00',$2,'explicit',
+   'openai_compatible','reported',0,0,0,0),
+  ($1,'succeeded','pending_review',NULL,'beichen','2026-11-18 03:00:00+00',$2,'unknown',
+   'anthropic',NULL,NULL,NULL,NULL,NULL),
+  ($1,'succeeded','pending_review',NULL,'beichen','2026-11-18 03:00:05+00',$2,'missing-write',
+   'openai_responses','reported',4225,5,4096,NULL)
+`, job.provider, job.credential)
 
 	const day = "2026-11-18"
 	one, zero, two, billed := int64(1), int64(0), int64(2), int64(43)
@@ -103,7 +117,7 @@ VALUES
 	if err := readComparison(ctx, tx, job.provider, start.AddDate(0, 0, -1), &prior); err != nil || len(prior.Comparison) != 0 {
 		t.Fatalf("call or snapshot assigned to the wrong Beijing day: %+v, %v", prior.Comparison, err)
 	}
-	if len(view.Comparison) != 4 {
+	if len(view.Comparison) != 5 {
 		t.Fatalf("unexpected model rows: %+v", view.Comparison)
 	}
 	for _, row := range view.Comparison {
@@ -111,7 +125,10 @@ VALUES
 		case "priced":
 			checkCount(t, row.LocalCacheWriteTokens, 0)
 			checkCount(t, row.EstimatedUpstreamMicros, 425)
-			checkCount(t, row.TrialCreditMilli, 0)
+			checkCount(t, row.TrialCreditMilli, 43)
+			if row.TrialCredits == nil || *row.TrialCredits != "0.0425" || row.ChargedCredits != nil {
+				t.Fatalf("unexpected legacy trial or charge: %+v", row)
+			}
 			checkCount(t, row.TrialUnpricedCalls, 0)
 			checkCount(t, row.UpstreamRequests, 0)
 			checkUsageSource(t, row.UpstreamUsageSource, "usage")
@@ -119,9 +136,18 @@ VALUES
 				t.Fatal("empty API snapshot fabricated an actual cost")
 			}
 		case "explicit":
+			checkCount(t, row.LocalRequests, 2)
 			checkCount(t, row.LocalInputTokens, 18)
 			checkCount(t, row.LocalCacheWriteTokens, 2)
+			checkCount(t, row.PendingReviewCalls, 0)
+			if row.ChargedCredits == nil || *row.ChargedCredits != "0.000000123456789" {
+				t.Fatalf("unexpected exact charge: %+v", row)
+			}
 		case "unknown":
+			checkCount(t, row.PendingReviewCalls, 1)
+			if row.ChargedCredits != nil {
+				t.Fatal("pending review was reported as charged")
+			}
 			if row.LocalCacheWriteTokens != nil {
 				t.Fatal("unknown Anthropic cache writes were fabricated")
 			}
@@ -129,6 +155,12 @@ VALUES
 			checkCount(t, row.UpstreamRequests, 2)
 			checkCount(t, row.BilledUpstreamMicros, 43)
 			checkUsageSource(t, row.UpstreamUsageSource, "csv")
+		case "missing-write":
+			checkCount(t, row.PendingReviewCalls, 1)
+			checkCount(t, row.LocalCacheReadTokens, 4096)
+			if row.LocalCacheWriteTokens != nil || row.LocalInputTokens != nil || row.EstimatedUpstreamMicros != nil || row.TrialCredits != nil {
+				t.Fatalf("incomplete Responses cache data was treated as known: %+v", row)
+			}
 		default:
 			t.Fatalf("obsolete model still present: %s", row.Model)
 		}

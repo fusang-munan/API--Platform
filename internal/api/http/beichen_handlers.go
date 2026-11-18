@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/starprince1234/Nebula-api/internal/beichen"
@@ -35,6 +37,63 @@ func (s *Server) syncBeichen(c *gin.Context) {
 		return
 	}
 	respond(c, http.StatusOK, gin.H{"synced": true})
+}
+
+func (s *Server) beichenPanelAccess(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	provider, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	credential, ok := pathID(c, "credential_id")
+	if !ok {
+		return
+	}
+	if c.Request.Method == http.MethodGet {
+		status, err := s.service.Beichen().PanelStatus(c.Request.Context(), provider, credential)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		respond(c, http.StatusOK, status)
+		return
+	}
+	if !panelManagementHTTPS(c.Request, s.config.AllowedOrigin) {
+		writeError(c, domain.NewError(domain.CodeValidation, "请先配置可信 HTTPS 管理入口"))
+		return
+	}
+	var input struct {
+		Enabled       *bool  `json:"enabled"`
+		GroupID       int64  `json:"group_id"`
+		Token         string `json:"token"`
+		UpstreamKeyID *int64 `json:"upstream_key_id"`
+	}
+	if !bindBeichenJSON(c, &input, false) {
+		return
+	}
+	if input.Enabled == nil {
+		writeError(c, domain.NewError(domain.CodeValidation, "请指定采价授权状态"))
+		return
+	}
+	access := beichen.PanelAccessInput{Enabled: *input.Enabled, GroupID: input.GroupID, Token: input.Token, UpstreamKeyID: input.UpstreamKeyID}
+	if err := s.service.Beichen().SetPanelAccess(c.Request.Context(), provider, credential, identity(c).UserID, access); err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, beichen.PanelAccessStatus{Configured: access.Enabled, GroupID: access.GroupID, UpstreamKeyID: access.UpstreamKeyID})
+}
+
+func panelManagementHTTPS(req *http.Request, allowedOrigin string) bool {
+	if req.TLS != nil {
+		return true
+	}
+	// The frontend proxy overwrites this header. The backend is only published
+	// on loopback; only the private container network may forward HTTPS.
+	host, _, err := net.SplitHostPort(req.RemoteAddr)
+	peer := net.ParseIP(host)
+	proto := req.Header.Values("X-Forwarded-Proto")
+	return err == nil && peer.IsPrivate() && strings.HasPrefix(allowedOrigin, "https://") &&
+		len(proto) == 1 && proto[0] == "https" && req.Header.Get("Origin") == allowedOrigin
 }
 
 func (s *Server) setBeichenPrice(c *gin.Context) {

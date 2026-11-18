@@ -172,16 +172,25 @@ WHERE c.id = $1 AND p.id = $2 AND p.status = 'active' AND c.status = 'active' AN
 func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credentialRecord, key string, manual bool) fetchResult {
 	switch job.kind {
 	case "billing":
+		requestedAt := s.now()
 		body, err := s.fetch(ctx, key, billingPath, nil)
-		if err != nil {
-			return fetchResult{err: err}
+		var info billingInfo
+		if err == nil {
+			info, err = parseBilling(body)
 		}
-		info, err := parseBilling(body)
-		if err != nil {
-			return fetchResult{err: err}
+		token, group, accessErr := s.panelAccess(ctx, job.credential)
+		var quote panelQuote
+		if accessErr != nil || (token == "") != (group == 0) || group < 0 {
+			quote.err = errors.New("读取北辰面板配置失败")
+		} else if group != 0 && err == nil {
+			if info.ObservedAt.Before(requestedAt.Add(-2 * time.Second)) {
+				quote.err = errors.New("北辰 Key 账单报价早于本轮采样")
+			} else {
+				quote = s.fetchPanelQuote(ctx, token, key, group, info)
+			}
 		}
-		return fetchResult{save: func(ctx context.Context, tx *sql.Tx) error {
-			return saveBilling(ctx, tx, job.credential, info)
+		return fetchResult{err: err, save: func(ctx context.Context, tx *sql.Tx) error {
+			return saveBillingObservation(ctx, tx, job.credential, credential.updatedAt, info, err, group, quote)
 		}}
 	case "usage":
 		return s.fetchUsage(ctx, job, key, manual)
@@ -286,7 +295,23 @@ func saveBilling(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, info b
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `
+	if err := saveMultiplier(ctx, tx, credentialID, info, effectiveAt); err != nil {
+		return err
+	}
+	basis, prices, err := parsePricing(info.Pricing)
+	if err != nil {
+		return recordPriceError(ctx, tx, credentialID, err.Error())
+	}
+	for _, row := range prices {
+		if err := savePrice(ctx, tx, credentialID, row.Model, "upstream", basis, "billing", nil, row.Rates, effectiveAt); err != nil {
+			return err
+		}
+	}
+	return recordSuccess(ctx, tx, credentialID, "prices")
+}
+
+func saveMultiplier(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, info billingInfo, effectiveAt time.Time) error {
+	_, err := tx.ExecContext(ctx, `
 INSERT INTO beichen_multiplier_versions (credential_id, multiplier, timezone, effective_at)
 SELECT $1::uuid, $2::text::numeric, NULLIF($3::text, ''), $4::timestamptz
 WHERE NOT EXISTS (
@@ -296,22 +321,14 @@ WHERE NOT EXISTS (
   ) previous
   WHERE previous.multiplier = $2::text::numeric AND previous.timezone IS NOT DISTINCT FROM NULLIF($3::text, '')
 )`, credentialID, info.Multiplier.String(), info.Timezone, effectiveAt)
-	if err != nil {
-		return err
-	}
-	basis, prices, err := parsePricing(info.Pricing)
-	if err != nil {
-		_, dbErr := tx.ExecContext(ctx, `
+	return err
+}
+
+func recordPriceError(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, message string) error {
+	_, err := tx.ExecContext(ctx, `
 INSERT INTO beichen_datasets (credential_id, kind, last_error) VALUES ($1, 'prices', $2)
-ON CONFLICT (credential_id, kind) DO UPDATE SET last_error = EXCLUDED.last_error`, credentialID, err.Error())
-		return dbErr
-	}
-	for _, row := range prices {
-		if err := savePrice(ctx, tx, credentialID, row.Model, "upstream", basis, "billing", nil, row.Rates, effectiveAt); err != nil {
-			return err
-		}
-	}
-	return recordSuccess(ctx, tx, credentialID, "prices")
+ON CONFLICT (credential_id, kind) DO UPDATE SET last_error = EXCLUDED.last_error`, credentialID, message)
+	return err
 }
 
 func (s *Service) finishJob(ctx context.Context, job syncJob, lease uuid.UUID, credential credentialRecord, result fetchResult, manual bool) error {
@@ -360,11 +377,15 @@ UPDATE beichen_datasets SET
   last_error = $4, failure_count = CASE WHEN $6 THEN failure_count WHEN $4::text IS NULL THEN 0 ELSE LEAST(failure_count + 1, 6) END,
   next_attempt = CASE
     WHEN $6 THEN next_attempt
+    WHEN $4 IS NULL AND kind = 'billing' THEN LEAST(
+      clock_timestamp() + $5::int * interval '1 minute',
+      (SELECT expires_at FROM beichen_panel_snapshots
+        WHERE credential_id = $1 ORDER BY effective_at DESC LIMIT 1))
     WHEN $4 IS NULL OR kind = 'usage' THEN clock_timestamp() + $5::int * interval '1 minute'
     ELSE clock_timestamp() + power(2, LEAST(failure_count, 6)) * interval '1 minute' END,
   lease_id = NULL, lease_until = NULL
 WHERE credential_id = $1 AND kind = $2`, job.credential, job.kind,
-		result.save != nil || result.err == nil, message, refreshMinutes(job.kind), manual && job.kind == "usage")
+		(result.save != nil && job.kind != "billing") || result.err == nil, message, refreshMinutes(job.kind), manual && job.kind == "usage")
 	if err != nil {
 		return err
 	}

@@ -59,6 +59,64 @@ func TestBeichenChatOnlyRequestsMissingStreamUsage(t *testing.T) {
 	}
 }
 
+func TestBeichenReceiptIDRequiresOneCanonicalResponseHeader(t *testing.T) {
+	const canonical = "a83bb259-7457-4a42-a233-007661ce8c7f"
+	for _, tc := range []struct {
+		name   string
+		header http.Header
+		valid  bool
+	}{
+		{"one", http.Header{beichenReceiptHeader: {canonical}}, true},
+		{"one lowercase header name", http.Header{strings.ToLower(beichenReceiptHeader): {canonical}}, true},
+		{"missing", nil, false},
+		{"repeated identical", http.Header{beichenReceiptHeader: {canonical, canonical}}, false},
+		{"conflicting header names", http.Header{beichenReceiptHeader: {canonical}, strings.ToLower(beichenReceiptHeader): {uuid.NewString()}}, false},
+		{"combined", http.Header{beichenReceiptHeader: {canonical + ", " + canonical}}, false},
+		{"uppercase UUID", http.Header{beichenReceiptHeader: {strings.ToUpper(canonical)}}, false},
+		{"compact UUID", http.Header{beichenReceiptHeader: {strings.ReplaceAll(canonical, "-", "")}}, false},
+		{"wrapped UUID", http.Header{beichenReceiptHeader: {"{" + canonical + "}"}}, false},
+		{"nil UUID", http.Header{beichenReceiptHeader: {uuid.Nil.String()}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := uuid.Nil
+			if tc.valid {
+				want = uuid.MustParse(canonical)
+			}
+			if got := beichenReceiptID(tc.header); got != want {
+				t.Fatalf("receipt = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+func TestBeichenUpstreamRequestStripsStudentReceipt(t *testing.T) {
+	gateway, _, candidate, _ := newProxyUsageTest(t)
+	candidate.Provider.BaseURL = "https://api.beichenapi.com"
+	replay, err := captureBody(io.NopCloser(strings.NewReader(`{"model":"public"}`)), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replay.Close()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(beichenReceiptHeader, uuid.NewString())
+	request.Header[strings.ToLower(beichenReceiptHeader)] = []string{uuid.NewString()}
+	upstream, cleanup, err := gateway.upstreamRequest(request, replay, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer upstream.Body.Close()
+	for name := range upstream.Header {
+		if strings.EqualFold(name, beichenReceiptHeader) {
+			t.Fatal("student receipt was forwarded upstream")
+		}
+	}
+	if request.Header.Get(beichenReceiptHeader) == "" {
+		t.Fatal("original request header was mutated")
+	}
+}
+
 func newProxyUsageTest(t *testing.T) (*Gateway, sqlmock.Sqlmock, route, usage.Reservation) {
 	t.Helper()
 	db, mock, err := sqlmock.New()
@@ -75,6 +133,7 @@ func newProxyUsageTest(t *testing.T) (*Gateway, sqlmock.Sqlmock, route, usage.Re
 
 func expectSuccessfulProxyCharge(mock sqlmock.Sqlmock, candidate route, reservation usage.Reservation, sentAt driver.Value) {
 	mock.ExpectBegin()
+	expectLegacyLedgerLock(mock, reservation.CallID)
 	mock.ExpectExec(`UPDATE gateway_calls SET billing_state=`).WithArgs(
 		"charged", "succeeded", "", "", candidate.Provider.ID, candidate.Provider.Name,
 		reservation.CallID, candidate.CredentialID, candidate.Binding.ID, candidate.Binding.UpstreamModelName, sentAt,
@@ -85,6 +144,7 @@ func expectSuccessfulProxyCharge(mock sqlmock.Sqlmock, candidate route, reservat
 
 func expectProxyReservationReleased(mock sqlmock.Sqlmock, candidate route, reservation usage.Reservation) {
 	mock.ExpectBegin()
+	expectLegacyLedgerLock(mock, reservation.CallID)
 	mock.ExpectExec(`UPDATE gateway_calls SET billing_state=`).WithArgs(
 		"failed", "upstream_failed", "stream", "Stream ended before output or completion.",
 		candidate.Provider.ID, candidate.Provider.Name, reservation.CallID, candidate.CredentialID,
@@ -98,6 +158,11 @@ func expectProxyReservationReleased(mock sqlmock.Sqlmock, candidate route, reser
 	mock.ExpectExec(`UPDATE api_key_month_credit_buckets SET pending_milli=pending_milli-\$1,updated_at`).
 		WithArgs(reservation.MultiplierMilli, reservation.APIKeyID, reservation.Month).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`DELETE FROM monitored_inputs`).WithArgs(reservation.CallID).WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+func expectLegacyLedgerLock(mock sqlmock.Sqlmock, callID uuid.UUID) {
+	mock.ExpectQuery("SELECT beichen_state IS NOT NULL.*FOR UPDATE").WithArgs(callID).
+		WillReturnRows(sqlmock.NewRows([]string{"routed", "pending", "expired"}).AddRow(false, true, false))
 }
 
 func expectUsageWrite(mock sqlmock.Sqlmock, callID uuid.UUID, responseID string, prompt, completion, total driver.Value, state usage.UsageState) {
@@ -119,6 +184,7 @@ func TestSSEForwardsFirstReadAndLongEventBeforeTail(t *testing.T) {
 	expectSuccessfulProxyCharge(mock, candidate, reservation, nil)
 	mock.ExpectCommit()
 	mock.ExpectBegin()
+	expectLegacyReportReview(mock, reservation.CallID)
 	expectUsageWrite(mock, reservation.CallID, "chat_end", int64(0), int64(2), nil, usage.UsageReported)
 	mock.ExpectExec(`UPDATE gateway_call_attempts SET status=`).WithArgs("succeeded", 200, "", "", sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -306,6 +372,7 @@ func TestGatewayFinalizesAtActualRetrySendTime(t *testing.T) {
 			if sse {
 				mock.ExpectCommit()
 				mock.ExpectBegin()
+				expectLegacyReportReview(mock, reservation.CallID)
 			}
 			expectUsageWrite(mock, reservation.CallID, "second", int64(0), nil, nil, usage.UsageReported)
 			if sse {
@@ -408,6 +475,11 @@ func TestGatewayFinalizesAtActualRetrySendTime(t *testing.T) {
 	}
 }
 
+func expectLegacyReportReview(mock sqlmock.Sqlmock, callID uuid.UUID) {
+	mock.ExpectQuery("SELECT COALESCE\\(beichen_state='pending_review'.*FOR UPDATE").WithArgs(callID).
+		WillReturnRows(sqlmock.NewRows([]string{"review"}).AddRow(false))
+}
+
 func TestHTTPUsageLimitDoesNotTruncateResponse(t *testing.T) {
 	gateway, mock, candidate, reservation := newProxyUsageTest(t)
 	expectSuccessfulProxyCharge(mock, candidate, reservation, nil)
@@ -416,7 +488,7 @@ func TestHTTPUsageLimitDoesNotTruncateResponse(t *testing.T) {
 	response := &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	w := httptest.NewRecorder()
-	gateway.proxyHTTPBody(w, request, response, candidate.Binding.Adapter, candidate.callRoute(), &reservation, true)
+	gateway.proxyHTTPBody(w, request, response, candidate.Binding.Adapter, candidate.callRoute(), &reservation, true, false, "")
 	if w.Code != http.StatusOK || w.Body.String() != body {
 		t.Fatalf("response status %d or length %d differs from upstream", w.Code, w.Body.Len())
 	}
@@ -445,10 +517,10 @@ func TestHTTPAndSSECanSettleAfterClientCancellation(t *testing.T) {
 				expectUsageWrite(mock, reservation.CallID, "", int64(0), nil, nil, usage.UsageInterrupted)
 				body := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}],\"usage\":{\"prompt_tokens\":0}}\n\n")
 				observer := observeSSE(candidate.Binding.Adapter, body)
-				gateway.proxySSE(w, request, response, reservation, candidate.callRoute(), &observer, body, len(body), context.Canceled)
+				gateway.proxySSE(w, request, response, reservation, candidate.callRoute(), &observer, body, len(body), context.Canceled, false)
 			} else {
 				expectUsageWrite(mock, reservation.CallID, "", nil, nil, nil, usage.UsageInterrupted)
-				gateway.proxyHTTPBody(w, request, response, candidate.Binding.Adapter, candidate.callRoute(), &reservation, true)
+				gateway.proxyHTTPBody(w, request, response, candidate.Binding.Adapter, candidate.callRoute(), &reservation, true, false, "")
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatal(err)

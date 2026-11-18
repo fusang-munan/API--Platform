@@ -1,7 +1,11 @@
 import { del, get, page, patch, post } from './client'
 import type { BeichenImport, BeichenOverview, BeichenPriceUpdate } from './types'
 import type { Application, Binding, BindingCreate, BindingRouteProbeEndpoint, BindingRouteProbeStep, BindingUpdate, MentorCandidate, Model, ModelCatalogPage, ModelCreate, ModelUpdate, Organization, OrganizationCreate, OrganizationUpdate, ProbeEndpoint, ProbeResponse, Project, ProjectBudget, ProjectBudgetUpdate, ProjectCreate, ProjectUpdate, Provider, ProviderCatalogSyncView, ProviderCreate, ProviderCredential, ProviderCredentialCreate, ProviderCredentialUpdate, ProviderUpdate, ProjectUsage, StudentAccount } from './types'
+interface BeichenPanelStatus { configured: boolean; group_id?: number; upstream_key_id?: number }
 export const teacherAPI = {
+  beichenPanelStatus: (provider: string, credential: string) => get<BeichenPanelStatus>(`/api/v1/teacher/providers/${provider}/beichen/access/${credential}`),
+  setBeichenPanelAccess: (provider: string, credential: string, body: { enabled: boolean; group_id?: number; upstream_key_id?: number; token?: string }) =>
+    patch<BeichenPanelStatus>(`/api/v1/teacher/providers/${provider}/beichen/access/${credential}`, body),
   invite: (email: string) => post<{ invited: boolean }>('/api/v1/teacher/invitations', { email }),
   students: (query = '') => get<StudentAccount[]>(`/api/v1/teacher/students${query ? `?q=${encodeURIComponent(query)}` : ''}`),
   grantMentor: (studentId: string) => post<StudentAccount>(`/api/v1/teacher/students/${studentId}/mentor-profile`),

@@ -44,7 +44,10 @@ type Comparison struct {
 	BilledUpstreamMicros     *int64    `json:"billed_upstream_micros"`
 	UpstreamUsageSource      *string   `json:"upstream_usage_source"`
 	TrialCreditMilli         *int64    `json:"trial_credit_milli"`
+	TrialCredits             *string   `json:"trial_credits"`
 	TrialUnpricedCalls       *int64    `json:"trial_unpriced_calls"`
+	ChargedCredits           *string   `json:"charged_credits"`
+	PendingReviewCalls       *int64    `json:"pending_review_calls"`
 }
 
 type Overview struct {
@@ -152,9 +155,10 @@ WITH credential_models AS (
 SELECT m.credential_id, m.model, p.mode,
   round(p.upstream_input)::bigint, round(p.upstream_output)::bigint,
   round(p.upstream_cache_read)::bigint, round(p.upstream_cache_write)::bigint,
-  round(p.school_input)::bigint, round(p.school_output)::bigint,
-  round(p.school_cache_read)::bigint, round(p.school_cache_write)::bigint
+  round(p.school_input * f.factor)::bigint, round(p.school_output * f.factor)::bigint,
+  round(p.school_cache_read * f.factor)::bigint, round(p.school_cache_write * f.factor)::bigint
 FROM credential_models m CROSS JOIN LATERAL beichen_price_at(m.credential_id, m.model, statement_timestamp()) p
+CROSS JOIN LATERAL (SELECT CASE WHEN p.mode = 'follow' THEN 100 ELSE 1 END AS factor) f
 ORDER BY m.credential_id, m.model`, providerID)
 	if err != nil {
 		return err
@@ -192,7 +196,7 @@ func readComparison(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, start
 			&item.LocalInputTokens, &item.UpstreamInputTokens, &item.LocalOutputTokens, &item.UpstreamOutputTokens,
 			&item.LocalCacheReadTokens, &item.UpstreamCacheReadTokens, &item.LocalCacheWriteTokens, &item.UpstreamCacheWriteTokens,
 			&item.EstimatedUpstreamMicros, &item.BilledUpstreamMicros, &item.TrialCreditMilli, &item.TrialUnpricedCalls,
-			&item.UpstreamUsageSource)
+			&item.UpstreamUsageSource, &item.TrialCredits, &item.ChargedCredits, &item.PendingReviewCalls)
 		if err != nil {
 			return err
 		}
@@ -206,35 +210,44 @@ func readComparison(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, start
 // separately reported miss count before treating it as uncached.
 const comparisonSQL = `
 WITH attributed AS (
-  SELECT c.provider_credential_id AS credential_id, c.upstream_model_name AS model, c.sent_at,
+  SELECT a.credential_id, a.model, a.sent_at, c.beichen_state, c.beichen_credit_exact,
     CASE WHEN c.usage_state = 'reported' THEN
       CASE WHEN c.cache_miss_tokens IS NOT NULL THEN c.cache_miss_tokens
            WHEN c.protocol = 'anthropic' THEN c.prompt_tokens::bigint
-           WHEN c.protocol IN ('openai_compatible','openai_responses')
-             AND c.cache_hit_tokens IS NOT NULL
-             AND c.cache_hit_tokens <= c.prompt_tokens
-             AND COALESCE(c.cache_write_tokens, 0) <= c.prompt_tokens::bigint - c.cache_hit_tokens
-           THEN c.prompt_tokens::bigint - c.cache_hit_tokens - COALESCE(c.cache_write_tokens, 0)
+           WHEN c.protocol IN ('openai_compatible','openai_responses','openai_realtime')
+             AND cache.reads::numeric + cache.writes <= c.prompt_tokens
+           THEN c.prompt_tokens::bigint - cache.reads - cache.writes
       END
     END AS input_tokens,
     CASE WHEN c.usage_state = 'reported' THEN c.completion_tokens::bigint END AS output_tokens,
-    CASE WHEN c.usage_state = 'reported' THEN c.cache_hit_tokens END AS cache_read_tokens,
-    CASE WHEN c.usage_state = 'reported' THEN
-      CASE WHEN c.cache_write_tokens IS NOT NULL THEN c.cache_write_tokens
-           WHEN c.protocol IN ('openai_compatible','openai_responses') AND
-             (c.prompt_tokens IS NOT NULL OR c.cache_miss_tokens IS NOT NULL) THEN 0::bigint
-      END
-    END AS cache_write_tokens
+    CASE WHEN c.usage_state = 'reported' THEN cache.reads END AS cache_read_tokens,
+    CASE WHEN c.usage_state = 'reported' THEN cache.writes END AS cache_write_tokens
   FROM gateway_calls c
-  WHERE c.provider_id = $1 AND c.sent_at >= $2 AND c.sent_at < $3
-    AND c.provider_credential_id IS NOT NULL AND c.binding_id IS NOT NULL AND c.sent_at IS NOT NULL AND c.outcome <> 'pending'
-    AND c.upstream_model_name <> ''
+  CROSS JOIN LATERAL (SELECT
+    COALESCE(c.cache_hit_tokens, CASE WHEN c.protocol IN ('openai_compatible','openai_responses','openai_realtime')
+      AND c.cache_miss_tokens::numeric + c.cache_write_tokens = c.prompt_tokens THEN 0::bigint END) AS reads,
+    COALESCE(c.cache_write_tokens, CASE WHEN c.protocol IN ('openai_compatible','openai_responses','openai_realtime')
+      AND c.cache_miss_tokens::numeric + c.cache_hit_tokens = c.prompt_tokens THEN 0::bigint END) AS writes
+  ) cache
+  CROSS JOIN LATERAL (SELECT
+    CASE WHEN c.beichen_dispatch_kind = 'beichen' THEN c.beichen_dispatch_credential_id ELSE c.provider_credential_id END AS credential_id,
+    CASE WHEN c.beichen_dispatch_kind = 'beichen' THEN c.beichen_dispatch_model ELSE c.upstream_model_name END AS model,
+    CASE WHEN c.beichen_dispatch_kind = 'beichen' THEN COALESCE(c.beichen_price_at, c.beichen_dispatch_at) ELSE c.sent_at END AS sent_at
+  ) a
+  WHERE (c.provider_id = $1 OR (c.provider_id IS NULL AND c.beichen_dispatch_kind = 'beichen' AND EXISTS (
+    SELECT 1 FROM provider_credentials pc WHERE pc.id = a.credential_id AND pc.provider_id = $1
+  ))) AND a.sent_at >= $2 AND a.sent_at < $3
+    AND a.credential_id IS NOT NULL AND a.model <> ''
+    AND (c.beichen_dispatch_kind = 'beichen' OR c.binding_id IS NOT NULL) AND c.outcome <> 'pending'
 ), priced_calls AS (
   SELECT a.*,
-    beichen_weighted_tokens(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-      p.upstream_input, p.upstream_output, p.upstream_cache_read, p.upstream_cache_write) AS estimated_weight,
-    beichen_weighted_tokens(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-      p.school_input, p.school_output, p.school_cache_read, p.school_cache_write) AS trial_weight
+    CASE WHEN cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN
+      beichen_weighted_tokens(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+      p.upstream_input, p.upstream_output, p.upstream_cache_read, p.upstream_cache_write) END AS estimated_weight,
+    CASE WHEN cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN
+      beichen_weighted_tokens(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+      p.school_input, p.school_output, p.school_cache_read, p.school_cache_write)
+      * CASE WHEN p.mode = 'follow' THEN 100 ELSE 1 END END AS trial_weight
   FROM attributed a CROSS JOIN LATERAL beichen_price_at(a.credential_id, a.model, a.sent_at) p
 ), local AS (
   SELECT credential_id, model, count(*) AS requests,
@@ -244,6 +257,9 @@ WITH attributed AS (
     CASE WHEN count(cache_write_tokens) = count(*) THEN sum(cache_write_tokens) END AS cache_write_tokens,
     CASE WHEN count(estimated_weight) = count(*) THEN round(sum(estimated_weight) / 1000000) END AS estimated_micros,
     round(sum(trial_weight) / 1000000000) AS trial_credit_milli,
+    trim_scale(sum(trial_weight) * 0.000000000001::numeric)::text AS trial_credits,
+    trim_scale(sum(beichen_credit_exact) FILTER (WHERE beichen_state = 'charged'))::text AS charged_credits,
+    count(*) FILTER (WHERE beichen_state = 'pending_review') AS pending_review_calls,
     count(*) FILTER (WHERE trial_weight IS NULL) AS unpriced_calls
   FROM priced_calls
   GROUP BY credential_id, model
@@ -260,7 +276,8 @@ SELECT COALESCE(l.credential_id, u.credential_id), COALESCE(l.model, u.model), l
   CASE WHEN l.cache_write_tokens <= 9223372036854775807 THEN l.cache_write_tokens::bigint END, u.cache_write_tokens,
   CASE WHEN l.estimated_micros <= 9223372036854775807 THEN l.estimated_micros::bigint END, u.billed_upstream_micros,
   CASE WHEN l.trial_credit_milli <= 9223372036854775807 THEN l.trial_credit_milli::bigint END, l.unpriced_calls,
-  COALESCE(u.source, CASE WHEN e.credential_id IS NOT NULL THEN 'usage' END)
+  COALESCE(u.source, CASE WHEN e.credential_id IS NOT NULL THEN 'usage' END), l.trial_credits,
+  l.charged_credits, l.pending_review_calls
 FROM local l FULL JOIN upstream u USING (credential_id, model)
 LEFT JOIN confirmed_empty e ON e.credential_id = l.credential_id
 ORDER BY 1, 2`

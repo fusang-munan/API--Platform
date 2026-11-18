@@ -92,6 +92,9 @@ func run() error {
 			ExposeVerificationCodeInResponse: cfg.ExposeVerificationCodeInResponse,
 		},
 	)
+	if err := controlService.Beichen().ConfigurePanel(os.Getenv("BEICHEN_PANEL_TOKEN"), os.Getenv("BEICHEN_PANEL_GROUPS")); err != nil {
+		return err
+	}
 	if err := controlService.BootstrapTeacher(
 		startupContext,
 		cfg.BootstrapTeacherName,
@@ -110,7 +113,8 @@ func run() error {
 		return err
 	}
 
-	gateway := dataplane.NewGateway(dbClient, usage.NewStore(sqlDB), cacheStore, securityManager, dataplane.Config{
+	usageStore := usage.NewStore(sqlDB)
+	gateway := dataplane.NewGateway(dbClient, usageStore, cacheStore, securityManager, dataplane.Config{
 		ConnectTimeout:        cfg.UpstreamConnectTimeout,
 		ResponseHeaderTimeout: cfg.UpstreamResponseHeaderTimeout,
 		MaxRequestBytes:       cfg.GatewayMaxRequestBytes,
@@ -139,13 +143,19 @@ func run() error {
 	defer stop()
 	syncContext, cancelSync := context.WithCancel(signalContext)
 	syncDone := make(chan struct{})
+	receiptsDone := make(chan struct{})
 	go func() {
 		defer close(syncDone)
 		controlService.Beichen().Run(syncContext)
 	}()
+	go func() {
+		defer close(receiptsDone)
+		controlService.Beichen().RunReceipts(syncContext, usageStore)
+	}()
 	defer func() {
 		cancelSync()
 		<-syncDone
+		<-receiptsDone
 	}()
 	serverErrors := make(chan error, 1)
 	go func() {

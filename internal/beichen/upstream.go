@@ -1,6 +1,7 @@
 package beichen
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -56,7 +57,16 @@ func (s *Service) fetch(ctx context.Context, key, path string, query url.Values)
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Accept", "application/json")
-	response, err := s.client.Do(req)
+	req.Header.Set("Cache-Control", "no-cache")
+	return s.readResponse(req)
+}
+
+func (s *Service) readResponse(req *http.Request) ([]byte, error) {
+	return readBeichenResponse(s.client, req)
+}
+
+func readBeichenResponse(client *http.Client, req *http.Request) ([]byte, error) {
+	response, err := client.Do(req)
 	if err != nil {
 		return nil, errors.New("北辰网络请求失败或超时")
 	}
@@ -82,8 +92,18 @@ type billingInfo struct {
 	SchemaVersion int             `json:"schema_version"`
 	Scope         string          `json:"billing_scope"`
 	Multiplier    json.Number     `json:"effective_rate_multiplier"`
+	GroupRate     json.Number     `json:"group_rate_multiplier"`
+	ResolvedRate  json.Number     `json:"resolved_rate_multiplier"`
+	UserRate      *json.Number    `json:"user_rate_multiplier"`
 	Timezone      string          `json:"timezone"`
 	Pricing       json.RawMessage `json:"pricing"`
+	GroupID       *int64          `json:"group_id"`
+	ObservedAt    time.Time       `json:"observed_at"`
+	PeakEnabled   *bool           `json:"peak_rate_enabled"`
+	PeakStart     string          `json:"peak_start"`
+	PeakEnd       string          `json:"peak_end"`
+	PeakRate      json.Number     `json:"peak_rate_multiplier"`
+	AppliedPeak   json.Number     `json:"applied_peak_multiplier"`
 }
 
 func parseBilling(body []byte) (billingInfo, error) {
@@ -105,12 +125,20 @@ func parseBilling(body []byte) (billingInfo, error) {
 // Sub2API v1 provides the multiplier only. A provider pricing extension must
 // declare both its token-rate unit and whether the rates are base or effective.
 func parsePricing(data json.RawMessage) (string, []priceRow, error) {
+	return parsePricingUnit(data, "usd_micros_per_million_tokens")
+}
+
+func parsePricingUnit(data json.RawMessage, unit string) (string, []priceRow, error) {
 	var pricing struct {
 		Basis  string     `json:"basis"`
 		Unit   string     `json:"unit"`
 		Models []priceRow `json:"models"`
 	}
-	if json.Unmarshal(data, &pricing) != nil || pricing.Unit != "usd_micros_per_million_tokens" ||
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if unit == panelRateUnit {
+		decoder.DisallowUnknownFields()
+	}
+	if decoder.Decode(&pricing) != nil || pricing.Unit != unit ||
 		(pricing.Basis != "base" && pricing.Basis != "effective") || len(pricing.Models) == 0 || len(pricing.Models) > maxRows {
 		return "", nil, errors.New("北辰账单未提供可确认单位和口径的模型单价，可导入报价 CSV")
 	}

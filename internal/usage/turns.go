@@ -411,6 +411,9 @@ func scanOptionalInt(value sql.NullInt64) *int {
 	return &v
 }
 
+const turnDisplayOutcomeSQL = `CASE WHEN EXISTS(SELECT 1 FROM gateway_calls review
+	WHERE review.turn_id=t.id AND review.beichen_state='pending_review') THEN 'pending_review' ELSE t.outcome END`
+
 func (s *Store) MentorCallTurns(ctx context.Context, mentorID uuid.UUID, f LogFilter) (Page[CallTurn], error) {
 	if f.Limit < 1 || f.Limit > 100 {
 		f.Limit = 50
@@ -439,7 +442,7 @@ func (s *Store) MentorCallTurns(ctx context.Context, mentorID uuid.UUID, f LogFi
 		where = append(where, fmt.Sprintf(`(EXISTS(SELECT 1 FROM models filter_model WHERE filter_model.id=t.model_id AND filter_model.model_id=$%d) OR EXISTS(SELECT 1 FROM gateway_calls filter_call JOIN models filter_model ON filter_model.id=filter_call.model_id WHERE filter_call.turn_id=t.id AND filter_model.model_id=$%d))`, n, n))
 	}
 	if f.Status != "" {
-		add("t.outcome=$%d", f.Status)
+		add("("+turnDisplayOutcomeSQL+")=$%d", f.Status)
 	}
 	if f.Start != nil {
 		add("t.started_at>=$%d", *f.Start)
@@ -452,7 +455,7 @@ func (s *Store) MentorCallTurns(ctx context.Context, mentorID uuid.UUID, f LogFi
 		where = append(where, fmt.Sprintf("(t.started_at,t.id)<($%d,$%d)", len(args)-1, len(args)))
 	}
 	args = append(args, f.Limit+1)
-	query := `SELECT t.id,t.project_id,t.project_name,t.user_id,t.user_name,t.api_key_id,t.api_key_name,m.model_id,` + turnModelNamesSQL + `,COALESCE(t.task_key,''),t.root_prompt,t.root_prompt_bytes,t.call_count,t.credit_milli,t.prompt_tokens,t.completion_tokens,t.total_tokens,t.outcome,t.started_at,t.finished_at FROM gateway_call_turns t JOIN models m ON m.id=t.model_id WHERE ` + strings.Join(where, " AND ") + fmt.Sprintf(" ORDER BY t.started_at DESC,t.id DESC LIMIT $%d", len(args))
+	query := `SELECT t.id,t.project_id,t.project_name,t.user_id,t.user_name,t.api_key_id,t.api_key_name,m.model_id,` + turnModelNamesSQL + `,COALESCE(t.task_key,''),t.root_prompt,t.root_prompt_bytes,t.call_count,trim_scale((t.credit_milli+t.charged_milli_remainder)*0.001)::text,t.prompt_tokens,t.completion_tokens,t.total_tokens,` + turnDisplayOutcomeSQL + `,t.started_at,t.finished_at FROM gateway_call_turns t JOIN models m ON m.id=t.model_id WHERE ` + strings.Join(where, " AND ") + fmt.Sprintf(" ORDER BY t.started_at DESC,t.id DESC LIMIT $%d", len(args))
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return Page[CallTurn]{}, err
@@ -461,12 +464,12 @@ func (s *Store) MentorCallTurns(ctx context.Context, mentorID uuid.UUID, f LogFi
 	page := Page[CallTurn]{Items: []CallTurn{}}
 	for rows.Next() {
 		var ids [4]uuid.UUID
-		var creditMilli int64
+		var credits string
 		var taskKey string
 		var rootPrompt string
 		var finishedAt sql.NullTime
 		var item CallTurn
-		if err := rows.Scan(&ids[0], &ids[1], &item.ProjectName, &ids[2], &item.UserName, &ids[3], &item.APIKeyName, &item.ModelID, &item.ModelName, &taskKey, &rootPrompt, &item.RootPromptBytes, &item.CallCount, &creditMilli, &item.PromptTokens, &item.CompletionTokens, &item.TotalTokens, &item.Outcome, &item.StartedAt, &finishedAt); err != nil {
+		if err := rows.Scan(&ids[0], &ids[1], &item.ProjectName, &ids[2], &item.UserName, &ids[3], &item.APIKeyName, &item.ModelID, &item.ModelName, &taskKey, &rootPrompt, &item.RootPromptBytes, &item.CallCount, &credits, &item.PromptTokens, &item.CompletionTokens, &item.TotalTokens, &item.Outcome, &item.StartedAt, &finishedAt); err != nil {
 			return page, err
 		}
 		item.ID = ids[0].String()
@@ -476,7 +479,7 @@ func (s *Store) MentorCallTurns(ctx context.Context, mentorID uuid.UUID, f LogFi
 		item.TaskKey = taskKey
 		item.RootPrompt = rootPrompt
 		item.RootPromptPreview = previewPrompt(rootPrompt, 200)
-		item.Credits = domain.FormatCredits(creditMilli)
+		item.Credits = displayCredits(credits)
 		if finishedAt.Valid {
 			item.FinishedAt = &finishedAt.Time
 		}
@@ -494,11 +497,11 @@ func (s *Store) MentorCallTurns(ctx context.Context, mentorID uuid.UUID, f LogFi
 
 func (s *Store) MentorCallTurn(ctx context.Context, mentorID, turnID uuid.UUID) (CallTurn, error) {
 	var ids [4]uuid.UUID
-	var creditMilli int64
+	var credits string
 	var taskKey, rootPrompt string
 	var finishedAt sql.NullTime
 	var item CallTurn
-	err := s.db.QueryRowContext(ctx, `SELECT t.id,t.project_id,t.project_name,t.user_id,t.user_name,t.api_key_id,t.api_key_name,m.model_id,`+turnModelNamesSQL+`,COALESCE(t.task_key,''),t.root_prompt,t.root_prompt_bytes,t.call_count,t.credit_milli,t.prompt_tokens,t.completion_tokens,t.total_tokens,t.outcome,t.started_at,t.finished_at FROM gateway_call_turns t JOIN models m ON m.id=t.model_id WHERE t.id=$1 AND EXISTS(SELECT 1 FROM project_members pm WHERE pm.project_id=t.project_id AND pm.user_id=$2)`, turnID, mentorID).Scan(&ids[0], &ids[1], &item.ProjectName, &ids[2], &item.UserName, &ids[3], &item.APIKeyName, &item.ModelID, &item.ModelName, &taskKey, &rootPrompt, &item.RootPromptBytes, &item.CallCount, &creditMilli, &item.PromptTokens, &item.CompletionTokens, &item.TotalTokens, &item.Outcome, &item.StartedAt, &finishedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT t.id,t.project_id,t.project_name,t.user_id,t.user_name,t.api_key_id,t.api_key_name,m.model_id,`+turnModelNamesSQL+`,COALESCE(t.task_key,''),t.root_prompt,t.root_prompt_bytes,t.call_count,trim_scale((t.credit_milli+t.charged_milli_remainder)*0.001)::text,t.prompt_tokens,t.completion_tokens,t.total_tokens,`+turnDisplayOutcomeSQL+`,t.started_at,t.finished_at FROM gateway_call_turns t JOIN models m ON m.id=t.model_id WHERE t.id=$1 AND EXISTS(SELECT 1 FROM project_members pm WHERE pm.project_id=t.project_id AND pm.user_id=$2)`, turnID, mentorID).Scan(&ids[0], &ids[1], &item.ProjectName, &ids[2], &item.UserName, &ids[3], &item.APIKeyName, &item.ModelID, &item.ModelName, &taskKey, &rootPrompt, &item.RootPromptBytes, &item.CallCount, &credits, &item.PromptTokens, &item.CompletionTokens, &item.TotalTokens, &item.Outcome, &item.StartedAt, &finishedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return CallTurn{}, domain.NewError(domain.CodeNotFound, "call turn not found")
 	}
@@ -512,11 +515,11 @@ func (s *Store) MentorCallTurn(ctx context.Context, mentorID, turnID uuid.UUID) 
 	item.TaskKey = taskKey
 	item.RootPrompt = rootPrompt
 	item.RootPromptPreview = previewPrompt(rootPrompt, 200)
-	item.Credits = domain.FormatCredits(creditMilli)
+	item.Credits = displayCredits(credits)
 	if finishedAt.Valid {
 		item.FinishedAt = &finishedAt.Time
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.request_id,c.turn_id,c.call_index,c.project_id,c.project_name,c.user_id,c.user_name,c.api_key_id,c.api_key_name,m.model_id,c.model_name,COALESCE(c.provider_name,''),c.protocol,c.request_path,c.multiplier_milli,c.credit_milli,c.prompt_tokens,c.completion_tokens,c.total_tokens,c.billing_state,c.outcome,COALESCE(c.error_category,''),COALESCE(c.error_message,''),c.created_at FROM gateway_calls c JOIN models m ON m.id=c.model_id WHERE c.turn_id=$1 ORDER BY c.call_index,c.created_at`, turnID)
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.request_id,c.turn_id,c.call_index,c.project_id,c.project_name,c.user_id,c.user_name,c.api_key_id,c.api_key_name,m.model_id,c.model_name,COALESCE(c.provider_name,''),c.protocol,c.request_path,c.multiplier_milli,`+callDisplayCreditsSQL+`,c.prompt_tokens,c.completion_tokens,c.total_tokens,`+callDisplayBillingSQL+`,`+callDisplayOutcomeSQL+`,COALESCE(c.error_category,''),COALESCE(c.error_message,''),c.created_at FROM gateway_calls c JOIN models m ON m.id=c.model_id WHERE c.turn_id=$1 ORDER BY c.call_index,c.created_at`, turnID)
 	if err != nil {
 		return CallTurn{}, err
 	}
@@ -534,7 +537,8 @@ func (s *Store) MentorCallTurn(ctx context.Context, mentorID, turnID uuid.UUID) 
 func scanCallLogRow(rows *sql.Rows) (CallLog, error) {
 	var ids [4]uuid.UUID
 	var turnID uuid.NullUUID
-	var multiplier, credits int64
+	var multiplier int64
+	var credits string
 	var promptTokens, completionTokens, totalTokens sql.NullInt64
 	var item CallLog
 	if err := rows.Scan(&ids[0], &item.RequestID, &turnID, &item.CallIndex, &ids[1], &item.ProjectName, &ids[2], &item.UserName, &ids[3], &item.APIKeyName, &item.ModelID, &item.ModelName, &item.ProviderName, &item.Protocol, &item.Path, &multiplier, &credits, &promptTokens, &completionTokens, &totalTokens, &item.BillingState, &item.Outcome, &item.ErrorCategory, &item.ErrorMessage, &item.CreatedAt); err != nil {
@@ -548,7 +552,7 @@ func scanCallLogRow(rows *sql.Rows) (CallLog, error) {
 		item.TurnID = turnID.UUID.String()
 	}
 	item.Multiplier = domain.FormatCredits(multiplier)
-	item.Credits = domain.FormatCredits(credits)
+	item.Credits = displayCredits(credits)
 	item.PromptTokens = scanOptionalInt(promptTokens)
 	item.CompletionTokens = scanOptionalInt(completionTokens)
 	item.TotalTokens = scanOptionalInt(totalTokens)

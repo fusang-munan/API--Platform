@@ -38,10 +38,12 @@ type PriceInput struct {
 }
 
 type Service struct {
-	db     *sql.DB
-	crypto *security.Manager
-	client *http.Client
-	now    func() time.Time
+	db          *sql.DB
+	crypto      *security.Manager
+	client      *http.Client
+	now         func() time.Time
+	panelToken  string
+	panelGroups map[uuid.UUID]int64
 }
 
 func New(db *sql.DB, crypto *security.Manager) *Service {

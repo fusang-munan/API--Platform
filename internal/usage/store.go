@@ -164,7 +164,7 @@ type QuotaError struct {
 
 func (e *QuotaError) Error() string { return e.Code }
 
-func (s *Store) Reserve(ctx context.Context, keyID, modelID uuid.UUID, requestID, protocol, path, prompt, promptSource string, correlation CallCorrelation) (Reservation, error) {
+func (s *Store) Reserve(ctx context.Context, keyID, modelID uuid.UUID, requestID, protocol, path, prompt, promptSource string, correlation CallCorrelation, routes ...CallRoute) (Reservation, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Reservation{}, err
@@ -188,10 +188,19 @@ FOR UPDATE OF p,k,m`, keyID, modelID).Scan(&r.ProjectID, &r.OrganizationID, &r.U
 	if err != nil {
 		return Reservation{}, err
 	}
-	if !multiplier.Valid {
+	hasBeichen, hasLegacy := false, len(routes) == 0
+	for _, route := range routes {
+		hasBeichen = hasBeichen || route.Beichen
+		hasLegacy = hasLegacy || !route.Beichen
+	}
+	if !multiplier.Valid && hasLegacy {
 		return Reservation{}, domain.NewError(domain.CodeModelNotReady, "model credit multiplier is not configured")
 	}
 	r.MultiplierMilli = multiplier.Int64
+	hold := r.MultiplierMilli
+	if hasBeichen && (!hasLegacy || hold == 0) {
+		hold = 1
+	}
 	now := time.Now().UTC()
 	if _, err = tx.ExecContext(ctx, `INSERT INTO project_month_credit_buckets(id,project_id,month,quota_milli,allocated_milli,charged_milli,pending_milli,created_at,updated_at)
 SELECT $1,p.id,$2,p.monthly_credit_quota_milli,COALESCE((SELECT sum(monthly_credit_quota_milli) FROM project_members WHERE project_id=p.id),0),0,0,$3,$3 FROM projects p WHERE p.id=$4 ON CONFLICT(project_id,month) DO NOTHING`, uuid.Must(uuid.NewV7()), r.Month, now, r.ProjectID); err != nil {
@@ -213,10 +222,10 @@ SELECT $1,k.id,k.project_id,$2,0,true,0,0,$3,$3 FROM api_keys k WHERE k.id=$4 ON
 		return Reservation{}, err
 	}
 	ends := r.Month.In(shanghai).AddDate(0, 1, 0).UTC()
-	if r.MultiplierMilli > 0 && memberCharged+memberPending >= memberQuota {
+	if hold > 0 && memberCharged+memberPending >= memberQuota {
 		return Reservation{}, &QuotaError{Code: "member_quota_exceeded", Name: r.UserName, EndsAt: ends}
 	}
-	if r.MultiplierMilli > 0 && projectCharged+projectPending >= projectQuota {
+	if hold > 0 && projectCharged+projectPending >= projectQuota {
 		return Reservation{}, &QuotaError{Code: "project_quota_exceeded", Name: r.ProjectName, EndsAt: ends}
 	}
 	correlation.ModelID = modelID
@@ -247,20 +256,25 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16,'pending','pen
 	if err != nil {
 		return Reservation{}, err
 	}
+	if hasBeichen {
+		if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_state='reserved',credit_milli=$2 WHERE id=$1`, r.CallID, hold); err != nil {
+			return Reservation{}, err
+		}
+	}
 	if storedPrompt != "" {
 		_, err = tx.ExecContext(ctx, `INSERT INTO monitored_inputs(id,call_id,project_id,user_id,source,content,content_bytes,visible,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,false,$8)`, uuid.Must(uuid.NewV7()), r.CallID, r.ProjectID, r.UserID, promptSource, storedPrompt, len([]byte(storedPrompt)), now)
 		if err != nil {
 			return Reservation{}, err
 		}
 	}
-	if r.MultiplierMilli > 0 {
-		if _, err = tx.ExecContext(ctx, `UPDATE project_month_credit_buckets SET pending_milli=pending_milli+$1,updated_at=$2 WHERE project_id=$3 AND month=$4`, r.MultiplierMilli, now, r.ProjectID, r.Month); err != nil {
+	if hold > 0 {
+		if _, err = tx.ExecContext(ctx, `UPDATE project_month_credit_buckets SET pending_milli=pending_milli+$1,updated_at=$2 WHERE project_id=$3 AND month=$4`, hold, now, r.ProjectID, r.Month); err != nil {
 			return Reservation{}, err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE project_member_month_credit_buckets SET pending_milli=pending_milli+$1,updated_at=$2 WHERE project_id=$3 AND user_id=$4 AND month=$5`, r.MultiplierMilli, now, r.ProjectID, r.UserID, r.Month); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE project_member_month_credit_buckets SET pending_milli=pending_milli+$1,updated_at=$2 WHERE project_id=$3 AND user_id=$4 AND month=$5`, hold, now, r.ProjectID, r.UserID, r.Month); err != nil {
 			return Reservation{}, err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE api_key_month_credit_buckets SET pending_milli=pending_milli+$1,updated_at=$2 WHERE api_key_id=$3 AND month=$4`, r.MultiplierMilli, now, r.APIKeyID, r.Month); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE api_key_month_credit_buckets SET pending_milli=pending_milli+$1,updated_at=$2 WHERE api_key_id=$3 AND month=$4`, hold, now, r.APIKeyID, r.Month); err != nil {
 			return Reservation{}, err
 		}
 	}
@@ -483,6 +497,17 @@ func (s *Store) DeactivateKey(ctx context.Context, mentorID, keyID uuid.UUID, co
 	}
 	rows.Close()
 	for _, r := range list {
+		var routed bool
+		if err = tx.QueryRowContext(ctx, `SELECT beichen_state IS NOT NULL FROM gateway_calls WHERE id=$1`, r.CallID).Scan(&routed); err != nil {
+			return uuid.Nil, err
+		}
+		if routed {
+			if err = finishRoutedCall(ctx, tx, r.CallID, false, "outcome_unknown", "deactivated_with_request_in_flight",
+				"API key was deactivated while the request was in flight", CallRoute{}, CallMetrics{}); err != nil {
+				return uuid.Nil, err
+			}
+			continue
+		}
 		if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET billing_state='charged',outcome='outcome_unknown',error_category='deactivated_with_request_in_flight',error_message='API key was deactivated while the request was in flight',finalized_at=$1,lease_expires_at=NULL WHERE id=$2 AND billing_state='pending'`, now, r.CallID); err != nil {
 			return uuid.Nil, err
 		}
@@ -609,6 +634,31 @@ func (s *Store) Finalize(ctx context.Context, r Reservation, success bool, outco
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var routed, pending, expired bool
+	err = tx.QueryRowContext(ctx, `SELECT beichen_state IS NOT NULL,billing_state='pending',
+		COALESCE(lease_expires_at<now()-interval '15 minutes',false) FROM gateway_calls WHERE id=$1 FOR UPDATE`, r.CallID).
+		Scan(&routed, &pending, &expired)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if category == "recovered_after_crash" && !expired {
+		return nil
+	}
+	if route.Beichen && pending && !routed {
+		if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_state='reserved' WHERE id=$1`, r.CallID); err != nil {
+			return err
+		}
+		routed = true
+	}
+	if routed {
+		if err = finishRoutedCall(ctx, tx, r.CallID, success, outcome, category, message, route, metrics); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
 	state := "failed"
 	if success {
 		state = "charged"
@@ -697,8 +747,29 @@ func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metri
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	review := false
+	if metrics.State == UsageReported {
+		err = tx.QueryRowContext(ctx, `SELECT COALESCE(beichen_state='pending_review' AND beichen_price_at IS NOT NULL,false)
+			FROM gateway_calls WHERE id=$1 FOR UPDATE`, callID).Scan(&review)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if review {
+			if err = postLedgerBuckets(ctx, tx, callID, 0, "0"); err != nil {
+				return err
+			}
+		}
+	}
 	if err := writeCallMetrics(ctx, tx, callID, metrics); err != nil {
 		return err
+	}
+	if review {
+		if err = settleBeichenReport(ctx, tx, callID, metrics); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -761,6 +832,19 @@ func boolInt(v bool) int {
 	return 0
 }
 
+// displayCredits preserves the legacy minimum of three decimal places while
+// retaining every significant digit returned by PostgreSQL numeric arithmetic.
+func displayCredits(value string) string {
+	whole, fraction, hasPoint := strings.Cut(value, ".")
+	if !hasPoint {
+		return whole + ".000"
+	}
+	if len(fraction) < 3 {
+		return value + strings.Repeat("0", 3-len(fraction))
+	}
+	return value
+}
+
 type UsageSlice struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
@@ -768,21 +852,24 @@ type UsageSlice struct {
 	Calls   int64  `json:"calls,omitempty"`
 }
 type KeyUsage struct {
-	ID      string       `json:"id"`
-	Name    string       `json:"name"`
-	Status  string       `json:"status"`
-	Used    string       `json:"used"`
-	Pending string       `json:"pending"`
-	Models  []UsageSlice `json:"models"`
+	Available     string       `json:"available,omitempty"`
+	PendingReview bool         `json:"pending_review,omitempty"`
+	ID            string       `json:"id"`
+	Name          string       `json:"name"`
+	Status        string       `json:"status"`
+	Used          string       `json:"used"`
+	Pending       string       `json:"pending"`
+	Models        []UsageSlice `json:"models"`
 }
 type StudentProjectUsage struct {
-	ProjectID   string     `json:"project_id"`
-	ProjectName string     `json:"project_name"`
-	Quota       string     `json:"quota"`
-	Used        string     `json:"used"`
-	Pending     string     `json:"pending"`
-	Available   string     `json:"available"`
-	Keys        []KeyUsage `json:"keys"`
+	PendingReview bool       `json:"pending_review,omitempty"`
+	ProjectID     string     `json:"project_id"`
+	ProjectName   string     `json:"project_name"`
+	Quota         string     `json:"quota"`
+	Used          string     `json:"used"`
+	Pending       string     `json:"pending"`
+	Available     string     `json:"available"`
+	Keys          []KeyUsage `json:"keys"`
 }
 type StudentUsage struct {
 	Month    string                `json:"month"`
@@ -797,7 +884,9 @@ func (s *Store) StudentUsage(ctx context.Context, userID uuid.UUID, month time.T
 		}
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT p.id,p.name,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0),COALESCE(mb.charged_milli,0),COALESCE(mb.pending_milli,0)
+SELECT p.id,p.name,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0),COALESCE(mb.pending_milli,0),trim_scale((COALESCE(mb.charged_milli,0)+COALESCE(mb.charged_milli_remainder,0))*0.001)::text,
+       trim_scale((GREATEST(0,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0)::numeric-COALESCE(mb.charged_milli,0)-COALESCE(mb.pending_milli,0)-COALESCE(mb.charged_milli_remainder,0)))*0.001)::text,
+       EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$2 AND review.project_id=p.id AND review.user_id=pm.user_id)
 FROM project_members pm
 JOIN projects p ON p.id=pm.project_id
 LEFT JOIN project_member_month_credit_buckets mb ON mb.project_id=pm.project_id AND mb.user_id=pm.user_id AND mb.month=$2
@@ -811,51 +900,53 @@ ORDER BY p.name`, userID, month)
 	for rows.Next() {
 		var projectID uuid.UUID
 		var item StudentProjectUsage
-		var quota, used, pending int64
-		if err := rows.Scan(&projectID, &item.ProjectName, &quota, &used, &pending); err != nil {
+		var quota, pending int64
+		if err := rows.Scan(&projectID, &item.ProjectName, &quota, &pending, &item.Used, &item.Available, &item.PendingReview); err != nil {
 			return result, err
 		}
 		item.ProjectID = projectID.String()
 		item.Quota = domain.FormatCredits(quota)
-		item.Used = domain.FormatCredits(used)
+		item.Used = displayCredits(item.Used)
 		item.Pending = domain.FormatCredits(pending)
-		available := quota - used - pending
-		if available < 0 {
-			available = 0
-		}
-		item.Available = domain.FormatCredits(available)
+		item.Available = displayCredits(item.Available)
 		item.Keys = []KeyUsage{}
-		kr, err := s.db.QueryContext(ctx, `SELECT k.id,k.name,k.status,COALESCE(b.charged_milli,0),COALESCE(b.pending_milli,0) FROM api_keys k LEFT JOIN api_key_month_credit_buckets b ON b.api_key_id=k.id AND b.month=$3 WHERE k.owner_user_id=$1 AND k.project_id=$2 AND (k.status IN ('approved','active') OR COALESCE(b.charged_milli,0)>0) ORDER BY k.created_at DESC`, userID, projectID, month)
+		kr, err := s.db.QueryContext(ctx, `SELECT k.id,k.name,k.status,trim_scale((COALESCE(b.charged_milli,0)+COALESCE(b.charged_milli_remainder,0))*0.001)::text,COALESCE(b.pending_milli,0),EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$3 AND review.api_key_id=k.id),
+		CASE WHEN b.id IS NOT NULL THEN trim_scale(GREATEST(0,b.quota_milli::numeric-b.charged_milli-b.pending_milli-b.charged_milli_remainder)*0.001)::text END
+		FROM api_keys k LEFT JOIN api_key_month_credit_buckets b ON b.api_key_id=k.id AND b.month=$3 WHERE k.owner_user_id=$1 AND k.project_id=$2 AND (k.status IN ('approved','active') OR b.charged_milli>0 OR b.charged_milli_remainder>0 OR EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$3 AND review.api_key_id=k.id)) ORDER BY k.created_at DESC`, userID, projectID, month)
 		if err != nil {
 			return result, err
 		}
 		for kr.Next() {
 			var keyID uuid.UUID
 			var key KeyUsage
-			var keyUsed, keyPending int64
-			if err := kr.Scan(&keyID, &key.Name, &key.Status, &keyUsed, &keyPending); err != nil {
+			var keyPending int64
+			var keyAvailable sql.NullString
+			if err := kr.Scan(&keyID, &key.Name, &key.Status, &key.Used, &keyPending, &key.PendingReview, &keyAvailable); err != nil {
 				kr.Close()
 				return result, err
 			}
 			key.ID = keyID.String()
-			key.Used = domain.FormatCredits(keyUsed)
+			key.Used = displayCredits(key.Used)
 			key.Pending = domain.FormatCredits(keyPending)
+			if keyAvailable.Valid {
+				key.Available = displayCredits(keyAvailable.String)
+			}
 			key.Models = []UsageSlice{}
-			mr, err := s.db.QueryContext(ctx, `SELECT c.model_id,m.model_id,c.model_name,c.charged_milli,c.charged_count+c.zero_cost_count FROM monthly_usage_cube c JOIN models m ON m.id=c.model_id WHERE c.api_key_id=$1 AND c.month=$2 ORDER BY c.charged_milli DESC,c.model_name`, keyID, month)
+			mr, err := s.db.QueryContext(ctx, `SELECT c.model_id,m.model_id,c.model_name,trim_scale((c.charged_milli+c.charged_milli_remainder)*0.001)::text,c.charged_count+c.zero_cost_count FROM monthly_usage_cube c JOIN models m ON m.id=c.model_id WHERE c.api_key_id=$1 AND c.month=$2 ORDER BY c.charged_milli DESC,c.charged_milli_remainder DESC,c.model_name`, keyID, month)
 			if err != nil {
 				kr.Close()
 				return result, err
 			}
 			for mr.Next() {
 				var sl UsageSlice
-				var credits int64
+				var credits string
 				var internalID uuid.UUID
 				if err := mr.Scan(&internalID, &sl.ID, &sl.Name, &credits, &sl.Calls); err != nil {
 					mr.Close()
 					kr.Close()
 					return result, err
 				}
-				sl.Credits = domain.FormatCredits(credits)
+				sl.Credits = displayCredits(credits)
 				key.Models = append(key.Models, sl)
 			}
 			mr.Close()
@@ -868,33 +959,36 @@ ORDER BY p.name`, userID, month)
 }
 
 type ProjectUsage struct {
-	Month       string        `json:"month"`
-	ProjectID   string        `json:"project_id"`
-	ProjectName string        `json:"project_name"`
-	Quota       string        `json:"quota"`
-	Allocated   string        `json:"allocated"`
-	Charged     string        `json:"charged"`
-	Pending     string        `json:"pending"`
-	Available   string        `json:"available"`
-	Members     []MemberUsage `json:"members"`
-	Models      []UsageSlice  `json:"models"`
-	FreeModels  []UsageSlice  `json:"free_models"`
+	PendingReview bool          `json:"pending_review,omitempty"`
+	Month         string        `json:"month"`
+	ProjectID     string        `json:"project_id"`
+	ProjectName   string        `json:"project_name"`
+	Quota         string        `json:"quota"`
+	Allocated     string        `json:"allocated"`
+	Charged       string        `json:"charged"`
+	Pending       string        `json:"pending"`
+	Available     string        `json:"available"`
+	Members       []MemberUsage `json:"members"`
+	Models        []UsageSlice  `json:"models"`
+	FreeModels    []UsageSlice  `json:"free_models"`
 }
 type MemberUsage struct {
-	UserID     string           `json:"user_id"`
-	UserName   string           `json:"user_name"`
-	Quota      string           `json:"quota"`
-	Available  string           `json:"available"`
-	Credits    string           `json:"credits"`
-	Keys       []KeyMemberUsage `json:"keys"`
-	FreeModels []UsageSlice     `json:"free_models"`
+	PendingReview bool             `json:"pending_review,omitempty"`
+	UserID        string           `json:"user_id"`
+	UserName      string           `json:"user_name"`
+	Quota         string           `json:"quota"`
+	Available     string           `json:"available"`
+	Credits       string           `json:"credits"`
+	Keys          []KeyMemberUsage `json:"keys"`
+	FreeModels    []UsageSlice     `json:"free_models"`
 }
 type KeyMemberUsage struct {
-	ID     string       `json:"id"`
-	Name   string       `json:"name"`
-	Status string       `json:"status"`
-	Used   string       `json:"used"`
-	Models []UsageSlice `json:"models"`
+	PendingReview bool         `json:"pending_review,omitempty"`
+	ID            string       `json:"id"`
+	Name          string       `json:"name"`
+	Status        string       `json:"status"`
+	Used          string       `json:"used"`
+	Models        []UsageSlice `json:"models"`
 }
 
 func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month time.Time) (ProjectUsage, error) {
@@ -906,8 +1000,8 @@ func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month tim
 	}
 	var v ProjectUsage
 	v.Members, v.Models, v.FreeModels = []MemberUsage{}, []UsageSlice{}, []UsageSlice{}
-	var q, a, c, p int64
-	err := s.db.QueryRowContext(ctx, `SELECT p.name,b.quota_milli,b.allocated_milli,b.charged_milli,b.pending_milli FROM projects p JOIN project_month_credit_buckets b ON b.project_id=p.id AND b.month=$2 WHERE p.id=$1`, projectID, month).Scan(&v.ProjectName, &q, &a, &c, &p)
+	var q, a, p int64
+	err := s.db.QueryRowContext(ctx, `SELECT p.name,b.quota_milli,b.allocated_milli,trim_scale((b.charged_milli+b.charged_milli_remainder)*0.001)::text,b.pending_milli,EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$2 AND review.project_id=p.id) FROM projects p JOIN project_month_credit_buckets b ON b.project_id=p.id AND b.month=$2 WHERE p.id=$1`, projectID, month).Scan(&v.ProjectName, &q, &a, &v.Charged, &p, &v.PendingReview)
 	if err != nil {
 		return v, err
 	}
@@ -915,14 +1009,16 @@ func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month tim
 	v.ProjectID = projectID.String()
 	v.Quota = domain.FormatCredits(q)
 	v.Allocated = domain.FormatCredits(a)
-	v.Charged = domain.FormatCredits(c)
+	v.Charged = displayCredits(v.Charged)
 	v.Pending = domain.FormatCredits(p)
 	available := q - a
 	if available < 0 {
 		available = 0
 	}
 	v.Available = domain.FormatCredits(available)
-	rows, err := s.db.QueryContext(ctx, `SELECT u.id,u.name,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0),COALESCE(mb.charged_milli,0),COALESCE(mb.pending_milli,0),COALESCE(sum(c.charged_milli),0) FROM users u JOIN api_keys k ON k.owner_user_id=u.id AND k.project_id=$1 JOIN project_members pm ON pm.project_id=$1 AND pm.user_id=u.id LEFT JOIN project_member_month_credit_buckets mb ON mb.project_id=$1 AND mb.user_id=u.id AND mb.month=$2 LEFT JOIN monthly_usage_cube c ON c.api_key_id=k.id AND c.month=$2 WHERE k.status IN ('approved','active') OR c.id IS NOT NULL GROUP BY u.id,u.name,mb.quota_milli,pm.monthly_credit_quota_milli,mb.charged_milli,mb.pending_milli ORDER BY u.name`, projectID, month)
+	rows, err := s.db.QueryContext(ctx, `SELECT u.id,u.name,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0),trim_scale((GREATEST(0,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0)::numeric-COALESCE(mb.charged_milli,0)-COALESCE(mb.pending_milli,0)-COALESCE(mb.charged_milli_remainder,0)))*0.001)::text,trim_scale((COALESCE(sum(c.charged_milli),0)+COALESCE(sum(c.charged_milli_remainder),0))*0.001)::text,
+		EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$2 AND review.project_id=$1 AND review.user_id=u.id)
+		FROM users u JOIN api_keys k ON k.owner_user_id=u.id AND k.project_id=$1 JOIN project_members pm ON pm.project_id=$1 AND pm.user_id=u.id LEFT JOIN project_member_month_credit_buckets mb ON mb.project_id=$1 AND mb.user_id=u.id AND mb.month=$2 LEFT JOIN monthly_usage_cube c ON c.api_key_id=k.id AND c.month=$2 WHERE k.status IN ('approved','active') OR c.id IS NOT NULL OR EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$2 AND review.api_key_id=k.id) GROUP BY u.id,u.name,mb.quota_milli,pm.monthly_credit_quota_milli,mb.charged_milli,mb.pending_milli,mb.charged_milli_remainder ORDER BY u.name`, projectID, month)
 	if err != nil {
 		return v, err
 	}
@@ -930,50 +1026,46 @@ func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month tim
 	for rows.Next() {
 		var uid uuid.UUID
 		var m MemberUsage
-		var memberQuota, memberCharged, memberPending, credit int64
-		if err := rows.Scan(&uid, &m.UserName, &memberQuota, &memberCharged, &memberPending, &credit); err != nil {
+		var memberQuota int64
+		if err := rows.Scan(&uid, &m.UserName, &memberQuota, &m.Available, &m.Credits, &m.PendingReview); err != nil {
 			return v, err
 		}
 		m.UserID = uid.String()
 		m.Quota = domain.FormatCredits(memberQuota)
-		m.Credits = domain.FormatCredits(credit)
-		available := memberQuota - memberCharged - memberPending
-		if available < 0 {
-			available = 0
-		}
-		m.Available = domain.FormatCredits(available)
+		m.Credits = displayCredits(m.Credits)
+		m.Available = displayCredits(m.Available)
 		m.Keys = []KeyMemberUsage{}
 		m.FreeModels = []UsageSlice{}
-		kr, err := s.db.QueryContext(ctx, `SELECT k.id,k.name,k.status,b.charged_milli FROM api_keys k JOIN api_key_month_credit_buckets b ON b.api_key_id=k.id AND b.month=$3 WHERE k.project_id=$1 AND k.owner_user_id=$2 AND k.status IN ('approved','active','inactive') ORDER BY k.name`, projectID, uid, month)
+		kr, err := s.db.QueryContext(ctx, `SELECT k.id,k.name,k.status,trim_scale((b.charged_milli+b.charged_milli_remainder)*0.001)::text,EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$3 AND review.api_key_id=k.id) FROM api_keys k JOIN api_key_month_credit_buckets b ON b.api_key_id=k.id AND b.month=$3 WHERE k.project_id=$1 AND k.owner_user_id=$2 AND k.status IN ('approved','active','inactive') ORDER BY k.name`, projectID, uid, month)
 		if err != nil {
 			return v, err
 		}
 		for kr.Next() {
 			var kid uuid.UUID
 			var ki KeyMemberUsage
-			var ku int64
-			if err := kr.Scan(&kid, &ki.Name, &ki.Status, &ku); err != nil {
+			var ku string
+			if err := kr.Scan(&kid, &ki.Name, &ki.Status, &ku, &ki.PendingReview); err != nil {
 				kr.Close()
 				return v, err
 			}
 			ki.ID = kid.String()
 			ki.Models = []UsageSlice{}
-			ki.Used = domain.FormatCredits(ku)
-			modelRows, err := s.db.QueryContext(ctx, `SELECT c.model_id,m.model_id,c.model_name,c.charged_milli,c.charged_count+c.zero_cost_count FROM monthly_usage_cube c JOIN models m ON m.id=c.model_id WHERE c.api_key_id=$1 AND c.month=$2 ORDER BY c.charged_milli DESC,c.model_name`, kid, month)
+			ki.Used = displayCredits(ku)
+			modelRows, err := s.db.QueryContext(ctx, `SELECT c.model_id,m.model_id,c.model_name,trim_scale((c.charged_milli+c.charged_milli_remainder)*0.001)::text,c.charged_count+c.zero_cost_count FROM monthly_usage_cube c JOIN models m ON m.id=c.model_id WHERE c.api_key_id=$1 AND c.month=$2 ORDER BY c.charged_milli DESC,c.charged_milli_remainder DESC,c.model_name`, kid, month)
 			if err != nil {
 				kr.Close()
 				return v, err
 			}
 			for modelRows.Next() {
 				var sl UsageSlice
-				var credits int64
+				var credits string
 				var internalID uuid.UUID
 				if err := modelRows.Scan(&internalID, &sl.ID, &sl.Name, &credits, &sl.Calls); err != nil {
 					modelRows.Close()
 					kr.Close()
 					return v, err
 				}
-				sl.Credits = domain.FormatCredits(credits)
+				sl.Credits = displayCredits(credits)
 				ki.Models = append(ki.Models, sl)
 			}
 			if err := modelRows.Err(); err != nil {
@@ -1021,7 +1113,7 @@ func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month tim
 		return v, err
 	}
 	v.FreeModels = summarizeMemberFreeModels(v.Members)
-	mr, err := s.db.QueryContext(ctx, `SELECT m.model_id,c.model_name,sum(c.charged_milli),sum(c.charged_count) FROM monthly_usage_cube c JOIN models m ON m.id=c.model_id WHERE c.project_id=$1 AND c.month=$2 GROUP BY m.model_id,c.model_name ORDER BY sum(c.charged_milli) DESC,c.model_name`, projectID, month)
+	mr, err := s.db.QueryContext(ctx, `SELECT m.model_id,c.model_name,trim_scale((sum(c.charged_milli)+sum(c.charged_milli_remainder))*0.001)::text,sum(c.charged_count) FROM monthly_usage_cube c JOIN models m ON m.id=c.model_id WHERE c.project_id=$1 AND c.month=$2 GROUP BY m.model_id,c.model_name HAVING sum(c.charged_milli)+sum(c.charged_milli_remainder)>0 ORDER BY sum(c.charged_milli)+sum(c.charged_milli_remainder) DESC,c.model_name`, projectID, month)
 	if err != nil {
 		return v, err
 	}
@@ -1029,16 +1121,14 @@ func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month tim
 	for mr.Next() {
 		var id string
 		var name string
-		var credits, calls int64
+		var credits string
+		var calls int64
 		if err := mr.Scan(&id, &name, &credits, &calls); err != nil {
 			return v, err
 		}
-		item := UsageSlice{ID: id, Name: name, Credits: domain.FormatCredits(credits), Calls: calls}
-		if credits > 0 {
-			v.Models = append(v.Models, item)
-		}
+		v.Models = append(v.Models, UsageSlice{ID: id, Name: name, Credits: displayCredits(credits), Calls: calls})
 	}
-	return v, nil
+	return v, mr.Err()
 }
 
 func summarizeMemberFreeModels(members []MemberUsage) []UsageSlice {
@@ -1086,6 +1176,10 @@ func DecodeCursor(raw string) (*Cursor, error) {
 	}
 	return &c, nil
 }
+
+const callDisplayCreditsSQL = `trim_scale(CASE WHEN c.beichen_state IN ('reserved','pending_review') THEN 0 ELSE COALESCE(c.beichen_credit_exact,c.credit_milli*0.001) END)::text`
+const callDisplayBillingSQL = `CASE WHEN c.beichen_state='pending_review' THEN 'pending_review' ELSE c.billing_state END`
+const callDisplayOutcomeSQL = `CASE WHEN c.beichen_state='pending_review' THEN 'pending_review' ELSE c.outcome END`
 
 type LogFilter struct {
 	ProjectID, UserID, APIKeyID *uuid.UUID
@@ -1183,7 +1277,7 @@ func (s *Store) MentorCallLogs(ctx context.Context, mentorID uuid.UUID, f LogFil
 		add("EXISTS(SELECT 1 FROM models filter_model WHERE filter_model.id=c.model_id AND filter_model.model_id=$%d)", *f.ModelID)
 	}
 	if f.Status != "" {
-		add("c.outcome=$%d", f.Status)
+		add("("+callDisplayOutcomeSQL+")=$%d", f.Status)
 	}
 	if f.Start != nil {
 		add("c.created_at>=$%d", *f.Start)
@@ -1196,7 +1290,7 @@ func (s *Store) MentorCallLogs(ctx context.Context, mentorID uuid.UUID, f LogFil
 		where = append(where, fmt.Sprintf("(c.created_at,c.id)<($%d,$%d)", len(args)-1, len(args)))
 	}
 	args = append(args, f.Limit+1)
-	query := `SELECT c.id,c.request_id,c.project_id,c.project_name,c.user_id,c.user_name,c.api_key_id,c.api_key_name,m.model_id,c.model_name,COALESCE(c.provider_name,''),c.protocol,c.request_path,c.multiplier_milli,c.credit_milli,c.billing_state,c.outcome,COALESCE(c.error_category,''),COALESCE(c.error_message,''),c.created_at FROM gateway_calls c JOIN models m ON m.id=c.model_id WHERE ` + strings.Join(where, " AND ") + fmt.Sprintf(" ORDER BY c.created_at DESC,c.id DESC LIMIT $%d", len(args))
+	query := `SELECT c.id,c.request_id,c.project_id,c.project_name,c.user_id,c.user_name,c.api_key_id,c.api_key_name,m.model_id,c.model_name,COALESCE(c.provider_name,''),c.protocol,c.request_path,c.multiplier_milli,` + callDisplayCreditsSQL + `,` + callDisplayBillingSQL + `,` + callDisplayOutcomeSQL + `,COALESCE(c.error_category,''),COALESCE(c.error_message,''),c.created_at FROM gateway_calls c JOIN models m ON m.id=c.model_id WHERE ` + strings.Join(where, " AND ") + fmt.Sprintf(" ORDER BY c.created_at DESC,c.id DESC LIMIT $%d", len(args))
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return Page[CallLog]{}, err
@@ -1205,7 +1299,8 @@ func (s *Store) MentorCallLogs(ctx context.Context, mentorID uuid.UUID, f LogFil
 	page := Page[CallLog]{Items: []CallLog{}}
 	for rows.Next() {
 		var ids [4]uuid.UUID
-		var multiplier, credits int64
+		var multiplier int64
+		var credits string
 		var item CallLog
 		if err := rows.Scan(&ids[0], &item.RequestID, &ids[1], &item.ProjectName, &ids[2], &item.UserName, &ids[3], &item.APIKeyName, &item.ModelID, &item.ModelName, &item.ProviderName, &item.Protocol, &item.Path, &multiplier, &credits, &item.BillingState, &item.Outcome, &item.ErrorCategory, &item.ErrorMessage, &item.CreatedAt); err != nil {
 			return page, err
@@ -1215,7 +1310,7 @@ func (s *Store) MentorCallLogs(ctx context.Context, mentorID uuid.UUID, f LogFil
 		item.UserID = ids[2].String()
 		item.APIKeyID = ids[3].String()
 		item.Multiplier = domain.FormatCredits(multiplier)
-		item.Credits = domain.FormatCredits(credits)
+		item.Credits = displayCredits(credits)
 		page.Items = append(page.Items, item)
 	}
 	if len(page.Items) > f.Limit {
@@ -1230,9 +1325,10 @@ func (s *Store) MentorCallLogs(ctx context.Context, mentorID uuid.UUID, f LogFil
 
 func (s *Store) MentorCallLog(ctx context.Context, mentorID, callID uuid.UUID) (CallLog, error) {
 	var ids [4]uuid.UUID
-	var multiplier, credits int64
+	var multiplier int64
+	var credits string
 	var item CallLog
-	err := s.db.QueryRowContext(ctx, `SELECT c.id,c.request_id,c.project_id,c.project_name,c.user_id,c.user_name,c.api_key_id,c.api_key_name,m.model_id,c.model_name,COALESCE(c.provider_name,''),c.protocol,c.request_path,c.multiplier_milli,c.credit_milli,c.billing_state,c.outcome,COALESCE(c.error_category,''),COALESCE(c.error_message,''),c.created_at FROM gateway_calls c JOIN models m ON m.id=c.model_id WHERE c.id=$1 AND EXISTS(SELECT 1 FROM project_members pm WHERE pm.project_id=c.project_id AND pm.user_id=$2)`, callID, mentorID).Scan(&ids[0], &item.RequestID, &ids[1], &item.ProjectName, &ids[2], &item.UserName, &ids[3], &item.APIKeyName, &item.ModelID, &item.ModelName, &item.ProviderName, &item.Protocol, &item.Path, &multiplier, &credits, &item.BillingState, &item.Outcome, &item.ErrorCategory, &item.ErrorMessage, &item.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT c.id,c.request_id,c.project_id,c.project_name,c.user_id,c.user_name,c.api_key_id,c.api_key_name,m.model_id,c.model_name,COALESCE(c.provider_name,''),c.protocol,c.request_path,c.multiplier_milli,`+callDisplayCreditsSQL+`,`+callDisplayBillingSQL+`,`+callDisplayOutcomeSQL+`,COALESCE(c.error_category,''),COALESCE(c.error_message,''),c.created_at FROM gateway_calls c JOIN models m ON m.id=c.model_id WHERE c.id=$1 AND EXISTS(SELECT 1 FROM project_members pm WHERE pm.project_id=c.project_id AND pm.user_id=$2)`, callID, mentorID).Scan(&ids[0], &item.RequestID, &ids[1], &item.ProjectName, &ids[2], &item.UserName, &ids[3], &item.APIKeyName, &item.ModelID, &item.ModelName, &item.ProviderName, &item.Protocol, &item.Path, &multiplier, &credits, &item.BillingState, &item.Outcome, &item.ErrorCategory, &item.ErrorMessage, &item.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return CallLog{}, domain.NewError(domain.CodeNotFound, "call log not found")
 	}
@@ -1240,7 +1336,7 @@ func (s *Store) MentorCallLog(ctx context.Context, mentorID, callID uuid.UUID) (
 		return CallLog{}, err
 	}
 	item.ID, item.ProjectID, item.UserID, item.APIKeyID = ids[0].String(), ids[1].String(), ids[2].String(), ids[3].String()
-	item.Multiplier, item.Credits = domain.FormatCredits(multiplier), domain.FormatCredits(credits)
+	item.Multiplier, item.Credits = domain.FormatCredits(multiplier), displayCredits(credits)
 	rows, err := s.db.QueryContext(ctx, `SELECT provider_name,status,http_status,COALESCE(error_category,''),COALESCE(error_message,''),latency_ms FROM gateway_call_attempts WHERE call_id=$1 ORDER BY created_at`, callID)
 	if err != nil {
 		return CallLog{}, err
@@ -1304,7 +1400,7 @@ func (s *Store) MentorInputs(ctx context.Context, mentorID uuid.UUID, f InputFil
 		add("EXISTS(SELECT 1 FROM models filter_model WHERE filter_model.id=c.model_id AND filter_model.model_id=$%d)", *f.ModelID)
 	}
 	if f.Status != "" {
-		add("c.outcome=$%d", f.Status)
+		add("("+callDisplayOutcomeSQL+")=$%d", f.Status)
 	}
 	if f.Start != nil {
 		add("c.created_at>=$%d", *f.Start)
@@ -1328,7 +1424,7 @@ func (s *Store) MentorInputs(ctx context.Context, mentorID uuid.UUID, f InputFil
 	if _, err = tx.ExecContext(ctx, `SET LOCAL statement_timeout='3s'`); err != nil {
 		return Page[InputMonitorItem]{}, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT c.id,c.project_id,c.project_name,c.user_id,c.user_name,c.api_key_name,c.model_name,COALESCE(c.provider_name,''),c.credit_milli,c.outcome,left(i.content,200),i.content_bytes,length(i.content)>200,c.created_at,i.id FROM monitored_inputs i JOIN gateway_calls c ON c.id=i.call_id WHERE `+strings.Join(where, " AND ")+fmt.Sprintf(" ORDER BY c.created_at DESC,c.id DESC LIMIT $%d", len(args)), args...)
+	rows, err := tx.QueryContext(ctx, `SELECT c.id,c.project_id,c.project_name,c.user_id,c.user_name,c.api_key_name,c.model_name,COALESCE(c.provider_name,''),`+callDisplayCreditsSQL+`,`+callDisplayOutcomeSQL+`,left(i.content,200),i.content_bytes,length(i.content)>200,c.created_at,i.id FROM monitored_inputs i JOIN gateway_calls c ON c.id=i.call_id WHERE `+strings.Join(where, " AND ")+fmt.Sprintf(" ORDER BY c.created_at DESC,c.id DESC LIMIT $%d", len(args)), args...)
 	if err != nil {
 		return Page[InputMonitorItem]{}, err
 	}
@@ -1336,7 +1432,7 @@ func (s *Store) MentorInputs(ctx context.Context, mentorID uuid.UUID, f InputFil
 	ids := []string{}
 	for rows.Next() {
 		var call, project, user, input uuid.UUID
-		var credit int64
+		var credit string
 		var item InputMonitorItem
 		if err := rows.Scan(&call, &project, &item.ProjectName, &user, &item.UserName, &item.APIKeyName, &item.ModelName, &item.ProviderName, &credit, &item.Outcome, &item.Preview, &item.ContentBytes, &item.Truncated, &item.CreatedAt, &input); err != nil {
 			rows.Close()
@@ -1345,7 +1441,7 @@ func (s *Store) MentorInputs(ctx context.Context, mentorID uuid.UUID, f InputFil
 		item.CallID = call.String()
 		item.ProjectID = project.String()
 		item.UserID = user.String()
-		item.Credits = domain.FormatCredits(credit)
+		item.Credits = displayCredits(credit)
 		page.Items = append(page.Items, item)
 		ids = append(ids, input.String())
 	}
@@ -1377,9 +1473,9 @@ func (s *Store) MentorInput(ctx context.Context, mentorID, callID uuid.UUID) (In
 	defer func() { _ = tx.Rollback() }()
 	var item InputMonitorItem
 	var project, user, input uuid.UUID
-	var credit int64
+	var credit string
 	var content string
-	err = tx.QueryRowContext(ctx, `SELECT c.project_id,c.project_name,c.user_id,c.user_name,c.api_key_name,c.model_name,COALESCE(c.provider_name,''),c.credit_milli,c.outcome,i.content,i.content_bytes,c.created_at,i.id FROM monitored_inputs i JOIN gateway_calls c ON c.id=i.call_id WHERE c.id=$1 AND i.visible=true AND i.created_at>=now()-interval '90 days' AND EXISTS(SELECT 1 FROM project_members pm WHERE pm.project_id=i.project_id AND pm.user_id=$2)`, callID, mentorID).Scan(&project, &item.ProjectName, &user, &item.UserName, &item.APIKeyName, &item.ModelName, &item.ProviderName, &credit, &item.Outcome, &content, &item.ContentBytes, &item.CreatedAt, &input)
+	err = tx.QueryRowContext(ctx, `SELECT c.project_id,c.project_name,c.user_id,c.user_name,c.api_key_name,c.model_name,COALESCE(c.provider_name,''),`+callDisplayCreditsSQL+`,`+callDisplayOutcomeSQL+`,i.content,i.content_bytes,c.created_at,i.id FROM monitored_inputs i JOIN gateway_calls c ON c.id=i.call_id WHERE c.id=$1 AND i.visible=true AND i.created_at>=now()-interval '90 days' AND EXISTS(SELECT 1 FROM project_members pm WHERE pm.project_id=i.project_id AND pm.user_id=$2)`, callID, mentorID).Scan(&project, &item.ProjectName, &user, &item.UserName, &item.APIKeyName, &item.ModelName, &item.ProviderName, &credit, &item.Outcome, &content, &item.ContentBytes, &item.CreatedAt, &input)
 	if errors.Is(err, sql.ErrNoRows) {
 		return InputMonitorItem{}, domain.NewError(domain.CodeNotFound, "monitored input not found")
 	}
@@ -1396,7 +1492,7 @@ func (s *Store) MentorInput(ctx context.Context, mentorID, callID uuid.UUID) (In
 	item.CallID = callID.String()
 	item.ProjectID = project.String()
 	item.UserID = user.String()
-	item.Credits = domain.FormatCredits(credit)
+	item.Credits = displayCredits(credit)
 	item.Content = &content
 	return item, nil
 }
@@ -1409,10 +1505,10 @@ func (s *Store) RecoverAndClean(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `DELETE FROM gateway_call_attempts WHERE call_id IN(SELECT id FROM gateway_calls WHERE created_at<now()-interval '365 days' LIMIT 1000)`)
+	_, err = s.db.ExecContext(ctx, `DELETE FROM gateway_call_attempts WHERE call_id IN(SELECT c.id FROM gateway_calls c WHERE c.created_at<now()-interval '365 days' AND EXISTS(SELECT 1 FROM gateway_call_attempts a WHERE a.call_id=c.id) LIMIT 1000)`)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `DELETE FROM gateway_calls WHERE id IN(SELECT id FROM gateway_calls WHERE created_at<now()-interval '365 days' AND NOT EXISTS(SELECT 1 FROM monitored_inputs i WHERE i.call_id=gateway_calls.id) LIMIT 1000)`)
+	_, err = s.db.ExecContext(ctx, `DELETE FROM gateway_calls WHERE id IN(SELECT id FROM gateway_calls WHERE created_at<now()-interval '365 days' AND (beichen_state IS NULL OR beichen_state='released') AND NOT EXISTS(SELECT 1 FROM monitored_inputs i WHERE i.call_id=gateway_calls.id) LIMIT 1000)`)
 	return err
 }

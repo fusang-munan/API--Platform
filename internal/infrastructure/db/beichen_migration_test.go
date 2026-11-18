@@ -107,7 +107,7 @@ VALUES($1, 'model', 'upstream', 'effective', 'billing', '2026-11-18 00:00:00+08'
 	if _, err := conn.ExecContext(ctx, `
 UPDATE gateway_calls SET provider_id=$2, provider_credential_id=$3, binding_id=$4, upstream_model_name='model',
   protocol='openai_compatible', outcome='succeeded', usage_state='reported', prompt_tokens=12000,
-  completion_tokens=1000, total_tokens=13000, cache_hit_tokens=2000,
+  completion_tokens=1000, total_tokens=13000, cache_hit_tokens=2000, cache_write_tokens=0,
   created_at='2026-11-17 23:59:59+08', sent_at='2026-11-18 00:00:01+08'
 WHERE id=$1`, callID, providerID, credentialID, uuid.New()); err != nil {
 		t.Fatal(err)
@@ -138,7 +138,7 @@ VALUES($1, $2, '2026-11-18', 'model', 1, 10000, 1000, 2000, 24000, 'usage')`, pr
 		{"cached input tokens", row.LocalCacheReadTokens, 2000},
 		{"upstream estimate", row.EstimatedUpstreamMicros, 24000},
 		{"upstream billed", row.BilledUpstreamMicros, 24000},
-		{"trial credits", row.TrialCreditMilli, 24},
+		{"trial credits (milli)", row.TrialCreditMilli, 2400},
 		{"unpriced calls", row.TrialUnpricedCalls, 0},
 	} {
 		if want.got == nil {

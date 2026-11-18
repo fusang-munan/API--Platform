@@ -4,6 +4,7 @@ import { APIError, apiErrorMessage } from '../../api/client'
 import { teacherAPI } from '../../api/teacher'
 import type { BeichenComparison, BeichenImport, BeichenImportKind, BeichenModel, BeichenOverview, BeichenPriceUpdate, BeichenRates, Provider } from '../../api/types'
 import AppDialog from '../../components/AppDialog.vue'
+import BeichenCatalogAccess from './BeichenCatalogAccess.vue'
 import LoadingButton from '../../components/LoadingButton.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
 import { useLoadState } from '../../composables/useLoadState'
@@ -40,17 +41,17 @@ const csvFormats: Record<BeichenImportKind, { label: string; header: string; hin
   prices: {
     label: '价格（最终实际单价）',
     header: priceHeader,
-    hint: '填写最终实际单价，单位为微美元 / 百万 Token。',
+    hint: '填写每百万 Token 的最终单价，以百万分之一北辰余额单位计。',
   },
   prices_base: {
     label: '价格（已确认的基础价）',
     header: priceHeader,
-    hint: '填写已确认的基础价，单位为微美元 / 百万 Token。最终单价由基础价乘以该凭据的北辰实际倍率计算。',
+    hint: '填写每百万 Token 的基础价，以百万分之一北辰余额单位计。系统会乘一次该渠道的实际倍率。',
   },
   usage: {
     label: '用量（日汇总）',
     header: 'date,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros',
-    hint: '每行填写一个模型的日汇总，账单金额以微美元计。',
+    hint: '每行填写一个模型的日汇总，金额以百万分之一北辰余额单位计。',
   },
   usage_export: {
     label: '北辰用量明细',
@@ -216,7 +217,16 @@ function scaledNumber(value: number, digits: number, group = false) {
 function amount(value: number | null | undefined, unit: 'USD' | 'credit', digits = 6) {
   if (value == null) return '—'
   const number = scaledNumber(value, digits, true)
-  return unit === 'USD' ? `$${number}` : `${number} credit`
+  return unit === 'USD' ? `${number} 单位` : `${number} credit`
+}
+
+function trialCredits(row: BeichenComparison) {
+  if (row.trial_credits === undefined) return amount(row.trial_credit_milli, 'credit', 3)
+  return exactCredits(row.trial_credits)
+}
+
+function exactCredits(value?: string | null) {
+  return value == null ? '—' : `${value} credit`
 }
 
 function count(value?: number | null) {
@@ -333,7 +343,7 @@ async function savePrice() {
               <LoadingButton class="button secondary" type="submit" :disabled="busy || !day" :pending="loadState.loading.value && !action" pending-label="查询中…">查询</LoadingButton>
             </form>
             <template v-if="comparison">
-              <p class="muted">账期 {{ snapshot?.day }}。请求数和 Token 用量均按「校内 / 北辰」排列。</p>
+              <p class="muted">账期 {{ snapshot?.day }}。请求数和 Token 用量均按「校内 / 北辰」排列。正式实扣来自逐笔记录；— 表示暂无金额或数据。</p>
               <div v-if="comparison.length" class="beichen-table" tabindex="0" role="region" aria-label="按凭据和模型对账">
                 <table class="usage-table">
                   <thead>
@@ -342,6 +352,7 @@ async function savePrice() {
                       <th v-for="field in usageFields" :key="field.local" scope="col" class="numeric-cell">{{ field.label }}</th>
                       <th scope="col" class="numeric-cell">上游费用</th>
                       <th scope="col" class="numeric-cell">校内试算</th>
+                      <th scope="col" class="numeric-cell">校内正式实扣</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -356,7 +367,8 @@ async function savePrice() {
                         账单 {{ amount(row.billed_upstream_micros, 'USD') }}
                         <small v-if="row.upstream_usage_source" class="muted">{{ usageSourceLabels[row.upstream_usage_source] }}</small>
                       </td>
-                      <td class="numeric-cell">{{ amount(row.trial_credit_milli, 'credit', 3) }}<br>未定价次数 {{ count(row.trial_unpriced_calls) }}</td>
+                      <td class="numeric-cell">{{ trialCredits(row) }}<br>未定价次数 {{ count(row.trial_unpriced_calls) }}</td>
+                      <td class="numeric-cell">{{ exactCredits(row.charged_credits) }}<br>待核账 {{ count(row.pending_review_calls) }} 条</td>
                     </tr>
                   </tbody>
                 </table>
@@ -367,6 +379,7 @@ async function savePrice() {
           </div>
         </details>
 
+        <BeichenCatalogAccess :provider-id="provider.id" :credentials="credentials" />
         <details class="beichen-section">
           <summary>导入官方 CSV</summary>
           <form class="beichen-body" @submit.prevent="importCSV">
@@ -418,7 +431,7 @@ async function savePrice() {
         <details class="beichen-section">
           <summary>模型价格</summary>
           <div class="beichen-body">
-            <p class="muted">单价按百万 Token 显示。每格依次为上游（美元）、校内（credit）。</p>
+            <p class="muted">每格依次显示每百万 Token 的北辰余额单位和校内试算积分。1 北辰余额单位折合 100 积分。</p>
             <form v-if="editing" ref="priceEditor" class="beichen-body beichen-editor" tabindex="-1" :aria-labelledby="priceTitleId" @submit.prevent="savePrice">
               <strong :id="priceTitleId">{{ editing.model }} · {{ credentialLabel(editing.credential_id) }}</strong>
               <label>校内定价方式
