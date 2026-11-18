@@ -52,40 +52,37 @@ func (s *SMTP) Send(ctx context.Context, to, subject, text string) error {
 		return fmt.Errorf("invalid mail header")
 	}
 	address := net.JoinHostPort(s.host, fmt.Sprint(s.port))
-	dialer := &net.Dialer{Timeout: s.timeout}
-	var (
-		client *smtp.Client
-		conn   net.Conn
-		err    error
-	)
-	if s.tlsMode == "tls" {
-		conn, err = tls.DialWithDialer(dialer, "tcp", address, &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			ServerName: s.host,
-		})
-		if err != nil {
-			return fmt.Errorf("dial SMTP TLS: %w", err)
-		}
-		client, err = smtp.NewClient(conn, s.host)
-	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", address)
-		if err != nil {
-			return fmt.Errorf("dial SMTP: %w", err)
-		}
-		client, err = smtp.NewClient(conn, s.host)
+	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+	dialer := &net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return fmt.Errorf("dial SMTP: %w", err)
 	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	deadline, _ := ctx.Deadline()
+	if err := conn.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("set SMTP deadline: %w", err)
+	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: s.host}
+	var smtpConn net.Conn = conn
+	if s.tlsMode == "tls" {
+		secureConn := tls.Client(conn, tlsConfig)
+		if err := secureConn.HandshakeContext(ctx); err != nil {
+			return fmt.Errorf("handshake SMTP TLS: %w", err)
+		}
+		smtpConn = secureConn
+	}
+	client, err := smtp.NewClient(smtpConn, s.host)
 	if err != nil {
 		return fmt.Errorf("create SMTP client: %w", err)
 	}
 	defer client.Close()
 
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(s.timeout))
-	}
 	if s.tlsMode == "starttls" {
-		if err := client.StartTLS(&tls.Config{MinVersion: tls.VersionTLS12, ServerName: s.host}); err != nil {
+		if err := client.StartTLS(tlsConfig); err != nil {
 			return fmt.Errorf("start SMTP TLS: %w", err)
 		}
 	}

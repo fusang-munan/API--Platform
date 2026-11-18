@@ -17,7 +17,7 @@ func TestMaintenanceHTTPSUsesNormalAuthentication(t *testing.T) {
 		t.Fatal(err)
 	}
 	api := httpapi.NewServer(nil, nil, nil, nil, httpapi.HealthDependencies{}, httpapi.Config{CookieSecure: true})
-	server := httptest.NewUnstartedServer(maintenanceHandler(api.Handler(), false))
+	server := httptest.NewUnstartedServer(maintenanceHandler(api.Handler(), false, nil))
 	server.TLS = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	server.StartTLS()
 	defer server.Close()

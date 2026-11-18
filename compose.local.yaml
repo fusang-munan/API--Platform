@@ -32,6 +32,10 @@ services:
       LAB_MAINTENANCE_TLS_ADDR: ":8443"
       LAB_MAINTENANCE_TLS_DIR: /app/maintenance-tls
       LAB_MAINTENANCE_TLS_ORIGIN: https://106.55.103.208:25555
+      LAB_MAINTENANCE_RELEASE: ${NEBULA_VERSION:?use scripts/compose-local.sh}
+      # Single opt-in public certificate email for this release. See docs/FRP_PUBLIC_ACCESS.md.
+      LAB_CERTIFICATE_NOTICE_REQUEST_SHA256: d934322d856eaa78f9cd4a91817cf34c27241a695904deb6cbf4a75fa8ec6643
+      LAB_CERTIFICATE_NOTICE_EXPIRES_AT: "2026-11-18T16:00:00Z"
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       BEICHEN_PANEL_TOKEN: ${BEICHEN_PANEL_TOKEN:-}
