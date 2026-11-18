@@ -77,6 +77,10 @@ func newCertificateNotice(parent context.Context, release, origin, grant, expiry
 			w.WriteHeader(http.StatusUnsupportedMediaType)
 			return
 		}
+		controller := http.NewResponseController(w)
+		if err := controller.SetReadDeadline(time.Now().Add(5 * time.Second)); err == nil {
+			defer controller.SetReadDeadline(time.Time{})
+		}
 		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512))
 		decoder.DisallowUnknownFields()
 		var req certificateNoticeRequest
