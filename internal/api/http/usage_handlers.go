@@ -29,6 +29,15 @@ func (s *Server) studentUsage(c *gin.Context) {
 	}
 	respond(c, http.StatusOK, v)
 }
+func (s *Server) studentCallReceipt(c *gin.Context) {
+	v, err := s.service.StudentCallReceipt(c.Request.Context(), identity(c).UserID, c.Param("request_id"))
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, v)
+}
+
 func (s *Server) mentorProjectUsage(c *gin.Context) {
 	id, ok := pathID(c, "project_id")
 	if !ok {

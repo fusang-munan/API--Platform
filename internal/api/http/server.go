@@ -86,6 +86,7 @@ func (s *Server) registerControlPlane() {
 	student.POST("/models", s.addStudentModel)
 	student.POST("/models/remove", s.removeStudentModel)
 	student.GET("/usage", s.studentUsage)
+	student.GET("/usage/calls/:request_id", s.studentCallReceipt)
 	student.POST("/api-keys", s.submitAPIKey)
 	student.GET("/api-keys", s.studentAPIKeys)
 	student.GET("/api-keys/:api_key_id", s.studentAPIKey)
