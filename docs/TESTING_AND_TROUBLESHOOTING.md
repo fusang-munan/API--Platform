@@ -176,8 +176,10 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 1. 在一次性测试数据库上应用迁移并重复执行一次。测试数据库必须新建、只监听回环地址、数据库名为 `nebula_test`。设置 `NEBULA_TEST_POSTGRES` 指向该测试库并使用 `sslmode=disable`，执行 `go test ./internal/infrastructure/db -run TestBeichenMigrationUpgrade -count=1 -v`。
 2. 用虚构凭据和模拟上游执行 `go test ./internal/beichen ./internal/dataplane ./internal/usage ./internal/api/http`。覆盖流式回填、零和缺失、用量中断、同步结果及教师端权限。控制台执行 `npm run typecheck` 和 `npm run test`。
+   - 贯通验证使用 `NEBULA_TEST_POSTGRES=postgres://nebula_qa@127.0.0.1:55439/nebula_test?sslmode=disable`，执行 `go test ./internal/dataplane -run '^TestBeichenPostgresGatewayReconciliation$' -count=1 -v`。测试在独立模式内验证模拟流式响应、网关入账、按次扣额度和北辰账单对比。数据库和角色必须是专用的本机测试实例。
 3. 校方在加密管理入口录入专用北辰凭据后，教师页按凭据执行手动同步，再用各待验收渠道的一次短文本调用核对实际的输入、输出、缓存明细与账单。对比时使用同一凭据、模型和北京时间日期。
 4. 若模型可见但没有倍率，分别检查计费接口状态和供应商开放范围。若缺少可确认报价或单日用量，使用教师面板的 CSV 导入。含未结算、断流或缺失用量的对账区间需要查看采集状态；当天上游账单可能晚于请求完成。
+5. 如果模型调用正常而目录、倍率和用量同时报网络超时，检查后端的 `HTTPS_PROXY`、`NO_PROXY` 与服务器实际出网路线，再在教师页手动同步。运行 `go test ./internal/beichen -run TestSyncUsesConfiguredHTTPSProxy -count=1` 可用本机模拟代理验证北辰同步走同一出网路线。代理只收到建立 HTTPS 隧道的请求，北辰认证头随隧道里的 HTTPS 请求发送。
 
 | 现象 | 常见根因 | 解决方案 | 排查建议 |
 | --- | --- | --- | --- |

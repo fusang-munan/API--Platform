@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +52,59 @@ func TestFixedOriginRejectsRedirectsAndBoundsResponses(t *testing.T) {
 	}
 	if _, err := service.fetch(context.Background(), "fake-test-key", "//elsewhere.invalid", nil); err == nil || calls != 2 {
 		t.Fatalf("invalid path was used, requests=%d", calls)
+	}
+}
+
+func TestSyncUsesConfiguredHTTPSProxy(t *testing.T) {
+	const proxyTestEnv = "NEBULA_TEST_BEICHEN_PROXY"
+	if os.Getenv(proxyTestEnv) == "1" {
+		service := New(nil, nil)
+		transport := service.client.Transport.(*http.Transport)
+		dial := transport.DialContext
+		proxyAddress := strings.TrimPrefix(os.Getenv("HTTPS_PROXY"), "http://")
+		host, _, err := net.SplitHostPort(proxyAddress)
+		if err != nil || !net.ParseIP(host).IsLoopback() {
+			t.Fatal("proxy fixture requires a loopback listener")
+		}
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			if address != proxyAddress {
+				t.Errorf("connection did not use the loopback proxy")
+				return nil, net.ErrClosed
+			}
+			return dial(ctx, network, address)
+		}
+		if _, err := service.fetch(context.Background(), "fake-test-key", billingPath, nil); err == nil {
+			t.Fatal("expected the simulated proxy's refusal")
+		}
+		return
+	}
+
+	calls := make(chan struct{}, 1)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect || r.Host != "api.beichenapi.com:443" {
+			t.Error("expected an HTTPS tunnel to the fixed upstream")
+		}
+		if r.Header.Get("Authorization") != "" {
+			t.Error("upstream authorization was exposed to the proxy")
+		}
+		select {
+		case calls <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+
+	// net/http caches proxy environment variables on first use.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestSyncUsesConfiguredHTTPSProxy$", "-test.timeout=12s")
+	cmd.Env = append(os.Environ(), proxyTestEnv+"=1", "HTTPS_PROXY="+proxy.URL, "NO_PROXY=")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run proxy fixture: %v\n%s", err, output)
+	}
+	select {
+	case <-calls:
+	default:
+		t.Fatal("loopback proxy did not receive the HTTPS tunnel request")
 	}
 }
 

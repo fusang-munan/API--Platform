@@ -29,7 +29,7 @@ func newClient() *http.Client {
 	dialer := &net.Dialer{Timeout: 4 * time.Second, KeepAlive: 30 * time.Second}
 	return &http.Client{
 		Transport: &http.Transport{
-			DialContext: dialer.DialContext, ForceAttemptHTTP2: true,
+			Proxy: http.ProxyFromEnvironment, DialContext: dialer.DialContext, ForceAttemptHTTP2: true,
 			TLSHandshakeTimeout: 4 * time.Second, ResponseHeaderTimeout: 6 * time.Second,
 			IdleConnTimeout: 30 * time.Second, MaxIdleConnsPerHost: 2, MaxConnsPerHost: 4,
 			MaxResponseHeaderBytes: 32 << 10,
