@@ -67,11 +67,16 @@ func (s *Server) importBeichen(c *gin.Context) {
 		return
 	}
 	var input struct {
-		CredentialID string `json:"credential_id"`
-		Kind         string `json:"kind"`
-		CSV          string `json:"csv"`
+		CredentialID     string `json:"credential_id"`
+		Kind             string `json:"kind"`
+		CSV              string `json:"csv"`
+		FullDayConfirmed bool   `json:"full_day_confirmed"`
 	}
 	if !bindBeichenJSON(c, &input, false) {
+		return
+	}
+	if input.Kind == "usage_export" && !input.FullDayConfirmed {
+		writeError(c, domain.NewError(domain.CodeValidation, "请确认北辰明细覆盖一个完整的北京时间账日"))
 		return
 	}
 	credentialID, err := controlplane.UUID(input.CredentialID)

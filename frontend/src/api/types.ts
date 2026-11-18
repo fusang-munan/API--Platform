@@ -68,8 +68,11 @@ export type BeichenRates = { input: number; output: number; cache_read?: number;
 export type BeichenPriceUpdate = { credential_id: string; model: string } & (
   { mode: 'follow' } | { mode: 'manual'; rates: BeichenRates }
 )
-export type BeichenImportKind = 'prices' | 'prices_base' | 'usage'
-export type BeichenImport = { credential_id: string; kind: BeichenImportKind; csv: string }
+export type BeichenImportKind = 'prices' | 'prices_base' | 'usage' | 'usage_export'
+export type BeichenImport = { credential_id: string; csv: string } & (
+  { kind: 'usage_export'; full_day_confirmed: true }
+  | { kind: Exclude<BeichenImportKind, 'usage_export'>; full_day_confirmed?: never }
+)
 export type BeichenDataset = {
   credential_id: string
   kind: string
@@ -88,6 +91,7 @@ export type BeichenModel = {
 export type BeichenComparison = {
   credential_id: string
   model: string
+  upstream_usage_source: 'usage' | 'csv' | 'export' | null
   local_requests: number | null
   upstream_requests: number | null
   local_input_tokens: number | null

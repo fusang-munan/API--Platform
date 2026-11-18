@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, nextTick, reactive, ref, useId } from 'vue'
+import { computed, nextTick, reactive, ref, useId, watch } from 'vue'
 import { APIError, apiErrorMessage } from '../../api/client'
 import { teacherAPI } from '../../api/teacher'
-import type { BeichenComparison, BeichenImportKind, BeichenModel, BeichenOverview, BeichenPriceUpdate, BeichenRates, Provider } from '../../api/types'
+import type { BeichenComparison, BeichenImport, BeichenImportKind, BeichenModel, BeichenOverview, BeichenPriceUpdate, BeichenRates, Provider } from '../../api/types'
 import AppDialog from '../../components/AppDialog.vue'
 import LoadingButton from '../../components/LoadingButton.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
@@ -24,6 +24,11 @@ const usageFields = [
   { local: 'local_cache_read_tokens', upstream: 'upstream_cache_read_tokens', label: '缓存读取' },
   { local: 'local_cache_write_tokens', upstream: 'upstream_cache_write_tokens', label: '缓存写入' },
 ] as const satisfies ReadonlyArray<{ local: keyof BeichenComparison; upstream: keyof BeichenComparison; label: string }>
+const usageSourceLabels: Record<NonNullable<BeichenComparison['upstream_usage_source']>, string> = {
+  usage: '自动同步',
+  csv: '手工汇总',
+  export: '导入明细（待核对）',
+}
 const datasetLabels: Record<string, string> = {
   catalog: '模型目录',
   billing: '计费倍率',
@@ -43,9 +48,14 @@ const csvFormats: Record<BeichenImportKind, { label: string; header: string; hin
     hint: '填写已确认的基础价，单位为微美元 / 百万 Token。最终单价由基础价乘以该凭据的北辰实际倍率计算。',
   },
   usage: {
-    label: '用量',
+    label: '用量（日汇总）',
     header: 'date,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros',
-    hint: '填写逐日用量，账单金额以微美元计。',
+    hint: '每行填写一个模型的日汇总，账单金额以微美元计。',
+  },
+  usage_export: {
+    label: '北辰用量明细',
+    header: 'Time,API Key Name,Model,Reasoning Effort,Inbound Endpoint,IP Address,Type,Billing Mode,Input Tokens,Output Tokens,Cache Read Tokens,Cache Creation Tokens,Rate Multiplier,Billed Cost,Original Cost,First Token (ms),Duration (ms)',
+    hint: '先在北辰「用量」页选一把 Key 和一个已经结束的完整北京时间账日，清除模型、请求类别等额外筛选后导出。回到 Nebula 选择同名凭据。',
   },
 }
 const maxImportBytes = 1024 * 1024
@@ -77,17 +87,21 @@ const comparison = computed(() => snapshot.value?.day === requestedDay.value ? s
 const credentials = computed(() => (provider.credentials ?? []).filter(item => item.credential_configured))
 const credentialId = ref('')
 const importKind = ref<BeichenImportKind>('prices')
+const usageExportConfirmed = ref(false)
 const importMultiplier = computed(() => datasetRows.value.find(
   row => row.kind === 'billing' && row.credential_id === credentialId.value,
 )?.effective_multiplier)
 const csvInput = ref<HTMLInputElement>()
 const csvHintId = useId()
+const usageExportImpactId = useId()
 const editing = ref<BeichenModel>()
 const priceEditor = ref<HTMLFormElement>()
 const priceTitleId = useId()
 const priceMode = ref<BeichenPriceUpdate['mode']>('manual')
 const priceDraft = reactive({ input: '', output: '', cache_read: '', cache_write: '' })
 let priceTrigger: HTMLButtonElement | undefined
+
+watch([credentialId, importKind], () => { usageExportConfirmed.value = false })
 
 function credentialLabel(id: string) {
   return provider.credentials?.find(item => item.id === id)?.label || id || '—'
@@ -103,7 +117,11 @@ function operationError(error: unknown, fallback: string) {
 
 function setOpen(value: boolean) {
   open.value = value
-  if (!value || busy.value) return
+  if (!value) {
+    usageExportConfirmed.value = false
+    return
+  }
+  if (busy.value) return
   day.value = requestedDay.value || billingDayFormat.format(new Date())
   void loadOverview(day.value)
 }
@@ -151,6 +169,7 @@ async function importCSV() {
   const credential = credentialId.value
   const kind = importKind.value
   if (busy.value || !file || !credentials.value.some(item => item.id === credential)) return
+  if (kind === 'usage_export' && !usageExportConfirmed.value) return
 
   await runAction('import', async () => {
     if (file.size > maxImportBytes) throw new CSVImportError('CSV 文件超过 1 MiB，请选择较小的文件。')
@@ -165,13 +184,25 @@ async function importCSV() {
     const columns = header.split(',').map(column => column.replace(/^"([^"]+)"$/, '$1')).join(',')
     if (columns !== csvFormats[kind].header) throw new CSVImportError('CSV 表头与所选类型不符，请核对列名和顺序。')
     if (newline < 0 || !csv.slice(newline + 1).trim()) throw new CSVImportError('CSV 只有表头，请选择含数据的文件。')
-    const body = { credential_id: credential, kind, csv }
+    const selection = { credential_id: credential, csv }
+    const body: BeichenImport = kind === 'usage_export'
+      ? { ...selection, kind, full_day_confirmed: true }
+      : { ...selection, kind }
     if (new TextEncoder().encode(JSON.stringify(body)).length > maxImportBytes) {
       throw new CSVImportError('导入请求超过 1 MiB，请选择较小的文件。')
     }
-    await teacherAPI.importBeichen(provider.id, body)
+    try {
+      await teacherAPI.importBeichen(provider.id, body)
+    } catch (error) {
+      if (kind !== 'usage_export') throw error
+      // Fixed messages keep API errors from echoing key names or IP addresses.
+      throw new CSVImportError(error instanceof APIError && error.code === 'VALIDATION_ERROR'
+        ? '北辰用量明细未通过校验。请核对凭据名称、已结束的北京时间账日及文件格式。'
+        : '北辰用量明细导入失败，请稍后重试。')
+    }
+    usageExportConfirmed.value = false
     if (csvInput.value) csvInput.value.value = ''
-  }, 'CSV 已导入。', 'CSV 导入失败，请核对文件后重试')
+  }, kind === 'usage_export' ? '明细已处理，请查看按日对账。' : 'CSV 已导入。', 'CSV 导入失败，请核对文件后重试')
 }
 
 function scaledNumber(value: number, digits: number, group = false) {
@@ -320,7 +351,11 @@ async function savePrice() {
                         <span class="sr-only">校内 </span>{{ count(row[field.local]) }}<br>
                         <span class="sr-only">北辰 </span>{{ count(row[field.upstream]) }}
                       </td>
-                      <td class="numeric-cell">估算 {{ amount(row.estimated_upstream_micros, 'USD') }}<br>账单 {{ amount(row.billed_upstream_micros, 'USD') }}</td>
+                      <td class="numeric-cell">
+                        估算 {{ amount(row.estimated_upstream_micros, 'USD') }}<br>
+                        账单 {{ amount(row.billed_upstream_micros, 'USD') }}
+                        <small v-if="row.upstream_usage_source" class="muted">{{ usageSourceLabels[row.upstream_usage_source] }}</small>
+                      </td>
                       <td class="numeric-cell">{{ amount(row.trial_credit_milli, 'credit', 3) }}<br>未定价次数 {{ count(row.trial_unpriced_calls) }}</td>
                     </tr>
                   </tbody>
@@ -352,7 +387,7 @@ async function savePrice() {
                   </select>
                 </label>
               </div>
-              <label>CSV 文件<input ref="csvInput" type="file" accept=".csv,text/csv" required :aria-describedby="csvHintId"></label>
+              <label>CSV 文件<input ref="csvInput" type="file" accept=".csv,text/csv" required :aria-describedby="csvHintId" @change="usageExportConfirmed = false"></label>
               <p :id="csvHintId" class="muted">
                 {{ csvFormats[importKind].hint }}
                 文件须为 UTF-8 编码，最多 2,000 条记录。表头为 <code>{{ csvFormats[importKind].header }}</code>
@@ -360,9 +395,21 @@ async function savePrice() {
               <p v-if="importKind === 'prices_base' && credentialId" class="muted">
                 当前凭据实际倍率 {{ multiplierLabel(importMultiplier) }}<span v-if="importMultiplier == null">，同步倍率后才能计算最终单价。</span>
               </p>
+              <template v-if="importKind === 'usage_export'">
+                <p :id="usageExportImpactId" class="muted">
+                  系统核对凭据名称和单日范围，按模型汇总为待核对补账。若该凭据已有自动同步确认的日账，整日以自动日账为准。
+                  已有手工日汇总也优先，后续同步到的自动日账可替代补账。
+                  若使用了默认「近 24 小时」范围，或记录不完整，请重新导出后再导入。
+                </p>
+                <p class="muted">文件含 IP 地址等使用明细，请勿将原文件或内容发到聊天、工单或日志。</p>
+                <label class="beichen-confirm">
+                  <input v-model="usageExportConfirmed" type="checkbox" required :aria-describedby="usageExportImpactId">
+                  <span>我已确认文件包含同名凭据在一个已经结束的完整北京时间账日内的全部记录，作为待核对补账导入。</span>
+                </label>
+              </template>
             </fieldset>
             <div v-if="credentials.length" class="beichen-toolbar">
-              <LoadingButton class="button secondary" type="submit" :pending="action === 'import'" :disabled="busy" pending-label="导入中…">导入 CSV</LoadingButton>
+              <LoadingButton class="button secondary" type="submit" :pending="action === 'import'" :disabled="busy || (importKind === 'usage_export' && !usageExportConfirmed)" pending-label="导入中…">导入 CSV</LoadingButton>
               <p v-if="feedback.import" :class="feedback.import.error ? 'error' : 'success'" :role="feedback.import.error ? 'alert' : 'status'">{{ feedback.import.text }}</p>
             </div>
           </form>
@@ -445,6 +492,8 @@ async function savePrice() {
 .beichen-section > .beichen-body { padding: 0 1rem 1rem; }
 .beichen-toolbar { display: flex; align-items: end; flex-wrap: wrap; gap: 0.65rem; }
 .beichen-toolbar p { align-self: center; }
+.beichen-confirm { display: flex; align-items: flex-start; gap: 0.6rem; line-height: 1.5; }
+.beichen-confirm input { flex: none; width: 1rem; height: 1rem; margin: 0.1rem 0 0; padding: 0; }
 .beichen-editor { padding: 0.85rem; border: 1px solid var(--line); border-radius: 12px; }
 .beichen-table { max-width: 100%; overflow-x: auto; }
 .beichen-table .usage-table { display: table; font-size: 13px; }

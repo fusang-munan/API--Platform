@@ -71,26 +71,31 @@ func (s *Service) Import(ctx context.Context, providerID, credentialID, actorID 
 			}
 			return nil
 		}
-	case "usage":
-		rows, err := readCSV(csvText, usageHeader)
+	case "usage", "usage_export":
+		header := usageHeader
+		if kind == "usage_export" {
+			header = usageExportHeader
+		}
+		rows, err := readCSV(csvText, header)
 		if err != nil {
 			return err
 		}
-		usage, err := parseCSVUsage(rows)
+		var usage []usageRow
+		var label string
+		if kind == "usage_export" {
+			usage, label, err = parseUsageExport(rows)
+		} else {
+			usage, err = parseCSVUsage(rows)
+		}
 		if err != nil {
 			return err
 		}
 		dataset = "usage"
 		action = func(tx *sql.Tx) error {
-			for _, row := range usage {
-				if err := saveUsage(ctx, tx, providerID, credentialID, row, "csv", &actorID); err != nil {
-					return err
-				}
-			}
-			return nil
+			return s.saveImportedUsage(ctx, tx, providerID, credentialID, actorID, label, usage)
 		}
 	default:
-		return invalid("导入类型须为 prices、prices_base 或 usage")
+		return invalid("导入类型须为 prices、prices_base、usage 或 usage_export")
 	}
 	return s.write(ctx, providerID, credentialID, func(tx *sql.Tx) error {
 		if err := action(tx); err != nil {
@@ -98,6 +103,45 @@ func (s *Service) Import(ctx context.Context, providerID, credentialID, actorID 
 		}
 		return recordSuccess(ctx, tx, credentialID, dataset)
 	})
+}
+
+func (s *Service) saveImportedUsage(ctx context.Context, tx *sql.Tx, providerID, credentialID, actorID uuid.UUID, expectedLabel string, rows []usageRow) error {
+	source := "csv"
+	// Export parsing has already verified a nonempty file for a single day.
+	// The caller holds the same credential lock as automatic synchronization.
+	if expectedLabel != "" {
+		day := rows[0].date
+		if day >= s.now().In(beijing).Format(dayLayout) {
+			return invalid("北辰明细 CSV 只支持已结束的北京时间账日，请在账日结束后重新导出")
+		}
+		var label string
+		err := tx.QueryRowContext(ctx, "SELECT label::text FROM provider_credentials WHERE id = $1", credentialID).Scan(&label)
+		if err != nil {
+			return err
+		}
+		if label != expectedLabel {
+			return invalid("北辰明细 CSV 的 API Key Name 与所选凭据标签不一致")
+		}
+		var confirmed bool
+		err = tx.QueryRowContext(ctx, `
+SELECT EXISTS (
+  SELECT 1 FROM beichen_usage_days
+  WHERE provider_id = $1 AND credential_id = $2 AND day = $3::text::date
+)`, providerID, credentialID, day).Scan(&confirmed)
+		if err != nil {
+			return err
+		}
+		if confirmed {
+			return invalid("该账日已有北辰自动确认的账单，请查看该日对账；如需更正，请使用手工日用量 CSV")
+		}
+		source = "export"
+	}
+	for _, row := range rows {
+		if err := saveUsage(ctx, tx, providerID, credentialID, row, source, &actorID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func readCSV(input string, header []string) ([][]string, error) {
@@ -197,7 +241,9 @@ SET requests = EXCLUDED.requests, input_tokens = EXCLUDED.input_tokens, output_t
   cache_read_tokens = EXCLUDED.cache_read_tokens, cache_write_tokens = EXCLUDED.cache_write_tokens,
   billed_upstream_micros = EXCLUDED.billed_upstream_micros, source = EXCLUDED.source, actor_id = EXCLUDED.actor_id,
   updated_at = clock_timestamp()
-WHERE EXCLUDED.source = 'csv' OR beichen_daily_usage.source <> 'csv'
+WHERE EXCLUDED.source = 'csv'
+   OR EXCLUDED.source = beichen_daily_usage.source
+   OR (EXCLUDED.source = 'usage' AND beichen_daily_usage.source = 'export')
 `, providerID, credentialID, row.date, row.model, row.requests, row.input, row.output, row.cacheRead, row.cacheWrite, row.billed, source, actor)
 	return err
 }

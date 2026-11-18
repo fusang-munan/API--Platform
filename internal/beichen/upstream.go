@@ -182,13 +182,10 @@ func parseUsage(body []byte, day string) ([]usageRow, error) {
 			}
 			// Storage uses whole microdollars: positive amounts below $0.0000005
 			// are displayed as zero. Date verification compares the raw amounts.
-			amount.Mul(amount, big.NewRat(1_000_000, 1))
-			amount.Add(amount, big.NewRat(1, 2))
-			micros := new(big.Int).Quo(amount.Num(), amount.Denom())
-			if !micros.IsInt64() {
+			value, ok := roundedUSDMicros(amount)
+			if !ok {
 				return nil, errors.New("北辰实际费用超出范围")
 			}
-			value := micros.Int64()
 			billed = &value
 		}
 		seen[model.Model] = true
@@ -321,4 +318,15 @@ func exactDecimal(number json.Number) *big.Rat {
 	}
 	value, _ := new(big.Rat).SetString(number.String())
 	return value
+}
+
+func roundedUSDMicros(amount *big.Rat) (int64, bool) {
+	var scaled big.Rat
+	scaled.Mul(amount, big.NewRat(1_000_000, 1))
+	scaled.Add(&scaled, big.NewRat(1, 2))
+	micros := new(big.Int).Quo(scaled.Num(), scaled.Denom())
+	if !micros.IsInt64() {
+		return 0, false
+	}
+	return micros.Int64(), true
 }

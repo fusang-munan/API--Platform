@@ -42,6 +42,7 @@ type Comparison struct {
 	UpstreamCacheWriteTokens *int64    `json:"upstream_cache_write_tokens"`
 	EstimatedUpstreamMicros  *int64    `json:"estimated_upstream_micros"`
 	BilledUpstreamMicros     *int64    `json:"billed_upstream_micros"`
+	UpstreamUsageSource      *string   `json:"upstream_usage_source"`
 	TrialCreditMilli         *int64    `json:"trial_credit_milli"`
 	TrialUnpricedCalls       *int64    `json:"trial_unpriced_calls"`
 }
@@ -190,7 +191,8 @@ func readComparison(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, start
 		err := rows.Scan(&item.CredentialID, &item.Model, &item.LocalRequests, &item.UpstreamRequests,
 			&item.LocalInputTokens, &item.UpstreamInputTokens, &item.LocalOutputTokens, &item.UpstreamOutputTokens,
 			&item.LocalCacheReadTokens, &item.UpstreamCacheReadTokens, &item.LocalCacheWriteTokens, &item.UpstreamCacheWriteTokens,
-			&item.EstimatedUpstreamMicros, &item.BilledUpstreamMicros, &item.TrialCreditMilli, &item.TrialUnpricedCalls)
+			&item.EstimatedUpstreamMicros, &item.BilledUpstreamMicros, &item.TrialCreditMilli, &item.TrialUnpricedCalls,
+			&item.UpstreamUsageSource)
 		if err != nil {
 			return err
 		}
@@ -257,7 +259,8 @@ SELECT COALESCE(l.credential_id, u.credential_id), COALESCE(l.model, u.model), l
   CASE WHEN l.cache_read_tokens <= 9223372036854775807 THEN l.cache_read_tokens::bigint END, u.cache_read_tokens,
   CASE WHEN l.cache_write_tokens <= 9223372036854775807 THEN l.cache_write_tokens::bigint END, u.cache_write_tokens,
   CASE WHEN l.estimated_micros <= 9223372036854775807 THEN l.estimated_micros::bigint END, u.billed_upstream_micros,
-  CASE WHEN l.trial_credit_milli <= 9223372036854775807 THEN l.trial_credit_milli::bigint END, l.unpriced_calls
+  CASE WHEN l.trial_credit_milli <= 9223372036854775807 THEN l.trial_credit_milli::bigint END, l.unpriced_calls,
+  COALESCE(u.source, CASE WHEN e.credential_id IS NOT NULL THEN 'usage' END)
 FROM local l FULL JOIN upstream u USING (credential_id, model)
 LEFT JOIN confirmed_empty e ON e.credential_id = l.credential_id
 ORDER BY 1, 2`

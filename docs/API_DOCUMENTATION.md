@@ -415,6 +415,10 @@ data: {"revision":"01K2..."}
 
 导入请求包含 `credential_id`、`kind`、`csv`。报价表头为 `model,input,output,cache_read,cache_write`，整数单位为微美元/百万 Token。用 `prices` 导入已应用倍率的最终报价，用 `prices_base` 导入需乘北辰倍率的已确认基础报价。日用量 `usage` 表头为 `date,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros`，日期为北京时间，缓存和实际扣款留空表示缺失。
 
+`usage_export` 接受北辰用量页的逐笔导出原始表头，并要求 `full_day_confirmed: true`。先在北辰选择一把 Key 和一个已结束的完整北京时间账日，取消模型、请求类别等可能使记录不完整的筛选，再导出。每行 `Time` 须含时区，换算出的北京时间日期须一致。每行 `API Key Name` 须与所选供应商凭据标签匹配。行数和文件大小仍受 CSV 限制。服务按模型汇总 Token 和以裸十进制表示的美元实付 `Billed Cost`，再统一换算成微美元。某字段在任一记录中缺失时，该模型日汇总的字段保持为空。记录内的 IP 和请求细节不入库。
+
+明细导入只用于补账。文件内容可以验证日期，覆盖整个账日仍需导入者核对筛选范围。有自动确认日账时拒绝导入同日的逐笔文件。补账可替换同日、同模型的旧补账，已有手工汇总优先。后续成功同步的整日账单会清理该日的补账。概览的 `upstream_usage_source` 为 `usage`（自动日账）、`csv`（手工汇总）、`export`（逐笔导入补账）或 `null`（来源缺失）。
+
 模型创建/修改使用核心模型字段。将模型改为 `active` 前必须至少存在一个 ACTIVE binding，且对应 provider 为 ACTIVE。更新请求中的 `credit_multiplier` 只有在已有倍率且值确实改变时才要求 `multiplier_change_reason` 并写倍率审计；原值为 NULL 的首次设置默认倍率不要求原因。Binding 请求形状：
 
 `context_window`、`max_input_tokens` 和 `max_output_tokens` 在 PATCH 中支持三态：省略保持不变、`null` 清空、正整数更新；它们只表示模型容量，不参与计费。`model_id` 创建后只读。能力只允许 `reasoning`、`vision`、`tool_calling`、`structured_output`、`web_search`、`coding`、`embeddings`、`rerank`、`realtime`、`image_generation`、`video_generation`、`speech_to_text`、`text_to_speech`。激活模型、停用 provider 或停用 binding 会在事务内锁定相关路由记录；若操作会令 ACTIVE 模型失去最后可用路由，返回 `409 MODEL_ROUTING_REQUIRED`，并在 `details.model_ids` 给出受影响模型。

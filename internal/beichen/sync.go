@@ -262,7 +262,7 @@ func (s *Service) fetchUsage(ctx context.Context, job syncJob, key string, manua
 func replaceUsageDay(ctx context.Context, tx *sql.Tx, job syncJob, day string, rows []usageRow) error {
 	_, err := tx.ExecContext(ctx, `
 DELETE FROM beichen_daily_usage
-WHERE provider_id = $1 AND credential_id = $2 AND day = $3::text::date AND source = 'usage'
+WHERE provider_id = $1 AND credential_id = $2 AND day = $3::text::date AND source IN ('usage', 'export')
 `, job.provider, job.credential, day)
 	if err != nil {
 		return err

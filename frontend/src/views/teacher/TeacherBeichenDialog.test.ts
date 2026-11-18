@@ -1,6 +1,6 @@
 import { DOMWrapper, flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { BeichenOverview, Provider } from '../../api/types'
+import type { BeichenComparison, BeichenOverview, Provider } from '../../api/types'
 import TeacherProviders from './TeacherProviders.vue'
 
 const provider: Provider = {
@@ -17,6 +17,15 @@ const provider: Provider = {
   created_at: '',
   updated_at: '',
 }
+const comparisonRow: BeichenComparison = {
+  credential_id: 'key-1', model: 'test-model', upstream_usage_source: 'usage',
+  local_requests: 1, upstream_requests: 0,
+  local_input_tokens: 5, upstream_input_tokens: null,
+  local_output_tokens: 2, upstream_output_tokens: 3,
+  local_cache_read_tokens: 0, upstream_cache_read_tokens: 0,
+  local_cache_write_tokens: 0, upstream_cache_write_tokens: 0,
+  estimated_upstream_micros: 10, billed_upstream_micros: 0, trial_credit_milli: 3, trial_unpriced_calls: 1,
+}
 const overview: BeichenOverview = {
   datasets: [
     { credential_id: 'key-1', kind: 'catalog', last_success: '2026-11-17T03:20:00Z', effective_multiplier: null },
@@ -29,17 +38,21 @@ const overview: BeichenOverview = {
     upstream_rates: { input: 1_200_000, output: 0 },
     school_rates: { input: 100_000, output: 0, cache_read: 1, cache_write: 0 },
   }],
-  comparison: [{
-    credential_id: 'key-1', model: 'test-model',
-    local_requests: 1, upstream_requests: 0,
-    local_input_tokens: 5, upstream_input_tokens: null,
-    local_output_tokens: 2, upstream_output_tokens: 3,
-    local_cache_read_tokens: 0, upstream_cache_read_tokens: 0,
-    local_cache_write_tokens: 0, upstream_cache_write_tokens: 0,
-    estimated_upstream_micros: 10, billed_upstream_micros: 0, trial_credit_milli: 3, trial_unpriced_calls: 1,
-  }],
+  comparison: [
+    comparisonRow,
+    { ...comparisonRow, model: 'manual-model', upstream_usage_source: 'csv' },
+    { ...comparisonRow, model: 'export-model', upstream_usage_source: 'export' },
+    {
+      ...comparisonRow, model: 'local-only', upstream_usage_source: null, billed_upstream_micros: null,
+      upstream_requests: null, upstream_output_tokens: null, upstream_cache_read_tokens: null, upstream_cache_write_tokens: null,
+    },
+  ],
 }
 const path = '/api/v1/teacher/providers/beichen/beichen'
+const usageExportCsv = [
+  'Time,API Key Name,Model,Reasoning Effort,Inbound Endpoint,IP Address,Type,Billing Mode,Input Tokens,Output Tokens,Cache Read Tokens,Cache Creation Tokens,Rate Multiplier,Billed Cost,Original Cost,First Token (ms),Duration (ms)',
+  '2026-11-16T12:00:00+08:00,测试凭据,test-model,low,/v1/responses,192.0.2.7,API,Token,5,2,0,0,1,0.00000120,0.00000120,45,120',
+].join('\r\n')
 const reply = (data: unknown) => new Response(JSON.stringify({ data }))
 const request = vi.fn<(input: string, options?: RequestInit) => Promise<Response>>()
 let widget: VueWrapper | undefined
@@ -72,6 +85,14 @@ async function openPanel() {
 
 function sent(method: string, suffix: string) {
   return request.mock.calls.filter(([url, options]) => url === path + suffix && options?.method === method)
+}
+
+function selectFile(input: Element, csv: string) {
+  const bytes = new TextEncoder().encode(csv)
+  Object.defineProperty(input, 'files', {
+    configurable: true,
+    value: [{ size: bytes.byteLength, arrayBuffer: async () => bytes.buffer }],
+  })
 }
 
 describe('北辰教师面板', () => {
@@ -138,6 +159,10 @@ describe('北辰教师面板', () => {
     expect(compare.text()).toContain('账单 $0')
     expect(compare.text()).toContain('0.003 credit')
     expect(compare.text()).toContain('北辰 —')
+    const billCells = compare.findAll('tbody tr').map(row => row.get('td:nth-last-child(2)'))
+    expect(billCells.slice(0, 3).map(cell => cell.get('small').text())).toEqual(['自动同步', '手工汇总', '导入明细（待核对）'])
+    expect(billCells[3].text()).toContain('账单 —')
+    expect(billCells[3].find('small').exists()).toBe(false)
 
     await button(dialog, '手动同步').trigger('click')
     await flushPromises()
@@ -190,24 +215,16 @@ describe('北辰教师面板', () => {
     await credential.setValue('key-1')
     const fileInput = importer.get('input[type="file"]').element
 
-    function selectFile(value: string) {
-      const file = new Blob([value], { type: 'text/csv' })
-      Object.defineProperty(fileInput, 'files', {
-        configurable: true,
-        value: [{ size: file.size, arrayBuffer: async () => new TextEncoder().encode(value).buffer }],
-      })
-    }
-
     const prices = 'model,input,output,cache_read,cache_write\r\ntest-model,100,200,0,0\r\n'
     await kind.setValue('usage')
-    selectFile(prices)
+    selectFile(fileInput, prices)
     await importer.get('form').trigger('submit')
     await flushPromises()
     expect(importer.text()).toContain('CSV 表头与所选类型不符')
     expect(sent('POST', '/import')).toHaveLength(0)
 
     await kind.setValue('prices')
-    selectFile('\uFEFF' + prices)
+    selectFile(fileInput, '\uFEFF' + prices)
     await importer.get('form').trigger('submit')
     await flushPromises()
     expect(JSON.parse(String(sent('POST', '/import')[0][1]?.body))).toEqual({
@@ -220,7 +237,7 @@ describe('北辰教师面板', () => {
     await credential.setValue('key-zero')
     expect(importer.text()).toContain('当前凭据实际倍率 0×')
     await credential.setValue('key-1')
-    selectFile(prices)
+    selectFile(fileInput, prices)
     await importer.get('form').trigger('submit')
     await flushPromises()
     expect(JSON.parse(String(sent('POST', '/import')[1][1]?.body))).toEqual({
@@ -229,11 +246,75 @@ describe('北辰教师面板', () => {
 
     const usage = 'date,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros\n2026-11-16,test-model,1,5,2,0,0,0'
     await kind.setValue('usage')
-    selectFile(usage)
+    expect(importer.find('input[type="checkbox"]').exists()).toBe(false)
+    selectFile(fileInput, usage)
     await importer.get('form').trigger('submit')
     await flushPromises()
     expect(JSON.parse(String(sent('POST', '/import')[2][1]?.body))).toEqual({
       credential_id: 'key-1', kind: 'usage', csv: usage,
     })
+  })
+
+  it('北辰用量明细需要确认，校验官方表头并发送 usage_export', async () => {
+    const importer = section(await openPanel(), '导入官方 CSV')
+    const [credential, kind] = importer.findAll('select')
+    expect(kind.text()).toContain('用量（日汇总）')
+    expect(kind.text()).toContain('北辰用量明细')
+    await credential.setValue('key-1')
+    await kind.setValue('usage_export')
+    expect(importer.text()).toContain('已经结束的完整北京时间账日')
+    expect(importer.text()).toContain('整日以自动日账为准')
+    expect(importer.text()).toContain('已有手工日汇总也优先')
+    expect(importer.text()).toContain('后续同步到的自动日账可替代补账')
+    const form = importer.get('form')
+    const file = importer.get('input[type="file"]')
+    const confirm = importer.get('input[type="checkbox"]')
+    const submit = button(importer, '导入 CSV')
+
+    selectFile(file.element, usageExportCsv.replace('Time,', 'Timestamp,'))
+    expect(submit.attributes('disabled')).toBeDefined()
+    await form.trigger('submit')
+    expect(sent('POST', '/import')).toHaveLength(0)
+
+    await confirm.setValue(true)
+    await form.trigger('submit')
+    await flushPromises()
+    expect(importer.text()).toContain('CSV 表头与所选类型不符')
+    expect(sent('POST', '/import')).toHaveLength(0)
+
+    selectFile(file.element, '\uFEFF' + usageExportCsv)
+    await file.trigger('change')
+    expect(submit.attributes('disabled')).toBeDefined()
+    await confirm.setValue(true)
+    await credential.setValue('key-zero')
+    expect(submit.attributes('disabled')).toBeDefined()
+
+    await credential.setValue('key-1')
+    await confirm.setValue(true)
+    await form.trigger('submit')
+    await flushPromises()
+    expect(sent('POST', '/import')).toHaveLength(1)
+    expect(JSON.parse(String(sent('POST', '/import')[0][1]?.body))).toEqual({
+      credential_id: 'key-1', kind: 'usage_export', csv: usageExportCsv, full_day_confirmed: true,
+    })
+    expect(importer.text()).toContain('明细已处理，请查看按日对账')
+    expect(submit.attributes('disabled')).toBeDefined()
+  })
+
+  it('官方明细校验失败时不展示服务端返回的逐笔数据', async () => {
+    const importer = section(await openPanel(), '导入官方 CSV')
+    const [credential, kind] = importer.findAll('select')
+    await credential.setValue('key-1')
+    await kind.setValue('usage_export')
+    selectFile(importer.get('input[type="file"]').element, usageExportCsv)
+    await importer.get('input[type="checkbox"]').setValue(true)
+    request.mockResolvedValueOnce(new Response(JSON.stringify({
+      error: { code: 'VALIDATION_ERROR', message: '第 1 行包含虚构地址 192.0.2.7' },
+    }), { status: 400 }))
+
+    await importer.get('form').trigger('submit')
+    await flushPromises()
+    expect(importer.get('[role="alert"]').text()).toContain('北辰用量明细未通过校验')
+    expect(importer.text()).not.toContain('192.0.2.7')
   })
 })
