@@ -376,6 +376,10 @@ data: {"revision":"01K2..."}
 | Matrix 目录 | GET | `/api/v1/teacher/model-catalog-candidates?q=&page=&page_size=` | 老师新增模型向导分页搜索 |
 | 模型测试 | POST | `/api/v1/teacher/model-probes` | 自动读取供应商 `/v1/models` 并测试文本/检索端点，返回可应用的标准化配置 |
 | Binding | PATCH | `/api/v1/teacher/model-bindings/{binding_id}` | 修改上游名、adapter、priority 或状态 |
+| 北辰同步与对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen?day=YYYY-MM-DD` | 按北京时间查看同步状态、模型报价和日对账 |
+| 北辰手动同步 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/sync` | 执行一次有时限的同步，页面按数据类别显示各自结果 |
+| 北辰校内试算价 | PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/price` | 指定模型手动设价或恢复跟随 |
+| 北辰报价或账单导入 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/import` | 按凭据导入受支持的 CSV |
 | Key 终审 | GET | `/api/v1/teacher/api-key-reviews` | 只列出 `pending_teacher` 摘要 |
 | Key 终审 | GET | `/api/v1/teacher/api-key-reviews/{api_key_id}` | 待终审摘要详情 |
 | Key 终审 | POST | `/api/v1/teacher/api-key-reviews/{api_key_id}/approve` | 终审通过并自动加入成员关系 |
@@ -404,6 +408,12 @@ data: {"revision":"01K2..."}
 ```
 
 `credential` 只作为写入字段；服务端加密后保存，所有读取响应只返回 `credential_configured: true/false`。
+
+北辰接口限老师访问，凭据必须属于指定的北辰供应商。更换北辰 Key 时新增一条凭据并重新绑定，以保留原 Key 的账单归属。手动同步接受空请求体或 `{}`。概览中的 `datasets`、`models`、`comparison` 分别提供同步状态、报价和本日对账。无法确认的数字使用 `null`，显式零使用 `0`。成本字段以百万分之一美元表示，`trial_credit_milli` 以千分之一校内 credit 表示。
+
+价格请求包含 `credential_id`、`model`、`mode`。设置 `manual` 时同时提供 `rates`，其中 `input`、`output` 必填，`cache_read`、`cache_write` 可空，四项均为每百万 Token 的价格，以百万分之一校内 credit 表示。恢复 `follow` 时省略 `rates`。跟随试算采用 1 美元换算 1 校内 credit。
+
+导入请求包含 `credential_id`、`kind`、`csv`。报价表头为 `model,input,output,cache_read,cache_write`，整数单位为微美元/百万 Token。用 `prices` 导入已应用倍率的最终报价，用 `prices_base` 导入需乘北辰倍率的已确认基础报价。日用量 `usage` 表头为 `date,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros`，日期为北京时间，缓存和实际扣款留空表示缺失。
 
 模型创建/修改使用核心模型字段。将模型改为 `active` 前必须至少存在一个 ACTIVE binding，且对应 provider 为 ACTIVE。更新请求中的 `credit_multiplier` 只有在已有倍率且值确实改变时才要求 `multiplier_change_reason` 并写倍率审计；原值为 NULL 的首次设置默认倍率不要求原因。Binding 请求形状：
 

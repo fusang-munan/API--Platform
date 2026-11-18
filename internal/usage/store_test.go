@@ -65,7 +65,7 @@ func TestStudentUsageIncludesZeroCostCalls(t *testing.T) {
 	defer database.Close()
 	store := NewStore(database)
 	userID, keyID, modelID := uuid.New(), uuid.New(), uuid.New()
-	month := Month(time.Now()).AddDate(0, -1, 0)
+	month := Month(time.Now()).In(shanghai).AddDate(0, -1, 0).UTC()
 	mock.ExpectQuery(`SELECT p.id,p.name,COALESCE\(mb.quota_milli,pm.monthly_credit_quota_milli,0\)`).
 		WithArgs(userID, month).
 		WillReturnRows(sqlmock.NewRows([]string{"project_id", "project_name", "quota_milli", "charged_milli", "pending_milli"}).AddRow(uuid.New(), "Project", int64(2_000_000), int64(0), int64(0)))
@@ -109,15 +109,15 @@ func TestApproveKeyBindsProjectBucketMonth(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT m.model_id,m.status,m.credit_multiplier_milli,EXISTS(SELECT 1 FROM model_bindings b JOIN providers p ON p.id=b.provider_id WHERE b.model_id=m.id AND b.status='active' AND p.status='active') FROM api_key_models km JOIN models m ON m.id=km.model_id WHERE km.api_key_id=$1 ORDER BY m.id FOR UPDATE OF m`)).
 		WithArgs(keyID).
 		WillReturnRows(sqlmock.NewRows([]string{"model_id", "status", "credit_multiplier_milli", "routed"}).AddRow("gpt-5.6-sol", "active", int64(1000), true))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COALESCE(monthly_credit_quota_milli,0) FROM project_members WHERE project_id=$1 AND user_id=$2`)).
-		WithArgs(projectID, ownerID).
-		WillReturnRows(sqlmock.NewRows([]string{"monthly_credit_quota_milli"}).AddRow(int64(0)))
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO project_month_credit_buckets`)).
 		WithArgs(projectID, month, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT quota_milli,allocated_milli FROM project_month_credit_buckets WHERE project_id=$1 AND month=$2 FOR UPDATE`)).
 		WithArgs(projectID, month).
 		WillReturnRows(sqlmock.NewRows([]string{"quota_milli", "allocated_milli"}).AddRow(int64(20_000_000), int64(0)))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COALESCE(monthly_credit_quota_milli,0) FROM project_members WHERE project_id=$1 AND user_id=$2`)).
+		WithArgs(projectID, ownerID).
+		WillReturnRows(sqlmock.NewRows([]string{"monthly_credit_quota_milli"}).AddRow(int64(0)))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE api_keys SET monthly_credit_quota_milli=0,mentor_monthly_credit_quota_milli=$1,status='approved',updated_at=$2 WHERE id=$3 AND status='pending_mentor'`)).
 		WithArgs(int64(500_000), sqlmock.AnyArg(), keyID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -166,6 +166,9 @@ func TestRunMaintenanceUsesTypedHeartbeatParameters(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"pg_try_advisory_lock"}).AddRow(true))
 	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO project_month_credit_buckets`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`INSERT INTO project_member_month_credit_buckets`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`INSERT INTO api_key_month_credit_buckets`).

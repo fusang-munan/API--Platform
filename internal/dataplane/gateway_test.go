@@ -246,7 +246,7 @@ func TestRewriteGeminiBatchModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replay.Close()
-	body, _, _, cleanup, err := rewriteUpstreamBody("application/json", replay, "gemini-embedding-001", "google_gemini_v1beta", "https://generativelanguage.googleapis.com")
+	body, _, _, cleanup, err := rewriteUpstreamBody("application/json", replay, "gemini-embedding-001", "google_gemini_v1beta", "https://generativelanguage.googleapis.com", "/v1beta/models/gemini-embedding-001:embedContent")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,6 +8,7 @@ import AppDialog from '../../components/AppDialog.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
 import { useLoadState } from '../../composables/useLoadState'
 import { useToast } from '../../composables/useToast'
+import TeacherBeichenDialog from './TeacherBeichenDialog.vue'
 
 type KeyDraft = {
   id?: string
@@ -43,6 +44,14 @@ const activeKey = computed(() => keyRows.value[activeKeyIndex.value] ?? null)
 
 function activeKeyCount(provider: Provider) {
   return (provider.credentials ?? []).filter(item => item.status === 'active').length
+}
+
+function isBeichenProvider(baseUrl: string) {
+  const address = baseUrl.trim()
+  const origin = 'https://api.beichenapi.com'
+  // URL parsing would normalize an explicit :443 and dot segments.
+  return address.slice(0, origin.length).toLowerCase() === origin
+    && ['', '/', '/v1', '/v1/'].includes(address.slice(origin.length))
 }
 
 function emptyKeyRow(): KeyDraft {
@@ -274,6 +283,7 @@ onMounted(load)
           </div>
           <div class="actions">
             <StatusBadge :status="p.status" />
+            <TeacherBeichenDialog v-if="isBeichenProvider(p.base_url)" :provider="p" />
             <button class="button secondary" :disabled="resetting === p.id" @click="resetCatalog(p)">{{ resetting === p.id ? '重置中…' : '配置重置' }}</button>
             <button class="button ghost" @click="open(p)">编辑</button>
             <button class="button danger" :disabled="deleting === p.id" @click="remove(p)">{{ deleting === p.id ? '删除中…' : '删除' }}</button>

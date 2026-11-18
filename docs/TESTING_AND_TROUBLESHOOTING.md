@@ -172,6 +172,13 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 ## 3. 常见问题矩阵
 
+### 北辰接入验收
+
+1. 在一次性测试数据库上应用迁移并重复执行一次。测试数据库必须新建、只监听回环地址、数据库名为 `nebula_test`。设置 `NEBULA_TEST_POSTGRES` 指向该测试库并使用 `sslmode=disable`，执行 `go test ./internal/infrastructure/db -run TestBeichenMigrationUpgrade -count=1 -v`。
+2. 用虚构凭据和模拟上游执行 `go test ./internal/beichen ./internal/dataplane ./internal/usage ./internal/api/http`。覆盖流式回填、零和缺失、用量中断、同步结果及教师端权限。控制台执行 `npm run typecheck` 和 `npm run test`。
+3. 校方在加密管理入口录入专用北辰凭据后，教师页按凭据执行手动同步，再用各待验收渠道的一次短文本调用核对实际的输入、输出、缓存明细与账单。对比时使用同一凭据、模型和北京时间日期。
+4. 若模型可见但没有倍率，分别检查计费接口状态和供应商开放范围。若缺少可确认报价或单日用量，使用教师面板的 CSV 导入。含未结算、断流或缺失用量的对账区间需要查看采集状态；当天上游账单可能晚于请求完成。
+
 | 现象 | 常见根因 | 解决方案 | 排查建议 |
 | --- | --- | --- | --- |
 | 服务启动时报缺少环境变量 | 未加载 `.env`，或关键 secret 仍为空 | 按 `.env.example` 配置运行环境 | 先核对变量名，不要在日志/工单粘贴变量值 |

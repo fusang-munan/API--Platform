@@ -1,6 +1,6 @@
 # Nebula
 
-Nebula 是实验室正在使用的 AI API 平台，当前版本见仓库根目录 `VERSION`（现在是 `0.8.6`）。学生、导师、老师共用这一套控制台：组织与项目、API Key 两级审批、供应商与模型、按倍率计费，以及 OpenAI、Anthropic、Cohere Rerank、Google Gemini 协议网关。
+Nebula 是实验室正在使用的 AI API 平台，镜像版本由仓库根目录 `VERSION` 指定。学生、导师、老师共用这一套控制台：组织与项目、API Key 两级审批、供应商与模型、按倍率计费，以及 OpenAI、Anthropic、Cohere Rerank、Google Gemini 协议网关。
 
 公网入口是 [http://106.55.103.208:25555](http://106.55.103.208:25555)。老师的项目管理在 `/teacher/projects`。代码仓库是 [fusang-munan/API--Platform](https://github.com/fusang-munan/API--Platform)。
 
@@ -15,6 +15,10 @@ Nebula 是实验室正在使用的 AI API 平台，当前版本见仓库根目�
 | 老师 | `/teacher/projects` 项目管理，`/teacher/project-spend` 项目监控，以及学生、组织、供应商、模型管理 |
 
 学生领到的平台密钥前缀是 `neb_sk_`，明文只在首次领取时返回一次。`/mentor/call-logs` 和 `/mentor/input-monitor` 会转到调用审查。调用审查按用户输入的提示词记一行；同一次提问里换模型，仍留在这一行，并按调用顺序列出用过的模型。新的用户提示词才另开一行。
+
+## 北辰接入
+
+老师可在「供应商管理」的北辰供应商行打开「同步与对账」。北辰 API 地址填 `https://api.beichenapi.com` 或其 `/v1` 地址。模型目录、倍率和可确认的单日用量由后端独立任务按凭据同步，也可以手动同步和导入报价或账单。按 Token 校内报价用于试算，现有额度按次结算。
 
 ## 技术栈
 

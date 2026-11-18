@@ -122,7 +122,7 @@ func (s *Store) RecoverExpired(ctx context.Context) error {
 		return err
 	}
 	for _, r := range list {
-		if err := s.Finalize(ctx, r, true, "outcome_unknown", "recovered_after_crash", "request outcome is unknown after process recovery", nil, "", CallMetrics{}); err != nil {
+		if err := s.Finalize(ctx, r, true, "outcome_unknown", "recovered_after_crash", "request outcome is unknown after process recovery", CallRoute{}, CallMetrics{State: UsageInterrupted}); err != nil {
 			return err
 		}
 	}
@@ -571,10 +571,20 @@ ON CONFLICT(api_key_id,month) DO UPDATE SET allocation_active=true,updated_at=EX
 	return ownerID, nil
 }
 
-func (s *Store) StartAttempt(ctx context.Context, callID, providerID, bindingID uuid.UUID, providerName string) (uuid.UUID, error) {
+func (s *Store) StartAttempt(ctx context.Context, callID uuid.UUID, route CallRoute) (uuid.UUID, error) {
 	id := uuid.Must(uuid.NewV7())
-	_, err := s.db.ExecContext(ctx, `INSERT INTO gateway_call_attempts(id,call_id,provider_id,binding_id,provider_name,status,created_at) VALUES($1,$2,$3,$4,$5,'connecting',now())`, id, callID, providerID, bindingID, providerName)
-	return id, err
+	_, err := s.db.ExecContext(ctx, `WITH started AS (
+		INSERT INTO gateway_call_attempts(id,call_id,provider_id,binding_id,provider_name,status,created_at)
+		VALUES($1,$2,$3,$4,$5,'connecting',now()) RETURNING call_id
+	)
+	UPDATE gateway_calls SET provider_id=$3,binding_id=$4,provider_name=$5,
+		provider_credential_id=$6,upstream_model_name=NULLIF($7,'')
+	WHERE id=(SELECT call_id FROM started) AND billing_state='pending'`,
+		id, callID, route.ProviderID, route.BindingID, route.ProviderName, nullableUUID(route.CredentialID), route.UpstreamModelName)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return id, nil
 }
 func (s *Store) FinishAttempt(ctx context.Context, id uuid.UUID, succeeded bool, status *int, category, message string, started time.Time) error {
 	state := "failed"
@@ -593,7 +603,7 @@ func sanitize(value string) string {
 	return value
 }
 
-func (s *Store) Finalize(ctx context.Context, r Reservation, success bool, outcome, category, message string, providerID *uuid.UUID, providerName string, metrics CallMetrics) error {
+func (s *Store) Finalize(ctx context.Context, r Reservation, success bool, outcome, category, message string, route CallRoute, metrics CallMetrics) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -603,24 +613,29 @@ func (s *Store) Finalize(ctx context.Context, r Reservation, success bool, outco
 	if success {
 		state = "charged"
 	}
-	upstreamResponseID := sql.NullString{String: strings.TrimSpace(metrics.UpstreamResponseID), Valid: strings.TrimSpace(metrics.UpstreamResponseID) != ""}
-	var promptTokens, completionTokens, totalTokens sql.NullInt64
-	if metrics.PromptTokens > 0 {
-		promptTokens = sql.NullInt64{Int64: int64(metrics.PromptTokens), Valid: true}
-	}
-	if metrics.CompletionTokens > 0 {
-		completionTokens = sql.NullInt64{Int64: int64(metrics.CompletionTokens), Valid: true}
-	}
-	if metrics.TotalTokens > 0 {
-		totalTokens = sql.NullInt64{Int64: int64(metrics.TotalTokens), Valid: true}
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE gateway_calls SET billing_state=$1,outcome=$2,error_category=NULLIF($3,''),error_message=NULLIF($4,''),provider_id=$5,provider_name=NULLIF($6,''),finalized_at=now(),lease_expires_at=NULL,upstream_response_id=COALESCE($8,upstream_response_id),prompt_tokens=COALESCE($9,prompt_tokens),completion_tokens=COALESCE($10,completion_tokens),total_tokens=COALESCE($11,total_tokens),reply_closed=COALESCE($12,reply_closed) WHERE id=$7 AND billing_state='pending'`, state, outcome, category, sanitize(message), providerID, providerName, r.CallID, upstreamResponseID, promptTokens, completionTokens, totalTokens, nullBool(metrics.ReplyClosed))
+	// A successful HTTP attempt replaces the provisional first-response time
+	// atomically with its route and outcome. Failed or unknown outcomes keep it.
+	sentAt := sql.NullTime{Time: route.SentAt, Valid: success && outcome == "succeeded" && !route.SentAt.IsZero()}
+	result, err := tx.ExecContext(ctx, `UPDATE gateway_calls
+	SET billing_state=$1,outcome=$2,error_category=NULLIF($3,''),error_message=NULLIF($4,''),
+		provider_id=COALESCE($5,provider_id),provider_name=COALESCE(NULLIF($6,''),provider_name),
+		finalized_at=now(),lease_expires_at=NULL,
+		provider_credential_id=COALESCE($8,provider_credential_id),binding_id=COALESCE($9,binding_id),
+		upstream_model_name=COALESCE(NULLIF($10,''),upstream_model_name),
+		sent_at=COALESCE($11::timestamptz,sent_at)
+	WHERE id=$7 AND billing_state='pending'`, state, outcome, category, sanitize(message),
+		nullableUUID(route.ProviderID), route.ProviderName, r.CallID, nullableUUID(route.CredentialID),
+		nullableUUID(route.BindingID), route.UpstreamModelName, sentAt)
 	if err != nil {
 		return err
 	}
 	affected, _ := result.RowsAffected()
 	if affected == 0 {
-		return nil
+		// Maintenance may have settled the charge first. Metrics may still arrive.
+		if err := writeCallMetrics(ctx, tx, r.CallID, metrics); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	if r.MultiplierMilli > 0 {
 		if success {
@@ -667,14 +682,14 @@ func (s *Store) Finalize(ctx context.Context, r Reservation, success bool, outco
 	if err = applyTurnBilling(ctx, tx, r.TurnID, r.CallIndex, success, outcome, r.MultiplierMilli); err != nil {
 		return err
 	}
-	if err = applyTurnTokenMetrics(ctx, tx, r.TurnID, metrics); err != nil {
+	if err = writeCallMetrics(ctx, tx, r.CallID, metrics); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
 func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metrics CallMetrics) error {
-	if !metrics.HasTokens() && strings.TrimSpace(metrics.UpstreamResponseID) == "" && metrics.ReplyClosed == nil {
+	if metrics == (CallMetrics{}) {
 		return nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -682,32 +697,55 @@ func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metri
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var turnID uuid.UUID
-	upstreamResponseID := sql.NullString{String: strings.TrimSpace(metrics.UpstreamResponseID), Valid: strings.TrimSpace(metrics.UpstreamResponseID) != ""}
-	var promptTokens, completionTokens, totalTokens sql.NullInt64
-	if metrics.PromptTokens > 0 {
-		promptTokens = sql.NullInt64{Int64: int64(metrics.PromptTokens), Valid: true}
+	if err := writeCallMetrics(ctx, tx, callID, metrics); err != nil {
+		return err
 	}
-	if metrics.CompletionTokens > 0 {
-		completionTokens = sql.NullInt64{Int64: int64(metrics.CompletionTokens), Valid: true}
+	return tx.Commit()
+}
+
+func writeCallMetrics(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics) error {
+	if metrics == (CallMetrics{}) {
+		return nil
 	}
-	if metrics.TotalTokens > 0 {
-		totalTokens = sql.NullInt64{Int64: int64(metrics.TotalTokens), Valid: true}
-	}
-	err = tx.QueryRowContext(ctx, `SELECT turn_id FROM gateway_calls WHERE id=$1`, callID).Scan(&turnID)
+	var turnID uuid.NullUUID
+	var oldPrompt, oldCompletion, oldTotal int64
+	err := tx.QueryRowContext(ctx, `SELECT turn_id,COALESCE(prompt_tokens,0),COALESCE(completion_tokens,0),COALESCE(total_tokens,0)
+	FROM gateway_calls WHERE id=$1 FOR UPDATE`, callID).Scan(&turnID, &oldPrompt, &oldCompletion, &oldTotal)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET upstream_response_id=COALESCE($2,upstream_response_id),prompt_tokens=COALESCE($3,prompt_tokens),completion_tokens=COALESCE($4,completion_tokens),total_tokens=COALESCE($5,total_tokens),reply_closed=COALESCE($6,reply_closed) WHERE id=$1`, callID, upstreamResponseID, promptTokens, completionTokens, totalTokens, nullBool(metrics.ReplyClosed)); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET upstream_response_id=COALESCE(NULLIF($2,''),upstream_response_id),
+		prompt_tokens=COALESCE($3,prompt_tokens),completion_tokens=COALESCE($4,completion_tokens),
+		total_tokens=COALESCE($5,total_tokens),reply_closed=COALESCE($6,reply_closed),
+		cache_hit_tokens=COALESCE($7,cache_hit_tokens),cache_miss_tokens=COALESCE($8,cache_miss_tokens),
+		cache_write_tokens=COALESCE($9,cache_write_tokens),reasoning_tokens=COALESCE($10,reasoning_tokens),
+		upstream_credit_micros=COALESCE($11,upstream_credit_micros),
+		usage_state=CASE
+			WHEN usage_state='interrupted' OR $12='interrupted' THEN 'interrupted'
+			WHEN usage_state='reported' OR $12='reported' THEN 'reported'
+			ELSE COALESCE(NULLIF($12,''),usage_state)
+		END
+	WHERE id=$1`, callID, metrics.UpstreamResponseID, metrics.PromptTokens, metrics.CompletionTokens,
+		metrics.TotalTokens, nullBool(metrics.ReplyClosed), metrics.CacheHitTokens, metrics.CacheMissTokens,
+		metrics.CacheWriteTokens, metrics.ReasoningTokens, metrics.UpstreamCreditMicros, string(metrics.State)); err != nil {
 		return err
 	}
-	if err = applyTurnTokenMetrics(ctx, tx, turnID, metrics); err != nil {
-		return err
+	return applyTurnTokenDelta(ctx, tx, turnID.UUID, tokenDelta(metrics.PromptTokens, oldPrompt),
+		tokenDelta(metrics.CompletionTokens, oldCompletion), tokenDelta(metrics.TotalTokens, oldTotal))
+}
+
+func tokenDelta(value *int64, previous int64) int64 {
+	if value == nil {
+		return 0
 	}
-	return tx.Commit()
+	return *value - previous
+}
+
+func nullableUUID(id uuid.UUID) uuid.NullUUID {
+	return uuid.NullUUID{UUID: id, Valid: id != uuid.Nil}
 }
 func nullBool(value *bool) sql.NullBool {
 	if value == nil {

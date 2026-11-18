@@ -318,6 +318,10 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 `project_month_credit_buckets` 与 `api_key_month_credit_buckets` 按北京时间月份保存额度、分配、charged 和 pending；`monthly_usage_cube` 永久保存项目、用户、Key、模型维度聚合。`gateway_calls`/`gateway_call_attempts` 保存 365 天原始调用与供应商尝试，`monitored_inputs` 保存 90 天完整文本。访问审计、额度调整审计和倍率调整审计永久保留；模型倍率从 NULL 首次设置时不产生倍率调整审计，后续改为不同值时必须记录原因。
 
+迁移 0029 增加单次调用的上游凭据、绑定和模型标识，以及缓存读、缓存未命中、缓存写和推理用量。可空列区分显式 0 和缺项。用量状态 `reported`、`missing`、`interrupted` 分别表示已报告、未取到和传输中断。上游 `credit` 的缩放值仅表示供应商原始额度数值，不作为美元成本参与对账。
+
+迁移 0030 增加北辰同步状态、不可变的上游报价和倍率版本、校内手动价版本以及按凭据、模型和北京时间日期保存的北辰账单。试算按调用时刻选择对应的有效版本，日汇总按明示的缓存口径计算；数据缺失的比较项保持为空。同步任务的租约防止多实例重复拉取。
+
 老师终审必须在同一事务内锁定项目、待审 Key、相关模型与当月项目 bucket；更新 `project_month_credit_buckets.allocated_milli` 时，条件必须同时包含 `project_id` 和当前上海月份。任何 SQL 绑定、约束或提交错误都必须回滚 Key 状态、项目分配、Key bucket、成员关系和审核记录，不允许部分成功。
 
 ## 10. 相比参考项目删除的结构

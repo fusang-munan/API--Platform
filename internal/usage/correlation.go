@@ -1,6 +1,10 @@
 package usage
 
-import "github.com/google/uuid"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
 
 const (
 	// QuestionContinue is a tool result or harness replay of the open question.
@@ -22,14 +26,41 @@ type CallCorrelation struct {
 
 type CallMetrics struct {
 	UpstreamResponseID string
-	PromptTokens       int
-	CompletionTokens   int
-	TotalTokens        int
+	PromptTokens       *int64
+	CompletionTokens   *int64
+	TotalTokens        *int64
+	CacheHitTokens     *int64
+	CacheMissTokens    *int64
+	CacheWriteTokens   *int64
+	ReasoningTokens    *int64
+	// UpstreamCreditMicros is the explicit upstream credit in millionths.
+	UpstreamCreditMicros *int64
+	State                UsageState
 	// ReplyClosed is set when the upstream stop flag is known.
 	// False means the model asked for a tool and the question is still open.
 	ReplyClosed *bool
 }
 
-func (m CallMetrics) HasTokens() bool {
-	return m.PromptTokens > 0 || m.CompletionTokens > 0 || m.TotalTokens > 0
+func (m CallMetrics) HasUsage() bool {
+	return m.PromptTokens != nil || m.CompletionTokens != nil || m.TotalTokens != nil ||
+		m.CacheHitTokens != nil || m.CacheMissTokens != nil || m.CacheWriteTokens != nil ||
+		m.ReasoningTokens != nil || m.UpstreamCreditMicros != nil
+}
+
+type UsageState string
+
+const (
+	UsageReported    UsageState = "reported"
+	UsageMissing     UsageState = "missing"
+	UsageInterrupted UsageState = "interrupted"
+)
+
+type CallRoute struct {
+	ProviderID        uuid.UUID
+	ProviderName      string
+	CredentialID      uuid.UUID
+	BindingID         uuid.UUID
+	UpstreamModelName string
+	// SentAt is the observed upstream write time of this HTTP attempt.
+	SentAt time.Time
 }

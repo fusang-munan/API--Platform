@@ -64,5 +64,49 @@ export type SubmitApiKey = { name: string; organization_id: string; project_id: 
 export type ModelCatalogCandidate = { model_id:string;display_name?:string|null;description?:string|null;owned_by?:string|null;upstream_object?:string|null;upstream_created_at?:string|null;credential_id?:string;credential_label?:string;provider_name?:string;credit_multiplier?:string|null;raw_entry:Record<string, unknown> }
 export type ModelCatalogPage = { items:ModelCatalogCandidate[];page:number;page_size:number;total:number }
 export type ProviderCatalogSyncView = { provider_id: string; provider_name: string; synced: number; synced_at: string }
+export type BeichenRates = { input: number; output: number; cache_read?: number; cache_write?: number }
+export type BeichenPriceUpdate = { credential_id: string; model: string } & (
+  { mode: 'follow' } | { mode: 'manual'; rates: BeichenRates }
+)
+export type BeichenImportKind = 'prices' | 'prices_base' | 'usage'
+export type BeichenImport = { credential_id: string; kind: BeichenImportKind; csv: string }
+export type BeichenDataset = {
+  credential_id: string
+  kind: string
+  last_success?: string | null
+  last_error?: string | null
+  effective_multiplier: number | null
+}
+type BeichenDisplayRates = Partial<Record<keyof BeichenRates, number | null>>
+export type BeichenModel = {
+  credential_id: string
+  model: string
+  mode: BeichenPriceUpdate['mode']
+  upstream_rates?: BeichenDisplayRates | null
+  school_rates?: BeichenDisplayRates | null
+}
+export type BeichenComparison = {
+  credential_id: string
+  model: string
+  local_requests: number | null
+  upstream_requests: number | null
+  local_input_tokens: number | null
+  upstream_input_tokens: number | null
+  local_output_tokens: number | null
+  upstream_output_tokens: number | null
+  local_cache_read_tokens: number | null
+  upstream_cache_read_tokens: number | null
+  local_cache_write_tokens: number | null
+  upstream_cache_write_tokens: number | null
+  estimated_upstream_micros: number | null
+  billed_upstream_micros: number | null
+  trial_credit_milli: number | null
+  trial_unpriced_calls: number | null
+}
+export type BeichenOverview = {
+  datasets: BeichenDataset[] | null
+  models: BeichenModel[] | null
+  comparison: BeichenComparison[] | null
+}
 export type ProbeEndpoint = 'chat_completions'|'responses'|'messages'|'embeddings'|'rerank'
 export type ProbeResponse = { results:Array<{endpoint:ProbeEndpoint|'models';path:string;http_status:number;duration_ms:number;truncated:boolean;error?:string;limits:{context_window?:number;max_input_tokens?:number;max_output_tokens?:number}}>;configuration:{description?:string;category?:ModelCategory;capabilities?:ModelCapability[];input_modalities?:string[];output_modalities?:string[];context_window?:number;max_input_tokens?:number;max_output_tokens?:number} }

@@ -137,6 +137,16 @@ func run() error {
 
 	signalContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	syncContext, cancelSync := context.WithCancel(signalContext)
+	syncDone := make(chan struct{})
+	go func() {
+		defer close(syncDone)
+		controlService.Beichen().Run(syncContext)
+	}()
+	defer func() {
+		cancelSync()
+		<-syncDone
+	}()
 	serverErrors := make(chan error, 1)
 	go func() {
 		slog.Info("Nebula server listening", "address", cfg.HTTPAddress)

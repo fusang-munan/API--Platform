@@ -22,16 +22,6 @@ func toUsageCorrelation(correlation CallCorrelation) usage.CallCorrelation {
 	return result
 }
 
-func toUsageMetrics(metrics ResponseMetrics) usage.CallMetrics {
-	return usage.CallMetrics{
-		UpstreamResponseID: metrics.UpstreamResponseID,
-		PromptTokens:       metrics.PromptTokens,
-		CompletionTokens:   metrics.CompletionTokens,
-		TotalTokens:        metrics.TotalTokens,
-		ReplyClosed:        metrics.ReplyClosed,
-	}
-}
-
 // turnCorrelation applies the question boundary, then pins a websocket tool
 // loop to the turn already open. A new question is not pinned, so the next
 // reply can become its own row. activeTurn is uuid.Nil for ordinary HTTP.

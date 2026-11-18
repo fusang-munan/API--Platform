@@ -378,8 +378,8 @@ ORDER BY created_at DESC LIMIT 1`, turnID).Scan(&outcome)
 	return outcome, nil
 }
 
-func applyTurnTokenMetrics(ctx context.Context, tx *sql.Tx, turnID uuid.UUID, metrics CallMetrics) error {
-	if turnID == uuid.Nil || !metrics.HasTokens() {
+func applyTurnTokenDelta(ctx context.Context, tx *sql.Tx, turnID uuid.UUID, prompt, completion, total int64) error {
+	if turnID == uuid.Nil || (prompt == 0 && completion == 0 && total == 0) {
 		return nil
 	}
 	_, err := tx.ExecContext(ctx, `UPDATE gateway_call_turns SET
@@ -387,7 +387,7 @@ prompt_tokens=prompt_tokens+$2,
 completion_tokens=completion_tokens+$3,
 total_tokens=total_tokens+$4,
 updated_at=now()
-WHERE id=$1`, turnID, metrics.PromptTokens, metrics.CompletionTokens, metrics.TotalTokens)
+WHERE id=$1`, turnID, prompt, completion, total)
 	return err
 }
 
@@ -404,7 +404,7 @@ func previewPrompt(value string, limit int) string {
 }
 
 func scanOptionalInt(value sql.NullInt64) *int {
-	if !value.Valid || value.Int64 <= 0 {
+	if !value.Valid {
 		return nil
 	}
 	v := int(value.Int64)

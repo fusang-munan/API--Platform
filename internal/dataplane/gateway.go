@@ -1,7 +1,6 @@
 package dataplane
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -55,9 +54,10 @@ type Gateway struct {
 }
 
 type route struct {
-	Binding    *ent.ModelBinding
-	Provider   *ent.Provider
-	Credential string
+	Binding      *ent.ModelBinding
+	Provider     *ent.Provider
+	Credential   string
+	CredentialID uuid.UUID
 }
 
 func NewGateway(db *ent.Client, usageStore *usage.Store, cacheStore *cache.Store, securityManager *security.Manager, cfg Config) *Gateway {
@@ -133,7 +133,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeProtocolError(w, r.URL.Path, http.StatusNotFound, "invalid_request_error", "resource_not_found", "The requested upstream resource is unavailable.", "")
 			return
 		}
-		g.proxyHTTP(w, r, replay, routes, uuid.Nil)
+		g.proxyHTTP(w, r, replay, routes, nil)
 		return
 	}
 
@@ -164,7 +164,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProtocolError(w, r.URL.Path, http.StatusBadRequest, "invalid_request_error", "billing_unavailable", "Unable to authorize this model call.", "model")
 		return
 	}
-	g.proxyHTTP(w, r, replay, routes, reservation)
+	g.proxyHTTP(w, r, replay, routes, &reservation)
 }
 
 func (g *Gateway) routesForMessages(ctx context.Context, keyID uuid.UUID, modelID string) ([]route, error) {
@@ -321,209 +321,37 @@ func (g *Gateway) decryptRoutes(ctx context.Context, bindings []*ent.ModelBindin
 		if upstream == nil || upstream.Status != provider.StatusActive {
 			continue
 		}
-		credential, err := g.resolveBindingCredential(ctx, binding)
+		credential, credentialID, err := g.resolveBindingCredential(ctx, binding)
 		if err != nil || strings.TrimSpace(credential) == "" {
 			continue
 		}
-		routes = append(routes, route{Binding: binding, Provider: upstream, Credential: credential})
+		routes = append(routes, route{Binding: binding, Provider: upstream, Credential: credential, CredentialID: credentialID})
 	}
 	return routes
 }
 
-func (g *Gateway) resolveBindingCredential(ctx context.Context, binding *ent.ModelBinding) (string, error) {
-	if binding.CredentialID != nil {
-		row, err := g.db.ProviderCredential.Query().
-			Where(
-				providercredential.IDEQ(*binding.CredentialID),
-				providercredential.StatusEQ(providercredential.StatusActive),
-			).
-			Only(ctx)
-		if err != nil {
-			return "", err
+func (g *Gateway) resolveBindingCredential(ctx context.Context, binding *ent.ModelBinding) (string, uuid.UUID, error) {
+	credentialID := binding.CredentialID
+	if credentialID == nil {
+		var found bool
+		var err error
+		credentialID, found, err = catalog.FindActiveCatalogCredential(ctx, g.db, binding.ProviderID, binding.UpstreamModelName, uuid.Nil)
+		if err != nil || !found || credentialID == nil {
+			return "", uuid.Nil, errors.New("provider credential is unavailable")
 		}
-		ready, err := catalog.BindingRouteReady(ctx, g.db, binding)
-		if err != nil || !ready {
-			return "", errors.New("provider credential is unavailable")
-		}
-		return g.security.DecryptCredential(row.CredentialCiphertext)
-	}
-	credentialID, found, err := catalog.FindActiveCatalogCredential(ctx, g.db, binding.ProviderID, binding.UpstreamModelName, uuid.Nil)
-	if err != nil || !found || credentialID == nil {
-		return "", errors.New("provider credential is unavailable")
 	}
 	row, err := g.db.ProviderCredential.Query().
 		Where(
 			providercredential.IDEQ(*credentialID),
+			providercredential.ProviderIDEQ(binding.ProviderID),
 			providercredential.StatusEQ(providercredential.StatusActive),
 		).
 		Only(ctx)
 	if err != nil {
-		return "", err
+		return "", uuid.Nil, err
 	}
-	return g.security.DecryptCredential(row.CredentialCiphertext)
-}
-
-func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, replay *replayBody, routes []route, reservation any) {
-	if len(routes) == 0 {
-		writeProtocolError(w, original.URL.Path, http.StatusBadGateway, "server_error", "upstream_unavailable", "No upstream provider is available.", "")
-		if r, ok := reservation.(usage.Reservation); ok {
-			_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "connection", "No upstream provider is available.", nil, "", usage.CallMetrics{})
-		}
-		return
-	}
-	candidate := routes[0]
-
-	var lastResponse *http.Response
-	var lastConnectionErr error
-	for attempt := 0; attempt < upstreamRetryAttempts; attempt++ {
-		if attempt > 0 && !sleepUpstreamRetry(original.Context(), attempt) {
-			break
-		}
-		attemptStarted := time.Now()
-		var attemptID uuid.UUID
-		if r, ok := reservation.(usage.Reservation); ok {
-			attemptID, _ = g.usage.StartAttempt(original.Context(), r.CallID, candidate.Provider.ID, candidate.Binding.ID, candidate.Provider.Name)
-		}
-		request, cleanup, err := g.upstreamRequest(original, replay, candidate)
-		if err != nil {
-			lastConnectionErr = err
-			if attemptID != uuid.Nil {
-				_ = g.usage.FinishAttempt(original.Context(), attemptID, false, nil, "request_rewrite", err.Error(), attemptStarted)
-			}
-			continue
-		}
-		response, err := g.client.Do(request)
-		cleanup()
-		if err != nil {
-			lastConnectionErr = err
-			if attemptID != uuid.Nil {
-				_ = g.usage.FinishAttempt(original.Context(), attemptID, false, nil, "connection", err.Error(), attemptStarted)
-			}
-			continue
-		}
-		if r, ok := reservation.(usage.Reservation); ok {
-			_ = g.usage.MarkSent(original.Context(), r.CallID)
-		}
-		if attemptID != uuid.Nil {
-			_ = g.usage.FinishAttempt(original.Context(), attemptID, response.StatusCode >= 200 && response.StatusCode < 300, &response.StatusCode, "", "", attemptStarted)
-		}
-		lastResponse = response
-
-		if r, ok := reservation.(usage.Reservation); ok && isSSEResponse(response) {
-			prefix, remainder, peekErr := peekSSEBody(response.Body, ssePeekLimit)
-			if peekErr != nil {
-				discardResponseBody(response, 0)
-				if attempt < upstreamRetryAttempts-1 {
-					continue
-				}
-				writeProtocolError(w, original.URL.Path, http.StatusBadGateway, "server_error", "upstream_unavailable", "Upstream stream ended before a response was delivered.", "")
-				_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "stream", peekErr.Error(), &candidate.Provider.ID, candidate.Provider.Name, usage.CallMetrics{})
-				return
-			}
-			if sseStreamRetryable(prefix) && attempt < upstreamRetryAttempts-1 {
-				_, _ = io.Copy(io.Discard, remainder)
-				_ = remainder.Close()
-				continue
-			}
-			response.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), remainder))
-			g.proxySSE(w, original, response, r, candidate.Provider)
-			return
-		}
-
-		if upstreamHTTPRetryable(response.StatusCode) && attempt < upstreamRetryAttempts-1 {
-			discardResponseBody(response, 64<<10)
-			continue
-		}
-
-		if r, ok := reservation.(usage.Reservation); ok {
-			success := response.StatusCode >= 200 && response.StatusCode < 300
-			bodyBytes, readErr := io.ReadAll(io.LimitReader(response.Body, 8<<20))
-			response.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			metrics := usage.CallMetrics{}
-			if success && readErr == nil {
-				metrics = toUsageMetrics(parseResponseMetrics(response.Header.Get("Content-Type"), bodyBytes))
-			}
-			if success {
-				if err := g.usage.Finalize(original.Context(), r, true, "succeeded", "", "", &candidate.Provider.ID, candidate.Provider.Name, metrics); err != nil {
-					response.Body.Close()
-					writeProtocolError(w, original.URL.Path, http.StatusServiceUnavailable, "server_error", "billing_unavailable", "Unable to finalize model usage.", "")
-					return
-				}
-			} else {
-				if err := g.usage.Finalize(original.Context(), r, false, "upstream_failed", "http", response.Status, &candidate.Provider.ID, candidate.Provider.Name, metrics); err != nil {
-					response.Body.Close()
-					writeProtocolError(w, original.URL.Path, http.StatusServiceUnavailable, "server_error", "billing_unavailable", "Unable to finalize model usage.", "")
-					return
-				}
-			}
-		}
-		if resourceType, ok := createdResourceType(original.Method, original.URL.Path); ok && response.StatusCode >= 200 && response.StatusCode < 300 {
-			g.writeResourceCreationResponse(w, response, resourceType, candidate.Binding.ID)
-			return
-		}
-		copyUpstreamResponse(w, response)
-		return
-	}
-
-	if lastResponse != nil {
-		if r, ok := reservation.(usage.Reservation); ok {
-			_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "http", fmt.Sprintf("HTTP %d", lastResponse.StatusCode), nil, "", usage.CallMetrics{})
-		}
-		copyUpstreamResponse(w, lastResponse)
-		return
-	}
-	message := "No upstream provider is available."
-	if lastConnectionErr != nil {
-		message = lastConnectionErr.Error()
-	}
-	writeProtocolError(w, original.URL.Path, http.StatusBadGateway, "server_error", "upstream_unavailable", message, "")
-	if r, ok := reservation.(usage.Reservation); ok {
-		_ = g.usage.Finalize(original.Context(), r, false, "upstream_failed", "connection", message, nil, "", usage.CallMetrics{})
-	}
-}
-
-func isSSEResponse(response *http.Response) bool {
-	return strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream")
-}
-
-func (g *Gateway) proxySSE(w http.ResponseWriter, original *http.Request, response *http.Response, reservation usage.Reservation, provider *ent.Provider) {
-	defer response.Body.Close()
-	reader := bufio.NewReader(response.Body)
-	var buffered bytes.Buffer
-	confirmed := false
-	for !confirmed {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			buffered.Write(line)
-			trimmed := bytes.TrimSpace(line)
-			if bytes.HasPrefix(trimmed, []byte("data:")) && !bytes.Contains(bytes.ToLower(trimmed), []byte("error")) {
-				confirmed = true
-			}
-		}
-		if err != nil {
-			if !confirmed {
-				_ = g.usage.Finalize(original.Context(), reservation, false, "upstream_failed", "stream", "stream ended before a successful event", nil, provider.Name, usage.CallMetrics{})
-			}
-			copyHeaders(w.Header(), response.Header)
-			w.WriteHeader(response.StatusCode)
-			_, _ = w.Write(buffered.Bytes())
-			return
-		}
-	}
-	if err := g.usage.Finalize(original.Context(), reservation, true, "succeeded", "", "", &provider.ID, provider.Name, usage.CallMetrics{}); err != nil {
-		writeProtocolError(w, original.URL.Path, http.StatusServiceUnavailable, "server_error", "billing_unavailable", "Unable to finalize model usage.", "")
-		return
-	}
-	copyHeaders(w.Header(), response.Header)
-	w.WriteHeader(response.StatusCode)
-	_, _ = w.Write(buffered.Bytes())
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
-	}
-	var streamed bytes.Buffer
-	_, _ = io.Copy(io.MultiWriter(w, &streamed), reader)
-	body := append(buffered.Bytes(), streamed.Bytes()...)
-	_ = g.usage.CompleteCallMetrics(original.Context(), reservation.CallID, toUsageMetrics(parseResponseMetrics(response.Header.Get("Content-Type"), body)))
+	credential, err := g.security.DecryptCredential(row.CredentialCiphertext)
+	return credential, row.ID, err
 }
 
 func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, candidate route) (*http.Request, func(), error) {
@@ -536,7 +364,7 @@ func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, ca
 		return nil, func() {}, err
 	}
 	body, contentType, contentLength, cleanup, err := rewriteUpstreamBody(
-		original.Header.Get("Content-Type"), replay, candidate.Binding.UpstreamModelName, candidate.Binding.Adapter, candidate.Provider.BaseURL,
+		original.Header.Get("Content-Type"), replay, candidate.Binding.UpstreamModelName, candidate.Binding.Adapter, candidate.Provider.BaseURL, original.URL.Path,
 	)
 	if err != nil {
 		return nil, func() {}, err
@@ -575,25 +403,6 @@ func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, ca
 	return request, cleanup, nil
 }
 
-func (g *Gateway) writeResourceCreationResponse(w http.ResponseWriter, response *http.Response, resourceType string, bindingID uuid.UUID) {
-	defer response.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(response.Body, 10<<20))
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "server_error", "invalid_upstream_response", "Invalid upstream resource response.", "")
-		return
-	}
-	var payload map[string]any
-	if json.Unmarshal(body, &payload) == nil {
-		resourceID := firstString(payload, "id", "task_id")
-		if resourceID != "" {
-			_ = g.cache.SetGatewayResourceRoute(context.Background(), resourceType, resourceID, bindingID.String(), g.config.ResourceRouteTTL)
-		}
-	}
-	copyHeaders(w.Header(), response.Header)
-	w.WriteHeader(response.StatusCode)
-	_, _ = w.Write(body)
-}
-
 func (g *Gateway) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/v1/responses" {
 		g.serveResponsesWebSocket(w, r)
@@ -623,6 +432,7 @@ func (g *Gateway) serveRealtimeWebSocket(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var upstream *websocket.Conn
+	var selected route
 	for _, candidate := range routes {
 		query := r.URL.Query()
 		query.Set("model", candidate.Binding.UpstreamModelName)
@@ -642,6 +452,7 @@ func (g *Gateway) serveRealtimeWebSocket(w http.ResponseWriter, r *http.Request)
 		headers.Set("Authorization", "Bearer "+candidate.Credential)
 		upstream, _, err = g.dialer.DialContext(r.Context(), target, headers)
 		if err == nil {
+			selected = candidate
 			break
 		}
 	}
@@ -658,7 +469,7 @@ func (g *Gateway) serveRealtimeWebSocket(w http.ResponseWriter, r *http.Request)
 	defer client.Close()
 	client.SetReadLimit(g.config.MaxRequestBytes)
 	upstream.SetReadLimit(g.config.MaxRequestBytes)
-	proxyRealtimeWebSocket(client, upstream, g, key.ID, routes[0].Binding.ModelID, uuid.Nil)
+	proxyRealtimeWebSocket(client, upstream, selected.callRoute(), g, key.ID, selected.Binding.ModelID, uuid.Nil)
 }
 
 func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -694,7 +505,7 @@ func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request
 	}
 	var upstream *websocket.Conn
 	var rewritten []byte
-	upstreamModel := ""
+	var selected route
 	for _, candidate := range routes {
 		rewritten, err = rewriteResponsesWebSocketModel(firstMessage, candidate.Binding.UpstreamModelName)
 		if err != nil {
@@ -709,7 +520,7 @@ func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request
 		headers := upstreamWebSocketHeaders(r.Header, candidate.Credential)
 		upstream, _, err = g.dialer.DialContext(r.Context(), target, headers)
 		if err == nil {
-			upstreamModel = candidate.Binding.UpstreamModelName
+			selected = candidate
 			break
 		}
 	}
@@ -721,18 +532,18 @@ func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request
 	upstream.SetReadLimit(g.config.MaxRequestBytes)
 	wsPrompt, wsPromptSource := extractPromptFromJSON(firstMessage)
 	wsPrompt, usageCorrelation := turnCorrelation(wsPrompt, extractCallCorrelationFromJSON(firstMessage), uuid.Nil)
-	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, routes[0].Binding.ModelID, requestIDFromContext(r), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, usageCorrelation)
+	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, selected.Binding.ModelID, requestIDFromContext(r), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, usageCorrelation)
 	if reserveErr != nil {
 		_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "rate_limit_error", "code": "quota_exceeded", "message": "The API key or project credit quota is exhausted."}})
 		return
 	}
 	if err := upstream.WriteMessage(messageType, rewritten); err != nil {
-		_ = g.usage.Finalize(r.Context(), reservation, false, "outcome_unknown", "connection", err.Error(), nil, "", usage.CallMetrics{})
+		_ = g.usage.Finalize(r.Context(), reservation, false, "outcome_unknown", "connection", "Unable to send upstream WebSocket message.", selected.callRoute(), usage.CallMetrics{})
 		return
 	}
 	_ = g.usage.MarkSent(r.Context(), reservation.CallID)
-	_ = g.usage.Finalize(r.Context(), reservation, true, "succeeded", "", "", &routes[0].Provider.ID, routes[0].Provider.Name, usage.CallMetrics{})
-	proxyResponsesWebSockets(client, upstream, upstreamModel, g, key.ID, routes[0].Binding.ModelID, reservation.TurnID)
+	_ = g.usage.Finalize(r.Context(), reservation, true, "succeeded", "", "", selected.callRoute(), usage.CallMetrics{})
+	proxyResponsesWebSockets(client, upstream, selected.callRoute(), g, key.ID, selected.Binding.ModelID, reservation.TurnID)
 }
 
 func (g *Gateway) validWebSocketOrigin(request *http.Request) bool {
@@ -789,7 +600,7 @@ func rewriteResponsesWebSocketModel(message []byte, upstreamModel string) ([]byt
 	return json.Marshal(payload)
 }
 
-func proxyResponsesWebSockets(client, upstream *websocket.Conn, upstreamModel string, gateway *Gateway, keyID, modelID, sessionTurnID uuid.UUID) {
+func proxyResponsesWebSockets(client, upstream *websocket.Conn, selected usage.CallRoute, gateway *Gateway, keyID, modelID, sessionTurnID uuid.UUID) {
 	errs := make(chan error, 2)
 	activeTurnID := sessionTurnID
 	go func() {
@@ -814,18 +625,18 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, upstreamModel st
 						_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "rate_limit_error", "code": "quota_exceeded", "message": "The API key or project credit quota is exhausted."}})
 						continue
 					}
-					data, err = rewriteResponsesWebSocketModel(data, upstreamModel)
+					data, err = rewriteResponsesWebSocketModel(data, selected.UpstreamModelName)
 					if err != nil {
 						errs <- err
 						return
 					}
 					if err := upstream.WriteMessage(messageType, data); err != nil {
-						_ = gateway.usage.Finalize(context.Background(), reservation, false, "outcome_unknown", "connection", err.Error(), nil, "", usage.CallMetrics{})
+						_ = gateway.usage.Finalize(context.Background(), reservation, false, "outcome_unknown", "connection", "Unable to send upstream WebSocket message.", selected, usage.CallMetrics{})
 						errs <- err
 						return
 					}
 					_ = gateway.usage.MarkSent(context.Background(), reservation.CallID)
-					_ = gateway.usage.Finalize(context.Background(), reservation, true, "succeeded", "", "", nil, "", usage.CallMetrics{})
+					_ = gateway.usage.Finalize(context.Background(), reservation, true, "succeeded", "", "", selected, usage.CallMetrics{})
 					continue
 				}
 			}
@@ -851,7 +662,7 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, upstreamModel st
 	<-errs
 }
 
-func proxyRealtimeWebSocket(client, upstream *websocket.Conn, gateway *Gateway, keyID, modelID, sessionTurnID uuid.UUID) {
+func proxyRealtimeWebSocket(client, upstream *websocket.Conn, selected usage.CallRoute, gateway *Gateway, keyID, modelID, sessionTurnID uuid.UUID) {
 	errs := make(chan error, 2)
 	activeTurnID := sessionTurnID
 	go func() {
@@ -877,12 +688,12 @@ func proxyRealtimeWebSocket(client, upstream *websocket.Conn, gateway *Gateway, 
 						continue
 					}
 					if err := upstream.WriteMessage(messageType, data); err != nil {
-						_ = gateway.usage.Finalize(context.Background(), reservation, false, "outcome_unknown", "connection", err.Error(), nil, "", usage.CallMetrics{})
+						_ = gateway.usage.Finalize(context.Background(), reservation, false, "outcome_unknown", "connection", "Unable to send upstream WebSocket message.", selected, usage.CallMetrics{})
 						errs <- err
 						return
 					}
 					_ = gateway.usage.MarkSent(context.Background(), reservation.CallID)
-					_ = gateway.usage.Finalize(context.Background(), reservation, true, "succeeded", "", "", nil, "", usage.CallMetrics{})
+					_ = gateway.usage.Finalize(context.Background(), reservation, true, "succeeded", "", "", selected, usage.CallMetrics{})
 					continue
 				}
 			}
@@ -1177,7 +988,7 @@ func upstreamPath(requestPath, upstreamModel string, adapter modelbinding.Adapte
 	}
 }
 
-func rewriteUpstreamBody(contentType string, replay *replayBody, upstreamModel string, adapter modelbinding.Adapter, baseURL string) (
+func rewriteUpstreamBody(contentType string, replay *replayBody, upstreamModel string, adapter modelbinding.Adapter, baseURL, requestPath string) (
 	io.ReadCloser,
 	string,
 	int64,
@@ -1194,6 +1005,8 @@ func rewriteUpstreamBody(contentType string, replay *replayBody, upstreamModel s
 		var adjust func(map[string]json.RawMessage) error
 		if adapter == modelbinding.AdapterAnthropic && deepseekHost(baseURL) {
 			adjust = repairDeepSeekAnthropicThinking
+		} else if adapter == modelbinding.AdapterOpenaiCompatible && requestPath == "/v1/chat/completions" && isBeichenAPI(baseURL) {
+			adjust = requestBeichenStreamUsage
 		}
 		return rewriteRequestBodyAdjusted(contentType, replay, upstreamModel, adjust)
 	}
@@ -1683,25 +1496,25 @@ func joinUpstreamURL(baseURL, requestPath, rawQuery string) (string, error) {
 	return base.String(), nil
 }
 
-func copyUpstreamResponse(w http.ResponseWriter, response *http.Response) {
+func copyUpstreamResponse(w http.ResponseWriter, response *http.Response) error {
 	defer response.Body.Close()
 	copyHeaders(w.Header(), response.Header)
 	removeHopByHop(w.Header())
 	w.WriteHeader(response.StatusCode)
 	buffer := make([]byte, 32<<10)
-	flusher, canFlush := w.(http.Flusher)
+	controller := http.NewResponseController(w)
 	for {
 		n, err := response.Body.Read(buffer)
 		if n > 0 {
-			if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
-				return
-			}
-			if canFlush {
-				flusher.Flush()
+			if writeErr := forwardResponseChunk(w, controller, buffer[:n]); writeErr != nil {
+				return writeErr
 			}
 		}
+		if err == io.EOF {
+			return nil
+		}
 		if err != nil {
-			return
+			return err
 		}
 	}
 }

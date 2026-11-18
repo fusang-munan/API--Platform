@@ -1,4 +1,5 @@
 import { del, get, page, patch, post } from './client'
+import type { BeichenImport, BeichenOverview, BeichenPriceUpdate } from './types'
 import type { Application, Binding, BindingCreate, BindingRouteProbeEndpoint, BindingRouteProbeStep, BindingUpdate, MentorCandidate, Model, ModelCatalogPage, ModelCreate, ModelUpdate, Organization, OrganizationCreate, OrganizationUpdate, ProbeEndpoint, ProbeResponse, Project, ProjectBudget, ProjectBudgetUpdate, ProjectCreate, ProjectUpdate, Provider, ProviderCatalogSyncView, ProviderCreate, ProviderCredential, ProviderCredentialCreate, ProviderCredentialUpdate, ProviderUpdate, ProjectUsage, StudentAccount } from './types'
 export const teacherAPI = {
   invite: (email: string) => post<{ invited: boolean }>('/api/v1/teacher/invitations', { email }),
@@ -29,6 +30,10 @@ export const teacherAPI = {
   updateProviderCredential: (providerId: string, credentialId: string, body: ProviderCredentialUpdate) => patch<ProviderCredential>(`/api/v1/teacher/providers/${providerId}/credentials/${credentialId}`, body),
   deleteProviderCredential: (providerId: string, credentialId: string) => del(`/api/v1/teacher/providers/${providerId}/credentials/${credentialId}`),
   resetProviderCatalog: (id: string) => post<ProviderCatalogSyncView>(`/api/v1/teacher/providers/${id}/reset-catalog`),
+  beichenOverview: (id: string, day: string) => get<BeichenOverview>(`/api/v1/teacher/providers/${id}/beichen?${new URLSearchParams({ day })}`),
+  syncBeichen: (id: string) => post<{ synced: boolean }>(`/api/v1/teacher/providers/${id}/beichen/sync`),
+  setBeichenPrice: (id: string, body: BeichenPriceUpdate) => patch<{ saved: boolean }>(`/api/v1/teacher/providers/${id}/beichen/price`, body),
+  importBeichen: (id: string, body: BeichenImport) => post<{ imported: boolean }>(`/api/v1/teacher/providers/${id}/beichen/import`, body),
   models: () => get<Model[]>('/api/v1/teacher/models'),
   createModel: (body: ModelCreate) => post<Model>('/api/v1/teacher/models', body),
   updateModel: (body: ModelUpdate) => patch<Model>('/api/v1/teacher/models/configuration', body),
