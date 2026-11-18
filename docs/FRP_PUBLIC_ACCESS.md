@@ -23,7 +23,17 @@
 
 **公网入口**：`http://106.55.103.208:25555`
 
-可选 HTTPS（自签，多机访问不推荐）：见 `scripts/generate-lab-tls.sh` 与 `frontend/nginx.lab-ssl.conf`，在 `compose.local.yaml` 为 frontend 挂载证书与 SSL 配置。
+0.10.2 的维护 API 使用 `https://106.55.103.208:25555`。同一端口的明文请求继续进入原控制台，TLS 字节由 Nginx 转交后端处理。后端仅在实验室 Compose 启用维护监听，复用教师和学生的现有鉴权。维护客户端使用独立的 Cookie 容器并验证学校证书，同时校验 IP 和有效期。
+
+学校实例首次启动时自行生成证书，私钥只由后端进程读写并保存在独立命名卷。管理员在学校主机执行以下命令可取得本次使用的公开证书摘要。通过维护者认识的校方联系人或经核实的正式发件地址传递完整 SHA-256。客户端必须先把从网络取得的叶证书与此值逐字节核对，再用这张证书作为本次连接的信任锚。浏览器和系统的全局信任设置无需修改。
+
+```bash
+bash scripts/compose-local.sh logs --no-color --tail=300 backend | grep 'maintenance HTTPS certificate' | tail -1
+```
+
+若日志显示 maintenance HTTPS unavailable，先检查命名卷的权限及证书有效期。保留现有卷，按学校批准的流程轮换证书并重新分发指纹。
+
+维护入口的 `GET /.well-known/nebula-maintenance` 供无凭据的上线检查使用。`email_delivery` 为 `log_only` 表示该实例只写开发日志，为 `smtp_configured` 表示已选择 SMTP，实际投递需要收件方确认。此接口不发信。
 
 ## 维护命令
 

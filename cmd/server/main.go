@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/cache"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/labtls"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/mail"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
@@ -121,23 +125,17 @@ func run() error {
 		ResourceRouteTTL:      cfg.GatewayResourceRouteTTL,
 		AllowedOrigin:         cfg.PublicAppURL,
 	})
-	api := httpapi.NewServer(
-		controlService, securityManager, cacheStore, gateway,
-		httpapi.HealthDependencies{Database: sqlDB, Cache: cacheStore},
-		httpapi.Config{
-			CookieSecure:  cfg.CookieSecure(),
-			RefreshTTL:    cfg.RefreshTTL,
-			SSEHeartbeat:  cfg.SSEHeartbeat,
-			AllowedOrigin: cfg.PublicAppURL,
-		},
-	)
-	httpServer := &http.Server{
-		Addr:              cfg.HTTPAddress,
-		Handler:           api.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-		MaxHeaderBytes:    1 << 20,
+	newServer := func(addr, origin string, secure bool) *http.Server {
+		api := httpapi.NewServer(controlService, securityManager, cacheStore, gateway,
+			httpapi.HealthDependencies{Database: sqlDB, Cache: cacheStore},
+			httpapi.Config{CookieSecure: secure, RefreshTTL: cfg.RefreshTTL, SSEHeartbeat: cfg.SSEHeartbeat, AllowedOrigin: origin},
+		)
+		return &http.Server{
+			Addr: addr, Handler: api.Handler(), ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 1 << 20,
+		}
 	}
+	httpServer := newServer(cfg.HTTPAddress, cfg.PublicAppURL, cfg.CookieSecure())
 
 	signalContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -157,6 +155,30 @@ func run() error {
 		<-syncDone
 		<-receiptsDone
 	}()
+	var secureServer *http.Server
+	if addr := os.Getenv("LAB_MAINTENANCE_TLS_ADDR"); addr != "" {
+		origin := os.Getenv("LAB_MAINTENANCE_TLS_ORIGIN")
+		secureServer = newServer(addr, origin, true)
+		secureServer.Handler = maintenanceHandler(secureServer.Handler, cfg.SMTPMode == "smtp")
+		cert, err := labtls.LoadOrCreate(os.Getenv("LAB_MAINTENANCE_TLS_DIR"), origin)
+		if err == nil {
+			var listener net.Listener
+			listener, err = net.Listen("tcp", addr)
+			if err == nil {
+				secureServer.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
+				slog.Info("maintenance HTTPS certificate", "origin", origin, "sha256", labtls.Fingerprint(cert))
+				go func() {
+					if err := secureServer.ServeTLS(listener, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+						slog.Error("maintenance HTTPS unavailable", "error", err)
+					}
+				}()
+			}
+		}
+		if err != nil {
+			slog.Error("maintenance HTTPS unavailable", "error", err)
+		}
+		defer secureServer.Close()
+	}
 	serverErrors := make(chan error, 1)
 	go func() {
 		slog.Info("Nebula server listening", "address", cfg.HTTPAddress)
@@ -167,11 +189,41 @@ func run() error {
 	case <-signalContext.Done():
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		return httpServer.Shutdown(shutdownContext)
+		if secureServer == nil {
+			return httpServer.Shutdown(shutdownContext)
+		}
+		tlsStopped := make(chan error, 1)
+		go func() { tlsStopped <- secureServer.Shutdown(shutdownContext) }()
+		return errors.Join(httpServer.Shutdown(shutdownContext), <-tlsStopped)
 	case err := <-serverErrors:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err
 	}
+}
+
+func maintenanceHandler(next http.Handler, mailEnabled bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/nebula-maintenance" {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				w.Header().Set("Allow", "GET, HEAD")
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Content-Type", "application/json")
+			if mailEnabled {
+				_, _ = w.Write([]byte(`{"email_delivery":"smtp_configured"}`))
+			} else {
+				_, _ = w.Write([]byte(`{"email_delivery":"log_only"}`))
+			}
+			return
+		}
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/") && !strings.HasPrefix(r.URL.Path, "/v1/") {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

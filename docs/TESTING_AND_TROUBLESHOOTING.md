@@ -176,6 +176,8 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 0.10.1 升级后，以教师身份打开「供应商管理」，搜索留空，状态选「全部状态」。新预置的北辰应为启用，显示 0 个 Key 和「待配置 Key」，「同步与对账」可以打开。教师的模型管理应继续列出其他已配置供应商的模型，只有空供应商时应返回空列表。没有凭据时，日账与倍率应显示暂无数据。若找不到，先看筛选条件和标准北辰地址，再检查显式迁移是否完成。专用本地 PostgreSQL 配置 `NEBULA_TEST_POSTGRES` 后，执行 `go test ./internal/infrastructure/db -run TestDefaultBeichenProviderMigration -count=1 -v` 验证预置和重复升级。
 
+学校维护 HTTPS 验证命令为 `go test ./internal/infrastructure/labtls ./cmd/server`。在有 Docker 的 Linux 测试机运行 `bash scripts/test-lab-port.sh` 验证同端口的 HTTP 和 TLS。证书不符时先停用维护客户端，再通过独立可信渠道核对学校实例记录的 SHA-256。HTTPS 返回 401 表示已到达受保护接口，实际计费需使用正常学生身份验证。
+
 逐笔核账使用已授权的用户面板与推理响应。选择已配数字 Key ID 的渠道，保存普通 HTTP 响应上的 `X-Client-Request-ID`。检查北辰账号的逐笔明细是否有同把 Key、同模型、时间相符并带 `client:<该编号>` 的记录。缺少可归属明细时保持待核。WebSocket 的响应编号及日汇总不具备这一关联含义。北辰页面显示版本 v0.2.15，可对照该版本的[请求头生成](https://github.com/Wei-Shaw/sub2api/blob/v0.2.15/backend/internal/server/middleware/client_request_id.go)和[账单编号选择](https://github.com/Wei-Shaw/sub2api/blob/v0.2.15/backend/internal/service/gateway_usage_billing.go)。
 
 1. 在一次性测试数据库上应用迁移并重复执行一次。测试数据库必须新建、只监听回环地址、数据库名为 `nebula_test`。设置 `NEBULA_TEST_POSTGRES` 指向该测试库并使用 `sslmode=disable`，执行 `go test ./internal/infrastructure/db -run TestBeichenMigrationUpgrade -count=1 -v`。

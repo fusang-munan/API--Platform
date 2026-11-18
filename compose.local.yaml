@@ -29,14 +29,29 @@ services:
       proxy-relay:
         condition: service_started
     environment:
+      LAB_MAINTENANCE_TLS_ADDR: ":8443"
+      LAB_MAINTENANCE_TLS_DIR: /app/maintenance-tls
+      LAB_MAINTENANCE_TLS_ORIGIN: https://106.55.103.208:25555
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       BEICHEN_PANEL_TOKEN: ${BEICHEN_PANEL_TOKEN:-}
       BEICHEN_PANEL_GROUPS: ${BEICHEN_PANEL_GROUPS:-}
       NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost,postgres,redis,172.30.10.1}
+    volumes:
+      - maintenance-tls:/app/maintenance-tls
   frontend:
     ports: !override
       - "127.0.0.1:25555:8080"
+    volumes:
+      - ./frontend/lab-maintenance:/etc/nginx/lab-maintenance:ro
+    entrypoint: ["/bin/sh", "/etc/nginx/lab-maintenance/start.sh"]
+    command: ["nginx", "-c", "/etc/nginx/lab-maintenance/nginx.conf", "-g", "daemon off;"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 15s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
 
 networks:
   edge:
@@ -48,3 +63,6 @@ networks:
     ipam:
       config:
         - subnet: 172.30.11.0/24
+
+volumes:
+  maintenance-tls:
