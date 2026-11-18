@@ -11,7 +11,7 @@ describe('API client', () => {
   })
 
   it('turns approval and validation errors into actionable Chinese messages', () => {
-    expect(apiErrorMessage(new APIError('mentor already belongs to the project', 409, 'MENTOR_ALREADY_PROJECT_MEMBER'))).toBe('该导师已经负责此项目，无需重复指派')
+    expect(apiErrorMessage(new APIError('mentor already belongs to the project', 409, 'MENTOR_ALREADY_PROJECT_MEMBER'))).toBe('该导师已在项目中')
     expect(apiErrorMessage(new APIError('rejection reason is required', 400, 'REJECTION_REASON_REQUIRED'))).toBe('驳回原因不能为空，请填写具体原因')
     expect(apiErrorMessage(new APIError('request validation failed', 400, 'VALIDATION_ERROR', [{ field: 'body', reason: 'unexpected end of JSON input' }]))).toBe('body：请求内容不完整')
     expect(apiErrorMessage(new APIError('one or more models are not ready', 409, 'MODEL_NOT_READY', { model_ids: ['gpt-4.1', 'embedding-3'] }))).toContain('gpt-4.1、embedding-3')

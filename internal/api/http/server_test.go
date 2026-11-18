@@ -1,9 +1,12 @@
 package httpapi
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/starprince1234/Nebula-api/internal/dataplane"
 )
 
@@ -11,9 +14,14 @@ func TestRegistersControlPlaneAndGatewayRoutes(t *testing.T) {
 	t.Parallel()
 	server := NewServer(nil, nil, nil, (*dataplane.Gateway)(nil), HealthDependencies{}, Config{})
 	routes := make(map[string]struct{})
+	deleteRoutes := map[string]bool{
+		"/api/v1/teacher/providers/:provider_id":                            true,
+		"/api/v1/teacher/providers/:provider_id/credentials/:credential_id": true,
+		"/api/v1/teacher/projects/:project_id/mentors/:mentor_id":           true,
+	}
 	for _, route := range server.engine.Routes() {
 		routes[route.Method+" "+route.Path] = struct{}{}
-		if route.Method == "DELETE" && route.Path != "/api/v1/teacher/providers/:provider_id" {
+		if route.Method == "DELETE" && !deleteRoutes[route.Path] {
 			t.Fatalf("unexpected DELETE route: %s", route.Path)
 		}
 		if strings.Contains(route.Path, "/api/nebula/gateway") {
@@ -92,6 +100,12 @@ func TestRegistersControlPlaneAndGatewayRoutes(t *testing.T) {
 		"PATCH /api/v1/teacher/providers/:provider_id/credentials/:credential_id",
 		"DELETE /api/v1/teacher/providers/:provider_id/credentials/:credential_id",
 		"POST /api/v1/teacher/providers/:provider_id/reset-catalog",
+		"GET /api/v1/teacher/providers/:provider_id/beichen",
+		"POST /api/v1/teacher/providers/:provider_id/beichen/sync",
+		"GET /api/v1/teacher/providers/:provider_id/beichen/access/:credential_id",
+		"PATCH /api/v1/teacher/providers/:provider_id/beichen/access/:credential_id",
+		"PATCH /api/v1/teacher/providers/:provider_id/beichen/price",
+		"POST /api/v1/teacher/providers/:provider_id/beichen/import",
 		"GET /api/v1/teacher/provider-catalog-candidates",
 		"GET /api/v1/teacher/models",
 		"POST /api/v1/teacher/models",
@@ -114,6 +128,41 @@ func TestRegistersControlPlaneAndGatewayRoutes(t *testing.T) {
 	for _, route := range expected {
 		if _, exists := routes[route]; !exists {
 			t.Fatalf("expected route %s is not registered", route)
+		}
+	}
+}
+
+func TestBeichenTeacherRoutesRequireLogin(t *testing.T) {
+	server := NewServer(nil, nil, nil, (*dataplane.Gateway)(nil), HealthDependencies{}, Config{})
+	base := "/api/v1/teacher/providers/123/beichen"
+	for _, route := range []struct{ method, path string }{
+		{http.MethodGet, base},
+		{http.MethodPost, base + "/sync"},
+		{http.MethodPatch, base + "/price"},
+		{http.MethodPost, base + "/import"},
+	} {
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(route.method, route.path, nil))
+		if response.Code != http.StatusUnauthorized {
+			t.Errorf("%s %s = %d, want 401", route.method, route.path, response.Code)
+		}
+	}
+}
+
+func TestBeichenUsageExportRequiresFullDayConfirmation(t *testing.T) {
+	// Test only the import handler's validation. The full router tests teacher auth.
+	server := &Server{}
+	router := gin.New()
+	router.POST("/:provider_id/beichen/import", server.importBeichen)
+	for _, body := range []string{
+		`{"credential_id":"00000000-0000-4000-8000-000000000002","kind":"usage_export","csv":"example"}`,
+		`{"credential_id":"00000000-0000-4000-8000-000000000002","kind":"usage_export","csv":"example","full_day_confirmed":false}`,
+	} {
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/00000000-0000-4000-8000-000000000001/beichen/import", strings.NewReader(body))
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "完整的北京时间账日") {
+			t.Fatalf("export without confirmation: status %d, body %s", response.Code, response.Body.String())
 		}
 	}
 }

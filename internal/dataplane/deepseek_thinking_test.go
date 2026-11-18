@@ -74,7 +74,7 @@ func rewriteDeepSeek(t *testing.T, body, baseURL string) []byte {
 		t.Fatal(err)
 	}
 	defer replay.Close()
-	upstream, _, _, cleanup, err := rewriteUpstreamBody("application/json", replay, "deepseek-v4-pro", modelbinding.AdapterAnthropic, baseURL)
+	upstream, _, _, cleanup, err := rewriteUpstreamBody("application/json", replay, "deepseek-v4-pro", modelbinding.AdapterAnthropic, baseURL, "/v1/messages")
 	if err != nil {
 		t.Fatal(err)
 	}

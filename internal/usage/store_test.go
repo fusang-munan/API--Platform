@@ -65,20 +65,67 @@ func TestStudentUsageIncludesZeroCostCalls(t *testing.T) {
 	defer database.Close()
 	store := NewStore(database)
 	userID, keyID, modelID := uuid.New(), uuid.New(), uuid.New()
-	month := Month(time.Now()).AddDate(0, -1, 0)
+	month := Month(time.Now()).In(shanghai).AddDate(0, -1, 0).UTC()
 	mock.ExpectQuery(`SELECT p.id,p.name,COALESCE\(mb.quota_milli,pm.monthly_credit_quota_milli,0\)`).
 		WithArgs(userID, month).
-		WillReturnRows(sqlmock.NewRows([]string{"project_id", "project_name", "quota_milli", "charged_milli", "pending_milli"}).AddRow(uuid.New(), "Project", int64(2_000_000), int64(0), int64(0)))
-	mock.ExpectQuery(`SELECT k.id,k.name,k.status,COALESCE\(b.charged_milli,0\),COALESCE\(b.pending_milli,0\)`).
+		WillReturnRows(sqlmock.NewRows([]string{"project_id", "project_name", "quota_milli", "pending_milli", "used", "available", "pending_review"}).
+			AddRow(uuid.New(), "Project", int64(2_000_000), 10, "0.00000000000001", "1999.98999999999999", true))
+	mock.ExpectQuery(`SELECT k.id,k.name,k.status,trim_scale.*b.charged_milli_remainder.*beichen_state='pending_review'`).
 		WithArgs(userID, sqlmock.AnyArg(), month).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "status", "charged_milli", "pending_milli"}).AddRow(keyID, "key", "active", 0, 0))
-	mock.ExpectQuery(`SELECT c.model_id,m.model_id,c.model_name,c.charged_milli,c.charged_count\+c.zero_cost_count`).WithArgs(keyID, month).WillReturnRows(sqlmock.NewRows([]string{"internal_id", "model_id", "model_name", "charged_milli", "calls"}).AddRow(modelID, "free-model", "Free Model", 0, 4))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "status", "used", "pending_milli", "pending_review", "available"}).
+			AddRow(keyID, "key", "inactive", "0.00000000000001", 10, true, "1.98999999999999"))
+	mock.ExpectQuery(`SELECT c.model_id,m.model_id,c.model_name,trim_scale.*c.charged_milli_remainder.*c.charged_count\+c.zero_cost_count`).WithArgs(keyID, month).WillReturnRows(sqlmock.NewRows([]string{"internal_id", "model_id", "model_name", "credits", "calls"}).
+		AddRow(modelID, "free-model", "Free Model", "0", 4).
+		AddRow(uuid.New(), "metered-model", "Metered Model", "0.00000000000001", 1))
 	usage, err := store.StudentUsage(context.Background(), userID, month)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(usage.Projects) != 1 || len(usage.Projects[0].Keys) != 1 || len(usage.Projects[0].Keys[0].Models) != 1 || usage.Projects[0].Keys[0].Models[0].ID != "free-model" || usage.Projects[0].Keys[0].Models[0].Calls != 4 {
+	if len(usage.Projects) != 1 || len(usage.Projects[0].Keys) != 1 || len(usage.Projects[0].Keys[0].Models) != 2 || usage.Projects[0].Keys[0].Models[0].ID != "free-model" || usage.Projects[0].Keys[0].Models[0].Calls != 4 {
 		t.Fatalf("unexpected usage: %#v", usage)
+	}
+	project := usage.Projects[0]
+	key := project.Keys[0]
+	if project.Used != "0.00000000000001" || project.Available != "1999.98999999999999" || !project.PendingReview ||
+		key.Used != project.Used || key.Available != "1.98999999999999" || key.Pending != "0.010" || !key.PendingReview ||
+		key.Models[0].Credits != "0.000" || key.Models[1].Credits != project.Used {
+		t.Fatalf("unexpected credit display: %#v", project)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMentorCallLogsDisplaysExactCreditsAndPendingReview(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	mentorID := uuid.New()
+	now := time.Now()
+	rows := sqlmock.NewRows([]string{
+		"id", "request_id", "project_id", "project_name", "user_id", "user_name", "api_key_id", "api_key_name",
+		"model_id", "model_name", "provider_name", "protocol", "path", "multiplier", "credits",
+		"billing_state", "outcome", "error_category", "error_message", "created_at",
+	})
+	rows.AddRow(uuid.New(), "exact", uuid.New(), "Project", uuid.New(), "Student", uuid.New(), "Key",
+		"model", "Model", "Provider", "anthropic", "/v1/messages", 1000, "0.00000000000001", "charged", "succeeded", "", "", now)
+	rows.AddRow(uuid.New(), "pending", uuid.New(), "Project", uuid.New(), "Student", uuid.New(), "Key",
+		"model", "Model", "Provider", "anthropic", "/v1/messages", 1000, "0", "pending_review", "pending_review", "", "", now)
+	rows.AddRow(uuid.New(), "legacy", uuid.New(), "Project", uuid.New(), "Student", uuid.New(), "Key",
+		"model", "Model", "Provider", "anthropic", "/v1/messages", 1000, "1.2", "charged", "succeeded", "", "", now)
+	mock.ExpectQuery(regexp.QuoteMeta(callDisplayCreditsSQL)+","+regexp.QuoteMeta(callDisplayBillingSQL)+","+regexp.QuoteMeta(callDisplayOutcomeSQL)).
+		WithArgs(mentorID, 51).WillReturnRows(rows)
+
+	logs, err := NewStore(database).MentorCallLogs(context.Background(), mentorID, LogFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs.Items) != 3 || logs.Items[0].Credits != "0.00000000000001" || logs.Items[2].Credits != "1.200" ||
+		logs.Items[1].Credits != "0.000" || logs.Items[1].BillingState != "pending_review" || logs.Items[1].Outcome != "pending_review" {
+		t.Fatalf("unexpected call logs: %#v", logs.Items)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -109,15 +156,15 @@ func TestApproveKeyBindsProjectBucketMonth(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT m.model_id,m.status,m.credit_multiplier_milli,EXISTS(SELECT 1 FROM model_bindings b JOIN providers p ON p.id=b.provider_id WHERE b.model_id=m.id AND b.status='active' AND p.status='active') FROM api_key_models km JOIN models m ON m.id=km.model_id WHERE km.api_key_id=$1 ORDER BY m.id FOR UPDATE OF m`)).
 		WithArgs(keyID).
 		WillReturnRows(sqlmock.NewRows([]string{"model_id", "status", "credit_multiplier_milli", "routed"}).AddRow("gpt-5.6-sol", "active", int64(1000), true))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COALESCE(monthly_credit_quota_milli,0) FROM project_members WHERE project_id=$1 AND user_id=$2`)).
-		WithArgs(projectID, ownerID).
-		WillReturnRows(sqlmock.NewRows([]string{"monthly_credit_quota_milli"}).AddRow(int64(0)))
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO project_month_credit_buckets`)).
 		WithArgs(projectID, month, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT quota_milli,allocated_milli FROM project_month_credit_buckets WHERE project_id=$1 AND month=$2 FOR UPDATE`)).
 		WithArgs(projectID, month).
 		WillReturnRows(sqlmock.NewRows([]string{"quota_milli", "allocated_milli"}).AddRow(int64(20_000_000), int64(0)))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COALESCE(monthly_credit_quota_milli,0) FROM project_members WHERE project_id=$1 AND user_id=$2`)).
+		WithArgs(projectID, ownerID).
+		WillReturnRows(sqlmock.NewRows([]string{"monthly_credit_quota_milli"}).AddRow(int64(0)))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE api_keys SET monthly_credit_quota_milli=0,mentor_monthly_credit_quota_milli=$1,status='approved',updated_at=$2 WHERE id=$3 AND status='pending_mentor'`)).
 		WithArgs(int64(500_000), sqlmock.AnyArg(), keyID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -166,6 +213,9 @@ func TestRunMaintenanceUsesTypedHeartbeatParameters(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"pg_try_advisory_lock"}).AddRow(true))
 	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO project_month_credit_buckets`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`INSERT INTO project_member_month_credit_buckets`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`INSERT INTO api_key_month_credit_buckets`).

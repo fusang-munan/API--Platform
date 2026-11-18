@@ -5,7 +5,7 @@ const statusLabels: Record<ApiKeyStatus | ModelStatus | ResourceStatus | string,
   pending_mentor: '等待导师审核', pending_teacher: '等待老师审核', approved: '等待领取', active: '已启用',
   rejected: '已驳回', inactive: '已停用', withdrawn: '已撤回', pending_configuration: '待配置', ready: '已就绪', pending: '待审核',
   cancelled: '已取消', mentor_review: '导师审核', teacher_review: '老师审核', claim: '等待领取',
-  rejected_teacher: '老师已驳回',
+  rejected_teacher: '老师已驳回', pending_review: '待核账',
 }
 export const roleLabel = (role?: Role) => role ? roleLabels[role] : ''
 export const statusLabel = (status?: string) => status ? statusLabels[status] ?? status : ''
@@ -19,4 +19,18 @@ export function relativeTime(value?: string | null): string {
   const minutes = Math.round(seconds / 60); if (Math.abs(minutes) < 60) return formatter.format(minutes, 'minute')
   const hours = Math.round(minutes / 60); if (Math.abs(hours) < 24) return formatter.format(hours, 'hour')
   return formatter.format(Math.round(hours / 24), 'day')
+}
+
+// Align the decimal places before calculating so displayed amounts retain every digit.
+export function calculateCredits(left: string, right: string, operation: 'add' | 'subtract'): string {
+  const [leftWhole, leftFraction = ''] = left.split('.')
+  const [rightWhole, rightFraction = ''] = right.split('.')
+  const scale = Math.max(3, leftFraction.length, rightFraction.length)
+  const a = BigInt(leftWhole + leftFraction.padEnd(scale, '0'))
+  const b = BigInt(rightWhole + rightFraction.padEnd(scale, '0'))
+  const amount = operation === 'add' ? a + b : a - b
+  if (amount <= 0n) return '0.000'
+  const digits = amount.toString().padStart(scale + 1, '0')
+  const fraction = digits.slice(-scale).replace(/0+$/, '').padEnd(3, '0')
+  return `${digits.slice(0, -scale)}.${fraction}`
 }

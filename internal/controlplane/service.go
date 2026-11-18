@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/beichen"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/cache"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
@@ -39,6 +40,7 @@ type Service struct {
 	db       *ent.Client
 	sqlDB    *sql.DB
 	usage    *usage.Store
+	beichen  *beichen.Service
 	cache    *cache.Store
 	security *security.Manager
 	mailer   inframail.Sender
@@ -52,10 +54,16 @@ type Identity struct {
 }
 
 func NewService(db *ent.Client, sqlDB *sql.DB, cacheStore *cache.Store, securityManager *security.Manager, mailer inframail.Sender, cfg Config) *Service {
-	return &Service{
+	service := &Service{
 		db: db, sqlDB: sqlDB, usage: usage.NewStore(sqlDB), cache: cacheStore, security: securityManager, mailer: mailer,
 		config: cfg, now: time.Now,
 	}
+	service.beichen = beichen.New(sqlDB, securityManager)
+	return service
+}
+
+func (s *Service) Beichen() *beichen.Service {
+	return s.beichen
 }
 
 func NormalizeEmail(value string) (string, error) {
@@ -94,6 +102,12 @@ func ValidateBaseURL(value string) (string, error) {
 	}
 	if parsed.Scheme != "https" && parsed.Scheme != "http" {
 		return "", domain.NewError(domain.CodeValidation, "provider base URL must use http or https")
+	}
+	if strings.EqualFold(parsed.Hostname(), "api.beichenapi.com") {
+		if parsed.Scheme != "https" || parsed.Port() != "" || (parsed.EscapedPath() != "" && parsed.EscapedPath() != "/v1") {
+			return "", domain.NewError(domain.CodeValidation, "北辰接口地址必须为 https://api.beichenapi.com 或 https://api.beichenapi.com/v1")
+		}
+		return "https://api.beichenapi.com", nil
 	}
 	return value, nil
 }

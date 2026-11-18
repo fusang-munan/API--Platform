@@ -28,6 +28,7 @@ const filter = reactive<MentorResourceFilter & { q: string; start: string; end: 
 const statusOptions = [
   { value: 'succeeded', label: '成功' },
   { value: 'upstream_failed', label: '上游失败' },
+  { value: 'pending_review', label: '待核账' },
   { value: 'outcome_unknown', label: '结果未知' },
 ]
 
@@ -110,7 +111,7 @@ onMounted(() => {
             <td>{{ row.user_name }}<br><span class="muted">{{ row.api_key_name }}</span></td>
             <td>{{ row.project_name }}<br><span class="muted">{{ row.model_name }}</span></td>
             <td class="prompt-cell">{{ row.root_prompt_preview || '—' }}<br><span class="muted">{{ row.root_prompt_bytes }} bytes</span></td>
-            <td><strong>{{ row.call_count }}</strong> 次<br><span class="muted">{{ row.credits }} credits</span></td>
+            <td><strong>{{ row.call_count }}</strong> 次<br><span class="muted">已结算 {{ row.credits }} credits</span></td>
             <td>{{ formatTokens(row.total_tokens) }}<br><span class="muted">in {{ formatTokens(row.prompt_tokens) }} / out {{ formatTokens(row.completion_tokens) }}</span></td>
             <td><StatusBadge :status="row.outcome" /></td>
             <td><button class="button ghost" @click="detail(row.id)">详情</button></td>
@@ -124,7 +125,7 @@ onMounted(() => {
       <template v-if="selected">
         <div class="usage-summary">
           <div class="usage-stat">模型调用<strong>{{ selected.call_count }} 次</strong></div>
-          <div class="usage-stat">credits<strong>{{ selected.credits }}</strong></div>
+          <div class="usage-stat">已结算 credits<strong>{{ selected.credits }}</strong></div>
           <div class="usage-stat">total tokens<strong>{{ formatTokens(selected.total_tokens) }}</strong></div>
         </div>
         <p>{{ selected.user_name }} · {{ selected.project_name }} · {{ selected.model_name }}</p>
@@ -150,7 +151,7 @@ onMounted(() => {
               <td>{{ call.model_name || '—' }}</td>
               <td>{{ call.path }}</td>
               <td>{{ formatTokens(call.total_tokens ?? 0) }}</td>
-              <td>{{ call.credits }}</td>
+              <td>{{ call.outcome === 'pending_review' ? '—' : call.credits }}</td>
               <td><StatusBadge :status="call.outcome" /></td>
             </tr>
           </tbody>

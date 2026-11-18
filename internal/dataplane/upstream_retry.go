@@ -2,7 +2,6 @@ package dataplane
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"time"
 )
@@ -29,12 +28,4 @@ func sleepUpstreamRetry(ctx context.Context, attempt int) bool {
 	case <-timer.C:
 		return true
 	}
-}
-
-func discardResponseBody(response *http.Response, limit int64) {
-	if response == nil || response.Body == nil {
-		return
-	}
-	_, _ = io.CopyN(io.Discard, response.Body, limit)
-	_ = response.Body.Close()
 }

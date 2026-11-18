@@ -32,7 +32,7 @@ func TestBootstrapTestAccountsCreatesMissingUser(t *testing.T) {
 	mock.ExpectCommit()
 
 	err := service.BootstrapTestAccounts(context.Background(), []BootstrapAccount{{
-		Role: string(user.RoleStudent), Name: "Student One", Email: "student.one@example.com", Password: "student-password-one",
+		Role: string(user.RoleStudent), Name: "Student One", Email: "student.one@example.com", Password: "student-password-1",
 	}})
 	if err != nil {
 		t.Fatal(err)

@@ -446,7 +446,7 @@ onMounted(load)
             <div class="usage-stat">项目月额度<strong>{{ projectUsage.quota }}</strong></div>
             <div class="usage-stat">已分配给学生<strong>{{ projectUsage.allocated }}</strong></div>
             <div class="usage-stat">可再分配<strong>{{ projectUsage.available }}</strong></div>
-            <div class="usage-stat">本月已消耗<strong>{{ projectUsage.charged }}</strong></div>
+            <div class="usage-stat">本月已消耗<strong>{{ projectUsage.charged }}</strong><small v-if="projectUsage.pending_review">有调用待核账</small></div>
           </div>
           <section class="usage-chart-card">
             <h2>成员分配占比</h2>
@@ -476,7 +476,7 @@ onMounted(load)
                 <tr v-for="member in projectUsage.members" :key="member.user_id">
                   <th scope="row">{{ member.user_name }}</th>
                   <td class="numeric-cell">{{ member.quota }}</td>
-                  <td class="numeric-cell">{{ member.credits }}</td>
+                  <td class="numeric-cell">{{ member.credits }}<small v-if="member.pending_review"> · 有调用待核账</small></td>
                   <td class="numeric-cell">{{ member.available }}</td>
                 </tr>
               </tbody>

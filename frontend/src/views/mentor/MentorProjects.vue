@@ -3,6 +3,7 @@ import { onMounted, ref } from 'vue'
 import { mentorAPI } from '../../api/mentor'
 import type { Application, Organization, Project, ProjectUsage } from '../../api/types'
 import { APIError } from '../../api/client'
+import { calculateCredits } from '../../utils/format'
 import StatusBadge from '../../components/StatusBadge.vue'
 import AppDialog from '../../components/AppDialog.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
@@ -87,9 +88,10 @@ function allocationSegments(usage: ProjectUsage): CreditSegment[] {
 }
 
 function spendSegments(usage: ProjectUsage): CreditSegment[] {
+  const unspent = calculateCredits(usage.quota, usage.charged, 'subtract')
   return [
-    ...usage.members.map(member => ({ name: member.user_name, value: Number(member.credits) })).filter(item => item.value > 0),
-    { name: '未消耗额度', value: Math.max(0, Number(usage.quota) - Number(usage.charged)), color: '#dfe3ec' },
+    ...usage.members.map(member => ({ name: member.user_name, value: Number(member.credits), displayValue: member.credits })).filter(item => item.value > 0),
+    { name: '未消耗额度', value: Number(unspent), displayValue: unspent, color: '#dfe3ec' },
   ]
 }
 
@@ -167,7 +169,7 @@ onMounted(load)
           <div class="usage-stat">项目月额度<strong>{{ projectUsage.quota }}</strong></div>
           <div class="usage-stat">已发给学生<strong>{{ projectUsage.allocated }}</strong></div>
           <div class="usage-stat">可再分配<strong>{{ projectUsage.available }}</strong></div>
-          <div class="usage-stat">本月实际消耗<strong>{{ projectUsage.charged }}</strong></div>
+          <div class="usage-stat">本月实际消耗<strong>{{ projectUsage.charged }}</strong><small v-if="projectUsage.pending_review">有调用待核账</small></div>
         </div>
         <div class="grid two">
           <section class="usage-chart-card">
@@ -201,7 +203,7 @@ onMounted(load)
                 <span class="member-avatar" aria-hidden="true">{{ member.user_name.slice(0, 1).toUpperCase() }}</span>
                 <div>
                   <h3>{{ member.user_name }}</h3>
-                  <p>月额度 {{ member.quota }} · 已用 {{ member.credits }} · 剩余 {{ member.available }}</p>
+                  <p>月额度 {{ member.quota }} · 已用 {{ member.credits }} · 剩余 {{ member.available }}<template v-if="member.pending_review"> · 有调用待核账</template></p>
                 </div>
                 <button
                   v-if="firstAdjustableKey(member)"
@@ -216,7 +218,7 @@ onMounted(load)
                   <div class="member-key-label">
                     <strong>{{ key.name }}</strong>
                     <StatusBadge :status="key.status" />
-                    <small>已用 {{ key.used }} credits</small>
+                    <small>已用 {{ key.used }} credits<template v-if="key.pending_review"> · 有调用待核账</template></small>
                   </div>
                 </article>
               </div>

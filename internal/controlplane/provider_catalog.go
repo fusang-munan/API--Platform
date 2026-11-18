@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -16,6 +17,13 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providermodelcatalog"
 )
+
+var beichenCatalogHTTPClient = &http.Client{
+	Timeout: 8 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
 
 type ProviderCatalogSyncView struct {
 	ProviderID string `json:"provider_id"`
@@ -159,6 +167,12 @@ func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, cred
 		}
 	}
 	if input.Credential != nil {
+		if row.Edges.Provider != nil {
+			baseURL, _ := ValidateBaseURL(row.Edges.Provider.BaseURL)
+			if baseURL == "https://api.beichenapi.com" {
+				return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "换北辰 Key 时请新增凭据并重新选择模型绑定，以保留原凭据的账单记录")
+			}
+		}
 		ciphertext, encErr := s.security.EncryptCredential(*input.Credential)
 		if encErr != nil {
 			return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, encErr.Error())
@@ -348,7 +362,11 @@ func (s *Service) fetchAndStoreCredentialCatalogEntries(
 	if decryptErr != nil {
 		return 0, nil, domain.NewError(domain.CodeValidation, "provider credential is unavailable")
 	}
-	entries, fetchErr := catalog.FetchProviderModels(ctx, providerRow.BaseURL, plain, nil)
+	var client *http.Client
+	if providerRow.BaseURL == "https://api.beichenapi.com" {
+		client = beichenCatalogHTTPClient
+	}
+	entries, fetchErr := catalog.FetchProviderModels(ctx, providerRow.BaseURL, plain, client)
 	if fetchErr != nil {
 		upstreamURL := strings.TrimRight(strings.TrimSpace(providerRow.BaseURL), "/") + "/v1/models"
 		return 0, nil, domain.WrapError(

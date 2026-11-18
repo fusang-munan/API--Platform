@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import type { Organization, ProjectUsage, UsageSlice } from '../../api/types'
 import { APIError } from '../../api/client'
+import { calculateCredits } from '../../utils/format'
 import CreditDonut from '../../components/CreditDonut.vue'
 import EmptyState from '../../components/EmptyState.vue'
 import AppDialog from '../../components/AppDialog.vue'
@@ -50,13 +51,14 @@ function usagePercent(used: string, quota: string) {
 }
 
 function remaining(row: ProjectUsage) {
-  return Math.max(0, Number(row.quota) - Number(row.charged)).toFixed(3)
+  return calculateCredits(row.quota, row.charged, 'subtract')
 }
 
 function segments(row: ProjectUsage) {
+  const unspent = remaining(row)
   return [
-    ...row.models.map(model => ({ name: model.name, value: Number(model.credits) })),
-    { name: '未消耗额度', value: Number(remaining(row)), color: '#dfe3ec' },
+    ...row.models.map(model => ({ name: model.name, value: Number(model.credits), displayValue: model.credits })),
+    { name: '未消耗额度', value: Number(unspent), displayValue: unspent, color: '#dfe3ec' },
   ]
 }
 
@@ -66,8 +68,7 @@ function initials(name: string) {
 
 function addUsageSlice(map: Map<string, UsageSlice>, model: UsageSlice) {
   const existing = map.get(model.id) ?? { id: model.id, name: model.name, credits: '0.000', calls: 0 }
-  const credits = Number(existing.credits) + Number(model.credits)
-  existing.credits = credits.toFixed(3)
+  existing.credits = calculateCredits(existing.credits, model.credits, 'add')
   existing.calls = (existing.calls ?? 0) + (model.calls ?? 0)
   map.set(model.id, existing)
 }
@@ -141,6 +142,7 @@ function modelDisplayLine(model: UsageSlice) {
               <span class="project-spend-name">
                 <strong>{{ row.project_name }}</strong>
                 <small class="muted">剩余 {{ remaining(row) }} credits</small>
+                <small v-if="row.pending_review" class="muted">有调用待核账</small>
               </span>
             </th>
             <td class="project-spend-chart">
@@ -153,7 +155,7 @@ function modelDisplayLine(model: UsageSlice) {
                   <span :style="{ width: `${usagePercent(row.charged, row.quota)}%` }"></span>
                 </div>
                 <span class="muted">{{ rateLabel(row) }} 已用</span>
-                <span v-if="Number(row.charged) > Number(row.quota)" class="error over-quota">超额 {{ (Number(row.charged) - Number(row.quota)).toFixed(3) }} credits</span>
+                <span v-if="calculateCredits(row.charged, row.quota, 'subtract') !== '0.000'" class="error over-quota">超额 {{ calculateCredits(row.charged, row.quota, 'subtract') }} credits</span>
               </div>
             </td>
             <td><button type="button" class="button ghost" @click="expanded = row">查看详情</button></td>
@@ -174,7 +176,7 @@ function modelDisplayLine(model: UsageSlice) {
           <div class="usage-stat">项目月额度<strong>{{ expanded.quota }}</strong></div>
           <div class="usage-stat">已发给学生<strong>{{ expanded.allocated }}</strong></div>
           <div class="usage-stat">可再分配<strong>{{ expanded.available }}</strong></div>
-          <div class="usage-stat highlight">本月实际消耗<strong>{{ expanded.charged }}</strong></div>
+          <div class="usage-stat highlight">本月实际消耗<strong>{{ expanded.charged }}</strong><small v-if="expanded.pending_review">有调用待核账</small></div>
         </div>
 
         <section class="dialog-section">
@@ -194,7 +196,7 @@ function modelDisplayLine(model: UsageSlice) {
                     <h3>{{ member.user_name }}</h3>
                     <div class="member-metrics">
                       <span>月额度 <strong>{{ member.quota }}</strong></span>
-                      <span>已用 <strong>{{ member.credits }}</strong></span>
+                      <span>已用 <strong>{{ member.credits }}</strong><template v-if="member.pending_review"> · 有调用待核账</template></span>
                       <span>剩余 <strong>{{ member.available }}</strong></span>
                     </div>
                     <div class="quota-progress member-progress" aria-hidden="true">
@@ -281,7 +283,7 @@ function modelDisplayLine(model: UsageSlice) {
             <h3>{{ memberDetail.user_name }}</h3>
             <div class="member-hero-stats">
               <span>月额度 <strong>{{ memberDetail.quota }}</strong></span>
-              <span>已用 <strong>{{ memberDetail.credits }}</strong></span>
+              <span>已用 <strong>{{ memberDetail.credits }}</strong><template v-if="memberDetail.pending_review"> · 有调用待核账</template></span>
               <span>剩余 <strong>{{ memberDetail.available }}</strong></span>
               <span>{{ memberModelRows(memberDetail).length }} 个模型</span>
             </div>
@@ -325,7 +327,7 @@ function modelDisplayLine(model: UsageSlice) {
             <article v-for="key in memberDetail.keys" :key="key.id" class="member-key-block">
               <div class="member-key-head">
                 <strong>{{ key.name }}</strong>
-                <span class="muted">已用 {{ key.used }} credits</span>
+                <span class="muted">已用 {{ key.used }} credits<template v-if="key.pending_review"> · 有调用待核账</template></span>
               </div>
               <table v-if="key.models.length" class="usage-table key-model-table">
                 <thead>

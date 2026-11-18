@@ -31,6 +31,8 @@ services:
     environment:
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
+      BEICHEN_PANEL_TOKEN: ${BEICHEN_PANEL_TOKEN:-}
+      BEICHEN_PANEL_GROUPS: ${BEICHEN_PANEL_GROUPS:-}
       NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost,postgres,redis,172.30.10.1}
   frontend:
     ports: !override

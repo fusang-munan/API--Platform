@@ -31,16 +31,11 @@ function percentLabel(used: string, quota: string) {
   return value === null ? 'N/A' : `${value.toFixed(1)}%`
 }
 
-function remaining(project: StudentProjectUsage) {
-  return project.available
-}
-
 function projectSegments(project: StudentProjectUsage) {
-  const keyUsage = project.keys.reduce((sum, key) => sum + Number(key.used), 0)
   return [
-    ...project.keys.map(key => ({ name: key.name, value: Number(key.used) })).filter(item => item.value > 0),
-    { name: '剩余额度', value: Number(remaining(project)), color: '#dfe3ec' },
-  ].filter(item => item.value > 0 || item.name === '剩余额度')
+    ...project.keys.map(key => ({ name: key.name, value: Number(key.used), displayValue: key.used })),
+    { name: '剩余额度', value: Number(project.available), displayValue: project.available, color: '#dfe3ec' },
+  ]
 }
 </script>
 
@@ -59,7 +54,7 @@ function projectSegments(project: StudentProjectUsage) {
         <div class="row">
           <div>
             <h2>{{ project.project_name }}</h2>
-            <p class="muted">月额度 {{ project.quota }} · 已用 {{ project.used }} · 在途 {{ project.pending }}</p>
+            <p class="muted">月额度 {{ project.quota }} · 已用 {{ project.used }} · 在途 {{ project.pending }}<template v-if="project.pending_review"> · 有调用待核账</template></p>
           </div>
           <strong>{{ percentLabel(project.used, project.quota) }}</strong>
         </div>
@@ -78,7 +73,10 @@ function projectSegments(project: StudentProjectUsage) {
         <section v-if="project.keys.length" class="member-key-stack">
           <article v-for="key in project.keys" :key="key.id" class="member-key-row">
             <strong>{{ key.name }}</strong>
-            <span class="muted">{{ key.status }} · 已用 {{ key.used }} · 在途 {{ key.pending }}</span>
+            <span class="muted">{{ key.status }} · 已用 {{ key.used }} · 在途 {{ key.pending }}<template v-if="key.available !== undefined"> · 剩余 {{ key.available }}</template><template v-if="key.pending_review"> · 有调用待核账</template></span>
+            <ul v-if="key.models.length" class="key-models">
+              <li v-for="model in key.models" :key="model.id">{{ model.name }} · {{ model.credits }} credits</li>
+            </ul>
           </article>
         </section>
       </article>
