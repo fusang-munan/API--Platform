@@ -35,7 +35,9 @@ COPY --from=builder --chown=10001:10001 /out/nebula-provider-catalog /app/nebula
 
 RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -S -g 10001 nebula && \
-    adduser -S -D -H -u 10001 -G nebula nebula
+    adduser -S -D -H -u 10001 -G nebula nebula && \
+    mkdir -m 0700 /app/maintenance-tls && \
+    chown 10001:10001 /app/maintenance-tls
 
 ARG VERSION
 LABEL org.opencontainers.image.title="Nebula API" \
