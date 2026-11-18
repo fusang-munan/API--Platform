@@ -159,14 +159,26 @@ func run() error {
 	if addr := os.Getenv("LAB_MAINTENANCE_TLS_ADDR"); addr != "" {
 		origin := os.Getenv("LAB_MAINTENANCE_TLS_ORIGIN")
 		secureServer = newServer(addr, origin, true)
-		secureServer.Handler = maintenanceHandler(secureServer.Handler, cfg.SMTPMode == "smtp")
 		cert, err := labtls.LoadOrCreate(os.Getenv("LAB_MAINTENANCE_TLS_DIR"), origin)
 		if err == nil {
 			var listener net.Listener
 			listener, err = net.Listen("tcp", addr)
 			if err == nil {
 				secureServer.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
-				slog.Info("maintenance HTTPS certificate", "origin", origin, "sha256", labtls.Fingerprint(cert))
+				fingerprint := labtls.Fingerprint(cert)
+				var notice http.Handler
+				if cfg.SMTPMode == "smtp" {
+					release := os.Getenv("LAB_MAINTENANCE_RELEASE")
+					var stopNotice func()
+					notice, stopNotice = newCertificateNotice(signalContext, release, origin,
+						os.Getenv("LAB_CERTIFICATE_NOTICE_REQUEST_SHA256"), os.Getenv("LAB_CERTIFICATE_NOTICE_EXPIRES_AT"),
+						func(ctx context.Context, digest []byte) error {
+							return controlService.SendCertificateNotice(ctx, digest, release, origin, fingerprint)
+						})
+					defer stopNotice()
+				}
+				secureServer.Handler = maintenanceHandler(secureServer.Handler, cfg.SMTPMode == "smtp", notice)
+				slog.Info("maintenance HTTPS certificate", "origin", origin, "sha256", fingerprint)
 				go func() {
 					if err := secureServer.ServeTLS(listener, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 						slog.Error("maintenance HTTPS unavailable", "error", err)
@@ -203,8 +215,12 @@ func run() error {
 	}
 }
 
-func maintenanceHandler(next http.Handler, mailEnabled bool) http.Handler {
+func maintenanceHandler(next http.Handler, mailEnabled bool, notice http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if notice != nil && r.URL.Path == certificateNoticePath {
+			notice.ServeHTTP(w, r)
+			return
+		}
 		if r.URL.Path == "/.well-known/nebula-maintenance" {
 			if r.Method != http.MethodGet && r.Method != http.MethodHead {
 				w.Header().Set("Allow", "GET, HEAD")

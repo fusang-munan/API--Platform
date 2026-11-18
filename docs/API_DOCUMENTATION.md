@@ -406,6 +406,10 @@ data: {"revision":"01K2..."}
 
 该 HTTPS 监听另有只读 `GET`、`HEAD /.well-known/nebula-maintenance`。返回 JSON 字段 `email_delivery`，值为 `log_only` 或 `smtp_configured`，不含邮箱、凭据或账号信息。匿名读取不会发送邮件。其他方法返回 405。
 
+维护 TLS 上另有 `POST /.well-known/nebula-maintenance/certificate-notice`。请求使用 `application/json`，含 `email_digest` 和 `request_nonce` 两个 64 位小写十六进制字段。邮箱摘要为 UTF-8 字符串 `nebula-certificate-notice-v1:` 加规范化注册邮箱的 SHA-256。随机数由每次同意投递时单独生成。服务端根据 `LAB_MAINTENANCE_RELEASE`、`LAB_CERTIFICATE_NOTICE_REQUEST_SHA256` 与 `LAB_CERTIFICATE_NOTICE_EXPIRES_AT` 核对批准。配置值为 UTF-8 字符串 `nebula-notice-request-v1:<版本>:<邮箱摘要>:<随机数>` 的 SHA-256。收件人来自匹配的激活账号，邮件只含服务端版本、配置的入口与当前叶证书指纹。
+
+格式正确统一返回无正文的 202，收件及投递状态仅能在邮箱确认。未启用或已过期返回 404，方法错误 405，错误媒体类型 415，跨来源浏览器请求 403。请求体上限为 512 字节，拒绝查询参数、Cookie、Authorization、额外字段及无效摘要。每次启动最多处理一个匹配请求，Redis 跨实例去重 24 小时。
+
 供应商创建：
 
 ```json
