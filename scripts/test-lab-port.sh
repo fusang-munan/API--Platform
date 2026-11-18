@@ -2,14 +2,24 @@
 set -Eeuo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-image=docker.io/library/nginx:1.29.1-alpine3.22
+image=${NGINX_IMAGE:-docker.io/library/nginx:1.29.1-alpine3.22}
+version="$(tr -d '\r' < "$repo/VERSION")"
 prefix="nebula-lab-smoke-$$-$RANDOM"
+frontend_image="$prefix:nginx-base"
 network="$prefix"
 frontend="$prefix-front"
 backend_a="$prefix-backend-a"
 backend_b="$prefix-backend-b"
 
-for tool in docker curl openssl; do
+entrypoint=(/bin/sh /etc/nginx/lab-maintenance/start.sh)
+nginx_command=(nginx -c /etc/nginx/lab-maintenance/nginx.conf -g 'daemon off;')
+frontend_options=(
+    --read-only --cap-drop ALL --security-opt no-new-privileges:true
+    --tmpfs /tmp:size=16m,mode=1777 --tmpfs /var/cache/nginx:size=16m,mode=1777
+    --tmpfs /var/run:size=4m,mode=1777 --init
+)
+
+for tool in docker curl openssl python3; do
     command -v "$tool" >/dev/null || { echo "Missing required tool: $tool" >&2; exit 1; }
 done
 
@@ -33,18 +43,10 @@ cleanup() {
     fi
     docker rm -f "$frontend" "$backend_a" "$backend_b" >/dev/null 2>&1 || true
     docker network rm "$network" >/dev/null 2>&1 || true
+    docker image rm "$frontend_image" >/dev/null 2>&1 || true
     rm -r -- "$work"
 }
 trap cleanup EXIT
-
-mkdir "$work/site"
-# Windows checkouts can have CRLF even though the container runs Linux.
-for file in nginx.conf start.sh; do
-    sed 's/\r$//' "$repo/frontend/lab-maintenance/$file" > "$work/site/$file"
-done
-sed 's/\r$//' "$repo/frontend/nginx.conf" > "$work/default.conf"
-chmod 755 "$work/site"
-chmod 644 "$work/site/"* "$work/default.conf"
 
 docker_work="$work"
 case "$OSTYPE" in
@@ -53,6 +55,30 @@ case "$OSTYPE" in
         export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
         ;;
 esac
+
+# Match compose-local.sh's file order without loading .env or starting services.
+: > "$work/empty.env"
+(
+    cd "$repo"
+    NEBULA_VERSION="$version" docker compose --env-file "$docker_work/empty.env" \
+        -f compose.yaml -f compose.local.yaml config --format json
+) | python3 -c '
+import json
+import sys
+
+frontend = json.load(sys.stdin)["services"]["frontend"]
+checks = {
+    "frontend must have no bind mounts": not any(
+        volume["type"] == "bind" for volume in frontend.get("volumes", [])
+    ),
+    "frontend must use the image user": not frontend.get("user"),
+    "frontend entrypoint differs from the smoke test": frontend.get("entrypoint") == sys.argv[1:3],
+    "frontend command differs from the smoke test": frontend.get("command") == sys.argv[3:],
+}
+for message, passed in checks.items():
+    if not passed:
+        sys.exit(message)
+' "${entrypoint[@]}" "${nginx_command[@]}"
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=127.0.0.1 \
     -addext subjectAltName=IP:127.0.0.1 -keyout "$work/key.pem" -out "$work/cert.pem" 2>/dev/null
@@ -80,16 +106,40 @@ EOF
         "$image" >/dev/null
 }
 
-docker pull "$image"
+(
+    cd "$repo/frontend"
+    docker build --target nginx-base --build-arg "NGINX_IMAGE=$image" \
+        --build-arg "VERSION=$version" --tag "$frontend_image" .
+)
+if [[ "$(docker image inspect --format '{{.Config.User}}' "$frontend_image")" != 10001:10001 ]]; then
+    echo "Expected nginx-base to run as 10001:10001" >&2
+    exit 1
+fi
+
+if [[ "${CHECK_LEGACY_BIND:-0}" == 1 ]]; then
+    # Model the old bind mount with files readable only by the host owner.
+    (umask 022; mkdir "$work/legacy")
+    (umask 077; for file in start.sh nginx.conf; do
+        cat "$repo/frontend/lab-maintenance/$file" > "$work/legacy/$file"
+    done)
+    status=0
+    docker run --rm --network none "${frontend_options[@]}" \
+        --mount "type=bind,src=$docker_work/legacy,dst=/etc/nginx/lab-maintenance,readonly" \
+        --entrypoint "${entrypoint[0]}" "$frontend_image" "${entrypoint[1]}" \
+        "${nginx_command[@]}" >"$work/legacy.log" 2>&1 || status=$?
+    if (( status == 0 )) ||
+        ! grep -Eiq '/etc/nginx/lab-maintenance/start\.sh.*permission denied' "$work/legacy.log"; then
+        cat "$work/legacy.log" >&2
+        echo "Expected the legacy bind mount to deny access to start.sh" >&2
+        exit 1
+    fi
+    echo "Legacy bind mount denied access to the owner-only fixture"
+fi
+
 docker network create "$network" >/dev/null
 docker run -d --name "$frontend" --network "$network" --publish 127.0.0.1::8080 \
-    --user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges:true \
-    --tmpfs /tmp:size=16m,mode=1777 --tmpfs /var/cache/nginx:size=16m,mode=1777 \
-    --tmpfs /var/run:size=4m,mode=1777 \
-    --mount "type=bind,src=$docker_work/site,dst=/etc/nginx/lab-maintenance,readonly" \
-    --mount "type=bind,src=$docker_work/default.conf,dst=/etc/nginx/conf.d/default.conf,readonly" \
-    --entrypoint /bin/sh "$image" /etc/nginx/lab-maintenance/start.sh \
-    nginx -c /etc/nginx/lab-maintenance/nginx.conf -g 'daemon off;' >/dev/null
+    "${frontend_options[@]}" --entrypoint "${entrypoint[0]}" "$frontend_image" \
+    "${entrypoint[1]}" "${nginx_command[@]}" >/dev/null
 address="$(docker port "$frontend" 8080/tcp)"
 
 request() {
@@ -117,6 +167,13 @@ for (( attempt=0; attempt<15; attempt++ )); do
     sleep 1
 done
 docker exec "$frontend" wget -q -T 2 -O /dev/null http://127.0.0.1:8080/
+
+printf '%s\n' "$version" > "$work/expected-release"
+request "http://$address/.well-known/nebula-release.txt" > "$work/actual-release"
+if ! cmp -s "$work/expected-release" "$work/actual-release"; then
+    echo "Expected the anonymous HTTP release file to contain exactly $version and a newline" >&2
+    exit 1
+fi
 
 http_url="http://$address/api/smoke"
 tls_url="https://$address/api/smoke"

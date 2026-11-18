@@ -165,6 +165,8 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        VERSION: ${NEBULA_VERSION:?run through scripts/compose.ps1}
     ports:
       - "127.0.0.1:8081:8080"
     networks:

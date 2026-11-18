@@ -5,8 +5,14 @@ on:
     paths:
       - '.github/workflows/lab-tls.yml'
       - 'scripts/test-lab-port.sh'
+      - 'scripts/compose-local.sh'
+      - '.gitattributes'
+      - 'VERSION'
+      - 'frontend/Dockerfile'
+      - 'frontend/.dockerignore'
       - 'frontend/lab-maintenance/**'
       - 'frontend/nginx.conf'
+      - 'compose.yaml'
       - 'compose.local.yaml'
 
 permissions:
@@ -21,4 +27,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Test the school frontend port
+        env:
+          NGINX_IMAGE: docker.io/library/nginx:1.29.1-alpine3.22
+          CHECK_LEGACY_BIND: '1'
         run: bash scripts/test-lab-port.sh
