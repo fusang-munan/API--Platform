@@ -38,7 +38,9 @@ cleanup() {
     local status=$?
     if (( status != 0 )); then
         for container in "$frontend" "$backend_a" "$backend_b"; do
-            docker logs "$container" 2>/dev/null || true
+            if docker container inspect --format '{{.Name}} {{.State.Status}} exit={{.State.ExitCode}} {{.State.Error}}' "$container" 2>/dev/null; then
+                docker logs "$container" || true
+            fi
         done
     fi
     docker rm -f "$frontend" "$backend_a" "$backend_b" >/dev/null 2>&1 || true
