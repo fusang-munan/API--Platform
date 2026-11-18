@@ -42,8 +42,6 @@ services:
   frontend:
     ports: !override
       - "127.0.0.1:25555:8080"
-    volumes:
-      - ./frontend/lab-maintenance:/etc/nginx/lab-maintenance:ro
     entrypoint: ["/bin/sh", "/etc/nginx/lab-maintenance/start.sh"]
     command: ["nginx", "-c", "/etc/nginx/lab-maintenance/nginx.conf", "-g", "daemon off;"]
     healthcheck:

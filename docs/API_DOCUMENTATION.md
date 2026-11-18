@@ -402,6 +402,8 @@ data: {"revision":"01K2..."}
 
 维护用 HTTPS 直接接收相同的 `/api/v1/` 和 `/v1/` 请求，复用相同的角色、登录和学生用量限制。该入口仅提供 API，登录挑战和刷新 Cookie 使用 Secure。证书指纹只用于验证服务器身份。
 
+通过 Compose 构建的控制台镜像从 0.10.3 起包含静态文件 `/.well-known/nebula-release.txt`，匿名 GET 返回构建时根目录 `VERSION` 的一行文本。该文件用于识别前端部署版本。维护用 HTTPS API 的证书和服务状态须通过该入口单独验证。
+
 该 HTTPS 监听另有只读 `GET`、`HEAD /.well-known/nebula-maintenance`。返回 JSON 字段 `email_delivery`，值为 `log_only` 或 `smtp_configured`，不含邮箱、凭据或账号信息。匿名读取不会发送邮件。其他方法返回 405。
 
 供应商创建：
