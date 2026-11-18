@@ -10,10 +10,10 @@ RUN npm run build
 FROM ${NGINX_IMAGE} AS nginx-base
 RUN addgroup -S -g 10001 nebula && adduser -S -D -H -u 10001 -G nebula nebula && \
     chown -R 10001:10001 /usr/share/nginx/html /var/cache/nginx /var/log/nginx /etc/nginx
-COPY --chmod=0444 nginx.conf /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY lab-maintenance/start.sh lab-maintenance/nginx.conf /etc/nginx/lab-maintenance/
 RUN chmod 0755 /etc/nginx/lab-maintenance && \
-    chmod 0444 /etc/nginx/lab-maintenance/start.sh /etc/nginx/lab-maintenance/nginx.conf
+    chmod 0444 /etc/nginx/conf.d/default.conf /etc/nginx/lab-maintenance/start.sh /etc/nginx/lab-maintenance/nginx.conf
 ARG VERSION
 RUN if [ -n "$VERSION" ]; then \
         mkdir -p /usr/share/nginx/html/.well-known && \

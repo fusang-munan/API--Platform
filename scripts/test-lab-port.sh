@@ -5,7 +5,7 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 image=${NGINX_IMAGE:-docker.io/library/nginx:1.29.1-alpine3.22}
 version="$(tr -d '\r' < "$repo/VERSION")"
 prefix="nebula-lab-smoke-$$-$RANDOM"
-frontend_image="$prefix:nginx-base"
+frontend_image="$prefix:runtime"
 network="$prefix"
 frontend="$prefix-front"
 backend_a="$prefix-backend-a"
@@ -110,11 +110,14 @@ EOF
 
 (
     cd "$repo/frontend"
-    docker build --target nginx-base --build-arg "NGINX_IMAGE=$image" \
-        --build-arg "VERSION=$version" --tag "$frontend_image" .
+    # Build the shipped Vue and Nginx image using the public origins for the CI runner.
+    sed -e 's/\r$//' -e 's|^FROM dockerproxy.net/library/node:|FROM docker.io/library/node:|' \
+        -e 's|^RUN npm config set registry https://registry.npmmirror.com$|RUN npm config set registry https://registry.npmjs.org|' \
+        Dockerfile | docker build -f - --target runtime --build-arg "NGINX_IMAGE=$image" \
+            --build-arg "VERSION=$version" --tag "$frontend_image" .
 )
 if [[ "$(docker image inspect --format '{{.Config.User}}' "$frontend_image")" != 10001:10001 ]]; then
-    echo "Expected nginx-base to run as 10001:10001" >&2
+    echo "Expected the frontend image to run as 10001:10001" >&2
     exit 1
 fi
 
@@ -170,6 +173,9 @@ for (( attempt=0; attempt<15; attempt++ )); do
 done
 docker exec "$frontend" wget -q -T 2 -O /dev/null http://127.0.0.1:8080/
 
+request "http://$address/" > "$work/homepage"
+grep -Fq '<div id="app">' "$work/homepage"
+grep -Fq 'src="/assets/' "$work/homepage"
 printf '%s\n' "$version" > "$work/expected-release"
 request "http://$address/.well-known/nebula-release.txt" > "$work/actual-release"
 if ! cmp -s "$work/expected-release" "$work/actual-release"; then
