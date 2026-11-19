@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set +x
 set -Eeuo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -18,11 +19,11 @@ cleanup() {
     if [[ -f "$work/ci.yaml" ]]; then
         if (( status != 0 )); then
             "${compose[@]}" ps -a || true
-            "${compose[@]}" logs --no-color postgres redis || true
+            "${compose[@]}" logs --no-color postgres redis frontend || true
         fi
         "${compose[@]}" down --volumes --remove-orphans || true
     fi
-    docker image rm "$project:ci" >/dev/null 2>&1 || true
+    docker image rm "$project:ci" "$project:frontend" "$project:nginx-base" >/dev/null 2>&1 || true
     rm -rf -- "$work"
 }
 trap cleanup EXIT
@@ -43,6 +44,25 @@ sed -n '/^FROM .* AS runtime$/,$p' "$repo/Dockerfile" |
         -e 's|^COPY --from=builder \(.*\) /out/|COPY \1 out/|' > "$work/Dockerfile"
 echo 'COPY --chown=10001:10001 out/ci-smtp-receiver /app/ci-smtp-receiver' >> "$work/Dockerfile"
 docker build --build-arg "VERSION=$NEBULA_VERSION" -t "$project:ci" "$work"
+
+# Use the shipped Nginx configuration, startup script, image user and release
+# marker. Only the Vue build output is replaced with small static CI fixtures.
+mkdir -p "$work/console/assets"
+cat > "$work/console/index.html" <<'HTML'
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Nebula CI fixture</title><link rel="stylesheet" href="/assets/ci-console.css"></head>
+<body><div id="app">Nebula CI fixture</div><script type="module" src="/assets/ci-console.js"></script></body>
+</html>
+HTML
+printf '%s\n' 'document.documentElement.dataset.console = "ci-fixture";' > "$work/console/assets/ci-console.js"
+printf '%s\n' '#app { display: block; }' > "$work/console/assets/ci-console.css"
+docker build --target nginx-base --build-arg NGINX_IMAGE=docker.io/library/nginx:1.29.1-alpine3.22 \
+    --build-arg "VERSION=$NEBULA_VERSION" -t "$project:nginx-base" "$repo/frontend"
+docker build -f - -t "$project:frontend" "$work/console" <<DOCKERFILE
+FROM $project:nginx-base
+COPY --chown=10001:10001 . /usr/share/nginx/html/
+DOCKERFILE
 
 : > "$work/empty.env"
 export CI_NEBULA_DB_PASSWORD="$(openssl rand -hex 16)"
@@ -93,6 +113,11 @@ services:
     build: !reset null
     environment:
       DATABASE_URL: ${CI_NEBULA_DATABASE_URL}
+  frontend:
+    image: ${CI_NEBULA_FRONTEND_IMAGE}
+    build: !reset null
+    ports: !override
+      - "127.0.0.1::8080"
   backend:
     image: ${CI_NEBULA_IMAGE}
     build: !reset null
@@ -129,6 +154,7 @@ services:
       BEICHEN_PANEL_GROUPS: ""
 YAML
 export CI_NEBULA_IMAGE="$project:ci"
+export CI_NEBULA_FRONTEND_IMAGE="$project:frontend"
 
 "${compose[@]}" up -d --wait --wait-timeout 90 postgres redis smtp-sink
 "${compose[@]}" run --rm --no-deps migrate
@@ -157,13 +183,109 @@ read_cert() {
     '
 }
 
-check_teacher_auth() {
-    local url="$1" status
-    shift
+check_anonymous_auth() {
+    local url="$1" path="$2" status
+    shift 2
     status="$("${request[@]}" --output "$work/response.json" --write-out '%{http_code}' \
-        "$@" "$url/api/v1/teacher/providers")"
-    [[ "$status" == 401 ]] || { echo "Expected teacher HTTP status 401, got $status" >&2; return 1; }
-    jq -e '.error.code == "AUTHENTICATION_REQUIRED"' "$work/response.json" >/dev/null
+        "$@" "$url$path")"
+    if [[ "$status" != 401 ]] ||
+        ! jq -e '.error.code == "AUTHENTICATION_REQUIRED"' "$work/response.json" >/dev/null; then
+        echo "Expected $url$path to return 401 AUTHENTICATION_REQUIRED, got status $status" >&2
+        return 1
+    fi
+}
+
+check_static_response() {
+    local url="$1" mime="$2" expected="$3" response
+    shift 3
+    response="$("${request[@]}" --output "$work/static-response" \
+        --write-out '%{http_code} %{content_type}' "$@" "$url")"
+    if [[ ! "$response" =~ ^200\ ($mime)([[:space:]]*\;.*)?$ ]] ||
+        ! cmp -s "$expected" "$work/static-response"; then
+        echo "Expected $url to return 200, MIME $mime and the contents of ${expected##*/}; got $response" >&2
+        return 1
+    fi
+}
+
+check_public_console() {
+    local url="$1" path
+    shift
+    for path in /teacher/providers /student/api-keys /login; do
+        check_static_response "$url$path" 'text/html' "$work/console/index.html" "$@"
+    done
+    check_static_response "$url/assets/ci-console.js" '(text|application)/javascript' \
+        "$work/console/assets/ci-console.js" "$@"
+    check_static_response "$url/assets/ci-console.css" 'text/css' "$work/console/assets/ci-console.css" "$@"
+    check_static_response "$url/.well-known/nebula-release.txt" 'text/plain' "$work/expected-release" "$@"
+    for path in /api/v1/teacher/providers /api/v1/student/api-keys; do
+        check_anonymous_auth "$url" "$path" "$@"
+    done
+}
+
+read_secure_auth_cookie() {
+    local jar="$1" name="$2"
+    if ! awk -F '\t' -v name="$name" '
+        $1 == "#HttpOnly_127.0.0.1" && $3 == "/api/v1/auth" &&
+            $4 == "TRUE" && $6 == name && $7 != "" { print $7; found = 1 }
+        END { exit !found }
+    ' "$jar"; then
+        echo "Expected HTTPS to store $name with Secure, HttpOnly and the auth path" >&2
+        return 1
+    fi
+}
+
+check_https_teacher_auth() {
+    # Keep the URL, Origin and certificate name aligned with the CI backend.
+    local origin=https://127.0.0.1
+    local -a https_request=("${request[@]}" --fail --cacert "$work/first.pem"
+        --connect-to "127.0.0.1:443:$1" --header "Origin: $origin")
+    local jar="$work/teacher-cookies" headers="$work/teacher-headers" response="$work/teacher-response.json"
+    local initial_refresh rotated_refresh access_token
+
+    jq -cn --arg email "$teacher_email" '{email: $email, password: env.CI_NEBULA_TEACHER_PASSWORD}' |
+        "${https_request[@]}" --header 'Content-Type: application/json' --data-binary @- \
+            --cookie-jar "$jar" --dump-header "$headers" --output "$response" "$origin/api/v1/auth/login" ||
+        { echo "HTTPS teacher login failed" >&2; return 1; }
+    jq -e --arg email "$teacher_email" '
+        .data.user.email == $email and (.data.identities | index("teacher") != null)
+    ' "$response" >/dev/null || { echo "HTTPS login did not offer the teacher identity" >&2; return 1; }
+    if ! awk -v origin="$origin" '
+        { sub(/\r$/, "") }
+        tolower($1) == "access-control-allow-origin:" && $2 == origin { allowed = 1 }
+        tolower($1) == "access-control-allow-credentials:" && $2 == "true" { credentials = 1 }
+        END { exit !(allowed && credentials) }
+    ' "$headers"; then
+        echo "HTTPS login did not allow credentials for the fixture origin" >&2
+        return 1
+    fi
+    read_secure_auth_cookie "$jar" nebula_login_challenge >/dev/null
+
+    "${https_request[@]}" --header 'Content-Type: application/json' --data-binary '{"identity":"teacher"}' \
+        --cookie "$jar" --cookie-jar "$jar" --output "$response" "$origin/api/v1/auth/session" ||
+        { echo "HTTPS teacher session creation failed" >&2; return 1; }
+    initial_refresh="$(read_secure_auth_cookie "$jar" nebula_refresh_token)"
+
+    "${https_request[@]}" --request POST --cookie "$jar" --cookie-jar "$jar" \
+        --output "$response" "$origin/api/v1/auth/refresh" ||
+        { echo "HTTPS teacher refresh failed" >&2; return 1; }
+    rotated_refresh="$(read_secure_auth_cookie "$jar" nebula_refresh_token)"
+    [[ "$initial_refresh" != "$rotated_refresh" ]] ||
+        { echo "HTTPS refresh did not rotate the refresh cookie" >&2; return 1; }
+    access_token="$(jq -er '.data | select(.identity == "teacher") | .access_token | strings | select(length > 0)' "$response")" ||
+        { echo "HTTPS refresh did not issue a teacher access token" >&2; return 1; }
+
+    printf 'Authorization: Bearer %s\n' "$access_token" |
+        "${https_request[@]}" --header @- --output "$response" "$origin/api/v1/me" ||
+        { echo "HTTPS /me rejected the refreshed teacher session" >&2; return 1; }
+    jq -e --arg email "$teacher_email" '
+        .data.identity == "teacher" and .data.user.role == "teacher" and .data.user.email == $email
+    ' "$response" >/dev/null || { echo "HTTPS /me did not return the fixture teacher" >&2; return 1; }
+
+    printf 'Authorization: Bearer %s\n' "$access_token" |
+        "${https_request[@]}" --header @- --output "$response" "$origin/api/v1/teacher/providers" ||
+        { echo "HTTPS teacher providers rejected the refreshed teacher session" >&2; return 1; }
+    jq -e '.data | type == "array"' "$response" >/dev/null ||
+        { echo "HTTPS teacher providers did not return a list" >&2; return 1; }
 }
 
 notice_path='/.well-known/nebula-maintenance/certificate-notice'
@@ -216,8 +338,20 @@ docker inspect --format '{{json .Mounts}}' "$first_backend" |
     jq -e --arg name "${project}_maintenance-tls" 'any(.[]; .Type == "volume" and
         .Name == $name and .Destination == "/app/maintenance-tls" and .RW)' >/dev/null
 read_cert > "$work/first.pem"
-check_teacher_auth "http://$http_address"
-check_teacher_auth "https://$https_address" --cacert "$work/first.pem"
+check_anonymous_auth "http://$http_address" /api/v1/teacher/providers
+check_anonymous_auth "https://$https_address" /api/v1/teacher/providers --cacert "$work/first.pem"
+
+# Test the production-shaped frontend listener, where HTTP and HTTPS share a
+# port. HTTPS reaches Go first, then fetches console files from frontend:8082.
+"${compose[@]}" up -d --no-deps --no-build --wait --wait-timeout 45 frontend
+public_address="$("${compose[@]}" port frontend 8080)"
+printf '%s\n' "$NEBULA_VERSION" > "$work/expected-release"
+"${compose[@]}" exec -T frontend wget -q -T 3 -O - http://frontend:8082/.well-known/nebula-release.txt \
+    > "$work/internal-release"
+cmp "$work/expected-release" "$work/internal-release"
+check_public_console "https://$public_address" --cacert "$work/first.pem"
+check_public_console "http://$public_address"
+check_https_teacher_auth "$public_address"
 
 post_notice "http://$http_address" "$teacher_digest" "$request_nonce" 404
 post_notice "https://$https_address" "$teacher_digest" "$wrong_nonce" 202 --cacert "$work/first.pem"
@@ -266,9 +400,9 @@ second_backend="$("${compose[@]}" ps -q backend)"
 [[ -n "$first_backend" && -n "$second_backend" && "$first_backend" != "$second_backend" ]]
 read_cert > "$work/second.pem"
 cmp "$work/first.pem" "$work/second.pem"
-check_teacher_auth "http://$http_address"
-check_teacher_auth "https://$https_address" --cacert "$work/first.pem"
+check_anonymous_auth "http://$http_address" /api/v1/teacher/providers
+check_anonymous_auth "https://$https_address" /api/v1/teacher/providers --cacert "$work/first.pem"
 post_notice "https://$https_address" "$teacher_digest" "$request_nonce" 202 --cacert "$work/first.pem"
 check_notice_response
 expect_quiet_mailbox 1
-echo "Lab backend passed HTTP readiness, HTTPS certificate creation and reuse, anonymous teacher authentication, and certificate notice delivery checks"
+echo "Lab backend passed shared-port console checks, HTTPS teacher login and refresh, certificate creation and reuse, anonymous authentication, and certificate notice delivery"

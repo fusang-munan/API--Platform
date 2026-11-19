@@ -177,7 +177,8 @@ func run() error {
 						})
 					defer stopNotice()
 				}
-				secureServer.Handler = maintenanceHandler(secureServer.Handler, cfg.SMTPMode == "smtp", notice)
+				secureServer.Handler = maintenanceHandler(secureServer.Handler, cfg.SMTPMode == "smtp", notice,
+					newSchoolFrontend(schoolFrontendOrigin))
 				slog.Info("maintenance HTTPS certificate", "origin", origin, "sha256", fingerprint)
 				go func() {
 					if err := secureServer.ServeTLS(listener, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -215,13 +216,14 @@ func run() error {
 	}
 }
 
-func maintenanceHandler(next http.Handler, mailEnabled bool, notice http.Handler) http.Handler {
+func maintenanceHandler(next http.Handler, mailEnabled bool, notice, frontend http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if notice != nil && r.URL.Path == certificateNoticePath {
+		p := r.URL.Path
+		if notice != nil && p == certificateNoticePath {
 			notice.ServeHTTP(w, r)
 			return
 		}
-		if r.URL.Path == "/.well-known/nebula-maintenance" {
+		if p == "/.well-known/nebula-maintenance" {
 			if r.Method != http.MethodGet && r.Method != http.MethodHead {
 				w.Header().Set("Allow", "GET, HEAD")
 				w.WriteHeader(http.StatusMethodNotAllowed)
@@ -236,10 +238,12 @@ func maintenanceHandler(next http.Handler, mailEnabled bool, notice http.Handler
 			}
 			return
 		}
-		if !strings.HasPrefix(r.URL.Path, "/api/v1/") && !strings.HasPrefix(r.URL.Path, "/v1/") {
-			http.NotFound(w, r)
+		// Keep API path parameters, headers and queries intact for the existing handlers.
+		if strings.HasPrefix(p, "/api/v1/") || strings.HasPrefix(p, "/v1/") ||
+			strings.HasPrefix(p, "/v1beta/models/") || p == "/v2/rerank" {
+			next.ServeHTTP(w, r)
 			return
 		}
-		next.ServeHTTP(w, r)
+		frontend.ServeHTTP(w, r)
 	})
 }
