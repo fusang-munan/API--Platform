@@ -34,6 +34,13 @@ const loadState = useLoadState()
 const form = reactive({ name: '', base_url: '', status: 'active' as 'active' | 'inactive' })
 const keyRows = ref<KeyDraft[]>([])
 const deletedCredentialIds = ref<string[]>([])
+const beichenChannels = [
+  { name: 'Gemini', alias: '哈吉米' },
+  { name: 'GM1', alias: '国模' },
+  { name: 'G3', alias: 'gpt' },
+  { name: 'CC1', alias: 'cc不满血' },
+]
+const securePage = window.location.protocol === 'https:'
 
 const filtered = computed(() => rows.value.filter(p =>
   (!query.value || `${p.name} ${p.base_url}`.toLowerCase().includes(query.value.toLowerCase()))
@@ -105,6 +112,19 @@ function addKeyRow() {
   revealKey.value = false
 }
 
+function selectBeichenChannel(channel: typeof beichenChannels[number]) {
+  const labels = [channel.name.toLowerCase(), channel.alias]
+  const existing = keyRows.value.findIndex(row => labels.includes(row.label.trim().toLowerCase()))
+  if (existing >= 0) {
+    selectKey(existing)
+    return
+  }
+  const blank = keyRows.value.findIndex(row => !row.id && !row.label.trim() && !row.key)
+  if (blank >= 0) selectKey(blank)
+  else addKeyRow()
+  keyRows.value[activeKeyIndex.value].label = channel.name
+}
+
 function removeActiveKey() {
   if (keyRows.value.length <= 1) {
     toast.error('至少保留一个 Key')
@@ -159,6 +179,10 @@ async function saveKeys(providerId: string) {
 }
 
 async function save() {
+  if (!securePage && isBeichenProvider(form.base_url) && keyRows.value.some(row => row.key.trim())) {
+    toast.error('请在学校 HTTPS 教师端录入北辰 Key')
+    return
+  }
   if (!validateKeyRows()) return
   saving.value = true
   try {
@@ -324,6 +348,12 @@ onMounted(load)
             <button type="button" class="key-tab add" aria-label="添加 Key" @click="addKeyRow">+</button>
           </div>
 
+          <div v-if="isBeichenProvider(form.base_url)" class="actions" aria-label="北辰渠道">
+            <span>北辰渠道</span>
+            <button v-for="channel in beichenChannels" :key="channel.name" type="button"
+              class="button ghost" @click="selectBeichenChannel(channel)">{{ channel.name }}</button>
+          </div>
+
           <div v-if="activeKey" class="key-editor">
             <label>Key 名称<input v-model="activeKey.label" required placeholder="例如 codex、claude"></label>
             <label>
@@ -331,10 +361,12 @@ onMounted(load)
               <input
                 v-model="activeKey.key"
                 :type="revealKey ? 'text' : 'password'"
+                :disabled="isBeichenProvider(form.base_url) && !securePage"
                 :required="!activeKey.id"
                 :placeholder="activeKey.id && activeKey.configured ? '已配置，留空保持不变' : 'sk-...'"
                 autocomplete="off"
               >
+              <span v-if="isBeichenProvider(form.base_url) && !securePage">请从学校 HTTPS 教师端录入北辰 Key。</span>
             </label>
             <div class="key-editor-row">
               <label class="grow">状态<select v-model="activeKey.status"><option value="active">启用</option><option value="inactive">停用</option></select></label>

@@ -62,7 +62,7 @@ const request = vi.fn<(input: string, options?: RequestInit) => Promise<Response
 let widget: VueWrapper | undefined
 let providers: Provider[]
 
-function button(root: DOMWrapper<Element>, text: string) {
+function button(root: Pick<DOMWrapper<Element>, 'findAll'>, text: string) {
   const result = root.findAll('button').find(item => item.text() === text)
   if (!result) throw new Error(`Missing button: ${text}`)
   return result
@@ -118,6 +118,22 @@ describe('北辰教师面板', () => {
     widget?.unmount()
     widget = undefined
     vi.unstubAllGlobals()
+  })
+
+  it('选择北辰预设渠道时复用历史标签，未保存的选择不创建凭据', async () => {
+    providers = [{ ...provider, credentials: [{ ...provider.credentials![0], label: '国模' }] }]
+    widget = mount(TeacherProviders, { attachTo: document.body })
+    await flushPromises()
+    await button(new DOMWrapper(widget.element), '编辑').trigger('click')
+    const dialog = new DOMWrapper(document.body.querySelector('[role="dialog"]')!)
+    const presets = dialog.get('[aria-label="北辰渠道"]')
+    expect(presets.findAll('button').map(item => item.text())).toEqual(['Gemini', 'GM1', 'G3', 'CC1'])
+    await button(presets, 'G3').trigger('click')
+    await button(presets, 'GM1').trigger('click')
+    expect(dialog.get('[role="tab"][aria-selected="true"]').text()).toBe('国模')
+    await button(presets, 'G3').trigger('click')
+    expect(dialog.findAll('[role="tab"]').map(item => item.text())).toEqual(['国模', 'G3'])
+    expect(request.mock.calls.every(([, options]) => !options?.method || options.method === 'GET')).toBe(true)
   })
 
   it('同步入口只接受北辰的 HTTPS 根地址或 /v1，且 URL 没有端口和附加部分', async () => {
