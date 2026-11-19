@@ -10,6 +10,8 @@
 
 ## 学校网页能打开，维护用 HTTPS 握手失败
 
+教师编辑北辰供应商时，选择 GM1 会复用已有「国模」凭据。在 HTTP 入口打开编辑器时，北辰密钥输入框禁用。正式业务验收应从学校 HTTPS 网页记录教师终审额度、学生可用额与调用后实扣，再按请求编号核对北辰流水。
+
 0.13.0 的学校 HTTPS 应能匿名读取 `/teacher/providers`、`/student/api-keys`、网页引用的 JS/CSS 和 `/.well-known/nebula-release.txt`。使用已独立核实的学校 PEM 证书执行 `curl --cacert school.pem https://106.55.103.208:25555/teacher/providers` 应返回官方控制台 HTML。同样请求 `/api/v1/teacher/providers` 时，匿名应返回 401。页面返回 502 而 API 能访问时，检查前后端均已更新，且学校前端容器的静态服务正在 8082 监听。浏览器报告未知签发机构时，需解决该设备对学校证书的信任，再录入密码或密钥。
 
 0.12.0 起实验室配置默认关闭单次证书邮件批准。后续获同意的通知可在发布时配置 `LAB_CERTIFICATE_NOTICE_REQUEST_SHA256` 和 `LAB_CERTIFICATE_NOTICE_EXPIRES_AT`，两项为空时通知路径返回 404。维护 HTTPS 和正常登录可以继续使用。
