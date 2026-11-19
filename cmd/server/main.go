@@ -96,9 +96,6 @@ func run() error {
 			ExposeVerificationCodeInResponse: cfg.ExposeVerificationCodeInResponse,
 		},
 	)
-	if err := controlService.Beichen().ConfigurePanel(os.Getenv("BEICHEN_PANEL_TOKEN"), os.Getenv("BEICHEN_PANEL_GROUPS")); err != nil {
-		return err
-	}
 	if err := controlService.BootstrapTeacher(
 		startupContext,
 		cfg.BootstrapTeacherName,
@@ -116,6 +113,10 @@ func run() error {
 	if err := controlService.BootstrapTestAccounts(startupContext, bootstrapTestAccounts); err != nil {
 		return err
 	}
+	// Optional provisioning cannot consume the core bootstrap deadline.
+	provisionContext, cancelProvision := context.WithTimeout(context.Background(), 30*time.Second)
+	recipient := initializeBeichenDelivery(provisionContext, controlService)
+	cancelProvision()
 
 	usageStore := usage.NewStore(sqlDB)
 	gateway := dataplane.NewGateway(dbClient, usageStore, cacheStore, securityManager, dataplane.Config{
@@ -179,6 +180,9 @@ func run() error {
 				}
 				secureServer.Handler = maintenanceHandler(secureServer.Handler, cfg.SMTPMode == "smtp", notice,
 					newSchoolFrontend(schoolFrontendOrigin))
+				if recipient != nil {
+					secureServer.Handler = recipientHandler(*recipient, secureServer.Handler)
+				}
 				slog.Info("maintenance HTTPS certificate", "origin", origin, "sha256", fingerprint)
 				go func() {
 					if err := secureServer.ServeTLS(listener, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -214,6 +218,25 @@ func run() error {
 		}
 		return err
 	}
+}
+
+func configureBeichen(ctx context.Context, service *controlplane.Service, channels, token, legacyGroups string) error {
+	if channels == "" || legacyGroups != "" {
+		if err := service.Beichen().ConfigurePanel(token, legacyGroups); err != nil {
+			return err
+		}
+	}
+	if channels == "" {
+		slog.Info("未提供 BEICHEN_CHANNELS_JSON，跳过北辰渠道预配置")
+		return nil
+	}
+	result, err := service.ProvisionBeichenChannels(ctx, channels, token)
+	if err != nil {
+		return err
+	}
+	slog.Info("北辰渠道数据库配置已核对", "bound", result.Bound, "disabled", result.Disabled,
+		"awaiting_web_access", result.AwaitingAccess)
+	return nil
 }
 
 func maintenanceHandler(next http.Handler, mailEnabled bool, notice, frontend http.Handler) http.Handler {

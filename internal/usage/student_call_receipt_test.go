@@ -35,8 +35,8 @@ func TestStudentCallReceiptJSON(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mock.ExpectQuery(studentCallReceiptSQL).WithArgs(student.String(), requestID).
-				WillReturnRows(sqlmock.NewRows([]string{"request_id", "model_id", "state", "credits", "cost", "applied"}).
-					AddRow(requestID, "public-model", tc.state, tc.credits, tc.cost, tc.applied))
+				WillReturnRows(sqlmock.NewRows([]string{"request_id", "model_id", "state", "credits", "cost", "applied", "base", "source", "factor"}).
+					AddRow(requestID, "public-model", tc.state, tc.credits, tc.cost, tc.applied, tc.credits, nil, "1"))
 			receipt, err := store.StudentCallReceipt(context.Background(), student, requestID)
 			if err != nil {
 				t.Fatal(err)
@@ -52,8 +52,10 @@ func TestStudentCallReceiptJSON(t *testing.T) {
 			want := map[string]any{
 				"request_id": requestID, "model_id": "public-model", "channel": "北辰", "billing_state": tc.state,
 				"charged_credits": nil, "actual_cost": nil, "receipt_applied": nil,
+				"base_credits": nil, "base_source": nil, "school_multiplier": "1",
 			}
 			if tc.credits != nil {
+				want["base_credits"] = *tc.credits
 				want["charged_credits"], want["actual_cost"], want["receipt_applied"] = *tc.credits, *tc.cost, *tc.applied
 			}
 			if !reflect.DeepEqual(got, want) {

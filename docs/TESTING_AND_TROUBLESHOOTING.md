@@ -10,7 +10,7 @@
 
 ## 学校网页能打开，维护用 HTTPS 握手失败
 
-教师编辑北辰供应商时，选择 GM1 会复用已有「国模」凭据。在 HTTP 入口打开编辑器时，北辰密钥输入框禁用。正式业务验收应从学校 HTTPS 网页记录教师终审额度、学生可用额与调用后实扣，再按请求编号核对北辰流水。
+教师在模型页确认已发现的模型、当前倍率与启用权限，在项目中给学生分配额度、查看开销。维护者可从学校已核实的 HTTPS 入口读取收件公钥，随下一次 GitHub 自动部署交付加密配置。
 
 0.13.0 的学校 HTTPS 应能匿名读取 `/teacher/providers`、`/student/api-keys`、网页引用的 JS/CSS 和 `/.well-known/nebula-release.txt`。使用已独立核实的学校 PEM 证书执行 `curl --cacert school.pem https://106.55.103.208:25555/teacher/providers` 应返回官方控制台 HTML。同样请求 `/api/v1/teacher/providers` 时，匿名应返回 401。页面返回 502 而 API 能访问时，检查前后端均已更新，且学校前端容器的静态服务正在 8082 监听。浏览器报告未知签发机构时，需解决该设备对学校证书的信任，再录入密码或密钥。
 
@@ -196,21 +196,11 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 ### 北辰接入验收
 
-0.10.1 升级后，以教师身份打开「供应商管理」，搜索留空，状态选「全部状态」。新预置的北辰应为启用，显示 0 个 Key 和「待配置 Key」，「同步与对账」可以打开。教师的模型管理应继续列出其他已配置供应商的模型，只有空供应商时应返回空列表。没有凭据时，日账与倍率应显示暂无数据。若找不到，先看筛选条件和标准北辰地址，再检查显式迁移是否完成。专用本地 PostgreSQL 配置 `NEBULA_TEST_POSTGRES` 后，执行 `go test ./internal/infrastructure/db -run TestDefaultBeichenProviderMigration -count=1 -v` 验证预置和重复升级。
-
-学校维护 HTTPS 验证命令为 `go test ./internal/infrastructure/labtls ./cmd/server`。在有 Docker 的 Linux 测试机运行 `bash scripts/test-lab-port.sh` 验证同端口的 HTTP 和 TLS。证书不符时先停用维护客户端，再通过独立可信渠道核对学校实例记录的 SHA-256。HTTPS 返回 401 表示已到达受保护接口，实际计费需使用正常学生身份验证。
-
-逐笔核账使用已授权的用户面板与推理响应。选择已配数字 Key ID 的渠道，保存普通 HTTP 响应上的 `X-Client-Request-ID`。检查北辰账号的逐笔明细是否有同把 Key、同模型、时间相符并带 `client:<该编号>` 的记录。缺少可归属明细时保持待核。WebSocket 的响应编号及日汇总不具备这一关联含义。北辰页面显示版本 v0.2.15，可对照该版本的[请求头生成](https://github.com/Wei-Shaw/sub2api/blob/v0.2.15/backend/internal/server/middleware/client_request_id.go)和[账单编号选择](https://github.com/Wei-Shaw/sub2api/blob/v0.2.15/backend/internal/service/gateway_usage_billing.go)。
-
-1. 在一次性测试数据库上应用迁移并重复执行一次。测试数据库必须新建、只监听回环地址、数据库名为 `nebula_test`。设置 `NEBULA_TEST_POSTGRES` 指向该测试库并使用 `sslmode=disable`，执行 `go test ./internal/infrastructure/db -run TestBeichenMigrationUpgrade -count=1 -v`。
-2. 用虚构凭据和模拟上游执行 `go test ./internal/beichen ./internal/dataplane ./internal/usage ./internal/api/http`。覆盖流式回填、零和缺失、用量中断、同步结果及教师端权限。控制台执行 `npm run typecheck` 和 `npm run test`。
-   - 设置专用本地测试数据库的 `NEBULA_TEST_POSTGRES` 后，执行 `go test ./internal/dataplane -run '^TestBeichenPostgresGatewayReconciliation$' -count=1 -v`。用例分别重放 Responses 返回的原始用量字段和两笔已确认账单。GM1 的未命中输入 59、命中 0、输出 3，乘 0.08 后实付 0.00001136 单位，应扣 0.001136 积分。G3 的未命中输入 129、命中 4096、写入 0、输出 5，乘 0.2 后实付 0.00014352 单位，应扣 0.014352 积分。两笔共 0.015488 积分。日汇总仅用于核对，不能据此分摊给学生。
-   - 运行 `go test ./internal/usage -run TestBeichenLedgerPostgres -count=1 -v` 检查缺明细、重复回执和小额累计。`go test ./internal/beichen -run TestReceiptSweepPostgresG3 -count=1 -v` 覆盖后台分页读取模拟北辰流水、在 PostgreSQL 中关联请求和实际扣分。看到「待核账」时先查看同一把凭据、同一模型在调用时刻的报价，再检查最终回执是否给出各项用量。回包缺失的缓存字段不能自动填零。多请求共享一个日账时须保留待核状态。
-   - 采价异常时，在教师「自动采价授权」核对分组及面板读取凭据，然后执行手动同步。后台用该组报价与推理 Key 的模型目录取交集。核对授权到期、模型下架及高峰时段切换可运行 `go test ./internal/beichen -run Panel -count=1 -v`。PostgreSQL 用例需使用专用的本地测试库。
-3. 校方在加密管理入口录入专用北辰凭据后，教师页按凭据执行手动同步，再用各待验收渠道的一次短文本调用核对实际的输入、输出、缓存明细与账单。对比时使用同一凭据、模型和北京时间日期。
-4. 若模型可见但没有倍率，分别检查计费接口状态和供应商开放范围。若缺少可确认报价或单日用量，使用教师面板的 CSV 导入。含未结算、断流或缺失用量的对账区间需要查看采集状态；当天上游账单可能晚于请求完成。
-5. 如果模型调用正常而目录、倍率和用量同时报网络超时，检查后端的 `HTTPS_PROXY`、`NO_PROXY` 与服务器实际出网路线，再在教师页手动同步。运行 `go test ./internal/beichen -run TestSyncUsesConfiguredHTTPSProxy -count=1` 可用本机模拟代理验证北辰同步走同一出网路线。代理只收到建立 HTTPS 隧道的请求，北辰认证头随隧道里的 HTTPS 请求发送。
-6. 导入北辰用量页直接导出的逐笔文件时，选「北辰用量明细」类型。筛选一把 Key 和已结束的完整北京时间账日，导入后在对账页选择该日期。若显示该日已自动同步，查看已有的自动日账。若提示标签或日期不匹配，检查导出范围和 Nebula 所选凭据的标签。运行 `go test ./internal/beichen -run 'Test(UsageExport|ImportUsageExport|BeichenPostgresDailyComparison)' -count=1 -v`，使用虚构账单验证时区、金额舍入、凭据核对、重导和账单来源优先级。设置步骤 1 的本机测试 DSN 才会执行真实 PostgreSQL 账单回归。
+1. 在隔离的本机 PostgreSQL 测试库运行 `go test ./...`。设置 `NEBULA_TEST_POSTGRES` 指向回环地址上的 `nebula_test` 后，可验证报价快照、小数精度、重复流水、延迟结算及并发超额。前端运行 `npm run typecheck`、`npm run test` 和 `npm run build`。
+2. 从已核实的学校 HTTPS 入口核对镜像版本与收件公钥。教师页应直接显示同一模型的首选倍率和启用状态。目录有模型但暂缺倍率时要显示待同步。核对价格时查看同一把北辰 Key 的分组、基础输入输出价、缓存价格、倍率和适用时段。
+3. 校方准备好真实验收后，使用同一把学生 Key，四条渠道各发一笔短文本请求。依次记录学生可用额、学校请求编号、上游响应编号，以及北辰官网使用明细的数字 Key ID、模型、用量和实扣。收到响应但账单尚未出现时保留待核，继续读取相同编号。
+4. 校内扣分应等于该次基础积分乘发件时的学校系数。把北辰实扣乘 100 换为积分后，再与校内扣分相减。此差额可为正或负。缺价格的调用可能靠官方流水补记，验证时也要记录基础积分来源。
+5. 后台目录、价格及流水均报超时时检查学校后端的 `HTTPS_PROXY`、`NO_PROXY` 和北辰官网授权状态。若北辰官网要求额外登录验证，教师页会提示学校重新授权。维护者通过北辰官网完成验证或修正账号配置，再按原发布流程重启学校后台，让服务重新建立会话。
 
 | 现象 | 常见根因 | 解决方案 | 排查建议 |
 | --- | --- | --- | --- |

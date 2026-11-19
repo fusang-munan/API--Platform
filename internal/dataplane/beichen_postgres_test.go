@@ -475,22 +475,34 @@ type beichenGatewayTestTransport func(*http.Request) (*http.Response, error)
 
 func (f beichenGatewayTestTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+// NewBeichenActivationFixture lets the external HTTP integration test exercise
+// the real gateway with an in-memory upstream and an isolated database.
+func NewBeichenActivationFixture(t *testing.T, ctx context.Context, manager *security.Manager, transport func(*http.Request) (*http.Response, error)) (*sql.DB, *ent.Client, *Gateway) {
+	t.Helper()
+	db := openBeichenGatewayTestSchema(t, ctx)
+	client := ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	gateway := NewGateway(client, usage.NewStore(db), nil, manager, Config{MaxRequestBytes: 4096})
+	gateway.client.Transport = beichenGatewayTestTransport(transport)
+	return db, client, gateway
+}
+
 func openBeichenGatewayTestSchema(t *testing.T, ctx context.Context) *sql.DB {
 	t.Helper()
 	dsn := os.Getenv("NEBULA_TEST_POSTGRES")
 	if dsn == "" {
 		t.Skip("NEBULA_TEST_POSTGRES opts in to PostgreSQL gateway reconciliation")
 	}
-	const required = "test requires a PostgreSQL URL for nebula_qa@127.0.0.1:55439/nebula_test?sslmode=disable"
+	const required = "test requires the disposable loopback gateway or rollout test database"
 	u, err := url.Parse(dsn)
 	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") ||
-		u.Host != "127.0.0.1:55439" || u.Path != "/nebula_test" || u.User.Username() != "nebula_qa" ||
+		u.User == nil || u.Path != "/nebula_test" ||
+		!(u.Host == "127.0.0.1:55439" && u.User.Username() == "nebula_qa" || u.Host == "127.0.0.1:55841" && u.User.Username() == "nebula_test") ||
 		u.RawQuery != "sslmode=disable" || u.Fragment != "" {
 		t.Fatal(required)
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || config.Port != 55439 || config.Database != "nebula_test" ||
-		config.User != "nebula_qa" || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
+	if err != nil || config.Host != "127.0.0.1" || config.Database != "nebula_test" ||
+		config.User != u.User.Username() || fmt.Sprint(config.Port) != u.Port() || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal(required)
 	}
 	schema := pgx.Identifier{"beichen_gateway_" + uuid.NewString()}.Sanitize()

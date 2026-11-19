@@ -12,6 +12,8 @@ import AppDialog from '../../components/AppDialog.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
 import { useLoadState } from '../../composables/useLoadState'
 import { useToast } from '../../composables/useToast'
+import BeichenSchoolModels from './BeichenSchoolModels.vue'
+import { isBeichenProvider } from '../../utils/beichenModels'
 
 const DEFAULT_CONTEXT_WINDOW = 128_000
 const DEFAULT_MAX_INPUT_TOKENS = 128_000
@@ -77,10 +79,13 @@ const bindingForm = reactive({
   status: 'active' as 'active' | 'inactive',
 })
 
-const filtered = computed(() => sortModelsByRecency(rows.value
+const schoolProviders = computed(() => providers.value.filter(provider => isBeichenProvider(provider.base_url)))
+const schoolProviderIds = computed(() => new Set(schoolProviders.value.map(provider => provider.id)))
+const commonIds = computed(() => new Set(rows.value.filter(model => model.is_common).map(model => model.model_id.toLowerCase())))
+const otherModels = computed(() => rows.value.filter(model => !schoolProviderIds.value.has(model.provider_id ?? '')))
+const filtered = computed(() => sortModelsByRecency(otherModels.value
   .filter(model => (tab.value === 'all' || model.is_common) && (!query.value || `${model.display_name} ${model.model_id}`.toLowerCase().includes(query.value.toLowerCase())))))
-const hasActiveProvider = computed(() => providers.value.some(provider => provider.status === 'active'))
-const activeProviders = computed(() => providers.value.filter(provider => provider.status === 'active'))
+const activeProviders = computed(() => providers.value.filter(provider => provider.status === 'active' && !isBeichenProvider(provider.base_url)))
 
 function harnessConfig(binding: Binding) {
   return harnessConfigSnippet(modelForm.model_id, binding.adapter, `${window.location.origin}/v1`)
@@ -109,7 +114,7 @@ async function load() {
       const credentialId = String(route.query.credential_id || '')
       if (target) {
         const row = rows.value.find(item => item.model_id === target && (!credentialId || item.credential_id === credentialId))
-        if (row) await open(row)
+        if (row && !schoolProviderIds.value.has(row.provider_id ?? '')) await open(row)
       }
     } catch (e) {
       error.value = msg(e)
@@ -193,7 +198,7 @@ function goToStep(target: number) {
 }
 
 async function searchCatalog() {
-  const activeProvider = providers.value.find(provider => provider.status === 'active')
+  const activeProvider = activeProviders.value[0]
   if (!activeProvider) {
     catalog.value = []
     catalogTotal.value = 0
@@ -265,7 +270,7 @@ function openBinding(binding?: Binding) {
   bindingProbeProgress.value = ''
   bindingProbeSteps.value = []
   Object.assign(bindingForm, {
-    provider_id: binding?.provider_id || selectedLine.value?.provider_id || providers.value.find(provider => provider.status === 'active')?.id || '',
+    provider_id: binding?.provider_id || selectedLine.value?.provider_id || activeProviders.value[0]?.id || '',
     upstream_model_name: binding?.upstream_model_name || modelForm.model_id,
     adapter: binding?.adapter || defaultBindingAdapter(modelForm.model_id),
     priority: binding?.priority || 100,
@@ -355,11 +360,15 @@ onMounted(load)
     <section class="panel">
       <div class="segmented">
         <button :class="{ active: tab === 'common' }" @click="tab = 'common'">常用模型</button>
-        <button :class="{ active: tab === 'all' }" @click="tab = 'all'">全部模型 <span>{{ rows.length }}</span></button>
+        <button :class="{ active: tab === 'all' }" @click="tab = 'all'">全部模型</button>
       </div>
       <label>搜索<input v-model="query" placeholder="名称或 model_id"></label>
     </section>
     <LoadingRegion :initial-loading="loadState.initialLoading.value" :refreshing="loadState.refreshing.value" variant="cards" label="正在加载模型" style="margin-top:20px">
+      <section v-for="provider in schoolProviders" :key="provider.id" class="panel">
+        <h2>{{ provider.name }}</h2>
+        <BeichenSchoolModels :provider-id="provider.id" :query="query" :common-ids="tab === 'common' ? commonIds : undefined" />
+      </section>
       <div v-if="filtered.length" class="grid two">
         <article v-for="model in filtered" :key="lineKey(model)" class="panel">
           <div class="row">

@@ -13,6 +13,8 @@ import { useToast } from '../../composables/useToast'
 import { changedApiKeyID } from '../../utils/keyStatusEvents'
 import { sortModelsByRecency } from '../../utils/modelSort'
 import { mergeStudentPlazaModels } from '../../utils/studentModels'
+import { calculateCredits, quotaBalance } from '../../utils/format'
+import { modelCreditsLabel } from '../../utils/modelPlazaDisplay'
 import { harnessDialogTitle, keyHarnessSupport } from '../../utils/studentHarnessConfig'
 
 const orgs = ref<Organization[]>([])
@@ -20,6 +22,13 @@ const projects = ref<StudentProject[]>([])
 const models = ref<Model[]>([])
 const keys = ref<ApiKey[]>([])
 const detail = ref<ApiKey | null>(null)
+const memberBalance = computed(() => {
+  const key = detail.value
+  if (key?.member_monthly_credits == null || key.member_used_credits == null) return
+  const available = key.member_pending_credits == null ? undefined :
+    calculateCredits(key.member_monthly_credits, calculateCredits(key.member_used_credits, key.member_pending_credits, 'add'), 'subtract')
+  return quotaBalance(key.member_monthly_credits, key.member_used_credits, available)
+})
 const claimConfirm = ref<ApiKey | null>(null)
 const withdrawConfirm = ref<ApiKey | null>(null)
 const configKey = ref<ApiKey | null>(null)
@@ -206,7 +215,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
                 <input v-model="modelQuery" placeholder="搜索我的模型">
                 <div class="model-quick-list">
                   <div v-for="model in filteredModels" :key="model.model_id" class="list-row">
-                    <div><strong>{{ model.display_name }}</strong><p class="muted">{{ model.model_id }} · {{ model.credit_multiplier ?? '未配置' }}x</p></div>
+                    <div><strong>{{ model.display_name }}</strong><p class="muted">{{ model.model_id }} · {{ modelCreditsLabel(model) }}</p></div>
                     <button type="button" class="button ghost" @click="toggleModel(model)">{{ selected(model.model_id) ? '取消' : '选择' }}</button>
                   </div>
                 </div>
@@ -262,8 +271,9 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
     <AppDialog :open="Boolean(detail)" title="申请详情" @update:open="detail = $event ? detail : null">
       <template v-if="detail">
         <StatusProgress :current="detail.progress.current" :completed="detail.progress.completed_steps" />
-        <p>学生申请 {{ detail.requested_monthly_credits }} · 导师审核 {{ detail.mentor_monthly_credits ?? '—' }} · 最终额度 {{ detail.monthly_credits ?? '—' }} credits</p>
-        <p>{{ detail.models.map(model => `${model.model_id} (${model.credit_multiplier ?? '未配置'}x)`).join('、') }}</p>
+        <p>学生申请 {{ detail.requested_monthly_credits }} · 导师审核 {{ detail.mentor_monthly_credits ?? '—' }} · 审批额度 {{ detail.monthly_credits ?? '—' }} 积分</p>
+        <p v-if="memberBalance">当前月额度 {{ detail.member_monthly_credits }} · 学校已用 {{ detail.member_used_credits }} · {{ memberBalance.label }} {{ memberBalance.amount }} 积分</p>
+        <p>{{ detail.models.map(model => `${model.model_id} (${modelCreditsLabel(model)})`).join('、') }}</p>
         <div v-if="canWithdraw(detail)" class="actions key-card-actions">
           <button class="button ghost" @click="withdrawConfirm = detail">撤回申请</button>
         </div>

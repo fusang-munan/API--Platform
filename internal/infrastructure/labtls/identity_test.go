@@ -139,6 +139,30 @@ func TestInvalidIdentityIsPreserved(t *testing.T) {
 	}
 }
 
+func TestRejectWritableTLSDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix volume modes")
+	}
+	dir := t.TempDir()
+	first, err := LoadOrCreate(dir, testURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0770); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrCreate(dir, testURL); err == nil {
+		t.Fatal("accepted a group-writable TLS volume")
+	}
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadOrCreate(dir, testURL)
+	if err != nil || Fingerprint(reloaded) != Fingerprint(first) {
+		t.Fatal("existing protected identity did not survive restoring volume permissions", err)
+	}
+}
+
 func TestInvalidPublicURL(t *testing.T) {
 	for _, input := range []string{"school.example", "https:///path", "ftp://school.example", "https://user@school.example", "https://*.example", "https://[school.example]"} {
 		dir := t.TempDir()

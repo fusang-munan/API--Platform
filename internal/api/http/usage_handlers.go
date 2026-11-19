@@ -79,6 +79,33 @@ func (s *Server) updateMentorKeyQuota(c *gin.Context) {
 	}
 	c.Status(http.StatusNoContent)
 }
+
+func (s *Server) updateTeacherMemberQuota(c *gin.Context) {
+	projectID, ok := pathID(c, "project_id")
+	if !ok {
+		return
+	}
+	userID, ok := pathID(c, "user_id")
+	if !ok {
+		return
+	}
+	var input struct {
+		MonthlyCredits string `json:"monthly_credits" binding:"required"`
+		Reason         string `json:"quota_change_reason" binding:"max=1000"`
+	}
+	if !bindJSON(c, &input) {
+		return
+	}
+	quota, err := domain.ParseCredits(input.MonthlyCredits)
+	if err == nil {
+		err = s.service.UpdateTeacherMemberQuota(c.Request.Context(), identity(c).UserID, projectID, userID, quota, input.Reason)
+	}
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
 func parseLogFilter(c *gin.Context) (usage.LogFilter, error) {
 	f := usage.LogFilter{Status: strings.TrimSpace(c.Query("status")), Limit: 50}
 	if raw := c.Query("limit"); raw != "" {

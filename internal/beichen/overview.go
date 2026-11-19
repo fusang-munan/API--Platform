@@ -1,6 +1,7 @@
 package beichen
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -20,11 +21,25 @@ type Dataset struct {
 }
 
 type Model struct {
-	CredentialID  uuid.UUID `json:"credential_id"`
-	Model         string    `json:"model"`
-	Mode          string    `json:"mode"`
-	UpstreamRates *Rates    `json:"upstream_rates"`
-	SchoolRates   *Rates    `json:"school_rates"`
+	CredentialID         uuid.UUID       `json:"credential_id"`
+	Model                string          `json:"model"`
+	Mode                 string          `json:"mode"`
+	SchoolStatus         string          `json:"school_status"`
+	RouteReady           bool            `json:"route_ready"`
+	PriceStatus          string          `json:"price_status"`
+	PriceConditions      json.RawMessage `json:"price_conditions"`
+	PriceConditionsExact map[string]any  `json:"price_conditions_exact,omitempty"`
+	UpstreamRates        *DisplayRates   `json:"upstream_rates"`
+	SchoolRates          *DisplayRates   `json:"school_rates"`
+}
+
+// The effective multiplier can yield fractions of a micro-unit. Decimal
+// strings also preserve integral amounts above JavaScript's safe range.
+type DisplayRates struct {
+	Input      *string `json:"input"`
+	Output     *string `json:"output"`
+	CacheRead  *string `json:"cache_read"`
+	CacheWrite *string `json:"cache_write"`
 }
 
 type Comparison struct {
@@ -51,9 +66,35 @@ type Comparison struct {
 }
 
 type Overview struct {
-	Datasets   []Dataset    `json:"datasets"`
-	Models     []Model      `json:"models"`
-	Comparison []Comparison `json:"comparison"`
+	WebLoginRequired bool            `json:"web_login_required,omitempty"`
+	ArchivedUsage    []ArchivedUsage `json:"archived_usage"`
+	Datasets         []Dataset       `json:"datasets"`
+	Models           []Model         `json:"models"`
+	ModelCatalog     []CatalogModel  `json:"model_catalog"`
+	Comparison       []Comparison    `json:"comparison"`
+}
+
+type CatalogModel struct {
+	CanEnable       bool             `json:"can_enable"`
+	SchoolStatus    string           `json:"school_status"`
+	SchoolModel     string           `json:"school_model,omitempty"`
+	Model           string           `json:"model"`
+	CredentialIDs   []uuid.UUID      `json:"credential_ids"`
+	PreferredRoutes []PreferredRoute `json:"preferred_routes"`
+}
+
+type PreferredRoute struct {
+	SchoolModel             string       `json:"school_model"`
+	UpstreamModel           string       `json:"upstream_model"`
+	ProviderName            string       `json:"provider_name"`
+	CredentialLabel         *string      `json:"credential_label"`
+	Adapter                 string       `json:"adapter"`
+	ProviderID              uuid.UUID    `json:"provider_id"`
+	CredentialID            *uuid.UUID   `json:"credential_id"`
+	Priority                int          `json:"priority"`
+	State                   string       `json:"state"`
+	EffectiveMultiplier     *json.Number `json:"effective_multiplier"`
+	EffectiveMultiplierText string       `json:"effective_multiplier_text,omitempty"`
 }
 
 type rowQueryer interface {
@@ -94,11 +135,20 @@ func (s *Service) Overview(ctx context.Context, providerID uuid.UUID, day string
 		return Overview{}, err
 	}
 	view := Overview{Datasets: []Dataset{}, Models: []Model{}, Comparison: []Comparison{}}
+	if s.webAccount != nil {
+		view.WebLoginRequired = s.webAccount.humanVerification.Load()
+	}
 	if err = readDatasets(ctx, tx, providerID, &view); err == nil {
 		err = readModels(ctx, tx, providerID, &view)
 	}
 	if err == nil {
+		err = readPreferredRoutes(ctx, tx, providerID, &view)
+	}
+	if err == nil {
 		err = readComparison(ctx, tx, providerID, start, &view)
+	}
+	if err == nil {
+		view.ArchivedUsage, err = readArchivedUsage(ctx, tx, providerID, start)
 	}
 	if err == nil {
 		err = tx.Commit()
@@ -145,36 +195,66 @@ ORDER BY c.label, c.id, kinds.kind`, providerID)
 
 func readModels(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Overview) error {
 	rows, err := tx.QueryContext(ctx, `
-WITH credential_models AS (
-  SELECT credential_id, model_id::text AS model FROM provider_model_catalog
-  WHERE provider_id = $1 AND status = 'active'
-  UNION
-  SELECT v.credential_id, v.model FROM beichen_price_versions v
-  JOIN provider_credentials c ON c.id = v.credential_id WHERE c.provider_id = $1
-)
-SELECT m.credential_id, m.model, p.mode,
-  round(p.upstream_input)::bigint, round(p.upstream_output)::bigint,
-  round(p.upstream_cache_read)::bigint, round(p.upstream_cache_write)::bigint,
-  round(p.school_input * f.factor)::bigint, round(p.school_output * f.factor)::bigint,
-  round(p.school_cache_read * f.factor)::bigint, round(p.school_cache_write * f.factor)::bigint
-FROM credential_models m CROSS JOIN LATERAL beichen_price_at(m.credential_id, m.model, statement_timestamp()) p
+SELECT m.credential_id, m.model_id::text, p.mode,
+  COALESCE(route.school_status, named.status, 'not_configured'),
+  owner.status = 'active' AND c.status = 'active' AND COALESCE(route.binding_ready, false),
+  CASE WHEN snap.expires_at > statement_timestamp() AND snap.credential_revision = c.updated_at
+       THEN snap.model_pricing -> (m.model_id::text) END,
+  trim_scale(p.upstream_input)::text, trim_scale(p.upstream_output)::text,
+  trim_scale(p.upstream_cache_read)::text, trim_scale(p.upstream_cache_write)::text,
+  trim_scale(p.school_input * f.factor)::text, trim_scale(p.school_output * f.factor)::text,
+  trim_scale(p.school_cache_read * f.factor)::text, trim_scale(p.school_cache_write * f.factor)::text
+FROM provider_model_catalog m
+JOIN provider_credentials c ON c.id = m.credential_id AND c.provider_id = m.provider_id
+JOIN providers owner ON owner.id = c.provider_id
+LEFT JOIN models named ON named.model_id = m.model_id
+LEFT JOIN LATERAL (
+  SELECT expires_at, credential_revision, model_pricing FROM beichen_panel_snapshots
+  WHERE credential_id = c.id AND effective_at <= statement_timestamp() ORDER BY effective_at DESC LIMIT 1
+) snap ON true
+LEFT JOIN LATERAL (
+  SELECT school.status AS school_status, b.status = 'active' AS binding_ready
+  FROM model_bindings b JOIN models school ON school.id = b.model_id
+  WHERE b.provider_id = m.provider_id AND b.credential_id = m.credential_id
+    AND lower(btrim(b.upstream_model_name)) = lower(m.model_id::text)
+  ORDER BY (b.status = 'active') DESC, (school.status = 'active') DESC,
+    (school.status = 'pending_configuration') DESC, b.priority, b.id
+  LIMIT 1
+) route ON true
+CROSS JOIN LATERAL beichen_price_at(m.credential_id, m.model_id::text, statement_timestamp()) p
 CROSS JOIN LATERAL (SELECT CASE WHEN p.mode = 'follow' THEN 100 ELSE 1 END AS factor) f
-ORDER BY m.credential_id, m.model`, providerID)
+WHERE m.provider_id = $1 AND m.status = 'active'
+ORDER BY m.credential_id, m.model_id`, providerID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var model Model
-		var upstream, school Rates
+		var upstream, school DisplayRates
+		var terms []byte
 		err := rows.Scan(&model.CredentialID, &model.Model, &model.Mode,
+			&model.SchoolStatus, &model.RouteReady, &terms,
 			&upstream.Input, &upstream.Output, &upstream.CacheRead, &upstream.CacheWrite,
 			&school.Input, &school.Output, &school.CacheRead, &school.CacheWrite)
 		if err != nil {
 			return err
 		}
-		if upstream.Input != nil {
+		model.PriceStatus = "pending_confirmation"
+		model.PriceConditions = terms
+		if len(terms) > 0 {
+			decoder := json.NewDecoder(bytes.NewReader(terms))
+			decoder.UseNumber()
+			if err := decoder.Decode(&model.PriceConditionsExact); err != nil {
+				return err
+			}
+			stringifyPriceNumbers(model.PriceConditionsExact)
+		}
+		if upstream.Input != nil && upstream.Output != nil {
+			model.PriceStatus = "confirmed"
 			model.UpstreamRates = &upstream
+		} else if conditionalPanelPricing(terms) {
+			model.PriceStatus = "conditional"
 		}
 		if school.Input != nil {
 			model.SchoolRates = &school
@@ -182,6 +262,35 @@ ORDER BY m.credential_id, m.model`, providerID)
 		view.Models = append(view.Models, model)
 	}
 	return rows.Err()
+}
+
+// Rates and tier boundaries can exceed JavaScript's numeric precision.
+func stringifyPriceNumbers(value any) any {
+	switch v := value.(type) {
+	case json.Number:
+		return v.String()
+	case map[string]any:
+		for k, child := range v {
+			v[k] = stringifyPriceNumbers(child)
+		}
+	case []any:
+		for i, child := range v {
+			v[i] = stringifyPriceNumbers(child)
+		}
+	}
+	return value
+}
+
+func readPreferredRoutes(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Overview) error {
+	models, err := loadActivationCatalog(ctx, tx, providerID, "")
+	if err != nil {
+		return err
+	}
+	view.ModelCatalog = make([]CatalogModel, 0, len(models))
+	for _, model := range models {
+		view.ModelCatalog = append(view.ModelCatalog, model.overview())
+	}
+	return nil
 }
 
 func readComparison(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, start time.Time, view *Overview) error {

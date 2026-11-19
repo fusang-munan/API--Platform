@@ -55,7 +55,7 @@ async function save(enabled: boolean) {
 
 <template>
   <details class="beichen-section">
-    <summary>自动采价授权</summary>
+    <summary>旧版面板授权维护</summary>
     <p v-if="!secure">请从学校 HTTPS 管理入口配置采价授权。</p>
     <form v-else class="beichen-body" @submit.prevent="save(true)">
       <label>北辰推理凭据

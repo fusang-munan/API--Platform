@@ -38,7 +38,7 @@ func TestPanelPostgresPriceLifecycle(t *testing.T) {
 CREATE TABLE users (id uuid PRIMARY KEY);
 CREATE TABLE provider_credentials (id uuid PRIMARY KEY, updated_at timestamptz NOT NULL);
 CREATE TABLE gateway_calls (provider_id uuid, provider_credential_id uuid, upstream_model_name text, sent_at timestamptz)`)
-	for _, name := range []string{"0030_beichen.sql", "0033_beichen_panel_prices.sql"} {
+	for _, name := range []string{"0030_beichen.sql", "0033_beichen_panel_prices.sql", "0040_beichen_panel_price_conditions.sql"} {
 		migration, err := os.ReadFile("../infrastructure/db/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)

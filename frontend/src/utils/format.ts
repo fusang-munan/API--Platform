@@ -34,3 +34,15 @@ export function calculateCredits(left: string, right: string, operation: 'add' |
   const fraction = digits.slice(-scale).replace(/0+$/, '').padEnd(3, '0')
   return `${digits.slice(0, -scale)}.${fraction}`
 }
+
+export const beichenBillingExplanation = '北辰 1 余额单位的充值等值为 1 元，对应 100 基础积分。学校按基础积分 × 1.10 记入已用额度。例如老师分配 100 积分，一次调用消耗 10 基础积分，学校记已用 11 积分，剩余 89 积分。北辰账单用于核对，学校已用额度保持原记账金额。'
+
+export function schoolMonth() {
+  return new Intl.DateTimeFormat('sv-SE', { year: 'numeric', month: '2-digit', timeZone: 'Asia/Shanghai' }).format(new Date())
+}
+
+export function quotaBalance(quota: string, used: string, available?: string | null) {
+  const over = calculateCredits(used, quota, 'subtract')
+  if (over !== '0.000') return { label: '已超用', amount: over }
+  return { label: '剩余', amount: available ?? calculateCredits(quota, used, 'subtract') }
+}

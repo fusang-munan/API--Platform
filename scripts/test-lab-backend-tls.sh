@@ -150,6 +150,9 @@ services:
       LAB_CERTIFICATE_NOTICE_EXPIRES_AT: ${CI_NEBULA_NOTICE_EXPIRES_AT}
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
+      BEICHEN_CHANNELS_JSON: ""
+      BEICHEN_WEB_EMAIL: ""
+      BEICHEN_WEB_PASSWORD: ""
       BEICHEN_PANEL_TOKEN: ""
       BEICHEN_PANEL_GROUPS: ""
 YAML
@@ -353,6 +356,18 @@ check_public_console "https://$public_address" --cacert "$work/first.pem"
 check_public_console "http://$public_address"
 check_https_teacher_auth "$public_address"
 
+recipient_path='/.well-known/nebula-beichen-recipient'
+read_recipient() {
+    "${request[@]}" --fail --cacert "$work/first.pem" "https://$1$recipient_path" |
+        jq -ce 'select(keys == ["algorithm","public_key"] and .algorithm == "nacl-sealed-box-v1"
+            and (.public_key | test("^[A-Za-z0-9+/]{43}=$")))'
+}
+read_recipient "$public_address" > "$work/first-recipient"
+"${compose[@]}" exec -T backend sh -ec '
+    test "$(stat -c "%a" "$LAB_BEICHEN_SEAL_DIR/recipient.key")" = 600
+    test -s "$LAB_BEICHEN_SEAL_DIR/recipient.key"
+'
+
 post_notice "http://$http_address" "$teacher_digest" "$request_nonce" 404
 post_notice "https://$https_address" "$teacher_digest" "$wrong_nonce" 202 --cacert "$work/first.pem"
 cp "$work/notice-response" "$work/notice-first-response"
@@ -400,6 +415,8 @@ second_backend="$("${compose[@]}" ps -q backend)"
 [[ -n "$first_backend" && -n "$second_backend" && "$first_backend" != "$second_backend" ]]
 read_cert > "$work/second.pem"
 cmp "$work/first.pem" "$work/second.pem"
+read_recipient "$https_address" > "$work/second-recipient"
+cmp "$work/first-recipient" "$work/second-recipient"
 check_anonymous_auth "http://$http_address" /api/v1/teacher/providers
 check_anonymous_auth "https://$https_address" /api/v1/teacher/providers --cacert "$work/first.pem"
 post_notice "https://$https_address" "$teacher_digest" "$request_nonce" 202 --cacert "$work/first.pem"

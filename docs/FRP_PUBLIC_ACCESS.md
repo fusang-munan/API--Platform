@@ -37,6 +37,12 @@ bash scripts/compose-local.sh logs --no-color --tail=300 backend | grep 'mainten
 
 维护入口的 `GET /.well-known/nebula-maintenance` 供无凭据的上线检查使用。`email_delivery` 为 `log_only` 表示该实例只写开发日志，为 `smtp_configured` 表示已选择 SMTP，实际投递需要收件方确认。此接口不发信。
 
+### 随 GitHub 更新交付北辰配置
+
+1. 学校按现有流程更新至 0.14.0 后，在已核实的学校 HTTPS 入口读取 `/.well-known/nebula-beichen-recipient`。该入口只返回收件公钥和算法。学校持久卷内的收件私钥与 HTTPS 身份各自保存。 首次取得证书时，可在浏览器的学校 HTTPS 证书详情中导出单张 DER 格式的服务器证书，用 `Get-FileHash -Algorithm SHA256 <证书路径>` 计算指纹，与校方通过独立渠道确认的 SHA-256 逐字核对。
+2. 在管理电脑的仓库目录运行 `scripts/seal-beichen.ps1 -Certificate <校方已核实的证书路径>`。工具先核对学校证书和公钥，再在本机读取四把推理 Key 和北辰普通网页登录信息，写出 `internal/infrastructure/schoolseal/school-config.sealed.json`。
+3. 将密文随原来的 GitHub 发布交付。校内后台自行解密并同步。如服务器更换了收件密钥，可用校方确认的 HTTPS 入口取回新公钥，重新加密发布。
+
 ### 通过学校正式邮件确认指纹
 
 0.11.1 的收件人已确认收到通知。自 0.12.0 起，实验室 Compose 中的通知批准默认为空。后续如需另发，可经收件人同意设置运行时变量 `LAB_CERTIFICATE_NOTICE_REQUEST_SHA256` 和 `LAB_CERTIFICATE_NOTICE_EXPIRES_AT`。收件地址和申请随机数仅留在请求方。配置中的公开 SHA-256 将一个注册邮箱摘要、一次随机数和发行版本绑定到一封固定内容的通知。未配置批准、超过 24 小时有效窗口、已过期或处于日志邮件模式时不提供发送入口。

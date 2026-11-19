@@ -1,7 +1,7 @@
 import { DOMWrapper, flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BeichenComparison, BeichenOverview, Provider } from '../../api/types'
-import TeacherProviders from './TeacherProviders.vue'
+import TeacherBeichenDialog from './TeacherBeichenDialog.vue'
 
 const provider: Provider = {
   id: 'beichen',
@@ -76,7 +76,7 @@ function section(root: DOMWrapper<Element>, text: string) {
 }
 
 async function openPanel() {
-  widget = mount(TeacherProviders, { attachTo: document.body })
+  widget = mount(TeacherBeichenDialog, { props: { provider }, attachTo: document.body })
   await flushPromises()
   const root = new DOMWrapper(widget.element)
   const trigger = button(root, '同步与对账')
@@ -99,7 +99,7 @@ function selectFile(input: Element, csv: string) {
   })
 }
 
-describe('北辰教师面板', () => {
+describe('兼容旧版北辰维护组件', () => {
   beforeEach(() => {
     request.mockReset()
     providers = [provider]
@@ -120,70 +120,8 @@ describe('北辰教师面板', () => {
     vi.unstubAllGlobals()
   })
 
-  it('选择北辰预设渠道时复用历史标签，未保存的选择不创建凭据', async () => {
-    providers = [{ ...provider, credentials: [{ ...provider.credentials![0], label: '国模' }] }]
-    widget = mount(TeacherProviders, { attachTo: document.body })
-    await flushPromises()
-    await button(new DOMWrapper(widget.element), '编辑').trigger('click')
-    const dialog = new DOMWrapper(document.body.querySelector('[role="dialog"]')!)
-    const presets = dialog.get('[aria-label="北辰渠道"]')
-    expect(presets.findAll('button').map(item => item.text())).toEqual(['Gemini', 'GM1', 'G3', 'CC1'])
-    await button(presets, 'G3').trigger('click')
-    await button(presets, 'GM1').trigger('click')
-    expect(dialog.get('[role="tab"][aria-selected="true"]').text()).toBe('国模')
-    await button(presets, 'G3').trigger('click')
-    expect(dialog.findAll('[role="tab"]').map(item => item.text())).toEqual(['国模', 'G3'])
-    expect(request.mock.calls.every(([, options]) => !options?.method || options.method === 'GET')).toBe(true)
-  })
-
-  it('同步入口只接受北辰的 HTTPS 根地址或 /v1，且 URL 没有端口和附加部分', async () => {
-    const supported = [
-      'https://api.beichenapi.com',
-      'https://api.beichenapi.com/',
-      'https://api.beichenapi.com/v1',
-      'https://API.BEICHENAPI.COM/v1/',
-    ]
-    const unsupported = [
-      'http://api.beichenapi.com',
-      'https://api.beichenapi.com.example.test',
-      'https://api.beichenapi.com:443/v1',
-      'https://api.beichenapi.com:8443',
-      'https://api.beichenapi.com/v2',
-      'https://api.beichenapi.com/V1',
-      'https://api.beichenapi.com/x/../v1',
-      'https://api.beichenapi.com/v1?foo=1',
-      'https://api.beichenapi.com/#here',
-    ]
-    providers = [...supported, ...unsupported].map((base_url, i) => ({
-      ...provider, id: String(i), name: base_url, base_url, credentials: [], credential_configured: false,
-    }))
-    widget = mount(TeacherProviders)
-    await flushPromises()
-    const rows = widget.findAll('article')
-    const rowsWithButton = rows.filter(row => row.findAll('button').some(item => item.text() === '同步与对账'))
-    expect(rowsWithButton.map(row => row.get('strong').text())).toEqual(supported)
-    expect(rows.filter(row => row.text().includes('待配置 Key')).map(row => row.get('strong').text())).toEqual(supported)
-  })
-
-  it('北辰零 Key 时显示待配置提示，保留停用状态和对账入口', async () => {
-    providers = [{ ...provider, credentials: [], credential_configured: false, status: 'inactive' }]
-    request.mockImplementation(async url => {
-      if (url === '/api/v1/teacher/providers') return reply(providers)
-      if (url.startsWith(`${path}?day=`)) return reply({ datasets: [], models: [], comparison: [] })
-      throw new Error(`Unexpected request: ${url}`)
-    })
-
-    const dialog = await openPanel()
-    const row = widget!.get('article')
-    expect(row.text()).toContain('0 个启用 Key / 0 个 Key')
-    expect(row.text()).toContain('待配置 Key')
-    expect(row.get('.status-badge').classes()).toContain('inactive')
-    expect(dialog.text()).toContain('暂无同步记录')
-  })
-
   it('展示同步状态，手动同步并按所选日期展示对账结果', async () => {
     const dialog = await openPanel()
-    expect(widget!.get('article').text()).not.toContain('待配置 Key')
     expect(dialog.text()).toContain('模型目录')
     expect(dialog.text()).toContain('计费倍率')
     expect(dialog.text()).toContain('暂时无法读取倍率')
@@ -280,7 +218,7 @@ describe('北辰教师面板', () => {
 
     await kind.setValue('prices_base')
     expect(importer.text()).toContain('乘一次该渠道的实际倍率')
-    expect(importer.text()).toContain('当前凭据实际倍率 0.125×')
+    expect(importer.text()).toContain('当前凭据实际倍率 —')
     await credential.setValue('key-zero')
     expect(importer.text()).toContain('当前凭据实际倍率 0×')
     await credential.setValue('key-1')

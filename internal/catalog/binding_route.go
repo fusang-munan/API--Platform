@@ -132,7 +132,7 @@ func FindActiveCatalogCredential(
 	if upstreamModel == "" {
 		return nil, false, nil
 	}
-	rows, err := client.ProviderModelCatalog.Query().
+	query := client.ProviderModelCatalog.Query().
 		Where(
 			providermodelcatalog.ProviderIDEQ(providerID),
 			providermodelcatalog.StatusEQ(providermodelcatalog.StatusActive),
@@ -141,8 +141,19 @@ func FindActiveCatalogCredential(
 				providercredential.ProviderIDEQ(providerID),
 				providercredential.HasProviderWith(provider.StatusEQ(provider.StatusActive)),
 			),
-		).
-		All(ctx)
+		)
+	owner, err := client.Provider.Get(ctx, providerID)
+	if ent.IsNotFound(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if IsBeichenBaseURL(owner.BaseURL) {
+		// Match the preview when a legacy binding leaves the key unspecified.
+		query.Order(ent.Asc(providermodelcatalog.FieldCredentialID))
+	}
+	rows, err := query.All(ctx)
 	if err != nil {
 		return nil, false, err
 	}

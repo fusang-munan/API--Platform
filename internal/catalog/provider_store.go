@@ -20,7 +20,7 @@ type ProviderCatalogSyncResult struct {
 	Synced       int
 }
 
-func (s *ProviderCatalogSyncer) UpsertCredentialEntries(ctx context.Context, providerID, credentialID uuid.UUID, entries []ProviderEntry, syncedAt time.Time) (int, error) {
+func (s *ProviderCatalogSyncer) UpsertCredentialEntries(ctx context.Context, providerID, credentialID uuid.UUID, entries []ProviderEntry, syncedAt time.Time, revision *time.Time) (int, error) {
 	if s.DB == nil {
 		return 0, fmt.Errorf("catalog database is unavailable")
 	}
@@ -29,7 +29,29 @@ func (s *ProviderCatalogSyncer) UpsertCredentialEntries(ctx context.Context, pro
 		return 0, err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `UPDATE provider_model_catalog SET status='inactive',synced_at=$1,updated_at=$1 WHERE credential_id=$2`, syncedAt, credentialID); err != nil {
+	if revision != nil {
+		var baseURL string
+		err := tx.QueryRowContext(ctx, `
+SELECT p.base_url FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
+WHERE c.id = $1 AND p.id = $2 AND c.updated_at = $3 AND c.status = 'active' AND p.status = 'active'
+FOR SHARE OF p FOR NO KEY UPDATE OF c`, credentialID, providerID, *revision).Scan(&baseURL)
+		if err != nil || !IsBeichenBaseURL(baseURL) {
+			return 0, fmt.Errorf("北辰目录写入时无法确认供应商或凭据版本")
+		}
+	}
+	count, err := ReplaceCredentialEntries(ctx, tx, providerID, credentialID, entries, syncedAt)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// ReplaceCredentialEntries applies a complete per-key snapshot in the caller's transaction.
+func ReplaceCredentialEntries(ctx context.Context, tx *sql.Tx, providerID, credentialID uuid.UUID, entries []ProviderEntry, syncedAt time.Time) (int, error) {
+	if _, err := tx.ExecContext(ctx, `UPDATE provider_model_catalog SET status='inactive',synced_at=$1,updated_at=$1 WHERE credential_id=$2`, syncedAt, credentialID); err != nil {
 		return 0, err
 	}
 	count := 0
@@ -38,7 +60,7 @@ func (s *ProviderCatalogSyncer) UpsertCredentialEntries(ctx context.Context, pro
 		if entry.Raw == nil {
 			raw = []byte("{}")
 		}
-		_, err = tx.ExecContext(ctx, `
+		_, err := tx.ExecContext(ctx, `
 INSERT INTO provider_model_catalog(
   id, provider_id, credential_id, model_id, display_name, description, owned_by, upstream_object, upstream_created_at,
   raw_entry, status, last_seen_at, synced_at, created_at, updated_at
@@ -62,9 +84,6 @@ ON CONFLICT(credential_id, model_id) DO UPDATE SET
 			return 0, err
 		}
 		count++
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
 	}
 	return count, nil
 }

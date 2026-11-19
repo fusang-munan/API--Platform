@@ -44,7 +44,7 @@ SELECT gen_random_uuid(),p.id,$1,p.monthly_credit_quota_milli,COALESCE((SELECT s
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO project_member_month_credit_buckets(id,project_id,user_id,month,quota_milli,charged_milli,pending_milli,created_at,updated_at)
-SELECT gen_random_uuid(),pm.project_id,pm.user_id,$1,pm.monthly_credit_quota_milli,0,0,$2,$2 FROM project_members pm WHERE pm.monthly_credit_quota_milli>0 ON CONFLICT(project_id,user_id,month) DO UPDATE SET quota_milli=EXCLUDED.quota_milli,updated_at=EXCLUDED.updated_at`, month, now); err != nil {
+SELECT gen_random_uuid(),pm.project_id,pm.user_id,$1,pm.monthly_credit_quota_milli,0,0,$2,$2 FROM project_members pm WHERE pm.monthly_credit_quota_milli>0 ON CONFLICT(project_id,user_id,month) DO NOTHING`, month, now); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO api_key_month_credit_buckets(id,api_key_id,project_id,month,quota_milli,allocation_active,charged_milli,pending_milli,created_at,updated_at)
@@ -353,17 +353,18 @@ func (s *Store) ApproveKey(ctx context.Context, actorID, keyID uuid.UUID, quota 
 		return uuid.Nil, err
 	}
 	var currentMemberQuota int64
-	err = tx.QueryRowContext(ctx, `SELECT COALESCE(monthly_credit_quota_milli,0) FROM project_members WHERE project_id=$1 AND user_id=$2`, projectID, ownerID).Scan(&currentMemberQuota)
+	var teacherAssigned bool
+	err = tx.QueryRowContext(ctx, `SELECT monthly_credit_quota_milli,teacher_quota_assigned FROM project_members WHERE project_id=$1 AND user_id=$2`, projectID, ownerID).Scan(&currentMemberQuota, &teacherAssigned)
 	if errors.Is(err, sql.ErrNoRows) {
 		currentMemberQuota = 0
 	} else if err != nil {
 		return uuid.Nil, err
 	}
 	memberQuota := quota
-	if currentMemberQuota == 0 && memberQuota <= 0 {
+	if !teacherAssigned && currentMemberQuota == 0 && memberQuota <= 0 {
 		return uuid.Nil, domain.NewError(domain.CodeValidation, "monthly credits are required")
 	}
-	if currentMemberQuota > 0 && memberQuota <= 0 {
+	if teacherAssigned || (currentMemberQuota > 0 && memberQuota <= 0) {
 		memberQuota = currentMemberQuota
 	}
 	delta := memberQuota - currentMemberQuota
@@ -890,7 +891,8 @@ SELECT p.id,p.name,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0),COAL
 FROM project_members pm
 JOIN projects p ON p.id=pm.project_id
 LEFT JOIN project_member_month_credit_buckets mb ON mb.project_id=pm.project_id AND mb.user_id=pm.user_id AND mb.month=$2
-WHERE pm.user_id=$1 AND pm.monthly_credit_quota_milli>0
+WHERE pm.user_id=$1 AND (pm.monthly_credit_quota_milli>0 OR mb.id IS NOT NULL OR
+  EXISTS(SELECT 1 FROM api_keys own WHERE own.project_id=p.id AND own.owner_user_id=pm.user_id AND own.status IN ('approved','active','inactive')))
 ORDER BY p.name`, userID, month)
 	if err != nil {
 		return StudentUsage{}, err
@@ -959,20 +961,22 @@ ORDER BY p.name`, userID, month)
 }
 
 type ProjectUsage struct {
-	PendingReview bool          `json:"pending_review,omitempty"`
-	Month         string        `json:"month"`
-	ProjectID     string        `json:"project_id"`
-	ProjectName   string        `json:"project_name"`
-	Quota         string        `json:"quota"`
-	Allocated     string        `json:"allocated"`
-	Charged       string        `json:"charged"`
-	Pending       string        `json:"pending"`
-	Available     string        `json:"available"`
-	Members       []MemberUsage `json:"members"`
-	Models        []UsageSlice  `json:"models"`
-	FreeModels    []UsageSlice  `json:"free_models"`
+	PendingReview bool                `json:"pending_review,omitempty"`
+	Month         string              `json:"month"`
+	ProjectID     string              `json:"project_id"`
+	ProjectName   string              `json:"project_name"`
+	Quota         string              `json:"quota"`
+	Allocated     string              `json:"allocated"`
+	Charged       string              `json:"charged"`
+	Pending       string              `json:"pending"`
+	Available     string              `json:"available"`
+	Members       []MemberUsage       `json:"members"`
+	Models        []ProjectModelUsage `json:"models"`
+	FreeModels    []UsageSlice        `json:"free_models"`
 }
 type MemberUsage struct {
+	BeichenSpend
+	IsStudent     bool             `json:"is_student"`
 	PendingReview bool             `json:"pending_review,omitempty"`
 	UserID        string           `json:"user_id"`
 	UserName      string           `json:"user_name"`
@@ -983,12 +987,12 @@ type MemberUsage struct {
 	FreeModels    []UsageSlice     `json:"free_models"`
 }
 type KeyMemberUsage struct {
-	PendingReview bool         `json:"pending_review,omitempty"`
-	ID            string       `json:"id"`
-	Name          string       `json:"name"`
-	Status        string       `json:"status"`
-	Used          string       `json:"used"`
-	Models        []UsageSlice `json:"models"`
+	PendingReview bool                `json:"pending_review,omitempty"`
+	ID            string              `json:"id"`
+	Name          string              `json:"name"`
+	Status        string              `json:"status"`
+	Used          string              `json:"used"`
+	Models        []ProjectModelUsage `json:"models"`
 }
 
 func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month time.Time) (ProjectUsage, error) {
@@ -999,9 +1003,14 @@ func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month tim
 		}
 	}
 	var v ProjectUsage
-	v.Members, v.Models, v.FreeModels = []MemberUsage{}, []UsageSlice{}, []UsageSlice{}
+	v.Members, v.Models, v.FreeModels = []MemberUsage{}, []ProjectModelUsage{}, []UsageSlice{}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return v, err
+	}
+	defer tx.Rollback()
 	var q, a, p int64
-	err := s.db.QueryRowContext(ctx, `SELECT p.name,b.quota_milli,b.allocated_milli,trim_scale((b.charged_milli+b.charged_milli_remainder)*0.001)::text,b.pending_milli,EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$2 AND review.project_id=p.id) FROM projects p JOIN project_month_credit_buckets b ON b.project_id=p.id AND b.month=$2 WHERE p.id=$1`, projectID, month).Scan(&v.ProjectName, &q, &a, &v.Charged, &p, &v.PendingReview)
+	err = tx.QueryRowContext(ctx, `SELECT p.name,b.quota_milli,b.allocated_milli,trim_scale((b.charged_milli+b.charged_milli_remainder)*0.001)::text,b.pending_milli,EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$2 AND review.project_id=p.id) FROM projects p JOIN project_month_credit_buckets b ON b.project_id=p.id AND b.month=$2 WHERE p.id=$1`, projectID, month).Scan(&v.ProjectName, &q, &a, &v.Charged, &p, &v.PendingReview)
 	if err != nil {
 		return v, err
 	}
@@ -1016,9 +1025,22 @@ func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month tim
 		available = 0
 	}
 	v.Available = domain.FormatCredits(available)
-	rows, err := s.db.QueryContext(ctx, `SELECT u.id,u.name,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0),trim_scale((GREATEST(0,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0)::numeric-COALESCE(mb.charged_milli,0)-COALESCE(mb.pending_milli,0)-COALESCE(mb.charged_milli_remainder,0)))*0.001)::text,trim_scale((COALESCE(sum(c.charged_milli),0)+COALESCE(sum(c.charged_milli_remainder),0))*0.001)::text,
-		EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$2 AND review.project_id=$1 AND review.user_id=u.id)
-		FROM users u JOIN api_keys k ON k.owner_user_id=u.id AND k.project_id=$1 JOIN project_members pm ON pm.project_id=$1 AND pm.user_id=u.id LEFT JOIN project_member_month_credit_buckets mb ON mb.project_id=$1 AND mb.user_id=u.id AND mb.month=$2 LEFT JOIN monthly_usage_cube c ON c.api_key_id=k.id AND c.month=$2 WHERE k.status IN ('approved','active') OR c.id IS NOT NULL OR EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$2 AND review.api_key_id=k.id) GROUP BY u.id,u.name,mb.quota_milli,pm.monthly_credit_quota_milli,mb.charged_milli,mb.pending_milli,mb.charged_milli_remainder ORDER BY u.name`, projectID, month)
+	rows, err := tx.QueryContext(ctx, `SELECT u.id,u.name,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0),
+		trim_scale(GREATEST(0,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0)::numeric-
+			COALESCE(mb.charged_milli,0)-COALESCE(mb.pending_milli,0)-COALESCE(mb.charged_milli_remainder,0))*0.001)::text,
+		EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$2 AND review.project_id=$1 AND review.user_id=u.id),
+		(sp.id IS NOT NULL)
+		FROM project_members pm JOIN users u ON u.id=pm.user_id
+		LEFT JOIN student_profiles sp ON sp.user_id=u.id AND sp.status='active' AND u.status='active' AND u.role='student'
+		LEFT JOIN project_member_month_credit_buckets mb ON mb.project_id=pm.project_id AND mb.user_id=u.id AND mb.month=$2
+		WHERE pm.project_id=$1 AND (sp.id IS NOT NULL OR EXISTS (
+			SELECT 1 FROM api_keys k WHERE k.owner_user_id=u.id AND k.project_id=$1 AND (
+				k.status IN ('approved','active') OR EXISTS (
+					SELECT 1 FROM monthly_usage_cube c WHERE c.api_key_id=k.id AND c.month=$2
+				) OR EXISTS (
+					SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$2 AND review.api_key_id=k.id
+				))
+		)) ORDER BY u.name,u.id`, projectID, month)
 	if err != nil {
 		return v, err
 	}
@@ -1027,56 +1049,16 @@ func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month tim
 		var uid uuid.UUID
 		var m MemberUsage
 		var memberQuota int64
-		if err := rows.Scan(&uid, &m.UserName, &memberQuota, &m.Available, &m.Credits, &m.PendingReview); err != nil {
+		if err := rows.Scan(&uid, &m.UserName, &memberQuota, &m.Available, &m.PendingReview, &m.IsStudent); err != nil {
+			rows.Close()
 			return v, err
 		}
 		m.UserID = uid.String()
 		m.Quota = domain.FormatCredits(memberQuota)
-		m.Credits = displayCredits(m.Credits)
+		m.Credits = "0.000"
 		m.Available = displayCredits(m.Available)
 		m.Keys = []KeyMemberUsage{}
 		m.FreeModels = []UsageSlice{}
-		kr, err := s.db.QueryContext(ctx, `SELECT k.id,k.name,k.status,trim_scale((b.charged_milli+b.charged_milli_remainder)*0.001)::text,EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$3 AND review.api_key_id=k.id) FROM api_keys k JOIN api_key_month_credit_buckets b ON b.api_key_id=k.id AND b.month=$3 WHERE k.project_id=$1 AND k.owner_user_id=$2 AND k.status IN ('approved','active','inactive') ORDER BY k.name`, projectID, uid, month)
-		if err != nil {
-			return v, err
-		}
-		for kr.Next() {
-			var kid uuid.UUID
-			var ki KeyMemberUsage
-			var ku string
-			if err := kr.Scan(&kid, &ki.Name, &ki.Status, &ku, &ki.PendingReview); err != nil {
-				kr.Close()
-				return v, err
-			}
-			ki.ID = kid.String()
-			ki.Models = []UsageSlice{}
-			ki.Used = displayCredits(ku)
-			modelRows, err := s.db.QueryContext(ctx, `SELECT c.model_id,m.model_id,c.model_name,trim_scale((c.charged_milli+c.charged_milli_remainder)*0.001)::text,c.charged_count+c.zero_cost_count FROM monthly_usage_cube c JOIN models m ON m.id=c.model_id WHERE c.api_key_id=$1 AND c.month=$2 ORDER BY c.charged_milli DESC,c.charged_milli_remainder DESC,c.model_name`, kid, month)
-			if err != nil {
-				kr.Close()
-				return v, err
-			}
-			for modelRows.Next() {
-				var sl UsageSlice
-				var credits string
-				var internalID uuid.UUID
-				if err := modelRows.Scan(&internalID, &sl.ID, &sl.Name, &credits, &sl.Calls); err != nil {
-					modelRows.Close()
-					kr.Close()
-					return v, err
-				}
-				sl.Credits = displayCredits(credits)
-				ki.Models = append(ki.Models, sl)
-			}
-			if err := modelRows.Err(); err != nil {
-				modelRows.Close()
-				kr.Close()
-				return v, err
-			}
-			modelRows.Close()
-			m.Keys = append(m.Keys, ki)
-		}
-		kr.Close()
 		memberIndexes[uid] = len(v.Members)
 		v.Members = append(v.Members, m)
 	}
@@ -1087,7 +1069,7 @@ func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month tim
 	if err := rows.Close(); err != nil {
 		return v, err
 	}
-	fr, err := s.db.QueryContext(ctx, `SELECT c.user_id,m.model_id,c.model_name,sum(c.zero_cost_count) FROM monthly_usage_cube c JOIN models m ON m.id=c.model_id WHERE c.project_id=$1 AND c.month=$2 AND c.zero_cost_count>0 GROUP BY c.user_id,m.model_id,c.model_name HAVING sum(c.zero_cost_count)>0 ORDER BY c.user_id,sum(c.zero_cost_count) DESC,c.model_name`, projectID, month)
+	fr, err := tx.QueryContext(ctx, `SELECT c.user_id,m.model_id,c.model_name,sum(c.zero_cost_count) FROM monthly_usage_cube c JOIN models m ON m.id=c.model_id WHERE c.project_id=$1 AND c.month=$2 AND c.zero_cost_count>0 GROUP BY c.user_id,m.model_id,c.model_name HAVING sum(c.zero_cost_count)>0 ORDER BY c.user_id,sum(c.zero_cost_count) DESC,c.model_name`, projectID, month)
 	if err != nil {
 		return v, err
 	}
@@ -1113,22 +1095,14 @@ func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month tim
 		return v, err
 	}
 	v.FreeModels = summarizeMemberFreeModels(v.Members)
-	mr, err := s.db.QueryContext(ctx, `SELECT m.model_id,c.model_name,trim_scale((sum(c.charged_milli)+sum(c.charged_milli_remainder))*0.001)::text,sum(c.charged_count) FROM monthly_usage_cube c JOIN models m ON m.id=c.model_id WHERE c.project_id=$1 AND c.month=$2 GROUP BY m.model_id,c.model_name HAVING sum(c.charged_milli)+sum(c.charged_milli_remainder)>0 ORDER BY sum(c.charged_milli)+sum(c.charged_milli_remainder) DESC,c.model_name`, projectID, month)
+	keyIndexes, err := v.loadProjectKeys(ctx, tx, projectID, month, memberIndexes)
 	if err != nil {
 		return v, err
 	}
-	defer mr.Close()
-	for mr.Next() {
-		var id string
-		var name string
-		var credits string
-		var calls int64
-		if err := mr.Scan(&id, &name, &credits, &calls); err != nil {
-			return v, err
-		}
-		v.Models = append(v.Models, UsageSlice{ID: id, Name: name, Credits: displayCredits(credits), Calls: calls})
+	if err := v.loadProjectModelUsage(ctx, tx, projectID, month, memberIndexes, keyIndexes); err != nil {
+		return v, err
 	}
-	return v, mr.Err()
+	return v, tx.Commit()
 }
 
 func summarizeMemberFreeModels(members []MemberUsage) []UsageSlice {

@@ -3,7 +3,6 @@ package controlplane
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 
@@ -17,13 +16,6 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providermodelcatalog"
 )
-
-var beichenCatalogHTTPClient = &http.Client{
-	Timeout: 8 * time.Second,
-	CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
 
 type ProviderCatalogSyncView struct {
 	ProviderID string `json:"provider_id"`
@@ -174,8 +166,7 @@ func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, cred
 	}
 	if input.Credential != nil {
 		if row.Edges.Provider != nil {
-			baseURL, _ := ValidateBaseURL(row.Edges.Provider.BaseURL)
-			if baseURL == "https://api.beichenapi.com" {
+			if catalog.IsBeichenBaseURL(row.Edges.Provider.BaseURL) {
 				return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "换北辰 Key 时请新增凭据并重新选择模型绑定，以保留原凭据的账单记录")
 			}
 		}
@@ -207,6 +198,11 @@ func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, cred
 	if updated.Status == providercredential.StatusInactive {
 		if err := catalog.DeactivateCredentialCatalog(ctx, s.db, credentialID); err != nil {
 			return ProviderCredentialView{}, domain.WrapError(domain.CodeDependencyUnavailable, "deactivate provider catalog", err)
+		}
+		if row.Edges.Provider != nil && catalog.IsBeichenBaseURL(row.Edges.Provider.BaseURL) {
+			// Preserve the teacher's binding intent when a key is retired.
+			// A later explicit enable can attach a newly discovered owner.
+			return providerCredentialView(updated), nil
 		}
 		if err := catalog.ReconcileProviderBindingRoutes(ctx, s.db, providerID); err != nil {
 			return ProviderCredentialView{}, domain.WrapError(domain.CodeDependencyUnavailable, "reconcile provider routes", err)
@@ -250,8 +246,14 @@ func (s *Service) DeleteProviderCredential(ctx context.Context, providerID, cred
 	if err := tx.ProviderCredential.DeleteOneID(credentialID).Exec(ctx); err != nil {
 		return domain.WrapError(domain.CodeDependencyUnavailable, "delete provider credential", err)
 	}
-	if err := catalog.ReconcileProviderBindingRoutes(ctx, tx.Client(), providerID); err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "reconcile provider routes", err)
+	owner, err := tx.Provider.Get(ctx, providerID)
+	if err != nil {
+		return domain.WrapError(domain.CodeDependencyUnavailable, "read provider for route reconciliation", err)
+	}
+	if !catalog.IsBeichenBaseURL(owner.BaseURL) {
+		if err := catalog.ReconcileProviderBindingRoutes(ctx, tx.Client(), providerID); err != nil {
+			return domain.WrapError(domain.CodeDependencyUnavailable, "reconcile provider routes", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.WrapError(domain.CodeDependencyUnavailable, "commit provider credential delete", err)
@@ -275,6 +277,17 @@ func (s *Service) syncProviderCatalog(ctx context.Context, providerID uuid.UUID,
 	if err != nil {
 		return ProviderCatalogSyncView{}, err
 	}
+	view := ProviderCatalogSyncView{
+		ProviderID: providerID.String(),
+		Provider:   row.Name,
+		Synced:     total,
+		SyncedAt:   syncedAt.Format(time.RFC3339),
+	}
+	// Each Beichen key may list the same model. Refreshing a catalog must
+	// not move a teacher's binding to the last key or publish a model.
+	if catalog.IsBeichenBaseURL(row.BaseURL) && !resetGovernance {
+		return view, nil
+	}
 	if err := s.materializeStoredProviderCatalog(ctx, providerID, resetGovernance); err != nil {
 		return ProviderCatalogSyncView{}, domain.WrapError(domain.CodeDependencyUnavailable, "materialize synced models", err)
 	}
@@ -286,12 +299,7 @@ func (s *Service) syncProviderCatalog(ctx context.Context, providerID uuid.UUID,
 			return ProviderCatalogSyncView{}, domain.WrapError(domain.CodeDependencyUnavailable, "restore governed models", err)
 		}
 	}
-	return ProviderCatalogSyncView{
-		ProviderID: providerID.String(),
-		Provider:   row.Name,
-		Synced:     total,
-		SyncedAt:   syncedAt.Format(time.RFC3339),
-	}, nil
+	return view, nil
 }
 
 func (s *Service) refreshCredentialCatalog(ctx context.Context, providerRow *ent.Provider, credentialRow *ent.ProviderCredential) (int, error) {
@@ -305,6 +313,9 @@ func (s *Service) refreshCredentialCatalog(ctx context.Context, providerRow *ent
 	count, err := s.fetchAndStoreCredentialCatalog(ctx, providerRow, credentialRow, syncedAt)
 	if err != nil {
 		return 0, err
+	}
+	if catalog.IsBeichenBaseURL(providerRow.BaseURL) {
+		return count, nil
 	}
 	if err := catalog.ReconcileProviderBindingRoutes(ctx, s.db, providerRow.ID); err != nil {
 		return 0, domain.WrapError(domain.CodeDependencyUnavailable, "reconcile provider routes", err)
@@ -368,11 +379,7 @@ func (s *Service) fetchAndStoreCredentialCatalogEntries(
 	if decryptErr != nil {
 		return 0, nil, domain.NewError(domain.CodeValidation, "provider credential is unavailable")
 	}
-	var client *http.Client
-	if providerRow.BaseURL == "https://api.beichenapi.com" {
-		client = beichenCatalogHTTPClient
-	}
-	entries, fetchErr := catalog.FetchProviderModels(ctx, providerRow.BaseURL, plain, client)
+	entries, fetchErr := catalog.FetchProviderModels(ctx, providerRow.BaseURL, plain, nil)
 	if fetchErr != nil {
 		upstreamURL := strings.TrimRight(strings.TrimSpace(providerRow.BaseURL), "/") + "/v1/models"
 		return 0, nil, domain.WrapError(
@@ -382,7 +389,11 @@ func (s *Service) fetchAndStoreCredentialCatalogEntries(
 		)
 	}
 	entries = catalog.FilterProviderEntriesByCredential(credentialRow.Label, credentialRow.GroupHint, providerRow.BaseURL, entries)
-	count, upsertErr := syncer.UpsertCredentialEntries(ctx, providerRow.ID, credentialRow.ID, entries, syncedAt)
+	var revision *time.Time
+	if catalog.IsBeichenBaseURL(providerRow.BaseURL) {
+		revision = &credentialRow.UpdatedAt
+	}
+	count, upsertErr := syncer.UpsertCredentialEntries(ctx, providerRow.ID, credentialRow.ID, entries, syncedAt, revision)
 	if upsertErr != nil {
 		return 0, nil, domain.WrapError(domain.CodeDependencyUnavailable, "store provider catalog", upsertErr)
 	}
@@ -482,6 +493,16 @@ func (s *Service) ProviderCatalogCandidates(ctx context.Context, providerID uuid
 
 func (s *Service) ResolveCredentialForUpstream(ctx context.Context, providerID uuid.UUID, upstreamModelName string) (*uuid.UUID, error) {
 	upstreamModelName = strings.ToLower(strings.TrimSpace(upstreamModelName))
+	baseURL, err := s.db.Provider.Query().Where(provider.IDEQ(providerID)).Select(provider.FieldBaseURL).String(ctx)
+	if err != nil && !ent.IsNotFound(err) {
+		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "query provider", err)
+	}
+	if catalog.IsBeichenBaseURL(baseURL) {
+		// Resolve an unspecified key using exactly the same catalog order as
+		// the gateway and teacher's candidate preview.
+		id, _, err := catalog.FindActiveCatalogCredential(ctx, s.db, providerID, upstreamModelName, uuid.Nil)
+		return id, err
+	}
 	rows, err := s.db.ProviderModelCatalog.Query().
 		Where(
 			providermodelcatalog.ProviderIDEQ(providerID),

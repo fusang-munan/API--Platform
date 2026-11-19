@@ -5,6 +5,7 @@ import { teacherAPI } from '../../api/teacher'
 import type { BeichenComparison, BeichenImport, BeichenImportKind, BeichenModel, BeichenOverview, BeichenPriceUpdate, BeichenRates, Provider } from '../../api/types'
 import AppDialog from '../../components/AppDialog.vue'
 import BeichenCatalogAccess from './BeichenCatalogAccess.vue'
+import { priceFields, scaledNumber } from '../../utils/beichenModels'
 import LoadingButton from '../../components/LoadingButton.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
 import { useLoadState } from '../../composables/useLoadState'
@@ -12,12 +13,6 @@ import { fullTime } from '../../utils/format'
 
 const { provider } = defineProps<{ provider: Provider }>()
 
-const priceFields = [
-  { key: 'input', label: '输入' },
-  { key: 'output', label: '输出' },
-  { key: 'cache_read', label: '缓存读取' },
-  { key: 'cache_write', label: '缓存写入' },
-] as const
 const usageFields = [
   { local: 'local_requests', upstream: 'upstream_requests', label: '请求数' },
   { local: 'local_input_tokens', upstream: 'upstream_input_tokens', label: '输入' },
@@ -90,7 +85,7 @@ const credentialId = ref('')
 const importKind = ref<BeichenImportKind>('prices')
 const usageExportConfirmed = ref(false)
 const importMultiplier = computed(() => datasetRows.value.find(
-  row => row.kind === 'billing' && row.credential_id === credentialId.value,
+  row => row.kind === 'billing' && !row.last_error && row.credential_id === credentialId.value,
 )?.effective_multiplier)
 const csvInput = ref<HTMLInputElement>()
 const csvHintId = useId()
@@ -135,6 +130,7 @@ async function loadOverview(date: string) {
       const overview = await teacherAPI.beichenOverview(provider.id, date)
       snapshot.value = { day: date, overview }
     } catch (error) {
+      snapshot.value = undefined
       overviewError.value = operationError(error, '请检查网络后重试')
     }
   })
@@ -206,17 +202,9 @@ async function importCSV() {
   }, kind === 'usage_export' ? '明细已处理，请查看按日对账。' : 'CSV 已导入。', 'CSV 导入失败，请核对文件后重试')
 }
 
-function scaledNumber(value: number, digits: number, group = false) {
-  const scale = 10 ** digits
-  const absolute = Math.abs(value)
-  const whole = Math.floor(absolute / scale)
-  const fraction = String(absolute % scale).padStart(digits, '0').replace(/0+$/, '')
-  return `${value < 0 ? '-' : ''}${group ? integerFormat.format(whole) : whole}${fraction ? `.${fraction}` : ''}`
-}
-
-function amount(value: number | null | undefined, unit: 'USD' | 'credit', digits = 6) {
-  if (value == null) return '—'
+function amount(value: number | string | null | undefined, unit: 'USD' | 'credit', digits = 6) {
   const number = scaledNumber(value, digits, true)
+  if (number == null) return '—'
   return unit === 'USD' ? `${number} 单位` : `${number} credit`
 }
 
@@ -233,8 +221,8 @@ function count(value?: number | null) {
   return value == null ? '—' : integerFormat.format(value)
 }
 
-function multiplierLabel(value?: number | null) {
-  return value == null ? '—' : `${value}×`
+function multiplierLabel(value?: number | string | null) {
+  return value == null || value === '' ? '—' : `${value}×`
 }
 
 async function editPrice(row: BeichenModel, event: MouseEvent) {
@@ -243,7 +231,7 @@ async function editPrice(row: BeichenModel, event: MouseEvent) {
   priceMode.value = 'manual'
   for (const { key } of priceFields) {
     const rate = row.school_rates?.[key]
-    priceDraft[key] = rate == null ? '' : scaledNumber(rate, 6)
+    priceDraft[key] = scaledNumber(rate, 6) ?? ''
   }
   delete feedback.price
   await nextTick()
@@ -293,7 +281,7 @@ async function savePrice() {
   <AppDialog
     :open="open"
     :title="`${provider.name} · 同步与对账`"
-    description="查看北辰同步结果、核对每日用量、导入官方 CSV 和编辑校内模型价格。"
+    description="查看各渠道扫描结果、模型单价及开销，可按日期对账和维护报价。"
     wide
     @update:open="setOpen"
   >
@@ -308,7 +296,7 @@ async function savePrice() {
           <button type="button" class="button ghost" :disabled="busy" @click="loadOverview(requestedDay)">重新读取</button>
         </div>
 
-        <details class="beichen-section" open>
+        <details class="beichen-section">
           <summary>同步状态</summary>
           <div class="beichen-body">
             <div class="beichen-toolbar">
@@ -324,6 +312,7 @@ async function savePrice() {
                     <td>
                       {{ datasetLabels[row.kind] ?? row.kind }}
                       <strong v-if="row.kind === 'billing'" class="beichen-multiplier">{{ multiplierLabel(row.effective_multiplier) }}</strong>
+                      <small v-if="row.kind === 'billing' && row.last_error && row.effective_multiplier != null">上次记录，本次倍率未知</small>
                     </td>
                     <td>{{ fullTime(row.last_success) }}</td>
                     <td :class="{ error: row.last_error }">{{ row.last_error || '—' }}</td>
@@ -379,6 +368,7 @@ async function savePrice() {
           </div>
         </details>
 
+        <h3>高级维护</h3>
         <BeichenCatalogAccess :provider-id="provider.id" :credentials="credentials" />
         <details class="beichen-section">
           <summary>导入官方 CSV</summary>

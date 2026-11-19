@@ -85,11 +85,12 @@ func TestReceiptWorkerContinuesBusyDayAndRejectsLateDuplicate(t *testing.T) {
 	credential, response, duplicate := uuid.New(), uuid.New(), uuid.New()
 	now := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
 	day := now.In(beijing).Truncate(24 * time.Hour)
-	encrypted, err := manager.EncryptCredential(panelCredentialPrefix(credential) + "panel-fixture")
-	if err != nil {
-		t.Fatal(err)
-	}
-	expectAccess := func() {
+	expectAccess := func(token string) {
+		t.Helper()
+		encrypted, err := manager.EncryptCredential(panelCredentialPrefix(credential) + token)
+		if err != nil {
+			t.Fatal(err)
+		}
 		mock.ExpectQuery("SELECT a.token_ciphertext, a.upstream_key_id, a.updated_at").WithArgs(credential).
 			WillReturnRows(sqlmock.NewRows([]string{"token", "key", "revision"}).AddRow(encrypted, 42, now))
 	}
@@ -97,11 +98,13 @@ func TestReceiptWorkerContinuesBusyDayAndRejectsLateDuplicate(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "response", "key", "revision", "model", "sent", "finalized", "day"}).
 			AddRow(uuid.New(), response, 42, now, "model", now, now, day).
 			AddRow(uuid.New(), duplicate, 42, now, "model", now, now, day))
-	expectAccess()
+	expectAccess("panel-fixture")
 	mock.ExpectQuery("SELECT EXISTS.*jsonb_array_elements_text").WithArgs(credential, sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
-	expectAccess()
-	expectAccess()
+	expectAccess("panel-fixture")
+	// A short-lived bearer may refresh at the final check without changing
+	// the account, numeric key, or dispatch-time binding revision.
+	expectAccess("renewed-panel-fixture")
 	entries := make([]receiptRow, 502)
 	for i := range entries {
 		entries[i] = receiptFixture(now, int64(i+1), "")
@@ -152,6 +155,70 @@ func TestReceiptWorkerNoPendingDoesNotFetch(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReceiptRequiresPinnedBindingThroughoutRead(t *testing.T) {
+	now := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	credential, response := uuid.New(), uuid.New()
+	key := bytes.Repeat([]byte{7}, 32)
+	manager, err := security.NewManager(key, key, key, key, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := manager.EncryptCredential(panelCredentialPrefix(credential) + "panel-fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name      string
+		beforeKey int64
+		afterKey  int64
+		revision  time.Time
+		fetches   int
+	}{
+		{"no active binding", 0, 0, now, 0},
+		{"different key before read", 43, 0, now, 0},
+		{"binding disabled during read", 42, 0, now, 1},
+		{"different key after read", 42, 43, now, 1},
+		{"same key rebound during read", 42, 42, now.Add(time.Second), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			s := New(db, manager)
+			mock.ExpectQuery("WITH eligible AS").WithArgs(credential, time.Time{}, "", uuid.Nil, 400).
+				WillReturnRows(sqlmock.NewRows([]string{"id", "response", "key", "revision", "model", "sent", "finalized", "day"}).
+					AddRow(uuid.New(), response, 42, now, "model", now, now, now))
+			expectBinding := func(keyID int64, revision time.Time) {
+				rows := sqlmock.NewRows([]string{"token", "key", "revision"})
+				if keyID != 0 {
+					rows.AddRow(encrypted, keyID, revision)
+				}
+				mock.ExpectQuery("SELECT a.token_ciphertext, a.upstream_key_id, a.updated_at").
+					WithArgs(credential).WillReturnRows(rows)
+			}
+			expectBinding(tc.beforeKey, now)
+			if tc.fetches > 0 {
+				expectBinding(tc.afterKey, tc.revision)
+			}
+			var fetches int
+			s.client.Transport = receiptTestTransport(func(req *http.Request) (*http.Response, error) {
+				fetches++
+				return receiptListResponse(t, req, []receiptRow{receiptFixture(now, 1, "client:"+response.String())})
+			})
+			ledger := &receiptTestLedger{}
+			err = s.reconcileReceiptKey(context.Background(), ledger, credential, &receiptProgress{})
+			if err != nil || len(ledger.calls) != 0 || fetches != tc.fetches {
+				t.Fatalf("fetches=%d applied=%d: %v", fetches, len(ledger.calls), err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

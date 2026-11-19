@@ -8,7 +8,8 @@ import AppDialog from '../../components/AppDialog.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
 import { useLoadState } from '../../composables/useLoadState'
 import { useToast } from '../../composables/useToast'
-import TeacherBeichenDialog from './TeacherBeichenDialog.vue'
+import BeichenSchoolModels from './BeichenSchoolModels.vue'
+import { isBeichenProvider } from '../../utils/beichenModels'
 
 type KeyDraft = {
   id?: string
@@ -19,6 +20,7 @@ type KeyDraft = {
 }
 
 const rows = ref<Provider[]>([])
+const schoolProvider = ref<Provider>()
 const query = ref('')
 const status = ref('')
 const drawer = ref(false)
@@ -34,13 +36,6 @@ const loadState = useLoadState()
 const form = reactive({ name: '', base_url: '', status: 'active' as 'active' | 'inactive' })
 const keyRows = ref<KeyDraft[]>([])
 const deletedCredentialIds = ref<string[]>([])
-const beichenChannels = [
-  { name: 'Gemini', alias: '哈吉米' },
-  { name: 'GM1', alias: '国模' },
-  { name: 'G3', alias: 'gpt' },
-  { name: 'CC1', alias: 'cc不满血' },
-]
-const securePage = window.location.protocol === 'https:'
 
 const filtered = computed(() => rows.value.filter(p =>
   (!query.value || `${p.name} ${p.base_url}`.toLowerCase().includes(query.value.toLowerCase()))
@@ -51,14 +46,6 @@ const activeKey = computed(() => keyRows.value[activeKeyIndex.value] ?? null)
 
 function activeKeyCount(provider: Provider) {
   return (provider.credentials ?? []).filter(item => item.status === 'active').length
-}
-
-function isBeichenProvider(baseUrl: string) {
-  const address = baseUrl.trim()
-  const origin = 'https://api.beichenapi.com'
-  // URL parsing would normalize an explicit :443 and dot segments.
-  return address.slice(0, origin.length).toLowerCase() === origin
-    && ['', '/', '/v1', '/v1/'].includes(address.slice(origin.length))
 }
 
 function emptyKeyRow(): KeyDraft {
@@ -110,19 +97,6 @@ function addKeyRow() {
   keyRows.value.push(emptyKeyRow())
   activeKeyIndex.value = keyRows.value.length - 1
   revealKey.value = false
-}
-
-function selectBeichenChannel(channel: typeof beichenChannels[number]) {
-  const labels = [channel.name.toLowerCase(), channel.alias]
-  const existing = keyRows.value.findIndex(row => labels.includes(row.label.trim().toLowerCase()))
-  if (existing >= 0) {
-    selectKey(existing)
-    return
-  }
-  const blank = keyRows.value.findIndex(row => !row.id && !row.label.trim() && !row.key)
-  if (blank >= 0) selectKey(blank)
-  else addKeyRow()
-  keyRows.value[activeKeyIndex.value].label = channel.name
 }
 
 function removeActiveKey() {
@@ -179,10 +153,7 @@ async function saveKeys(providerId: string) {
 }
 
 async function save() {
-  if (!securePage && isBeichenProvider(form.base_url) && keyRows.value.some(row => row.key.trim())) {
-    toast.error('请在学校 HTTPS 教师端录入北辰 Key')
-    return
-  }
+  if (isBeichenProvider(form.base_url)) return
   if (!validateKeyRows()) return
   saving.value = true
   try {
@@ -298,9 +269,8 @@ onMounted(load)
         <article v-for="p in filtered" :key="p.id" class="list-row">
           <div>
             <strong>{{ p.name }}</strong>
-            <p class="muted">{{ p.base_url }} · {{ activeKeyCount(p) }} 个启用 Key / {{ (p.credentials ?? []).length }} 个 Key</p>
-            <span v-if="isBeichenProvider(p.base_url) && !p.credentials?.some(key => key.credential_configured)" class="chip">待配置 Key</span>
-            <div v-if="p.credentials?.length" class="chip-list">
+            <p v-if="!isBeichenProvider(p.base_url)" class="muted">{{ p.base_url }} · {{ activeKeyCount(p) }} 个启用 Key / {{ (p.credentials ?? []).length }} 个 Key</p>
+            <div v-if="!isBeichenProvider(p.base_url) && p.credentials?.length" class="chip-list">
               <span v-for="key in p.credentials" :key="key.id" class="chip">
                 {{ key.label }} · {{ key.status === 'active' ? '启用' : '停用' }}
               </span>
@@ -308,17 +278,22 @@ onMounted(load)
           </div>
           <div class="actions">
             <StatusBadge :status="p.status" />
-            <TeacherBeichenDialog v-if="isBeichenProvider(p.base_url)" :provider="p" />
+            <button v-if="isBeichenProvider(p.base_url)" class="button secondary" @click="schoolProvider = p">查看模型</button>
+            <template v-else>
             <button class="button secondary" :disabled="resetting === p.id" @click="resetCatalog(p)">{{ resetting === p.id ? '重置中…' : '配置重置' }}</button>
             <button class="button ghost" @click="open(p)">编辑</button>
             <button class="button danger" :disabled="deleting === p.id" @click="remove(p)">{{ deleting === p.id ? '删除中…' : '删除' }}</button>
             <button class="button" :class="p.status === 'active' ? 'danger' : 'secondary'" @click="toggle(p)">{{ p.status === 'active' ? '停用' : '启用' }}</button>
+            </template>
           </div>
         </article>
       </section>
     </LoadingRegion>
 
-    <AppDialog :open="drawer" :title="editing ? '编辑供应商' : '创建供应商'" @update:open="drawer = $event">
+    <AppDialog :open="Boolean(schoolProvider)" title="北辰模型" description="查看学校首选倍率并管理模型启用状态。" wide @update:open="open => { if (!open) schoolProvider = undefined }">
+      <BeichenSchoolModels v-if="schoolProvider" :provider-id="schoolProvider.id" />
+    </AppDialog>
+    <AppDialog :open="drawer" :title="editing ? '编辑供应商' : '创建供应商'" description="维护供应商地址、渠道凭据与启用状态。" @update:open="drawer = $event">
       <form class="provider-form" @submit.prevent="save">
         <div class="grid two">
           <label>名称<input v-model="form.name" required></label>
@@ -326,7 +301,8 @@ onMounted(load)
         </div>
         <label>Base URL<input v-model="form.base_url" type="url" required></label>
 
-        <section class="key-panel">
+        <p v-if="isBeichenProvider(form.base_url)" class="muted">北辰由学校后台统一管理。</p>
+        <section v-else class="key-panel">
           <div class="key-panel-head">
             <strong>Key</strong>
             <button v-if="keyRows.length > 1" type="button" class="button ghost danger-text" @click="removeActiveKey">删除当前 Key</button>
@@ -348,12 +324,6 @@ onMounted(load)
             <button type="button" class="key-tab add" aria-label="添加 Key" @click="addKeyRow">+</button>
           </div>
 
-          <div v-if="isBeichenProvider(form.base_url)" class="actions" aria-label="北辰渠道">
-            <span>北辰渠道</span>
-            <button v-for="channel in beichenChannels" :key="channel.name" type="button"
-              class="button ghost" @click="selectBeichenChannel(channel)">{{ channel.name }}</button>
-          </div>
-
           <div v-if="activeKey" class="key-editor">
             <label>Key 名称<input v-model="activeKey.label" required placeholder="例如 codex、claude"></label>
             <label>
@@ -361,12 +331,10 @@ onMounted(load)
               <input
                 v-model="activeKey.key"
                 :type="revealKey ? 'text' : 'password'"
-                :disabled="isBeichenProvider(form.base_url) && !securePage"
                 :required="!activeKey.id"
                 :placeholder="activeKey.id && activeKey.configured ? '已配置，留空保持不变' : 'sk-...'"
                 autocomplete="off"
               >
-              <span v-if="isBeichenProvider(form.base_url) && !securePage">请从学校 HTTPS 教师端录入北辰 Key。</span>
             </label>
             <div class="key-editor-row">
               <label class="grow">状态<select v-model="activeKey.status"><option value="active">启用</option><option value="inactive">停用</option></select></label>
@@ -375,7 +343,7 @@ onMounted(load)
           </div>
         </section>
 
-        <div class="actions"><button class="button primary" :disabled="saving">{{ saving ? '保存中…' : '保存' }}</button></div>
+        <div class="actions"><button class="button primary" :disabled="saving || isBeichenProvider(form.base_url)">{{ saving ? '保存中…' : '保存' }}</button></div>
       </form>
     </AppDialog>
   </section>

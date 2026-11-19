@@ -21,11 +21,19 @@ export type StudentProject = { id: string; organization_id: string; name: string
 export type Project = { id: string; organization_id: string; name: string; description?: string | null; status: ResourceStatus; has_mentor: boolean; mentors?: MentorSummary[]; is_responsible?: boolean; application_status?: ApplicationStatus; monthly_credit_quota: string }
 export type Model = { model_id: string; display_name: string; description?: string | null; category: ModelCategory; capabilities: ModelCapability[]; input_modalities: string[]; output_modalities: string[]; context_window?: number | null; max_input_tokens?: number | null; max_output_tokens?: number | null; is_common: boolean; status: ModelStatus; route_ready: boolean; credit_multiplier: string | null; upstream_metadata?: Record<string, unknown>; provider_id?: string; provider_name?: string; primary_adapter?: BindingAdapter | null; anthropic_ready?: boolean; responses_ready?: boolean; credential_id?: string; credential_label?: string }
 export type StudentModelPlaza = { common_models: Model[]; library_models: Model[] }
-export type UsageSlice = { id: string; name: string; credits: string; calls?: number }
+export type BeichenReceiptSpend = {
+  beichen_base_credits?: string | null
+  beichen_base_source?: string | null
+  beichen_school_multiplier?: string | null
+  beichen_charged_credits?: string | null
+  beichen_actual_cost?: string | null
+  beichen_unmatched_calls?: number | null
+}
+export type UsageSlice = BeichenReceiptSpend & { id: string; name: string; credits: string; calls?: number }
 export type KeyUsage = { id: string; name: string; status: ApiKeyStatus; used: string; available?: string; pending: string; pending_review?: boolean; models: UsageSlice[] }
 export type StudentProjectUsage = { project_id: string; project_name: string; quota: string; used: string; pending: string; available: string; pending_review?: boolean; keys: KeyUsage[] }
 export type StudentUsage = { month: string; projects: StudentProjectUsage[] }
-export type ProjectUsage = { month: string; project_id: string; project_name: string; quota: string; allocated: string; charged: string; pending: string; available: string; pending_review?: boolean; members: Array<{ user_id: string; user_name: string; quota: string; available: string; credits: string; pending_review?: boolean; keys: Array<{ id: string; name: string; status: ApiKeyStatus; used: string; pending_review?: boolean; models: UsageSlice[] }>; free_models: UsageSlice[] }>; models: UsageSlice[]; free_models: UsageSlice[] }
+export type ProjectUsage = { month: string; project_id: string; project_name: string; quota: string; allocated: string; charged: string; pending: string; available: string; pending_review?: boolean; members: Array<BeichenReceiptSpend & { is_student?: boolean; user_id: string; user_name: string; quota: string; available: string; credits: string; pending_review?: boolean; keys: Array<{ id: string; name: string; status: ApiKeyStatus; used: string; pending_review?: boolean; models: UsageSlice[] }>; free_models: UsageSlice[] }>; models: UsageSlice[]; free_models: UsageSlice[] }
 export type CallLog = { id: string; request_id: string; turn_id?: string; call_index?: number; project_id: string; project_name: string; user_id: string; user_name: string; api_key_id: string; api_key_name: string; model_id: string; model_name: string; provider_name: string; protocol: string; path: string; multiplier: string; credits: string; prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; billing_state: string; outcome: string; error_category: string; error_message: string; created_at: string; attempts?: Array<{ provider_name: string; status: string; error_category: string; error_message: string; http_status?: number; latency_ms: number }> }
 export type CallTurn = { id: string; project_id: string; project_name: string; user_id: string; user_name: string; api_key_id: string; api_key_name: string; model_id: string; model_name: string; task_key?: string; root_prompt: string; root_prompt_preview: string; root_prompt_bytes: number; call_count: number; credits: string; prompt_tokens: number; completion_tokens: number; total_tokens: number; outcome: string; started_at: string; finished_at?: string; calls?: CallLog[] }
 export type InputMonitorItem = { call_id: string; project_id: string; project_name: string; user_id: string; user_name: string; api_key_name: string; model_name: string; provider_name: string; credits: string; outcome: string; preview: string; content_bytes: number; truncated: boolean; created_at: string; content?: string }
@@ -78,13 +86,27 @@ export type BeichenDataset = {
   kind: string
   last_success?: string | null
   last_error?: string | null
-  effective_multiplier: number | null
+  effective_multiplier: number | string | null
 }
-type BeichenDisplayRates = Partial<Record<keyof BeichenRates, number | null>>
+type BeichenDisplayRates = Partial<Record<keyof BeichenRates, number | string | null>>
+type BeichenPanelPrice = 'input_price' | 'output_price' | 'cache_read_price' | 'cache_write_price' |
+  'cache_write_1h_price' | 'cache_write_12h_price' | 'image_input_price' | 'image_output_price' | 'per_request_price'
+export type BeichenPriceTier = Partial<Record<BeichenPanelPrice | 'min_tokens' | 'max_tokens', number | string | null>>
+export type BeichenPriceConditions = BeichenPriceTier & {
+  billing_mode?: string
+  intervals?: BeichenPriceTier[] | null
+  reasoning_effort_multipliers?: Record<string, number | string | null> | null
+}
+export type BeichenSchoolStatus = ModelStatus | 'not_configured'
 export type BeichenModel = {
   credential_id: string
   model: string
   mode: BeichenPriceUpdate['mode']
+  school_status?: BeichenSchoolStatus | null
+  route_ready?: boolean | null
+  price_status?: 'confirmed' | 'pending_confirmation' | 'conditional' | null
+  price_conditions?: BeichenPriceConditions | null
+  price_conditions_exact?: BeichenPriceConditions | null
   upstream_rates?: BeichenDisplayRates | null
   school_rates?: BeichenDisplayRates | null
 }
@@ -111,9 +133,24 @@ export type BeichenComparison = {
   trial_unpriced_calls: number | null
 }
 export type BeichenOverview = {
+  web_login_required?: boolean | null
+  model_catalog?: BeichenCatalogModel[] | null
   datasets: BeichenDataset[] | null
   models: BeichenModel[] | null
   comparison: BeichenComparison[] | null
+}
+export type BeichenCatalogModel = {
+  model: string
+  school_model?: string | null
+  school_status?: BeichenSchoolStatus | null
+  can_enable?: boolean | null
+  credential_ids?: string[]
+  preferred_routes?: BeichenPreferredRoute[] | null
+}
+export type BeichenPreferredRoute = {
+  school_model: string; upstream_model?: string; adapter: string; provider_id: string; credential_id?: string | null
+  priority: number; state: 'ready' | 'candidate'; effective_multiplier?: number | string | null
+  effective_multiplier_text?: string | null
 }
 export type ProbeEndpoint = 'chat_completions'|'responses'|'messages'|'embeddings'|'rerank'
 export type ProbeResponse = { results:Array<{endpoint:ProbeEndpoint|'models';path:string;http_status:number;duration_ms:number;truncated:boolean;error?:string;limits:{context_window?:number;max_input_tokens?:number;max_output_tokens?:number}}>;configuration:{description?:string;category?:ModelCategory;capabilities?:ModelCapability[];input_modalities?:string[];output_modalities?:string[];context_window?:number;max_input_tokens?:number;max_output_tokens?:number} }

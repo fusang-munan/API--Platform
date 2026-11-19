@@ -29,8 +29,6 @@ type syncJob struct {
 
 type credentialRecord struct {
 	ciphertext []byte
-	label      string
-	groupHint  *string
 	updatedAt  time.Time
 }
 
@@ -150,10 +148,10 @@ RETURNING lease_id`, job.credential, job.kind, lease, leaseSeconds, manual).Scan
 	}
 	var credential credentialRecord
 	err = s.db.QueryRowContext(ctx, `
-SELECT c.credential_ciphertext, c.label::text, c.group_hint, c.updated_at
+SELECT c.credential_ciphertext, c.updated_at
 FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
 WHERE c.id = $1 AND p.id = $2 AND p.status = 'active' AND c.status = 'active' AND `+beichenProvider,
-		job.credential, job.provider).Scan(&credential.ciphertext, &credential.label, &credential.groupHint, &credential.updatedAt)
+		job.credential, job.provider).Scan(&credential.ciphertext, &credential.updatedAt)
 	if err != nil {
 		result := fetchResult{err: errors.New("读取已启用的北辰凭据失败")}
 		return false, s.finishJob(ctx, job, lease, credential, result, manual)
@@ -178,15 +176,16 @@ func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credenti
 		if err == nil {
 			info, err = parseBilling(body)
 		}
-		token, group, accessErr := s.panelAccess(ctx, job.credential)
+		access, accessErr := s.PanelStatus(ctx, job.provider, job.credential)
+		group := access.GroupID
 		var quote panelQuote
-		if accessErr != nil || (token == "") != (group == 0) || group < 0 {
+		if accessErr != nil {
 			quote.err = errors.New("读取北辰面板配置失败")
 		} else if group != 0 && err == nil {
 			if info.ObservedAt.Before(requestedAt.Add(-2 * time.Second)) {
 				quote.err = errors.New("北辰 Key 账单报价早于本轮采样")
 			} else {
-				quote = s.fetchPanelQuote(ctx, token, key, group, info)
+				quote = s.fetchChannelQuote(ctx, job, key, group, info)
 			}
 		}
 		return fetchResult{err: err, save: func(ctx context.Context, tx *sql.Tx) error {
@@ -199,29 +198,14 @@ func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credenti
 		if err != nil {
 			return fetchResult{err: err}
 		}
-		entries, err := catalog.ParseProviderModels(body)
-		if err != nil || len(entries) > maxRows {
+		entries, err := catalog.ParseBeichenModels(body)
+		if err != nil {
 			return fetchResult{err: errors.New("北辰模型目录格式无效或超过 2000 条")}
 		}
-		entries = catalog.FilterProviderEntriesByCredential(credential.label, credential.groupHint, origin, entries)
-		if len(entries) == 0 {
-			return fetchResult{err: errors.New("北辰目录未返回适用于此凭据的模型")}
-		}
-		// The catalog writer owns its transaction. The job lease covers the fetch
-		// and write; validate credential changes before applying the fetched data.
-		var valid bool
-		err = s.db.QueryRowContext(ctx, `SELECT EXISTS (
-  SELECT 1 FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
-  WHERE c.id = $1 AND p.id = $2 AND c.updated_at = $3 AND c.status = 'active' AND p.status = 'active' AND `+beichenProvider+`
-)`, job.credential, job.provider, credential.updatedAt).Scan(&valid)
-		if err != nil || !valid {
-			return fetchResult{err: errors.New("同步期间北辰凭据或供应商已变化")}
-		}
-		syncer := &catalog.ProviderCatalogSyncer{DB: s.db}
-		if _, err := syncer.UpsertCredentialEntries(ctx, job.provider, job.credential, entries, s.now().UTC()); err != nil {
-			return fetchResult{err: errors.New("保存北辰模型目录失败")}
-		}
-		return fetchResult{}
+		return fetchResult{save: func(ctx context.Context, tx *sql.Tx) error {
+			_, err := catalog.ReplaceCredentialEntries(ctx, tx, job.provider, job.credential, entries, s.now().UTC())
+			return err
+		}}
 	default:
 		return fetchResult{err: errors.New("北辰同步任务类型无效")}
 	}

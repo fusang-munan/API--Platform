@@ -14,11 +14,22 @@ import (
 
 func TestUsageJSONContractUsesSnakeCase(t *testing.T) {
 	t.Parallel()
-	raw, err := json.Marshal(ProjectUsage{ProjectID: "project", ProjectName: "Project", Quota: "20.000", Members: []MemberUsage{{UserID: "user", UserName: "User", Quota: "2.000", Available: "1.000", Keys: []KeyMemberUsage{{ID: "key", Used: "1.000", Models: []UsageSlice{{ID: "model", Name: "Free"}}}}, FreeModels: []UsageSlice{{ID: "model", Name: "Free", Credits: "0.000", Calls: 3}}}}, Models: []UsageSlice{}, FreeModels: []UsageSlice{{ID: "model", Name: "Free", Credits: "0.000", Calls: 3}}})
+	raw, err := json.Marshal(ProjectUsage{
+		ProjectID: "project", ProjectName: "Project", Quota: "20.000",
+		Members: []MemberUsage{{
+			UserID: "user", UserName: "User", Quota: "2.000", Available: "1.000",
+			Keys:       []KeyMemberUsage{{ID: "key", Used: "1.000", Models: []ProjectModelUsage{{UsageSlice: UsageSlice{ID: "model", Name: "Free"}}}}},
+			FreeModels: []UsageSlice{{ID: "model", Name: "Free", Credits: "0.000", Calls: 3}},
+		}},
+		Models: []ProjectModelUsage{}, FreeModels: []UsageSlice{{ID: "model", Name: "Free", Credits: "0.000", Calls: 3}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(raw)
+	if strings.Count(text, `"beichen_actual_cost":null`) != 2 || strings.Count(text, `"beichen_unmatched_calls":0`) != 2 {
+		t.Fatalf("missing receipt fields on member or key model: %s", text)
+	}
 	for _, field := range []string{`"project_id"`, `"project_name"`, `"quota"`, `"members"`, `"user_id"`, `"keys"`, `"models"`, `"free_models"`, `"calls":3`} {
 		if !strings.Contains(text, field) {
 			t.Fatalf("missing %s in %s", field, text)
@@ -162,9 +173,9 @@ func TestApproveKeyBindsProjectBucketMonth(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT quota_milli,allocated_milli FROM project_month_credit_buckets WHERE project_id=$1 AND month=$2 FOR UPDATE`)).
 		WithArgs(projectID, month).
 		WillReturnRows(sqlmock.NewRows([]string{"quota_milli", "allocated_milli"}).AddRow(int64(20_000_000), int64(0)))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COALESCE(monthly_credit_quota_milli,0) FROM project_members WHERE project_id=$1 AND user_id=$2`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT monthly_credit_quota_milli,teacher_quota_assigned FROM project_members WHERE project_id=$1 AND user_id=$2`)).
 		WithArgs(projectID, ownerID).
-		WillReturnRows(sqlmock.NewRows([]string{"monthly_credit_quota_milli"}).AddRow(int64(0)))
+		WillReturnRows(sqlmock.NewRows([]string{"monthly_credit_quota_milli", "teacher_quota_assigned"}).AddRow(int64(500000), true))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE api_keys SET monthly_credit_quota_milli=0,mentor_monthly_credit_quota_milli=$1,status='approved',updated_at=$2 WHERE id=$3 AND status='pending_mentor'`)).
 		WithArgs(int64(500_000), sqlmock.AnyArg(), keyID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -188,7 +199,7 @@ func TestApproveKeyBindsProjectBucketMonth(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
-	approvedOwnerID, err := store.ApproveKey(context.Background(), teacherID, keyID, 500_000, "")
+	approvedOwnerID, err := store.ApproveKey(context.Background(), teacherID, keyID, 100_000, "")
 	if err != nil {
 		t.Fatalf("approve key: %v", err)
 	}

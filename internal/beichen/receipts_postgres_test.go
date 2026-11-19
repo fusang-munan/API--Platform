@@ -26,8 +26,8 @@ func TestReceiptSweepPostgresG3(t *testing.T) {
 	}
 	config, err := pgx.ParseConfig(dsn)
 	if err != nil || config.Host != "127.0.0.1" || config.Database != "nebula_test" ||
-		config.User != "nebula_qa" || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
-		t.Fatal("requires loopback PostgreSQL as nebula_qa/nebula_test with sslmode=disable")
+		(config.User != "nebula_qa" && config.User != "nebula_test") || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
+		t.Fatal("requires the loopback nebula_test database with a test role and sslmode=disable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
@@ -84,6 +84,8 @@ func TestReceiptSweepPostgresG3(t *testing.T) {
 		VALUES($1,'Beichen',$2,now(),now())`, provider, origin)
 	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
 		VALUES($1,$2,'G3','fixture',now(),now())`, credential, provider)
+	exec(`INSERT INTO beichen_provision_channels(credential_id,channel,key_fingerprint,discover_ids)
+		VALUES($1,'G3',decode(repeat('34',32),'hex'),false)`, credential)
 
 	secret := bytes.Repeat([]byte{7}, 32)
 	manager, err := security.NewManager(secret, secret, secret, secret, time.Minute)
@@ -177,10 +179,120 @@ func TestReceiptSweepPostgresG3(t *testing.T) {
 	sweep()
 	assertLedger("pending_review", "0", 0)
 	sweep()
-	assertLedger("charged", "14.352", 1)
+	assertLedger("charged", "15.7872", 1)
 	sweep()
-	assertLedger("charged", "14.352", 1)
+	assertLedger("charged", "15.7872", 1)
 	if requests != 6 {
 		t.Fatalf("got %d HTTP requests, want four pages, boundary recheck and final page only", requests)
 	}
+	t.Run("already charged is linked once in the bounded window", func(t *testing.T) {
+		if err := s.ConfigureWebSession("school@example.test", "fixture-password"); err != nil {
+			t.Fatal(err)
+		}
+		binding, err := s.DeploymentPanelAccess(3, upstreamKeyID, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetPanelAccess(ctx, provider, credential, teacher, binding); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		var revision time.Time
+		if err := tx.QueryRowContext(ctx, `SELECT updated_at FROM provider_credentials WHERE id=$1`, credential).Scan(&revision); err != nil {
+			t.Fatal(err)
+		}
+		rate, zero := int64(2000000), int64(0)
+		quote := panelQuote{rows: []priceRow{{Model: modelName, Rates: Rates{Input: &rate, Output: &rate, CacheRead: &zero, CacheWrite: &zero}}}, expiresAt: revision.Add(time.Hour)}
+		if err := saveBillingObservation(ctx, tx, credential, revision, billingInfo{Multiplier: "1"}, nil, 3, quote); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		booked, err := store.Reserve(ctx, key, model, uuid.NewString(), "openai_responses", "/v1/responses", "", "", usage.CallCorrelation{}, route)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.PrepareDispatch(ctx, booked.CallID, route); err != nil {
+			t.Fatal(err)
+		}
+		responseID := uuid.New()
+		if err := store.RecordBeichenReceiptID(ctx, booked.CallID, credential, responseID); err != nil {
+			t.Fatal(err)
+		}
+		route.SentAt = time.Now().UTC().Truncate(time.Microsecond)
+		one := int64(1)
+		if err := store.Finalize(ctx, booked, true, "succeeded", "", "", route, usage.CallMetrics{
+			State: usage.UsageReported, PromptTokens: &one, CompletionTokens: &zero, CacheHitTokens: &zero, CacheWriteTokens: &zero,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var lookups, logins int
+		var bookedState string
+		if err := db.QueryRowContext(ctx, `SELECT beichen_state FROM gateway_calls WHERE id=$1`, booked.CallID).Scan(&bookedState); err != nil || bookedState != "charged" {
+			t.Fatalf("expected local charge before receipt scan, state=%s: %v", bookedState, err)
+		}
+		s.client.Transport = receiptTestTransport(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Scheme != "https" || req.URL.Host != "beichenapi.com" {
+				t.Fatal("unexpected site for the web session fixture")
+			}
+			if req.Method == http.MethodPost && req.URL.Path == "/api/v1/auth/login" {
+				logins++
+				raw := `{"code":0,"data":{"access_token":"school-web-fixture","token_type":"Bearer","expires_in":3600,"user":{"id":17,"email":"school@example.test"}}}`
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewBufferString(raw))}, nil
+			}
+			if req.Method != http.MethodGet || req.URL.Path != "/api/v1/usage" ||
+				req.URL.Query().Get("api_key_id") != "42" || req.Header.Get("Authorization") != "Bearer school-web-fixture" {
+				t.Fatal("usage lookup did not use the bound numeric key and website session")
+			}
+			lookups++
+			row := receiptFixture(route.SentAt, 503, "client:"+responseID.String())
+			row.Model = modelName
+			raw, err := json.Marshal(map[string]any{"code": 0, "data": map[string]any{
+				"items": []receiptRow{row}, "total": 1, "page": 1, "page_size": receiptPageSize, "pages": 1,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(raw))}, nil
+		})
+		exec(`UPDATE gateway_calls SET created_at=now()-interval '8 days' WHERE id=$1`, booked.CallID)
+		sweep()
+		if lookups != 0 || logins != 0 {
+			t.Fatal("scanned a charged call outside the backfill window")
+		}
+		exec(`UPDATE gateway_calls SET created_at=sent_at WHERE id=$1`, booked.CallID)
+		sweep()
+		sweep()
+		var applied bool
+		var actual, credits, total string
+		err = db.QueryRowContext(ctx, `SELECT applied,trim_scale(actual_cost)::text,trim_scale(credits_booked)::text,
+			(SELECT trim_scale(charged_milli+charged_milli_remainder)::text FROM project_month_credit_buckets)
+			FROM beichen_call_receipts WHERE call_id=$1`, booked.CallID).Scan(&applied, &actual, &credits, &total)
+		if err != nil || logins != 1 || lookups != 1 || applied || actual != "0.0001435200000000001" || credits != "0.00022" || total != "16.0072" {
+			t.Fatalf("logins=%d lookups=%d applied=%t actual=%s credits=%s project milli=%s: %v", logins, lookups, applied, actual, credits, total, err)
+		}
+		// A corrected website charge changes the comparison only.
+		exec(`INSERT INTO beichen_upstream_usage_rows(upstream_user_id,row_id,upstream_key_id,provider_id,credential_id,channel,
+			request_id,model,occurred_at,actual_cost,billing_type,cost_details)
+			SELECT 17,row_id,api_key_id,$2,credential_id,'G3','client:'||response_id::text,
+			model,occurred_at,0.00001,0,'{}'::jsonb FROM beichen_call_receipts WHERE call_id=$1`, booked.CallID, provider)
+		var stamp time.Time
+		if err := db.QueryRowContext(ctx, "SELECT occurred_at FROM beichen_call_receipts WHERE call_id=$1", booked.CallID).Scan(&stamp); err != nil {
+			t.Fatal(err)
+		}
+		view, err := s.Overview(ctx, provider, stamp.In(beijing).Format(dayLayout))
+		if err != nil || len(view.ArchivedUsage) != 1 {
+			t.Fatalf("read observed amount: %v, %v", view.ArchivedUsage, err)
+		}
+		group := view.ArchivedUsage[0]
+		if group.UnmatchedRows != 0 || group.MatchedChargedCredits == nil || *group.MatchedChargedCredits != credits ||
+			group.MarginCredits == nil || *group.MarginCredits != "-0.00078" {
+			t.Fatalf("unexpected corrected comparison: %+v", group)
+		}
+	})
 }
