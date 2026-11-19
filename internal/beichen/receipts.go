@@ -34,11 +34,12 @@ const eligibleReceiptCalls = `
 FROM gateway_calls c
 JOIN beichen_receipt_response_claims r ON r.response_id=c.beichen_receipt_response_id
  AND r.first_call_id=c.id AND r.conflicted_at IS NULL
-JOIN beichen_panel_access a ON a.credential_id=c.beichen_dispatch_credential_id
+JOIN beichen_receipt_active_bindings a ON a.credential_id=c.beichen_dispatch_credential_id
  AND a.upstream_key_id=c.beichen_receipt_api_key_id AND a.updated_at=c.beichen_receipt_panel_revision
-JOIN provider_credentials pc ON pc.id=a.credential_id AND pc.updated_at=a.updated_at AND pc.status='active'
-JOIN providers p ON p.id=pc.provider_id AND p.status='active'
-WHERE ` + beichenProvider + ` AND c.beichen_state='pending_review' AND c.beichen_dispatch_kind='beichen'
+WHERE c.beichen_dispatch_kind='beichen'
+ AND (c.beichen_state='pending_review' OR
+      (c.beichen_state='charged' AND c.created_at >= now()-interval '7 days'))
+ AND NOT EXISTS (SELECT 1 FROM beichen_call_receipts linked WHERE linked.call_id=c.id)
  AND c.beichen_receipt_response_id IS NOT NULL AND c.beichen_receipt_api_key_id IS NOT NULL
  AND NOT c.beichen_receipt_conflict AND c.sent_at IS NOT NULL AND c.finalized_at IS NOT NULL`
 
@@ -94,6 +95,7 @@ type receiptPage struct {
 }
 
 type receiptRow struct {
+	receiptCostDetails
 	ID             int64           `json:"id"`
 	UserID         int64           `json:"user_id"`
 	KeyID          int64           `json:"api_key_id"`
@@ -110,11 +112,30 @@ type receiptRow struct {
 	CreatedAt      time.Time       `json:"created_at"`
 }
 
+// Only website billing fields are archived. Arbitrary response metadata, prompts,
+// session material and raw API keys are never part of this projection.
+type receiptCostDetails struct {
+	InputCost      *json.Number `json:"input_cost,omitempty"`
+	OutputCost     *json.Number `json:"output_cost,omitempty"`
+	CacheReadCost  *json.Number `json:"cache_read_cost,omitempty"`
+	CacheWriteCost *json.Number `json:"cache_creation_cost,omitempty"`
+	TotalCost      *json.Number `json:"total_cost,omitempty"`
+	RateMultiplier *json.Number `json:"rate_multiplier,omitempty"`
+	CacheWrite5m   *int64       `json:"cache_creation_5m_tokens,omitempty"`
+	CacheWrite1h   *int64       `json:"cache_creation_1h_tokens,omitempty"`
+}
+
 // RunReceipts polls independently of the price and daily usage workers.
 func (s *Service) RunReceipts(ctx context.Context, ledger *usage.Store) {
 	if s.db == nil || s.crypto == nil || ledger == nil {
 		return
 	}
+	archiveDone := make(chan struct{})
+	go func() {
+		defer close(archiveDone)
+		s.runUpstreamUsage(ctx)
+	}()
+	defer func() { <-archiveDone }()
 	var keyCursor uuid.UUID
 	progress := make(map[uuid.UUID]*receiptProgress)
 	for ctx.Err() == nil {
@@ -280,10 +301,11 @@ func (s *Service) reconcileReceiptKey(ctx context.Context, ledger receiptApplier
 	if err != nil || !complete {
 		return err
 	}
-	// Rotation or revocation during pagination invalidates the whole result.
+	// A managed web session can refresh its bearer while the same account/key
+	// binding remains active. Configuration changes invalidate the pinned revision.
 	current, currentKey, currentRevision, err := s.PanelUsageAccess(ctx, credential)
 	state.cursor, state.scan = scan.next, nil
-	if err != nil || current != token || currentKey != keyID || !currentRevision.Equal(revision) {
+	if err != nil || current == "" || currentKey != keyID || !currentRevision.Equal(revision) {
 		return err
 	}
 	for id, row := range scan.matches {
@@ -344,7 +366,7 @@ func (s *Service) scanReceiptPages(ctx context.Context, token string, scan *rece
 		}
 		data, err := fetchReceiptPage(ctx, &client, token, query, page)
 		if err != nil {
-			return false, err
+			return false, s.webReadError(token, err)
 		}
 		total := *data.Data.Total
 		if total < scan.total {
@@ -420,7 +442,10 @@ func fetchReceiptPage(ctx context.Context, client *http.Client, token string, qu
 		pages++
 	}
 	pages = max(1, pages)
-	if data.Pages != pages || page > pages ||
+	if total == 0 && data.Pages == 0 {
+		envelope.Data.Pages = 1
+	}
+	if envelope.Data.Pages != pages || page > pages ||
 		len(data.Items) != min(receiptPageSize, total-(page-1)*receiptPageSize) {
 		return receiptPage{}, errReceiptPagination
 	}

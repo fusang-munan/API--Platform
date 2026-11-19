@@ -20,7 +20,8 @@ export function modelProviderLabel(model: Pick<Model, 'provider_name'>) {
   return model.provider_name?.trim() || '—'
 }
 
-export function modelCreditsLabel(model: Pick<Model, 'credit_multiplier'>) {
+export function modelCreditsLabel(model: Pick<Model, 'credit_multiplier' | 'provider_name'>) {
+  if (model.provider_name?.trim() === '北辰') return '基础积分 × 1.10'
   return model.credit_multiplier ? `${model.credit_multiplier} 点/次` : '未配置'
 }
 
@@ -28,6 +29,6 @@ export function catalogProviderLabel(item: Pick<ModelCatalogCandidate, 'provider
   return item.provider_name?.trim() || '—'
 }
 
-export function catalogCreditsLabel(item: Pick<ModelCatalogCandidate, 'credit_multiplier'>) {
-  return item.credit_multiplier ? `${item.credit_multiplier} 点/次` : '未配置'
+export function catalogCreditsLabel(item: Pick<ModelCatalogCandidate, 'credit_multiplier' | 'provider_name'>) {
+  return modelCreditsLabel({ provider_name: item.provider_name, credit_multiplier: item.credit_multiplier ?? null })
 }

@@ -52,27 +52,44 @@ ON CONFLICT(project_id,month) DO NOTHING`, projectID, month, now)
 }
 
 func (s *Store) UpdateMemberQuota(ctx context.Context, mentorID, projectID, userID uuid.UUID, quota int64, reason string) error {
+	return s.updateMemberQuota(ctx, mentorID, projectID, userID, quota, reason, false)
+}
+
+func (s *Store) UpdateStudentQuotaAsTeacher(ctx context.Context, teacherID, projectID, userID uuid.UUID, quota int64, reason string) error {
+	return s.updateMemberQuota(ctx, teacherID, projectID, userID, quota, reason, true)
+}
+
+func (s *Store) updateMemberQuota(ctx context.Context, actorID, projectID, userID uuid.UUID, quota int64, reason string, asTeacher bool) error {
 	if quota < 0 || quota > domain.MaxCreditMilli {
 		return domain.NewError(domain.CodeValidation, "monthly credits are out of range")
 	}
 	reason = strings.TrimSpace(reason)
-	var responsible bool
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM project_members WHERE project_id=$1 AND user_id=$2)`, projectID, mentorID).Scan(&responsible); err != nil {
-		return err
-	}
-	if !responsible {
-		return domain.NewError(domain.CodeNotFound, "project member not found")
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err = tx.ExecContext(ctx, `SELECT id FROM projects WHERE id=$1 FOR UPDATE`, projectID); err != nil {
+	var allowed bool
+	if asTeacher {
+		err = tx.QueryRowContext(ctx, `SELECT true FROM projects p
+			JOIN users actor ON actor.id=$2 AND actor.role='teacher' AND actor.status='active'
+			JOIN users student ON student.id=$3 AND student.role='student' AND student.status='active'
+			JOIN student_profiles sp ON sp.user_id=student.id AND sp.status='active'
+			WHERE p.id=$1 AND p.status='active' FOR UPDATE OF p FOR SHARE OF actor,student,sp`, projectID, actorID, userID).Scan(&allowed)
+	} else {
+		err = tx.QueryRowContext(ctx, `SELECT true FROM projects p
+			JOIN project_members pm ON pm.project_id=p.id AND pm.user_id=$2
+			WHERE p.id=$1 FOR UPDATE OF p FOR SHARE OF pm`, projectID, actorID).Scan(&allowed)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.NewError(domain.CodeNotFound, "project member not found")
+	}
+	if err != nil {
 		return err
 	}
 	var oldQuota int64
-	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(monthly_credit_quota_milli,0) FROM project_members WHERE project_id=$1 AND user_id=$2 FOR UPDATE`, projectID, userID).Scan(&oldQuota); errors.Is(err, sql.ErrNoRows) {
+	var teacherAssigned bool
+	if err = tx.QueryRowContext(ctx, `SELECT monthly_credit_quota_milli,teacher_quota_assigned FROM project_members WHERE project_id=$1 AND user_id=$2 FOR UPDATE`, projectID, userID).Scan(&oldQuota, &teacherAssigned); errors.Is(err, sql.ErrNoRows) {
 		return domain.NewError(domain.CodeNotFound, "project member not found")
 	} else if err != nil {
 		return err
@@ -88,11 +105,11 @@ func (s *Store) UpdateMemberQuota(ctx context.Context, mentorID, projectID, user
 	if err = ensureMemberMonthBucketTx(ctx, tx, projectID, userID, month, now); err != nil {
 		return err
 	}
-	var charged, pending int64
-	if err = tx.QueryRowContext(ctx, `SELECT charged_milli,pending_milli FROM project_member_month_credit_buckets WHERE project_id=$1 AND user_id=$2 AND month=$3 FOR UPDATE`, projectID, userID, month).Scan(&charged, &pending); err != nil {
+	var coversUsage bool
+	if err = tx.QueryRowContext(ctx, `SELECT $4::numeric >= charged_milli+charged_milli_remainder+pending_milli FROM project_member_month_credit_buckets WHERE project_id=$1 AND user_id=$2 AND month=$3 FOR UPDATE`, projectID, userID, month, quota).Scan(&coversUsage); err != nil {
 		return err
 	}
-	if quota < charged+pending {
+	if !coversUsage {
 		return domain.NewError(domain.CodeValidation, "member quota cannot be lower than charged plus pending credits")
 	}
 	var allocated int64
@@ -102,7 +119,7 @@ func (s *Store) UpdateMemberQuota(ctx context.Context, mentorID, projectID, user
 	if allocated-oldQuota+quota > projectQuota {
 		return domain.NewError(domain.CodeProjectQuotaAllocation, "project quota allocation exceeded")
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE project_members SET monthly_credit_quota_milli=$1 WHERE project_id=$2 AND user_id=$3`, quota, projectID, userID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE project_members SET monthly_credit_quota_milli=$1,teacher_quota_assigned=(teacher_quota_assigned OR $4) WHERE project_id=$2 AND user_id=$3`, quota, projectID, userID, asTeacher); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE project_member_month_credit_buckets SET quota_milli=$1,updated_at=$2 WHERE project_id=$3 AND user_id=$4 AND month=$5`, quota, now, projectID, userID, month); err != nil {
@@ -111,7 +128,10 @@ func (s *Store) UpdateMemberQuota(ctx context.Context, mentorID, projectID, user
 	if err = syncProjectAllocatedTx(ctx, tx, projectID, month, now); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO quota_adjustment_audits(id,owner_type,owner_id,actor_user_id,old_quota_milli,new_quota_milli,reason,created_at) VALUES(gen_random_uuid(),'member',$1,$2,$3,$4,NULLIF($5,''),$6)`, userID, mentorID, oldQuota, quota, reason, now); err != nil {
+	if asTeacher && teacherAssigned && oldQuota == quota {
+		return tx.Commit()
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO quota_adjustment_audits(id,owner_type,owner_id,actor_user_id,old_quota_milli,new_quota_milli,reason,created_at,project_id) VALUES(gen_random_uuid(),'member',$1,$2,$3,$4,NULLIF($5,''),$6,$7)`, userID, actorID, oldQuota, quota, reason, now, projectID); err != nil {
 		return err
 	}
 	return tx.Commit()

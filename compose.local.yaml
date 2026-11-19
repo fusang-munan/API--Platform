@@ -31,6 +31,7 @@ services:
     environment:
       LAB_MAINTENANCE_TLS_ADDR: ":8443"
       LAB_MAINTENANCE_TLS_DIR: /app/maintenance-tls
+      LAB_BEICHEN_SEAL_DIR: /app/maintenance-tls/beichen-delivery
       LAB_MAINTENANCE_TLS_ORIGIN: https://106.55.103.208:25555
       LAB_MAINTENANCE_RELEASE: ${NEBULA_VERSION:?use scripts/compose-local.sh}
       # Optional one-time public certificate notification. See docs/FRP_PUBLIC_ACCESS.md.
@@ -39,6 +40,9 @@ services:
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       BEICHEN_PANEL_TOKEN: ${BEICHEN_PANEL_TOKEN:-}
+      BEICHEN_CHANNELS_JSON: ${BEICHEN_CHANNELS_JSON:-}
+      BEICHEN_WEB_EMAIL: ${BEICHEN_WEB_EMAIL:-}
+      BEICHEN_WEB_PASSWORD: ${BEICHEN_WEB_PASSWORD:-}
       BEICHEN_PANEL_GROUPS: ${BEICHEN_PANEL_GROUPS:-}
       NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost,postgres,redis,172.30.10.1}
     volumes:

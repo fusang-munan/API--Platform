@@ -22,6 +22,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/privatefile"
 )
 
 const identityName = "identity.pem"
@@ -39,6 +41,13 @@ func LoadOrCreate(dir string, publicURL string) (tls.Certificate, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return tls.Certificate{}, fmt.Errorf("create maintenance TLS directory: %w", err)
 	}
+	info, err := os.Lstat(filepath.Clean(dir))
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("inspect maintenance TLS directory: %w", err)
+	}
+	if !info.IsDir() || (runtime.GOOS != "windows" && info.Mode().Perm()&0022 != 0) {
+		return tls.Certificate{}, errors.New("maintenance TLS directory must be a directory writable only by its owner")
+	}
 	path := filepath.Join(dir, identityName)
 	cert, err := loadIdentity(path, host, time.Now())
 	if !errors.Is(err, os.ErrNotExist) {
@@ -48,7 +57,7 @@ func LoadOrCreate(dir string, publicURL string) (tls.Certificate, error) {
 	if err != nil {
 		return tls.Certificate{}, err
 	}
-	if err := publishIdentity(dir, path, data); err != nil {
+	if err := privatefile.PublishOnce(dir, path, data); err != nil {
 		return tls.Certificate{}, err
 	}
 	return loadIdentity(path, host, time.Now())
@@ -124,29 +133,6 @@ func generateIdentity(host string, now time.Time) ([]byte, error) {
 	}
 	return append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
 		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})...), nil
-}
-
-func publishIdentity(dir, path string, data []byte) error {
-	file, err := os.CreateTemp(dir, ".identity-*.tmp")
-	if err != nil {
-		return fmt.Errorf("stage maintenance TLS identity: %w", err)
-	}
-	defer os.Remove(file.Name())
-	defer file.Close()
-	if _, err := file.Write(data); err != nil {
-		return fmt.Errorf("write maintenance TLS identity: %w", err)
-	}
-	if err := file.Sync(); err != nil {
-		return fmt.Errorf("sync maintenance TLS identity: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close maintenance TLS identity: %w", err)
-	}
-	// Link publishes a complete file and cannot overwrite a concurrent winner.
-	if err := os.Link(file.Name(), path); err != nil && !errors.Is(err, os.ErrExist) {
-		return fmt.Errorf("publish maintenance TLS identity: %w", err)
-	}
-	return nil
 }
 
 func loadIdentity(path, host string, now time.Time) (tls.Certificate, error) {

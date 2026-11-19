@@ -6,9 +6,10 @@ import { APIError } from '../../api/client'
 import CreditDonut from '../../components/CreditDonut.vue'
 import EmptyState from '../../components/EmptyState.vue'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
+import { beichenBillingExplanation, quotaBalance, schoolMonth, statusLabel } from '../../utils/format'
 
 const usage = ref<Awaited<ReturnType<typeof studentAPI.usage>> | null>(null)
-const month = ref(new Date().toISOString().slice(0, 7))
+const month = ref(schoolMonth())
 const error = ref('')
 
 async function load() {
@@ -49,12 +50,13 @@ function projectSegments(project: StudentProjectUsage) {
       <label>月份<input v-model="month" type="month" @change="refresh"></label>
     </div>
     <p v-if="error" class="error banner">{{ error }}</p>
+    <p class="muted">{{ beichenBillingExplanation }}</p>
     <div v-if="usage?.projects.length" class="grid two">
       <article v-for="project in usage.projects" :key="project.project_id" class="panel">
         <div class="row">
           <div>
             <h2>{{ project.project_name }}</h2>
-            <p class="muted">月额度 {{ project.quota }} · 已用 {{ project.used }} · 在途 {{ project.pending }}<template v-if="project.pending_review"> · 有调用待核账</template></p>
+            <p class="muted">已分配 {{ project.quota }} 积分 · 学校已用 {{ project.used }} · 在途 {{ project.pending }}<template v-if="project.pending_review"> · 有调用待核账</template></p>
           </div>
           <strong>{{ percentLabel(project.used, project.quota) }}</strong>
         </div>
@@ -68,14 +70,14 @@ function projectSegments(project: StudentProjectUsage) {
         <div class="usage-summary">
           <div class="usage-stat">已用<strong>{{ project.used }}</strong></div>
           <div class="usage-stat">在途<strong>{{ project.pending }}</strong></div>
-          <div class="usage-stat">剩余<strong>{{ project.available }}</strong></div>
+          <div class="usage-stat">{{ quotaBalance(project.quota, project.used, project.available).label }}<strong>{{ quotaBalance(project.quota, project.used, project.available).amount }}</strong></div>
         </div>
         <section v-if="project.keys.length" class="member-key-stack">
           <article v-for="key in project.keys" :key="key.id" class="member-key-row">
             <strong>{{ key.name }}</strong>
-            <span class="muted">{{ key.status }} · 已用 {{ key.used }} · 在途 {{ key.pending }}<template v-if="key.available !== undefined"> · 剩余 {{ key.available }}</template><template v-if="key.pending_review"> · 有调用待核账</template></span>
+            <span class="muted">{{ statusLabel(key.status) }} · 学校已用 {{ key.used }} 积分 · 在途 {{ key.pending }}<template v-if="key.pending_review"> · 有调用待核账</template></span>
             <ul v-if="key.models.length" class="key-models">
-              <li v-for="model in key.models" :key="model.id">{{ model.name }} · {{ model.credits }} credits</li>
+              <li v-for="model in key.models" :key="model.id">{{ model.name }} · 学校已用 {{ model.credits }} 积分</li>
             </ul>
           </article>
         </section>

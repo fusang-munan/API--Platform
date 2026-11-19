@@ -39,6 +39,26 @@ func (s *Server) syncBeichen(c *gin.Context) {
 	respond(c, http.StatusOK, gin.H{"synced": true})
 }
 
+func (s *Server) enableBeichenModel(c *gin.Context) {
+	provider, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	var input struct {
+		Model       string `json:"model"`
+		SchoolModel string `json:"school_model"`
+	}
+	if !bindBeichenJSON(c, &input, false) {
+		return
+	}
+	model, err := s.service.Beichen().EnableModel(c.Request.Context(), provider, identity(c).UserID, input.Model, input.SchoolModel)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, gin.H{"model_id": model, "status": "active"})
+}
+
 func (s *Server) beichenPanelAccess(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	provider, ok := pathID(c, "provider_id")

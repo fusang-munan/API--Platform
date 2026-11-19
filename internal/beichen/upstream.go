@@ -65,6 +65,12 @@ func (s *Service) readResponse(req *http.Request) ([]byte, error) {
 	return readBeichenResponse(s.client, req)
 }
 
+type upstreamHTTPStatus int
+
+func (status upstreamHTTPStatus) Error() string {
+	return fmt.Sprintf("北辰接口返回 HTTP %d", int(status))
+}
+
 func readBeichenResponse(client *http.Client, req *http.Request) ([]byte, error) {
 	response, err := client.Do(req)
 	if err != nil {
@@ -72,7 +78,7 @@ func readBeichenResponse(client *http.Client, req *http.Request) ([]byte, error)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("北辰接口返回 HTTP %d", response.StatusCode)
+		return nil, upstreamHTTPStatus(response.StatusCode)
 	}
 	if response.ContentLength > maxResponseBytes {
 		return nil, errors.New("北辰接口响应超过 2 MiB")
@@ -125,20 +131,13 @@ func parseBilling(body []byte) (billingInfo, error) {
 // Sub2API v1 provides the multiplier only. A provider pricing extension must
 // declare both its token-rate unit and whether the rates are base or effective.
 func parsePricing(data json.RawMessage) (string, []priceRow, error) {
-	return parsePricingUnit(data, "usd_micros_per_million_tokens")
-}
-
-func parsePricingUnit(data json.RawMessage, unit string) (string, []priceRow, error) {
 	var pricing struct {
 		Basis  string     `json:"basis"`
 		Unit   string     `json:"unit"`
 		Models []priceRow `json:"models"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	if unit == panelRateUnit {
-		decoder.DisallowUnknownFields()
-	}
-	if decoder.Decode(&pricing) != nil || pricing.Unit != unit ||
+	if decoder.Decode(&pricing) != nil || pricing.Unit != "usd_micros_per_million_tokens" ||
 		(pricing.Basis != "base" && pricing.Basis != "effective") || len(pricing.Models) == 0 || len(pricing.Models) > maxRows {
 		return "", nil, errors.New("北辰账单未提供可确认单位和口径的模型单价，可导入报价 CSV")
 	}

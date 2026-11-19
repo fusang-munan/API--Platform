@@ -25,6 +25,7 @@ type activeCredentialRow struct {
 	Label                string
 	GroupHint            sql.NullString
 	CredentialCiphertext []byte
+	UpdatedAt            time.Time
 }
 
 func (r *ProviderSyncRunner) SyncActiveProviders(ctx context.Context) (int, error) {
@@ -33,7 +34,7 @@ func (r *ProviderSyncRunner) SyncActiveProviders(ctx context.Context) (int, erro
 	}
 	now := r.now().UTC()
 	rows, err := r.DB.QueryContext(ctx, `
-SELECT pc.id, pc.provider_id, p.base_url, pc.label, pc.group_hint, pc.credential_ciphertext
+SELECT pc.id, pc.provider_id, p.base_url, pc.label, pc.group_hint, pc.credential_ciphertext, pc.updated_at
 FROM provider_credentials pc
 JOIN providers p ON p.id = pc.provider_id
 WHERE p.status='active' AND pc.status='active'
@@ -46,7 +47,7 @@ ORDER BY lower(p.name), p.name, lower(pc.label), pc.label`)
 	syncer := &ProviderCatalogSyncer{DB: r.DB}
 	for rows.Next() {
 		var row activeCredentialRow
-		if err := rows.Scan(&row.ID, &row.ProviderID, &row.BaseURL, &row.Label, &row.GroupHint, &row.CredentialCiphertext); err != nil {
+		if err := rows.Scan(&row.ID, &row.ProviderID, &row.BaseURL, &row.Label, &row.GroupHint, &row.CredentialCiphertext, &row.UpdatedAt); err != nil {
 			return synced, err
 		}
 		credential, err := r.Decrypt(row.CredentialCiphertext)
@@ -63,7 +64,11 @@ ORDER BY lower(p.name), p.name, lower(pc.label), pc.label`)
 			groupHint = &hint
 		}
 		entries = FilterProviderEntriesByCredential(row.Label, groupHint, row.BaseURL, entries)
-		if _, err := syncer.UpsertCredentialEntries(ctx, row.ProviderID, row.ID, entries, now); err != nil {
+		var revision *time.Time
+		if IsBeichenBaseURL(row.BaseURL) {
+			revision = &row.UpdatedAt
+		}
+		if _, err := syncer.UpsertCredentialEntries(ctx, row.ProviderID, row.ID, entries, now, revision); err != nil {
 			return synced, err
 		}
 		synced++

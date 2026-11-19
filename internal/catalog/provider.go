@@ -20,8 +20,26 @@ type ProviderEntry struct {
 	Raw         map[string]any `json:"-"`
 }
 
+const beichenOrigin = "https://api.beichenapi.com"
+
+func IsBeichenBaseURL(baseURL string) bool {
+	switch strings.TrimSuffix(strings.ToLower(strings.TrimSpace(baseURL)), "/") {
+	case beichenOrigin, beichenOrigin + "/v1":
+		return true
+	}
+	return false
+}
+
 func FetchProviderModels(ctx context.Context, baseURL, credential string, client *http.Client) ([]ProviderEntry, error) {
-	if client == nil {
+	beichen := IsBeichenBaseURL(baseURL)
+	if beichen {
+		baseURL = beichenOrigin
+		if client == nil {
+			client = &http.Client{Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			}}
+		}
+	} else if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
 	url := strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/v1/models"
@@ -43,15 +61,44 @@ func FetchProviderModels(ctx context.Context, baseURL, credential string, client
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("upstream models returned HTTP %d", resp.StatusCode)
 	}
+	if beichen {
+		return ParseBeichenModels(body)
+	}
 	return ParseProviderModels(body)
 }
 
 func ParseProviderModels(body []byte) ([]ProviderEntry, error) {
+	return parseProviderModels(body, false)
+}
+
+// An explicit empty Beichen catalog revokes the previous snapshot. A missing
+// list or a malformed record must not retire models that might still exist.
+func ParseBeichenModels(body []byte) ([]ProviderEntry, error) {
+	return parseProviderModels(body, true)
+}
+
+func parseProviderModels(body []byte, beichen bool) ([]ProviderEntry, error) {
 	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("invalid upstream models response")
 	}
+	if envelope, ok := payload.(map[string]any); beichen && ok {
+		if envelope["error"] != nil || envelope["object"] == "error" || envelope["success"] == false {
+			return nil, fmt.Errorf("Beichen returned a catalog error")
+		}
+		if code, exists := envelope["code"]; exists && code != float64(0) {
+			return nil, fmt.Errorf("Beichen returned an unsuccessful catalog response")
+		}
+	}
 	records := modelRecords(payload)
+	if beichen && records != nil {
+		if len(records) == 0 {
+			return []ProviderEntry{}, nil
+		}
+		if len(records) > 2000 {
+			return nil, fmt.Errorf("Beichen model catalog exceeds 2000 records")
+		}
+	}
 	if len(records) == 0 {
 		return nil, fmt.Errorf("upstream models list is empty")
 	}
@@ -59,12 +106,12 @@ func ParseProviderModels(body []byte) ([]ProviderEntry, error) {
 	result := make([]ProviderEntry, 0, len(records))
 	for _, record := range records {
 		item, ok := record.(map[string]any)
-		if !ok {
-			continue
-		}
 		id, _ := item["id"].(string)
 		id = strings.TrimSpace(id)
-		if id == "" {
+		if !ok || id == "" {
+			if beichen {
+				return nil, fmt.Errorf("invalid Beichen model catalog record")
+			}
 			continue
 		}
 		key := strings.ToLower(id)

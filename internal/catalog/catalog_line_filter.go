@@ -2,9 +2,12 @@ package catalog
 
 import "strings"
 
-// FilterProviderEntriesByCredential trims upstream /v1/models to the Key line.
-// Key label / group_hint take precedence over provider Base URL path.
+// Beichen returns the visible catalog for the authenticated key. Other
+// providers may expose a shared list that needs filtering by key line.
 func FilterProviderEntriesByCredential(label string, groupHint *string, baseURL string, entries []ProviderEntry) []ProviderEntry {
+	if IsBeichenBaseURL(baseURL) {
+		return entries
+	}
 	switch resolveCredentialLine(label, groupHint, baseURL) {
 	case "claude":
 		return filterProviderEntries(entries, func(modelID string) bool {

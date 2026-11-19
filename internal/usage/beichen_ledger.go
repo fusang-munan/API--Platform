@@ -19,11 +19,16 @@ func (s *Store) PrepareDispatch(ctx context.Context, callID uuid.UUID, route Cal
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE gateway_calls SET
 		beichen_state=CASE WHEN $2='beichen' THEN 'reserved' ELSE beichen_state END,
+		beichen_school_multiplier=CASE WHEN $2='beichen' THEN CASE WHEN EXISTS (
+			SELECT 1 FROM beichen_provision_channels school
+			JOIN provider_credentials pc ON pc.id=school.credential_id
+			WHERE school.credential_id=$3 AND pc.provider_id=$6
+		) THEN 1.10 ELSE 1 END END,
 		beichen_dispatch_kind=$2,beichen_dispatch_at=$5,
 		beichen_dispatch_credential_id=$3,beichen_dispatch_model=NULLIF($4,''),
 		lease_expires_at=clock_timestamp()+interval '15 minutes'
 		WHERE id=$1 AND billing_state='pending'`, callID, kind, nullableUUID(route.CredentialID), route.UpstreamModelName,
-		time.Now().UTC().Truncate(time.Microsecond))
+		time.Now().UTC().Truncate(time.Microsecond), nullableUUID(route.ProviderID))
 	return requireLedgerRow(result, err)
 }
 
@@ -124,18 +129,19 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics) error {
 	// An interrupted usage report can contain only the initial stream counters.
 	// Price lookup uses the dispatch identity and observed time pinned by Finalize.
-	var exact, milli sql.NullString
+	var base, exact, milli sql.NullString
 	var upstream, multiplier sql.NullInt64
-	err := tx.QueryRowContext(ctx, `SELECT cost.credits::text,(cost.credits*1000)::text,
+	err := tx.QueryRowContext(ctx, `SELECT cost.credits::text,booked.credits::text,(booked.credits*1000)::text,
 		p.upstream_version,p.multiplier_version
 		FROM gateway_calls c
 		CROSS JOIN LATERAL beichen_price_at(c.beichen_dispatch_credential_id,c.beichen_dispatch_model,c.beichen_price_at) p
 		CROSS JOIN LATERAL (SELECT beichen_token_credits(c.protocol,$2,$3,$4,$5,$6,
 			p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write) AS credits) cost
+		CROSS JOIN LATERAL (SELECT cost.credits*COALESCE(c.beichen_school_multiplier,1) AS credits) booked
 		WHERE c.id=$1 AND c.beichen_state='pending_review'
 		  AND c.beichen_price_at IS NOT NULL
 		FOR UPDATE OF c`, callID, metrics.PromptTokens, metrics.CompletionTokens,
-		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens).Scan(&exact, &milli, &upstream, &multiplier)
+		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens).Scan(&base, &exact, &milli, &upstream, &multiplier)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -159,8 +165,9 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_state='charged',billing_state='charged',
 		beichen_credit_exact=$2::numeric,credit_milli=trunc($2::numeric*1000)::bigint,
+		beichen_base_credits=$5::numeric,beichen_base_source='gateway_usage_price',
 		beichen_review_reason=NULL,beichen_upstream_price_version=$3,beichen_multiplier_version=$4
-		WHERE id=$1`, callID, exact.String, upstream, multiplier)
+		WHERE id=$1`, callID, exact.String, upstream, multiplier, base.String)
 	if err != nil {
 		return err
 	}

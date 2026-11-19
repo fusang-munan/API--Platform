@@ -1,38 +1,55 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import type { Organization, ProjectUsage, UsageSlice } from '../../api/types'
 import { APIError } from '../../api/client'
-import { calculateCredits } from '../../utils/format'
+import { beichenBillingExplanation, calculateCredits, quotaBalance, schoolMonth } from '../../utils/format'
 import CreditDonut from '../../components/CreditDonut.vue'
 import EmptyState from '../../components/EmptyState.vue'
 import AppDialog from '../../components/AppDialog.vue'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
-
-type MemberUsage = ProjectUsage['members'][number]
+import { memberModelRows, studentSpend } from '../../utils/teacherSpend'
+import BeichenReceiptSpend from './BeichenReceiptSpend.vue'
 
 const rows = ref<ProjectUsage[]>([])
 const organizations = ref<Organization[]>([])
-const expanded = ref<ProjectUsage | null>(null)
-const memberDetail = ref<MemberUsage | null>(null)
-const month = ref(new Date().toISOString().slice(0, 7))
+const students = computed(() => studentSpend(rows.value))
+const projectId = ref('')
+const selection = ref<{ projectId: string; userId: string } | null>(null)
+const expanded = computed(() => rows.value.find(project => project.project_id === projectId.value))
+const memberProject = computed(() => rows.value.find(project => project.project_id === selection.value?.projectId))
+const memberDetail = computed(() => memberProject.value?.members.find(member => member.user_id === selection.value?.userId))
+const month = ref(schoolMonth())
 const organization = ref('')
 const query = ref('')
 const error = ref('')
 
+let latestRequest = 0
+let displayedQuery = ''
 async function load() {
+  const request = ++latestRequest
   try {
     const params = new URLSearchParams({
       month: month.value,
       ...(organization.value ? { organization_id: organization.value } : {}),
       ...(query.value ? { q: query.value } : {}),
     })
-    ;[rows.value, organizations.value] = await Promise.all([
-      teacherAPI.projectSpend(params.toString()),
+    const queryString = params.toString()
+    if (queryString !== displayedQuery) {
+      rows.value = []
+      closeProjectDialog()
+    }
+    const [projects, orgs] = await Promise.all([
+      teacherAPI.projectSpend(queryString),
       teacherAPI.organizations(),
     ])
+    if (request !== latestRequest) return
+    displayedQuery = queryString
+    rows.value = projects
+    organizations.value = orgs
     error.value = ''
   } catch (caught) {
+    if (request !== latestRequest) return
     error.value = caught instanceof APIError ? caught.message : '加载项目花费失败'
   }
 }
@@ -66,31 +83,13 @@ function initials(name: string) {
   return name.trim().charAt(0).toUpperCase() || '?'
 }
 
-function addUsageSlice(map: Map<string, UsageSlice>, model: UsageSlice) {
-  const existing = map.get(model.id) ?? { id: model.id, name: model.name, credits: '0.000', calls: 0 }
-  existing.credits = calculateCredits(existing.credits, model.credits, 'add')
-  existing.calls = (existing.calls ?? 0) + (model.calls ?? 0)
-  map.set(model.id, existing)
-}
-
-function memberModelRows(member: MemberUsage) {
-  const map = new Map<string, UsageSlice>()
-  for (const key of member.keys) {
-    for (const model of key.models) addUsageSlice(map, model)
-  }
-  for (const model of member.free_models) addUsageSlice(map, model)
-  return [...map.values()].sort((a, b) =>
-    Number(b.credits) - Number(a.credits) || (b.calls ?? 0) - (a.calls ?? 0) || a.name.localeCompare(b.name),
-  )
-}
-
 function closeProjectDialog() {
-  expanded.value = null
-  memberDetail.value = null
+  projectId.value = ''
+  selection.value = null
 }
 
-function openMemberDetail(member: MemberUsage) {
-  memberDetail.value = member
+function openMemberDetail(projectId: string, userId: string) {
+  selection.value = { projectId, userId }
 }
 
 function modelDisplayLine(model: UsageSlice) {
@@ -114,6 +113,7 @@ function modelDisplayLine(model: UsageSlice) {
       </div>
     </div>
     <p v-if="error" class="error banner">{{ error }}</p>
+    <p class="muted">{{ beichenBillingExplanation }}</p>
 
     <section class="panel filter-panel">
       <div class="filter-toolbar">
@@ -124,6 +124,25 @@ function modelDisplayLine(model: UsageSlice) {
         </div>
       </div>
     </section>
+
+    <details v-if="students.length" class="panel student-summary">
+      <summary>学生月度开销（{{ students.length }} 人）</summary>
+      <p class="muted">汇总当前查询范围内各项目的校内积分。北辰实扣仅合计已匹配的独立回执，待核笔数另列。</p>
+      <div class="model-table-wrap">
+        <table class="usage-table">
+          <thead><tr><th scope="col">学生</th><th scope="col">校内积分合计</th><th scope="col">北辰回执小计</th><th scope="col">分项目明细</th></tr></thead>
+          <tbody>
+            <tr v-for="student in students" :key="student.id">
+              <th scope="row">{{ student.name }}<small class="muted model-id">{{ student.id }}</small></th>
+              <td>{{ student.credits }}</td>
+              <td><BeichenReceiptSpend :spend="student" /></td>
+              <td><button v-for="entry in student.entries" :key="entry.project.project_id" type="button" class="button ghost"
+                @click="openMemberDetail(entry.project.project_id, student.id)">{{ entry.project.project_name }} · {{ entry.member.credits }} 积分</button></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </details>
 
     <section class="panel">
       <table v-if="rows.length" class="usage-table project-spend-table">
@@ -158,7 +177,7 @@ function modelDisplayLine(model: UsageSlice) {
                 <span v-if="calculateCredits(row.charged, row.quota, 'subtract') !== '0.000'" class="error over-quota">超额 {{ calculateCredits(row.charged, row.quota, 'subtract') }} credits</span>
               </div>
             </td>
-            <td><button type="button" class="button ghost" @click="expanded = row">查看详情</button></td>
+            <td><button type="button" class="button ghost" @click="projectId = row.project_id">查看详情</button></td>
           </tr>
         </tbody>
       </table>
@@ -168,6 +187,7 @@ function modelDisplayLine(model: UsageSlice) {
     <AppDialog
       :open="Boolean(expanded)"
       :title="`${expanded?.project_name || ''} · 项目监控`"
+      description="查看本月成员开销、模型用量与北辰回执。"
       wide
       @update:open="open => !open && closeProjectDialog()"
     >
@@ -197,14 +217,15 @@ function modelDisplayLine(model: UsageSlice) {
                     <div class="member-metrics">
                       <span>月额度 <strong>{{ member.quota }}</strong></span>
                       <span>已用 <strong>{{ member.credits }}</strong><template v-if="member.pending_review"> · 有调用待核账</template></span>
-                      <span>剩余 <strong>{{ member.available }}</strong></span>
+                      <span>{{ quotaBalance(member.quota, member.credits, member.available).label }} <strong>{{ quotaBalance(member.quota, member.credits, member.available).amount }}</strong></span>
+                      <BeichenReceiptSpend :spend="member" />
                     </div>
                     <div class="quota-progress member-progress" aria-hidden="true">
                       <span :style="{ width: `${usagePercent(member.credits, member.quota)}%` }"></span>
                     </div>
                   </div>
                 </div>
-                <button type="button" class="button primary member-detail-btn" @click="openMemberDetail(member)">查看详情</button>
+                <button type="button" class="button primary member-detail-btn" @click="openMemberDetail(expanded.project_id, member.user_id)">查看详情</button>
               </div>
               <div v-if="memberModelRows(member).length" class="model-chip-list">
                 <span v-for="model in memberModelRows(member).slice(0, 4)" :key="model.id" class="model-chip">
@@ -221,7 +242,7 @@ function modelDisplayLine(model: UsageSlice) {
           <div class="section-heading">
             <div>
               <h2>项目总用量</h2>
-              <p class="muted">按模型汇总的本月项目级消耗</p>
+              <p class="muted">校内积分按月汇总。北辰实扣仅计已匹配回执，待核笔数另列。</p>
             </div>
           </div>
           <div class="project-total-layout">
@@ -238,8 +259,9 @@ function modelDisplayLine(model: UsageSlice) {
                 <thead>
                   <tr>
                     <th scope="col">模型</th>
-                    <th scope="col" class="numeric-cell">credits</th>
+                    <th scope="col" class="numeric-cell">学校已用积分</th>
                     <th scope="col" class="numeric-cell">调用次数</th>
+                    <th scope="col" class="numeric-cell">北辰回执</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -247,6 +269,7 @@ function modelDisplayLine(model: UsageSlice) {
                     <th scope="row">{{ model.name }}</th>
                     <td class="numeric-cell">{{ model.credits }}</td>
                     <td class="numeric-cell"><span class="call-pill">{{ model.calls ?? 0 }}</span></td>
+                    <td class="numeric-cell"><BeichenReceiptSpend :spend="model" /></td>
                   </tr>
                   <tr v-for="model in expanded.free_models" :key="`free-${model.id}`">
                     <th scope="row">
@@ -255,11 +278,12 @@ function modelDisplayLine(model: UsageSlice) {
                     </th>
                     <td class="numeric-cell">0.000</td>
                     <td class="numeric-cell"><span class="call-pill free">{{ model.calls ?? 0 }}</span></td>
+                    <td class="numeric-cell"><BeichenReceiptSpend :spend="model" /></td>
                   </tr>
                   <tr v-if="Number(remaining(expanded)) > 0" class="remaining-row">
                     <th scope="row">未消耗额度</th>
                     <td class="numeric-cell">{{ remaining(expanded) }}</td>
-                    <td class="numeric-cell">—</td>
+                    <td class="numeric-cell" colspan="2">—</td>
                   </tr>
                 </tbody>
               </table>
@@ -272,9 +296,10 @@ function modelDisplayLine(model: UsageSlice) {
 
     <AppDialog
       :open="Boolean(memberDetail)"
-      :title="`${memberDetail?.user_name || ''} · 成员用量`"
+      :title="`${memberDetail?.user_name || ''} · ${memberProject?.project_name || ''} · 成员用量`"
+      description="查看该学生在本项目的积分、北辰回执和各 Key 的模型明细。"
       wide
-      @update:open="open => !open && (memberDetail = null)"
+      @update:open="open => !open && (selection = null)"
     >
       <template v-if="memberDetail">
         <div class="member-detail-hero">
@@ -284,7 +309,8 @@ function modelDisplayLine(model: UsageSlice) {
             <div class="member-hero-stats">
               <span>月额度 <strong>{{ memberDetail.quota }}</strong></span>
               <span>已用 <strong>{{ memberDetail.credits }}</strong><template v-if="memberDetail.pending_review"> · 有调用待核账</template></span>
-              <span>剩余 <strong>{{ memberDetail.available }}</strong></span>
+              <span>{{ quotaBalance(memberDetail.quota, memberDetail.credits, memberDetail.available).label }} <strong>{{ quotaBalance(memberDetail.quota, memberDetail.credits, memberDetail.available).amount }}</strong></span>
+              <BeichenReceiptSpend :spend="memberDetail" />
               <span>{{ memberModelRows(memberDetail).length }} 个模型</span>
             </div>
             <div class="quota-progress member-progress" aria-hidden="true">
@@ -297,12 +323,14 @@ function modelDisplayLine(model: UsageSlice) {
           <div class="section-heading compact">
             <h2>模型调用明细</h2>
           </div>
+          <p class="muted">北辰实扣仅计已匹配回执，按北辰余额单位显示。</p>
           <table v-if="memberModelRows(memberDetail).length" class="usage-table member-model-table">
             <thead>
               <tr>
                 <th scope="col">模型</th>
-                <th scope="col" class="numeric-cell">credits</th>
+                <th scope="col" class="numeric-cell">学校已用积分</th>
                 <th scope="col" class="numeric-cell">调用次数</th>
+                <th scope="col" class="numeric-cell">北辰回执</th>
               </tr>
             </thead>
             <tbody>
@@ -313,6 +341,7 @@ function modelDisplayLine(model: UsageSlice) {
                 </th>
                 <td class="numeric-cell">{{ model.credits }}</td>
                 <td class="numeric-cell">{{ model.calls ?? 0 }}</td>
+                <td class="numeric-cell"><BeichenReceiptSpend :spend="model" /></td>
               </tr>
             </tbody>
           </table>
@@ -333,8 +362,9 @@ function modelDisplayLine(model: UsageSlice) {
                 <thead>
                   <tr>
                     <th scope="col">模型</th>
-                    <th scope="col" class="numeric-cell">credits</th>
+                    <th scope="col" class="numeric-cell">学校已用积分</th>
                     <th scope="col" class="numeric-cell">调用次数</th>
+                    <th scope="col" class="numeric-cell">北辰回执</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -342,6 +372,7 @@ function modelDisplayLine(model: UsageSlice) {
                     <th scope="row">{{ modelDisplayLine(model).title }}</th>
                     <td class="numeric-cell">{{ model.credits }}</td>
                     <td class="numeric-cell">{{ model.calls ?? 0 }}</td>
+                    <td class="numeric-cell"><BeichenReceiptSpend :spend="model" /></td>
                   </tr>
                 </tbody>
               </table>
@@ -355,6 +386,8 @@ function modelDisplayLine(model: UsageSlice) {
 </template>
 
 <style scoped>
+.student-summary summary { cursor: pointer; font-weight: 700; }
+
 .page-lead {
   margin: 0;
 }
@@ -566,6 +599,7 @@ function modelDisplayLine(model: UsageSlice) {
 
 .model-table-wrap {
   min-width: 0;
+  overflow-x: auto;
   padding: 14px;
   border: 1px solid rgba(83, 99, 136, 0.1);
   border-radius: 14px;

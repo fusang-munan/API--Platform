@@ -147,7 +147,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
               </div>
               <div class="chip-list">
                 <span class="chip preset">预置</span>
-                <span class="chip">{{ model.credit_multiplier ?? '未配置' }}x</span>
+                <span class="chip">{{ modelCreditsLabel(model) }}</span>
                 <span v-if="model.provider_name" class="chip">{{ model.provider_name }}</span>
                 <span v-for="capability in model.capabilities" :key="capability" class="chip">{{ capabilityLabel(capability) }}</span>
               </div>
@@ -184,7 +184,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
                 <StatusBadge :status="model.status" />
               </div>
               <div class="chip-list">
-                <span class="chip">{{ model.credit_multiplier ?? '未配置' }}x</span>
+                <span class="chip">{{ modelCreditsLabel(model) }}</span>
                 <span v-if="model.provider_name" class="chip">{{ model.provider_name }}</span>
                 <span v-for="capability in model.capabilities" :key="capability" class="chip">{{ capabilityLabel(capability) }}</span>
               </div>

@@ -44,6 +44,7 @@ type Service struct {
 	now         func() time.Time
 	panelToken  string
 	panelGroups map[uuid.UUID]int64
+	webAccount  *webSession
 }
 
 func New(db *sql.DB, crypto *security.Manager) *Service {

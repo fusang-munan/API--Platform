@@ -378,6 +378,7 @@ data: {"revision":"01K2..."}
 | Binding | PATCH | `/api/v1/teacher/model-bindings/{binding_id}` | 修改上游名、adapter、priority 或状态 |
 | 北辰同步与对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen?day=YYYY-MM-DD` | 按北京时间查看同步状态、模型报价和日对账 |
 | 北辰手动同步 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/sync` | 执行一次有时限的同步，页面按数据类别显示各自结果 |
+| 启用北辰已发现模型 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/models/enable` | 教师提交 `model`，如已有校内别名可另传 `school_model`。学校复核当前目录和路由后，使模型可供学生申请或调用。 |
 | 北辰采价授权 | GET / PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/access/{credential_id}` | 读取配置状态，设置、轮换或停用该凭据的面板读取授权 |
 | 北辰校内试算价 | PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/price` | 指定模型手动设价或恢复跟随 |
 | 北辰报价或账单导入 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/import` | 按凭据导入受支持的 CSV |
@@ -398,7 +399,7 @@ data: {"revision":"01K2..."}
 {"email":"teacher2@example.com"}
 ```
 
-显式迁移会预置北辰。教师在现有 `GET /api/v1/teacher/providers` 列表即可发现该记录。首次预置返回 `status: active`、`credential_configured: false`，凭据数为 0。教师模型列表和自动选择供应商的目录接口仅使用至少有一把启用凭据的启用供应商。对账概览可打开，此时同步状态、报价和日账列表均为空。教师手动创建其他供应商仍使用以下接口。
+迁移预置北辰供应商。学校部署随后从加密的发布配置建立四条渠道，以官网登录身份关联分组和数字 Key ID。教师模型页读取已同步的可用模型、当前首选线路倍率和启用状态。项目用量按学生、模型汇总。其他供应商可用现有接口配置。
 
 学校 HTTPS 入口承载控制台、`/api/v1/` 及网关已有的原生协议路由。访问 `GET /teacher/providers`、`GET /student/api-keys` 或 `GET /login` 返回官方 Vue 应用的 HTML；应用使用同源 API 登录、选择身份和检查权限。登录挑战和刷新 Cookie 使用 Secure。读取网页本身不授予教师或学生权限。
 
@@ -424,7 +425,9 @@ data: {"revision":"01K2..."}
 
 北辰接口限老师访问，凭据必须属于指定的北辰供应商。更换北辰 Key 时新增一条凭据并重新绑定，以保留原 Key 的账单归属。手动同步接受空请求体或 `{}`。概览中的 `datasets`、`models`、`comparison` 分别提供同步状态、报价和当日对账。成本的 `_micros` 字段以百万分之一北辰余额单位表示。`trial_credits` 和 `charged_credits` 用十进制字符串分别返回试算与实际结算积分，`pending_review_calls` 给出待核账笔数。未知值为 `null`，可确认的零单独返回。原有 `trial_credit_milli` 保留千分之一积分精度。
 
-采价授权 GET 返回 `configured` 以及已配置的 `group_id`、`upstream_key_id`。PATCH 启用或轮换时提交 `enabled: true`、正整数 `group_id` 和写入专用字段 `token`。逐笔账单匹配还需填写北辰 Key 的数字编号 `upstream_key_id`，可省略以仅同步报价。停用时只提交 `{"enabled":false}`。面板授权与推理 Key 分开保管。学校 HTTPS 入口可供教师配置，改组或撤权会使旧授权下的报价失效。
+维护用的 `beichen/access/{credential_id}` 可读该凭据的同步状态、分组与北辰 Key 数字 ID。学校自动部署通过官网普通账号建立这些关联。旧版专用读取凭据的接口保留兼容。
+
+概览的 `archived_usage` 以北京时间按日、模型和凭据汇总持续采集的原始流水。`rows`、`unmatched_rows`、`unpriced_rows` 分别表示已采集笔数、未能归属学校扣款的笔数和无法确认余额实扣的笔数。`observed_cost` 汇总已知原始实扣，`matched_cost`、`matched_base_credits`、`matched_charged_credits` 与 `margin_credits` 只比较同一批可匹配且金额齐全的调用。官网更正金额后会更新差额，保留原学生扣分。
 
 价格请求包含 `credential_id`、`model`、`mode`。设置 `manual` 时同时提供 `rates`，其中 `input`、`output` 必填，`cache_read`、`cache_write` 可空，四项均为每百万 Token 的试算价格，以百万分之一校内积分表示。恢复 `follow` 时省略 `rates`。跟随试算和学生正式扣费均以 1 北辰余额单位折合 100 积分；手填校内试算价只影响试算列。
 
@@ -603,7 +606,16 @@ Anthropic-compatible 示例：
 
 学生使用 `GET /api/v1/student/usage?month=YYYY-MM` 查看每个 API Key 的模型 credit 分解。
 
-已登录的学生使用 `GET /api/v1/student/usage/calls/{request_id}` 读取自己的一笔北辰调用。使用网关响应的 `X-Request-ID`，按一个 URL 路径段编码。返回 `request_id`、`model_id`、`channel`（北辰）、`billing_state`、`charged_credits`、`actual_cost`、`receipt_applied`。状态为 `pending`、`pending_review`、`charged` 或 `released`。校内实际扣分与北辰余额单位均为十进制字符串。只有已扣时才返回扣分，已确认零用字符串 `"0"` 表示。上游金额及流水标记在尚未匹配时为 `null`。标记为 `true` 表示流水补记扣款，为 `false` 表示流水与已处置的调用关联。核账时比较 `charged_credits` 和 `actual_cost × 100`。具体上游渠道可凭北辰流水编号与该渠道的 Key 数字 ID 独立确认。
+学生使用 `GET /api/v1/student/usage/calls/{request_id}` 查自己的一笔北辰消费。请求编号取自学校网关响应头 `X-Request-ID`。金额以十进制字符串返回，缺失值为 `null`。
+
+| 字段 | 含义 |
+| --- | --- |
+| `base_credits`、`base_source` | 基础积分及依据。来源标记区分网关用量与报价、官方用量与报价、按官方实扣折算和历史账目。 |
+| `school_multiplier`、`charged_credits` | 请求发出时确定的学校系数和学生实际用掉的积分。由学校接管的四条北辰渠道在新请求上使用 1.10。其他凭据及历史派发保留原系数。 |
+| `actual_cost`、`receipt_applied` | 能关联的北辰原始实扣，以及本次是否依据回执完成补记。1 个北辰余额单位折合 1 元人民币或 100 个基础积分。 |
+| `request_id`、`model_id`、`channel`、`billing_state` | 请求归属和当前结算状态。 |
+
+教师使用 `PATCH /api/v1/teacher/projects/{project_id}/members/{user_id}/monthly-credit-quota` 调整学生的项目月额度。请求必填积分字符串 `monthly_credits`，可选 `quota_change_reason` 记录原因，成功返回 HTTP 204。学生用完当月个人额度后，新网关请求返回 `member_quota_exceeded`。已发出的请求按实际用量结算。
 
 匿名返回 401，其他身份返回 403。在本人范围内找不到唯一、可读的北辰调用时统一返回 404，包含本人请求编号重用、他人的调用和其他供应商的调用。
 

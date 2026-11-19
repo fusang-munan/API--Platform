@@ -345,6 +345,10 @@ func TestBeichenLedgerPostgres(t *testing.T) {
 		if err := store.CompleteCallMetrics(ctx, estimated.CallID, report); err != nil {
 			t.Fatal(err)
 		}
+		// A settled row from before 0039 has its original exact debit and no
+		// policy snapshot. A later receipt must not reprice that debit.
+		ledgerTestExec(t, ctx, isolated, `UPDATE gateway_calls SET beichen_school_multiplier=NULL,
+			beichen_base_credits=NULL,beichen_base_source=NULL WHERE id=$1`, estimated.CallID)
 		apply(route.CredentialID, audited, false)
 		var recordedDifference bool
 		err = isolated.QueryRowContext(ctx, `SELECT NOT applied AND credits_booked=0.0005 AND actual_cost=0.00014352
@@ -355,11 +359,22 @@ func TestBeichenLedgerPostgres(t *testing.T) {
 		check(estimated.CallID, "charged", "0.0005")
 		applied = false
 		assertStudentReceipt(estimated.RequestID, "charged", "0.0005", "0.00014352", &applied)
+		legacy, err := store.StudentCallReceipt(ctx, student, estimated.RequestID)
+		if err != nil || legacy.BaseCredits == nil || *legacy.BaseCredits != "0.0005" || legacy.BaseSource == nil ||
+			*legacy.BaseSource != "legacy" || legacy.SchoolMultiplier == nil || *legacy.SchoolMultiplier != "1" {
+			t.Fatalf("legacy receipt lost original basis: %+v, %v", legacy, err)
+		}
 
 		stale, old := makeReceipt(route, uuid.New(), 504, 91)
 		ledgerTestExec(t, ctx, isolated, `UPDATE provider_credentials SET updated_at=updated_at+interval '1 second' WHERE id=$1`, route.CredentialID)
 		apply(route.CredentialID, old, false)
 		check(stale.CallID, "pending_review", "")
+		t.Run("school billing and teacher allocation", func(t *testing.T) {
+			testSchoolBilling(t, ctx, isolated, org, student, model, provider, other.CredentialID)
+		})
+	})
+	t.Run("project receipt attribution", func(t *testing.T) {
+		testProjectReceiptAttribution(t, ctx, isolated, org, project, student, key, model)
 	})
 }
 

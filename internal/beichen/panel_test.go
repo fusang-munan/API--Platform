@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 )
@@ -55,14 +56,63 @@ func TestPanelGroupIsolation(t *testing.T) {
 	billing := billingInfo{PeakEnabled: &peak, GroupRate: "1", ResolvedRate: "1", Multiplier: "1"}
 	entries := []catalog.ProviderEntry{{ID: "shared"}}
 	for group := int64(1); group <= 2; group++ {
-		rows, err := parsePanelPrices([]byte(panelPayload(panelFirst, panelSecond)), group, billing, entries)
+		rows, _, err := parsePanelPrices([]byte(panelPayload(panelFirst, panelSecond)), group, billing, entries)
 		if err != nil || len(rows) != 1 || rows[0].Model != "shared" || *rows[0].Rates.Input != group*1_000_000 {
 			t.Fatalf("group %d: rows %+v, err %v", group, rows, err)
 		}
 	}
 	for _, body := range []string{panelPayload(panelSecond), panelPayload(panelFirst, panelFirst), panelPayload()} {
-		if _, err := parsePanelPrices([]byte(body), 1, billing, entries); err == nil {
+		if _, _, err := parsePanelPrices([]byte(body), 1, billing, entries); err == nil {
 			t.Fatal("accepted missing or ambiguous group")
+		}
+	}
+}
+
+func TestPanelConfirmsModelsIndependently(t *testing.T) {
+	peak := false
+	info := billingInfo{PeakEnabled: &peak, GroupRate: "1", ResolvedRate: "1", Multiplier: "1"}
+	models := []catalog.ProviderEntry{{ID: "shared"}, {ID: "unlisted"}, {ID: "no-price"}}
+	const flat = `"input_price":0.000001,"output_price":0,"intervals":[]`
+	for _, row := range []string{
+		`{"name":"shared","platform":"other","pricing":{` + flat + `}}`,
+		`{"name":"shared","platform":"openai","pricing":{"billing_mode":"per_request","per_request_price":1}}`,
+		`{"name":"shared","platform":"openai","pricing":null}`,
+	} {
+		start := strings.Index(panelFirst, `{"name":"shared"`)
+		end := strings.Index(panelFirst, `},{"name":"unlisted"`) + 1
+		body := panelPayload(panelFirst[:start]+row+panelFirst[end:], panelSecond)
+		prices, _, err := parsePanelPrices([]byte(body), 1, info, models)
+		if err != nil || len(prices) != 1 || prices[0].Model != "unlisted" {
+			t.Fatalf("expected just the verified price from group 1, got %+v, %v", prices, err)
+		}
+	}
+	rates, err := panelBillingRates(json.RawMessage(`{"basis":"base","unit":"beichen_micros_per_million_tokens","models":[
+		{"model":"verified","input":0,"output":1},{"model":"tiered","input":1,"output":1,"intervals":[{}]},
+		{"model":"duplicate","input":1,"output":1},{"model":"duplicate","input":1,"output":1,"intervals":[{}]}]}`))
+	if err != nil || len(rates) != 1 || rates["verified"].Input == nil || *rates["verified"].Input != 0 {
+		t.Fatalf("billing extension must corroborate only the unambiguous model: %+v, %v", rates, err)
+	}
+}
+
+func TestPanelRetainsVisibleConditionalPricing(t *testing.T) {
+	peak := false
+	info := billingInfo{PeakEnabled: &peak, GroupRate: "1", ResolvedRate: "1", Multiplier: "1"}
+	for _, tc := range []struct {
+		pricing     string
+		conditional bool
+	}{
+		{`{"billing_mode":"token","input_price":0.000001,"cache_read_price":0}`, false},
+		{`{"billing_mode":"token","input_price":0.000001,"output_price":0.000002,"cache_write_1h_price":0,"cache_write_12h_price":0.000004}`, true},
+		{`{"billing_mode":"token","intervals":[{"min_tokens":200000,"max_tokens":null,"input_price":0.000008}]}`, true},
+		{`{"billing_mode":"per_request","per_request_price":0.3}`, true},
+		{`{"billing_mode":"future","unknown_fee":0.4}`, false},
+	} {
+		const original = `{"billing_mode":"token","input_price":0.000001,"output_price":0,"intervals":[]}`
+		body := panelPayload(strings.Replace(panelFirst, original, tc.pricing, 1), panelSecond)
+		rows, terms, err := parsePanelPrices([]byte(body), 1, info, []catalog.ProviderEntry{{ID: "shared"}, {ID: "missing"}})
+		if err != nil || len(rows) != 0 || len(terms) != 1 || string(terms["shared"]) != tc.pricing ||
+			conditionalPanelPricing(terms["shared"]) != tc.conditional {
+			t.Fatalf("expected original per-key terms and no flat ledger price: %s %v", terms["shared"], err)
 		}
 	}
 }
@@ -83,13 +133,13 @@ func TestPanelPricesRequireStandardBalanceGroup(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mapped := strings.Replace(panelSecond, standard, tc.field, 1)
-			rows, err := parsePanelPrices([]byte(panelPayload(panelFirst, mapped)), 2, info, models)
+			rows, _, err := parsePanelPrices([]byte(panelPayload(panelFirst, mapped)), 2, info, models)
 			if err == nil || !strings.Contains(err.Error(), "标准余额组") || len(rows) != 0 {
 				t.Fatalf("mapped nonstandard group must fail without using a standard group with the same model: %v", err)
 			}
 		})
 	}
-	rows, err := parsePanelPrices([]byte(panelPayload(panelFirst, panelSecond)), 2, info, models)
+	rows, _, err := parsePanelPrices([]byte(panelPayload(panelFirst, panelSecond)), 2, info, models)
 	if err != nil || len(rows) != 1 || *rows[0].Rates.Input != 2_000_000 {
 		t.Fatalf("standard v0.2.15 group: rows %v, error %v", rows, err)
 	}
@@ -98,6 +148,83 @@ func TestPanelPricesRequireStandardBalanceGroup(t *testing.T) {
 type panelTransport func(*http.Request) (*http.Response, error)
 
 func (f panelTransport) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestChannelQuoteUsesPublicAccessBeforeLogin(t *testing.T) {
+	now := time.Now().UTC()
+	peak := false
+	info := billingInfo{PeakEnabled: &peak, ObservedAt: now, GroupRate: "1", ResolvedRate: "1", Multiplier: "1"}
+	job := syncJob{provider: uuid.New(), credential: uuid.New()}
+	for _, tc := range []struct {
+		name                          string
+		panelStatus, keyStatus, calls int
+		needsLogin, priced            bool
+	}{
+		{"public", 200, 200, 2, false, true},
+		{"login required", 401, 200, 4, true, true},
+		{"forbidden for anonymous", 403, 200, 3, true, true},
+		{"site unavailable", 503, 200, 1, false, false},
+		{"bad inference key", 200, 401, 2, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			s := New(db, nil)
+			s.now = func() time.Time { return now }
+			// The resolver also supports explicitly configured existing authorizations.
+			s.panelGroups = map[uuid.UUID]int64{job.credential: 2}
+			if tc.panelStatus == http.StatusForbidden {
+				s.panelToken = "synthetic-web-session"
+			} else if err := s.ConfigureWebSession("school@example.test", "synthetic-password"); err != nil {
+				t.Fatal(err)
+			}
+			if tc.needsLogin {
+				mock.ExpectQuery("SELECT group_id,token_ciphertext").WithArgs(job.credential).
+					WillReturnRows(sqlmock.NewRows([]string{"group_id", "token_ciphertext"}))
+			}
+			calls := 0
+			s.client.Transport = panelTransport(func(r *http.Request) (*http.Response, error) {
+				calls++
+				status, body := http.StatusOK, ""
+				auth := r.Header.Get("Authorization")
+				switch r.URL.String() {
+				case webAuthURL + "login":
+					if calls != 2 || tc.panelStatus != http.StatusUnauthorized || r.Method != http.MethodPost || auth != "" {
+						t.Fatal("unexpected website sign-in")
+					}
+					body = `{"code":0,"data":{"token_type":"Bearer","access_token":"synthetic-web-session","expires_in":900}}`
+				case panelURL:
+					if calls == 1 {
+						if auth != "" {
+							t.Fatal("public price check sent an authorization")
+						}
+						status = tc.panelStatus
+					} else if !tc.needsLogin || auth != "Bearer synthetic-web-session" {
+						t.Fatal("unexpected authenticated panel access")
+					}
+					body = panelPayload(panelSecond)
+				case origin + modelsPath:
+					if auth != "Bearer synthetic-inference" {
+						t.Fatal("catalog used the wrong credential")
+					}
+					status, body = tc.keyStatus, `{"data":[{"id":"shared"}]}`
+				default:
+					t.Fatal("unexpected URL")
+				}
+				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
+			})
+			quote := s.fetchChannelQuote(context.Background(), job, "synthetic-inference", 2, info)
+			if (quote.err == nil) != tc.priced || (len(quote.rows) == 1) != tc.priced || calls != tc.calls {
+				t.Fatalf("price %+v, error %v, requests %d", quote.rows, quote.err, calls)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func TestPanelFetchSeparatesCredentials(t *testing.T) {
 	now := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
@@ -178,7 +305,7 @@ func TestPanelRejectsDisplayFallback(t *testing.T) {
 				}
 				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}, nil
 			})
-			if quote := s.fetchPanelQuote(context.Background(), "panel-test", "inference-test", group, info); quote.err == nil || len(quote.rows) != 0 {
+			if quote := s.fetchPanelQuote(context.Background(), "panel-test", "inference-test", group, info); (quote.err == nil && quote.verificationError == nil) || len(quote.rows) != 0 {
 				t.Fatal("accepted unverified panel price")
 			}
 		})

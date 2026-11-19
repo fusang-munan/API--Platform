@@ -2,7 +2,9 @@ package beichen
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"time"
@@ -10,11 +12,14 @@ import (
 	"github.com/google/uuid"
 )
 
+const ProvisionActorID = "01953422-b1f7-7c50-81b1-734f142827bb"
+
 type PanelAccessInput struct {
 	Enabled       bool   `json:"enabled"`
 	GroupID       int64  `json:"group_id"`
 	Token         string `json:"token"`
 	UpstreamKeyID *int64 `json:"upstream_key_id,omitempty"`
+	webAccount    string
 }
 
 type PanelAccessStatus struct {
@@ -30,13 +35,35 @@ func (in PanelAccessInput) validate() error {
 		}
 		return nil
 	}
-	if in.GroupID <= 0 || in.GroupID > 9007199254740991 || !validPanelBearer(in.Token) {
+	if in.GroupID <= 0 || in.GroupID > 9007199254740991 || (in.webAccount == "" && !validPanelBearer(in.Token)) {
 		return invalid("请输入北辰分组 ID 和独立的面板读取凭据")
 	}
 	if in.UpstreamKeyID != nil && (*in.UpstreamKeyID <= 0 || *in.UpstreamKeyID > 9007199254740991) {
 		return invalid("北辰 Key ID 须为可精确表示的正整数")
 	}
 	return nil
+}
+
+// DeploymentPanelAccess pins the configured school account, never its short-lived session.
+// The existing bearer configuration remains available to older deployments.
+func (s *Service) DeploymentPanelAccess(group, keyID int64, legacyToken string) (PanelAccessInput, error) {
+	if group <= 0 || group > 9007199254740991 || keyID <= 0 || keyID > 9007199254740991 {
+		return PanelAccessInput{}, errors.New("北辰分组、上游 Key ID 须为可精确表示的正整数")
+	}
+	in := PanelAccessInput{Enabled: true, GroupID: group, UpstreamKeyID: &keyID, Token: legacyToken}
+	if identity := s.webPanelIdentity(); identity != "" {
+		in.Token, in.webAccount = "", accountDigest(identity)
+	}
+	if in.Token == "" && in.webAccount == "" {
+		// The inference key alone is sufficient for catalog discovery.
+		return PanelAccessInput{}, nil
+	}
+	return in, in.validate()
+}
+
+func accountDigest(identity string) string {
+	digest := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(identity))))
+	return hex.EncodeToString(digest[:])
 }
 
 // A disabled database row overrides deployment settings. Rotation never
@@ -58,7 +85,7 @@ func (s *Service) panelAccess(ctx context.Context, credentialID uuid.UUID) (stri
 	if !group.Valid {
 		return "", 0, nil
 	}
-	token, err := s.decryptPanelToken(credentialID, encrypted)
+	token, err := s.resolvePanelToken(ctx, credentialID, encrypted)
 	if err != nil {
 		return "", 0, err
 	}
@@ -84,20 +111,42 @@ WHERE a.credential_id = $1 AND a.upstream_key_id IS NOT NULL
 	if err != nil {
 		return "", 0, time.Time{}, errors.New("读取北辰逐笔查账配置失败")
 	}
-	token, err = s.decryptPanelToken(credentialID, encrypted)
+	token, err = s.resolvePanelToken(ctx, credentialID, encrypted)
 	if err != nil {
 		return "", 0, time.Time{}, err
 	}
 	return token, upstreamKeyID, revision, nil
 }
 
-func (s *Service) decryptPanelToken(credentialID uuid.UUID, encrypted []byte) (string, error) {
+func (s *Service) storedPanelAccess(credentialID uuid.UUID, encrypted []byte) (PanelAccessInput, error) {
 	stored, err := s.crypto.DecryptCredential(encrypted)
-	token, bound := strings.CutPrefix(stored, panelCredentialPrefix(credentialID))
-	if err != nil || !bound || !validPanelBearer(token) {
-		return "", errors.New("解密北辰采价配置失败")
+	if err == nil {
+		if token, ok := strings.CutPrefix(stored, panelCredentialPrefix(credentialID)); ok && validPanelBearer(token) {
+			return PanelAccessInput{Token: token}, nil
+		}
+		if id, ok := strings.CutPrefix(stored, webAccountPrefix(credentialID)); ok && len(id) == sha256.Size*2 {
+			if _, err := hex.DecodeString(id); err == nil {
+				return PanelAccessInput{webAccount: id}, nil
+			}
+		}
 	}
-	return token, nil
+	return PanelAccessInput{}, errors.New("解密北辰采价配置失败")
+}
+
+func (s *Service) resolvePanelToken(ctx context.Context, credentialID uuid.UUID, encrypted []byte) (string, error) {
+	source, err := s.storedPanelAccess(credentialID, encrypted)
+	if err != nil || source.webAccount == "" {
+		return source.Token, err
+	}
+	identity := s.webPanelIdentity()
+	if identity == "" || source.webAccount != accountDigest(identity) {
+		return "", errors.New("北辰绑定的学校网页登录身份与本机配置不一致")
+	}
+	return s.webPanelToken(ctx)
+}
+
+func webAccountPrefix(credentialID uuid.UUID) string {
+	return "beichen-web-v1:" + credentialID.String() + ":"
 }
 
 func panelCredentialPrefix(credentialID uuid.UUID) string {
@@ -133,32 +182,47 @@ func (s *Service) SetPanelAccess(ctx context.Context, provider, credential, acto
 	if actor == uuid.Nil {
 		return invalid("需要有效的教师 ID")
 	}
+	return s.write(ctx, provider, credential, func(tx *sql.Tx) error {
+		return s.WritePanelAccessTx(ctx, tx, credential, actor, input)
+	})
+}
+
+// PanelSourceMatches compares a stored source without logging in while holding DB locks.
+func (s *Service) PanelSourceMatches(credential uuid.UUID, ciphertext []byte, expected PanelAccessInput) (bool, error) {
+	stored, err := s.storedPanelAccess(credential, ciphertext)
+	return stored.Token == expected.Token && stored.webAccount == expected.webAccount, err
+}
+
+// WritePanelAccessTx requires validated input, a verified actor and the credential lock in tx.
+func (s *Service) WritePanelAccessTx(ctx context.Context, tx *sql.Tx, credential, actor uuid.UUID, input PanelAccessInput) error {
 	var group *int64
 	var ciphertext []byte
 	if input.Enabled {
 		var err error
-		ciphertext, err = s.crypto.EncryptCredential(panelCredentialPrefix(credential) + input.Token)
+		value := panelCredentialPrefix(credential) + input.Token
+		if input.webAccount != "" {
+			value = webAccountPrefix(credential) + input.webAccount
+		}
+		ciphertext, err = s.crypto.EncryptCredential(value)
 		if err != nil {
 			return unavailable("加密北辰采价凭据失败", err)
 		}
 		group = &input.GroupID
 	}
-	return s.write(ctx, provider, credential, func(tx *sql.Tx) error {
-		version, err := priceTimestamp(ctx, tx)
-		if err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(ctx, `
+	version, err := priceTimestamp(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `
 INSERT INTO beichen_panel_access (credential_id,group_id,token_ciphertext,updated_by,updated_at,upstream_key_id)
 VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (credential_id) DO UPDATE
 SET group_id=excluded.group_id, token_ciphertext=excluded.token_ciphertext,
     updated_by=excluded.updated_by, updated_at=excluded.updated_at,
     upstream_key_id=excluded.upstream_key_id`, credential, group, ciphertext, actor, version, input.UpstreamKeyID); err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(ctx, `UPDATE provider_credentials SET updated_at=$2 WHERE id=$1`, credential, version); err != nil {
-			return err
-		}
-		return s.InvalidatePanelQuote(ctx, tx, credential, version)
-	})
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE provider_credentials SET updated_at=$2 WHERE id=$1`, credential, version); err != nil {
+		return err
+	}
+	return s.InvalidatePanelQuote(ctx, tx, credential, version)
 }

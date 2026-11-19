@@ -2,6 +2,31 @@ package catalog
 
 import "testing"
 
+func TestBeichenUsesActualCredentialCatalog(t *testing.T) {
+	entries := []ProviderEntry{{ID: "claude-a"}, {ID: "gemini-b"}, {ID: "deepseek-c"}}
+	for _, base := range []string{"https://api.beichenapi.com", " https://API.BEICHENAPI.COM/v1/ "} {
+		for _, label := range []string{"Gemini", "gpt", "Claude"} {
+			if got := FilterProviderEntriesByCredential(label, &label, base, entries); len(got) != len(entries) {
+				t.Fatalf("%s %s: lost catalog entries: %v", base, label, got)
+			}
+		}
+	}
+	for _, other := range []string{"https://api.beichenapi.com.other.test", "http://api.beichenapi.com", "https://api.beichenapi.com/other"} {
+		if got := FilterProviderEntriesByCredential("Gemini", nil, other, entries); len(got) != 1 || got[0].ID != "gemini-b" {
+			t.Fatalf("%s: changed non-Beichen filtering: %v", other, got)
+		}
+	}
+	if rows, err := ParseBeichenModels([]byte(`{"object":"list","data":[]}`)); err != nil || len(rows) != 0 {
+		t.Fatalf("explicit empty catalog: %v, %v", rows, err)
+	}
+	for _, body := range []string{`{}`, `{"data":null}`, `{"error":{"message":"failed"},"data":[]}`,
+		`{"code":401,"data":[]}`, `{"data":[{"id":"valid"},{}]}`} {
+		if _, err := ParseBeichenModels([]byte(body)); err == nil {
+			t.Fatalf("accepted incomplete catalog %s", body)
+		}
+	}
+}
+
 func TestFilterProviderEntriesByLine(t *testing.T) {
 	entries := []ProviderEntry{
 		{ID: "claude-opus-5"},

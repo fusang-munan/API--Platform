@@ -30,6 +30,16 @@ func RestoreReadyGovernedModels(ctx context.Context, client *ent.Client, provide
 	if err != nil {
 		return err
 	}
+	if len(rows) == 0 {
+		return nil
+	}
+	owner, err := client.Provider.Get(ctx, providerID)
+	if err != nil {
+		return err
+	}
+	if IsBeichenBaseURL(owner.BaseURL) {
+		return nil
+	}
 	for _, row := range rows {
 		if !ModelGovernanceConfigured(row) {
 			continue

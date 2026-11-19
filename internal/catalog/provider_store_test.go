@@ -43,7 +43,7 @@ func TestProviderCatalogUpsertStoresExtendedFields(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
-	count, err := (&ProviderCatalogSyncer{DB: database}).UpsertCredentialEntries(context.Background(), providerID, credentialID, entries, syncedAt)
+	count, err := (&ProviderCatalogSyncer{DB: database}).UpsertCredentialEntries(context.Background(), providerID, credentialID, entries, syncedAt, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

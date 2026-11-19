@@ -21,6 +21,8 @@ export const teacherAPI = {
   updateProjectBudget: (id: string, body: ProjectBudgetUpdate) => patch<ProjectBudget>(`/api/v1/teacher/project-budgets/${id}`, body),
   projectSpend: (query = '') => get<ProjectUsage[]>(`/api/v1/teacher/project-spend${query ? `?${query}` : ''}`),
   projectUsage: (id: string, month?: string) => get<ProjectUsage>(`/api/v1/teacher/projects/${id}/usage${month ? `?month=${month}` : ''}`),
+  updateMemberQuota: (project: string, user: string, monthly_credits: string) =>
+    patch<void>(`/api/v1/teacher/projects/${encodeURIComponent(project)}/members/${encodeURIComponent(user)}/monthly-credit-quota`, { monthly_credits }),
   createProject: (body: ProjectCreate) => post<Project>('/api/v1/teacher/projects', body),
   updateProject: (id: string, body: ProjectUpdate) => patch<Project>(`/api/v1/teacher/projects/${id}`, body),
   mentorApplications: (status = 'pending') => get<Application[]>(`/api/v1/teacher/mentor-project-applications?status=${status}`),
@@ -35,6 +37,9 @@ export const teacherAPI = {
   deleteProviderCredential: (providerId: string, credentialId: string) => del(`/api/v1/teacher/providers/${providerId}/credentials/${credentialId}`),
   resetProviderCatalog: (id: string) => post<ProviderCatalogSyncView>(`/api/v1/teacher/providers/${id}/reset-catalog`),
   beichenOverview: (id: string, day: string) => get<BeichenOverview>(`/api/v1/teacher/providers/${id}/beichen?${new URLSearchParams({ day })}`),
+  enableBeichenModel: (id: string, model: string, schoolModel?: string) =>
+    post<{ model_id: string; status: 'active' }>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/models/enable`,
+      { model, ...(schoolModel && schoolModel !== model ? { school_model: schoolModel } : {}) }),
   syncBeichen: (id: string) => post<{ synced: boolean }>(`/api/v1/teacher/providers/${id}/beichen/sync`),
   setBeichenPrice: (id: string, body: BeichenPriceUpdate) => patch<{ saved: boolean }>(`/api/v1/teacher/providers/${id}/beichen/price`, body),
   importBeichen: (id: string, body: BeichenImport) => post<{ imported: boolean }>(`/api/v1/teacher/providers/${id}/beichen/import`, body),
