@@ -306,11 +306,23 @@ func TestUpstreamUsageWithoutSchoolCallsPostgres(t *testing.T) {
 	count("SELECT count(*) FROM beichen_upstream_usage_rows", 530)
 	count("SELECT count(*) FROM gateway_calls", 0)
 	count("SELECT count(*) FROM beichen_call_receipts", 0)
+	fresh.client.Transport = receiptTestTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":0,"data":{"requires_2fa":true}}`))}, nil
+	})
+	if err := fresh.ConfigureWebSession("fixture@example.invalid", "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fresh.webPanelToken(ctx); err == nil {
+		t.Fatal("expected upstream account challenge")
+	}
 	view, err := fresh.Overview(ctx, provider, stamp.In(beijing).Format(dayLayout))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var total int64
+	if !view.WebLoginRequired {
+		t.Fatal("school overview must expose the upstream account challenge")
+	}
 	for _, group := range view.ArchivedUsage {
 		if group.UnmatchedRows != group.Rows || group.ObservedCost == nil || group.MarginCredits != nil {
 			t.Fatalf("unassigned upstream charges must remain independent: %+v", group)

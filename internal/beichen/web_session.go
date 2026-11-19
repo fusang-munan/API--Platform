@@ -9,6 +9,7 @@ import (
 	"net/mail"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,12 +20,13 @@ var errWebSignIn = errors.New("北辰官网要求核实学校账号或完成登�
 // The school signs in through the same endpoints as the Beichen website. Only
 // its running process holds the session and refresh token.
 type webSession struct {
-	email, password string
-	mu              sync.Mutex
-	access, refresh string
-	renewAt         time.Time
-	lastError       error
-	retryAt         time.Time
+	email, password   string
+	mu                sync.Mutex
+	access, refresh   string
+	renewAt           time.Time
+	lastError         error
+	humanVerification atomic.Bool
+	retryAt           time.Time
 }
 
 // ConfigureWebSession runs before any workers start.
@@ -113,6 +115,7 @@ func (s *Service) webPanelToken(ctx context.Context) (string, error) {
 		case errors.Is(err, errWebSignIn), errors.As(err, &status) && (status == 400 || status == 401 || status == 403 || status == 422):
 			// A rejected sign-in or human challenge needs account action.
 			account.lastError, account.retryAt = errWebSignIn, time.Time{}
+			account.humanVerification.Store(true)
 		case errors.Is(err, upstreamHTTPStatus(http.StatusTooManyRequests)):
 			account.retryAt = now.Add(15 * time.Minute)
 		}
@@ -126,6 +129,7 @@ func (s *Service) webPanelToken(ctx context.Context) (string, error) {
 	account.access, account.refresh = tokens.Access, tokens.Refresh
 	account.renewAt = now.Add(ttl - min(time.Minute, ttl/5))
 	account.lastError = nil
+	account.humanVerification.Store(false)
 	return account.access, nil
 }
 

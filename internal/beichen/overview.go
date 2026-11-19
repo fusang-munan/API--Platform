@@ -66,11 +66,12 @@ type Comparison struct {
 }
 
 type Overview struct {
-	ArchivedUsage []ArchivedUsage `json:"archived_usage"`
-	Datasets      []Dataset       `json:"datasets"`
-	Models        []Model         `json:"models"`
-	ModelCatalog  []CatalogModel  `json:"model_catalog"`
-	Comparison    []Comparison    `json:"comparison"`
+	WebLoginRequired bool            `json:"web_login_required,omitempty"`
+	ArchivedUsage    []ArchivedUsage `json:"archived_usage"`
+	Datasets         []Dataset       `json:"datasets"`
+	Models           []Model         `json:"models"`
+	ModelCatalog     []CatalogModel  `json:"model_catalog"`
+	Comparison       []Comparison    `json:"comparison"`
 }
 
 type CatalogModel struct {
@@ -134,6 +135,9 @@ func (s *Service) Overview(ctx context.Context, providerID uuid.UUID, day string
 		return Overview{}, err
 	}
 	view := Overview{Datasets: []Dataset{}, Models: []Model{}, Comparison: []Comparison{}}
+	if s.webAccount != nil {
+		view.WebLoginRequired = s.webAccount.humanVerification.Load()
+	}
 	if err = readDatasets(ctx, tx, providerID, &view); err == nil {
 		err = readModels(ctx, tx, providerID, &view)
 	}
