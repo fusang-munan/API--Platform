@@ -400,7 +400,7 @@ data: {"revision":"01K2..."}
 
 显式迁移会预置北辰。教师在现有 `GET /api/v1/teacher/providers` 列表即可发现该记录。首次预置返回 `status: active`、`credential_configured: false`，凭据数为 0。教师模型列表和自动选择供应商的目录接口仅使用至少有一把启用凭据的启用供应商。对账概览可打开，此时同步状态、报价和日账列表均为空。教师手动创建其他供应商仍使用以下接口。
 
-维护用 HTTPS 直接接收相同的 `/api/v1/` 和 `/v1/` 请求，复用相同的角色、登录和学生用量限制。该入口仅提供 API，登录挑战和刷新 Cookie 使用 Secure。证书指纹只用于验证服务器身份。
+学校 HTTPS 入口承载控制台、`/api/v1/` 及网关已有的原生协议路由。访问 `GET /teacher/providers`、`GET /student/api-keys` 或 `GET /login` 返回官方 Vue 应用的 HTML；应用使用同源 API 登录、选择身份和检查权限。登录挑战和刷新 Cookie 使用 Secure。读取网页本身不授予教师或学生权限。
 
 通过 Compose 构建的控制台镜像从 0.10.3 起包含静态文件 `/.well-known/nebula-release.txt`，匿名 GET 返回构建时根目录 `VERSION` 的一行文本。该文件用于识别前端部署版本。维护用 HTTPS API 的证书和服务状态须通过该入口单独验证。
 

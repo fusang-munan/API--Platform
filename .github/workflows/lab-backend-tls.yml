@@ -5,6 +5,11 @@ on:
     paths:
       - '.github/workflows/lab-backend-tls.yml'
       - 'scripts/test-lab-backend-tls.sh'
+      - 'scripts/ci-smtp-receiver.go'
+      - 'frontend/Dockerfile'
+      - 'frontend/.dockerignore'
+      - 'frontend/nginx.conf'
+      - 'frontend/lab-maintenance/**'
       - 'compose.yaml'
       - 'compose.local.yaml'
       - 'Dockerfile'
@@ -28,5 +33,5 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Test the school backend with disposable databases
+      - name: Test the school console and backend with disposable databases
         run: bash scripts/test-lab-backend-tls.sh
