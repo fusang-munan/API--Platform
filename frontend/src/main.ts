@@ -4,6 +4,7 @@ import App from './App.vue'
 import router from './router'
 import './styles.css'
 import './credit.css'
+import './styles-beichen.css'
 import './styles-additions.css'
 import './styles-apple.css'
 

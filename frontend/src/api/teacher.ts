@@ -1,5 +1,5 @@
 import { del, get, page, patch, post, request } from './client'
-import type { BeichenImport, BeichenOverview, BeichenPriceUpdate, BeichenReceiptPage } from './types'
+import type { BeichenBatchEnableResult, BeichenImport, BeichenModelPriceResult, BeichenModelPriceUpdate, BeichenModelUsage, BeichenOverview, BeichenPriceUpdate, BeichenReceiptPage, BeichenReconcile, BeichenUsageRange } from './types'
 import type { Application, Binding, BindingCreate, BindingRouteProbeEndpoint, BindingRouteProbeStep, BindingUpdate, MentorCandidate, Model, ModelCatalogPage, ModelCreate, ModelUpdate, Organization, OrganizationCreate, OrganizationUpdate, ProbeEndpoint, ProbeResponse, Project, ProjectBudget, ProjectBudgetUpdate, ProjectCreate, ProjectUpdate, Provider, ProviderCatalogSyncView, ProviderCreate, ProviderCredential, ProviderCredentialCreate, ProviderCredentialUpdate, ProviderUpdate, ProjectUsage, StudentAccount } from './types'
 interface BeichenPanelStatus { configured: boolean; group_id?: number; upstream_key_id?: number }
 export const teacherAPI = {
@@ -45,6 +45,16 @@ export const teacherAPI = {
   enableBeichenModel: (id: string, model: string, schoolModel?: string) =>
     post<{ model_id: string; status: 'active' }>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/models/enable`,
       { model, ...(schoolModel && schoolModel !== model ? { school_model: schoolModel } : {}) }),
+  enableBeichenModelsBatch: (id: string, models: string[]) =>
+    post<BeichenBatchEnableResult>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/models/enable-batch`, { models }),
+  setBeichenModelPrice: (id: string, body: BeichenModelPriceUpdate) =>
+    patch<BeichenModelPriceResult>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/models/price`, body),
+  modelUsage: (range: BeichenUsageRange, providerID?: string) => {
+    const query = new URLSearchParams({ range, ...(providerID ? { provider_id: providerID } : {}) })
+    return get<BeichenModelUsage>(`/api/v1/teacher/model-usage?${query}`)
+  },
+  beichenReconciliation: (id: string, range: BeichenUsageRange) =>
+    get<BeichenReconcile>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/reconciliation?${new URLSearchParams({ range })}`),
   syncBeichen: (id: string) => post<{ synced: boolean }>(`/api/v1/teacher/providers/${id}/beichen/sync`),
   setBeichenPrice: (id: string, body: BeichenPriceUpdate) => patch<{ saved: boolean }>(`/api/v1/teacher/providers/${id}/beichen/price`, body),
   importBeichen: (id: string, body: BeichenImport) => post<{ imported: boolean }>(`/api/v1/teacher/providers/${id}/beichen/import`, body),

@@ -7,7 +7,40 @@ export function isBeichenProvider(baseUrl: string) {
     && ['', '/', '/v1', '/v1/'].includes(address.slice(origin.length))
 }
 
-export function schoolCatalog(overview: BeichenOverview, providerId: string) {
+export type SchoolQuote = {
+  key: string
+  multiplier: string
+  multiplierLabel: string
+  standard: string | null
+  actual: string | null
+  actualRates: { input: string | null; output: string | null; cache_read: string | null; cache_write: string | null } | null
+  status: 'confirmed' | 'conditional' | 'not_listed' | 'pending'
+  statusLabel: string
+  notes: string[]
+  mode: 'follow' | 'manual'
+  priceReady: boolean
+}
+export type SchoolCredentialPrice = {
+  credential_id: string
+  label: string
+  mode: 'follow' | 'manual'
+  priceReady: boolean
+}
+export type SchoolCatalogRow = {
+  model: string
+  school: string
+  status?: string | null
+  canEnable?: boolean | null
+  canDisable: boolean
+  routeCount: number
+  readyCount: number
+  priceReady: boolean
+  mode: 'follow' | 'manual' | 'mixed'
+  credentials: SchoolCredentialPrice[]
+  quotes: SchoolQuote[]
+}
+
+export function schoolCatalog(overview: BeichenOverview, providerId: string): SchoolCatalogRow[] {
   const records = new Map<string, BeichenModel[]>()
   const prices = new Map<string, BeichenModel>()
   for (const row of overview.models ?? []) {
@@ -34,6 +67,7 @@ export function schoolCatalog(overview: BeichenOverview, providerId: string) {
       : entry.school_status ?? (ready ? 'active' : statuses.size === 1 ? rows[0].school_status : undefined)
     const canDisable = status === 'active' && (entry.school_status === 'active' || selected.length > 0)
     const quotes = new Map<string, ReturnType<typeof schoolQuote>>()
+    const credentials = new Map<string, { credential_id: string; label: string; mode: 'follow' | 'manual'; priceReady: boolean }>()
     for (const route of selected) {
       if (route.provider_id !== providerId || !route.credential_id) continue
       const upstreamName = (route.upstream_model ?? entry.model).toLowerCase()
@@ -42,10 +76,24 @@ export function schoolCatalog(overview: BeichenOverview, providerId: string) {
         route.state === 'candidate', syncErrors.get('prices:' + route.credential_id),
         syncErrors.get('billing:' + route.credential_id))
       quotes.set(JSON.stringify(quote), quote)
+      credentials.set(route.credential_id, {
+        credential_id: route.credential_id,
+        label: route.credential_label ?? '未命名 Key',
+        mode: quote.mode,
+        priceReady: quote.priceReady,
+      })
     }
+    const quoteList = Array.from(quotes, ([key, quote]) => ({ key, ...quote }))
+    const modes = new Set(quoteList.map(quote => quote.mode))
+    const mode = modes.size > 1 ? 'mixed' : modes.has('manual') ? 'manual' : 'follow'
     return {
       model: entry.model, school, status, canEnable: entry.can_enable, canDisable,
-      quotes: Array.from(quotes, ([key, quote]) => ({ key, ...quote })),
+      routeCount: selected.length,
+      readyCount: selected.filter(route => route.state === 'ready').length,
+      priceReady: quoteList.length > 0 && quoteList.every(quote => quote.priceReady),
+      mode,
+      credentials: Array.from(credentials.values()),
+      quotes: quoteList,
     }
   })
 }
@@ -59,19 +107,28 @@ const priceStatusLabels = {
 
 function schoolQuote(record: BeichenModel | undefined, reported: string | number | null | undefined,
   candidate: boolean, priceError?: string | null, billingError?: string | null) {
-  const status = record?.price_status === 'confirmed' || record?.price_status === 'conditional' ||
+  const status: SchoolQuote['status'] = record?.price_status === 'confirmed' || record?.price_status === 'conditional' ||
     record?.price_status === 'not_listed' ? record.price_status : 'pending'
+  const mode: 'follow' | 'manual' = record?.mode === 'manual' ? 'manual' : 'follow'
   const rate = billingError ? null : nonNegativeDecimal(reported)
   const multiplier = rate ? formatDecimal(rate) + (candidate ? '× · 待启用' : '×')
     : billingError || reported == null || reported === '' ? '待同步' : '倍率无效'
   const source = record?.price_conditions_exact ?? record?.price_conditions
   const terms = status !== 'not_listed' && source && typeof source === 'object' && !Array.isArray(source) ? source : null
   const canCalculate = !priceError && (status === 'confirmed' || status === 'conditional') ? rate : null
-  const prices = terms ? formatPriceConditions(terms, canCalculate) : null
+  const prices = terms ? formatPriceConditions(terms, canCalculate, true) : null
   const standard = prices?.standard ?? null
   // Older confirmed quotes can have effective token rates without a website pricing object.
   const legacy = !terms && canCalculate && status === 'confirmed' ? legacyEffectivePrice(record?.upstream_rates) : null
   const actual = prices?.actual ?? legacy?.actual ?? null
+  const schoolRates = record?.school_rates
+  const actualRates = schoolRates ? {
+    input: scaledNumber(schoolRates.input, 6), output: scaledNumber(schoolRates.output, 6),
+    cache_read: scaledNumber(schoolRates.cache_read, 6), cache_write: scaledNumber(schoolRates.cache_write, 6),
+  } : null
+  const priceReady = mode === 'manual'
+    ? Boolean(actualRates?.input != null && actualRates?.output != null)
+    : !priceError && Boolean(record?.upstream_rates?.input != null && record?.upstream_rates?.output != null)
   const statusLabel = priceError
     ? (status === 'pending' ? '价格同步失败' : '上次报价状态 · ' + priceStatusLabels[status])
     : (status === 'pending' && standard ? '官网单价待核对' : priceStatusLabels[status])
@@ -83,7 +140,8 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
   if (prices?.precisionUnknown) notes.push('官网原始小数精度未知')
   if (legacy?.zeroUncertain) notes.push('后台已有报价小数精度未知，零值待核对')
   if (legacy?.actual) notes.push('实际单价来自后台已有报价')
-  return { multiplier, standard, actual, status, statusLabel, notes }
+  return { multiplier, multiplierLabel: mode === 'manual' ? '手动定价' : '倍率 ' + multiplier,
+    standard, actual, actualRates, status, statusLabel, notes, mode, priceReady }
 }
 
 const tokenPrices = [
@@ -95,9 +153,9 @@ const effortLabels = new Map([
   ['minimal', '极低'], ['low', '低'], ['medium', '中'], ['high', '高'], ['xhigh', '极高'], ['max', '最高'],
 ])
 const unitLabels = {
-  token: '每百万 Token 的北辰余额单位',
-  request: '北辰余额单位/次',
-  second: '北辰余额单位/秒',
+  token: '每百万 Token 的积分',
+  request: '积分/次',
+  second: '积分/秒',
   unknown: '官网原值（单位未知）',
 }
 
@@ -118,10 +176,11 @@ function priceGroups(mode: BeichenPriceTier['billing_mode']): PriceGroup[] {
   }
 }
 
-function priceLines(tier: BeichenPriceTier, mode: BeichenPriceTier['billing_mode'], rate: Decimal | null = null) {
+function priceLines(tier: BeichenPriceTier, mode: BeichenPriceTier['billing_mode'], rate: Decimal | null = null, credits = false) {
   const lines: string[] = []
   for (const [unit, fields] of priceGroups(mode)) {
     if (rate && unit === 'unknown') continue
+    const factor = credits && unit !== 'unknown' ? 100n : 1n
     const values: string[] = []
     for (const [key, label] of fields) {
       const raw = tier[key]
@@ -132,7 +191,7 @@ function priceLines(tier: BeichenPriceTier, mode: BeichenPriceTier['billing_mode
       }
       const value = nonNegativeDecimal(raw)
       if (!value) continue
-      const coefficient = value.coefficient * (rate?.coefficient ?? 1n)
+      const coefficient = value.coefficient * (rate?.coefficient ?? 1n) * factor
       const scale = value.scale + (rate?.scale ?? 0) - (unit === 'token' ? 6 : 0)
       values.push(label + ' ' + formatDecimal({ coefficient, scale }))
     }
@@ -154,9 +213,9 @@ function tokenBoundary(raw: number | string | null | undefined, upper = false) {
   return { label, tokens: invalid ? null : BigInt(label), invalid }
 }
 
-function formatPriceConditions(terms: BeichenPriceConditions, rate: Decimal | null) {
-  const standard = priceLines(terms, terms.billing_mode)
-  const actual = rate ? priceLines(terms, terms.billing_mode, rate) : []
+function formatPriceConditions(terms: BeichenPriceConditions, rate: Decimal | null, credits = false) {
+  const standard = priceLines(terms, terms.billing_mode, null, credits)
+  const actual = rate ? priceLines(terms, terms.billing_mode, rate, credits) : []
   let precisionUnknown = hasNumericPrice(terms)
   for (const tier of Array.isArray(terms.intervals) ? terms.intervals : []) {
     if (!tier || typeof tier !== 'object' || Array.isArray(tier)) continue
@@ -168,10 +227,10 @@ function formatPriceConditions(terms: BeichenPriceConditions, rate: Decimal | nu
     const label = '上下文分档（Token 下限 ' + from.label + '，上限 ' + to.label + '）'
     const warning = invalid ? ' · 档位无效' : boundsUnknown ? ' · 适用范围待核对' : ''
     const mode = tier.billing_mode ?? terms.billing_mode
-    const tierStandard = priceLines(tier, mode)
+    const tierStandard = priceLines(tier, mode, null, credits)
     standard.push(label + warning, ...(tierStandard.length ? tierStandard : ['分档单价未知']))
     if (rate && !invalid && !boundsUnknown) {
-      const tierActual = priceLines(tier, mode, rate)
+      const tierActual = priceLines(tier, mode, rate, credits)
       if (tierActual.length) actual.push(label, ...tierActual)
     }
   }
@@ -189,7 +248,7 @@ function legacyEffectivePrice(rates: BeichenModel['upstream_rates']) {
   const formatted = priceFields.map(({ key, label }) => {
     const value = rates?.[key]
     const zeroUncertain = value === 0
-    return { label, amount: !zeroUncertain && nonNegativeDecimal(value) ? scaledNumber(value, 6) : null, zeroUncertain }
+    return { label, amount: !zeroUncertain && nonNegativeDecimal(value) ? scaledNumber(value, 4) : null, zeroUncertain }
   })
   const actual = formatted.some(({ amount }) => amount !== null)
     ? unitLabels.token + ' · ' + formatted.map(({ label, amount }) => label + ' ' + (amount ?? '未知')).join(' · ')
