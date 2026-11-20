@@ -44,6 +44,25 @@ func (s *Service) ConfigureWebSession(email, password string) error {
 	return nil
 }
 
+// ConfigureWebSessionTokens loads a session captured after the school account's
+// normal human verification. The access token is used until its recorded
+// expiry; the refresh token renews it without another password login.
+func (s *Service) ConfigureWebSessionTokens(email, access, refresh string, expiresAt time.Time) error {
+	email = strings.TrimSpace(email)
+	access, refresh = strings.TrimSpace(access), strings.TrimSpace(refresh)
+	addr, err := mail.ParseAddress(email)
+	if err != nil || addr.Address != email || len(email) > 254 || !validPanelBearer(access) ||
+		!validPanelBearer(refresh) || expiresAt.IsZero() {
+		return errors.New("北辰网页会话需要有效的账号邮箱、双令牌和到期时间")
+	}
+	renewAt := expiresAt.Add(-time.Minute)
+	if renewAt.Before(s.now()) {
+		renewAt = s.now()
+	}
+	s.webAccount = &webSession{email: email, access: access, refresh: refresh, renewAt: renewAt}
+	return nil
+}
+
 func (s *Service) WebSessionConfigured() bool { return s.webAccount != nil }
 
 // A protected endpoint can reject a session before its advertised expiry. Only
@@ -102,6 +121,11 @@ func (s *Service) webPanelToken(ctx context.Context) (string, error) {
 		}
 	}
 	if account.refresh == "" {
+		if account.password == "" {
+			account.lastError = errWebSignIn
+			account.humanVerification.Store(true)
+			return "", account.lastError
+		}
 		tokens, err = s.requestWebTokens(ctx, "login", map[string]string{"email": account.email, "password": account.password})
 	}
 	if err != nil {
@@ -121,16 +145,23 @@ func (s *Service) webPanelToken(ctx context.Context) (string, error) {
 		}
 		return "", account.lastError
 	}
-	life := tokens.Lifetime
-	if life == 0 || life > 86400 {
-		life = 900
-	}
-	ttl := time.Duration(life) * time.Second
+	ttl := webSessionTTL(tokens.Lifetime)
 	account.access, account.refresh = tokens.Access, tokens.Refresh
 	account.renewAt = now.Add(ttl - min(time.Minute, ttl/5))
 	account.lastError = nil
 	account.humanVerification.Store(false)
 	return account.access, nil
+}
+
+func webSessionTTL(seconds int64) time.Duration {
+	const maxLifetime = 366 * 24 * time.Hour
+	if seconds <= 0 {
+		return 15 * time.Minute
+	}
+	if seconds > int64(maxLifetime/time.Second) {
+		return maxLifetime
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // The only callers use fixed first-party login and refresh endpoints. Never

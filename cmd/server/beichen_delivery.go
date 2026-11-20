@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/starprince1234/Nebula-api/internal/controlplane"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/schoolseal"
@@ -14,6 +15,8 @@ import (
 
 type beichenSettings struct {
 	channels, email, password string
+	access, refresh           string
+	expiresAt                 time.Time
 	recipient                 *schoolseal.Recipient
 }
 
@@ -27,8 +30,14 @@ func initializeBeichenDelivery(ctx context.Context, service *controlplane.Servic
 			return settings.recipient
 		}
 	}
-	if err := service.Beichen().ConfigureWebSession(settings.email, settings.password); err != nil {
-		slog.Error("北辰学校账号配置无效", "error", err)
+	var sessionErr error
+	if settings.access != "" || settings.refresh != "" {
+		sessionErr = service.Beichen().ConfigureWebSessionTokens(settings.email, settings.access, settings.refresh, settings.expiresAt)
+	} else {
+		sessionErr = service.Beichen().ConfigureWebSession(settings.email, settings.password)
+	}
+	if sessionErr != nil {
+		slog.Error("北辰学校账号配置无效", "error", sessionErr)
 	}
 	if err := configureBeichen(ctx, service, settings.channels, os.Getenv("BEICHEN_PANEL_TOKEN"), os.Getenv("BEICHEN_PANEL_GROUPS")); err != nil {
 		slog.Error("北辰渠道预配置未完成", "error", err)
@@ -61,6 +70,17 @@ func loadBeichenSettings() (beichenSettings, error) {
 		if sealed.WebEmail != "" {
 			settings.email, settings.password = sealed.WebEmail, sealed.WebPassword
 		}
+	}
+	session, err := identity.OpenSessionRelease()
+	if err != nil {
+		return settings, err
+	}
+	if session != nil {
+		settings.email = session.WebEmail
+		settings.password = ""
+		settings.access = session.WebAccess
+		settings.refresh = session.WebRefresh
+		settings.expiresAt = session.WebExpiresAt
 	}
 	return settings, nil
 }
