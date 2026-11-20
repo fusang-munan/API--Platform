@@ -72,6 +72,7 @@ VALUES($1,'fixture','fixture@audit.invalid','!','student','disabled',now(),now()
 	names := [...]string{"Gemini", "GM1", "G3", "CC1"}
 	platforms := [...]string{"gemini", "deepseek", "openai", "anthropic"}
 	multipliers := [...]int{30, 8, 20, 15}
+	currentGroups := [...]int{20, 21, 22, 83}
 	secrets := [...]string{"sk-fixture-gemini", "sk-fixture-gm1", "sk-fixture-g3", "sk-fixture-cc1"}
 	ids := [len(names)]uuid.UUID{}
 	var keys []map[string]any
@@ -95,7 +96,7 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 			}
 		}
 		exec(`INSERT INTO beichen_datasets (credential_id,kind,next_attempt) VALUES ($1,'usage',now()+interval '1 hour')`, ids[i])
-		keys = append(keys, map[string]any{"id": 40 + i, "user_id": 13, "key": secrets[i], "name": name, "group_id": 20 + i})
+		keys = append(keys, map[string]any{"id": 40 + i, "user_id": 13, "key": secrets[i], "name": name, "group_id": currentGroups[i]})
 	}
 
 	useAmount := func(n int) json.Number { return json.Number(fmt.Sprintf("0.%02d", n)) }
@@ -112,7 +113,7 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 			if i == 1 {
 				groupPlatform = "composite"
 			}
-			group := map[string]any{"id": 20 + i, "platform": groupPlatform, "subscription_type": "standard",
+			group := map[string]any{"id": currentGroups[i], "platform": groupPlatform, "subscription_type": "standard",
 				"rate_multiplier": useAmount(multipliers[i]), "peak_rate_enabled": false}
 			model := func(id, platform string, base int) map[string]any {
 				return map[string]any{"name": id, "platform": platform, "pricing": map[string]any{
@@ -124,7 +125,7 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 			if i == 0 {
 				models = append(models, map[string]any{"name": "tiered", "platform": platform, "pricing": map[string]any{
 					"billing_mode": "token", "intervals": []any{map[string]any{"min_tokens": 200000, "input_price": 3e-6}},
-				}})
+				}}, map[string]any{"name": "listed-without-price", "platform": platform, "pricing": nil})
 				if round >= 3 {
 					models = append(models, model("new-model", platform, 7))
 				}
@@ -135,6 +136,16 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 					"supported_models": []any{model("mixed-model", "minimax", 6)}})
 			}
 			channels = append(channels, map[string]any{"platforms": sections})
+			if i == 3 {
+				// The obsolete fixed group remains visible and uses the same
+				// multiplier but has a different price for the same model.
+				staleGroup := map[string]any{"id": 23, "platform": platform, "subscription_type": "standard",
+					"rate_multiplier": useAmount(multipliers[i]), "peak_rate_enabled": false}
+				channels = append(channels, map[string]any{"platforms": []any{map[string]any{
+					"platform": platform, "groups": []any{staleGroup},
+					"supported_models": []any{model("shared", platform, 9)},
+				}}})
+			}
 		}
 		return map[string]any{"code": 0, "data": channels}
 	}
@@ -170,8 +181,12 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 				websiteReads.Add(1)
 				return response(200, websiteBody())
 			case "/api/v1/keys":
+				items := keys
+				if round == 5 {
+					items = items[:len(items)-1]
+				}
 				return response(200, map[string]any{"code": 0, "data": map[string]any{
-					"items": keys, "page": 1, "pages": 1, "page_size": 100, "total": len(keys)}})
+					"items": items, "page": 1, "pages": 1, "page_size": 100, "total": len(items)}})
 			}
 		}
 		for i, key := range secrets {
@@ -185,14 +200,14 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 					"effective_rate_multiplier": useAmount(multipliers[i]), "group_rate_multiplier": useAmount(multipliers[i]),
 					"resolved_rate_multiplier": useAmount(multipliers[i]), "peak_rate_enabled": false, "observed_at": time.Now().UTC()}
 				if i == 0 || i == 2 {
-					billing["group_id"] = 20 + i
+					billing["group_id"] = currentGroups[i]
 				}
 				return response(200, billing)
 			case modelsPath:
 				catalogReads[i].Add(1)
 				data := []map[string]any{{"id": "shared"}}
 				if i == 0 {
-					data = append(data, map[string]any{"id": "tiered"})
+					data = append(data, map[string]any{"id": "tiered"}, map[string]any{"id": "listed-without-price"})
 					if round >= 2 {
 						data = append(data, map[string]any{"id": "new-model"})
 					}
@@ -206,10 +221,11 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 		return nil, fmt.Errorf("unexpected outbound request")
 	})
 
+	var pricedChannels int64 = 4
 	current := func(model string, credential uuid.UUID, expectedStatus, input string) {
 		t.Helper()
 		overview, err := service.Overview(ctx, provider, "")
-		if err != nil || overview.WebsiteSync.PricedChannels != 4 || overview.WebsiteSync.Channels != 4 {
+		if err != nil || overview.WebsiteSync.PricedChannels != pricedChannels || overview.WebsiteSync.Channels != 4 {
 			t.Fatalf("website status %+v, error %v", overview.WebsiteSync, err)
 		}
 		for _, row := range overview.Models {
@@ -250,7 +266,7 @@ JOIN beichen_multiplier_versions m ON m.id=s.multiplier_version
 CROSS JOIN LATERAL beichen_price_at(c.id,'shared',statement_timestamp()) p
 WHERE c.id=$1 AND v.model='shared' AND v.source='panel' AND v.basis='base'
 ORDER BY s.effective_at DESC LIMIT 1`, id).Scan(&group, &base, &observedRevision, &multiplier, &input, &output, &read, &write)
-			if err != nil || !observedRevision || group != int64(20+i) || base != (i+1)*1_000_000 ||
+			if err != nil || !observedRevision || group != int64(currentGroups[i]) || base != (i+1)*1_000_000 ||
 				!samePanelRate(json.Number(multiplier), useAmount(multipliers[i])) ||
 				input != strconv.Itoa((i+1)*10_000*multipliers[i]) || output != strconv.Itoa(50_000*multipliers[i]) ||
 				read != strconv.Itoa(1_000*multipliers[i]) || write != strconv.Itoa(2_000*multipliers[i]) {
@@ -259,8 +275,9 @@ ORDER BY s.effective_at DESC LIMIT 1`, id).Scan(&group, &base, &observedRevision
 		}
 		current("tiered", ids[0], "conditional", "")
 		current("mixed-model", ids[1], "confirmed", "480000")
+		current("listed-without-price", ids[0], "pending_confirmation", "")
 		if round == 2 {
-			current("new-model", ids[0], "pending_confirmation", "")
+			current("new-model", ids[0], "not_listed", "")
 		} else if round == 3 {
 			current("new-model", ids[0], "confirmed", "2100000")
 		}
@@ -289,4 +306,16 @@ ORDER BY s.effective_at DESC LIMIT 1`, id).Scan(&group, &base, &observedRevision
 	if err != nil || failed != 4 || snapshotCount != 12 || !latestSuccess.Equal(priorSuccess) {
 		t.Fatalf("empty read lost history or advanced last success: errors %d snapshots %d (%v)", failed, snapshotCount, err)
 	}
+
+	round, pricedChannels = 5, 3
+	exec("UPDATE beichen_datasets SET next_attempt=clock_timestamp() WHERE kind='billing'")
+	if err := service.syncJobs(ctx, nil); err == nil {
+		t.Fatal("unverified fixed-group membership reported success")
+	}
+	current("shared", ids[3], "pending_confirmation", "")
+	var reason string
+	if err := db.QueryRowContext(ctx, `SELECT last_error FROM beichen_datasets WHERE kind='prices' AND credential_id=$1`, ids[3]).Scan(&reason); err != nil || reason != errPanelGroupUnverified.Error() {
+		t.Fatalf("missing group verification failure: %v", err)
+	}
+	t.Log("three four-channel rounds, deferred model price, and fixed-group rejection verified")
 }

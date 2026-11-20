@@ -70,6 +70,7 @@ type panelQuote struct {
 	groupID           int64
 	rows              []priceRow
 	terms             map[string]json.RawMessage
+	notListed         []string
 	expiresAt         time.Time
 	err               error
 	verificationError error
@@ -77,24 +78,19 @@ type panelQuote struct {
 
 var errPanelLoginRequired = errors.New("北辰渠道页要求登录")
 var errPanelEmpty = errors.New("北辰渠道页没有当前 Key 的有效模型报价")
+var errPanelGroupUnverified = errors.New("无法核实北辰 Key 当前所属分组")
 
 func (s *Service) fetchChannelQuote(ctx context.Context, access priceAccess, key string, info billingInfo, entries []catalog.ProviderEntry) panelQuote {
-	mappedGroup := access.groupID
-	if access.discoverIDs && s.WebSessionConfigured() {
-		// A discovered binding may be from before an upstream group change.
-		// If the billing endpoint omits the ID, confirm it on the account page.
-		mappedGroup = 0
-	}
-	group := billingPanelGroup(mappedGroup, info)
+	group := billingPanelGroup(info)
 	if access.disabled {
 		return panelQuote{groupID: group, err: errors.New("北辰面板采价已停用")}
 	}
 	webConfigured := s.WebSessionConfigured()
 	// The school's channels use the saved account every round. Legacy bindings
 	// outside that provisioning path can still use their own read authorization.
-	if access.legacyToken != "" && access.channel == "" && group != 0 {
+	if access.legacyToken != "" && access.channel == "" {
 		quote := s.fetchPanelQuote(ctx, access.legacyToken, key, group, access, info, entries)
-		if quote.err == nil || !webConfigured {
+		if (quote.err == nil && len(quote.terms) > 0) || !webConfigured {
 			return quote
 		}
 	}
@@ -103,6 +99,9 @@ func (s *Service) fetchChannelQuote(ctx context.Context, access priceAccess, key
 			return panelQuote{groupID: group, err: errors.New("未配置北辰学校网页会话")}
 		}
 		if group == 0 {
+			if access.groupID != 0 {
+				return panelQuote{err: errPanelGroupUnverified}
+			}
 			// Existing billing-extension and CSV deployments have no website source.
 			return panelQuote{}
 		}
@@ -120,12 +119,12 @@ func (s *Service) fetchChannelQuote(ctx context.Context, access priceAccess, key
 	s.webReadError(token, upstreamHTTPStatus(http.StatusUnauthorized))
 	token, err = s.webPanelToken(ctx)
 	if err != nil {
-		return panelQuote{groupID: group, err: fmt.Errorf("续期学校的北辰网页会话失败：%w", err)}
+		return panelQuote{groupID: quote.groupID, err: fmt.Errorf("续期学校的北辰网页会话失败：%w", err)}
 	}
 	retried := s.fetchPanelQuote(ctx, token, key, group, access, info, entries)
 	if panelAuthFailed(retried.err) {
 		s.webReadError(token, upstreamHTTPStatus(http.StatusUnauthorized))
-		return panelQuote{groupID: group, err: errors.New("续期后北辰渠道页仍拒绝学校网页会话")}
+		retried.err = errors.New("续期后北辰渠道页仍拒绝学校网页会话")
 	}
 	return retried
 }
@@ -151,6 +150,23 @@ func (s *Service) fetchPanelQuote(ctx context.Context, token, key string, group 
 		quote.err = err
 		return quote
 	}
+	if group == 0 {
+		if token == "" {
+			quote.err = errPanelGroupUnverified
+			return quote
+		}
+		keys, err := s.accountKeys(ctx, token)
+		if err != nil {
+			quote.err = fmt.Errorf("%w：%w", errPanelGroupUnverified, err)
+			return quote
+		}
+		match, err := info.matchWebsiteKey(keys, key, access.channel, access.label)
+		if err != nil {
+			quote.err = errPanelGroupUnverified
+			return quote
+		}
+		quote.groupID = match.GroupID
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, panelURL, nil)
 	if err != nil {
 		quote.err = errors.New("构建北辰面板请求失败")
@@ -171,51 +187,39 @@ func (s *Service) fetchPanelQuote(ctx context.Context, token, key string, group 
 		quote.err = err
 		return quote
 	}
-	if group == 0 {
-		keys, err := s.accountKeys(ctx, token)
-		if err != nil {
-			quote.err = err
-			return quote
-		}
-		match, err := info.matchWebsiteKey(keys, key, access.channel, access.label)
-		if err != nil {
-			quote.err = err
-			return quote
-		}
-		quote.groupID = match.GroupID
-	}
-	rows, terms, err := matchPanelPrices(sections, quote.groupID, info, entries)
+	matched, err := matchPanelPrices(sections, quote.groupID, info, entries)
 	if err != nil {
 		quote.err = err
 		return quote
 	}
-	for model, raw := range terms {
+	for model, raw := range matched.terms {
 		if !hasPanelPrice(raw) {
-			delete(terms, model)
+			delete(matched.terms, model)
 		}
 	}
-	if len(terms) == 0 {
+	if !matched.hasPrices {
 		quote.err = errPanelEmpty
 		return quote
 	}
-	quote.rows, quote.terms, quote.expiresAt = rows, terms, expires
-	if len(rows) == 0 || len(info.Pricing) == 0 || bytes.Equal(info.Pricing, []byte("null")) {
-		return quote
-	}
-	quote.rows = nil
-	verified, err := panelBillingRates(info.Pricing)
-	if err != nil {
-		quote.verificationError = errors.New("北辰 Key 账单提供了无法确认的逐模型基础报价")
-		return quote
-	}
-	for _, row := range rows {
-		if ratesEqual(row.Rates, verified[row.Model]) {
-			quote.rows = append(quote.rows, row)
+	quote.rows, quote.terms, quote.expiresAt = matched.rows, matched.terms, expires
+	if len(matched.rows) > 0 && len(info.Pricing) != 0 && !bytes.Equal(info.Pricing, []byte("null")) {
+		quote.rows = nil
+		verified, err := panelBillingRates(info.Pricing)
+		if err != nil {
+			quote.verificationError = errors.New("北辰 Key 账单提供了无法确认的逐模型基础报价")
+			return quote
+		}
+		for _, row := range matched.rows {
+			if ratesEqual(row.Rates, verified[row.Model]) {
+				quote.rows = append(quote.rows, row)
+			}
+		}
+		if len(quote.rows) == 0 {
+			quote.verificationError = errors.New("北辰面板报价与 Key 账单的逐模型基础价无可信交集")
+			return quote
 		}
 	}
-	if len(quote.rows) == 0 {
-		quote.verificationError = errors.New("北辰面板报价与 Key 账单的逐模型基础价无可信交集")
-	}
+	quote.notListed = matched.notListed
 	return quote
 }
 
@@ -392,7 +396,14 @@ func decodePanelChannels(body []byte) ([]panelChannel, error) {
 	}
 }
 
-func matchPanelPrices(channels []panelChannel, groupID int64, info billingInfo, entries []catalog.ProviderEntry) ([]priceRow, map[string]json.RawMessage, error) {
+type matchedPanelPrices struct {
+	rows      []priceRow
+	terms     map[string]json.RawMessage
+	notListed []string
+	hasPrices bool
+}
+
+func matchPanelPrices(channels []panelChannel, groupID int64, info billingInfo, entries []catalog.ProviderEntry) (matchedPanelPrices, error) {
 	var sections []panelSection
 	selectedChannel := -1
 	groupPlatform := ""
@@ -409,16 +420,16 @@ func matchPanelPrices(channels []panelChannel, groupID int64, info billingInfo, 
 				if groupID <= 0 || candidate.Platform == "" || seenPlatforms[candidate.Platform] ||
 					(group.Platform != candidate.Platform && group.Platform != "composite") ||
 					(selectedChannel >= 0 && (selectedChannel != i || groupPlatform != group.Platform)) {
-					return nil, nil, errors.New("北辰面板分组无法唯一对应同一渠道的平台")
+					return matchedPanelPrices{}, errors.New("北辰面板分组无法唯一对应同一渠道的平台")
 				}
 				if (channel.Status != "" && channel.Status != "active") || (group.Status != "" && group.Status != "active") {
-					return nil, nil, errors.New("北辰面板分组或渠道已停用")
+					return matchedPanelPrices{}, errors.New("北辰面板分组或渠道已停用")
 				}
 				if group.SubscriptionType != "standard" {
-					return nil, nil, errors.New("北辰面板分组未确认为标准余额组")
+					return matchedPanelPrices{}, errors.New("北辰面板分组未确认为标准余额组")
 				}
 				if !matchesPanelMultiplier(group, info) {
-					return nil, nil, errors.New("北辰面板与 Key 账单的分组倍率或高峰规则不一致")
+					return matchedPanelPrices{}, errors.New("北辰面板与 Key 账单的分组倍率或高峰规则不一致")
 				}
 				selectedChannel, groupPlatform = i, group.Platform
 				seenPlatforms[candidate.Platform] = true
@@ -428,33 +439,46 @@ func matchPanelPrices(channels []panelChannel, groupID int64, info billingInfo, 
 		}
 	}
 	if len(sections) == 0 || modelCount > maxRows {
-		return nil, nil, errors.New("北辰面板找不到映射分组或模型数量超限")
+		return matchedPanelPrices{}, errors.New("北辰面板找不到映射分组或模型数量超限")
 	}
 	available := make(map[string]bool, len(entries))
 	for _, model := range entries {
 		available[model.ID] = true
 	}
 	occurrences := make(map[string]int, modelCount)
+	complete := true
 	for _, section := range sections {
+		complete = complete && section.Models != nil
 		for _, model := range section.Models {
 			occurrences[model.Name]++
+			complete = complete && validModel(model.Name) && model.Platform == section.Platform
 		}
 	}
-	var rows []priceRow
-	terms := make(map[string]json.RawMessage)
+	matched := matchedPanelPrices{terms: make(map[string]json.RawMessage)}
 	for _, section := range sections {
 		for _, model := range section.Models {
-			if !available[model.Name] || !validModel(model.Name) || occurrences[model.Name] != 1 ||
+			if !validModel(model.Name) || occurrences[model.Name] != 1 ||
 				model.Platform != section.Platform || len(model.Pricing) == 0 || model.Pricing[0] != '{' {
 				continue
 			}
-			terms[model.Name] = model.Pricing
+			matched.hasPrices = matched.hasPrices || hasPanelPrice(model.Pricing)
+			if !available[model.Name] {
+				continue
+			}
+			matched.terms[model.Name] = model.Pricing
 			if rates, ok := flatPanelRates(model.Pricing); ok {
-				rows = append(rows, priceRow{Model: model.Name, Rates: rates})
+				matched.rows = append(matched.rows, priceRow{Model: model.Name, Rates: rates})
 			}
 		}
 	}
-	return rows, terms, nil
+	if complete && matched.hasPrices {
+		for _, model := range entries {
+			if validModel(model.ID) && occurrences[model.ID] == 0 {
+				matched.notListed = append(matched.notListed, model.ID)
+			}
+		}
+	}
+	return matched, nil
 }
 
 var panelAmountField = regexp.MustCompile(`^(input|output|cache_read|cache_write(_[0-9]+[hm])?|image_input|image_output|per_request)_price$`)
@@ -606,8 +630,8 @@ func saveBillingObservation(ctx context.Context, tx *sql.Tx, credentialID uuid.U
 		quote.err = errors.New("北辰报价已过期或同步期间跨越高峰边界")
 	}
 	if quote.err != nil {
-		// Keep the last verified quote for its original validity window. A
-		// newly observed group or rate can invalidate it before that window ends.
+		// A failed read retains the last quote only while this round can still
+		// verify its group and multiplier.
 		if billingErr == nil {
 			if err := invalidateChangedPanelQuote(ctx, tx, credentialID, revision, effectiveAt, group, info.Multiplier.String()); err != nil {
 				return err
@@ -616,6 +640,11 @@ func saveBillingObservation(ctx context.Context, tx *sql.Tx, credentialID uuid.U
 		return recordDatasetError(ctx, tx, credentialID, "prices", quote.err.Error())
 	}
 	terms := []byte("{}")
+	for _, model := range quote.notListed {
+		// JSON null records coverage without a matching model. An absent key
+		// means coverage was not established for that model.
+		quote.terms[model] = json.RawMessage("null")
+	}
 	if quote.terms != nil {
 		terms, err = json.Marshal(quote.terms)
 		if err != nil {
@@ -663,7 +692,7 @@ FROM (
   WHERE credential_id = $1 ORDER BY effective_at DESC LIMIT 1
 ) previous JOIN beichen_multiplier_versions m ON m.id = previous.multiplier_version
 WHERE previous.expires_at > $2
-  AND (($4::bigint > 0 AND previous.group_id <> $4) OR m.multiplier <> NULLIF($5::text, '')::numeric)
+  AND ($4::bigint = 0 OR previous.group_id <> $4 OR m.multiplier <> NULLIF($5::text, '')::numeric)
 ON CONFLICT (credential_id, effective_at) DO NOTHING`, credentialID, effectiveAt, revision, group, multiplier)
 	return err
 }

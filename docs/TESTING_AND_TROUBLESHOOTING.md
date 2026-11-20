@@ -232,7 +232,9 @@ WHERE c.status = 'active'
 ORDER BY j.channel;
 ```
 
-用隔离的本机 PostgreSQL 运行 `go test ./internal/beichen -run 'TestScheduledWebsitePricesPostgres|TestChannelQuoteReportsFailedRefresh|TestUpstreamUsageWithoutSchoolCallsPostgres' -count=1`。测试模拟四把 Key 连续重读价表及目录、网页会话续期、新模型后来补价、有效快照跨凭据元数据更新，以及账号内逐笔归档。测试请求均在模拟接口处理。
+续期后重启仍提示网页登录失效时，核对学校后端是否挂载原来的私有卷，且服务能写入 `LAB_BEICHEN_SEAL_DIR`。续期状态文件需要由同一卷上的学校收件私钥解密。新交付的网页登录捕获使用独立的续期状态。
+
+设置 `NEBULA_TEST_POSTGRES` 指向隔离的本机 PostgreSQL，再运行 `go test ./internal/beichen ./internal/dataplane -run 'TestSavedWebSessionSurvivesProcessRestart|TestScheduledWebsitePricesPostgres|TestPanelPostgresPriceLifecycle|TestReceiptSweepPostgresG3|TestBeichenTeacherEnablesDiscoveredModelForStudent' -count=1 -v`。覆盖真实进程重启、三轮四路采价、固定分组校验、新模型补价、已有快照升级、1.10 扣费和教师接口状态。所有上游请求使用模拟响应。
 7. 预期的维护教师看不到工作区时，核对学校维护 HTTPS、登录账号的校内 UUID 和校方提供的固定应用地址。工作区配置无效时会记录简短的启动提示，学校网站继续提供服务。若能打开工作区但流水时间仍旧，需分别核验工作区登录状态和后台数据来源。运行 `go test ./internal/api/http -run 'TestSchoolWorkspace|TestBeichenOverviewPreventsSharedCaching'` 可检查教师隔离、空配置和缓存。
 
 | 现象 | 常见根因 | 解决方案 | 排查建议 |

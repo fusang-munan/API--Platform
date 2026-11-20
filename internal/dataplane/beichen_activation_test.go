@@ -219,4 +219,36 @@ func TestBeichenTeacherEnablesDiscoveredModelForStudent(t *testing.T) {
 			t.Fatalf("duplicate governance audit: %v", err)
 		}
 	})
+	t.Run("teacher API reports only current coverage", func(t *testing.T) {
+		checkPriceStatus := func(want string) {
+			t.Helper()
+			var response struct{ Data beichen.Overview }
+			if err := json.Unmarshal([]byte(request("GET", path, teacherToken, "", 200)), &response); err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range response.Data.Models {
+				if row.CredentialID == replacement && row.Model == model {
+					if row.PriceStatus != want || row.UpstreamRates != nil || string(row.PriceConditions) != "null" {
+						t.Fatalf("expected %q with no inferred price, got %q", want, row.PriceStatus)
+					}
+					return
+				}
+			}
+			t.Fatal("missing teacher price row")
+		}
+		checkPriceStatus("pending_confirmation")
+		exec(`
+WITH multiplier AS (
+  INSERT INTO beichen_multiplier_versions(credential_id, effective_at, multiplier)
+  VALUES ($1,statement_timestamp()-interval '1 minute',1) RETURNING id, effective_at
+)
+INSERT INTO beichen_panel_snapshots(credential_id,effective_at,credential_revision,group_id,expires_at,
+  multiplier_version,model_pricing,credential_ciphertext_sha256)
+SELECT c.id, m.effective_at, c.updated_at, 7, statement_timestamp()+interval '1 minute', m.id,
+  jsonb_build_object($2::text, NULL, 'listed', '{"input_price":0.000001}'::jsonb),sha256(c.credential_ciphertext)
+FROM provider_credentials c CROSS JOIN multiplier m WHERE c.id=$1`, replacement, model)
+		checkPriceStatus("not_listed")
+		exec(`UPDATE beichen_panel_snapshots SET expires_at=statement_timestamp()-interval '30 seconds' WHERE credential_id=$1`, replacement)
+		checkPriceStatus("pending_confirmation")
+	})
 }

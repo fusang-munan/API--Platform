@@ -204,7 +204,7 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 	entries, catalogErr := s.fetchKeyCatalog(ctx, key)
 	catalogAt := s.now().UTC()
 	access, accessErr := s.loadPriceAccess(ctx, job.credential)
-	group := billingPanelGroup(access.groupID, info)
+	group := billingPanelGroup(info)
 	quote := panelQuote{groupID: group}
 	switch {
 	case billingErr != nil:
@@ -247,11 +247,11 @@ func (s *Service) fetchKeyCatalog(ctx context.Context, key string) ([]catalog.Pr
 	return entries, nil
 }
 
-func billingPanelGroup(mappedGroup int64, info billingInfo) int64 {
-	if info.GroupID != nil && *info.GroupID > 0 {
+func billingPanelGroup(info billingInfo) int64 {
+	if info.GroupID != nil && *info.GroupID > 0 && *info.GroupID <= 9007199254740991 {
 		return *info.GroupID
 	}
-	return mappedGroup
+	return 0
 }
 
 func (s *Service) fetchUsage(ctx context.Context, job syncJob, key string, manual bool) fetchResult {

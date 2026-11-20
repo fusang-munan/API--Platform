@@ -56,7 +56,8 @@ func parsePanelPrices(body []byte, groupID int64, info billingInfo, entries []ca
 	if err != nil {
 		return nil, nil, err
 	}
-	return matchPanelPrices(channels, groupID, info, entries)
+	matched, err := matchPanelPrices(channels, groupID, info, entries)
+	return matched.rows, matched.terms, err
 }
 
 func TestPanelGroupIsolation(t *testing.T) {
@@ -160,7 +161,8 @@ func (f panelTransport) RoundTrip(req *http.Request) (*http.Response, error) { r
 func TestChannelQuoteUsesSavedWebSession(t *testing.T) {
 	now := time.Now().UTC()
 	peak := false
-	info := billingInfo{PeakEnabled: &peak, ObservedAt: now, GroupRate: "1", ResolvedRate: "1", Multiplier: "1"}
+	group := int64(2)
+	info := billingInfo{GroupID: &group, PeakEnabled: &peak, ObservedAt: now, GroupRate: "1", ResolvedRate: "1", Multiplier: "1"}
 	models := []catalog.ProviderEntry{{ID: "shared"}}
 	for _, tc := range []struct {
 		name, legacyBody string
@@ -218,6 +220,7 @@ func TestChannelQuoteUsesSavedWebSession(t *testing.T) {
 func TestChannelQuoteReportsFailedRefresh(t *testing.T) {
 	now := time.Now().UTC()
 	peak := false
+	group := int64(2)
 	s := New(nil, nil)
 	s.now = func() time.Time { return now }
 	if err := s.ConfigureWebSessionTokens("school@example.test", "saved-access", "saved-refresh", now.Add(time.Hour)); err != nil {
@@ -236,7 +239,7 @@ func TestChannelQuoteReportsFailedRefresh(t *testing.T) {
 			return nil, nil
 		}
 	})
-	info := billingInfo{PeakEnabled: &peak, ObservedAt: now, GroupRate: "1", ResolvedRate: "1", Multiplier: "1"}
+	info := billingInfo{GroupID: &group, PeakEnabled: &peak, ObservedAt: now, GroupRate: "1", ResolvedRate: "1", Multiplier: "1"}
 	quote := s.fetchChannelQuote(context.Background(), priceAccess{groupID: 2, channel: "G3"}, "sk-synthetic", info, nil)
 	if !errors.Is(quote.err, errWebSignIn) || !s.webAccount.humanVerification.Load() ||
 		strings.Join(requests, ",") != "GET /api/v1/channels/available,POST /api/v1/auth/refresh" {

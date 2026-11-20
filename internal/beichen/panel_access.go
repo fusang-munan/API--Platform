@@ -72,7 +72,6 @@ type priceAccess struct {
 	label       string
 	legacyToken string
 	disabled    bool
-	discoverIDs bool
 }
 
 func (s *Service) loadPriceAccess(ctx context.Context, credentialID uuid.UUID) (priceAccess, error) {
@@ -81,11 +80,11 @@ func (s *Service) loadPriceAccess(ctx context.Context, credentialID uuid.UUID) (
 	var actor uuid.NullUUID
 	var encrypted []byte
 	err := s.db.QueryRowContext(ctx, `
-SELECT a.group_id,a.token_ciphertext,a.updated_by,COALESCE(j.channel,''),c.label::text,COALESCE(j.discover_ids,false)
+SELECT a.group_id,a.token_ciphertext,a.updated_by,COALESCE(j.channel,''),c.label::text
 FROM provider_credentials c
 LEFT JOIN beichen_panel_access a ON a.credential_id=c.id
 LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
-WHERE c.id=$1`, credentialID).Scan(&group, &encrypted, &actor, &access.channel, &access.label, &access.discoverIDs)
+WHERE c.id=$1`, credentialID).Scan(&group, &encrypted, &actor, &access.channel, &access.label)
 	if err != nil {
 		return priceAccess{}, errors.New("读取北辰采价配置失败")
 	}

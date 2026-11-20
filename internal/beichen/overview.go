@@ -246,6 +246,10 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 			return err
 		}
 		model.PriceStatus = "pending_confirmation"
+		if bytes.Equal(terms, []byte("null")) {
+			model.PriceStatus = "not_listed"
+			terms = nil
+		}
 		model.PriceConditions = terms
 		if len(terms) > 0 {
 			decoder := json.NewDecoder(bytes.NewReader(terms))
