@@ -6,7 +6,7 @@ import router from '../router'
 import { token } from '../api/client'
 import { useAuthStore } from '../store/auth'
 import type { ProjectUsage, Role } from '../api/types'
-import { schoolMonth } from '../utils/format'
+import { schoolDay, schoolMonth } from '../utils/format'
 
 vi.mock('../api/client', async original => ({
   ...await original<typeof import('../api/client')>(), openEvents: vi.fn(),
@@ -63,8 +63,13 @@ async function fetchFixture(url: string, init?: RequestInit) {
     throw Error('未预期的写入 ' + path)
   }
   if (path.endsWith('/providers')) return reply([school, other])
+  if (path === '/api/v1/teacher/providers/north/beichen/receipts') return reply({ items: [], next_cursor: null })
   if (path.endsWith('/beichen')) return reply({
     web_login_required: true,
+    website_sync: {
+      channels: 4, priced_channels: 3, receipt_checked_channels: 4, receipt_caught_up_channels: 1,
+      price_last_seen: '2026-11-01T15:30:00Z', receipt_last_checked: '2026-11-01T16:02:03Z',
+    },
     datasets: [
       { kind: 'billing', credential_id: 'cheap', effective_multiplier: 0.1 },
       { kind: 'billing', credential_id: 'stale', last_error: '本轮读取失败', effective_multiplier: 0.3 },
@@ -174,6 +179,7 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   await widget.get('a[href="/teacher/models"]').trigger('click')
   await flushPromises()
   expect(widget.get('[aria-label="北辰模型目录"]').findAll('tbody tr')).toHaveLength(4)
+  expect(widget.find('[aria-label="近期逐笔对账"]').exists()).toBe(false)
   expect(widget.find('article.panel').exists()).toBe(false)
 })
 
@@ -212,6 +218,54 @@ it('教师从目录直接启用未配置模型，失败后可重试，后台成�
   expect(button('禁用', row).exists()).toBe(true)
 })
 
+it('从教师供应商维护抽屉展开真实对账入口，复用官网状态，模型主目录隐藏状态和流水', async () => {
+  await enter('teacher', '/teacher/providers')
+  const before = request.mock.calls.length
+  await button('查看模型', widget.get('article')).trigger('click')
+  await flushPromises()
+  const panel = page().get('[role="dialog"]').get('[aria-label="近期逐笔对账"]')
+  expect(panel.text()).not.toContain('渠道')
+  const row = { occurred_at: '2026-11-01T16:02:03Z', model: '假数据模型', student_name: '测试学生',
+    base_credits: '0', school_multiplier: '1.10', charged_credits: '0', actual_cost: '0.0000', difference_credits: '0', matched: true }
+  request.mockResolvedValueOnce(reply({ items: [row, { ...row, student_name: null, actual_cost: null, difference_credits: null, matched: false }], next_cursor: null }))
+  await button('近期逐笔对账', panel).trigger('click')
+  await flushPromises()
+  const overviewPath = '/api/v1/teacher/providers/north/beichen'
+  const readPaths = () => request.mock.calls.slice(before).map(([url, init]) => [init?.method ?? 'GET', url.split('?')[0]])
+  expect(readPaths()).toEqual([['GET', overviewPath], ['GET', overviewPath + '/receipts']])
+  expect(panel.findAll('dl > div').map(field => [field.get('dt').text(), field.get('dd').text()])).toEqual([
+    ['当前有有效网页报价', '3 / 4 个渠道'], ['成功读取过流水页', '4 / 4 个渠道'], ['最近一次扫描已到末页', '1 / 4 个渠道'],
+    ['最近记录报价时间', '2026-11-01 23:30:00'], ['最近一页流水读取成功时间', '2026-11-02 00:02:03'],
+  ])
+  const [zero, pending] = panel.findAll('tbody tr')
+  expect(zero.findAll('td').slice(2).map(cell => cell.text())).toEqual(['0.0000', '0', '已匹配'])
+  expect(pending.findAll('td').slice(2).map(cell => cell.text())).toEqual(['待核', '待核', '待核'])
+  await panel.get('input').setValue('')
+  await panel.get('input').setValue('2026-11-02')
+  await flushPromises()
+  expect(panel.text()).toContain('学校尚未归档所选日期的北辰流水')
+  expect(readPaths().slice(2)).toEqual([['GET', overviewPath + '/receipts']])
+  await button('刷新对账', panel).trigger('click')
+  await flushPromises()
+  expect(readPaths().slice(3)).toEqual([['GET', overviewPath], ['GET', overviewPath + '/receipts']])
+  await page().get('button[aria-label="关闭"]').trigger('click')
+  const beforeCatalog = request.mock.calls.length
+  await widget.get('a[href="/teacher/models"]').trigger('click')
+  await flushPromises()
+  expect(router.currentRoute.value.path).toBe('/teacher/models')
+  expect(widget.get('[aria-label="北辰模型目录"]').text()).toContain('2.125000000000000000000001×')
+  expect(widget.text()).not.toMatch(/近期逐笔对账|当前有有效网页报价|最近一次扫描已到末页|隐藏的首选渠道|北辰官网需要学校后台重新授权/)
+  expect(request.mock.calls.slice(beforeCatalog).some(([url]) => url.includes('/beichen/receipts'))).toBe(false)
+  expect(writes).not.toHaveBeenCalled()
+})
+
+it.each(['student', 'mentor'] as const)('%s 身份打开教师供应商地址时无法进入对账区或发起教师请求', async identity => {
+  await enter(identity, '/teacher/providers')
+  expect(router.currentRoute.value.path).not.toBe('/teacher/providers')
+  expect(page().find('[aria-label="近期逐笔对账"]').exists()).toBe(false)
+  expect(request.mock.calls.some(([url]) => url.includes('/api/v1/teacher/'))).toBe(false)
+})
+
 it('普通教师用学校邮箱密码登录后回到原供应商页面，首次查看北辰只读取目录', async () => {
   role = 'teacher'
   const pinia = createPinia()
@@ -237,12 +291,25 @@ it('普通教师用学校邮箱密码登录后回到原供应商页面，首次�
   expect(JSON.parse(String(request.mock.calls[2][1]?.body))).toEqual({ identity: role })
   expect(router.currentRoute.value.path).toBe('/teacher/providers')
   const before = request.mock.calls.length
+  // 旧版学校后台的概览不含官网同步状态。
+  request.mockResolvedValueOnce(reply({ datasets: [], models: [], comparison: [] }))
   await button('查看模型', widget.get('article')).trigger('click')
   await flushPromises()
   expect(request.mock.calls.slice(before).map(([url, init]) => [init?.method ?? 'GET', url.split('?')[0]])).toEqual([
     ['GET', '/api/v1/teacher/providers/north/beichen'],
   ])
   expect(page().get('[aria-label="北辰模型目录"]').find('input').exists()).toBe(false)
+  const receipts = page().get('[aria-label="近期逐笔对账"]')
+  expect(button('近期逐笔对账', receipts).attributes('aria-expanded')).toBe('false')
+  expect(receipts.text()).not.toContain('渠道')
+  request.mockResolvedValueOnce(reply({ items: [], next_cursor: null }))
+  await button('近期逐笔对账', receipts).trigger('click')
+  await flushPromises()
+  expect(request.mock.calls.slice(before + 1).map(([url, init]) => [init?.method ?? 'GET', url])).toEqual([
+    ['GET', '/api/v1/teacher/providers/north/beichen/receipts?day=' + schoolDay()],
+  ])
+  expect(receipts.text()).toContain('官网同步状态未知')
+  expect(receipts.text()).toContain('学校尚未归档所选日期的北辰流水')
 })
 
 it('教师查看超用、设置学生额度、从服务器刷新余额，历史月份只读', async () => {

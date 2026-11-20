@@ -1,5 +1,5 @@
-import { del, get, page, patch, post } from './client'
-import type { BeichenImport, BeichenOverview, BeichenPriceUpdate } from './types'
+import { del, get, page, patch, post, request } from './client'
+import type { BeichenImport, BeichenOverview, BeichenPriceUpdate, BeichenReceiptPage } from './types'
 import type { Application, Binding, BindingCreate, BindingRouteProbeEndpoint, BindingRouteProbeStep, BindingUpdate, MentorCandidate, Model, ModelCatalogPage, ModelCreate, ModelUpdate, Organization, OrganizationCreate, OrganizationUpdate, ProbeEndpoint, ProbeResponse, Project, ProjectBudget, ProjectBudgetUpdate, ProjectCreate, ProjectUpdate, Provider, ProviderCatalogSyncView, ProviderCreate, ProviderCredential, ProviderCredentialCreate, ProviderCredentialUpdate, ProviderUpdate, ProjectUsage, StudentAccount } from './types'
 interface BeichenPanelStatus { configured: boolean; group_id?: number; upstream_key_id?: number }
 export const teacherAPI = {
@@ -37,6 +37,11 @@ export const teacherAPI = {
   deleteProviderCredential: (providerId: string, credentialId: string) => del(`/api/v1/teacher/providers/${providerId}/credentials/${credentialId}`),
   resetProviderCatalog: (id: string) => post<ProviderCatalogSyncView>(`/api/v1/teacher/providers/${id}/reset-catalog`),
   beichenOverview: (id: string, day: string) => get<BeichenOverview>(`/api/v1/teacher/providers/${id}/beichen?${new URLSearchParams({ day })}`),
+  beichenReceipts: (id: string, day: string, cursor: string | null, signal: AbortSignal) => {
+    const query = new URLSearchParams({ day })
+    if (cursor) query.set('cursor', cursor)
+    return request<BeichenReceiptPage>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/receipts?${query}`, { signal })
+  },
   enableBeichenModel: (id: string, model: string, schoolModel?: string) =>
     post<{ model_id: string; status: 'active' }>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/models/enable`,
       { model, ...(schoolModel && schoolModel !== model ? { school_model: schoolModel } : {}) }),

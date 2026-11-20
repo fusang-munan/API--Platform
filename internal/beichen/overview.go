@@ -66,12 +66,13 @@ type Comparison struct {
 }
 
 type Overview struct {
-	WebLoginRequired bool            `json:"web_login_required,omitempty"`
-	ArchivedUsage    []ArchivedUsage `json:"archived_usage"`
-	Datasets         []Dataset       `json:"datasets"`
-	Models           []Model         `json:"models"`
-	ModelCatalog     []CatalogModel  `json:"model_catalog"`
-	Comparison       []Comparison    `json:"comparison"`
+	WebLoginRequired bool              `json:"web_login_required,omitempty"`
+	WebsiteSync      WebsiteSyncStatus `json:"website_sync"`
+	ArchivedUsage    []ArchivedUsage   `json:"archived_usage"`
+	Datasets         []Dataset         `json:"datasets"`
+	Models           []Model           `json:"models"`
+	ModelCatalog     []CatalogModel    `json:"model_catalog"`
+	Comparison       []Comparison      `json:"comparison"`
 }
 
 type CatalogModel struct {
@@ -149,6 +150,9 @@ func (s *Service) Overview(ctx context.Context, providerID uuid.UUID, day string
 	}
 	if err == nil {
 		view.ArchivedUsage, err = readArchivedUsage(ctx, tx, providerID, start)
+	}
+	if err == nil {
+		view.WebsiteSync, err = readWebsiteSyncStatus(ctx, tx, providerID)
 	}
 	if err == nil {
 		err = tx.Commit()

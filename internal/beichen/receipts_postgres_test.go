@@ -294,5 +294,53 @@ func TestReceiptSweepPostgresG3(t *testing.T) {
 			group.MarginCredits == nil || *group.MarginCredits != "-0.00078" {
 			t.Fatalf("unexpected corrected comparison: %+v", group)
 		}
+		page, err := s.ArchivedReceipts(ctx, provider, stamp.In(beijing).Format(dayLayout), "")
+		if err != nil || len(page.Items) != 1 || page.NextCursor != nil {
+			t.Fatalf("read the corrected receipt: got %d rows, error %v", len(page.Items), err)
+		}
+		item := page.Items[0]
+		if !item.Matched || item.StudentName == nil || *item.StudentName != "Student" ||
+			item.ActualCost == nil || *item.ActualCost != "0.00001" ||
+			item.BaseCredits == nil || *item.BaseCredits != "0.0002" ||
+			item.SchoolMultiplier == nil || *item.SchoolMultiplier != "1.10" ||
+			item.ChargedCredits == nil || *item.ChargedCredits != credits ||
+			item.DifferenceCredits == nil || *item.DifferenceCredits != *group.MarginCredits {
+			t.Fatalf("receipt differs from its original student booking or the archive: %+v", item)
+		}
+	})
+	t.Run("archive pages keep equal timestamps and unknown debits", func(t *testing.T) {
+		const day = "2020-06-12"
+		start, err := dayStart(day)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec(`INSERT INTO beichen_upstream_usage_rows(upstream_user_id,row_id,upstream_key_id,provider_id,credential_id,
+			channel,model,occurred_at,actual_cost,billing_type,cost_details)
+			SELECT 41,1000+n,82,$1,$2,'G3','model-'||n,$3,0,
+			CASE WHEN n=50 THEN 1 ELSE 0 END,'{}'::jsonb FROM generate_series(1,50) n`, provider, credential, start)
+		exec(`INSERT INTO beichen_upstream_usage_rows(upstream_user_id,row_id,upstream_key_id,provider_id,credential_id,
+			channel,model,occurred_at,actual_cost,billing_type,cost_details) VALUES
+			(42,1001,83,$1,$2,'G3','same-number',$3,0.000001,0,'{}'),
+			(42,1002,83,$1,$2,'G3','previous-day',$3::timestamptz - interval '1 microsecond',0,0,'{}')`,
+			provider, credential, start)
+		first, err := s.ArchivedReceipts(ctx, provider, day, "")
+		if err != nil || len(first.Items) != archivedReceiptPageSize || first.NextCursor == nil {
+			t.Fatalf("expected a full first page with more rows, got %d, error %v", len(first.Items), err)
+		}
+		unpriced, zero := first.Items[0], first.Items[1]
+		if unpriced.Model != "model-50" || unpriced.ActualCost != nil || unpriced.Matched || unpriced.StudentName != nil ||
+			unpriced.ChargedCredits != nil || zero.ActualCost == nil || *zero.ActualCost != "0" || zero.DifferenceCredits != nil {
+			t.Fatal("unmatched, unpriced and confirmed zero must remain distinguishable")
+		}
+		if first.Items[len(first.Items)-1].Model != "same-number" {
+			t.Fatal("expected the page boundary inside a set with equal row IDs and times")
+		}
+		second, err := s.ArchivedReceipts(ctx, provider, day, *first.NextCursor)
+		if err != nil || len(second.Items) != 1 || second.Items[0].Model != "model-1" || second.NextCursor != nil {
+			t.Fatalf("missing or repeated row after the bookmark: %+v, error %v", second, err)
+		}
+		if _, err = s.ArchivedReceipts(ctx, provider, "2020-06-13", *first.NextCursor); err == nil {
+			t.Fatal("cursor from a different Beijing day was accepted")
+		}
 	})
 }

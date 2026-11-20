@@ -4,9 +4,10 @@ import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
 import type { BeichenOverview } from '../../api/types'
 import { schoolCatalog } from '../../utils/beichenModels'
-import { statusLabel } from '../../utils/format'
+import { schoolDay, statusLabel } from '../../utils/format'
+import BeichenRecentReceipts from './BeichenRecentReceipts.vue'
 
-const props = defineProps<{ providerId: string; query?: string; commonIds?: Set<string> }>()
+const props = defineProps<{ providerId: string; query?: string; commonIds?: Set<string>; providerMaintenance?: boolean }>()
 const overview = ref<BeichenOverview>()
 const loading = ref(false)
 const updating = ref('')
@@ -21,14 +22,17 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const day = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
-    overview.value = await teacherAPI.beichenOverview(props.providerId, day)
+    overview.value = await teacherAPI.beichenOverview(props.providerId, schoolDay())
   } catch (e) {
     overview.value = undefined
     error.value = apiErrorMessage(e, '读取北辰模型失败')
   } finally {
     loading.value = false
   }
+}
+
+function refreshOverview() {
+  if (!loading.value && !updating.value) void load()
 }
 
 async function changeStatus(row: (typeof rows.value)[number], enable: boolean) {
@@ -52,10 +56,12 @@ onMounted(load)
 </script>
 
 <template>
+  <BeichenRecentReceipts v-if="providerMaintenance" :provider-id="providerId" :website-sync="overview?.website_sync"
+    @refresh-overview="refreshOverview" />
   <section aria-label="北辰模型目录">
     <button type="button" class="button ghost" :disabled="loading || Boolean(updating)" @click="load">刷新模型</button>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
-    <p v-if="loginNeeded" role="status">北辰官网需要学校后台重新授权。</p>
+    <p v-if="providerMaintenance && loginNeeded" role="status">北辰官网需要学校后台重新授权。</p>
     <p v-if="loading" role="status">正在读取模型…</p>
     <div v-if="rows.length" class="model-scroll">
       <table class="usage-table">

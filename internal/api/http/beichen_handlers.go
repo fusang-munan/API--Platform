@@ -27,6 +27,20 @@ func (s *Server) beichenOverview(c *gin.Context) {
 	respond(c, http.StatusOK, view)
 }
 
+func (s *Server) beichenArchivedReceipts(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	providerID, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	view, err := s.service.Beichen().ArchivedReceipts(c.Request.Context(), providerID, c.Query("day"), c.Query("cursor"))
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
+}
+
 func (s *Server) syncBeichen(c *gin.Context) {
 	providerID, ok := pathID(c, "provider_id")
 	if !ok || !bindBeichenJSON(c, &struct{}{}, true) {

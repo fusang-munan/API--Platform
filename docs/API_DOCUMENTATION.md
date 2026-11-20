@@ -377,6 +377,7 @@ data: {"revision":"01K2..."}
 | 模型测试 | POST | `/api/v1/teacher/model-probes` | 自动读取供应商 `/v1/models` 并测试文本/检索端点，返回可应用的标准化配置 |
 | Binding | PATCH | `/api/v1/teacher/model-bindings/{binding_id}` | 修改上游名、adapter、priority 或状态 |
 | 北辰同步与对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen?day=YYYY-MM-DD` | 按北京时间查看同步状态、模型报价和日对账 |
+| 北辰逐笔对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/receipts?day=YYYY-MM-DD&cursor=…` | 教师按北京时间分页查看学校已归档的北辰流水及关联的校内扣分 |
 | 北辰手动同步 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/sync` | 执行一次有时限的同步，页面按数据类别显示各自结果 |
 | 启用北辰已发现模型 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/models/enable` | 教师提交 `model`，如已有校内别名可另传 `school_model`。学校复核当前目录和路由后，使模型可供学生申请或调用。 |
 | 北辰采价授权 | GET / PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/access/{credential_id}` | 读取配置状态，设置、轮换或停用该凭据的面板读取授权 |
@@ -428,6 +429,10 @@ data: {"revision":"01K2..."}
 维护用的 `beichen/access/{credential_id}` 可读该凭据的同步状态、分组与北辰 Key 数字 ID。学校自动部署通过官网普通账号建立这些关联。旧版专用读取凭据的接口保留兼容。
 
 概览的 `archived_usage` 以北京时间按日、模型和凭据汇总持续采集的原始流水。`rows`、`unmatched_rows`、`unpriced_rows` 分别表示已采集笔数、未能归属学校扣款的笔数和无法确认余额实扣的笔数。`observed_cost` 汇总已知原始实扣，`matched_cost`、`matched_base_credits`、`matched_charged_credits` 与 `margin_credits` 只比较同一批可匹配且金额齐全的调用。官网更正金额后会更新差额，保留原学生扣分。
+
+`website_sync` 汇总当前学校预配的有效渠道。按 `channels` 查看渠道总数，`priced_channels` 表示当前有有效网页报价的数量，`price_last_seen` 表示最近观察到网页模型价格的时间。`receipt_checked_channels` 计数曾成功读取逐笔流水分页的渠道，`receipt_last_checked` 为最近成功读取一页的时间，`receipt_caught_up_channels` 计数已读到末页的渠道。时间可为空。这组状态反映当前同步进度，查询不同账日时含义相同。
+
+逐笔对账的 `day` 默认为北京时间当天。第一页省略 `cursor`，后续传入上页的 `data.next_cursor`，保持同一供应商和日期。每页最多 50 行，以流水发生时间倒序排列。最后一页的游标为 `null`。游标错用到其他账日或供应商、游标内容错误及日期格式错误均返回 400。每行含 `occurred_at`、`model`、`matched`、`student_name`、`base_credits`、`school_multiplier`、`charged_credits`、`actual_cost` 和 `difference_credits`。金额和积分用十进制字符串表示。缺少依据的字段返回 `null`，确认零金额返回 `"0"`。差额等于学校已扣积分减去北辰原始实扣乘 100。此查询只读取学校的账本。
 
 价格请求包含 `credential_id`、`model`、`mode`。设置 `manual` 时同时提供 `rates`，其中 `input`、`output` 必填，`cache_read`、`cache_write` 可空，四项均为每百万 Token 的试算价格，以百万分之一校内积分表示。恢复 `follow` 时省略 `rates`。跟随试算和学生正式扣费均以 1 北辰余额单位折合 100 积分；手填校内试算价只影响试算列。
 
