@@ -5,7 +5,8 @@ import App from '../App.vue'
 import router from '../router'
 import { token } from '../api/client'
 import { useAuthStore } from '../store/auth'
-import type { ProjectUsage, Role } from '../api/types'
+import type { BeichenModel, BeichenOverview, BeichenPriceConditions, ProjectUsage, Role } from '../api/types'
+import { schoolCatalog } from '../utils/beichenModels'
 import { schoolDay, schoolMonth } from '../utils/format'
 
 vi.mock('../api/client', async original => ({
@@ -79,13 +80,14 @@ async function fetchFixture(url: string, init?: RequestInit) {
     ],
     models: [
       { credential_id: 'chosen', model: 'shared', price_status: 'confirmed', price_conditions: {
-        input_price: '0.0000001', output_price: '0.0000002', cache_read_price: '0', cache_write_price: null,
+        billing_mode: 'token', input_price: '0.0000001', output_price: '0.0000002', cache_read_price: '0', cache_write_price: null,
       }, upstream_rates: {
         input: '0.000000031', output: '2', cache_read: '0', cache_write: null,
       } },
       { credential_id: 'cheap', model: 'shared', price_status: 'conditional', price_conditions: { cache_write_1h_price: 0.1 },
-        price_conditions_exact: { cache_write_1h_price: '0', cache_write_12h_price: '0.000004', internal_route: '隐藏的渠道',
+        price_conditions_exact: { billing_mode: 'token', cache_write_1h_price: '0', cache_write_12h_price: '0.000004', internal_route: '隐藏的渠道',
           intervals: [{ min_tokens: '200000', max_tokens: null, input_price: '0.000008000000000000000019' }],
+          reasoning_effort_multipliers: { low: '0.5' },
         } },
     ],
     model_catalog: [
@@ -121,7 +123,7 @@ beforeEach(() => {
   writes.mockClear(); request.mockClear()
   vi.stubGlobal('fetch', request)
 })
-afterEach(() => { widget?.unmount(); token.set(null); vi.unstubAllGlobals() })
+afterEach(() => { widget?.unmount(); token.set(null); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 async function enter(identity: Role, path: string) {
   role = identity
@@ -141,6 +143,10 @@ function button(label: string, root: Pick<DOMWrapper<Element>, 'findAll'> = page
   const b = root.findAll('button').find(item => item.text() === label)
   if (!b) throw Error('没有找到按钮 ' + label)
   return b
+}
+
+function visiblePrices(quote: Pick<DOMWrapper<Element>, 'findAll'>) {
+  return quote.findAll('.quote-prices > div').map(pair => [pair.get('dt').text(), pair.get('dd').text()])
 }
 
 it('教师在两个入口看到同一份按模型合并的首选报价，可启停已有校内别名，其他供应商仍能维护', async () => {
@@ -164,10 +170,27 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   expect(paused.find('button').exists()).toBe(false)
   expect(historical.text()).toContain('启用条件待同步')
   expect(table.text()).toContain('北辰官网需要学校后台重新授权')
-  expect(shared.text()).toContain('输入 0.000000000000031 · 输出 0.000002 · 缓存读取 0 · 缓存写入 未知')
-  expect(shared.text()).toContain('官网标准价 · 每 Token · 输入 0.0000001 · 输出 0.0000002 · 缓存读取 0')
-  expect(shared.text()).toContain('每 Token · 缓存写入（1 小时） 0 · 缓存写入（12 小时） 0.000004')
-  expect(shared.text()).toContain('阶梯（Token 下限 200000，上限 未知） · 每 Token · 输入 0.000008000000000000000019')
+  const confirmed = shared.get('[data-price-status="confirmed"]')
+  expect(visiblePrices(confirmed)).toEqual([
+    ['官网标准价', '每百万 Token 的北辰余额单位 · 输入 0.1 · 输出 0.2 · 缓存读取 0'],
+    ['实际单价（已乘倍率）', '每百万 Token 的北辰余额单位 · 输入 0.2125000000000000000000001 · 输出 0.4250000000000000000000002 · 缓存读取 0'],
+  ])
+  expect(confirmed.text()).toContain('报价已确认')
+  const conditional = shared.get('[data-price-status="conditional"]')
+  const [standard, actual] = visiblePrices(conditional)
+  expect(standard).toEqual(['官网标准价', [
+    '每百万 Token 的北辰余额单位 · 缓存写入（1 小时） 0 · 缓存写入（12 小时） 4',
+    '上下文分档（Token 下限 200000，上限 无上限）',
+    '每百万 Token 的北辰余额单位 · 输入 8.000000000000000019',
+    '推理强度（低）倍率 0.5×',
+  ].join('\n')])
+  expect(actual).toEqual(['实际单价（已乘倍率）', [
+    '每百万 Token 的北辰余额单位 · 缓存写入（1 小时） 0 · 缓存写入（12 小时） 0.25',
+    '上下文分档（Token 下限 200000，上限 无上限）',
+    '每百万 Token 的北辰余额单位 · 输入 0.5000000000000000011875',
+  ].join('\n')])
+  expect(conditional.text()).toContain('按条件计价')
+  expect(shared.find('details').exists()).toBe(false)
   expect(table.text()).not.toMatch(/隐藏的|chosen|cheap|school-alias|OpenAI|Anthropic|协议|路由|渠道/i)
   expect(writes).not.toHaveBeenCalled()
   await button('禁用', shared).trigger('click')
@@ -181,7 +204,9 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   await page().get('button[aria-label="关闭"]').trigger('click')
   await widget.get('a[href="/teacher/models"]').trigger('click')
   await flushPromises()
-  expect(widget.get('[aria-label="北辰模型目录"]').findAll('tbody tr')).toHaveLength(4)
+  const models = widget.get('[aria-label="北辰模型目录"]')
+  expect(models.findAll('tbody tr')).toHaveLength(4)
+  expect(visiblePrices(models.get('[data-price-status="confirmed"]'))).toEqual(visiblePrices(confirmed))
   expect(widget.find('[aria-label="近期逐笔对账"]').exists()).toBe(false)
   expect(widget.find('article.panel').exists()).toBe(false)
 })
@@ -219,6 +244,176 @@ it('教师从目录直接启用未配置模型，失败后可重试，后台成�
   expect(row.text()).toContain('0.15×')
   expect(row.text()).not.toMatch(/待启用|未配置|openai|chosen/i)
   expect(button('禁用', row).exists()).toBe(true)
+})
+
+const discoveredModel = 'catalog/new-from-key'
+type PriceSnapshot = Pick<BeichenModel, 'price_status' | 'price_conditions' | 'price_conditions_exact' | 'upstream_rates'>
+
+function discoveredOverview(price: PriceSnapshot | null, multiplier: string | null = '0.125'): BeichenOverview {
+  return {
+    datasets: [], comparison: [],
+    model_catalog: [{
+      model: discoveredModel, school_status: 'not_configured', can_enable: true,
+      preferred_routes: [{
+        school_model: discoveredModel, upstream_model: discoveredModel, provider_id: 'north', credential_id: 'chosen',
+        adapter: 'openai_responses', priority: 10, state: 'candidate', effective_multiplier_text: multiplier,
+      }],
+    }],
+    models: price ? [{ ...price, model: discoveredModel, credential_id: 'chosen', mode: 'follow' }] : [],
+  }
+}
+
+it('教师页自动发现目录里的新模型，并随后台报价更新待同步、未匹配和实际单价', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+  await enter('teacher', '/teacher/models')
+  const table = widget.get('[aria-label="北辰模型目录"]')
+  expect(table.text()).not.toContain(discoveredModel)
+  const before = request.mock.calls.length
+  const update = async (snapshot: BeichenOverview) => {
+    request.mockResolvedValueOnce(reply(snapshot))
+    await vi.advanceTimersByTimeAsync(60_000)
+    await flushPromises()
+    return table.findAll('tbody tr').find(row => row.get('th').text() === discoveredModel)!
+  }
+
+  const forOtherKey = discoveredOverview(null)
+  forOtherKey.models = [{ credential_id: 'cheap', model: discoveredModel, mode: 'follow', price_status: 'not_listed' }]
+  const pending = await update(forOtherKey)
+  expect(pending.get('[data-price-status="pending"]').text()).toContain('单价待同步')
+  expect(pending.text()).not.toContain('官网未提供同名报价')
+
+  const unlisted = await update(discoveredOverview({ price_status: 'not_listed', price_conditions: null }))
+  expect(unlisted.get('[data-price-status="not_listed"]').text()).toContain('官网未提供同名报价')
+  expect(unlisted.text()).not.toContain('单价待同步')
+
+  const price: BeichenPriceConditions = { billing_mode: 'token', input_price: '8e-6', output_price: '0.000016' }
+  const confirmed = await update(discoveredOverview({ price_status: 'confirmed', price_conditions_exact: price }))
+  expect(confirmed.text()).toContain('0.125× · 待启用')
+  expect(visiblePrices(confirmed.get('[data-price-status="confirmed"]'))).toEqual([
+    ['官网标准价', '每百万 Token 的北辰余额单位 · 输入 8 · 输出 16'],
+    ['实际单价（已乘倍率）', '每百万 Token 的北辰余额单位 · 输入 1 · 输出 2'],
+  ])
+  const changed = await update(discoveredOverview({
+    price_status: 'confirmed', price_conditions_exact: { ...price, input_price: '0.000012' },
+  }, '0.25'))
+  expect(changed.text()).toContain('0.25× · 待启用')
+  expect(visiblePrices(changed.get('[data-price-status="confirmed"]'))).toEqual([
+    ['官网标准价', '每百万 Token 的北辰余额单位 · 输入 12 · 输出 16'],
+    ['实际单价（已乘倍率）', '每百万 Token 的北辰余额单位 · 输入 3 · 输出 4'],
+  ])
+  expect(request.mock.calls.slice(before).map(([url, init]) => [init?.method ?? 'GET', url.split('?')[0]])).toEqual(
+    Array.from({ length: 4 }, () => ['GET', '/api/v1/teacher/providers/north/beichen']),
+  )
+  expect(writes).not.toHaveBeenCalled()
+})
+
+it.each([
+  ['per_request', { per_request_price: '0.3' }, '北辰余额单位/次 · 每次请求 0.3', '北辰余额单位/次 · 每次请求 0.0375'],
+  ['video', { per_request_price: '3e-1' }, '北辰余额单位/秒 · 每秒 0.3', '北辰余额单位/秒 · 每秒 0.0375'],
+  ['image', { image_output_price: '0.8', image_input_price: '0.4' },
+    '北辰余额单位/次 · 图像输出 0.8\n官网原值（单位未知） · 图像输入 0.4', '北辰余额单位/次 · 图像输出 0.1'],
+] as const)('按 %s 的官网单位展示标准价和实际价', (billing_mode, fields, standard, actual) => {
+  const data = discoveredOverview({
+    price_status: 'conditional', price_conditions_exact: { billing_mode, ...fields, input_price: '999' },
+  })
+  expect(schoolCatalog(data, 'north')[0].quotes[0]).toMatchObject({ status: 'conditional', standard, actual })
+})
+
+it.each(['pending', 'pending_confirmation'] as const)('兼容 %s，保留待核对的官网价', price_status => {
+  const data = discoveredOverview({
+    price_status, price_conditions: { billing_mode: 'token', input_price: 0.000008 },
+    upstream_rates: { input: '1000000' },
+  })
+  expect(schoolCatalog(data, 'north')[0].quotes[0]).toMatchObject({
+    status: 'pending', statusLabel: '官网单价待核对', standard: '每百万 Token 的北辰余额单位 · 输入 8',
+    actual: null, notes: ['官网原始小数精度未知'],
+  })
+})
+
+it('旧接口极小报价解析为数字零时待核对，官网精确字符串零照常展示', () => {
+  const decoded = JSON.parse('{"billing_mode":"token","input_price":1e-400}') as BeichenPriceConditions
+  expect(decoded.input_price).toBe(0)
+  const legacy = { price_status: 'confirmed', price_conditions: decoded } as const
+  const [row] = schoolCatalog(discoveredOverview(legacy), 'north')
+  expect(row.quotes[0]).toMatchObject({
+    standard: '每百万 Token 的北辰余额单位 · 输入 待核对',
+    actual: null,
+    notes: ['官网原始小数精度未知'],
+  })
+
+  const exact = discoveredOverview({ ...legacy, price_conditions_exact: { billing_mode: 'token', input_price: '0' } })
+  expect(schoolCatalog(exact, 'north')[0].quotes[0]).toMatchObject({
+    standard: '每百万 Token 的北辰余额单位 · 输入 0',
+    actual: '每百万 Token 的北辰余额单位 · 输入 0',
+    notes: [],
+  })
+})
+
+it('官网或倍率同步失败时显示对应错误，并保留上次读取的官网报价', () => {
+  const data = discoveredOverview({
+    price_status: 'conditional', price_conditions_exact: { billing_mode: 'per_request', per_request_price: '0.3' },
+  })
+  data.datasets = [{ kind: 'prices', credential_id: 'chosen', last_error: '官网分组映射缺失', effective_multiplier: null }]
+  expect(schoolCatalog(data, 'north')[0].quotes[0]).toMatchObject({
+    multiplier: '0.125× · 待启用', status: 'conditional', statusLabel: '上次报价状态 · 按条件计价',
+    standard: '北辰余额单位/次 · 每次请求 0.3', actual: null, notes: ['价格同步错误：官网分组映射缺失'],
+  })
+  data.datasets = [{ kind: 'billing', credential_id: 'chosen', last_error: '读取倍率失败', effective_multiplier: 0.125 }]
+  expect(schoolCatalog(data, 'north')[0].quotes[0]).toMatchObject({
+    multiplier: '待同步', standard: '北辰余额单位/次 · 每次请求 0.3', actual: null, notes: ['倍率同步失败：读取倍率失败'],
+  })
+})
+
+it('缺少官网价时仍可展示后台已有报价，并区分零元与未知缓存价', () => {
+  const data = discoveredOverview({
+    price_status: 'confirmed', upstream_rates: { input: '0.000000031', output: '0', cache_read: 0, cache_write: null },
+  })
+  expect(schoolCatalog(data, 'north')[0].quotes[0]).toMatchObject({
+    standard: null,
+    actual: '每百万 Token 的北辰余额单位 · 输入 0.000000000000031 · 输出 0 · 缓存读取 未知 · 缓存写入 未知',
+    notes: ['官网标准价待同步', '后台已有报价小数精度未知，零值待核对', '实际单价来自后台已有报价'],
+  })
+})
+
+it('保留分档原值和顺序，实际价只使用单位明确、范围有效的分档', () => {
+  const data = discoveredOverview({
+    price_status: 'conditional', price_conditions_exact: {
+      billing_mode: 'token', intervals: [
+        { min_tokens: '9007199254740993', max_tokens: '9007199254740992', input_price: '0.000001' },
+        { min_tokens: '10', max_tokens: '20', billing_mode: 'unknown', input_price: '0.000002' },
+        { min_tokens: '30', max_tokens: null, input_price: '0.000008' },
+      ],
+    },
+  }, '0')
+  const quote = schoolCatalog(data, 'north')[0].quotes[0]
+  expect(quote.standard).toContain('上下文分档（Token 下限 9007199254740993，上限 9007199254740992） · 档位无效')
+  expect(quote.standard).toContain('官网原值（单位未知） · 输入 0.000002')
+  expect(quote.actual).toBe('上下文分档（Token 下限 30，上限 无上限）\n每百万 Token 的北辰余额单位 · 输入 0')
+})
+
+it('分档边界未知时保留条件和标准价，只有适用范围已知的分档显示实际价', () => {
+  const data = discoveredOverview({
+    price_status: 'conditional', price_conditions_exact: {
+      billing_mode: 'token', intervals: [
+        { max_tokens: '100', input_price: '0.000001' },
+        { min_tokens: '100', input_price: '0.000002' },
+        { min_tokens: null, max_tokens: null, input_price: '0.000004' },
+        { min_tokens: '300', max_tokens: null, input_price: '0.000008' },
+      ],
+    },
+  })
+  const quote = schoolCatalog(data, 'north')[0].quotes[0]
+  expect(quote.standard).toBe([
+    '上下文分档（Token 下限 未知，上限 100） · 适用范围待核对',
+    '每百万 Token 的北辰余额单位 · 输入 1',
+    '上下文分档（Token 下限 100，上限 未知） · 适用范围待核对',
+    '每百万 Token 的北辰余额单位 · 输入 2',
+    '上下文分档（Token 下限 未知，上限 无上限） · 适用范围待核对',
+    '每百万 Token 的北辰余额单位 · 输入 4',
+    '上下文分档（Token 下限 300，上限 无上限）',
+    '每百万 Token 的北辰余额单位 · 输入 8',
+  ].join('\n'))
+  expect(quote.actual).toBe('上下文分档（Token 下限 300，上限 无上限）\n每百万 Token 的北辰余额单位 · 输入 1')
 })
 
 it('教师从维护抽屉打开校方工作区，授权提示和网页时间仍来自概览，模型主目录隐藏维护入口', async () => {

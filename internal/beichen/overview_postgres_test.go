@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 )
 
 func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
@@ -70,11 +71,11 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 			}
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
 		})
-		result := s.fetchJob(ctx, syncJob{provider: provider, credential: id, kind: "catalog"}, credentialRecord{}, "fake-key", false)
-		if result.err != nil || result.save == nil {
-			t.Fatalf("fetch catalog: %v", result.err)
+		entries, err := s.fetchKeyCatalog(ctx, "fake-key")
+		if err != nil {
+			t.Fatalf("fetch catalog: %v", err)
 		}
-		if err := result.save(ctx, tx); err != nil {
+		if _, err := catalog.ReplaceCredentialEntries(ctx, tx, provider, id, entries, s.now().UTC()); err != nil {
 			t.Fatal(err)
 		}
 	}

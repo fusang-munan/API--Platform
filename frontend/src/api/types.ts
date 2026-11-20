@@ -91,9 +91,10 @@ export type BeichenDataset = {
 type BeichenDisplayRates = Partial<Record<keyof BeichenRates, number | string | null>>
 type BeichenPanelPrice = 'input_price' | 'output_price' | 'cache_read_price' | 'cache_write_price' |
   'cache_write_1h_price' | 'cache_write_12h_price' | 'image_input_price' | 'image_output_price' | 'per_request_price'
-export type BeichenPriceTier = Partial<Record<BeichenPanelPrice | 'min_tokens' | 'max_tokens', number | string | null>>
+export type BeichenPriceTier = Partial<Record<BeichenPanelPrice | 'min_tokens' | 'max_tokens', number | string | null>> & {
+  billing_mode?: string | null
+}
 export type BeichenPriceConditions = BeichenPriceTier & {
-  billing_mode?: string
   intervals?: BeichenPriceTier[] | null
   reasoning_effort_multipliers?: Record<string, number | string | null> | null
 }
@@ -104,7 +105,7 @@ export type BeichenModel = {
   mode: BeichenPriceUpdate['mode']
   school_status?: BeichenSchoolStatus | null
   route_ready?: boolean | null
-  price_status?: 'confirmed' | 'pending_confirmation' | 'conditional' | null
+  price_status?: 'confirmed' | 'conditional' | 'not_listed' | 'pending' | 'pending_confirmation' | null
   price_conditions?: BeichenPriceConditions | null
   price_conditions_exact?: BeichenPriceConditions | null
   upstream_rates?: BeichenDisplayRates | null

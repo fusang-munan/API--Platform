@@ -33,8 +33,9 @@ type credentialRecord struct {
 }
 
 type fetchResult struct {
-	save func(context.Context, *sql.Tx) error
-	err  error
+	save       func(context.Context, *sql.Tx) error
+	err        error
+	partialErr error
 }
 
 func (s *Service) Run(ctx context.Context) {
@@ -82,16 +83,31 @@ func (s *Service) syncJobs(ctx context.Context, providerID *uuid.UUID) error {
 		return invalid("北辰供应商和凭据须为已启用状态")
 	}
 	failed, busy := 0, 0
-	for _, job := range jobs {
+	for len(jobs) > 0 {
 		if ctx.Err() != nil {
 			return unavailable("北辰同步达到时限，已保存完成的任务", ctx.Err())
 		}
-		running, err := s.runJob(ctx, job, providerID != nil)
-		if err != nil {
-			failed++
-		} else if running {
-			busy++
+		batch := jobs[:min(4, len(jobs))]
+		type outcome struct {
+			running bool
+			err     error
 		}
+		results := make(chan outcome, len(batch))
+		for _, job := range batch {
+			go func() {
+				running, err := s.runJob(ctx, job, providerID != nil)
+				results <- outcome{running, err}
+			}()
+		}
+		for range batch {
+			result := <-results
+			if result.err != nil {
+				failed++
+			} else if result.running {
+				busy++
+			}
+		}
+		jobs = jobs[len(batch):]
 	}
 	if failed > 0 {
 		return unavailable(fmt.Sprintf("有 %d 项北辰同步未完成，请查看数据状态", failed), nil)
@@ -106,7 +122,7 @@ func (s *Service) listJobs(ctx context.Context, providerID *uuid.UUID) ([]syncJo
 	rows, err := s.db.QueryContext(ctx, `
 SELECT p.id, c.id, job.kind
 FROM providers p JOIN provider_credentials c ON c.provider_id = p.id
-CROSS JOIN (VALUES ('billing', 1), ('catalog', 2), ('usage', 3)) AS job(kind, priority)
+CROSS JOIN (VALUES ('billing', 1), ('usage', 2)) AS job(kind, priority)
 LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = job.kind
 WHERE `+beichenProvider+` AND p.status = 'active' AND c.status = 'active'
   AND ($1::uuid IS NULL OR p.id = $1)
@@ -114,7 +130,7 @@ WHERE `+beichenProvider+` AND p.status = 'active' AND c.status = 'active'
     COALESCE(d.next_attempt, '-infinity'::timestamptz) <= clock_timestamp()
     AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
   ))
-ORDER BY COALESCE(d.next_attempt, '-infinity'::timestamptz), c.id, job.priority
+ORDER BY job.priority, COALESCE(d.next_attempt, '-infinity'::timestamptz), c.id
 LIMIT CASE WHEN $1 IS NULL THEN 24 ELSE NULL END`, providerID)
 	if err != nil {
 		return nil, err
@@ -170,55 +186,69 @@ WHERE c.id = $1 AND p.id = $2 AND p.status = 'active' AND c.status = 'active' AN
 func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credentialRecord, key string, manual bool) fetchResult {
 	switch job.kind {
 	case "billing":
-		requestedAt := s.now()
-		body, err := s.fetch(ctx, key, billingPath, nil)
-		var info billingInfo
-		if err == nil {
-			info, err = parseBilling(body)
-		}
-		access, accessErr := s.PanelStatus(ctx, job.provider, job.credential)
-		group := billingPanelGroup(access, info)
-		var quote panelQuote
-		if accessErr != nil {
-			quote.err = errors.New("读取北辰面板配置失败")
-		} else if group != 0 && err == nil {
-			if info.ObservedAt.Before(requestedAt.Add(-2 * time.Second)) {
-				quote.err = errors.New("北辰 Key 账单报价早于本轮采样")
-			} else {
-				quote = s.fetchChannelQuote(ctx, job, key, group, info)
-			}
-		}
-		return fetchResult{err: err, save: func(ctx context.Context, tx *sql.Tx) error {
-			return saveBillingObservation(ctx, tx, job.credential, credential.updatedAt, info, err, group, quote)
-		}}
+		return s.fetchBillingJob(ctx, job, credential.updatedAt, key)
 	case "usage":
 		return s.fetchUsage(ctx, job, key, manual)
-	case "catalog":
-		body, err := s.fetch(ctx, key, modelsPath, nil)
-		if err != nil {
-			return fetchResult{err: err}
-		}
-		entries, err := catalog.ParseBeichenModels(body)
-		if err != nil {
-			return fetchResult{err: errors.New("北辰模型目录格式无效或超过 2000 条")}
-		}
-		return fetchResult{save: func(ctx context.Context, tx *sql.Tx) error {
-			_, err := catalog.ReplaceCredentialEntries(ctx, tx, job.provider, job.credential, entries, s.now().UTC())
-			return err
-		}}
 	default:
 		return fetchResult{err: errors.New("北辰同步任务类型无效")}
 	}
 }
 
-// The key billing response is an independent source for the group. A missing
-// discovery row must not suppress the price snapshot when the key itself
-// already identifies the group.
-func billingPanelGroup(access PanelAccessStatus, info billingInfo) int64 {
-	if access.GroupID > 0 {
-		return access.GroupID
+func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision time.Time, key string) fetchResult {
+	requestedAt := s.now()
+	body, billingErr := s.fetch(ctx, key, billingPath, nil)
+	var info billingInfo
+	if billingErr == nil {
+		info, billingErr = parseBilling(body)
 	}
-	if info.GroupID != nil && *info.GroupID > 0 {
+	entries, catalogErr := s.fetchKeyCatalog(ctx, key)
+	catalogAt := s.now().UTC()
+	access, accessErr := s.loadPriceAccess(ctx, job.credential)
+	group := billingPanelGroup(info)
+	quote := panelQuote{groupID: group}
+	switch {
+	case billingErr != nil:
+		quote.err = billingErr
+	case catalogErr != nil:
+		quote.err = catalogErr
+	case accessErr != nil:
+		quote.err = accessErr
+	case (group != 0 || s.WebSessionConfigured()) && info.ObservedAt.Before(requestedAt.Add(-2*time.Second)):
+		quote.err = errors.New("北辰 Key 账单报价早于本轮采样")
+	default:
+		quote = s.fetchChannelQuote(ctx, access, key, info, entries)
+	}
+	return fetchResult{err: billingErr, partialErr: errors.Join(quote.err, quote.verificationError), save: func(ctx context.Context, tx *sql.Tx) error {
+		if catalogErr != nil {
+			if err := recordDatasetError(ctx, tx, job.credential, "catalog", catalogErr.Error()); err != nil {
+				return err
+			}
+		} else {
+			if _, err := catalog.ReplaceCredentialEntries(ctx, tx, job.provider, job.credential, entries, catalogAt); err != nil {
+				return err
+			}
+			if err := recordSuccess(ctx, tx, job.credential, "catalog"); err != nil {
+				return err
+			}
+		}
+		return saveBillingObservation(ctx, tx, job.credential, revision, info, billingErr, quote.groupID, quote)
+	}}
+}
+
+func (s *Service) fetchKeyCatalog(ctx context.Context, key string) ([]catalog.ProviderEntry, error) {
+	body, err := s.fetch(ctx, key, modelsPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := catalog.ParseBeichenModels(body)
+	if err != nil {
+		return nil, errors.New("北辰模型目录格式无效或超过 2000 条")
+	}
+	return entries, nil
+}
+
+func billingPanelGroup(info billingInfo) int64 {
+	if info.GroupID != nil && *info.GroupID > 0 && *info.GroupID <= 9007199254740991 {
 		return *info.GroupID
 	}
 	return 0
@@ -297,7 +327,7 @@ func saveBilling(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, info b
 	}
 	basis, prices, err := parsePricing(info.Pricing)
 	if err != nil {
-		return recordPriceError(ctx, tx, credentialID, err.Error())
+		return recordDatasetError(ctx, tx, credentialID, "prices", err.Error())
 	}
 	for _, row := range prices {
 		if err := savePrice(ctx, tx, credentialID, row.Model, "upstream", basis, "billing", nil, row.Rates, effectiveAt); err != nil {
@@ -321,10 +351,10 @@ WHERE NOT EXISTS (
 	return err
 }
 
-func recordPriceError(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, message string) error {
+func recordDatasetError(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, kind, message string) error {
 	_, err := tx.ExecContext(ctx, `
-INSERT INTO beichen_datasets (credential_id, kind, last_error) VALUES ($1, 'prices', $2)
-ON CONFLICT (credential_id, kind) DO UPDATE SET last_error = EXCLUDED.last_error`, credentialID, message)
+INSERT INTO beichen_datasets (credential_id, kind, last_error) VALUES ($1, $2, $3)
+ON CONFLICT (credential_id, kind) DO UPDATE SET last_error = EXCLUDED.last_error`, credentialID, kind, message)
 	return err
 }
 
@@ -375,9 +405,11 @@ UPDATE beichen_datasets SET
   next_attempt = CASE
     WHEN $6 THEN next_attempt
     WHEN $4 IS NULL AND kind = 'billing' THEN LEAST(
-      clock_timestamp() + $5::int * interval '1 minute',
-      (SELECT expires_at FROM beichen_panel_snapshots
-        WHERE credential_id = $1 ORDER BY effective_at DESC LIMIT 1))
+      clock_timestamp() + CASE WHEN EXISTS (
+        SELECT 1 FROM beichen_datasets WHERE credential_id = $1 AND kind = 'prices' AND last_error IS NOT NULL
+      ) THEN interval '2 minutes' ELSE $5::int * interval '1 minute' END,
+      (SELECT CASE WHEN expires_at > clock_timestamp() THEN expires_at END
+        FROM beichen_panel_snapshots WHERE credential_id = $1 ORDER BY effective_at DESC LIMIT 1))
     WHEN $4 IS NULL OR kind = 'usage' THEN clock_timestamp() + $5::int * interval '1 minute'
     ELSE clock_timestamp() + power(2, LEAST(failure_count, 6)) * interval '1 minute' END,
   lease_id = NULL, lease_until = NULL
@@ -389,16 +421,12 @@ WHERE credential_id = $1 AND kind = $2`, job.credential, job.kind,
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return result.err
+	return errors.Join(result.err, result.partialErr)
 }
 
 func refreshMinutes(kind string) int {
-	switch kind {
-	case "billing":
+	if kind == "billing" {
 		return 15
-	case "usage":
-		return 1440
-	default:
-		return 30
 	}
+	return 1440
 }

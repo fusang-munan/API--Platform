@@ -200,7 +200,11 @@ func TestUpstreamUsageWithoutSchoolCallsPostgres(t *testing.T) {
 			}
 			var keys []map[string]any
 			for i, n := range names {
-				keys = append(keys, map[string]any{"id": 41 + i, "user_id": 17, "group_id": 21 + i, "name": n, "status": "active", "key": "never-match-this-raw-property"})
+				key := map[string]any{"id": 41 + i, "user_id": 17, "group_id": 21 + i, "name": n, "status": "active"}
+				if !ambiguous {
+					key["key"] = fmt.Sprintf("sk-fixture-%d", i)
+				}
+				keys = append(keys, key)
 			}
 			if ambiguous {
 				keys = append(keys, map[string]any{"id": 95, "group_id": 24, "user_id": 17, "name": "CC1", "status": "active"})
@@ -211,7 +215,11 @@ func TestUpstreamUsageWithoutSchoolCallsPostgres(t *testing.T) {
 			if err != nil || i < 0 || i >= 4 {
 				t.Fatal("wrong inference key")
 			}
-			return response(200, map[string]any{"object": "sub2api.key_billing", "schema_version": 1, "billing_scope": "token", "group_id": 21 + i})
+			info := map[string]any{"object": "sub2api.key_billing", "schema_version": 1, "billing_scope": "token"}
+			if ambiguous {
+				info["group_id"] = 21 + i
+			}
+			return response(200, info)
 		case "beichenapi.com/api/v1/usage":
 			q := r.URL.Query()
 			if r.Header.Get("Authorization") != "Bearer panel-fixture" || q.Get("model") != "" || q.Get("start_date") != "1970-01-01" || q.Get("sort_order") != "asc" {

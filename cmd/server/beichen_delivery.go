@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/starprince1234/Nebula-api/internal/controlplane"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/schoolseal"
@@ -15,8 +14,7 @@ import (
 
 type beichenSettings struct {
 	channels, email, password string
-	access, refresh           string
-	expiresAt                 time.Time
+	session                   *schoolseal.SessionStore
 	recipient                 *schoolseal.Recipient
 }
 
@@ -31,8 +29,8 @@ func initializeBeichenDelivery(ctx context.Context, service *controlplane.Servic
 		}
 	}
 	var sessionErr error
-	if settings.access != "" || settings.refresh != "" {
-		sessionErr = service.Beichen().ConfigureWebSessionTokens(settings.email, settings.access, settings.refresh, settings.expiresAt)
+	if settings.session != nil {
+		sessionErr = service.Beichen().ConfigureSavedWebSession(settings.session)
 	} else {
 		sessionErr = service.Beichen().ConfigureWebSession(settings.email, settings.password)
 	}
@@ -76,11 +74,10 @@ func loadBeichenSettings() (beichenSettings, error) {
 		return settings, err
 	}
 	if session != nil {
-		settings.email = session.WebEmail
-		settings.password = ""
-		settings.access = session.WebAccess
-		settings.refresh = session.WebRefresh
-		settings.expiresAt = session.WebExpiresAt
+		settings.session, err = identity.SessionStore(*session)
+		if err != nil {
+			return settings, err
+		}
 	}
 	return settings, nil
 }

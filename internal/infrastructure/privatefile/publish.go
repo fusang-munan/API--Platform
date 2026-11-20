@@ -4,6 +4,7 @@ package privatefile
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"runtime"
 )
 
@@ -29,6 +30,30 @@ func PublishOnce(dir, path string, data []byte) error {
 		return err
 	}
 	if err := os.Remove(file.Name()); err != nil {
+		return err
+	}
+	return SyncDirectory(dir)
+}
+
+// Replace publishes the complete private file and syncs the directory entry.
+func Replace(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	file, err := os.CreateTemp(dir, ".private-*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(file.Name(), path); err != nil {
 		return err
 	}
 	return SyncDirectory(dir)

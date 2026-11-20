@@ -11,14 +11,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/schoolseal"
 )
 
 const webAuthURL = "https://beichenapi.com/api/v1/auth/"
 
 var errWebSignIn = errors.New("北辰官网要求核实学校账号或完成登录验证")
 
-// The school signs in through the same endpoints as the Beichen website. Only
-// its running process holds the session and refresh token.
+// The school signs in through the same endpoints as the Beichen website.
 type webSession struct {
 	email, password   string
 	mu                sync.Mutex
@@ -27,6 +28,9 @@ type webSession struct {
 	lastError         error
 	humanVerification atomic.Bool
 	retryAt           time.Time
+	expiresAt         time.Time
+	save              func(access, refresh string, expiresAt time.Time) error
+	savePending       bool
 }
 
 // ConfigureWebSession runs before any workers start.
@@ -60,6 +64,19 @@ func (s *Service) ConfigureWebSessionTokens(email, access, refresh string, expir
 		renewAt = s.now()
 	}
 	s.webAccount = &webSession{email: email, access: access, refresh: refresh, renewAt: renewAt}
+	return nil
+}
+
+// ConfigureSavedWebSession loads the current session before any workers start.
+func (s *Service) ConfigureSavedWebSession(store *schoolseal.SessionStore) error {
+	session, err := store.Load()
+	if err != nil {
+		return err
+	}
+	if err := s.ConfigureWebSessionTokens(session.WebEmail, session.WebAccess, session.WebRefresh, session.WebExpiresAt); err != nil {
+		return err
+	}
+	s.webAccount.save = store.Save
 	return nil
 }
 
@@ -104,6 +121,9 @@ func (s *Service) webPanelToken(ctx context.Context) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	if err := account.saveRotation(); err != nil {
+		return "", err
+	}
 	now := s.now()
 	if account.access != "" && now.Before(account.renewAt) {
 		return account.access, nil
@@ -146,11 +166,31 @@ func (s *Service) webPanelToken(ctx context.Context) (string, error) {
 		return "", account.lastError
 	}
 	ttl := webSessionTTL(tokens.Lifetime)
+	if tokens.Refresh == "" {
+		tokens.Refresh = account.refresh
+	}
 	account.access, account.refresh = tokens.Access, tokens.Refresh
+	account.expiresAt = now.Add(ttl)
 	account.renewAt = now.Add(ttl - min(time.Minute, ttl/5))
 	account.lastError = nil
 	account.humanVerification.Store(false)
+	account.savePending = account.save != nil
+	if err := account.saveRotation(); err != nil {
+		return "", err
+	}
 	return account.access, nil
+}
+
+func (account *webSession) saveRotation() error {
+	if account.savePending {
+		// Retry the durable write before using or refreshing the new pair. The
+		// upstream may already have revoked the previous refresh credential.
+		if err := account.save(account.access, account.refresh, account.expiresAt); err != nil {
+			return err
+		}
+		account.savePending = false
+	}
+	return nil
 }
 
 func webSessionTTL(seconds int64) time.Duration {

@@ -28,6 +28,7 @@ type Recipient struct {
 type Identity struct {
 	public  [32]byte
 	private [32]byte
+	dir     string
 }
 
 func (id *Identity) Recipient() Recipient {
@@ -86,7 +87,7 @@ func LoadOrCreate(dir string) (*Identity, error) {
 	if err != nil {
 		return nil, errors.New("学校配置密钥无效")
 	}
-	id := &Identity{}
+	id := &Identity{dir: dir}
 	copy(id.private[:], raw)
 	copy(id.public[:], key.PublicKey().Bytes())
 	return id, nil

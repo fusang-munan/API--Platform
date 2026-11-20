@@ -47,7 +47,9 @@ func TestPanelAccessPostgresIsolationAndRotation(t *testing.T) {
 CREATE TABLE users (id uuid PRIMARY KEY);
 CREATE TABLE providers (id uuid PRIMARY KEY, base_url text NOT NULL, status text NOT NULL DEFAULT 'active');
 CREATE TABLE provider_credentials (id uuid PRIMARY KEY, provider_id uuid NOT NULL REFERENCES providers(id),
-  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(), status text NOT NULL DEFAULT 'active');
+  label text NOT NULL DEFAULT 'test channel', updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  status text NOT NULL DEFAULT 'active');
+CREATE TABLE beichen_provision_channels (credential_id uuid PRIMARY KEY, channel text, discover_ids boolean);
 CREATE TABLE gateway_calls (provider_id uuid, provider_credential_id uuid, upstream_model_name text, sent_at timestamptz)`)
 	for _, name := range []string{"0030_beichen.sql", "0033_beichen_panel_prices.sql", "0034_beichen_panel_access.sql"} {
 		data, err := os.ReadFile("../infrastructure/db/migrations/" + name)
@@ -71,9 +73,9 @@ CREATE TABLE gateway_calls (provider_id uuid, provider_credential_id uuid, upstr
 	}
 	check := func(id uuid.UUID, wantToken string, wantGroup int64) {
 		t.Helper()
-		token, group, err := s.panelAccess(ctx, id)
-		if err != nil || token != wantToken || group != wantGroup {
-			t.Fatalf("unexpected access for %s: group %d, error %v", id, group, err)
+		access, err := s.loadPriceAccess(ctx, id)
+		if err != nil || access.legacyToken != wantToken || access.groupID != wantGroup {
+			t.Fatalf("unexpected access for %s: group %d, error %v", id, access.groupID, err)
 		}
 	}
 	check(a, "panel-env-fixture", 7)
@@ -107,7 +109,7 @@ CREATE TABLE gateway_calls (provider_id uuid, provider_credential_id uuid, upstr
 		t.Fatal("panel token was not stored as ciphertext")
 	}
 	exec("INSERT INTO beichen_panel_access (credential_id,group_id,token_ciphertext,updated_by,updated_at) VALUES ($1,11,$2,$3,clock_timestamp())", b, ciphertext, actor)
-	if token, group, err := s.panelAccess(ctx, b); err == nil || token != "" || group != 0 {
+	if access, err := s.loadPriceAccess(ctx, b); err == nil || access.legacyToken != "" || access.groupID != 0 {
 		t.Fatal("transplanted ciphertext was accepted or fell back")
 	}
 	status, err := s.PanelStatus(ctx, provider, a)
@@ -149,6 +151,9 @@ CREATE TABLE gateway_calls (provider_id uuid, provider_credential_id uuid, upstr
 		t.Fatal(err)
 	}
 	check(a, "", 0)
+	if access, err := s.loadPriceAccess(ctx, a); err != nil || !access.disabled {
+		t.Fatal("explicit teacher disable did not override automatic website pricing")
+	}
 	assertUsage(a, "", 0)
 	if status, err := s.PanelStatus(ctx, provider, a); err != nil || status.Configured || status.GroupID != 0 || status.UpstreamKeyID != nil {
 		t.Fatal("disabled configuration fell back to environment")

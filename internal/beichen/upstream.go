@@ -104,6 +104,9 @@ type billingInfo struct {
 	Timezone      string          `json:"timezone"`
 	Pricing       json.RawMessage `json:"pricing"`
 	GroupID       *int64          `json:"group_id"`
+	KeyID         int64           `json:"key_id"`
+	APIKeyID      int64           `json:"api_key_id"`
+	APIKeyName    string          `json:"api_key_name"`
 	ObservedAt    time.Time       `json:"observed_at"`
 	PeakEnabled   *bool           `json:"peak_rate_enabled"`
 	PeakStart     string          `json:"peak_start"`
