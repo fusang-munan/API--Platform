@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { teacherAPI } from '../../api/teacher'
-import type { Provider, ProviderCredential } from '../../api/types'
+import type { BeichenCatalogDifference, Provider, ProviderCredential } from '../../api/types'
 import { APIError } from '../../api/client'
 import StatusBadge from '../../components/StatusBadge.vue'
 import AppDialog from '../../components/AppDialog.vue'
@@ -24,7 +24,7 @@ type KeyDraft = {
 const rows = ref<Provider[]>([])
 const schoolProvider = ref<Provider>()
 const reconcileProviderIds = ref<string[]>([])
-const anomalies = ref<Record<string, { pendingCalls?: number; missingModels?: number }>>({})
+const anomalies = ref<Record<string, { pendingCalls?: number; missingModels?: number; differences?: BeichenCatalogDifference[] }>>({})
 const query = ref('')
 const status = ref('')
 const drawer = ref(false)
@@ -66,7 +66,11 @@ async function jumpToReconciliation(providerId: string) {
 }
 
 function catalogSyncTime(provider: Provider) {
-  const date = provider.last_catalog_sync?.synced_at ? new Date(provider.last_catalog_sync.synced_at) : null
+  return beijingTime(provider.last_catalog_sync?.synced_at)
+}
+
+function beijingTime(value?: string | null) {
+  const date = value ? new Date(value) : null
   return date && Number.isFinite(date.getTime())
     ? new Intl.DateTimeFormat('zh-CN', {
       timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
@@ -100,9 +104,12 @@ async function loadAnomalies(providerId: string, day: string, version: number) {
     if (version !== loadVersion) return
     const counts = overview.comparison?.flatMap(row => row.pending_review_calls == null ? [] : [row.pending_review_calls]) ?? []
     const catalog = overview.model_catalog ?? []
-    const missing = new Set(catalog.filter(model => model.price_state === 'missing' ||
-      model.blockers?.some(blocker => blocker.code === 'missing_price')).map(model => model.model.trim().toLowerCase()))
-    const mixedModels = new Set(catalog.filter(model => model.price_state === 'mixed').map(model => model.model.trim().toLowerCase()))
+    const listed = catalog.filter(model => model.credential_ids?.length !== 0)
+    const missing = new Set(listed.filter(model => model.price_covered === false || (model.price_covered == null &&
+      (model.price_state === 'missing' || model.blockers?.some(blocker => blocker.code === 'missing_price'))))
+      .map(model => model.model.trim().toLowerCase()))
+    const mixedModels = new Set(listed.filter(model => model.price_covered == null && model.price_state === 'mixed')
+      .map(model => model.model.trim().toLowerCase()))
     for (const row of overview.models ?? []) {
       const name = row.model.trim().toLowerCase()
       if (mixedModels.has(name) && row.mode === 'follow' && row.price_status != null &&
@@ -110,11 +117,16 @@ async function loadAnomalies(providerId: string, day: string, version: number) {
     }
     anomalies.value[providerId] = {
       pendingCalls: counts.length ? counts.reduce((sum, count) => sum + count, 0) : undefined,
-      missingModels: missing.size || (catalog.length && catalog.every(model => model.price_state != null) ? 0 : undefined),
+      missingModels: missing.size || (listed.length && listed.every(model => model.price_state != null) ? 0 : undefined),
+      differences: overview.catalog_differences ?? undefined,
     }
   } catch {
     // 异常摘要可独立缺省，供应商操作和对账入口仍可用。
   }
+}
+
+function refreshSchoolCatalog() {
+  if (schoolProvider.value) void loadAnomalies(schoolProvider.value.id, schoolDay(), loadVersion)
 }
 
 async function load() {
@@ -355,6 +367,30 @@ onBeforeUnmount(() => { loadVersion++ })
               </template>
             </div>
           </div>
+          <details v-if="isBeichenProvider(p.base_url) && anomalies[p.id]?.differences" class="catalog-differences">
+            <summary>目录差异</summary>
+            <p v-if="!anomalies[p.id].differences?.length" class="muted">当前没有启用的渠道 Key。</p>
+            <section v-for="channel in anomalies[p.id].differences" :key="channel.credential_id">
+              <h3>{{ channel.label }}<template v-if="channel.group_id != null"> · 分组 {{ channel.group_id }}</template></h3>
+              <p v-if="channel.state === 'unverified'" class="muted">待核对。请检查官网授权和分组，再同步目录。</p>
+              <template v-else>
+                <p class="muted">核对时间 {{ beijingTime(channel.checked_at) }}（北京时间）</p>
+                <p v-if="!channel.website_only.length && !channel.key_only.length">网页和 Key 目录一致。</p>
+                <div v-else class="catalog-difference-groups">
+                  <div>
+                    <h4>网页有 Key 无（{{ channel.website_only.length }}）</h4>
+                    <p v-if="channel.website_only.length" class="muted">确认这把 Key 是否归属该分组，或更换为能访问这些模型的 Key。</p>
+                    <ul><li v-for="model in channel.website_only" :key="model">{{ model }}</li></ul>
+                  </div>
+                  <div>
+                    <h4>Key 有 网页无（{{ channel.key_only.length }}）</h4>
+                    <p v-if="channel.key_only.length" class="muted">核对分组映射，并在官网补齐分组或模型配置后同步。</p>
+                    <ul><li v-for="model in channel.key_only" :key="model">{{ model }}</li></ul>
+                  </div>
+                </div>
+              </template>
+            </section>
+          </details>
           <div v-if="isBeichenProvider(p.base_url)" :id="`beichen-reconcile-${p.id}`" class="provider-reconciliation"
             role="region" aria-label="北辰对账" tabindex="-1">
             <BeichenReconcile v-if="reconcileProviderIds.includes(p.id)" :provider-id="p.id" />
@@ -364,7 +400,7 @@ onBeforeUnmount(() => { loadVersion++ })
     </LoadingRegion>
 
     <AppDialog :open="Boolean(schoolProvider)" title="北辰模型" description="查看学校首选倍率并管理模型启用状态。" wide @update:open="open => { if (!open) schoolProvider = undefined }">
-      <BeichenSchoolModels v-if="schoolProvider" :key="schoolProvider.id" :provider-id="schoolProvider.id" provider-maintenance />
+      <BeichenSchoolModels v-if="schoolProvider" :key="schoolProvider.id" :provider-id="schoolProvider.id" provider-maintenance @catalog-synced="refreshSchoolCatalog" />
     </AppDialog>
     <AppDialog :open="drawer" :title="editing ? '编辑供应商' : '创建供应商'" description="维护供应商地址、渠道凭据与启用状态。" @update:open="drawer = $event">
       <form class="provider-form" @submit.prevent="save">
@@ -430,6 +466,14 @@ onBeforeUnmount(() => { loadVersion++ })
 .provider-overview { margin-top: 10px; gap: 6px; }
 .provider-overview .chip { white-space: normal; overflow-wrap: anywhere; }
 .provider-compare { align-self: center; padding: 4px 6px; color: var(--primary); text-decoration: underline; }
+.catalog-differences { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.catalog-differences summary { width: fit-content; cursor: pointer; font-weight: 600; }
+.catalog-differences section { padding: 10px 0; }
+.catalog-differences section + section { border-top: 1px solid var(--line); }
+.catalog-differences h3, .catalog-differences h4 { margin: 0; font-size: 13px; }
+.catalog-differences p, .catalog-differences ul { margin: 4px 0 0; font-size: 12px; }
+.catalog-differences ul { padding-inline-start: 18px; }
+.catalog-difference-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 12px; margin-top: 8px; }
 .provider-reconciliation { width: 100%; min-width: 0; }
 .provider-reconciliation:has(> *) { margin-top: 16px; border-top: 1px solid var(--line); }
 @media (max-width: 900px) {

@@ -28,6 +28,20 @@ func TestLoadRejectsShortJWTKey(t *testing.T) {
 	}
 }
 
+func TestLoadBeichenProbeSchedule(t *testing.T) {
+	setValidEnvironment(t)
+	for _, tc := range []struct {
+		value   string
+		enabled bool
+	}{{"", true}, {"false", false}, {"true", true}} {
+		t.Setenv("BEICHEN_PROBES_ENABLED", tc.value)
+		cfg, err := Load()
+		if err != nil || cfg.BeichenProbesEnabled != tc.enabled {
+			t.Fatalf("probe schedule = %t, want %t, %v", cfg.BeichenProbesEnabled, tc.enabled, err)
+		}
+	}
+}
+
 func TestLoadParsesBootstrapTestAccounts(t *testing.T) {
 	setValidEnvironment(t)
 	t.Setenv("TEST_STUDENT_1_NAME", " Student One ")

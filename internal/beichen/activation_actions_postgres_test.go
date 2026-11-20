@@ -195,6 +195,23 @@ SELECT c.id,rate.effective_at,c.updated_at,1,rate.effective_at+interval '1 hour'
 FROM provider_credentials c CROSS JOIN rate WHERE c.id=$1`, key, single, batch, tc.conditions)
 			}
 
+			view, err := service.Overview(ctx, provider, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			previewed := 0
+			for _, model := range view.ModelCatalog {
+				if model.Model != single && model.Model != batch {
+					continue
+				}
+				previewed++
+				if model.PriceCovered != tc.enable || (model.Activation == "ready") != tc.enable || model.ProbeState != "unprobed" {
+					t.Fatalf("coverage and activation preview disagree: %+v", model)
+				}
+			}
+			if previewed != 2 {
+				t.Fatal("missing activation preflight")
+			}
 			id, singleErr := service.EnableModel(ctx, provider, actor, single, "")
 			result, err := service.EnableModelsBatch(ctx, provider, actor, []string{batch})
 			if err != nil {
@@ -214,7 +231,17 @@ FROM provider_credentials c CROSS JOIN rate WHERE c.id=$1`, key, single, batch, 
 					id, result.Enabled[0].ModelID).Scan(&active); err != nil || active != 2 {
 					t.Fatalf("两种入口都应发布模型: active=%d err=%v", active, err)
 				}
-				return
+				exec("UPDATE provider_model_catalog SET status='inactive' WHERE model_id=$1", single)
+				view, err := service.Overview(ctx, provider, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, model := range view.ModelCatalog {
+					if model.Model == single && model.ReadyCount == 0 && model.BindingIssue != nil && model.BindingIssue.Code == "catalog_missing" {
+						return
+					}
+				}
+				t.Fatal("a published model must stay visible after it leaves all catalogues")
 			}
 			if id != uuid.Nil || domain.ErrorCode(singleErr) != domain.CodeValidation || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
 				result.Skipped[0].Reason != "no_price" || result.Skipped[0].Message != singleErr.Error() ||

@@ -30,6 +30,7 @@ const (
 	BindingRouteProbeResponses         BindingRouteProbeEndpoint = "responses"
 	BindingRouteProbeMessages          BindingRouteProbeEndpoint = "messages"
 	BindingRouteProbeImagesGenerations BindingRouteProbeEndpoint = "images_generations"
+	BindingRouteProbeGenerateContent   BindingRouteProbeEndpoint = "generate_content"
 )
 
 var bindingRouteProbeOrder = []BindingRouteProbeEndpoint{
@@ -40,13 +41,29 @@ var bindingRouteProbeOrder = []BindingRouteProbeEndpoint{
 }
 
 type RouteProbeStep struct {
-	Endpoint   BindingRouteProbeEndpoint `json:"endpoint"`
-	Path       string                    `json:"path"`
-	Adapter    modelbinding.Adapter      `json:"adapter"`
-	HTTPStatus int                       `json:"http_status"`
-	OK         bool                      `json:"ok"`
-	DurationMS int64                     `json:"duration_ms"`
-	Error      string                    `json:"error,omitempty"`
+	Endpoint    BindingRouteProbeEndpoint `json:"endpoint"`
+	Path        string                    `json:"path"`
+	Adapter     modelbinding.Adapter      `json:"adapter"`
+	HTTPStatus  int                       `json:"http_status"`
+	OK          bool                      `json:"ok"`
+	DurationMS  int64                     `json:"duration_ms"`
+	Error       string                    `json:"error,omitempty"`
+	FailureCode string                    `json:"-"`
+}
+
+func TokenProbeEndpoint(protocol string) (BindingRouteProbeEndpoint, bool) {
+	switch modelbinding.Adapter(protocol) {
+	case modelbinding.AdapterOpenaiCompatible:
+		return BindingRouteProbeChatCompletions, true
+	case modelbinding.AdapterOpenaiResponses:
+		return BindingRouteProbeResponses, true
+	case modelbinding.AdapterAnthropic:
+		return BindingRouteProbeMessages, true
+	case modelbinding.AdapterGoogleGeminiV1beta:
+		return BindingRouteProbeGenerateContent, true
+	default:
+		return "", false
+	}
 }
 
 func BindingRouteProbeOrder() []BindingRouteProbeEndpoint {
@@ -138,6 +155,14 @@ func bindingProbeRequests(model string) ([]bindingProbeRequest, error) {
 }
 
 func bindingProbeRequestForEndpoint(model string, endpoint BindingRouteProbeEndpoint) (bindingProbeRequest, error) {
+	if endpoint == BindingRouteProbeGenerateContent {
+		body, err := json.Marshal(map[string]any{
+			"contents":         []any{map[string]any{"role": "user", "parts": []any{map[string]string{"text": "Reply with OK."}}}},
+			"generationConfig": map[string]int{"maxOutputTokens": 1},
+		})
+		path := "/v1beta/models/" + url.PathEscape(strings.TrimPrefix(model, "models/")) + ":generateContent"
+		return bindingProbeRequest{path: path, body: body, adapter: modelbinding.AdapterGoogleGeminiV1beta}, err
+	}
 	requests, err := bindingProbeRequests(model)
 	if err != nil {
 		return bindingProbeRequest{}, err
@@ -157,6 +182,21 @@ func bindingProbeRequestForEndpoint(model string, endpoint BindingRouteProbeEndp
 }
 
 func (p *RouteProbe) ProbeStep(ctx context.Context, upstreamModelID string, endpoint BindingRouteProbeEndpoint) (RouteProbeStep, error) {
+	return p.probeStep(ctx, upstreamModelID, endpoint, false)
+}
+
+// ProbeTokenStep makes exactly one capped request and verifies that a 2xx
+// response is a generation response for the protocol. Upstream error bodies
+// and transport descriptions are never returned from this path.
+func (p *RouteProbe) ProbeTokenStep(ctx context.Context, upstreamModelID, protocol string) (RouteProbeStep, error) {
+	endpoint, ok := TokenProbeEndpoint(protocol)
+	if !ok {
+		return RouteProbeStep{}, errors.New("protocol does not support a one-token probe")
+	}
+	return p.probeStep(ctx, upstreamModelID, endpoint, true)
+}
+
+func (p *RouteProbe) probeStep(ctx context.Context, upstreamModelID string, endpoint BindingRouteProbeEndpoint, validateResponse bool) (RouteProbeStep, error) {
 	upstreamModelID = strings.TrimSpace(upstreamModelID)
 	if upstreamModelID == "" {
 		return RouteProbeStep{}, errors.New("upstream model id is required")
@@ -176,6 +216,7 @@ func (p *RouteProbe) ProbeStep(ctx context.Context, upstreamModelID string, endp
 	target, err := probeTargetURL(probeBaseForRequest(p.BaseURL, item.anthropic), item.path)
 	if err != nil {
 		step.Error = err.Error()
+		step.FailureCode = "network_error"
 		return step, nil
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(item.body))
@@ -186,24 +227,79 @@ func (p *RouteProbe) ProbeStep(ctx context.Context, upstreamModelID string, endp
 	if item.anthropic {
 		req.Header.Set("x-api-key", p.Credential)
 		req.Header.Set("anthropic-version", "2023-06-01")
+	} else if item.adapter == modelbinding.AdapterGoogleGeminiV1beta {
+		req.Header.Set("x-goog-api-key", p.Credential)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+p.Credential)
 	}
 	started := time.Now()
 	resp, err := client.Do(req)
-	step.DurationMS = time.Since(started).Milliseconds()
 	if err != nil {
-		step.Error = err.Error()
+		step.DurationMS = time.Since(started).Milliseconds()
+		step.FailureCode = probeTransportError(err)
+		if validateResponse {
+			step.Error = step.FailureCode
+		} else {
+			step.Error = err.Error()
+		}
 		return step, nil
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	_ = resp.Body.Close()
+	defer resp.Body.Close()
 	step.HTTPStatus = resp.StatusCode
 	step.OK = probeEndpointSuccess(resp.StatusCode)
 	if !step.OK {
+		step.FailureCode = "http_error"
 		step.Error = fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
 	}
+	if validateResponse && step.OK {
+		const maxBody = 64 << 10
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+		switch {
+		case err != nil:
+			step.FailureCode = probeTransportError(err)
+		case len(body) > maxBody || !validTokenProbeResponse(body, endpoint):
+			step.FailureCode = "invalid_response"
+		}
+		step.OK = step.FailureCode == ""
+		step.Error = step.FailureCode
+	} else {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	}
+	step.DurationMS = time.Since(started).Milliseconds()
 	return step, nil
+}
+
+func probeTransportError(err error) string {
+	var timeout interface{ Timeout() bool }
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout() {
+		return "timeout"
+	}
+	return "network_error"
+}
+
+func validTokenProbeResponse(body []byte, endpoint BindingRouteProbeEndpoint) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil ||
+		len(fields["error"]) > 0 && string(fields["error"]) != "null" {
+		return false
+	}
+	var field string
+	switch endpoint {
+	case BindingRouteProbeChatCompletions:
+		field = "choices"
+	case BindingRouteProbeResponses:
+		status := string(fields["status"])
+		if status == `"failed"` || status == `"cancelled"` {
+			return false
+		}
+		field = "output"
+	case BindingRouteProbeMessages:
+		field = "content"
+	case BindingRouteProbeGenerateContent:
+		field = "candidates"
+	}
+	value := fields[field]
+	return len(value) > 0 && value[0] == '['
 }
 
 func (p *RouteProbe) Discover(ctx context.Context, upstreamModelID string) ([]modelbinding.Adapter, error) {
@@ -280,7 +376,12 @@ func probeTargetURL(baseURL, requestPath string) (string, error) {
 	if strings.HasSuffix(basePath, "/v1") && strings.HasPrefix(requestPath, "/v1/") {
 		requestPath = requestPath[3:]
 	}
-	parsed.Path = strings.TrimRight(basePath, "/") + "/" + strings.TrimLeft(requestPath, "/")
+	rawPath := strings.TrimRight(parsed.EscapedPath(), "/") + "/" + strings.TrimLeft(requestPath, "/")
+	decoded, err := url.PathUnescape(rawPath)
+	if err != nil {
+		return "", errors.New("invalid probe path")
+	}
+	parsed.Path, parsed.RawPath = decoded, rawPath
 	return parsed.String(), nil
 }
 

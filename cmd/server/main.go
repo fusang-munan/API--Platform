@@ -143,6 +143,7 @@ func run() error {
 	syncContext, cancelSync := context.WithCancel(signalContext)
 	syncDone := make(chan struct{})
 	receiptsDone := make(chan struct{})
+	probesDone := make(chan struct{})
 	go func() {
 		defer close(syncDone)
 		controlService.Beichen().Run(syncContext)
@@ -151,10 +152,15 @@ func run() error {
 		defer close(receiptsDone)
 		controlService.Beichen().RunReceipts(syncContext, usageStore)
 	}()
+	go func() {
+		defer close(probesDone)
+		controlService.Beichen().RunProbes(syncContext, cfg.BeichenProbesEnabled)
+	}()
 	defer func() {
 		cancelSync()
 		<-syncDone
 		<-receiptsDone
+		<-probesDone
 	}()
 	var secureServer *http.Server
 	if addr := os.Getenv("LAB_MAINTENANCE_TLS_ADDR"); addr != "" {

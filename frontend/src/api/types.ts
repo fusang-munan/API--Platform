@@ -110,6 +110,7 @@ export type BeichenModel = {
   price_conditions_exact?: BeichenPriceConditions | null
   upstream_rates?: BeichenDisplayRates | null
   school_rates?: BeichenDisplayRates | null
+  price_covered?: boolean
 }
 export type BeichenComparison = {
   credential_id: string
@@ -138,10 +139,47 @@ export type BeichenOverview = {
   website_sync?: BeichenWebsiteSync | null
   maintenance_workspace?: { launch_url?: string | null } | null
   model_catalog?: BeichenCatalogModel[] | null
+  credentials?: BeichenCredentialSummary[] | null
+  catalog_differences?: BeichenCatalogDifference[] | null
+  probe_run?: BeichenProbeRun
   datasets: BeichenDataset[] | null
   models: BeichenModel[] | null
   comparison: BeichenComparison[] | null
 }
+export type BeichenHealthDimension = { state: 'available' | 'unavailable' | 'pending'; message: string }
+export type BeichenCredentialSummary = {
+  credential_id: string
+  label: string
+  status?: ResourceStatus
+  health?: Record<'credential' | 'catalog' | 'pricing' | 'probe', BeichenHealthDimension> & { available_dimensions: number }
+}
+export type BeichenCatalogDifference = {
+  credential_id: string
+  label: string
+  state: 'compared' | 'unverified'
+  group_id: number | null
+  checked_at: string | null
+  website_only: string[]
+  key_only: string[]
+}
+export type BeichenProbeRun = {
+  state: 'idle' | 'queued' | 'running' | 'completed' | 'failed'
+  started_at: string | null
+  finished_at: string | null
+  error_code: string | null
+}
+export type BeichenProbeResult = {
+  provider_id: string
+  credential_id: string
+  model: string
+  protocol: BindingAdapter
+  status_code: number
+  error_code: string | null
+  duration_ms: number
+  checked_at: string
+  detail: { max_output_tokens: number }
+}
+export type BeichenProbes = { run: BeichenProbeRun; results: BeichenProbeResult[] }
 export type BeichenWebsiteSync = {
   channels: number
   priced_channels: number
@@ -302,8 +340,13 @@ export type BeichenCatalogModel = {
   route_count?: number | null
   ready_count?: number | null
   price_state?: 'confirmed' | 'conditional' | 'manual' | 'missing' | 'mixed' | null
+  price_covered?: boolean
   blockers?: Array<{ code: string; message: string }> | null
   activation?: 'active' | 'ready' | 'blocked' | null
+  protocols?: BindingAdapter[]
+  probe_state?: 'unprobed' | 'passed' | 'failed'
+  last_probe_at?: string | null
+  binding_issue?: { code: string; message: string }
 }
 export type BeichenPreferredRoute = {
   school_model: string; upstream_model?: string; adapter: string; provider_id: string; credential_id?: string | null; credential_label?: string | null

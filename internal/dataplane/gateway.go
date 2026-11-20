@@ -35,6 +35,8 @@ import (
 
 const replayMemoryThreshold = 1 << 20
 
+const defaultAnthropicVersion = "2023-06-01"
+
 type Config struct {
 	ConnectTimeout        time.Duration
 	ResponseHeaderTimeout time.Duration
@@ -90,7 +92,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !supportedRoute(r.Method, r.URL.Path) {
-		writeOpenAIError(w, http.StatusNotFound, "invalid_request_error", "route_not_found", "Route not found.", "")
+		writeOpenAIError(w, http.StatusNotFound, "invalid_request_error", "route_not_found", gatewayErrorMessage(http.StatusNotFound, "route_not_found", "Route not found."), "")
 		return
 	}
 	if isGeminiPath(r.URL.Path) && r.URL.Query().Has("key") {
@@ -122,10 +124,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	adapter := adapterForPath(r.URL.Path)
 	if adapter == modelbinding.AdapterAnthropic {
-		if strings.TrimSpace(r.Header.Get("anthropic-version")) == "" {
-			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "anthropic-version header is required")
-			return
-		}
+		ensureAnthropicVersion(r.Header)
 	}
 	if resourceType, resourceID, ok := routedResource(r.Method, r.URL.Path); ok {
 		routes, routeErr := g.resourceRoutes(r.Context(), key.ID, resourceType, resourceID, adapter)
@@ -174,30 +173,73 @@ func requestIDFromContext(r *http.Request) string {
 }
 
 func (g *Gateway) authenticate(r *http.Request) (*ent.APIKey, error) {
-	raw := ""
-	if r.URL.Path == "/v1/messages" {
-		raw = strings.TrimSpace(r.Header.Get("x-api-key"))
-	} else if isGeminiPath(r.URL.Path) {
-		raw = strings.TrimSpace(r.Header.Get("x-goog-api-key"))
-	}
-	if raw == "" {
-		authorization := strings.TrimSpace(r.Header.Get("Authorization"))
-		if len(authorization) > 7 && strings.EqualFold(authorization[:7], "Bearer ") {
-			raw = strings.TrimSpace(authorization[7:])
+	return authenticateAPIKey(r, func(raw string) (*ent.APIKey, error) {
+		hash := g.security.HashAPIKey(raw)
+		key, err := g.db.APIKey.Query().Where(
+			apikey.KeyHashEQ(hash),
+			apikey.StatusEQ(apikey.StatusActive),
+		).Only(r.Context())
+		if err != nil {
+			return nil, errors.New("invalid API key")
 		}
-	}
-	if raw == "" {
+		return key, nil
+	})
+}
+
+// authenticateAPIKey accepts the protocol-native header first and then the
+// Bearer header. When a client sends both, a stale or unrelated value in one
+// header must not prevent the other valid credential from being used.
+func authenticateAPIKey(r *http.Request, verify func(string) (*ent.APIKey, error)) (*ent.APIKey, error) {
+	candidates := apiKeyCandidates(r)
+	if len(candidates) == 0 {
 		return nil, errors.New("missing API key")
 	}
-	hash := g.security.HashAPIKey(raw)
-	key, err := g.db.APIKey.Query().Where(
-		apikey.KeyHashEQ(hash),
-		apikey.StatusEQ(apikey.StatusActive),
-	).Only(r.Context())
-	if err != nil {
-		return nil, errors.New("invalid API key")
+	var lastErr error
+	for _, raw := range candidates {
+		key, err := verify(raw)
+		if err == nil && key != nil {
+			return key, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
 	}
-	return key, nil
+	if lastErr == nil {
+		lastErr = errors.New("invalid API key")
+	}
+	return nil, lastErr
+}
+
+func apiKeyCandidates(r *http.Request) []string {
+	values := make([]string, 0, 3)
+	add := func(raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		for _, existing := range values {
+			if existing == raw {
+				return
+			}
+		}
+		values = append(values, raw)
+	}
+	if r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/models" {
+		add(r.Header.Get("x-api-key"))
+	}
+	if isGeminiPath(r.URL.Path) {
+		add(r.Header.Get("x-goog-api-key"))
+	}
+	if authorization := strings.TrimSpace(r.Header.Get("Authorization")); len(authorization) > 7 && strings.EqualFold(authorization[:7], "Bearer ") {
+		add(authorization[7:])
+	}
+	return values
+}
+
+func ensureAnthropicVersion(header http.Header) {
+	if strings.TrimSpace(header.Get("anthropic-version")) == "" {
+		header.Set("anthropic-version", defaultAnthropicVersion)
+	}
 }
 
 func (g *Gateway) serveModels(w http.ResponseWriter, r *http.Request, key *ent.APIKey) {
@@ -386,6 +428,7 @@ func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, ca
 	request.Header.Del("x-api-key")
 	request.Header.Del("x-goog-api-key")
 	if candidate.Binding.Adapter == modelbinding.AdapterAnthropic {
+		ensureAnthropicVersion(request.Header)
 		request.Header.Set("x-api-key", candidate.Credential)
 	} else if candidate.Binding.Adapter == modelbinding.AdapterGoogleGeminiV1beta {
 		request.Header.Set("x-goog-api-key", candidate.Credential)
@@ -420,7 +463,7 @@ func (g *Gateway) serveRealtimeWebSocket(w http.ResponseWriter, r *http.Request)
 	}
 	key, err := g.authenticateRealtime(r)
 	if err != nil {
-		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "Invalid API key.", "")
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", gatewayErrorMessage(http.StatusUnauthorized, "invalid_api_key", "Invalid API key."), "")
 		return
 	}
 	modelID := strings.TrimSpace(r.URL.Query().Get("model"))
@@ -430,7 +473,7 @@ func (g *Gateway) serveRealtimeWebSocket(w http.ResponseWriter, r *http.Request)
 	}
 	routes, err := g.routesForModel(r.Context(), key.ID, modelID, modelbinding.AdapterOpenaiRealtime)
 	if err != nil || len(routes) == 0 {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "model_not_allowed", "No allowed model is available for this protocol.", "model")
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "model_not_allowed", gatewayErrorMessage(http.StatusBadRequest, "model_not_allowed", "No allowed model is available for this protocol."), "model")
 		return
 	}
 	var upstream *websocket.Conn
@@ -482,7 +525,7 @@ func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request
 	}
 	key, err := g.authenticateRealtime(r)
 	if err != nil {
-		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "Invalid API key.", "")
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", gatewayErrorMessage(http.StatusUnauthorized, "invalid_api_key", "Invalid API key."), "")
 		return
 	}
 	upgrader := websocket.Upgrader{CheckOrigin: g.validWebSocketOrigin}
@@ -503,7 +546,7 @@ func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request
 	}
 	routes, err := g.routesForModel(r.Context(), key.ID, modelID, modelbinding.AdapterOpenaiResponses)
 	if err != nil || len(routes) == 0 {
-		_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "code": "model_not_allowed", "message": "The requested model is not allowed."}})
+		_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "code": "model_not_allowed", "message": gatewayErrorMessage(http.StatusBadRequest, "model_not_allowed", "The requested model is not allowed.")}})
 		return
 	}
 	var upstream *websocket.Conn
@@ -1604,7 +1647,31 @@ func firstString(payload map[string]any, keys ...string) string {
 	return ""
 }
 
+const (
+	gatewayMessageInvalidAPIKey   = "API Key 无效或已停用。请打开 Nebula 控制台「申请密钥」页确认 Key 状态，重新领取或重新生成 Key 后，再更新客户端配置。"
+	gatewayMessageForbidden       = "当前 Key 无权执行此操作。请确认使用的是本人状态为 active 的 Key；如果模型不在 Key 白名单内，请到模型广场重新申领 Key。"
+	gatewayMessageNotFound        = "请求的接口或资源不存在。请检查客户端 Base URL 不要重复带 /v1，并确认该模型仍在模型广场中。"
+	gatewayMessageModelNotAllowed = "当前 Key 未包含该模型。请打开 Nebula 控制台「模型广场」，在该模型卡片点「需重新申领 Key」，撤回后按原审批额度重新申请。"
+)
+
+func gatewayErrorMessage(status int, code, fallback string) string {
+	if code == "model_not_allowed" {
+		return gatewayMessageModelNotAllowed
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		return gatewayMessageInvalidAPIKey
+	case http.StatusForbidden:
+		return gatewayMessageForbidden
+	case http.StatusNotFound:
+		return gatewayMessageNotFound
+	default:
+		return fallback
+	}
+}
+
 func writeProtocolError(w http.ResponseWriter, requestPath string, status int, errorType, code, message, parameter string) {
+	message = gatewayErrorMessage(status, code, message)
 	if requestPath == "/v1/messages" {
 		writeAnthropicError(w, status, errorType, message)
 		return

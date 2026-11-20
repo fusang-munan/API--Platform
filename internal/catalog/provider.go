@@ -11,13 +11,14 @@ import (
 )
 
 type ProviderEntry struct {
-	ID          string         `json:"id"`
-	Object      string         `json:"object"`
-	DisplayName string         `json:"display_name"`
-	CreatedAt   string         `json:"created_at"`
-	OwnedBy     string         `json:"owned_by"`
-	Description string         `json:"description"`
-	Raw         map[string]any `json:"-"`
+	ID                 string         `json:"id"`
+	Object             string         `json:"object"`
+	DisplayName        string         `json:"display_name"`
+	CreatedAt          string         `json:"created_at"`
+	OwnedBy            string         `json:"owned_by"`
+	Description        string         `json:"description"`
+	SupportedProtocols []string       `json:"supported_protocols"`
+	Raw                map[string]any `json:"-"`
 }
 
 const beichenOrigin = "https://api.beichenapi.com"
@@ -141,6 +142,7 @@ func parseProviderModels(body []byte, beichen bool) ([]ProviderEntry, error) {
 		if description, ok := item["description"].(string); ok {
 			entry.Description = plainText(description)
 		}
+		entry.SupportedProtocols = RegisteredProtocols(entry)
 		result = append(result, entry)
 	}
 	if len(result) == 0 {

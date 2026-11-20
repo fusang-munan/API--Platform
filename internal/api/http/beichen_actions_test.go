@@ -19,6 +19,7 @@ func beichenActionsTestRouter(server *Server, actor uuid.UUID) *gin.Engine {
 	router := gin.New()
 	router.Use(func(c *gin.Context) { c.Set(identityKey, controlplane.Identity{UserID: actor, Role: "teacher"}) })
 	router.POST("/providers/:provider_id/enable-batch", server.enableBeichenModelsBatch)
+	router.POST("/providers/:provider_id/probes", server.requestBeichenProbes)
 	router.PATCH("/providers/:provider_id/price", server.setBeichenModelPrice)
 	return router
 }
@@ -36,6 +37,7 @@ func TestBeichenActionsRejectInvalidBodies(t *testing.T) {
 		{"缺失批次", "POST", "enable-batch", `{}`},
 		{"过大批次", "POST", "enable-batch", string(tooMany)},
 		{"未知批次字段", "POST", "enable-batch", `{"models":["model"],"unexpected":true}`},
+		{"未知探活字段", "POST", "probes", `{"credential":"unexpected"}`},
 		{"无效模型名", "POST", "enable-batch", `{"models":[" model"]}`},
 		{"未知定价字段", "PATCH", "price", `{"model":"model","mode":"follow","unexpected":true}`},
 		{"未知费率字段", "PATCH", "price", `{"model":"model","mode":"manual","rates":{"input":"1","output":"1","unexpected":"1"}}`},

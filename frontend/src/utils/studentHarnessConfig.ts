@@ -1,4 +1,4 @@
-import type { BindingAdapter, Model } from '../api/types'
+import type { ApiKey, ApiKeyStatus, BindingAdapter, Model, RequestedModel } from '../api/types'
 import { bindingAdapterMeta } from './bindingAdapters'
 import {
   codexReasoningLevelsForModel,
@@ -11,6 +11,29 @@ export type HarnessTool = 'codex' | 'claude' | 'cc-switch'
 
 export const CODEX_MODEL_CATALOG_FILENAME = 'nebula-model-catalog.json'
 export const CODEX_MODEL_CATALOG_TOML_PATH = `~/.codex/${CODEX_MODEL_CATALOG_FILENAME}`
+
+export const STUDENT_GATEWAY_ERROR_GUIDANCE = [
+  {
+    key: '401',
+    title: '401 · Key 无效或已停用',
+    action: '打开「申请密钥」页确认 Key 状态，重新领取或重新生成 Key，再更新客户端配置。',
+  },
+  {
+    key: '403',
+    title: '403 · Key 无权调用',
+    action: '确认使用的是本人 active Key；模型不在 Key 白名单时，到模型广场点「需重新申领 Key」。',
+  },
+  {
+    key: '404',
+    title: '404 · 接口或模型不存在',
+    action: '检查客户端的 Base URL 不要重复带 /v1，并确认该模型仍在模型广场中。',
+  },
+  {
+    key: 'model_not_allowed',
+    title: 'model_not_allowed · 当前 Key 未包含该模型',
+    action: '在模型广场该模型卡片点「需重新申领 Key」，撤回后按原审批额度重新申请。',
+  },
+] as const
 
 /** Required by Codex catalog loader — without this, model metadata (incl. reasoning picker) fails to load. */
 export const CODEX_DEFAULT_BASE_INSTRUCTIONS =
@@ -55,11 +78,27 @@ export function buildCCSwitchProviderName(keyName?: string | null) {
   return `Nebula-${trimmed}`
 }
 
+/** Claude needs the origin only; Codex appends /v1 to this value. */
+export function normalizeGatewayOrigin(value: string) {
+  return value.trim().replace(/\/+$/, '').replace(/(?:\/v1)+$/i, '')
+}
+
 export function gatewayOrigin(explicit?: string) {
   const trimmed = explicit?.trim()
-  if (trimmed) return trimmed.replace(/\/$/, '')
-  if (typeof window !== 'undefined' && window.location?.origin) return window.location.origin
+  if (trimmed) return normalizeGatewayOrigin(trimmed)
+  if (typeof window !== 'undefined' && window.location?.origin) return normalizeGatewayOrigin(window.location.origin)
   return 'http://localhost:5173'
+}
+
+/** Empty string means the origin is usable. */
+export function gatewayOriginIssue(value?: string | null) {
+  const raw = value?.trim()
+  if (!raw) return ''
+  if (!/^https?:\/\//i.test(raw)) return '网关地址必须以 http:// 或 https:// 开头。'
+  if (/\/v1(?:\/|$)/i.test(raw)) {
+    return '网关地址不要包含 /v1：Claude 只写到域名，Codex 会自动带 /v1，请删除多余的 /v1 后再保存。'
+  }
+  return ''
 }
 
 export function pickCodexModel(models: Pick<Model, 'model_id'>[]) {
@@ -72,29 +111,72 @@ export function pickClaudeModel(models: Pick<Model, 'model_id'>[]) {
 
 
 export function claudeHarnessReady(
-  model: Pick<Model, 'model_id' | 'route_ready' | 'anthropic_ready'>,
+  model: Pick<Model, 'anthropic_ready'>,
 ) {
   return model.anthropic_ready === true
-    || (isClaudeModelId(model.model_id) && model.route_ready === true)
 }
 
 export function codexHarnessModels(models: Pick<Model, 'model_id' | 'display_name' | 'provider_name' | 'primary_adapter' | 'route_ready' | 'responses_ready'>[]) {
   return models.filter(model => {
     if (isClaudeModelId(model.model_id)) return false
-    if (isCodexModelId(model.model_id)) return true
-    // DeepSeek and other non-GPT chat models still use the Codex Responses harness.
-    return model.responses_ready === true
+    return codexHarnessReady(model)
   })
 }
 
 export function codexHarnessReady(
-  model: Pick<Model, 'model_id' | 'route_ready' | 'responses_ready'>,
+  model: Pick<Model, 'responses_ready'>,
 ) {
-  return model.responses_ready === true || model.route_ready === true
+  return model.responses_ready === true
 }
 
 export function claudeHarnessModels(models: Pick<Model, 'model_id' | 'display_name' | 'provider_name' | 'primary_adapter' | 'route_ready' | 'anthropic_ready'>[]) {
   return models.filter(model => claudeHarnessReady(model))
+}
+
+const KEY_STATUS_PRIORITY: Record<ApiKeyStatus, number> = {
+  active: 0,
+  approved: 1,
+  pending_teacher: 2,
+  pending_mentor: 3,
+  inactive: 4,
+  rejected: 5,
+}
+
+export function selectCurrentStudentKey<T extends Pick<ApiKey, 'id' | 'status' | 'updated_at'>>(keys: T[]): T | null {
+  const candidates = keys.filter(key => key.status !== 'rejected')
+  if (!candidates.length) return null
+  return [...candidates].sort((left, right) =>
+    KEY_STATUS_PRIORITY[left.status] - KEY_STATUS_PRIORITY[right.status]
+    || Date.parse(right.updated_at) - Date.parse(left.updated_at),
+  )[0]
+}
+
+export function keyIncludesModel(key: Pick<ApiKey, 'models'>, modelID: string) {
+  const target = modelID.trim().toLowerCase()
+  return key.models.some(model => model.model_id.trim().toLowerCase() === target)
+}
+
+export function keyCanWithdraw(key: Pick<ApiKey, 'status'>) {
+  return key.status === 'pending_mentor' || key.status === 'pending_teacher'
+}
+
+export function keyReapplyQuota(
+  key: Pick<ApiKey, 'monthly_credits' | 'mentor_monthly_credits' | 'requested_monthly_credits'>,
+) {
+  return (key.monthly_credits || key.mentor_monthly_credits || key.requested_monthly_credits || '0.000').trim()
+}
+
+export function buildKeyReapplyModels(key: Pick<ApiKey, 'models'>, addModelID: string): RequestedModel[] {
+  const seen = new Set<string>()
+  const result: RequestedModel[] = []
+  for (const model of [...key.models, { model_id: addModelID, display_name: '' }]) {
+    const modelID = model.model_id.trim()
+    const normalized = modelID.toLowerCase()
+    if (!modelID || seen.has(normalized)) continue
+    seen.add(normalized)
+    result.push({ model_id: modelID, ...(model.display_name && model.display_name !== modelID ? { display_name: model.display_name } : {}) })
+  }
+  return result
 }
 
 export type KeyHarnessSupport = {
@@ -135,12 +217,14 @@ export function harnessModelSummary(
       ? (model.anthropic_ready ? 'anthropic' : model.primary_adapter)
       : model.primary_adapter
   if (adapter) parts.push(bindingAdapterMeta(adapter as BindingAdapter).label)
-  if (!model.route_ready) parts.push('路由未就绪')
+  if (kind === 'codex' && model.responses_ready !== true) parts.push('Responses 未就绪')
+  else if (kind === 'claude' && model.anthropic_ready !== true) parts.push('Anthropic 未就绪')
+  else if (!model.route_ready) parts.push('路由未就绪')
   return parts.join(' · ')
 }
 
 export function defaultHarnessModel(
-  models: Pick<Model, 'model_id' | 'display_name' | 'provider_name' | 'primary_adapter' | 'route_ready'>[],
+  models: Pick<Model, 'model_id' | 'display_name' | 'provider_name' | 'primary_adapter' | 'route_ready' | 'anthropic_ready' | 'responses_ready'>[],
   kind: 'codex' | 'claude',
 ) {
   const options = kind === 'codex' ? codexHarnessModels(models) : claudeHarnessModels(models)
@@ -169,7 +253,7 @@ export function buildStudentHarnessConfig(
     codexReasoningEffort?: CodexReasoningEffort | null
   },
 ): StudentHarnessConfig {
-  const gateway_origin = origin.replace(/\/$/, '')
+  const gateway_origin = normalizeGatewayOrigin(origin)
   const gateway_api_base = `${gateway_origin}/v1`
   const anthropic_base_url = gateway_origin
   const codex_model = options?.codexModel?.trim() || null

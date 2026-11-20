@@ -158,6 +158,8 @@ func (s *Server) registerControlPlane() {
 	teacher.GET("/providers/:provider_id/beichen/reconciliation", s.beichenReconciliation)
 	teacher.GET("/providers/:provider_id/beichen/receipts", s.beichenArchivedReceipts)
 	teacher.POST("/providers/:provider_id/beichen/sync", s.syncBeichen)
+	teacher.POST("/providers/:provider_id/beichen/probes", s.requestBeichenProbes)
+	teacher.GET("/providers/:provider_id/beichen/probes", s.latestBeichenProbes)
 	teacher.POST("/providers/:provider_id/beichen/models/enable", s.enableBeichenModel)
 	teacher.POST("/providers/:provider_id/beichen/models/enable-batch", s.enableBeichenModelsBatch)
 	teacher.PATCH("/providers/:provider_id/beichen/models/price", s.setBeichenModelPrice)

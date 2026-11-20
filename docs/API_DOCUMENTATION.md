@@ -381,6 +381,8 @@ data: {"revision":"01K2..."}
 | 北辰区间对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/reconciliation?range=day\|month\|all` | 按模型和供应商渠道比较本地扣分、Token 与北辰日账 |
 | 北辰逐笔对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/receipts?day=YYYY-MM-DD&cursor=…` | 教师按北京时间分页查看学校已归档的北辰流水及关联的校内扣分 |
 | 北辰手动同步 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/sync` | 执行一次有时限的同步，页面按数据类别显示各自结果 |
+| 北辰手动探活 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/probes` | 接受空请求体或 `{}`，排队后返回 202 |
+| 北辰最近探活 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/probes` | 查询任务进度和最多 100 个最近的 Key、模型、协议结果 |
 | 启用北辰已发现模型 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/models/enable` | 教师提交 `model`，如已有校内别名可另传 `school_model`。学校复核当前目录和路由后，使模型可供学生申请或调用。 |
 | 批量启用北辰模型 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/models/enable-batch` | 教师提交当前筛选出的 1 至 200 个模型，分别返回启用或跳过结果 |
 | 按模型统一定价 | PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/models/price` | 为同一模型的全部目录渠道设置教师价或恢复官网价 |
@@ -429,6 +431,16 @@ data: {"revision":"01K2..."}
 `credential` 只作为写入字段；服务端加密后保存，所有读取响应只返回 `credential_configured: true/false`。
 
 北辰接口限老师访问，凭据必须属于指定的北辰供应商。更换北辰 Key 时新增一条凭据并重新绑定，以保留原 Key 的账单归属。手动同步接受空请求体或 `{}`。概览中的 `datasets`、`models`、`comparison` 分别提供同步状态、报价和当日对账。成本的 `_micros` 字段以百万分之一北辰余额单位表示。`trial_credits` 和 `charged_credits` 用十进制字符串分别返回试算与实际结算积分，`pending_review_calls` 给出待核账笔数。未知值为 `null`，可确认的零单独返回。原有 `trial_credit_milli` 保留千分之一积分精度。
+
+`credentials[].health` 包含 `credential`、`catalog`、`pricing`、`probe` 四个维度，各返回 `state`（`available`、`unavailable` 或 `pending`）和说明 `message`。`available_dimensions` 统计可用项。报价维度按当前可计算报价数判断。探活维度按有至少一种协议通过的模型占可探活模型的比例判断。
+
+`model_catalog[].protocols` 使用网关绑定的协议枚举。`probe_state` 为 `unprobed`、`passed` 或 `failed`。同一模型任一当前 Key 和协议的最近结果通过即为 `passed`。`last_probe_at` 是所有有效最近结果里的最新时间。发布可达线路数仍由 `ready_count` 表示。学校已启用但 `ready_count=0` 时返回 `binding_issue`，整个模型从当前目录消失时仍保留这个异常条目。`price_covered` 表示至少一条启用 Key 有可计算报价，发布时仍逐条检查实际会使用的线路。
+
+`catalog_differences` 按启用 Key 返回分组、核对时间、`website_only` 和 `key_only`。完整网页目录与 Key 目录都已核实才标为 `compared`，其余标为 `unverified`。模型匹配忽略大小写，列表保留各自来源的原始拼写。
+
+探活 POST 返回任务对象，GET 返回 `{run, results}`。概览中的 `probe_run` 使用相同任务对象。任务对象含 `state`（`idle`、`queued`、`running`、`completed` 或 `failed`）、`started_at`、`finished_at` 和 `error_code`。同一供应商在排队或执行时收到重复 POST 会合并。没有启用且已同步目录的 Key 时 POST 返回 400，供应商不存在或并非北辰时返回 404。未登录返回 401，角色不符返回 403。两个接口均返回 `Cache-Control: private, no-store`。
+
+`results` 按 `checked_at` 倒序，每个当前组合只保留最新结果。每项包括 `provider_id`、`credential_id`、`model`、`protocol`、`status_code`、`error_code`、`duration_ms`、`checked_at` 和 `detail`。尚未收到 HTTP 状态时 `status_code=0`，通过时 `error_code=null`。`detail` 只记录输出限制 `max_output_tokens: 1`。
 
 维护用的 `beichen/access/{credential_id}` 可读该凭据的同步状态、分组与北辰 Key 数字 ID。学校自动部署通过官网普通账号建立这些关联。旧版专用读取凭据的接口保留兼容。
 

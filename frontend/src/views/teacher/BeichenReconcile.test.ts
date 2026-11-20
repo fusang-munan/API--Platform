@@ -29,52 +29,77 @@ vi.mock('echarts/renderers', () => ({ SVGRenderer: {} }))
 
 const wrappers: VueWrapper[] = []
 let observers: Array<{ observe: ReturnType<typeof vi.fn>; disconnect: ReturnType<typeof vi.fn> }>
-type ReconcileFixture = ReconcileData & { coverage: ReconcileData['coverage'] & { credentials: Array<{ expected_days: number }> } }
+type FixtureSide = BeichenReconcileSide & {
+  requests: number
+  completeness: 'complete' | 'partial' | 'missing'
+  tokens_missing: number
+  charged_tokens_missing_calls: number
+}
+type FixtureLine = { local: FixtureSide; upstream: FixtureSide; margin_available: boolean }
+type ReconcileFixture = Omit<ReconcileData, 'totals' | 'models' | 'keys'> & {
+  coverage: ReconcileData['coverage'] & { comparable_days: number; verified_matched_complete_token_calls: number }
+  totals: Pick<FixtureLine, 'local' | 'upstream'> & { money: ReconcileData['totals']['money'] & { margin_available: boolean } }
+  models: (ReconcileData['models'][number] & FixtureLine & { credential_id: string; label: string | null })[]
+  keys: (ReconcileData['keys'][number] & FixtureLine)[]
+}
 
-function side(tokens = 0, credits = '0'): BeichenReconcileSide {
-  return { tokens, credits, input_tokens: tokens, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, calls: 1 }
+function side(tokens = 0, credits = '0', overrides: Partial<FixtureSide> = {}): FixtureSide {
+  return {
+    tokens, credits, input_tokens: tokens, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
+    requests: 1, completeness: 'complete', tokens_missing: 0, charged_tokens_missing_calls: 0, ...overrides,
+  }
+}
+
+function absentSide() {
+  return side(0, '0', { requests: 0, completeness: 'missing', source: null })
 }
 
 function response(range: BeichenUsageRange = 'all'): ReconcileFixture {
   return {
     range, start: range === 'all' ? null : '2026-11-19T16:00:00Z', end: '2026-11-20T10:00:00Z', timezone: 'Asia/Shanghai',
     coverage: {
-      days_expected: 12, days_present: 2, credentials: [{ expected_days: 11 }, { expected_days: 1 }],
-      missing_days: Array.from({ length: 10 }, (_, index) => `2026-11-${index + 10}`),
-      pending_calls: 3, unpriced_calls: 2, multiplier_mixed: true, coverage_kind: 'partial', verified_matched_calls: 0,
+      days_expected: 2, days_present: 2, comparable_days: 1, missing_days: [],
+      pending_calls: 3, unpriced_calls: 2, multiplier_mixed: true, coverage_kind: 'full',
+      verified_matched_calls: 0, verified_matched_complete_token_calls: 0,
     },
     totals: {
-      local: side(3000, '165'), upstream: side(2000),
-      money: { student_yuan: '1.65', base_yuan: '1.5', actual_yuan: '1.25', margin_yuan: '0.4', margin_rate: '0.242424' },
+      local: side(3000, '165'), upstream: side(2000, '0', { requests: 4 }),
+      money: { student_yuan: '1.65', base_yuan: '1.5', actual_yuan: '1.25', margin_yuan: '0.4', margin_rate: '0.242424', margin_available: true },
     },
     models: [
       {
-        model: '双方有记录的模型', match_status: 'matched', completeness: 'complete', local: side(2000, '110'), upstream: side(1800),
-        student_yuan: '1.1', base_yuan: '1', actual_yuan: '1', margin_yuan: '0.1', local_share: '0.666667', upstream_share: '0.9', school_absorbed_credits: '2.5',
+        model: '同名模型', credential_id: 'channel-1', label: '测试渠道', match_status: 'matched', completeness: 'complete', local: side(2000, '110'), upstream: side(1800),
+        student_yuan: '1.1', base_yuan: '1', actual_yuan: '1', margin_yuan: '0.1', margin_available: true,
+        local_share: '0.666667', upstream_share: '0.9', school_absorbed_credits: '2.5',
       },
       {
-        model: '本地独有模型', match_status: 'local_only', completeness: 'partial', local: side(1000, '55'), upstream: side(),
-        student_yuan: '0.55', base_yuan: '0.5', actual_yuan: null, margin_yuan: null, local_share: '0.333333', upstream_share: '0', school_absorbed_credits: '0.000000000001',
+        model: '同名模型', credential_id: 'channel-2', label: '备用渠道', match_status: 'local_only', completeness: 'partial', local: side(1000, '55'), upstream: absentSide(),
+        student_yuan: '0.55', base_yuan: '0.5', actual_yuan: null, margin_yuan: null, margin_available: false,
+        local_share: '0.333333', upstream_share: '0', school_absorbed_credits: '0',
       },
       {
-        model: '北辰独有模型', match_status: 'upstream_only', completeness: 'partial', local: side(), upstream: side(200),
-        student_yuan: '0', base_yuan: '0', actual_yuan: '0.25', margin_yuan: '-0.25', local_share: '0', upstream_share: '0.1', school_absorbed_credits: '0',
+        model: '北辰独有模型', credential_id: 'channel-1', label: '测试渠道', match_status: 'upstream_only', completeness: 'partial', local: absentSide(), upstream: side(200),
+        student_yuan: '0', base_yuan: '0', actual_yuan: '0.25', margin_yuan: '-0.25', margin_available: true,
+        local_share: '0', upstream_share: '0.1', school_absorbed_credits: null,
       },
     ],
     keys: [{
       credential_id: 'channel-1', label: '测试渠道', completeness: 'complete', local: side(3000, '165'), upstream: side(2000),
-      student_yuan: '1.65', base_yuan: '1.5', actual_yuan: '1.25', margin_yuan: '0.4', school_absorbed_credits: '2.500000000001',
+      student_yuan: '1.65', base_yuan: '1.5', actual_yuan: '1.25', margin_yuan: '0.4', margin_available: true, school_absorbed_credits: '2.5',
     }],
   }
 }
 
-function emptyResponse(): ReconcileData {
+function emptyResponse(): ReconcileFixture {
   return {
     ...response(), models: [], keys: [],
-    totals: { local: side(), upstream: side(), money: { student_yuan: '0', base_yuan: '0', actual_yuan: null, margin_yuan: null, margin_rate: null } },
+    totals: {
+      local: absentSide(), upstream: absentSide(),
+      money: { student_yuan: '0', base_yuan: '0', actual_yuan: null, margin_yuan: null, margin_rate: null, margin_available: false },
+    },
     coverage: {
       days_expected: 0, days_present: 0, missing_days: [], pending_calls: 0, unpriced_calls: 0, multiplier_mixed: false,
-      coverage_kind: 'none', verified_matched_calls: 0,
+      coverage_kind: 'none', comparable_days: 0, verified_matched_calls: 0, verified_matched_complete_token_calls: 0,
     },
   }
 }
@@ -125,7 +150,10 @@ describe('北辰区间对账', () => {
     expect(mocks.reconciliation).toHaveBeenCalledWith('beichen', 'all')
     expect(button(view, '总计').attributes('aria-pressed')).toBe('true')
     expect(view.get('[data-kpi="local-tokens"] strong').text()).toBe('3,000')
-    expect(view.get('[data-kpi="upstream-tokens"] strong').text()).toBe('2,000')
+    const upstream = view.get('[data-kpi="upstream-tokens"]')
+    expect(upstream.get('span').text()).toBe('北辰 Token 总量')
+    expect(upstream.get('strong').text()).toBe('2,000')
+    expect(upstream.get('small').text()).toBe('北辰回报 4 笔调用')
     expect(view.get('[data-kpi="student-yuan"] strong').text()).toBe('1.65')
     expect(view.get('[data-kpi="student-yuan"] small').text()).toContain('165 积分 ÷ 100 = 1.65 元')
     expect(view.get('[data-kpi="actual-yuan"] strong').text()).toBe('1.25')
@@ -133,7 +161,8 @@ describe('北辰区间对账', () => {
     expect(view.get('[data-kpi="margin-yuan"] strong').classes()).toContain('positive')
     expect(view.get('.key-details tbody').text()).toContain('测试渠道')
     expect(view.text()).toContain('全部已记录数据')
-    expect(view.text()).toContain('基础成本 1.5 元')
+    expect(view.text()).toContain('基础成本 1.5 元（北辰余额单位）')
+    expect(view.get('[aria-label="日账覆盖"]').text()).toContain('差额率 24.2%')
   })
 
   it('切换当天和本月时重新请求并显示北京时间区间', async () => {
@@ -183,11 +212,14 @@ describe('北辰区间对账', () => {
     expect(view.find('[data-kpi="local-tokens"]').exists()).toBe(true)
   })
 
-  it('区分双方和单边记录，逐笔关联数独立展示', async () => {
+  it('同名模型按渠道分行，区分双方和单边记录', async () => {
     const view = mountView()
     await flushPromises()
     const rows = view.findAll('.model-details tbody tr')
     expect(rows.map(row => row.get('.status-pill').text())).toEqual(['两边均有记录', '仅本地有记录', '仅北辰有记录'])
+    expect(rows[0].get('th').text()).toBe('同名模型测试渠道')
+    expect(rows[1].get('th').text()).toBe('同名模型备用渠道')
+    expect(view.getComponent(CompareBars).props('categories').slice(0, 2)).toEqual(['同名模型 · 测试渠道', '同名模型 · 备用渠道'])
     expect(view.text()).not.toContain('已匹配')
     expect(view.text()).toContain('可逐笔关联 0 笔')
     expect(rows[0].classes()).not.toContain('unmatched-row')
@@ -200,14 +232,21 @@ describe('北辰区间对账', () => {
     expect(rows[2].get('.negative').text()).toBe('-0.25')
   })
 
-  it('分别显示完整账日与渠道账日，列出最多八个待同步日期', async () => {
+  it('列出全部缺失日期，区间差额不可比，逐笔关联单列', async () => {
     const result = response()
-    result.coverage.verified_matched_calls = 7
+    Object.assign(result.coverage, {
+      days_expected: 12, days_present: 2, coverage_kind: 'partial',
+      missing_days: Array.from({ length: 10 }, (_, index) => `2026-11-${index + 10}`),
+      verified_matched_calls: 7, verified_matched_complete_token_calls: 5,
+    })
     result.totals.local.requests = 8
+    result.totals.money.margin_available = false
+    result.models.forEach(row => { row.margin_available = false })
+    result.keys[0].margin_available = false
     mocks.reconciliation.mockResolvedValueOnce(result)
     const view = mountView()
     await flushPromises()
-    const card = view.get('[aria-label="数据完整性"]')
+    const card = view.get('[aria-label="日账覆盖"]')
     const [completeDays, channelDays] = card.findAll('dl > div')
     expect(completeDays.get('dt').text()).toBe('完整账日')
     expect(completeDays.get('dd').text()).toContain('1 天')
@@ -215,16 +254,19 @@ describe('北辰区间对账', () => {
     expect(channelDays.get('dd').text()).toContain('2 / 12')
     const coverage = card.text()
     expect(coverage).toContain('部分同步')
-    expect(coverage).toContain('可逐笔关联 7 笔')
-    expect(coverage).not.toContain('账单覆盖')
     expect(coverage).toContain('2026-11-10')
-    expect(coverage).toContain('2026-11-17')
-    expect(coverage).not.toContain('2026-11-18')
-    expect(coverage).toContain('等 10 天')
-    expect(coverage).toContain('待核账 3 笔')
-    expect(coverage).toContain('无报价调用 2 笔')
+    expect(coverage).toContain('2026-11-19')
+    expect(coverage).not.toContain('可逐笔关联')
+    expect(coverage).toContain('当前区间差额不可比')
+    expect(coverage).not.toContain('%')
+    expect(coverage).not.toContain('差额率')
     expect(coverage).toContain('不能统一按 1.10 倍推算差额')
-    expect(coverage).toContain('差额仅供参考')
+    const calls = view.get('[aria-label="调用核对"]').text()
+    expect(calls).toContain('可逐笔关联 7 笔，其中本地 Token 完整 5 笔')
+    expect(calls).toContain('待核账 3 笔')
+    expect(calls).toContain('无报价调用 2 笔')
+    expect(view.get('[data-kpi="margin-yuan"] strong').text()).toBe('不可比')
+    expect(view.findAll('[data-label="差额"]').map(cell => cell.text())).toEqual(Array(4).fill('不可比'))
   })
 
   it('在柱状图下方按模型显示两侧的 Token 百分比和差额', async () => {
@@ -242,19 +284,24 @@ describe('北辰区间对账', () => {
     const [first, , third] = view.findAll('.model-details tbody tr')
     expect(first.get('[data-label="本地占比"].numeric-cell').text()).toBe('66.7%')
     expect(first.get('[data-label="北辰占比"].numeric-cell').text()).toBe('90%')
-    expect(third.get('[data-label="本地占比"].numeric-cell').text()).toBe('0%')
+    expect(third.get('[data-label="本地占比"].numeric-cell').text()).toBe('—')
     expect(third.get('[data-label="北辰占比"].numeric-cell').text()).toBe('10%')
-    expect(first.get('[data-label="差额（元）"].numeric-cell').text()).toBe('+0.1')
+    expect(first.get('[data-label="差额"].numeric-cell').text()).toBe('+0.1')
   })
 
-  it('模型与渠道分列学校承担，保留换算后的微小金额和零值', async () => {
+  it('学校承担区分超限金额、未触顶和历史未统计', async () => {
+    const result = response()
+    result.models[0].school_absorbed_credits = '0.000000000001'
+    result.keys[0].school_absorbed_credits = result.models[0].school_absorbed_credits
+    result.models[2] = { ...result.models[2], match_status: 'matched', local: side(200, '25') }
+    mocks.reconciliation.mockResolvedValueOnce(result)
     const view = mountView()
     await flushPromises()
-    expect(view.get('.model-details thead').text()).toContain('学校承担（元）')
-    expect(view.get('.key-details thead').text()).toContain('学校承担（元）')
-    expect(view.findAll('.model-details [data-label="学校承担（元）"].numeric-cell').map(cell => cell.text())).toEqual(['0.025', '0.00000000000001', '0'])
-    expect(view.get('.key-details [data-label="学校承担（元）"].numeric-cell').text()).toBe('0.02500000000001')
-    expect(view.text()).toContain('学校承担的金额不从学生额度扣除')
+    expect(view.get('.model-details thead').text()).toContain('学校承担')
+    expect(view.get('.key-details thead').text()).toContain('学校承担')
+    expect(view.findAll('.model-details [data-label="学校承担"].numeric-cell').map(cell => cell.text())).toEqual(['0.00000000000001', '未触顶', '未统计'])
+    expect(view.get('.key-details [data-label="学校承担"].numeric-cell').text()).toBe('0.00000000000001')
+    expect(view.text()).toContain('学校承担只统计超过学生额度上限的部分')
   })
 
   it('金额切换使用元，不重复将后端金额除以一百', async () => {
@@ -264,7 +311,7 @@ describe('北辰区间对账', () => {
     expect(view.getComponent(CompareBars).props('right')).toEqual([1800, null, 200])
     await button(view, '金额对比').trigger('click')
     const bars = view.getComponent(CompareBars)
-    expect(bars.props('unit')).toBe('元')
+    expect(bars.props('unit')).toBe('元（北辰余额单位）')
     expect(bars.props('left')).toEqual([1.1, 0.55, 0])
     expect(bars.props('right')).toEqual([1, null, 0.25])
     expect(view.get('table.bars-data caption').text()).toContain('学生已扣与北辰实扣')
@@ -274,26 +321,30 @@ describe('北辰区间对账', () => {
     expect(mocks.reconciliation).toHaveBeenCalledTimes(1)
   })
 
-  it('两边均有记录时区分真实零 Token 和回报缺失', async () => {
+  it('两边均有记录时仍区分真实零 Token 和已扣款但缺项', async () => {
     const result = response()
     result.models[0].local = side()
     result.models[0].upstream = side()
-    result.models[1] = { ...result.models[0], model: '用量待核模型', completeness: 'missing' }
+    const incomplete = side(0, '55', { completeness: 'missing', charged_tokens_missing_calls: 1, tokens_missing: 37 })
+    result.models[1] = { ...result.models[1], match_status: 'matched', local: incomplete, upstream: side(100) }
+    result.totals.local = { ...incomplete, requests: 2, completeness: 'partial' }
     mocks.reconciliation.mockResolvedValueOnce(result)
     const view = mountView()
     await flushPromises()
     expect(view.getComponent(CompareBars).props('left')).toEqual([0, null, null])
-    expect(view.getComponent(CompareBars).props('right')).toEqual([0, null, 200])
+    expect(view.getComponent(CompareBars).props('right')).toEqual([0, 100, 200])
     const [reported, missing] = view.findAll('.model-details tbody tr')
     expect(reported.get('[data-label="本地 Token"]').text()).toBe('0')
     expect(missing.get('[data-label="本地 Token"]').text()).toBe('—')
-    expect(missing.get('[data-label="记录情况"]').text()).toContain('Token 待核')
+    expect(missing.get('[data-label="记录情况"]').text()).toContain('已扣款但 Token 不完整 1 笔')
+    expect(view.get('[data-kpi="local-tokens"] strong').text()).toBe('—')
+    expect(view.get('[aria-label="调用核对"]').text()).toContain('另有约 37 Token 待核')
   })
 
   it('小于一积分的扣费正确换算为元，负差额使用红色', async () => {
     const result = response()
     result.totals.local.credits = '0.5'
-    result.totals.money = { student_yuan: '0.005', base_yuan: '0.004545', actual_yuan: '0.006', margin_yuan: '-0.001', margin_rate: '-0.2' }
+    result.totals.money = { student_yuan: '0.005', base_yuan: '0.004545', actual_yuan: '0.006', margin_yuan: '-0.001', margin_rate: '-0.2', margin_available: true }
     mocks.reconciliation.mockResolvedValueOnce(result)
     const view = mountView()
     await flushPromises()
@@ -323,7 +374,7 @@ describe('北辰区间对账', () => {
     expect(view.text()).toContain('当前范围暂无对账记录')
     expect(view.get('[role="status"]').text()).toContain('先到「查看模型」同步北辰数据，完成后返回并点击「刷新对账」')
     expect(view.get('[data-kpi="local-tokens"] strong').text()).toBe('0')
-    expect(view.get('[data-kpi="margin-yuan"] strong').text()).toBe('—')
+    expect(view.get('[data-kpi="margin-yuan"] strong').text()).toBe('不可比')
     expect(view.text()).toContain('暂无已同步账日')
     expect(mocks.charts).toHaveLength(0)
   })

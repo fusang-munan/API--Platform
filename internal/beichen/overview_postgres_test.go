@@ -254,9 +254,9 @@ VALUES(gen_random_uuid(),$1,$2,'Mixed',now(),now(),now(),now()),
  (gen_random_uuid(),$1,$3,'unpriced',now(),now(),now(),now()),
  (gen_random_uuid(),$1,$4,'offline',now(),now(),now(),now())`, provider, first, second, disabled)
 	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", disabled)
-	exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,actor_id)
-VALUES($1,'Mixed','upstream','effective','billing',0,2000000,NULL),
- ($1,'manual','school','manual','teacher',1000000,1000000,$2)`, first, actor)
+	exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,cache_read_rate,cache_write_rate,actor_id)
+VALUES($1,'Mixed','upstream','effective','billing',0,2000000,0,0,NULL),
+ ($1,'manual','school','manual','teacher',1000000,1000000,0,0,$2)`, first, actor)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, beijing)
 	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success,last_error,failure_count,next_attempt)
 VALUES($1,'catalog',$3,NULL,0,'-infinity'),

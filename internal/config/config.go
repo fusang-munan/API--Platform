@@ -30,21 +30,21 @@ type Config struct {
 	BootstrapTeacherPassword string
 	BootstrapTestAccounts    []BootstrapAccount
 
-	SMTPMode                             string
-	ExposeVerificationCodeInResponse     bool
-	SMTPHost                             string
-	SMTPPort        int
-	SMTPUser        string
-	SMTPPass        string
-	SMTPFrom        string
-	SMTPFromName    string
-	SMTPTLSMode     string
-	SMTPTimeout     time.Duration
-	VerificationTTL time.Duration
-	SendCooldown    time.Duration
-	MaxAttempts     int
-	Lockout         time.Duration
-	InvitationTTL   time.Duration
+	SMTPMode                         string
+	ExposeVerificationCodeInResponse bool
+	SMTPHost                         string
+	SMTPPort                         int
+	SMTPUser                         string
+	SMTPPass                         string
+	SMTPFrom                         string
+	SMTPFromName                     string
+	SMTPTLSMode                      string
+	SMTPTimeout                      time.Duration
+	VerificationTTL                  time.Duration
+	SendCooldown                     time.Duration
+	MaxAttempts                      int
+	Lockout                          time.Duration
+	InvitationTTL                    time.Duration
 
 	SSEStreamMaxLength int64
 	SSEHeartbeat       time.Duration
@@ -53,6 +53,7 @@ type Config struct {
 	UpstreamResponseHeaderTimeout time.Duration
 	GatewayMaxRequestBytes        int64
 	GatewayResourceRouteTTL       time.Duration
+	BeichenProbesEnabled          bool
 }
 
 type BootstrapAccount struct {
@@ -219,6 +220,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.GatewayResourceRouteTTL, err = durationFromInt("GATEWAY_RESOURCE_ROUTE_TTL_HOURS", 24, time.Hour); err != nil {
+		return Config{}, err
+	}
+	if cfg.BeichenProbesEnabled, err = boolValue("BEICHEN_PROBES_ENABLED", true); err != nil {
 		return Config{}, err
 	}
 

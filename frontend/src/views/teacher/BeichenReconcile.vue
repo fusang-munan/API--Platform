@@ -2,14 +2,31 @@
 import { computed, onBeforeUnmount, ref, shallowRef, useId, watch } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
-import type { BeichenReconcile as ReconcileData, BeichenReconcileModel, BeichenUsageRange } from '../../api/types'
+import type { BeichenReconcile, BeichenReconcileKey, BeichenReconcileModel, BeichenReconcileSide, BeichenUsageRange } from '../../api/types'
 import CompareBars from '../../components/CompareBars.vue'
 import CreditDonut from '../../components/CreditDonut.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
 import { creditsToYuan, formatCredits, formatPercent, formatTokens, formatYuan, shiftDecimal } from '../../utils/credits'
 
+type TokenCompleteness = 'complete' | 'partial' | 'missing'
+type TokenSide = BeichenReconcileSide & { requests: number; completeness: TokenCompleteness }
+type LocalUsage = TokenSide & { tokens_missing: number; charged_tokens_missing_calls: number }
+type Margin = { margin_available: boolean; margin_yuan: string | null }
+type ReconcileLine = Margin & { local: LocalUsage; upstream: TokenSide }
+type Channel = { credential_id: string; label: string | null }
+type ReconcileModel = BeichenReconcileModel & ReconcileLine & Channel
+type ReconcileKey = Omit<BeichenReconcileKey, 'label'> & ReconcileLine & Channel
+type ReconcileCoverage = BeichenReconcile['coverage'] & { comparable_days: number; verified_matched_complete_token_calls: number }
+type ReconcileData = Omit<BeichenReconcile, 'models' | 'keys'> & {
+  coverage: ReconcileCoverage
+  totals: { local: LocalUsage; upstream: TokenSide; money: BeichenReconcile['totals']['money'] & Margin }
+  models: ReconcileModel[]
+  keys: ReconcileKey[]
+}
+
 const props = defineProps<{ providerId: string }>()
 const titleId = useId()
+const moneyUnit = '元（北辰余额单位）'
 const range = ref<BeichenUsageRange>('all')
 const ranges: Array<{ value: BeichenUsageRange; label: string }> = [
   { value: 'day', label: '当天' }, { value: 'month', label: '本月' }, { value: 'all', label: '总计' },
@@ -20,22 +37,12 @@ const loading = ref(true)
 const error = ref('')
 const models = computed(() => data.value?.models ?? [])
 const keys = computed(() => data.value?.keys ?? [])
-const missingDays = computed(() => data.value?.coverage.missing_days ?? [])
-type ReconcileCoverage = ReconcileData['coverage'] & { credentials?: Array<{ expected_days: number }> }
-const completeDays = computed(() => {
-  const coverage: ReconcileCoverage | undefined = data.value?.coverage
-  if (!coverage || coverage.days_present === 0) return 0
-  if (!coverage.credentials?.length) return null
-  // 渠道的应同步区间共用截止日。最早开始的渠道覆盖全部应同步日期，再减去任一渠道缺失的日期。
-  const expectedDates = coverage.credentials.reduce((days, channel) => Math.max(days, channel.expected_days), 0)
-  return expectedDates - missingDays.value.length
-})
 const empty = computed(() => !models.value.length && !keys.value.length)
 const palette = ['#0071e3', '#168473', '#b77916', '#b44d76', '#7657b7', '#427886', '#646f80']
 const matchLabels: Record<BeichenReconcileModel['match_status'], string> = {
   matched: '两边均有记录', local_only: '仅本地有记录', upstream_only: '仅北辰有记录',
 }
-const completenessLabels: Record<NonNullable<BeichenReconcileModel['completeness']>, string> = {
+const completenessLabels: Record<TokenCompleteness, string> = {
   complete: 'Token 回报完整', partial: 'Token 部分回报', missing: 'Token 待核',
 }
 const coverageLabels: Record<NonNullable<ReconcileCoverage['coverage_kind']>, string> = {
@@ -47,23 +54,35 @@ const period = computed(() => {
   return data.value.start ? `${beijingDate(data.value.start)} 起 · 截至 ${end}（北京时间）` : `全部已记录数据 · 截至 ${end}（北京时间）`
 })
 const localSegments = computed(() => models.value.map((row, index) => ({
-  name: row.model, value: row.local.tokens, color: palette[index % palette.length], displayValue: formatPercent(row.local_share),
+  name: modelLabel(row), value: row.local.tokens, color: palette[index % palette.length], displayValue: formatPercent(row.local_share),
 })))
 const upstreamSegments = computed(() => models.value.map((row, index) => ({
-  name: row.model, value: row.upstream.tokens, color: palette[index % palette.length], displayValue: formatPercent(row.upstream_share),
+  name: modelLabel(row), value: row.upstream.tokens, color: palette[index % palette.length], displayValue: formatPercent(row.upstream_share),
 })))
 const bars = computed(() => ({
-  categories: models.value.map(row => row.model),
-  left: models.value.map(row => metric.value === 'tokens' ? modelTokens(row, 'local') : chartNumber(row.student_yuan)),
-  right: models.value.map(row => metric.value === 'tokens' ? modelTokens(row, 'upstream') : chartNumber(row.actual_yuan)),
+  categories: models.value.map(modelLabel),
+  left: models.value.map(row => metric.value === 'tokens' ? reportedTokens(row.local) : chartNumber(row.student_yuan)),
+  right: models.value.map(row => metric.value === 'tokens' ? reportedTokens(row.upstream) : chartNumber(row.actual_yuan)),
 }))
 const yuan = (value: string | number | null | undefined) => formatYuan(value, 6)
 let requestVersion = 0
 
-function modelTokens(row: BeichenReconcileModel, side: 'local' | 'upstream') {
-  if (row.completeness === 'missing') return null
-  if (row.match_status === (side === 'local' ? 'upstream_only' : 'local_only')) return null
-  return row[side].tokens
+function channelLabel(row: Channel) {
+  return row.label || `渠道 ${row.credential_id.slice(0, 8)}`
+}
+
+function modelLabel(row: ReconcileModel) {
+  return `${row.model} · ${channelLabel(row)}`
+}
+
+function reportedTokens(side: TokenSide) {
+  return side.completeness === 'complete' || side.tokens > 0 ? side.tokens : null
+}
+
+function schoolAbsorbed(value: string | null | undefined) {
+  if (value == null) return '未统计'
+  const amount = shiftDecimal(value, -2)
+  return amount === '0' ? '未触顶' : amount
 }
 
 function beijingDate(value: string) {
@@ -79,13 +98,14 @@ function chartNumber(value: string | null | undefined) {
   return Number.isFinite(number) ? number : null
 }
 
-function marginClass(value: string | null) {
-  const number = chartNumber(value)
+function marginClass(line: Margin) {
+  const number = line.margin_available ? chartNumber(line.margin_yuan) : null
   return number != null && number > 0 ? 'positive' : number != null && number < 0 ? 'negative' : ''
 }
 
-function margin(value: string | null) {
-  return `${(chartNumber(value) ?? 0) > 0 ? '+' : ''}${yuan(value)}`
+function margin(line: Margin) {
+  if (!line.margin_available) return '不可比'
+  return `${(chartNumber(line.margin_yuan) ?? 0) > 0 ? '+' : ''}${yuan(line.margin_yuan)}`
 }
 
 async function load() {
@@ -94,7 +114,7 @@ async function load() {
   error.value = ''
   data.value = undefined
   try {
-    const result = await teacherAPI.beichenReconciliation(props.providerId, range.value)
+    const result = await teacherAPI.beichenReconciliation(props.providerId, range.value) as ReconcileData
     // 切换范围或供应商后，过期响应不能覆盖当前对账结果。
     if (current === requestVersion) data.value = result
   } catch (e) {
@@ -113,7 +133,7 @@ onBeforeUnmount(() => { requestVersion++ })
     <header class="beichen-toolbar reconcile-header">
       <div>
         <h2 :id="titleId">北辰对账</h2>
-        <p class="beichen-note">100 积分 = 1 元。学校承担的金额不从学生额度扣除。</p>
+        <p class="beichen-note">100 积分折合 1 {{ moneyUnit }}。学校承担只统计超过学生额度上限的部分。</p>
       </div>
       <div class="beichen-toolbar-group">
         <div class="range-switch" role="group" aria-label="对账时间范围">
@@ -130,18 +150,26 @@ onBeforeUnmount(() => { requestVersion++ })
       <div v-if="data" class="beichen-stack">
         <p class="beichen-note">{{ period }}</p>
         <div class="beichen-summary reconcile-kpis" aria-label="对账汇总">
-          <div class="beichen-stat" data-kpi="local-tokens"><span>本地 Token</span><strong>{{ formatTokens(data.totals.local.tokens) }}</strong><small>学校网关记录</small></div>
-          <div class="beichen-stat" data-kpi="upstream-tokens"><span>北辰 Token</span><strong>{{ formatTokens(data.totals.upstream.tokens) }}</strong><small>北辰已同步账单</small></div>
+          <div class="beichen-stat" data-kpi="local-tokens">
+            <span>本地 Token 总量</span>
+            <strong>{{ formatTokens(data.totals.local.requests === 0 ? 0 : reportedTokens(data.totals.local)) }}</strong>
+            <small>学校网关已回报的分项合计</small>
+          </div>
+          <div class="beichen-stat" data-kpi="upstream-tokens">
+            <span>北辰 Token 总量</span>
+            <strong>{{ formatTokens(data.totals.upstream.requests === 0 && data.totals.upstream.source == null ? 0 : reportedTokens(data.totals.upstream)) }}</strong>
+            <small>北辰回报 {{ formatTokens(data.totals.upstream.requests) }} 笔调用</small>
+          </div>
           <div class="beichen-stat" data-kpi="student-yuan">
-            <span>学生已扣（元）</span><strong>{{ yuan(data.totals.money.student_yuan) }}</strong>
-            <small v-if="data.totals.local.credits != null">{{ formatCredits(data.totals.local.credits, 6) }} 积分 ÷ 100 = {{ creditsToYuan(data.totals.local.credits, 6) }} 元</small>
+            <span>学生已扣</span><strong>{{ yuan(data.totals.money.student_yuan) }}</strong>
+            <small v-if="data.totals.local.credits != null">{{ formatCredits(data.totals.local.credits, 6) }} 积分 ÷ 100 = {{ creditsToYuan(data.totals.local.credits, 6) }} {{ moneyUnit }}</small>
             <small v-else>已扣积分 ÷ 100</small>
           </div>
-          <div class="beichen-stat" data-kpi="actual-yuan"><span>北辰实扣（元）</span><strong>{{ yuan(data.totals.money.actual_yuan) }}</strong><small>北辰实际扣款</small></div>
-          <div class="beichen-stat" data-kpi="margin-yuan"><span>差额（元）</span><strong :class="marginClass(data.totals.money.margin_yuan)">{{ margin(data.totals.money.margin_yuan) }}</strong><small>学生已扣折合金额 − 北辰实扣</small></div>
+          <div class="beichen-stat" data-kpi="actual-yuan"><span>北辰实扣</span><strong>{{ yuan(data.totals.money.actual_yuan) }}</strong><small>{{ moneyUnit }}</small></div>
+          <div class="beichen-stat" data-kpi="margin-yuan"><span>差额</span><strong :class="marginClass(data.totals.money)">{{ margin(data.totals.money) }}</strong><small>学生已扣折合金额 − 北辰实扣</small></div>
         </div>
 
-        <section class="beichen-card coverage-card" aria-label="数据完整性">
+        <section class="beichen-card coverage-card" aria-label="日账覆盖">
           <div class="beichen-section-head">
             <h3>账单同步</h3>
             <span v-if="data.coverage.coverage_kind" class="status-pill" :class="data.coverage.coverage_kind === 'full' ? 'confirmed' : 'pending'">
@@ -151,22 +179,30 @@ onBeforeUnmount(() => { requestVersion++ })
           <dl class="coverage-days">
             <div>
               <dt>完整账日</dt>
-              <dd>{{ formatTokens(completeDays) }} 天 <small>当天应同步的渠道均已同步</small></dd>
+              <dd>{{ formatTokens(data.coverage.comparable_days) }} 天 <small>当天应同步的渠道均已同步</small></dd>
             </div>
             <div>
               <dt>渠道账日</dt>
               <dd>{{ formatTokens(data.coverage.days_present) }} / {{ formatTokens(data.coverage.days_expected) }} <small>已同步 / 应同步，每渠道每天计一次</small></dd>
             </div>
           </dl>
+          <p v-if="data.coverage.missing_days.length" class="coverage-warning">待同步日期 {{ data.coverage.missing_days.join('、') }}。当前区间差额不可比。</p>
+          <p v-else-if="data.coverage.coverage_kind === 'full' && !data.totals.money.margin_available" class="coverage-warning">缺少可核对的北辰实扣金额，差额不可比。</p>
+          <p v-if="data.coverage.multiplier_mixed" class="coverage-warning">当前范围包含不同学校扣费倍率，不能统一按 1.10 倍推算差额。</p>
+          <p class="beichen-note">
+            基础成本 {{ yuan(data.totals.money.base_yuan) }} {{ moneyUnit }}<template v-if="data.totals.money.margin_available && data.totals.money.margin_rate != null">，差额率 {{ formatPercent(data.totals.money.margin_rate) }}</template>。
+          </p>
+        </section>
+
+        <section class="beichen-card coverage-card" aria-label="调用核对">
+          <h3>调用核对</h3>
           <div class="coverage-facts">
-            <strong>可逐笔关联 {{ formatTokens(data.coverage.verified_matched_calls) }} 笔</strong>
+            <strong>可逐笔关联 {{ formatTokens(data.coverage.verified_matched_calls) }} 笔，其中本地 Token 完整 {{ formatTokens(data.coverage.verified_matched_complete_token_calls) }} 笔</strong>
+            <span :class="{ 'coverage-warning': data.totals.local.charged_tokens_missing_calls > 0 }">已扣款但 Token 不完整 {{ formatTokens(data.totals.local.charged_tokens_missing_calls) }} 笔</span>
             <span :class="{ 'coverage-warning': data.coverage.pending_calls > 0 }">待核账 {{ formatTokens(data.coverage.pending_calls) }} 笔</span>
             <span :class="{ 'coverage-warning': data.coverage.unpriced_calls > 0 }">无报价调用 {{ formatTokens(data.coverage.unpriced_calls) }} 笔</span>
           </div>
-          <p v-if="missingDays.length" class="coverage-warning">待同步日期包括 {{ missingDays.slice(0, 8).join('、') }}<template v-if="missingDays.length > 8"> 等 {{ missingDays.length }} 天</template>。数据尚未齐全，差额仅供参考。</p>
-          <p v-else-if="data.coverage.days_present < data.coverage.days_expected" class="coverage-warning">仍有 {{ formatTokens(data.coverage.days_expected - data.coverage.days_present) }} 个渠道账日待同步，差额仅供参考。</p>
-          <p v-if="data.coverage.multiplier_mixed" class="coverage-warning">当前范围包含不同学校扣费倍率，不能统一按 1.10 倍推算差额。</p>
-          <p class="beichen-note">基础成本 {{ yuan(data.totals.money.base_yuan) }} 元，差额率 {{ formatPercent(data.totals.money.margin_rate) }}。差额会受计价、同步进度和单边记录影响。</p>
+          <p v-if="data.totals.local.tokens_missing > 0" class="beichen-note">另有约 {{ formatTokens(data.totals.local.tokens_missing) }} Token 待核。</p>
         </section>
 
         <div v-if="empty" class="beichen-empty" role="status">
@@ -197,42 +233,43 @@ onBeforeUnmount(() => { requestVersion++ })
                 <button type="button" :aria-pressed="metric === 'money'" @click="metric = 'money'">金额对比</button>
               </div>
             </div>
-            <CompareBars :categories="bars.categories" :left="bars.left" :right="bars.right" :left-label="metric === 'tokens' ? '本地 Token' : '学生已扣'" :right-label="metric === 'tokens' ? '北辰 Token' : '北辰实扣'" :value-formatter="metric === 'tokens' ? formatTokens : yuan" :unit="metric === 'tokens' ? 'Token' : '元'" />
+            <CompareBars :categories="bars.categories" :left="bars.left" :right="bars.right" :left-label="metric === 'tokens' ? '本地 Token' : '学生已扣'" :right-label="metric === 'tokens' ? '北辰 Token' : '北辰实扣'" :value-formatter="metric === 'tokens' ? formatTokens : yuan" :unit="metric === 'tokens' ? 'Token' : moneyUnit" />
           </section>
 
           <section class="beichen-card reconcile-detail">
             <h3>模型对账明细</h3>
-            <p class="beichen-note">本地占比和北辰占比分别按各自已回报的 Token 总量计算。</p>
+            <p class="beichen-note">每行对应一条渠道的上游模型。两侧占比按各自已回报的 Token 总量计算。金额单位为{{ moneyUnit }}。</p>
             <div class="reconcile-table-wrap">
               <table class="beichen-table reconcile-table model-details">
-                <caption class="sr-only">模型对账明细，金额单位为元</caption>
+                <caption class="sr-only">模型对账明细，金额单位为{{ moneyUnit }}</caption>
                 <thead><tr>
                   <th scope="col">模型</th>
                   <th scope="col" class="numeric-cell">本地 Token</th>
                   <th scope="col" class="numeric-cell">北辰 Token</th>
                   <th scope="col" class="numeric-cell">本地占比</th>
                   <th scope="col" class="numeric-cell">北辰占比</th>
-                  <th scope="col" class="numeric-cell">学生已扣（元）</th>
-                  <th scope="col" class="numeric-cell">北辰实扣（元）</th>
-                  <th scope="col" class="numeric-cell">学校承担（元）</th>
-                  <th scope="col" class="numeric-cell">差额（元）</th>
+                  <th scope="col" class="numeric-cell">学生已扣</th>
+                  <th scope="col" class="numeric-cell">北辰实扣</th>
+                  <th scope="col" class="numeric-cell">学校承担</th>
+                  <th scope="col" class="numeric-cell">差额</th>
                   <th scope="col">记录情况</th>
                 </tr></thead>
                 <tbody>
-                  <tr v-for="row in models" :key="row.model" :class="{ 'unmatched-row': row.match_status !== 'matched' }">
-                    <th scope="row">{{ row.model }}</th>
-                    <td class="numeric-cell" data-label="本地 Token">{{ formatTokens(modelTokens(row, 'local')) }}</td>
-                    <td class="numeric-cell" data-label="北辰 Token">{{ formatTokens(modelTokens(row, 'upstream')) }}</td>
-                    <td class="numeric-cell" data-label="本地占比">{{ formatPercent(row.local_share) }}</td>
-                    <td class="numeric-cell" data-label="北辰占比">{{ formatPercent(row.upstream_share) }}</td>
-                    <td class="numeric-cell" data-label="学生已扣（元）">{{ yuan(row.student_yuan) }}</td>
-                    <td class="numeric-cell" data-label="北辰实扣（元）">{{ yuan(row.actual_yuan) }}</td>
-                    <td class="numeric-cell" data-label="学校承担（元）">{{ shiftDecimal(row.school_absorbed_credits, -2) }}</td>
-                    <td class="numeric-cell" :class="marginClass(row.margin_yuan)" data-label="差额（元）">{{ margin(row.margin_yuan) }}</td>
+                  <tr v-for="row in models" :key="`${row.credential_id}:${row.model}`" :class="{ 'unmatched-row': row.match_status !== 'matched' }">
+                    <th scope="row">{{ row.model }}<small class="beichen-note model-channel">{{ channelLabel(row) }}</small></th>
+                    <td class="numeric-cell" data-label="本地 Token">{{ formatTokens(reportedTokens(row.local)) }}</td>
+                    <td class="numeric-cell" data-label="北辰 Token">{{ formatTokens(reportedTokens(row.upstream)) }}</td>
+                    <td class="numeric-cell" data-label="本地占比">{{ formatPercent(reportedTokens(row.local) == null ? null : row.local_share) }}</td>
+                    <td class="numeric-cell" data-label="北辰占比">{{ formatPercent(reportedTokens(row.upstream) == null ? null : row.upstream_share) }}</td>
+                    <td class="numeric-cell" data-label="学生已扣">{{ yuan(row.student_yuan) }}</td>
+                    <td class="numeric-cell" data-label="北辰实扣">{{ yuan(row.actual_yuan) }}</td>
+                    <td class="numeric-cell" data-label="学校承担">{{ schoolAbsorbed(row.school_absorbed_credits) }}</td>
+                    <td class="numeric-cell" :class="marginClass(row)" data-label="差额">{{ margin(row) }}</td>
                     <td data-label="记录情况">
                       <div class="reconcile-row-status">
                         <span class="status-pill" :class="row.match_status === 'matched' ? 'confirmed' : row.match_status">{{ matchLabels[row.match_status] }}</span>
                         <small v-if="row.completeness" class="beichen-note">{{ completenessLabels[row.completeness] }}</small>
+                        <small v-if="row.local.charged_tokens_missing_calls" class="beichen-note">已扣款但 Token 不完整 {{ formatTokens(row.local.charged_tokens_missing_calls) }} 笔</small>
                       </div>
                     </td>
                   </tr>
@@ -244,30 +281,35 @@ onBeforeUnmount(() => { requestVersion++ })
 
         <section v-if="!empty" class="beichen-card reconcile-detail">
           <h3>按渠道 Key 对账</h3>
-          <p class="beichen-note">此处的 Key 是学校配置的北辰渠道。</p>
+          <p class="beichen-note">此处的 Key 是学校配置的北辰渠道。金额单位为{{ moneyUnit }}。</p>
           <div v-if="keys.length" class="reconcile-table-wrap">
             <table class="beichen-table reconcile-table key-details">
-              <caption class="sr-only">按渠道 Key 对账，金额单位为元</caption>
+              <caption class="sr-only">按渠道 Key 对账，金额单位为{{ moneyUnit }}</caption>
               <thead><tr>
                 <th scope="col">Key 名称</th>
                 <th scope="col" class="numeric-cell">本地 Token</th>
                 <th scope="col" class="numeric-cell">北辰 Token</th>
-                <th scope="col" class="numeric-cell">学生已扣（元）</th>
-                <th scope="col" class="numeric-cell">北辰实扣（元）</th>
-                <th scope="col" class="numeric-cell">学校承担（元）</th>
-                <th scope="col" class="numeric-cell">差额（元）</th>
+                <th scope="col" class="numeric-cell">学生已扣</th>
+                <th scope="col" class="numeric-cell">北辰实扣</th>
+                <th scope="col" class="numeric-cell">学校承担</th>
+                <th scope="col" class="numeric-cell">差额</th>
                 <th scope="col">Token 回报</th>
               </tr></thead>
               <tbody>
                 <tr v-for="row in keys" :key="row.credential_id">
-                  <th scope="row">{{ row.label || '未命名 Key' }}</th>
-                  <td class="numeric-cell" data-label="本地 Token">{{ formatTokens(row.completeness === 'missing' || row.local.requests === 0 ? null : row.local.tokens) }}</td>
-                  <td class="numeric-cell" data-label="北辰 Token">{{ formatTokens(row.completeness === 'missing' || row.upstream.source === null ? null : row.upstream.tokens) }}</td>
-                  <td class="numeric-cell" data-label="学生已扣（元）">{{ yuan(row.student_yuan) }}</td>
-                  <td class="numeric-cell" data-label="北辰实扣（元）">{{ yuan(row.actual_yuan) }}</td>
-                  <td class="numeric-cell" data-label="学校承担（元）">{{ shiftDecimal(row.school_absorbed_credits, -2) }}</td>
-                  <td class="numeric-cell" :class="marginClass(row.margin_yuan)" data-label="差额（元）">{{ margin(row.margin_yuan) }}</td>
-                  <td data-label="Token 回报">{{ row.completeness ? completenessLabels[row.completeness] : '—' }}</td>
+                  <th scope="row">{{ channelLabel(row) }}</th>
+                  <td class="numeric-cell" data-label="本地 Token">{{ formatTokens(reportedTokens(row.local)) }}</td>
+                  <td class="numeric-cell" data-label="北辰 Token">{{ formatTokens(reportedTokens(row.upstream)) }}</td>
+                  <td class="numeric-cell" data-label="学生已扣">{{ yuan(row.student_yuan) }}</td>
+                  <td class="numeric-cell" data-label="北辰实扣">{{ yuan(row.actual_yuan) }}</td>
+                  <td class="numeric-cell" data-label="学校承担">{{ schoolAbsorbed(row.school_absorbed_credits) }}</td>
+                  <td class="numeric-cell" :class="marginClass(row)" data-label="差额">{{ margin(row) }}</td>
+                  <td data-label="Token 回报">
+                    <div class="reconcile-row-status">
+                      <span>{{ row.completeness ? completenessLabels[row.completeness] : '—' }}</span>
+                      <small v-if="row.local.charged_tokens_missing_calls" class="beichen-note">已扣款但 Token 不完整 {{ formatTokens(row.local.charged_tokens_missing_calls) }} 笔</small>
+                    </div>
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -312,6 +354,7 @@ onBeforeUnmount(() => { requestVersion++ })
 .reconcile-table .numeric-cell { text-align: right; font-variant-numeric: tabular-nums; white-space: normal; }
 .model-details th:first-child { width: 17%; }
 .model-details th:last-child { width: 15%; }
+.model-channel { display: block; margin-top: 4px; }
 .reconcile-row-status { display: grid; gap: 4px; justify-items: start; }
 .reconcile-table .status-pill { max-width: 100%; white-space: normal; }
 .reconcile-table .unmatched-row, .reconcile-table .unmatched-row:hover { background: #fff8f0; }
