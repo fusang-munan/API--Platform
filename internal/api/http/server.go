@@ -12,10 +12,11 @@ import (
 )
 
 type Config struct {
-	CookieSecure  bool
-	RefreshTTL    time.Duration
-	SSEHeartbeat  time.Duration
-	AllowedOrigin string
+	CookieSecure    bool
+	RefreshTTL      time.Duration
+	SSEHeartbeat    time.Duration
+	AllowedOrigin   string
+	SchoolWorkspace SchoolWorkspace
 }
 
 type Server struct {
@@ -153,6 +154,7 @@ func (s *Server) registerControlPlane() {
 	teacher.DELETE("/providers/:provider_id/credentials/:credential_id", s.deleteProviderCredential)
 	teacher.POST("/providers/:provider_id/reset-catalog", s.resetProviderCatalog)
 	teacher.GET("/providers/:provider_id/beichen", s.beichenOverview)
+	teacher.GET("/providers/:provider_id/beichen/receipts", s.beichenArchivedReceipts)
 	teacher.POST("/providers/:provider_id/beichen/sync", s.syncBeichen)
 	teacher.POST("/providers/:provider_id/beichen/models/enable", s.enableBeichenModel)
 	teacher.GET("/providers/:provider_id/beichen/access/:credential_id", s.beichenPanelAccess)

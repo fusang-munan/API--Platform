@@ -22,8 +22,6 @@ try {
     }
     $config = @{
         channels = @($channels)
-        web_email = (Read-Host '北辰账号邮箱')
-        web_password = (Read-PrivateField '北辰网页登录密码')
     }
     $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     ($config | ConvertTo-Json -Compress -Depth 4) | & $Go run ./cmd/seal-beichen -certificate $certPath

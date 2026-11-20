@@ -6,12 +6,14 @@ import router from '../router'
 import { token } from '../api/client'
 import { useAuthStore } from '../store/auth'
 import type { ProjectUsage, Role } from '../api/types'
-import { schoolMonth } from '../utils/format'
+import { schoolDay, schoolMonth } from '../utils/format'
 
 vi.mock('../api/client', async original => ({
   ...await original<typeof import('../api/client')>(), openEvents: vi.fn(),
 }))
 const month = schoolMonth()
+const workspaceUrl = 'https://workspace.example.test/apps/beichen'
+const workspaceSection = '[aria-label="校方北辰工作区"]'
 const school = { id: 'north', name: '北辰', base_url: 'https://api.beichenapi.com', status: 'active', credential_configured: true, credentials: [
   { id: 'cheap', label: '隐藏的低倍率渠道', credential_configured: true, status: 'active' },
   { id: 'chosen', label: '隐藏的首选渠道', credential_configured: true, status: 'active' },
@@ -63,8 +65,14 @@ async function fetchFixture(url: string, init?: RequestInit) {
     throw Error('未预期的写入 ' + path)
   }
   if (path.endsWith('/providers')) return reply([school, other])
+  if (path === '/api/v1/teacher/providers/north/beichen/receipts') return reply({ items: [], next_cursor: null })
   if (path.endsWith('/beichen')) return reply({
     web_login_required: true,
+    maintenance_workspace: { launch_url: workspaceUrl },
+    website_sync: {
+      channels: 4, priced_channels: 3, receipt_checked_channels: 4, receipt_caught_up_channels: 1,
+      price_last_seen: '2026-11-01T15:30:00Z', receipt_last_checked: '2026-11-01T16:02:03Z',
+    },
     datasets: [
       { kind: 'billing', credential_id: 'cheap', effective_multiplier: 0.1 },
       { kind: 'billing', credential_id: 'stale', last_error: '本轮读取失败', effective_multiplier: 0.3 },
@@ -174,6 +182,7 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   await widget.get('a[href="/teacher/models"]').trigger('click')
   await flushPromises()
   expect(widget.get('[aria-label="北辰模型目录"]').findAll('tbody tr')).toHaveLength(4)
+  expect(widget.find('[aria-label="近期逐笔对账"]').exists()).toBe(false)
   expect(widget.find('article.panel').exists()).toBe(false)
 })
 
@@ -212,6 +221,93 @@ it('教师从目录直接启用未配置模型，失败后可重试，后台成�
   expect(button('禁用', row).exists()).toBe(true)
 })
 
+it('教师从维护抽屉打开校方工作区，授权提示和网页时间仍来自概览，模型主目录隐藏维护入口', async () => {
+  await enter('teacher', '/teacher/providers?from=list#north')
+  expect(page().find(workspaceSection).exists()).toBe(false)
+  const before = request.mock.calls.length
+  await button('查看模型', widget.get('article')).trigger('click')
+  await flushPromises()
+  const dialog = page().get('[role="dialog"]')
+  const link = dialog.get(`${workspaceSection} a`)
+  expect(link.text()).toBe('打开校方北辰工作区')
+  expect(link.attributes()).toMatchObject({ href: workspaceUrl, target: '_blank', rel: 'noopener noreferrer', referrerpolicy: 'no-referrer' })
+  const panel = dialog.get('[aria-label="近期逐笔对账"]')
+  expect(panel.text()).not.toContain('渠道')
+  const row = { occurred_at: '2026-11-01T16:02:03Z', model: '假数据模型', student_name: '测试学生',
+    base_credits: '0', school_multiplier: '1.10', charged_credits: '0', actual_cost: '0.0000', difference_credits: '0', matched: true }
+  request.mockResolvedValueOnce(reply({ items: [row, { ...row, student_name: null, actual_cost: null, difference_credits: null, matched: false }], next_cursor: null }))
+  await button('近期逐笔对账', panel).trigger('click')
+  await flushPromises()
+  const overviewPath = '/api/v1/teacher/providers/north/beichen'
+  const readPaths = () => request.mock.calls.slice(before).map(([url, init]) => [init?.method ?? 'GET', url.split('?')[0]])
+  // 触发点击处理，但让测试浏览器留在本地。
+  link.element.addEventListener('click', event => event.preventDefault(), { once: true })
+  await link.trigger('click')
+  await flushPromises()
+  expect(dialog.text()).toContain('北辰官网需要学校后台重新授权。')
+  expect(readPaths()).toEqual([['GET', overviewPath], ['GET', overviewPath + '/receipts']])
+  expect(panel.findAll('dl > div').map(field => [field.get('dt').text(), field.get('dd').text()])).toEqual([
+    ['当前有有效网页报价', '3 / 4 个渠道'], ['成功读取过流水页', '4 / 4 个渠道'], ['最近一次扫描已到末页', '1 / 4 个渠道'],
+    ['最近记录报价时间', '2026-11-01 23:30:00'], ['最近一页流水读取成功时间', '2026-11-02 00:02:03'],
+  ])
+  const [zero, pending] = panel.findAll('tbody tr')
+  expect(zero.findAll('td').slice(2).map(cell => cell.text())).toEqual(['0.0000', '0', '已匹配'])
+  expect(pending.findAll('td').slice(2).map(cell => cell.text())).toEqual(['待核', '待核', '待核'])
+  await panel.get('input').setValue('')
+  await panel.get('input').setValue('2026-11-02')
+  await flushPromises()
+  expect(panel.text()).toContain('学校尚未归档所选日期的北辰流水')
+  expect(readPaths().slice(2)).toEqual([['GET', overviewPath + '/receipts']])
+  await button('刷新对账', panel).trigger('click')
+  await flushPromises()
+  expect(readPaths().slice(3)).toEqual([['GET', overviewPath], ['GET', overviewPath + '/receipts']])
+  await page().get('button[aria-label="关闭"]').trigger('click')
+  const beforeCatalog = request.mock.calls.length
+  await widget.get('a[href="/teacher/models"]').trigger('click')
+  await flushPromises()
+  expect(router.currentRoute.value.path).toBe('/teacher/models')
+  expect(widget.get('[aria-label="北辰模型目录"]').text()).toContain('2.125000000000000000000001×')
+  expect(widget.text()).not.toMatch(/近期逐笔对账|当前有有效网页报价|最近一次扫描已到末页|隐藏的首选渠道|北辰官网需要学校后台重新授权/)
+  expect(widget.find(workspaceSection).exists()).toBe(false)
+  expect(widget.find(`a[href="${workspaceUrl}"]`).exists()).toBe(false)
+  expect(request.mock.calls.slice(beforeCatalog).some(([url]) => url.includes('/beichen/receipts'))).toBe(false)
+  expect(writes).not.toHaveBeenCalled()
+})
+
+it.each([
+  ['工作区为 null', null],
+  ['未配置地址', {}],
+  ['地址为 null', { launch_url: null }],
+  ['地址为空', { launch_url: '' }],
+  ['HTTP 地址', { launch_url: 'http://workspace.example.test/apps/beichen' }],
+  ['相对地址', { launch_url: '//workspace.example.test/apps/beichen' }],
+  ['非网页链接', { launch_url: 'javascript:void(0)' }],
+  ['主机无效', { launch_url: 'https://[invalid' }],
+  ['带用户信息', { launch_url: 'https://teacher@workspace.example.test/apps/beichen' }],
+  ['带查询参数', { launch_url: workspaceUrl + '?from=school' }],
+  ['带片段', { launch_url: workspaceUrl + '#school' }],
+  ['学校同主机', { launch_url: `https://${window.location.hostname}:9443/apps/beichen` }],
+] as const)('维护抽屉刷新概览后撤下原工作区链接（%s）', async (_label, workspace) => {
+  await enter('teacher', '/teacher/providers')
+  await button('查看模型', widget.get('article')).trigger('click')
+  await flushPromises()
+  const dialog = page().get('[role="dialog"]')
+  expect(dialog.get(`${workspaceSection} a`).attributes('href')).toBe(workspaceUrl)
+  request.mockResolvedValueOnce(reply({ datasets: [], models: [], comparison: [], maintenance_workspace: workspace }))
+  await button('刷新模型', dialog).trigger('click')
+  await flushPromises()
+  expect(dialog.find(`${workspaceSection} a`).exists()).toBe(false)
+  expect(dialog.findAll(workspaceSection).map(section => section.text())).toEqual(workspace === null ? [] : ['校方尚未配置远程应用地址'])
+})
+
+it.each(['student', 'mentor'] as const)('%s 身份打开教师供应商地址时无法进入对账区或发起教师请求', async identity => {
+  await enter(identity, '/teacher/providers')
+  expect(router.currentRoute.value.path).not.toBe('/teacher/providers')
+  expect(page().find('[aria-label="近期逐笔对账"]').exists()).toBe(false)
+  expect(page().find(workspaceSection).exists()).toBe(false)
+  expect(request.mock.calls.some(([url]) => url.includes('/api/v1/teacher/'))).toBe(false)
+})
+
 it('普通教师用学校邮箱密码登录后回到原供应商页面，首次查看北辰只读取目录', async () => {
   role = 'teacher'
   const pinia = createPinia()
@@ -237,12 +333,26 @@ it('普通教师用学校邮箱密码登录后回到原供应商页面，首次�
   expect(JSON.parse(String(request.mock.calls[2][1]?.body))).toEqual({ identity: role })
   expect(router.currentRoute.value.path).toBe('/teacher/providers')
   const before = request.mock.calls.length
+  // 旧版学校后台的概览不含官网同步状态和校方工作区。
+  request.mockResolvedValueOnce(reply({ datasets: [], models: [], comparison: [] }))
   await button('查看模型', widget.get('article')).trigger('click')
   await flushPromises()
   expect(request.mock.calls.slice(before).map(([url, init]) => [init?.method ?? 'GET', url.split('?')[0]])).toEqual([
     ['GET', '/api/v1/teacher/providers/north/beichen'],
   ])
   expect(page().get('[aria-label="北辰模型目录"]').find('input').exists()).toBe(false)
+  expect(page().get('[role="dialog"]').find(workspaceSection).exists()).toBe(false)
+  const receipts = page().get('[aria-label="近期逐笔对账"]')
+  expect(button('近期逐笔对账', receipts).attributes('aria-expanded')).toBe('false')
+  expect(receipts.text()).not.toContain('渠道')
+  request.mockResolvedValueOnce(reply({ items: [], next_cursor: null }))
+  await button('近期逐笔对账', receipts).trigger('click')
+  await flushPromises()
+  expect(request.mock.calls.slice(before + 1).map(([url, init]) => [init?.method ?? 'GET', url])).toEqual([
+    ['GET', '/api/v1/teacher/providers/north/beichen/receipts?day=' + schoolDay()],
+  ])
+  expect(receipts.text()).toContain('官网同步状态未知')
+  expect(receipts.text()).toContain('学校尚未归档所选日期的北辰流水')
 })
 
 it('教师查看超用、设置学生额度、从服务器刷新余额，历史月份只读', async () => {

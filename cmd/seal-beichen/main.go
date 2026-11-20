@@ -27,15 +27,38 @@ const schoolOrigin = "https://106.55.103.208:25555"
 
 func main() {
 	cert := flag.String("certificate", "", "经学校独立确认的 HTTPS 叶证书文件，支持 PEM 或 DER")
-	out := flag.String("out", "internal/infrastructure/schoolseal/school-config.sealed.json", "Git 发布中要保存的密文文件")
+	out := flag.String("out", "", "Git 发布中要保存的密文文件；默认按模式选择")
 	check := flag.Bool("check", false, "仅确认学校收件公钥就绪")
+	sessionMode := flag.Bool("session", false, "打开北辰登录页并捕获网页面板会话")
+	login := flag.String("login", "https://beichenapi.com/login", "北辰网页登录地址")
+	edge := flag.String("edge", "", "Microsoft Edge 可执行文件；留空自动查找")
+	timeout := flag.Duration("timeout", 10*time.Minute, "等待本人完成北辰登录的最长时间")
 	flag.Parse()
-	if err := run(schoolOrigin, *cert, *out, *check, os.Stdin); err != nil {
+	if *out == "" {
+		if *sessionMode {
+			*out = "internal/infrastructure/schoolseal/school-session.sealed.json"
+		} else {
+			*out = "internal/infrastructure/schoolseal/school-config.sealed.json"
+		}
+	}
+	var err error
+	if *check {
+		err = run(schoolOrigin, *cert, *out, true, os.Stdin)
+	} else if *sessionMode {
+		err = runSession(schoolOrigin, *cert, *out, *login, *edge, *timeout)
+	} else {
+		err = run(schoolOrigin, *cert, *out, *check, os.Stdin)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	if !*check {
-		fmt.Println("学校配置已加密，可随原 GitHub 自动部署发布。")
+		if *sessionMode {
+			fmt.Println("北辰网页会话已加密，可随原 GitHub 自动部署发布。")
+		} else {
+			fmt.Println("学校配置已加密，可随原 GitHub 自动部署发布。")
+		}
 	}
 }
 
@@ -115,13 +138,17 @@ func run(origin, certPath, out string, check bool, input io.Reader) error {
 	if err != nil {
 		return err
 	}
+	return writeSealed(out, append(sealed, '\n'))
+}
+
+func writeSealed(out string, data []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(out), ".beichen-sealed-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
-	if _, err := tmp.Write(append(sealed, '\n')); err != nil {
+	if _, err := tmp.Write(data); err != nil {
 		return err
 	}
 	if err := tmp.Sync(); err != nil {

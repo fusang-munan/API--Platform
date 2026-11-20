@@ -41,6 +41,10 @@ export function schoolMonth() {
   return new Intl.DateTimeFormat('sv-SE', { year: 'numeric', month: '2-digit', timeZone: 'Asia/Shanghai' }).format(new Date())
 }
 
+export function schoolDay() {
+  return new Intl.DateTimeFormat('sv-SE', { year: 'numeric', month: '2-digit', day: '2-digit', timeZone: 'Asia/Shanghai' }).format(new Date())
+}
+
 export function quotaBalance(quota: string, used: string, available?: string | null) {
   const over = calculateCredits(used, quota, 'subtract')
   if (over !== '0.000') return { label: '已超用', amount: over }

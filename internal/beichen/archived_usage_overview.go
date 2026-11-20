@@ -23,14 +23,12 @@ type ArchivedUsage struct {
 	MarginCredits         *string   `json:"margin_credits"`
 }
 
-func readArchivedUsage(ctx context.Context, tx *sql.Tx, provider uuid.UUID, start time.Time) ([]ArchivedUsage, error) {
-	rows, err := tx.QueryContext(ctx, `
-WITH observed AS (
- SELECT u.model,u.credential_id,
-   CASE WHEN u.billing_type=0 AND u.subscription_id IS NULL AND coalesce(u.currency,'USD')='USD'
-        THEN u.actual_cost END AS cost,
-   c.id AS call_id,coalesce(c.beichen_base_credits,c.beichen_credit_exact) AS base,
-   c.beichen_credit_exact AS charged
+// Both the daily totals and individual receipts must use the same proof of a
+// match and the same definition of a balance debit.
+const archivedDebitSQL = `CASE WHEN u.billing_type=0 AND u.subscription_id IS NULL
+  AND coalesce(u.currency,'USD')='USD' THEN u.actual_cost END`
+
+const archivedMatchesSQL = `
  FROM beichen_upstream_usage_rows u
  LEFT JOIN beichen_call_receipts r ON r.row_id=u.row_id AND r.credential_id=u.credential_id
    AND r.api_key_id=u.upstream_key_id AND u.request_id='client:'||r.response_id::text
@@ -38,8 +36,16 @@ WITH observed AS (
  LEFT JOIN beichen_receipt_response_claims claim ON claim.response_id=r.response_id
    AND claim.first_call_id=r.call_id AND claim.conflicted_at IS NULL
  LEFT JOIN gateway_calls c ON c.id=claim.first_call_id AND c.beichen_receipt_response_id=claim.response_id
-   AND NOT c.beichen_receipt_conflict AND c.beichen_state='charged'
- WHERE u.provider_id=$1 AND u.occurred_at >= $2 AND u.occurred_at < $3
+   AND NOT c.beichen_receipt_conflict AND c.beichen_state='charged'`
+
+const archivedDaySQL = ` WHERE u.provider_id=$1 AND u.occurred_at >= $2 AND u.occurred_at < $3`
+
+func readArchivedUsage(ctx context.Context, tx *sql.Tx, provider uuid.UUID, start time.Time) ([]ArchivedUsage, error) {
+	rows, err := tx.QueryContext(ctx, `
+WITH observed AS (
+ SELECT u.model,u.credential_id,`+archivedDebitSQL+` AS cost,
+   c.id AS call_id,coalesce(c.beichen_base_credits,c.beichen_credit_exact) AS base,
+   c.beichen_credit_exact AS charged`+archivedMatchesSQL+archivedDaySQL+`
 )
 SELECT model,credential_id,count(*),count(*) FILTER (WHERE call_id IS NULL),count(*)-count(cost),
   trim_scale(sum(cost))::text,

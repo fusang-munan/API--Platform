@@ -134,11 +134,33 @@ export type BeichenComparison = {
 }
 export type BeichenOverview = {
   web_login_required?: boolean | null
+  website_sync?: BeichenWebsiteSync | null
+  maintenance_workspace?: { launch_url?: string | null } | null
   model_catalog?: BeichenCatalogModel[] | null
   datasets: BeichenDataset[] | null
   models: BeichenModel[] | null
   comparison: BeichenComparison[] | null
 }
+export type BeichenWebsiteSync = {
+  channels: number
+  priced_channels: number
+  price_last_seen: string | null
+  receipt_checked_channels: number
+  receipt_last_checked: string | null
+  receipt_caught_up_channels: number
+}
+export type BeichenReceiptItem = {
+  occurred_at: string
+  model: string
+  student_name: string | null
+  base_credits: string | null
+  school_multiplier: string | null
+  charged_credits: string | null
+  actual_cost: string | null
+  difference_credits: string | null
+  matched: boolean
+}
+export type BeichenReceiptPage = { items: BeichenReceiptItem[]; next_cursor: string | null }
 export type BeichenCatalogModel = {
   model: string
   school_model?: string | null

@@ -15,11 +15,26 @@ import (
 )
 
 func (s *Server) beichenOverview(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
 	providerID, ok := pathID(c, "provider_id")
 	if !ok {
 		return
 	}
 	view, err := s.service.Beichen().Overview(c.Request.Context(), providerID, c.Query("day"))
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, s.config.SchoolWorkspace.overview(view, identity(c), c.Request))
+}
+
+func (s *Server) beichenArchivedReceipts(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	providerID, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	view, err := s.service.Beichen().ArchivedReceipts(c.Request.Context(), providerID, c.Query("day"), c.Query("cursor"))
 	if err != nil {
 		writeError(c, err)
 		return

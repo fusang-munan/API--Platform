@@ -291,7 +291,7 @@ onMounted(load)
     </LoadingRegion>
 
     <AppDialog :open="Boolean(schoolProvider)" title="北辰模型" description="查看学校首选倍率并管理模型启用状态。" wide @update:open="open => { if (!open) schoolProvider = undefined }">
-      <BeichenSchoolModels v-if="schoolProvider" :provider-id="schoolProvider.id" />
+      <BeichenSchoolModels v-if="schoolProvider" :key="schoolProvider.id" :provider-id="schoolProvider.id" provider-maintenance />
     </AppDialog>
     <AppDialog :open="drawer" :title="editing ? '编辑供应商' : '创建供应商'" description="维护供应商地址、渠道凭据与启用状态。" @update:open="drawer = $event">
       <form class="provider-form" @submit.prevent="save">

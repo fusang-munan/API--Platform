@@ -126,17 +126,17 @@ func run() error {
 		ResourceRouteTTL:      cfg.GatewayResourceRouteTTL,
 		AllowedOrigin:         cfg.PublicAppURL,
 	})
-	newServer := func(addr, origin string, secure bool) *http.Server {
+	newServer := func(addr, origin string, secure bool, workspace httpapi.SchoolWorkspace) *http.Server {
 		api := httpapi.NewServer(controlService, securityManager, cacheStore, gateway,
 			httpapi.HealthDependencies{Database: sqlDB, Cache: cacheStore},
-			httpapi.Config{CookieSecure: secure, RefreshTTL: cfg.RefreshTTL, SSEHeartbeat: cfg.SSEHeartbeat, AllowedOrigin: origin},
+			httpapi.Config{CookieSecure: secure, RefreshTTL: cfg.RefreshTTL, SSEHeartbeat: cfg.SSEHeartbeat, AllowedOrigin: origin, SchoolWorkspace: workspace},
 		)
 		return &http.Server{
 			Addr: addr, Handler: api.Handler(), ReadHeaderTimeout: 10 * time.Second,
 			IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 1 << 20,
 		}
 	}
-	httpServer := newServer(cfg.HTTPAddress, cfg.PublicAppURL, cfg.CookieSecure())
+	httpServer := newServer(cfg.HTTPAddress, cfg.PublicAppURL, cfg.CookieSecure(), httpapi.SchoolWorkspace{})
 
 	signalContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -159,7 +159,12 @@ func run() error {
 	var secureServer *http.Server
 	if addr := os.Getenv("LAB_MAINTENANCE_TLS_ADDR"); addr != "" {
 		origin := os.Getenv("LAB_MAINTENANCE_TLS_ORIGIN")
-		secureServer = newServer(addr, origin, true)
+		workspace, workspaceErr := httpapi.ParseSchoolWorkspace(
+			os.Getenv("LAB_BEICHEN_WORKSPACE_TEACHER_ID"), os.Getenv("LAB_BEICHEN_WORKSPACE_URL"), origin)
+		if workspaceErr != nil {
+			slog.Warn("school browser workspace unavailable", "reason", workspaceErr)
+		}
+		secureServer = newServer(addr, origin, true, workspace)
 		cert, err := labtls.LoadOrCreate(os.Getenv("LAB_MAINTENANCE_TLS_DIR"), origin)
 		if err == nil {
 			var listener net.Listener

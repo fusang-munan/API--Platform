@@ -4,9 +4,10 @@ import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
 import type { BeichenOverview } from '../../api/types'
 import { schoolCatalog } from '../../utils/beichenModels'
-import { statusLabel } from '../../utils/format'
+import { schoolDay, statusLabel } from '../../utils/format'
+import BeichenRecentReceipts from './BeichenRecentReceipts.vue'
 
-const props = defineProps<{ providerId: string; query?: string; commonIds?: Set<string> }>()
+const props = defineProps<{ providerId: string; query?: string; commonIds?: Set<string>; providerMaintenance?: boolean }>()
 const overview = ref<BeichenOverview>()
 const loading = ref(false)
 const updating = ref('')
@@ -16,19 +17,35 @@ const rows = computed(() => overview.value ? schoolCatalog(overview.value, props
   (!props.commonIds || props.commonIds.has(row.model.toLowerCase()))) : [])
 const loginNeeded = computed(() => overview.value?.web_login_required ?? overview.value?.datasets?.some(row =>
   /重新授权|重新登录|完成登录验证|(?:官网|网站).*(?:授权|会话)(?:已)?(?:失效|过期)/u.test(row.last_error ?? '')))
+const workspaceUrl = computed(() => {
+  const raw = overview.value?.maintenance_workspace?.launch_url
+  if (typeof raw !== 'string' || !/^https:\/\/[^/@]+(?:\/|$)/i.test(raw)) return null
+  // 只接受原始的主机和路径，拒绝参数、片段及浏览器会自动修正的分隔符。
+  if (/[?#\\\s\u0000-\u001f\u007f]/u.test(raw)) return null
+  try {
+    const target = new URL(raw)
+    // 同一主机即使端口不同，也可能收到学校的会话 Cookie。
+    return target.hostname === window.location.hostname ? null : target.href
+  } catch {
+    return null
+  }
+})
 
 async function load() {
   loading.value = true
   error.value = ''
   try {
-    const day = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
-    overview.value = await teacherAPI.beichenOverview(props.providerId, day)
+    overview.value = await teacherAPI.beichenOverview(props.providerId, schoolDay())
   } catch (e) {
     overview.value = undefined
     error.value = apiErrorMessage(e, '读取北辰模型失败')
   } finally {
     loading.value = false
   }
+}
+
+function refreshOverview() {
+  if (!loading.value && !updating.value) void load()
 }
 
 async function changeStatus(row: (typeof rows.value)[number], enable: boolean) {
@@ -52,10 +69,17 @@ onMounted(load)
 </script>
 
 <template>
+  <section v-if="providerMaintenance && overview?.maintenance_workspace" aria-label="校方北辰工作区">
+    <a v-if="workspaceUrl" class="button secondary" :href="workspaceUrl" target="_blank"
+      rel="noopener noreferrer" referrerpolicy="no-referrer">打开校方北辰工作区</a>
+    <p v-else class="muted">校方尚未配置远程应用地址</p>
+  </section>
+  <BeichenRecentReceipts v-if="providerMaintenance" :provider-id="providerId" :website-sync="overview?.website_sync"
+    @refresh-overview="refreshOverview" />
   <section aria-label="北辰模型目录">
     <button type="button" class="button ghost" :disabled="loading || Boolean(updating)" @click="load">刷新模型</button>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
-    <p v-if="loginNeeded" role="status">北辰官网需要学校后台重新授权。</p>
+    <p v-if="providerMaintenance && loginNeeded" role="status">北辰官网需要学校后台重新授权。</p>
     <p v-if="loading" role="status">正在读取模型…</p>
     <div v-if="rows.length" class="model-scroll">
       <table class="usage-table">

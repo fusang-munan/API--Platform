@@ -102,6 +102,7 @@ func TestRegistersControlPlaneAndGatewayRoutes(t *testing.T) {
 		"DELETE /api/v1/teacher/providers/:provider_id/credentials/:credential_id",
 		"POST /api/v1/teacher/providers/:provider_id/reset-catalog",
 		"GET /api/v1/teacher/providers/:provider_id/beichen",
+		"GET /api/v1/teacher/providers/:provider_id/beichen/receipts",
 		"POST /api/v1/teacher/providers/:provider_id/beichen/sync",
 		"GET /api/v1/teacher/providers/:provider_id/beichen/access/:credential_id",
 		"PATCH /api/v1/teacher/providers/:provider_id/beichen/access/:credential_id",
@@ -148,6 +149,7 @@ func TestBeichenTeacherRoutesRequireLogin(t *testing.T) {
 	base := "/api/v1/teacher/providers/123/beichen"
 	for _, route := range []struct{ method, path string }{
 		{http.MethodGet, base},
+		{http.MethodGet, base + "/receipts"},
 		{http.MethodPost, base + "/sync"},
 		{http.MethodPatch, base + "/price"},
 		{http.MethodPost, base + "/import"},
