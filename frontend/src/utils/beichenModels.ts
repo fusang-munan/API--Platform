@@ -17,7 +17,7 @@ export function schoolCatalog(overview: BeichenOverview, providerId: string) {
     if (group) group.push(row)
     else records.set(key, [row])
   }
-  const failures = new Set(overview.datasets?.filter(row => row.last_error).map(row => row.kind + ':' + row.credential_id))
+  const syncErrors = new Map(overview.datasets?.map(row => [row.kind + ':' + row.credential_id, row.last_error]))
   const catalog: BeichenCatalogModel[] = overview.model_catalog ??
     Array.from(records.values(), rows => ({ model: rows[0].model }))
   return catalog.map(entry => {
@@ -33,80 +33,186 @@ export function schoolCatalog(overview: BeichenOverview, providerId: string) {
     const status = ambiguous ? undefined
       : entry.school_status ?? (ready ? 'active' : statuses.size === 1 ? rows[0].school_status : undefined)
     const canDisable = status === 'active' && (entry.school_status === 'active' || selected.length > 0)
-    const quotes = new Map<string, { multiplier: string; price: string | null }>()
+    const quotes = new Map<string, ReturnType<typeof schoolQuote>>()
     for (const route of selected) {
-      const local = route.provider_id === providerId && Boolean(route.credential_id)
-      const reported = route.effective_multiplier_text === undefined ? route.effective_multiplier : route.effective_multiplier_text
-      const rate = local && !failures.has('billing:' + route.credential_id) ? reported : null
-      const multiplier = rate == null || rate === '' ? '待同步' : rate + (route.state === 'candidate' ? '× · 待启用' : '×')
+      if (route.provider_id !== providerId || !route.credential_id) continue
       const upstreamName = (route.upstream_model ?? entry.model).toLowerCase()
       const record = prices.get(route.credential_id + ':' + upstreamName)
-      const price = local && !failures.has('prices:' + route.credential_id) ? unitPrice(record) : null
-      quotes.set(JSON.stringify([multiplier, price]), { multiplier, price })
+      const quote = schoolQuote(record, route.effective_multiplier_text ?? route.effective_multiplier,
+        route.state === 'candidate', syncErrors.get('prices:' + route.credential_id),
+        syncErrors.get('billing:' + route.credential_id))
+      quotes.set(JSON.stringify(quote), quote)
     }
-    return { model: entry.model, school, status, canEnable: entry.can_enable, canDisable, quotes: Array.from(quotes.values()) }
+    return {
+      model: entry.model, school, status, canEnable: entry.can_enable, canDisable,
+      quotes: Array.from(quotes, ([key, quote]) => ({ key, ...quote })),
+    }
   })
 }
 
-function unitPrice(record?: BeichenModel) {
-  if (record?.price_status === 'conditional') return conditionalPrices(record.price_conditions_exact ?? record.price_conditions)
-  if (record?.price_status !== 'confirmed') return null
-  const effective = '实际单价（已乘倍率） · 每百万 Token 的北辰余额单位 · ' +
-    priceFields.map(({ key, label }) => label + ' ' + (scaledNumber(record.upstream_rates?.[key], 6) ?? '未知')).join(' · ')
-  const standard = standardPrice(record)
-  return [standard, effective].filter(Boolean).join('\n')
+const priceStatusLabels = {
+  confirmed: '报价已确认',
+  conditional: '按条件计价',
+  not_listed: '官网未提供同名报价',
+  pending: '单价待同步',
 }
 
-function standardPrice(record: BeichenModel) {
-  const terms = record.price_conditions
-  if (!terms || typeof terms !== 'object') return null
-  const fields = tokenPrices
-    .map(([key, label]) => [key, label, (terms as unknown as Record<string, unknown>)[key]] as const)
-    .filter(([, , value]) => value != null)
-  if (!fields.length) return null
-  return '官网标准价 · 每 Token · ' + fields.map(([, label, value]) => label + ' ' + conditionNumber(value)).join(' · ')
+function schoolQuote(record: BeichenModel | undefined, reported: string | number | null | undefined,
+  candidate: boolean, priceError?: string | null, billingError?: string | null) {
+  const status = record?.price_status === 'confirmed' || record?.price_status === 'conditional' ||
+    record?.price_status === 'not_listed' ? record.price_status : 'pending'
+  const rate = billingError ? null : nonNegativeDecimal(reported)
+  const multiplier = rate ? formatDecimal(rate) + (candidate ? '× · 待启用' : '×')
+    : billingError || reported == null || reported === '' ? '待同步' : '倍率无效'
+  const source = record?.price_conditions_exact ?? record?.price_conditions
+  const terms = status !== 'not_listed' && source && typeof source === 'object' && !Array.isArray(source) ? source : null
+  const canCalculate = !priceError && (status === 'confirmed' || status === 'conditional') ? rate : null
+  const prices = terms ? formatPriceConditions(terms, canCalculate) : null
+  const standard = prices?.standard ?? null
+  // Older confirmed quotes can have effective token rates without a website pricing object.
+  const legacyActual = !terms && canCalculate && status === 'confirmed' ? legacyEffectivePrice(record?.upstream_rates) : null
+  const actual = prices?.actual ?? legacyActual
+  const statusLabel = priceError
+    ? (status === 'pending' ? '价格同步失败' : '上次报价状态 · ' + priceStatusLabels[status])
+    : (status === 'pending' && standard ? '官网单价待核对' : priceStatusLabels[status])
+  const notes: string[] = []
+  if (priceError) notes.push('价格同步错误：' + priceError)
+  if (billingError) notes.push('倍率同步失败：' + billingError)
+  if (status === 'confirmed' && !standard && !priceError) notes.push('官网标准价待同步')
+  if (status === 'conditional' && !standard && !priceError) notes.push('条件明细待同步')
+  if (prices?.precisionUnknown) notes.push('官网原始小数精度未知')
+  if (legacyActual) notes.push('实际单价来自后台已有报价')
+  return { multiplier, standard, actual, status, statusLabel, notes }
 }
 
 const tokenPrices = [
   ['input_price', '输入'], ['output_price', '输出'], ['cache_read_price', '缓存读取'], ['cache_write_price', '缓存写入'],
   ['cache_write_1h_price', '缓存写入（1 小时）'], ['cache_write_12h_price', '缓存写入（12 小时）'],
 ] as const
-const effortLabels = { minimal: '极低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高' }
-
-function conditionNumber(value: unknown) {
-  if (typeof value !== 'string' && typeof value !== 'number') return '未知'
-  return /^\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(String(value)) ? String(value) : '未知'
+const imagePrices = [['image_input_price', '图像输入'], ['image_output_price', '图像输出']] as const
+const effortLabels = new Map([
+  ['minimal', '极低'], ['low', '低'], ['medium', '中'], ['high', '高'], ['xhigh', '极高'], ['max', '最高'],
+])
+const unitLabels = {
+  token: '每百万 Token 的北辰余额单位',
+  request: '北辰余额单位/次',
+  second: '北辰余额单位/秒',
+  unknown: '官网原值（单位未知）',
 }
 
-function panelPrices(tier: BeichenPriceTier) {
+type PriceUnit = keyof typeof unitLabels
+type PriceField = readonly [(typeof tokenPrices | typeof imagePrices)[number][0] | 'per_request_price', string]
+type PriceGroup = readonly [PriceUnit, readonly PriceField[]]
+
+function priceGroups(mode: BeichenPriceTier['billing_mode']): PriceGroup[] {
+  switch (mode) {
+    case 'token': return [['token', [...tokenPrices, ...imagePrices]]]
+    case 'per_request': return [['request', [['per_request_price', '每次请求']]]]
+    case 'video': return [['second', [['per_request_price', '每秒']]]]
+    case 'image': return [
+      ['request', [imagePrices[1]]],
+      ['unknown', [imagePrices[0], ['per_request_price', '基础价格']]],
+    ]
+    default: return [['unknown', [...tokenPrices, ...imagePrices, ['per_request_price', '基础价格']]]]
+  }
+}
+
+function priceLines(tier: BeichenPriceTier, mode: BeichenPriceTier['billing_mode'], rate: Decimal | null = null) {
   const lines: string[] = []
-  const token = tokenPrices.filter(([key]) => key in tier).map(([key, label]) => label + ' ' + conditionNumber(tier[key]))
-  if (token.length) lines.push('每 Token · ' + token.join(' · '))
-  if ('per_request_price' in tier) lines.push('每次请求 ' + conditionNumber(tier.per_request_price))
-  for (const [key, label] of [['image_input_price', '图像输入'], ['image_output_price', '图像输出']] as const) {
-    if (key in tier) lines.push(label + ' ' + conditionNumber(tier[key]) + '（官网原价）')
+  for (const [unit, fields] of priceGroups(mode)) {
+    if (rate && unit === 'unknown') continue
+    const values: string[] = []
+    for (const [key, label] of fields) {
+      const value = nonNegativeDecimal(tier[key])
+      if (!value) continue
+      const coefficient = value.coefficient * (rate?.coefficient ?? 1n)
+      const scale = value.scale + (rate?.scale ?? 0) - (unit === 'token' ? 6 : 0)
+      values.push(label + ' ' + formatDecimal({ coefficient, scale }))
+    }
+    if (values.length) lines.push(unitLabels[unit] + ' · ' + values.join(' · '))
   }
   return lines
 }
 
-function conditionalPrices(terms?: BeichenPriceConditions | null) {
-  if (!terms || typeof terms !== 'object') return '按条件计价 · 条件待同步'
-  const lines = panelPrices(terms)
-  if (Array.isArray(terms.intervals)) {
-    for (const tier of terms.intervals) {
-      if (!tier || typeof tier !== 'object') continue
-      const prices = panelPrices(tier)
-      lines.push('阶梯（Token 下限 ' + conditionNumber(tier.min_tokens) + '，上限 ' + conditionNumber(tier.max_tokens) + '） · ' +
-        (prices.join(' · ') || '单价待同步'))
+function hasNumericPrice(tier: BeichenPriceTier) {
+  return Object.entries(tier).some(([key, value]) => key.endsWith('_price') && typeof value === 'number')
+}
+
+function tokenBoundary(raw: number | string | null | undefined, upper = false) {
+  if (raw == null) return { label: upper && raw === null ? '无上限' : '未知', tokens: null, invalid: false }
+  const parsed = decimal(raw)
+  if (!parsed) return { label: '无效', tokens: null, invalid: true }
+  const label = formatDecimal(parsed)
+  const invalid = parsed.coefficient < 0n || label.includes('.')
+  return { label, tokens: invalid ? null : BigInt(label), invalid }
+}
+
+function formatPriceConditions(terms: BeichenPriceConditions, rate: Decimal | null) {
+  const standard = priceLines(terms, terms.billing_mode)
+  const actual = rate ? priceLines(terms, terms.billing_mode, rate) : []
+  let precisionUnknown = hasNumericPrice(terms)
+  for (const tier of Array.isArray(terms.intervals) ? terms.intervals : []) {
+    if (!tier || typeof tier !== 'object' || Array.isArray(tier)) continue
+    precisionUnknown ||= hasNumericPrice(tier)
+    const from = tokenBoundary(tier.min_tokens)
+    const to = tokenBoundary(tier.max_tokens, true)
+    const invalid = from.invalid || to.invalid || (from.tokens != null && to.tokens != null && from.tokens > to.tokens)
+    const label = '上下文分档（Token 下限 ' + from.label + '，上限 ' + to.label + '）'
+    const mode = tier.billing_mode ?? terms.billing_mode
+    const tierStandard = priceLines(tier, mode)
+    standard.push(label + (invalid ? ' · 档位无效' : ''), ...(tierStandard.length ? tierStandard : ['分档单价未知']))
+    if (rate && !invalid) {
+      const tierActual = priceLines(tier, mode, rate)
+      if (tierActual.length) actual.push(label, ...tierActual)
     }
   }
-  const efforts = terms.reasoning_effort_multipliers
-  if (efforts) {
-    for (const [key, label] of Object.entries(effortLabels)) {
-      if (efforts[key] != null) lines.push('推理强度（' + label + '）倍率 ' + conditionNumber(efforts[key]) + '×')
+
+  for (const [effort, value] of Object.entries(terms.reasoning_effort_multipliers ?? {})) {
+    const parsed = nonNegativeDecimal(value)
+    if (parsed) {
+      standard.push('推理强度（' + (effortLabels.get(effort) ?? effort) + '）倍率 ' + formatDecimal(parsed) + '×')
     }
   }
-  return ['官网条件报价（北辰余额单位）', ...(lines.length ? lines : ['条件待同步'])].join('\n')
+  return { standard: standard.join('\n') || null, actual: actual.join('\n') || null, precisionUnknown }
+}
+
+function legacyEffectivePrice(rates: BeichenModel['upstream_rates']) {
+  const formatted = priceFields.map(({ key, label }) => {
+    const value = rates?.[key]
+    return { label, amount: nonNegativeDecimal(value) ? scaledNumber(value, 6) : null }
+  })
+  if (formatted.every(({ amount }) => amount === null)) return null
+  return unitLabels.token + ' · ' + formatted.map(({ label, amount }) => label + ' ' + (amount ?? '未知')).join(' · ')
+}
+
+type Decimal = { coefficient: bigint; scale: number }
+
+function decimal(value: unknown): Decimal | null {
+  if (typeof value === 'number' && (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value)))) return null
+  const raw = typeof value === 'number' || typeof value === 'string' ? String(value).trim() : ''
+  if (!raw || raw.length > 512) return null
+  const match = /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:e([+-]?\d+))?$/i.exec(raw)
+  if (!match) return null
+  const exponent = Number(match[5] ?? '0')
+  if (Math.abs(exponent) > 1000) return null
+  const fraction = match[3] ?? match[4] ?? ''
+  const coefficient = BigInt((match[2] ?? '') + fraction)
+  return { coefficient: match[1] === '-' ? -coefficient : coefficient, scale: fraction.length - exponent }
+}
+
+function nonNegativeDecimal(value: unknown) {
+  const amount = decimal(value)
+  return amount && amount.coefficient >= 0n ? amount : null
+}
+
+function formatDecimal({ coefficient, scale }: Decimal) {
+  if (coefficient === 0n) return '0'
+  const sign = coefficient < 0n ? '-' : ''
+  const digits = (coefficient < 0n ? -coefficient : coefficient).toString()
+  if (scale <= 0) return sign + digits + '0'.repeat(-scale)
+  const padded = digits.padStart(scale + 1, '0')
+  const fraction = padded.slice(-scale).replace(/0+$/, '')
+  return sign + padded.slice(0, -scale) + (fraction ? '.' + fraction : '')
 }
 
 export const priceFields = [

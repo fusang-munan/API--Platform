@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
 import type { BeichenOverview } from '../../api/types'
+import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { schoolCatalog } from '../../utils/beichenModels'
 import { schoolDay, statusLabel } from '../../utils/format'
 import BeichenRecentReceipts from './BeichenRecentReceipts.vue'
@@ -36,6 +37,7 @@ const workspaceUrl = computed(() => {
 })
 
 async function load() {
+  if (loading.value) return
   loading.value = true
   error.value = ''
   try {
@@ -48,8 +50,8 @@ async function load() {
   }
 }
 
-function refreshOverview() {
-  if (!loading.value && !updating.value) void load()
+async function refreshOverview() {
+  if (!syncing.value && !updating.value) await load()
 }
 
 async function syncPrices() {
@@ -67,7 +69,7 @@ async function syncPrices() {
 }
 
 async function changeStatus(row: (typeof rows.value)[number], enable: boolean) {
-  if (updating.value || loading.value) return
+  if (updating.value || loading.value || syncing.value) return
   updating.value = row.model
   error.value = ''
   try {
@@ -83,7 +85,7 @@ async function changeStatus(row: (typeof rows.value)[number], enable: boolean) {
     updating.value = ''
   }
 }
-onMounted(load)
+useVisibilityPolling(refreshOverview, 60_000)
 </script>
 
 <template>
@@ -96,7 +98,7 @@ onMounted(load)
     @refresh-overview="refreshOverview" />
   <section aria-label="北辰模型目录">
     <div class="model-toolbar">
-      <button type="button" class="button ghost" :disabled="loading || Boolean(updating)" @click="load">刷新模型</button>
+      <button type="button" class="button ghost" :disabled="loading || syncing || Boolean(updating)" @click="refreshOverview">刷新模型</button>
       <button type="button" class="button secondary" :disabled="loading || syncing || Boolean(updating)" @click="syncPrices">
         {{ syncing ? '同步中…' : '立即同步价格' }}
       </button>
@@ -114,22 +116,26 @@ onMounted(load)
             <td>
               <span>{{ row.status === 'not_configured' ? '未配置' : statusLabel(row.status ?? undefined) || '待同步' }}</span>
               <div class="model-actions">
-                <button v-if="row.canEnable" type="button" class="button secondary" :disabled="loading || Boolean(updating)"
+                <button v-if="row.canEnable" type="button" class="button secondary" :disabled="loading || syncing || Boolean(updating)"
                   :aria-label="(row.status === 'active' ? '重新启用 ' : '启用 ') + row.model" @click="changeStatus(row, true)">
                   {{ row.status === 'active' ? '重新启用' : '启用' }}
                 </button>
-                <button v-if="row.canDisable" type="button" class="button secondary" :disabled="loading || Boolean(updating)"
+                <button v-if="row.canDisable" type="button" class="button secondary" :disabled="loading || syncing || Boolean(updating)"
                   :aria-label="'禁用 ' + row.model" @click="changeStatus(row, false)">禁用</button>
                 <small v-else-if="row.status !== 'active' && !row.canEnable" class="muted">{{ row.canEnable === false ? '暂不可启用' : '启用条件待同步' }}</small>
               </div>
             </td>
             <td>
-              <div v-for="quote in row.quotes" :key="JSON.stringify([quote.multiplier, quote.price])" class="quote-row">
-                <span class="quote-multiplier">{{ quote.multiplier }}</span>
-                <span v-if="quote.price" class="price-detail">{{ quote.price }}</span>
-                <small v-else class="muted">单价待同步</small>
+              <div v-for="quote in row.quotes" :key="quote.key" class="quote-row" :data-price-status="quote.status">
+                <strong class="quote-multiplier">倍率 {{ quote.multiplier }}</strong>
+                <dl class="quote-prices">
+                  <div><dt>官网标准价</dt><dd class="price-detail">{{ quote.standard ?? '—' }}</dd></div>
+                  <div><dt>实际单价（已乘倍率）</dt><dd class="price-detail">{{ quote.actual ?? '—' }}</dd></div>
+                </dl>
+                <span class="quote-status">{{ quote.statusLabel }}</span>
+                <small v-for="note in quote.notes" :key="note" class="muted">{{ note }}</small>
               </div>
-              <span v-if="!row.quotes.length">待同步</span>
+              <span v-if="!row.quotes.length" class="muted">暂无可显示报价的北辰首选线路</span>
             </td>
           </tr>
         </tbody>
@@ -146,6 +152,9 @@ onMounted(load)
 .quote-row { display: grid; gap: .2rem; }
 .quote-row + .quote-row { margin-top: .7rem; padding-top: .7rem; border-top: 1px solid var(--line, #e5e7eb); }
 .quote-multiplier { font-variant-numeric: tabular-nums; }
-.price-detail { display: block; white-space: pre-line; color: var(--ink-soft); }
+.quote-prices { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr)); gap: .4rem 1rem; margin: .2rem 0; }
+.quote-prices dt { color: var(--ink); font-weight: 650; }
+.price-detail { white-space: pre-line; overflow-wrap: anywhere; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+.quote-status { color: var(--ink-soft); font-size: 13px; font-weight: 650; }
 th[scope="row"] { white-space: normal; overflow-wrap: anywhere; }
 </style>
