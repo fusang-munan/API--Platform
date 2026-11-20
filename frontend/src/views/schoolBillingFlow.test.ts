@@ -78,7 +78,9 @@ async function fetchFixture(url: string, init?: RequestInit) {
       { kind: 'billing', credential_id: 'stale', last_error: '本轮读取失败', effective_multiplier: 0.3 },
     ],
     models: [
-      { credential_id: 'chosen', model: 'shared', price_status: 'confirmed', upstream_rates: {
+      { credential_id: 'chosen', model: 'shared', price_status: 'confirmed', price_conditions: {
+        input_price: '0.0000001', output_price: '0.0000002', cache_read_price: '0', cache_write_price: null,
+      }, upstream_rates: {
         input: '0.000000031', output: '2', cache_read: '0', cache_write: null,
       } },
       { credential_id: 'cheap', model: 'shared', price_status: 'conditional', price_conditions: { cache_write_1h_price: 0.1 },
@@ -162,12 +164,10 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   expect(paused.find('button').exists()).toBe(false)
   expect(historical.text()).toContain('启用条件待同步')
   expect(table.text()).toContain('北辰官网需要学校后台重新授权')
-  await shared.get('summary').trigger('click')
-  expect(shared.get('details').text()).toContain('输入 0.000000000000031 · 输出 0.000002 · 缓存读取 0 · 缓存写入 未知')
-  const conditional = shared.findAll('details')[1]
-  await conditional.get('summary').trigger('click')
-  expect(conditional.text()).toContain('每 Token · 缓存写入（1 小时） 0 · 缓存写入（12 小时） 0.000004')
-  expect(conditional.text()).toContain('阶梯（Token 下限 200000，上限 未知） · 每 Token · 输入 0.000008000000000000000019')
+  expect(shared.text()).toContain('输入 0.000000000000031 · 输出 0.000002 · 缓存读取 0 · 缓存写入 未知')
+  expect(shared.text()).toContain('官网标准价 · 每 Token · 输入 0.0000001 · 输出 0.0000002 · 缓存读取 0')
+  expect(shared.text()).toContain('每 Token · 缓存写入（1 小时） 0 · 缓存写入（12 小时） 0.000004')
+  expect(shared.text()).toContain('阶梯（Token 下限 200000，上限 未知） · 每 Token · 输入 0.000008000000000000000019')
   expect(table.text()).not.toMatch(/隐藏的|chosen|cheap|school-alias|OpenAI|Anthropic|协议|路由|渠道/i)
   expect(writes).not.toHaveBeenCalled()
   await button('禁用', shared).trigger('click')

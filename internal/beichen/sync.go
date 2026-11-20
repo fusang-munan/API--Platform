@@ -177,7 +177,7 @@ func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credenti
 			info, err = parseBilling(body)
 		}
 		access, accessErr := s.PanelStatus(ctx, job.provider, job.credential)
-		group := access.GroupID
+		group := billingPanelGroup(access, info)
 		var quote panelQuote
 		if accessErr != nil {
 			quote.err = errors.New("读取北辰面板配置失败")
@@ -209,6 +209,19 @@ func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credenti
 	default:
 		return fetchResult{err: errors.New("北辰同步任务类型无效")}
 	}
+}
+
+// The key billing response is an independent source for the group. A missing
+// discovery row must not suppress the price snapshot when the key itself
+// already identifies the group.
+func billingPanelGroup(access PanelAccessStatus, info billingInfo) int64 {
+	if access.GroupID > 0 {
+		return access.GroupID
+	}
+	if info.GroupID != nil && *info.GroupID > 0 {
+		return *info.GroupID
+	}
+	return 0
 }
 
 func (s *Service) fetchUsage(ctx context.Context, job syncJob, key string, manual bool) fetchResult {
