@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -92,6 +93,102 @@ func TestDeepSeekAnthropicUpstreamUsesOfficialPrefix(t *testing.T) {
 	}
 	if request.Header.Get("Accept-Encoding") != "identity" {
 		t.Fatalf("upstream Accept-Encoding = %q", request.Header.Get("Accept-Encoding"))
+	}
+}
+
+func TestAnthropicVersionDefaultsWhenMissing(t *testing.T) {
+	t.Parallel()
+	header := http.Header{}
+	ensureAnthropicVersion(header)
+	if got := header.Get("anthropic-version"); got != defaultAnthropicVersion {
+		t.Fatalf("default anthropic-version = %q", got)
+	}
+	header.Set("anthropic-version", "2024-01-01")
+	ensureAnthropicVersion(header)
+	if got := header.Get("anthropic-version"); got != "2024-01-01" {
+		t.Fatalf("explicit anthropic-version was overwritten: %q", got)
+	}
+}
+
+func TestAnthropicUpstreamRequestAddsDefaultVersion(t *testing.T) {
+	t.Parallel()
+	replay, err := captureBody(io.NopCloser(strings.NewReader(`{"model":"claude-test","max_tokens":1,"messages":[]}`)), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replay.Close()
+	original := httptest.NewRequest(http.MethodPost, "https://nebula.example/v1/messages", nil)
+	original.Header.Set("Content-Type", "application/json")
+	original.Header.Set("x-api-key", "nebula-key")
+	request, cleanup, err := (&Gateway{}).upstreamRequest(original, replay, route{
+		Binding:  &ent.ModelBinding{UpstreamModelName: "claude-test", Adapter: modelbinding.AdapterAnthropic},
+		Provider: &ent.Provider{BaseURL: "https://api.anthropic.com"}, Credential: "provider-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if got := request.Header.Get("anthropic-version"); got != defaultAnthropicVersion {
+		t.Fatalf("upstream anthropic-version = %q", got)
+	}
+}
+
+func TestModelsAcceptXAPIKeyAndBearerHeaders(t *testing.T) {
+	t.Parallel()
+	request := httptest.NewRequest(http.MethodGet, "https://nebula.example/v1/models", nil)
+	request.Header.Set("x-api-key", "anthropic-style-key")
+	request.Header.Set("Authorization", "Bearer bearer-style-key")
+	got := apiKeyCandidates(request)
+	if len(got) != 2 || got[0] != "anthropic-style-key" || got[1] != "bearer-style-key" {
+		t.Fatalf("unexpected candidates: %#v", got)
+	}
+
+	duplicate := httptest.NewRequest(http.MethodGet, "https://nebula.example/v1/models", nil)
+	duplicate.Header.Set("x-api-key", "same-key")
+	duplicate.Header.Set("Authorization", "Bearer same-key")
+	if got := apiKeyCandidates(duplicate); len(got) != 1 {
+		t.Fatalf("duplicate credential was not removed: %#v", got)
+	}
+}
+
+func TestAuthenticateAPIKeyUsesHeaderThatValidates(t *testing.T) {
+	t.Parallel()
+	request := httptest.NewRequest(http.MethodGet, "https://nebula.example/v1/models", nil)
+	request.Header.Set("x-api-key", "stale-key")
+	request.Header.Set("Authorization", "Bearer valid-key")
+	attempts := make([]string, 0, 2)
+	key, err := authenticateAPIKey(request, func(raw string) (*ent.APIKey, error) {
+		attempts = append(attempts, raw)
+		if raw == "valid-key" {
+			return &ent.APIKey{}, nil
+		}
+		return nil, errors.New("invalid API key")
+	})
+	if err != nil || key == nil {
+		t.Fatalf("valid bearer header was rejected: %v", err)
+	}
+	if len(attempts) != 2 || attempts[0] != "stale-key" || attempts[1] != "valid-key" {
+		t.Fatalf("unexpected verification order: %#v", attempts)
+	}
+}
+
+func TestGatewayErrorMessagesGiveChineseNextStep(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		status int
+		code   string
+		want   string
+	}{
+		{http.StatusUnauthorized, "invalid_api_key", "申请密钥"},
+		{http.StatusForbidden, "forbidden", "重新申领 Key"},
+		{http.StatusNotFound, "resource_not_found", "/v1"},
+		{http.StatusBadRequest, "model_not_allowed", "模型广场"},
+	}
+	for _, test := range tests {
+		message := gatewayErrorMessage(test.status, test.code, "fallback")
+		if !strings.Contains(message, test.want) {
+			t.Fatalf("message for %d/%s = %q, want %q", test.status, test.code, message, test.want)
+		}
 	}
 }
 

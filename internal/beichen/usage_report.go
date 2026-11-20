@@ -42,16 +42,17 @@ func reportPeriod(value string, now time.Time) (ReportPeriod, error) {
 }
 
 type UsageTotals struct {
-	Credits          string `json:"credits"`
-	Tokens           int64  `json:"tokens"`
-	InputTokens      int64  `json:"input_tokens"`
-	OutputTokens     int64  `json:"output_tokens"`
-	CacheReadTokens  int64  `json:"cache_read_tokens"`
-	CacheWriteTokens int64  `json:"cache_write_tokens"`
-	Calls            int64  `json:"calls"`
-	PendingCalls     int64  `json:"pending_calls"`
-	Students         int64  `json:"students"`
-	Keys             int64  `json:"keys"`
+	Credits                   string `json:"credits"`
+	Tokens                    int64  `json:"tokens"`
+	InputTokens               int64  `json:"input_tokens"`
+	OutputTokens              int64  `json:"output_tokens"`
+	CacheReadTokens           int64  `json:"cache_read_tokens"`
+	CacheWriteTokens          int64  `json:"cache_write_tokens"`
+	Calls                     int64  `json:"calls"`
+	PendingCalls              int64  `json:"pending_calls"`
+	ChargedTokensMissingCalls int64  `json:"charged_tokens_missing_calls"`
+	Students                  int64  `json:"students"`
+	Keys                      int64  `json:"keys"`
 }
 
 type ModelUsageMetrics struct {
@@ -68,7 +69,7 @@ type ModelUsageItem struct {
 
 type ModelUsageKeyItem struct {
 	Model string `json:"model"`
-	UsageTotals
+	ModelUsageMetrics
 }
 
 type ModelUsageStudent struct {
@@ -87,7 +88,7 @@ type ModelUsageKey struct {
 	UserName    string    `json:"user_name"`
 	ProjectID   uuid.UUID `json:"project_id"`
 	ProjectName string    `json:"project_name"`
-	UsageTotals
+	ModelUsageMetrics
 	Models []ModelUsageKeyItem `json:"models"`
 }
 
@@ -100,90 +101,84 @@ type ModelUsageReport struct {
 }
 
 // attributed 保留日对账的发送时刻及渠道归属；只在全校查询时额外排除其他供应商。
-// 缺少任一缓存分项时无法确认总 Token，整笔不计入 Token 汇总，调用数仍保留。
+// 区间对账和学校用量都按已归一化分项累计，扣款状态独立于 Token 回报。
 const reportAttributionSQL = `
 WITH attributed AS (
  SELECT ` + attributedColumnsSQL + `,
    c.project_id, c.project_name, c.user_id, c.user_name, c.api_key_id, c.api_key_name,
-   c.beichen_base_credits, c.beichen_school_multiplier`
+   c.beichen_school_multiplier, c.total_tokens, c.protocol, c.prompt_tokens, c.completion_tokens,
+   c.cache_hit_tokens, c.cache_miss_tokens, c.cache_write_tokens AS raw_cache_write_tokens`
 
+// 缺失量取原始用量可以推知且尚未计入的部分。OpenAI 的输入含缓存，估算时避免重复相加。
 const reportCallsFromSQL = attributedFromSQL + `
    AND ($1::uuid IS NOT NULL OR EXISTS (
      SELECT 1 FROM providers p
      WHERE p.id = COALESCE(c.provider_id, (SELECT pc.provider_id FROM provider_credentials pc WHERE pc.id = a.credential_id))
        AND ` + beichenProvider + `
    ))
+), report_tokens AS (
+ SELECT a.*,
+   num_nonnulls(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) AS token_parts,
+   COALESCE(input_tokens, 0)::numeric + COALESCE(output_tokens, 0) +
+     COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0) AS tokens
+ FROM attributed a
 ), report_calls AS (
  SELECT a.*,
-   beichen_state IS DISTINCT FROM 'pending_review' AND input_tokens IS NOT NULL
-     AND output_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL AS tokens_reported,
-   CASE WHEN beichen_state IS DISTINCT FROM 'pending_review' THEN
-     COALESCE(input_tokens::numeric + output_tokens + cache_read_tokens + cache_write_tokens, 0)
-   ELSE 0::numeric END AS tokens
- FROM attributed a
+   CASE WHEN token_parts < 4 THEN GREATEST(tokens, total_tokens,
+     CASE WHEN protocol = 'anthropic' THEN
+       COALESCE(cache_miss_tokens, prompt_tokens, 0)::numeric + COALESCE(cache_hit_tokens, 0) + COALESCE(raw_cache_write_tokens, 0)
+     ELSE GREATEST(prompt_tokens,
+       COALESCE(cache_miss_tokens, 0)::numeric + COALESCE(cache_hit_tokens, 0) + COALESCE(raw_cache_write_tokens, 0))
+     END + COALESCE(completion_tokens, 0)) - tokens
+   ELSE 0 END AS missing_tokens
+ FROM report_tokens a
 )`
 
 const reportCallsSQL = reportAttributionSQL + reportCallsFromSQL
 
+const tokenCompletenessSQL = `CASE WHEN min(token_parts) = 4 THEN 'complete'
+   WHEN max(token_parts) > 0 THEN 'partial' ELSE 'missing' END`
+
+const chargedTokensMissingCallsSQL = `count(*) FILTER (WHERE beichen_state = 'charged' AND token_parts < 4)`
+
 const usageTotalsJSONSQL = `jsonb_build_object(
  'credits', trim_scale(COALESCE(sum(beichen_credit_exact) FILTER (WHERE beichen_state = 'charged'), 0))::text,
  'tokens', COALESCE(sum(tokens), 0),
- 'input_tokens', COALESCE(sum(input_tokens) FILTER (WHERE tokens_reported), 0),
- 'output_tokens', COALESCE(sum(output_tokens) FILTER (WHERE tokens_reported), 0),
- 'cache_read_tokens', COALESCE(sum(cache_read_tokens) FILTER (WHERE tokens_reported), 0),
- 'cache_write_tokens', COALESCE(sum(cache_write_tokens) FILTER (WHERE tokens_reported), 0), 'calls', count(*),
+ 'input_tokens', COALESCE(sum(input_tokens), 0),
+ 'output_tokens', COALESCE(sum(output_tokens), 0),
+ 'cache_read_tokens', COALESCE(sum(cache_read_tokens), 0),
+ 'cache_write_tokens', COALESCE(sum(cache_write_tokens), 0), 'calls', count(*),
  'pending_calls', count(*) FILTER (WHERE beichen_state = 'pending_review'),
+ 'charged_tokens_missing_calls', ` + chargedTokensMissingCallsSQL + `,
  'students', count(DISTINCT user_id), 'keys', count(DISTINCT api_key_id))`
 
 const modelUsageMetricsJSONSQL = usageTotalsJSONSQL + ` || jsonb_build_object(
- 'cache_hit_rate', sum(cache_read_tokens) FILTER (WHERE tokens_reported) /
-   NULLIF(sum(input_tokens::numeric + cache_read_tokens) FILTER (WHERE tokens_reported), 0),
+ 'cache_hit_rate', sum(cache_read_tokens) FILTER (WHERE token_parts = 4) /
+   NULLIF(sum(input_tokens::numeric + cache_read_tokens) FILTER (WHERE token_parts = 4), 0),
  'tokens_missing', COALESCE(sum(missing_tokens), 0),
- 'completeness', CASE
-   WHEN count(*) FILTER (WHERE tokens_reported) = 0 THEN 'missing'
-   WHEN bool_and(tokens_reported) THEN 'complete'
-   ELSE 'partial' END)`
+ 'completeness', ` + tokenCompletenessSQL + `)`
 
-// 待核调用优先采用已归一化的 Token。分项不全或中断时，保留已知的总量或可确定的部分。
-// Anthropic 的输入不含缓存，其他协议只取已知的输入与缓存合计中的较大值，避免重复计数。
-const modelUsageSQL = reportAttributionSQL + `,
-   c.total_tokens, c.protocol, c.prompt_tokens, c.completion_tokens,
-   c.cache_hit_tokens, c.cache_miss_tokens, c.cache_write_tokens AS raw_cache_write_tokens
-` + reportCallsFromSQL + `,
-usage_calls AS (
- SELECT model, user_id, user_name, project_id, project_name, api_key_id, api_key_name,
-   beichen_state, beichen_credit_exact, tokens, tokens_reported,
-   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-   CASE WHEN NOT tokens_reported THEN
-   COALESCE(input_tokens::numeric + output_tokens + cache_read_tokens + cache_write_tokens,
-     GREATEST(total_tokens,
-       CASE WHEN protocol = 'anthropic' THEN
-         COALESCE(cache_miss_tokens, prompt_tokens, 0)::numeric + COALESCE(cache_hit_tokens, 0) + COALESCE(raw_cache_write_tokens, 0)
-       ELSE GREATEST(prompt_tokens,
-         COALESCE(cache_miss_tokens, 0)::numeric + COALESCE(cache_hit_tokens, 0) + COALESCE(raw_cache_write_tokens, 0))
-       END + COALESCE(completion_tokens, 0))) END AS missing_tokens
- FROM report_calls
-),
+const modelUsageSQL = reportCallsSQL + `,
 models AS (
  SELECT model, jsonb_build_object('model', model) || ` + modelUsageMetricsJSONSQL + ` AS item
- FROM usage_calls GROUP BY model
+ FROM report_calls GROUP BY model
 ), student_models AS (
  SELECT project_id, user_id, model, jsonb_build_object('model', model) || ` + modelUsageMetricsJSONSQL + ` AS item
- FROM usage_calls GROUP BY project_id, user_id, model
+ FROM report_calls GROUP BY project_id, user_id, model
 ), key_models AS (
- SELECT api_key_id, model, jsonb_build_object('model', model) || ` + usageTotalsJSONSQL + ` AS item
- FROM usage_calls GROUP BY api_key_id, model
+ SELECT api_key_id, model, jsonb_build_object('model', model) || ` + modelUsageMetricsJSONSQL + ` AS item
+ FROM report_calls GROUP BY api_key_id, model
 ), students AS (
  SELECT project_id, user_id, max(user_name) AS user_name, max(project_name) AS project_name,
    ` + modelUsageMetricsJSONSQL + ` AS metrics
- FROM usage_calls GROUP BY project_id, user_id
+ FROM report_calls GROUP BY project_id, user_id
 ), keys AS (
  SELECT api_key_id, max(api_key_name) AS api_key_name, user_id, max(user_name) AS user_name,
-   project_id, max(project_name) AS project_name, ` + usageTotalsJSONSQL + ` AS metrics
- FROM usage_calls GROUP BY api_key_id, user_id, project_id
+   project_id, max(project_name) AS project_name, ` + modelUsageMetricsJSONSQL + ` AS metrics
+ FROM report_calls GROUP BY api_key_id, user_id, project_id
 )
 SELECT jsonb_build_object(
- 'totals', (SELECT ` + modelUsageMetricsJSONSQL + ` FROM usage_calls),
+ 'totals', (SELECT ` + modelUsageMetricsJSONSQL + ` FROM report_calls),
  'models', COALESCE((SELECT jsonb_agg(item ORDER BY model) FROM models), '[]'::jsonb),
  'students', COALESCE((SELECT jsonb_agg(jsonb_build_object(
    'user_id', s.user_id, 'user_name', s.user_name, 'project_id', s.project_id, 'project_name', s.project_name,

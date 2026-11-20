@@ -13,6 +13,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
+	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
 // Both preview and publication use the same snapshot and route selection.
@@ -51,7 +53,7 @@ SELECT k.model_id::text,k.raw_entry,p.name::text,c.id,c.label::text,
  CASE WHEN d.last_error IS NULL AND d.last_success>=c.updated_at
    AND d.last_success>statement_timestamp()-interval '16 minutes'
    AND (snap.expires_at IS NULL OR snap.expires_at>statement_timestamp())
- THEN mv.multiplier::text END
+ THEN mv.multiplier::text END, to_json(k.supported_protocols)
 FROM provider_model_catalog k JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
 JOIN providers p ON p.id=c.provider_id
 LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='billing'
@@ -73,19 +75,19 @@ ORDER BY lower(k.model_id::text),c.id`
 	index := map[string]*activationModel{}
 	rates := map[uuid.UUID]*json.Number{}
 	for rows.Next() {
-		var e catalog.ProviderEntry
-		var raw []byte
+		var modelID string
+		var raw, protocols []byte
 		var providerName, label string
 		var key uuid.UUID
 		var available bool
 		var rate *string
-		if err := rows.Scan(&e.ID, &raw, &providerName, &key, &label, &available, &rate); err != nil {
+		if err := rows.Scan(&modelID, &raw, &providerName, &key, &label, &available, &rate, &protocols); err != nil {
 			return nil, err
 		}
-		name := strings.ToLower(e.ID)
+		name := strings.ToLower(modelID)
 		m := index[name]
 		if m == nil {
-			m = &activationModel{name: e.ID, provider: provider, defaults: map[string]PreferredRoute{}, schools: map[string]*activationSchool{}}
+			m = &activationModel{name: modelID, provider: provider, defaults: map[string]PreferredRoute{}, schools: map[string]*activationSchool{}}
 			index[name] = m
 			models = append(models, m)
 		}
@@ -93,19 +95,20 @@ ORDER BY lower(k.model_id::text),c.id`
 		if !available {
 			continue
 		}
-		if err := json.Unmarshal(raw, &e.Raw); err != nil {
+		entry, err := storedCatalogEntry(modelID, raw, protocols)
+		if err != nil {
 			return nil, err
 		}
 		if rate != nil {
 			n := json.Number(*rate)
 			rates[key] = &n
 		}
-		for _, adapter := range catalog.AdaptersFromUpstream(e) {
-			if _, ok := m.defaults[string(adapter)]; ok {
+		for _, protocol := range catalog.RegisteredProtocols(entry) {
+			if _, ok := m.defaults[protocol]; ok {
 				continue
 			}
-			m.defaults[string(adapter)] = PreferredRoute{SchoolModel: m.name, UpstreamModel: e.ID, ProviderName: providerName, CredentialLabel: &label,
-				Adapter: string(adapter), ProviderID: provider, CredentialID: &key, Priority: catalog.DefaultBindingPriority(adapter), State: "candidate", EffectiveMultiplier: rates[key]}
+			m.defaults[protocol] = PreferredRoute{SchoolModel: m.name, UpstreamModel: modelID, ProviderName: providerName, CredentialLabel: &label,
+				Adapter: protocol, ProviderID: provider, CredentialID: &key, Priority: catalog.DefaultBindingPriority(modelbinding.Adapter(protocol)), State: "candidate", EffectiveMultiplier: rates[key]}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -114,12 +117,15 @@ ORDER BY lower(k.model_id::text),c.id`
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	if len(models) == 0 {
+	if len(models) == 0 && source != "" {
 		return models, nil
 	}
 	bound, err := tx.QueryContext(ctx, `
 WITH north AS (
  SELECT DISTINCT model_id FROM provider_model_catalog WHERE provider_id=$1 AND status='active' AND ($2::text='' OR model_id=$2::citext)
+ UNION
+ SELECT btrim(b.upstream_model_name)::citext FROM model_bindings b JOIN models s ON s.id = b.model_id
+ WHERE b.provider_id=$1 AND $2::text='' AND s.status='active' AND btrim(b.upstream_model_name)<>''
 ), names AS (
  SELECT n.model_id AS upstream,m.id FROM north n JOIN models m ON m.model_id=n.model_id
  UNION
@@ -153,7 +159,13 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source)
 			&priority, &active, &reachable, &key, &label); err != nil {
 			return nil, err
 		}
-		m := index[strings.ToLower(source)]
+		group := strings.ToLower(source)
+		m := index[group]
+		if m == nil {
+			m = &activationModel{name: source, provider: provider, defaults: map[string]PreferredRoute{}, schools: map[string]*activationSchool{}}
+			index[group] = m
+			models = append(models, m)
+		}
 		name := strings.ToLower(school.name)
 		if m.schools[name] == nil {
 			m.schools[name] = &school
@@ -169,6 +181,7 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source)
 		s := m.schools[name]
 		s.bindings = append(s.bindings, activationBinding{id: *id, route: r, active: *active, reachable: *reachable})
 	}
+	sort.Slice(models, func(i, j int) bool { return strings.ToLower(models[i].name) < strings.ToLower(models[j].name) })
 	return models, bound.Err()
 }
 
@@ -291,15 +304,33 @@ type activationPrice int
 
 const (
 	activationPriceMissing activationPrice = iota
+	activationPriceUnusableConditional
 	activationPriceFixed
 	activationPriceConditional
 
 	activationManualPriceMessage = "北辰线路缺少可自动结算的报价，请先手动定价"
 )
 
+func (price activationPrice) ready() bool {
+	return price == activationPriceFixed || price == activationPriceConditional
+}
+
+func routePriceReadiness(fixed bool, terms json.RawMessage) activationPrice {
+	switch {
+	case fixed:
+		return activationPriceFixed
+	case activationTokenPriceReady(terms):
+		return activationPriceConditional
+	case conditionalPanelPricing(terms):
+		return activationPriceUnusableConditional
+	default:
+		return activationPriceMissing
+	}
+}
+
 // Check the North routes that can actually be used after publication,
 // including fallbacks hidden by a higher-priority route in the preview.
-func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx) (activationPrice, error) {
+func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx, observed map[string]map[uuid.UUID]*Model) (activationPrice, error) {
 	type routeKey struct {
 		credential uuid.UUID
 		model      string
@@ -312,16 +343,23 @@ func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx) (activat
 			continue
 		}
 		seen[key] = true
-		var fixed bool
-		var terms []byte
-		if err := tx.QueryRowContext(ctx, activationPriceSQL, key.credential, key.model).Scan(&fixed, &terms); err != nil {
-			return activationPriceMissing, err
-		}
-		if !fixed {
-			if !activationTokenPriceReady(terms) {
-				return activationPriceMissing, nil
+		record := observed[strings.ToLower(key.model)][key.credential]
+		var price activationPrice
+		if record != nil && record.Model == key.model {
+			price = record.priceReadiness
+		} else {
+			var fixed bool
+			var terms []byte
+			if err := tx.QueryRowContext(ctx, activationPriceSQL, key.credential, key.model).Scan(&fixed, &terms); err != nil {
+				return activationPriceMissing, err
 			}
-			readiness = activationPriceConditional
+			price = routePriceReadiness(fixed, terms)
+		}
+		if !price.ready() {
+			return price, nil
+		}
+		if price == activationPriceConditional {
+			readiness = price
 		}
 	}
 	return readiness, nil
@@ -329,8 +367,11 @@ func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx) (activat
 
 // Both price_conditions_exact and price_conditions come from model_pricing.
 // Read that original JSON without converting any prices to floating point.
+const activationFixedSchoolPriceSQL = `p.school_input IS NOT NULL AND p.school_output IS NOT NULL
+  AND (p.mode = 'manual' OR (p.school_cache_read IS NOT NULL AND p.school_cache_write IS NOT NULL))`
+
 const activationPriceSQL = `
-SELECT p.school_input IS NOT NULL AND p.school_output IS NOT NULL,
+SELECT ` + activationFixedSchoolPriceSQL + `,
   CASE WHEN snap.expires_at > statement_timestamp()
        AND COALESCE(snap.credential_ciphertext_sha256 = sha256(c.credential_ciphertext), snap.credential_revision = c.updated_at)
        THEN snap.model_pricing -> ($2::text) END
@@ -344,49 +385,12 @@ LEFT JOIN LATERAL (
 ) snap ON true
 WHERE c.id=$1`
 
-type activationTokenRates struct {
-	Mode        string       `json:"billing_mode"`
-	Input       *json.Number `json:"input_price"`
-	Output      *json.Number `json:"output_price"`
-	PerRequest  *json.Number `json:"per_request_price"`
-	ImageInput  *json.Number `json:"image_input_price"`
-	ImageOutput *json.Number `json:"image_output_price"`
-	VideoInput  *json.Number `json:"video_input_price"`
-	VideoOutput *json.Number `json:"video_output_price"`
-}
-
-func (r activationTokenRates) tokenOnly() bool {
-	return (r.Mode == "" || r.Mode == "token") && r.PerRequest == nil &&
-		r.ImageInput == nil && r.ImageOutput == nil && r.VideoInput == nil && r.VideoOutput == nil
-}
-
-func (r activationTokenRates) hasTokenPrices() bool {
-	return r.Input != nil && r.Output != nil &&
-		!strings.HasPrefix(r.Input.String(), "-") && !strings.HasPrefix(r.Output.String(), "-")
-}
-
 func activationTokenPriceReady(terms json.RawMessage) bool {
-	var quote struct {
-		activationTokenRates
-		Intervals []activationTokenRates `json:"intervals"`
-	}
-	if json.Unmarshal(terms, &quote) != nil || quote.Mode != "token" || !quote.tokenOnly() {
-		return false
-	}
-	if len(quote.Intervals) == 0 {
-		return quote.hasTokenPrices()
-	}
-	// Settlement uses the selected tier's rates without inheriting base prices.
-	for _, tier := range quote.Intervals {
-		if !tier.tokenOnly() || !tier.hasTokenPrices() {
-			return false
-		}
-	}
-	return true
+	return usage.BeichenTokenQuoteUsable(terms)
 }
 
 func (m *activationModel) overview() CatalogModel {
-	result := CatalogModel{Model: m.name, CredentialIDs: m.keys, SchoolStatus: "not_configured", PreferredRoutes: []PreferredRoute{}}
+	result := CatalogModel{Model: m.name, CredentialIDs: append([]uuid.UUID{}, m.keys...), SchoolStatus: "not_configured", PreferredRoutes: []PreferredRoute{}}
 	target := m.target("")
 	if target != nil {
 		plan := m.plan(target)
@@ -511,17 +515,17 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 		return skip("route_not_ready", "存在多个校内模型，请先明确该模型的线路")
 	}
 	plan := m.plan(target)
-	if target.status == "active" && len(plan.writes) == 0 {
-		return skip("already_active", "模型已启用")
-	}
 	if !plan.allowed(target) {
 		return skip("route_not_ready", "当前北辰凭据、已配置的线路或其他供应商计价尚未就绪")
 	}
-	price, err := plan.priceReadiness(ctx, tx)
+	if target.status == "active" && len(plan.writes) == 0 && target.multiplier != nil && *target.multiplier > 0 {
+		return skip("already_active", "模型已启用")
+	}
+	price, err := plan.priceReadiness(ctx, tx, nil)
 	if err != nil {
 		return enabled, nil, err
 	}
-	if price == activationPriceMissing {
+	if !price.ready() {
 		return skip("no_price", activationManualPriceMessage)
 	}
 	id, err := applyActivationPlan(ctx, tx, provider, actor, target, plan)
@@ -581,11 +585,11 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 	if target.status == "active" && len(plan.writes) == 0 && target.multiplier != nil && *target.multiplier > 0 {
 		return target.id, nil
 	}
-	price, err := plan.priceReadiness(ctx, tx)
+	price, err := plan.priceReadiness(ctx, tx, nil)
 	if err != nil {
 		return uuid.Nil, err
 	}
-	if price == activationPriceMissing {
+	if !price.ready() {
 		return uuid.Nil, invalid(activationManualPriceMessage)
 	}
 	id, err := applyActivationPlan(ctx, tx, provider, actor, target, plan)

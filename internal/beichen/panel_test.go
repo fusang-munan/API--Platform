@@ -77,6 +77,22 @@ func TestPanelGroupIsolation(t *testing.T) {
 	}
 }
 
+func TestPanelKeepsVerifiedWebsiteNamesWithoutPrices(t *testing.T) {
+	s := New(nil, nil)
+	s.client.Transport = panelTransport(func(*http.Request) (*http.Response, error) {
+		body := panelPayload(`{"platforms":[{"platform":"openai",
+"groups":[{"id":1,"platform":"openai","subscription_type":"standard","rate_multiplier":1,"peak_rate_enabled":false}],
+"supported_models":[{"name":"web-only","platform":"openai","pricing":null}]}]}`)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	peak := false
+	info := billingInfo{PeakEnabled: &peak, GroupRate: "1", ResolvedRate: "1", Multiplier: "1", ObservedAt: s.now()}
+	quote := s.fetchPanelQuote(context.Background(), "", "fixture", 1, priceAccess{}, info, []catalog.ProviderEntry{{ID: "key-only"}})
+	if !errors.Is(quote.err, errPanelEmpty) || len(quote.websiteModels) != 1 || quote.websiteModels[0] != "web-only" {
+		t.Fatal("the verified website catalogue was discarded when prices were absent")
+	}
+}
+
 func TestPanelConfirmsModelsIndependently(t *testing.T) {
 	peak := false
 	info := billingInfo{PeakEnabled: &peak, GroupRate: "1", ResolvedRate: "1", Multiplier: "1"}

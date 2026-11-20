@@ -2,10 +2,11 @@
 import { computed, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
-import type { BeichenCatalogModel, BeichenModelUsage, BeichenOverview, BeichenUsageRange } from '../../api/types'
+import type { BeichenCatalogModel, BeichenHealthDimension, BeichenModelUsage, BeichenOverview, BeichenProbeRun, BeichenUsageRange } from '../../api/types'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { useToast } from '../../composables/useToast'
 import { priceFields, schoolCatalog, type SchoolCatalogRow, type SchoolQuote } from '../../utils/beichenModels'
+import { bindingAdapterMeta } from '../../utils/bindingAdapters'
 import { formatPercent, formatTokens, multiplyDecimal, shiftDecimal } from '../../utils/credits'
 import { schoolDay, statusLabel } from '../../utils/format'
 import AppDialog from '../../components/AppDialog.vue'
@@ -14,26 +15,20 @@ import BeichenModelUsageDrawer from '../../components/BeichenModelUsageDrawer.vu
 import BeichenRecentReceipts from './BeichenRecentReceipts.vue'
 
 const props = defineProps<{ providerId: string; query?: string; commonIds?: Set<string>; providerMaintenance?: boolean }>()
-type OverviewCredential = {
-  credential_id: string
-  label: string
-  catalog_last_success?: string | null
-  prices_last_success?: string | null
-  billing_last_success?: string | null
-  usage_last_success?: string | null
-  last_error?: string | null
-}
-type ModelOverview = BeichenOverview & { credentials?: OverviewCredential[] | null }
+const emit = defineEmits<{ 'catalog-synced': [] }>()
 type UsageState = { data?: BeichenModelUsage; loading?: boolean; error?: string }
 type PriceState = NonNullable<BeichenCatalogModel['price_state']>
 type BatchOutcome = { model: string; status: 'enabled' | 'skipped' | 'failed'; reason: string }
 
-const overview = ref<ModelOverview>()
+const overview = ref<BeichenOverview>()
 const usageStates = ref<Partial<Record<BeichenUsageRange, UsageState>>>({})
 const range = ref<BeichenUsageRange>('month')
 const loading = ref(false)
 const updating = ref('')
 const syncing = ref(false)
+const probeSubmitting = ref(false)
+const probeOverride = ref<BeichenProbeRun>()
+const probeError = ref('')
 const error = ref('')
 const toast = useToast()
 const reasonId = useId()
@@ -72,11 +67,11 @@ const catalog = computed(() => {
     const routeCount = validCount(entry?.route_count) ?? row.routeCount
     const readyCount = validCount(entry?.ready_count) ?? row.readyCount
     const activation = entry?.activation
-    const active = row.status === 'active' || activation === 'active'
+    const active = row.status === 'active' || activation === 'active' || Boolean(entry?.binding_issue)
     const canDisable = row.canDisable || (activation === 'active' && Boolean(entry?.school_model))
     const priceState = entry?.price_state ?? oldPriceState(row)
-    const priceCovered = entry?.price_state == null ? row.priceReady
-      : priceState === 'confirmed' || priceState === 'manual' || (priceState === 'mixed' && row.priceReady)
+    const priceCovered = entry?.price_covered ?? (entry?.price_state == null ? row.priceReady
+      : priceState === 'confirmed' || priceState === 'manual' || (priceState === 'mixed' && row.priceReady))
     const blockers = [...new Set((entry?.blockers ?? []).map(blocker => blocker.message?.trim()).filter(Boolean))]
     const pricing = (row.quotes.length ? row.quotes : [null]).map(quote => ({
       key: quote?.key ?? 'missing',
@@ -89,11 +84,31 @@ const catalog = computed(() => {
     }))
     return {
       ...row, active, activation, canDisable, blockers, keyCoverage, routeCount, readyCount, priceState, priceCovered, pricing,
-      protocolCount: protocols.size || (routeCount === 0 ? 0 : null),
+      listed: entry?.credential_ids?.length !== 0,
+      protocolCount: entry?.protocols?.length ?? (protocols.size || (routeCount === 0 ? 0 : null)),
+      protocolLabels: entry?.protocols?.map(protocol => bindingAdapterMeta(protocol).label) ?? [],
+      probeState: entry?.probe_state,
+      lastProbeAt: entry?.last_probe_at,
+      bindingIssue: entry?.binding_issue,
     }
   })
 })
 type CatalogRow = (typeof catalog.value)[number]
+const listedModels = computed(() => catalog.value.filter(row => row.listed))
+const probeRun = computed(() => probeOverride.value ?? overview.value?.probe_run)
+const probeInProgress = computed(() => probeRun.value?.state === 'queued' || probeRun.value?.state === 'running')
+const probeLabels = { passed: '探活通过', failed: '探活失败', unprobed: '待探活' } as const
+const probeRunLabel = computed(() => {
+  switch (probeRun.value?.state) {
+    case 'queued': return '探活已排队'
+    case 'running': return '探活进行中'
+    case 'completed': return '最近一轮探活已完成'
+    case 'failed': return probeRun.value.error_code === 'no_token_protocols'
+      ? '当前目录没有可进行 1 Token 探活的模型协议'
+      : '探活未完成，可重新提交'
+    default: return ''
+  }
+})
 const catalogByModel = computed(() => new Map(catalog.value.map(row => [row.model.toLowerCase(), row])))
 const searchedRows = computed(() => catalog.value.filter(row =>
   row.model.toLowerCase().includes((props.query ?? '').trim().toLowerCase()) &&
@@ -130,28 +145,19 @@ const batchCounts = computed(() => ({
   skipped: batchResults.value.filter(row => row.status === 'skipped').length,
   failed: batchResults.value.filter(row => row.status === 'failed').length,
 }))
-const keyHealth = computed(() => {
-  const keys = new Map(catalog.value.flatMap(row => row.credentials.map(key => [key.credential_id, key.label] as const)))
-  for (const entry of overview.value?.model_catalog ?? []) {
-    for (const id of entry.credential_ids ?? []) if (!keys.has(id)) keys.set(id, '未命名 Key')
-  }
-  for (const record of overview.value?.models ?? []) if (!keys.has(record.credential_id)) keys.set(record.credential_id, '未命名 Key')
-  for (const dataset of overview.value?.datasets ?? []) if (!keys.has(dataset.credential_id)) keys.set(dataset.credential_id, '未命名 Key')
-  const credentials = new Map((overview.value?.credentials ?? []).map(key => [key.credential_id, key]))
-  for (const key of credentials.values()) if (key.label || !keys.has(key.credential_id)) keys.set(key.credential_id, key.label || '未命名 Key')
-  return Array.from(keys, ([id, label]) => {
-    const credential = credentials.get(id)
-    const datasets = (overview.value?.datasets ?? []).filter(row => row.credential_id === id)
-    const errors = [...new Set([credential?.last_error, ...datasets.map(row => row.last_error)]
-      .filter((message): message is string => Boolean(message)))]
-    const healthy = !errors.length && Boolean(credential?.catalog_last_success || credential?.prices_last_success ||
-      credential?.billing_last_success || credential?.usage_last_success || datasets.some(row => row.last_success))
-    return { id, label, healthy, state: errors.length ? '同步异常' : healthy ? '已同步' : '待同步', errors }
-  })
-})
+const healthDimensions = [['credential', '凭据'], ['catalog', '目录'], ['pricing', '报价'], ['probe', '探活']] as const
+const healthLabels: Record<BeichenHealthDimension['state'], string> = { available: '可用', unavailable: '异常', pending: '待确认' }
+const keyHealth = computed(() => (overview.value?.credentials ?? []).flatMap(key => key.health ? [{
+  id: key.credential_id, label: key.label, count: key.health.available_dimensions, health: key.health,
+}] : []))
 const keyCount = computed(() => {
+  const observedKeys = new Set([
+    ...(overview.value?.model_catalog ?? []).flatMap(row => row.credential_ids ?? []),
+    ...(overview.value?.models ?? []).map(row => row.credential_id),
+    ...(overview.value?.datasets ?? []).map(row => row.credential_id),
+  ])
   const count = overview.value?.credentials?.length ??
-    Math.max(validCount(overview.value?.website_sync?.channels) ?? 0, keyHealth.value.length)
+    Math.max(validCount(overview.value?.website_sync?.channels) ?? 0, observedKeys.size)
   return catalog.value.reduce((total, row) => Math.max(total, row.keyCoverage), count)
 })
 const lastSync = computed(() => overview.value?.website_sync?.price_last_seen ??
@@ -223,6 +229,7 @@ function oldPriceState(row: SchoolCatalogRow): PriceState {
 }
 
 function publicationLabel(row: CatalogRow) {
+  if (row.bindingIssue) return '已启用 · 线路异常'
   if (row.active) return '已启用'
   if (row.activation === 'ready') return '可启用'
   if (row.status === 'not_configured') return '未配置'
@@ -260,9 +267,44 @@ async function syncPrices() {
     await teacherAPI.syncBeichen(props.providerId)
     await load()
   } catch (e) {
+    await load()
     error.value = apiErrorMessage(e, '立即同步失败，请稍后重试')
   } finally {
     syncing.value = false
+    emit('catalog-synced')
+  }
+}
+
+async function requestProbes() {
+  if (probeSubmitting.value || probeInProgress.value) return
+  const providerId = props.providerId
+  const current = () => !disposed && props.providerId === providerId
+  probeSubmitting.value = true
+  probeError.value = ''
+  try {
+    const run = await teacherAPI.requestBeichenProbes(providerId)
+    if (current()) probeOverride.value = run
+  } catch (e) {
+    if (current()) probeError.value = apiErrorMessage(e, '提交探活失败，请稍后重试')
+  } finally {
+    if (current()) probeSubmitting.value = false
+  }
+}
+
+async function pollProbes() {
+  if (!probeInProgress.value) return
+  const providerId = props.providerId
+  try {
+    const view = await teacherAPI.beichenProbes(providerId)
+    if (disposed || props.providerId !== providerId) return
+    probeOverride.value = view.run
+    probeError.value = ''
+    if (!probeInProgress.value) {
+      await load()
+      if (!disposed && props.providerId === providerId && overview.value?.probe_run) probeOverride.value = undefined
+    }
+  } catch (e) {
+    if (!disposed && props.providerId === providerId) probeError.value = apiErrorMessage(e, '读取探活进度失败，稍后会自动重试')
   }
 }
 
@@ -411,6 +453,9 @@ function modelTokens(model: string) {
 
 watch(() => props.providerId, () => {
   overview.value = undefined
+  probeOverride.value = undefined
+  probeError.value = ''
+  probeSubmitting.value = false
   usageStates.value = {}
   priceRow.value = undefined
   conditionsRow.value = undefined
@@ -429,6 +474,7 @@ useVisibilityPolling(async () => {
     await Promise.all([load(), loadUsage('month')])
   } else await load()
 }, 60_000)
+useVisibilityPolling(pollProbes, 5_000)
 onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 </script>
 
@@ -457,20 +503,35 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
       </div>
     </section>
     <div class="beichen-summary model-summary" aria-label="模型概况">
-      <div class="beichen-stat"><span>可用模型</span><strong>{{ overview ? formatTokens(catalog.length) : '—' }}</strong><small>已从上游发现</small></div>
+      <div class="beichen-stat"><span>目录模型</span><strong>{{ overview ? formatTokens(listedModels.length) : '—' }}</strong><small>已从上游发现</small></div>
       <div class="beichen-stat"><span>已启用</span><strong>{{ overview ? formatTokens(catalog.filter(row => row.active).length) : '—' }}</strong><small>学校模型</small></div>
-      <div class="beichen-stat"><span>报价覆盖</span><strong>{{ overview ? catalog.filter(row => row.priceCovered).length + ' / ' + catalog.length : '—' }}</strong><small>含教师手动价</small></div>
+      <div class="beichen-stat"><span>报价覆盖</span><strong>{{ overview ? listedModels.filter(row => row.priceCovered).length + ' / ' + listedModels.length : '—' }}</strong><small>含可计算的 Token 条件价与手动价</small></div>
       <div class="beichen-stat sync-stat"><span>价格最后同步</span><strong>{{ syncTime(lastSync) }}</strong><small>北京时间</small></div>
-      <div class="beichen-stat"><span>Key 健康</span><strong>{{ keyHealth.filter(key => key.healthy).length }} / {{ keyCount }}</strong><small>无同步错误且已成功读取</small></div>
     </div>
-    <details v-if="keyHealth.length" class="key-health"><summary>查看 Key 同步状态</summary><ul><li v-for="key in keyHealth" :key="key.id"><strong>{{ key.label }}</strong><span class="status-pill" :class="key.healthy ? 'active' : key.errors.length ? 'danger' : 'pending'">{{ key.state }}</span><small v-for="message in key.errors" :key="message" class="error">{{ message }}</small></li></ul></details>
+    <section v-if="keyHealth.length" class="beichen-card key-health" aria-label="Key 健康">
+      <h3>Key 健康</h3>
+      <details v-for="key in keyHealth" :key="key.id">
+        <summary><strong>{{ key.label }}</strong> <span class="status-pill" :class="key.count === 4 ? 'active' : 'pending'">{{ key.count }}/4 维可用</span></summary>
+        <dl>
+          <div v-for="[dimension, label] in healthDimensions" :key="dimension" :data-state="key.health[dimension].state">
+            <dt>{{ label }} · {{ healthLabels[key.health[dimension].state] }}</dt>
+            <dd>{{ key.health[dimension].message }}</dd>
+          </div>
+        </dl>
+      </details>
+    </section>
     <div class="beichen-toolbar model-toolbar">
       <div class="beichen-toolbar-group">
         <button type="button" class="button ghost" :disabled="busy" @click="refreshOverview">刷新模型</button>
         <button type="button" class="button secondary" :disabled="busy" @click="syncPrices">{{ syncing ? '同步中…' : '立即同步价格' }}</button>
+        <button v-if="probeRun" type="button" class="button secondary" :disabled="probeSubmitting || probeInProgress || !listedModels.length" @click="requestProbes">
+          {{ probeSubmitting ? '提交中…' : '立即探活' }}
+        </button>
         <button type="button" class="button primary" :disabled="busy || !rows.length" @click="previewBatch">一键启用</button>
       </div>
     </div>
+    <p v-if="probeRunLabel" class="beichen-note" role="status">{{ probeRunLabel }}</p>
+    <p v-if="probeError" class="error" role="alert">{{ probeError }}</p>
     <div class="model-filters" role="group" aria-label="模型状态筛选"><button v-for="item in filters" :key="item.id" type="button" :aria-pressed="filter === item.id" @click="filter = item.id">{{ item.label }}</button><small>当前筛选 {{ rows.length }} 个模型</small></div>
     <p class="beichen-note">Token 单价按每百万 Token 计，1 元 = 100 积分。跟随官网时，学生实价按该线路的倍率计算。</p>
     <p v-if="error && !batchSelection" class="error" role="alert">{{ error }}</p>
@@ -485,14 +546,20 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
           <tr><th scope="col">模型</th><th scope="col">状态与覆盖</th><th scope="col">官网价</th><th scope="col">学生实价</th><th scope="col">本月用量</th><th scope="col">操作</th></tr>
         </thead>
         <tbody>
-          <tr v-for="(row, index) in rows" :key="row.model" :data-model="row.model">
+          <tr v-for="(row, index) in rows" :key="row.model" :data-model="row.model" :class="{ 'binding-issue-row': row.bindingIssue }">
             <th scope="row" class="model-name">{{ row.model }}</th>
             <td data-label="状态与覆盖" class="model-state">
               <span>{{ row.keyCoverage }}/{{ keyCount }} 把 Key 覆盖</span> ·
               <span :title="row.routeCount + ' 条候选线路'">{{ row.protocolCount == null ? '协议数待同步' : row.protocolCount + ' 种协议' }}</span> ·
               <span>{{ row.readyCount }} 条已发布</span> ·
               <span>{{ priceStateLabels[row.priceState] ?? '报价待同步' }}</span> ·
-              <strong :class="{ 'published-state': row.active }">{{ publicationLabel(row) }}</strong>
+              <strong :class="row.bindingIssue ? 'binding-issue' : row.active ? 'published-state' : undefined">{{ publicationLabel(row) }}</strong>
+              <small v-if="row.bindingIssue" class="row-note binding-issue">{{ row.bindingIssue.message }}</small>
+              <small v-if="row.protocolLabels.length" class="row-note">{{ row.protocolLabels.join(' · ') }}</small>
+              <div v-if="row.probeState" class="model-probe">
+                <span class="status-pill" :class="{ active: row.probeState === 'passed', danger: row.probeState === 'failed', pending: row.probeState === 'unprobed' }">{{ probeLabels[row.probeState] }}</span>
+                <small v-if="row.lastProbeAt">{{ syncTime(row.lastProbeAt) }}（北京时间）</small>
+              </div>
             </td>
             <td v-for="column in priceColumns" :key="column.id" :data-label="column.label"
               :class="column.id === 'official' ? 'standard-price' : 'actual-price'">
@@ -620,6 +687,10 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .model-name { font-size: 13px; }
 .model-state { font-size: 12px; line-height: 1.75; }
 .published-state { color: #16765e; }
+.binding-issue { color: var(--danger, #b42318); }
+.binding-issue-row { background: color-mix(in srgb, var(--danger, #b42318) 5%, transparent); }
+.model-probe { display: flex; gap: 3px 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+.model-probe small { color: var(--ink-soft); }
 .beichen-models .button { min-width: 0; max-width: 100%; white-space: normal; }
 .model-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .model-actions .button { padding: 7px 10px; }
@@ -644,10 +715,13 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .model-filters small { margin-left: auto; color: var(--ink-soft); font-size: 11px; }
 .sync-stat strong { font-size: 16px; line-height: 1.5; }
 .key-health { color: var(--ink-soft); font-size: 12px; }
+.key-health h3 { margin: 0 0 10px; color: var(--ink); font-size: 14px; }
 .key-health summary { width: fit-content; cursor: pointer; }
-.key-health ul { display: grid; gap: 10px; list-style: none; padding: 10px 0 0; margin: 0; }
-.key-health li { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.key-health small { flex-basis: 100%; }
+.key-health details + details { margin-top: 8px; }
+.key-health dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 145px), 1fr)); gap: 10px; margin: 8px 0 0; }
+.key-health dt { font-weight: 700; }
+.key-health [data-state="unavailable"] dt { color: var(--danger, #b42318); }
+.key-health dd { margin: 2px 0 0; }
 .usage-feedback { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .model-skeleton { display: grid; gap: 12px; }
 .model-skeleton i { height: 105px; background: #edf0f7; border-radius: 12px; }

@@ -71,6 +71,7 @@ type panelQuote struct {
 	rows              []priceRow
 	terms             map[string]json.RawMessage
 	notListed         []string
+	websiteModels     []string
 	expiresAt         time.Time
 	err               error
 	verificationError error
@@ -192,6 +193,7 @@ func (s *Service) fetchPanelQuote(ctx context.Context, token, key string, group 
 		quote.err = err
 		return quote
 	}
+	quote.websiteModels = matched.websiteModels
 	for model, raw := range matched.terms {
 		if !hasPanelPrice(raw) {
 			delete(matched.terms, model)
@@ -397,10 +399,11 @@ func decodePanelChannels(body []byte) ([]panelChannel, error) {
 }
 
 type matchedPanelPrices struct {
-	rows      []priceRow
-	terms     map[string]json.RawMessage
-	notListed []string
-	hasPrices bool
+	rows          []priceRow
+	terms         map[string]json.RawMessage
+	notListed     []string
+	hasPrices     bool
+	websiteModels []string
 }
 
 func matchPanelPrices(channels []panelChannel, groupID int64, info billingInfo, entries []catalog.ProviderEntry) (matchedPanelPrices, error) {
@@ -455,6 +458,12 @@ func matchPanelPrices(channels []panelChannel, groupID int64, info billingInfo, 
 		}
 	}
 	matched := matchedPanelPrices{terms: make(map[string]json.RawMessage)}
+	if complete {
+		matched.websiteModels = make([]string, 0, len(occurrences))
+		for name := range occurrences {
+			matched.websiteModels = append(matched.websiteModels, name)
+		}
+	}
 	for _, section := range sections {
 		for _, model := range section.Models {
 			if !validModel(model.Name) || occurrences[model.Name] != 1 ||

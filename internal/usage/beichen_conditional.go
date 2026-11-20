@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/big"
 	"regexp"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -57,6 +58,62 @@ func decodeBeichenConditions(raw json.RawMessage) *beichenPriceConditions {
 		return nil
 	}
 	return terms
+}
+
+// BeichenTokenQuoteUsable checks a quote's structure before publication.
+// Settlement still needs the actual token counts and any effort or TTL.
+func BeichenTokenQuoteUsable(raw json.RawMessage) bool {
+	quote := decodeBeichenConditions(raw)
+	if quote == nil || quote.BillingMode != "token" || quote.hasNonTokenPrice() {
+		return false
+	}
+	for _, rate := range quote.EffortMultiplier {
+		if beichenPriceDecimal(rate) == nil {
+			return false
+		}
+	}
+	if len(quote.Intervals) == 0 {
+		return quote.usableTokenRates()
+	}
+
+	type tokenRange struct{ min, max int64 }
+	ranges := make([]tokenRange, 0, len(quote.Intervals))
+	for _, tier := range quote.Intervals {
+		if !tier.usableTokenRates() || tier.Min == nil {
+			return false
+		}
+		minimum, err := tier.Min.Int64()
+		if err != nil || minimum < 0 {
+			return false
+		}
+		bounds := tokenRange{min: minimum, max: -1}
+		if tier.Max != nil {
+			bounds.max, err = tier.Max.Int64()
+			if err != nil || bounds.max <= minimum {
+				return false
+			}
+		}
+		ranges = append(ranges, bounds)
+	}
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].min < ranges[j].min })
+	for i := 1; i < len(ranges); i++ {
+		if ranges[i-1].max < 0 || ranges[i-1].max > ranges[i].min {
+			return false
+		}
+	}
+	return true
+}
+
+func (r beichenPanelRates) usableTokenRates() bool {
+	if (r.BillingMode != "" && r.BillingMode != "token") || r.hasNonTokenPrice() || r.Input == nil || r.Output == nil {
+		return false
+	}
+	for _, price := range []*json.Number{r.Input, r.Output, r.CacheRead, r.CacheWrite, r.CacheWrite1h, r.CacheWrite12h} {
+		if price != nil && beichenPriceDecimal(price) == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func isBeichenConditional(raw json.RawMessage) bool {

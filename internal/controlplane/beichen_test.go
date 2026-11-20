@@ -55,7 +55,7 @@ func TestBeichenRefreshStoresOnlyActualCatalog(t *testing.T) {
 	mock.ExpectExec("UPDATE provider_model_catalog").WillReturnResult(sqlmock.NewResult(0, 0))
 	for _, id := range []string{"gemini-test", "other-family"} {
 		mock.ExpectExec("INSERT INTO provider_model_catalog").WithArgs(sqlmock.AnyArg(), provider.ID, key.ID, id,
-			"", "", "", "", "", sqlmock.AnyArg(), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+			"", "", "", "", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
 	}
 	mock.ExpectCommit()
 	s := &Service{sqlDB: db, security: manager, now: time.Now}

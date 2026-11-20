@@ -60,11 +60,16 @@ func ReplaceCredentialEntries(ctx context.Context, tx *sql.Tx, providerID, crede
 		if entry.Raw == nil {
 			raw = []byte("{}")
 		}
-		_, err := tx.ExecContext(ctx, `
+		protocols, err := json.Marshal(RegisteredProtocols(entry))
+		if err != nil {
+			return 0, err
+		}
+		_, err = tx.ExecContext(ctx, `
 INSERT INTO provider_model_catalog(
   id, provider_id, credential_id, model_id, display_name, description, owned_by, upstream_object, upstream_created_at,
-  raw_entry, status, last_seen_at, synced_at, created_at, updated_at
-) VALUES ($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10::jsonb,'active',$11,$11,$11,$11)
+  raw_entry, status, last_seen_at, synced_at, created_at, updated_at, supported_protocols
+) VALUES ($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10::jsonb,'active',$11,$11,$11,$11,
+  ARRAY(SELECT jsonb_array_elements_text($12::jsonb)))
 ON CONFLICT(credential_id, model_id) DO UPDATE SET
   display_name=EXCLUDED.display_name,
   description=EXCLUDED.description,
@@ -72,13 +77,20 @@ ON CONFLICT(credential_id, model_id) DO UPDATE SET
   upstream_object=EXCLUDED.upstream_object,
   upstream_created_at=EXCLUDED.upstream_created_at,
   raw_entry=EXCLUDED.raw_entry,
+  supported_protocols=EXCLUDED.supported_protocols || ARRAY(
+    SELECT probe.protocol FROM upstream_probes probe
+    JOIN provider_credentials c ON c.id = probe.credential_id AND c.provider_id = probe.provider_id
+    WHERE probe.provider_id = $2 AND probe.credential_id = $3 AND probe.model = EXCLUDED.model_id::text
+      AND probe.checked_at >= c.updated_at AND probe.error_code IS NULL
+      AND NOT (probe.protocol = ANY(EXCLUDED.supported_protocols))
+    ORDER BY probe.protocol),
   status='active',
   last_seen_at=$11,
   synced_at=$11,
   updated_at=$11`,
 			uuid.Must(uuid.NewV7()), providerID, credentialID, entry.ID,
 			entry.DisplayName, entry.Description, entry.OwnedBy, entry.Object, entry.CreatedAt,
-			string(raw), syncedAt,
+			string(raw), syncedAt, string(protocols),
 		)
 		if err != nil {
 			return 0, err

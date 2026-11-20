@@ -56,6 +56,12 @@ func TestBeichenTeacherEnablesDiscoveredModelForStudent(t *testing.T) {
 		t.Fatal(err)
 	}
 	key, teacher, student, org, project, studentKeyID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	quote := func(credential uuid.UUID, upstream string) {
+		// Supply the teacher's activation price independently of the official
+		// price statuses tested below.
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate,cache_read_rate,cache_write_rate)
+VALUES($1,$2,'school','manual','teacher',$3,1000000,1000000,0,0)`, credential, upstream, teacher)
+	}
 	ciphertext, err := manager.EncryptCredential(upstreamKey)
 	if err != nil {
 		t.Fatal(err)
@@ -65,6 +71,7 @@ func TestBeichenTeacherEnablesDiscoveredModelForStudent(t *testing.T) {
 	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success) VALUES($1,'billing',now())`, key)
 	exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier) VALUES($1,0.250000000000000000000019)`, key)
 	exec(`INSERT INTO users(id,name,email,password_hash,role,created_at,updated_at) VALUES($1,'Teacher','t@example.test','fixture','teacher',now(),now()),($2,'Student','s@example.test','fixture','student',now(),now())`, teacher, student)
+	quote(key, model)
 	exec(`INSERT INTO student_profiles(id,user_id,created_at,updated_at) VALUES(gen_random_uuid(),$1,now(),now())`, student)
 	exec(`INSERT INTO organizations(id,name,created_at,updated_at) VALUES($1,'Fixture',now(),now())`, org)
 	exec(`INSERT INTO projects(id,organization_id,name,monthly_credit_quota_milli,created_at,updated_at) VALUES($1,$2,'Course',10000,now(),now())`, project, org)
@@ -163,6 +170,7 @@ func TestBeichenTeacherEnablesDiscoveredModelForStudent(t *testing.T) {
 	replacement := uuid.New()
 	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at) VALUES($1,$2,'line B',$3,now(),now())`, replacement, provider, ciphertext)
 	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at) VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now())`, provider, replacement, model)
+	quote(replacement, model)
 	exec("UPDATE model_bindings SET status='inactive' WHERE model_id=$1 AND adapter='openai_compatible'", id)
 	exec("UPDATE models SET model_id='school-alias' WHERE id=$1", id)
 	before := status()
@@ -187,6 +195,7 @@ func TestBeichenTeacherEnablesDiscoveredModelForStudent(t *testing.T) {
 		for _, owner := range [][2]uuid.UUID{{provider, replacement}, {other, otherKey}} {
 			exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at) VALUES(gen_random_uuid(),$1,$2,'mixed',now(),now(),now(),now())`, owner[0], owner[1])
 		}
+		quote(replacement, "mixed")
 		exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at) VALUES(gen_random_uuid(),$1,$2,$3,'mixed','openai_responses',250,now(),now())`, school, other, otherKey)
 		request("POST", path+"/models/enable", teacherToken, `{"model":"mixed"}`, 400)
 		request("POST", path+"/models/enable", teacherToken, `{"model":"mixed","school_model":"school-alias"}`, 400)
@@ -199,6 +208,7 @@ func TestBeichenTeacherEnablesDiscoveredModelForStudent(t *testing.T) {
 	})
 	t.Run("simultaneous first clicks", func(t *testing.T) {
 		exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at) VALUES(gen_random_uuid(),$1,$2,'concurrent',now(),now(),now(),now())`, provider, replacement)
+		quote(replacement, "concurrent")
 		db.SetMaxOpenConns(4)
 		start := make(chan struct{})
 		done := make(chan error, 4)

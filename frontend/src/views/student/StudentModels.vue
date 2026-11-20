@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { studentAPI } from '../../api/student'
-import type { Model, ModelCatalogCandidate, ModelCategory, ModelStatus } from '../../api/types'
+import type { ApiKey, Model, ModelCatalogCandidate, ModelCategory, ModelStatus } from '../../api/types'
 import { capabilityLabel, formatTokenK } from '../../utils/modelCatalog'
+import { buildKeyReapplyModels, keyCanWithdraw, keyReapplyQuota, selectCurrentStudentKey } from '../../utils/studentHarnessConfig'
 import { sortModelsByRecency } from '../../utils/modelSort'
 import { filterStudentModels } from '../../utils/studentModels'
 import { catalogCreditsLabel, catalogProviderLabel, modelCreditsLabel, modelDescriptionText, modelProviderLabel } from '../../utils/modelPlazaDisplay'
@@ -16,6 +17,8 @@ import { APIError } from '../../api/client'
 
 const commonRows = ref<Model[]>([])
 const libraryRows = ref<Model[]>([])
+const keys = ref<ApiKey[]>([])
+const currentKeyID = ref('')
 const catalogItems = ref<ModelCatalogCandidate[]>([])
 const query = ref('')
 const category = ref<ModelCategory | ''>('')
@@ -26,6 +29,9 @@ const catalogQuery = ref('')
 const catalogPage = ref(1)
 const catalogTotal = ref(0)
 const error = ref('')
+const reapplyModel = ref<Model | null>(null)
+const reapplyOpen = ref(false)
+const reapplyBusy = ref(false)
 const loadState = useLoadState()
 const toast = useToast()
 
@@ -37,15 +43,32 @@ const filteredCommon = computed(() => sortModelsByRecency(filterStudentModels(co
 const filteredLibrary = computed(() => sortModelsByRecency(filterStudentModels(libraryRows.value, query.value, category.value, status.value)))
 const hasAnyModels = computed(() => filteredCommon.value.length > 0 || filteredLibrary.value.length > 0)
 const catalogPages = computed(() => Math.max(1, Math.ceil(catalogTotal.value / 20)))
+const allRows = computed(() => [...commonRows.value, ...libraryRows.value])
+const selectableKeys = computed(() => keys.value.filter(key => key.status !== 'rejected'))
+const currentKey = computed(() => keys.value.find(key => key.id === currentKeyID.value) ?? null)
+const currentKeyModelIDs = computed(() => new Set((currentKey.value?.models ?? []).map(model => model.model_id.trim().toLowerCase())))
+const missingKeyCount = computed(() => allRows.value.filter(model => requiresNewKey(model)).length)
+const reapplyQuota = computed(() => currentKey.value ? keyReapplyQuota(currentKey.value) : '')
+const reapplyModels = computed(() => currentKey.value && reapplyModel.value
+  ? buildKeyReapplyModels(currentKey.value, reapplyModel.value.model_id)
+  : [])
+const canReapply = computed(() => Boolean(currentKey.value && keyCanWithdraw(currentKey.value)))
 
 watch(catalogQuery, () => { catalogPage.value = 1 })
 
 async function load() {
   await loadState.run(async () => {
     try {
-      const plaza = await studentAPI.models()
+      const [plaza, keyList] = await Promise.all([
+        studentAPI.models(),
+        studentAPI.keys().catch(() => [] as ApiKey[]),
+      ])
       commonRows.value = plaza.common_models
       libraryRows.value = plaza.library_models
+      keys.value = keyList
+      if (!keyList.some(key => key.id === currentKeyID.value)) {
+        currentKeyID.value = selectCurrentStudentKey(keyList)?.id ?? ''
+      }
       error.value = ''
     } catch (caught) {
       error.value = caught instanceof APIError ? caught.message : '加载模型失败'
@@ -103,6 +126,61 @@ async function removeModel(modelID: string) {
 
 function refresh() { void load() }
 
+function requiresNewKey(model: Model) {
+  return Boolean(currentKey.value) && !currentKeyModelIDs.value.has(model.model_id.trim().toLowerCase())
+}
+
+function openReapply(model: Model) {
+  reapplyModel.value = model
+  reapplyOpen.value = true
+}
+
+function keyStatusLabel(status: ApiKey['status']) {
+  const labels: Record<ApiKey['status'], string> = {
+    pending_mentor: '待导师审核',
+    pending_teacher: '待老师终审',
+    approved: '已审批待领取',
+    active: '已生效',
+    inactive: '已停用',
+    rejected: '已驳回',
+  }
+  return labels[status] ?? status
+}
+
+function caughtMessage(caught: unknown, fallback: string) {
+  return caught instanceof APIError ? caught.message : fallback
+}
+
+async function confirmReapply() {
+  const key = currentKey.value
+  const model = reapplyModel.value
+  if (!key || !model || reapplyBusy.value || !canReapply.value) return
+  reapplyBusy.value = true
+  try {
+    await studentAPI.withdraw(key.id)
+    try {
+      await studentAPI.submit({
+        name: key.name,
+        organization_id: key.organization.id,
+        project_id: key.project.id,
+        models: buildKeyReapplyModels(key, model.model_id),
+        requested_monthly_credits: keyReapplyQuota(key),
+      })
+      toast.success(`已撤回并重新申请，沿用原审批额度 ${keyReapplyQuota(key)} credits`)
+      reapplyOpen.value = false
+      reapplyModel.value = null
+      await load()
+    } catch (caught) {
+      error.value = `原申请已撤回，但新申请提交失败：${caughtMessage(caught, '请到「申请密钥」页重新提交')}`
+      await load()
+    }
+  } catch (caught) {
+    error.value = caughtMessage(caught, '撤回失败，请稍后重试')
+  } finally {
+    reapplyBusy.value = false
+  }
+}
+
 onMounted(() => {
   void load()
   window.addEventListener('nebula:refresh', refresh)
@@ -130,6 +208,26 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
       </div>
     </section>
 
+    <section class="panel key-context">
+      <template v-if="selectableKeys.length">
+        <label>当前 Key
+          <select v-model="currentKeyID" data-testid="current-key">
+            <option v-for="key in selectableKeys" :key="key.id" :value="key.id">
+              {{ key.name }} · {{ keyStatusLabel(key.status) }} · {{ key.project.name }}
+            </option>
+          </select>
+        </label>
+        <p class="muted">
+          模型是否可调用以当前 Key 的审批白名单为准。
+          <template v-if="missingKeyCount">有 {{ missingKeyCount }} 个模型不在当前 Key 中，需重新申领 Key。</template>
+        </p>
+        <p v-if="currentKey && !canReapply && missingKeyCount" class="muted">
+          当前 Key 状态为「{{ keyStatusLabel(currentKey.status) }}」，学生端不能直接撤回；请先在「申请密钥」页等待审核，或联系导师停用后再重新申请。
+        </p>
+      </template>
+      <p v-else class="muted">还没有 Key。先到「申请密钥」页申领，模型才会与 Key 白名单同步。</p>
+    </section>
+
     <LoadingRegion :initial-loading="loadState.initialLoading.value" :refreshing="loadState.refreshing.value" variant="cards" label="正在加载模型" style="margin-top:20px">
       <div v-if="hasAnyModels" class="plaza-layout">
         <section class="plaza-column">
@@ -147,6 +245,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
               </div>
               <div class="chip-list">
                 <span class="chip preset">预置</span>
+                <span v-if="requiresNewKey(model)" class="chip warn" data-testid="needs-new-key">需重新申领 Key</span>
                 <span class="chip">{{ modelCreditsLabel(model) }}</span>
                 <span v-if="model.provider_name" class="chip">{{ model.provider_name }}</span>
                 <span v-for="capability in model.capabilities" :key="capability" class="chip">{{ capabilityLabel(capability) }}</span>
@@ -154,6 +253,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
               <p v-if="modelDescriptionText(model)" class="muted">{{ modelDescriptionText(model) }}</p>
               <div class="actions">
                 <button class="button ghost" @click="expanded = expanded === model.model_id ? '' : model.model_id">{{ expanded === model.model_id ? '收起' : '查看详情' }}</button>
+                <button v-if="requiresNewKey(model)" class="button secondary" data-testid="reapply-key" @click="openReapply(model)">撤回并重新申请</button>
               </div>
               <Transition name="content-fade">
                 <dl v-if="expanded === model.model_id">
@@ -184,6 +284,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
                 <StatusBadge :status="model.status" />
               </div>
               <div class="chip-list">
+                <span v-if="requiresNewKey(model)" class="chip warn" data-testid="needs-new-key">需重新申领 Key</span>
                 <span class="chip">{{ modelCreditsLabel(model) }}</span>
                 <span v-if="model.provider_name" class="chip">{{ model.provider_name }}</span>
                 <span v-for="capability in model.capabilities" :key="capability" class="chip">{{ capabilityLabel(capability) }}</span>
@@ -191,6 +292,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
               <p v-if="modelDescriptionText(model)" class="muted">{{ modelDescriptionText(model) }}</p>
               <div class="actions">
                 <button class="button ghost" @click="expanded = expanded === model.model_id ? '' : model.model_id">{{ expanded === model.model_id ? '收起' : '查看详情' }}</button>
+                <button v-if="requiresNewKey(model)" class="button secondary" data-testid="reapply-key" @click="openReapply(model)">撤回并重新申请</button>
                 <button class="button secondary" @click="removeModel(model.model_id)">移除</button>
               </div>
               <Transition name="content-fade">
@@ -238,6 +340,30 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
         </div>
       </section>
     </AppDialog>
+
+    <AppDialog :open="reapplyOpen" title="撤回并按原审批额度重新申请" @update:open="reapplyOpen = $event">
+      <template v-if="reapplyModel && currentKey">
+        <p>
+          模型 <strong>{{ reapplyModel.model_id }}</strong> 不在当前 Key「{{ currentKey.name }}」中，无法直接用于调用。
+        </p>
+        <p>
+          将撤回当前申请，并按原审批额度 <strong>{{ reapplyQuota }} credits</strong> 重新提交；模型白名单会包含：
+          {{ reapplyModels.map(model => model.model_id).join('、') }}。
+        </p>
+        <p v-if="!canReapply" class="error banner">
+          当前 Key 状态为「{{ keyStatusLabel(currentKey.status) }}」，学生端不能直接撤回。请先在「申请密钥」页等待审核，或联系导师停用该 Key 后再重新申请。
+        </p>
+        <button
+          v-if="canReapply"
+          class="button primary"
+          data-testid="confirm-reapply"
+          :disabled="reapplyBusy"
+          @click="confirmReapply"
+        >
+          {{ reapplyBusy ? '正在重新申请…' : '确认撤回并重新申请' }}
+        </button>
+      </template>
+    </AppDialog>
   </section>
 </template>
 
@@ -247,6 +373,10 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
 .plaza-heading h2 { margin: 0; font-size: 18px; }
 .plaza-cards { display: grid; gap: 16px; }
 .chip.preset { background: #eef3ff; color: #3b5bdb; }
+.chip.warn { background: #fff4e5; color: #9a4d00; }
+.key-context { display: grid; gap: 10px; margin-top: 16px; }
+.key-context select { max-width: 520px; }
+.key-context p { margin: 0; }
 .model-table { display: grid; gap: 10px; }
 .model-table.compact { margin-top: 12px; }
 .model-table-head,

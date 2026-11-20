@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"slices"
 	"sort"
 	"strings"
 
@@ -84,6 +85,35 @@ func AdaptersFromUpstream(entry ProviderEntry) []modelbinding.Adapter {
 		return adapters
 	}
 	return DefaultAdaptersForModel(entry.ID)
+}
+
+// RegisteredProtocols uses explicit protocol names when supplied, then the
+// same endpoint signals and model defaults used to prepare bindings.
+func RegisteredProtocols(entry ProviderEntry) []string {
+	values := entry.SupportedProtocols
+	if len(values) == 0 {
+		values = extractStringSlice(entry.Raw, "supported_protocols")
+	}
+	protocols := make([]string, 0, len(values))
+	for _, value := range values {
+		adapter := modelbinding.Adapter(strings.ToLower(strings.TrimSpace(value)))
+		if modelbinding.AdapterValidator(adapter) != nil {
+			var ok bool
+			adapter, ok = ResolveAdapter(value)
+			if !ok {
+				continue
+			}
+		}
+		if !slices.Contains(protocols, string(adapter)) {
+			protocols = append(protocols, string(adapter))
+		}
+	}
+	if len(protocols) == 0 {
+		for _, adapter := range AdaptersFromUpstream(entry) {
+			protocols = append(protocols, string(adapter))
+		}
+	}
+	return protocols
 }
 
 func explicitEndpointSignals(entry ProviderEntry) []string {

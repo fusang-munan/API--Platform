@@ -111,10 +111,10 @@ func TestModelUsageCompletenessPostgres(t *testing.T) {
 	call.prompt, call.output, call.read, call.write, call.total = 50, 4, 10, nil, 73
 	insertReportCall(t, ctx, tx, call)
 	call.model, call.usage, call.protocol = "incomplete", "reported", "anthropic"
-	call.prompt, call.output, call.read, call.write, call.total = 9, 2, nil, 4, nil
+	call.prompt, call.output, call.read, call.write, call.total = 9, 2, nil, 4, 18
 	insertReportCall(t, ctx, tx, call)
 	call.model, call.usage, call.state = "unknown", "missing", "pending_review"
-	call.write = nil
+	call.write, call.total = nil, nil
 	insertReportCall(t, ctx, tx, call)
 	execTestSQL(t, ctx, tx, "UPDATE gateway_calls SET prompt_tokens=NULL,completion_tokens=NULL WHERE beichen_dispatch_model='unknown'")
 
@@ -132,20 +132,26 @@ func TestModelUsageCompletenessPostgres(t *testing.T) {
 			if got.CacheHitRate != nil {
 				t.Errorf("%s 的缓存命中率应为空: %v", label, *got.CacheHitRate)
 			}
-		} else if got.CacheHitRate == nil || math.Abs(*got.CacheHitRate-*rate) > 1e-12 {
-			t.Errorf("%s 的缓存命中率有误: got=%v, want=%v", label, got.CacheHitRate, *rate)
+		} else if got.CacheHitRate == nil {
+			t.Errorf("%s 的缓存命中率为空，期望 %v", label, *rate)
+		} else if math.Abs(*got.CacheHitRate-*rate) > 1e-12 {
+			t.Errorf("%s 的缓存命中率有误: got=%v, want=%v", label, *got.CacheHitRate, *rate)
 		}
 	}
-	totalRate, mixedRate, zero := 25.0/105, 25.0/95, 0.0
-	check("总计", report.Totals, 132, 208, "partial", &totalRate)
+	totalRate, mixedRate, zero := 50.0/200, 25.0/95, 0.0
+	check("总计", report.Totals, 267, 76, "partial", &totalRate)
+	if got := report.Totals; got.InputTokens != 159 || got.OutputTokens != 44 ||
+		got.CacheReadTokens != 50 || got.CacheWriteTokens != 14 || got.ChargedTokensMissingCalls != 2 {
+		t.Errorf("已回报的分项累计或缺项笔数有误: %+v", got)
+	}
 	models := make(map[string]ModelUsageMetrics)
 	for _, row := range report.Models {
 		models[row.Model] = row.ModelUsageMetrics
 	}
 	check("完整", models["ready"], 12, 0, "complete", &zero)
-	check("部分", models["mixed"], 120, 120, "partial", &mixedRate)
+	check("账款待核但 Token 已回报", models["mixed"], 240, 0, "complete", &mixedRate)
 	check("上游有总数", models["interrupted"], 0, 73, "missing", nil)
-	check("只有部分分项", models["incomplete"], 0, 15, "missing", nil)
+	check("只有部分分项", models["incomplete"], 15, 3, "partial", nil)
 	check("上游未回报", models["unknown"], 0, 0, "missing", nil)
 	if len(report.Students) != 2 {
 		t.Fatalf("应包含两个学生: %+v", report.Students)
@@ -154,11 +160,16 @@ func TestModelUsageCompletenessPostgres(t *testing.T) {
 		if row.UserID == first {
 			check("第一个学生", row.ModelUsageMetrics, 12, 0, "complete", &zero)
 		} else {
-			check("第二个学生", row.ModelUsageMetrics, 120, 208, "partial", &mixedRate)
+			check("第二个学生", row.ModelUsageMetrics, 255, 76, "partial", &mixedRate)
 			for _, detail := range row.Models {
 				check("第二个学生的 "+detail.Model, detail.ModelUsageMetrics, models[detail.Model].Tokens,
 					models[detail.Model].TokensMissing, models[detail.Model].Completeness, models[detail.Model].CacheHitRate)
 			}
+		}
+	}
+	for _, row := range report.Keys {
+		if row.APIKeyID == secondKey {
+			check("第二个 Key", row.ModelUsageMetrics, 255, 76, "partial", &mixedRate)
 		}
 	}
 }
@@ -223,7 +234,7 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 	call.model, call.state, call.usage, call.credits = "missing", "charged", "missing", "1.1"
 	insertReportCall(t, ctx, tx, call)
 	call.credential, call.project, call.user, call.key = second, otherProject, otherStudent, otherKey
-	call.model, call.protocol, call.usage, call.credits, call.base = "local", "openai_responses", "reported", "5.5", "5"
+	call.model, call.protocol, call.usage, call.credits, call.base = "one-sided", "openai_responses", "reported", "5.5", "5"
 	call.prompt, call.output, call.read, call.miss, call.write = 50, 2, 10, 40, nil
 	insertReportCall(t, ctx, tx, call)
 	call.user, call.key, call.model, call.legacy = student, thirdKey, "matched", true
@@ -236,7 +247,7 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 	execTestSQL(t, ctx, tx, `INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros,source)
  VALUES($1,$2,'2026-11-20','matched',2,150,20,40,10,330000,'usage'),
  ($1,$3,'2026-11-20','matched',1,10,3,0,0,10000,'usage'),
- ($1,$2,'2026-11-20','upstream-only',1,40,0,0,0,40000,'usage'),
+ ($1,$2,'2026-11-20','one-sided',1,40,0,0,0,40000,'usage'),
  ($1,$2,'2026-11-19','prior',1,1,1,0,0,500000,'usage')`, provider, first, second)
 	execTestSQL(t, ctx, tx, `INSERT INTO beichen_usage_days(provider_id,credential_id,day,empty) VALUES
  ($1,$2,'2026-11-18',true),($1,$2,'2026-11-20',false)`, provider, first)
@@ -246,7 +257,7 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if usage.Totals.Credits != "40.60000000000000000001" || usage.Totals.Tokens != 285 || usage.Totals.Calls != 6 ||
+	if usage.Totals.Credits != "40.60000000000000000001" || usage.Totals.Tokens != 395 || usage.Totals.Calls != 6 ||
 		usage.Totals.PendingCalls != 1 || usage.Totals.Students != 2 || usage.Totals.Keys != 3 || len(usage.Students) != 3 || len(usage.Keys) != 3 {
 		t.Fatalf("用量总计错误: %+v", usage)
 	}
@@ -264,43 +275,68 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Totals.Local.Tokens != usage.Totals.Tokens || view.Totals.Local.Requests != usage.Totals.Calls || view.Totals.Upstream.Tokens != 273 ||
+	local, upstream := view.Totals.Local, view.Totals.Upstream
+	if local.Tokens != usage.Totals.Tokens || local.Requests != usage.Totals.Calls ||
+		local.InputTokens != 275 || local.OutputTokens != 35 || local.CacheReadTokens != 70 || local.CacheWriteTokens != 15 ||
+		local.TokensMissing != 110 || local.ChargedTokensMissingCalls != 1 || local.Completeness != "partial" ||
+		upstream.Tokens != 273 || upstream.Requests != 4 ||
 		view.Totals.Money.StudentYuan != "0.4060000000000000000001" || view.Totals.Money.BaseYuan != "0.37" ||
-		reportDecimal(view.Totals.Money.ActualYuan) != "0.38" || reportDecimal(view.Totals.Money.MarginYuan) != "0.0260000000000000000001" {
+		reportDecimal(view.Totals.Money.ActualYuan) != "0.38" || view.Totals.Money.MarginAvailable ||
+		view.Totals.Money.MarginYuan != nil || view.Totals.Money.MarginRate != nil {
 		t.Fatalf("金额或 Token 汇总错误: %+v", view.Totals)
 	}
-	if view.Coverage.ExpectedDays != 2 || view.Coverage.SyncedDays != 1 || strings.Join(view.Coverage.MissingDays, ",") != "2026-11-20" ||
+	if view.Coverage.ExpectedDays != 2 || view.Coverage.SyncedDays != 1 || view.Coverage.ComparableDays != 0 ||
+		strings.Join(view.Coverage.MissingDays, ",") != "2026-11-20" ||
 		view.Coverage.PendingCalls != 1 || view.Coverage.UnpricedCalls != 1 || !view.Coverage.MultiplierMixed ||
 		view.Coverage.CoverageKind != "partial" || view.Coverage.VerifiedMatchedCalls != 0 {
 		t.Fatalf("覆盖情况错误: %+v", view.Coverage)
 	}
+	matchedChannels := make(map[uuid.UUID]bool)
 	for _, row := range view.Models {
+		if row.MarginAvailable || row.MarginYuan != nil || row.MarginRate != nil {
+			t.Errorf("区间缺账日时模型差额须为空: %+v", row)
+		}
 		switch row.Model {
 		case "matched":
-			if row.MatchStatus != "matched" || row.Completeness != "complete" || row.Local.Tokens != 233 || row.Upstream.Tokens != 233 || row.Local.InputTokens != 160 ||
-				row.Local.EstimatedMicros == nil || *row.Local.EstimatedMicros != 256 || row.LocalShare == "0" || row.UpstreamShare == "0" {
+			wantTokens := map[uuid.UUID]int64{first: 220, second: 13}[row.CredentialID]
+			wantEstimate := map[uuid.UUID]int64{first: 240, second: 16}[row.CredentialID]
+			if row.MatchStatus != "matched" || row.Completeness != "complete" || row.Label == nil || wantTokens == 0 ||
+				row.Local.Tokens != wantTokens || row.Upstream.Tokens != wantTokens ||
+				row.Local.EstimatedMicros == nil || *row.Local.EstimatedMicros != wantEstimate {
 				t.Errorf("两边均有记录的模型归一化错误: %+v", row)
 			}
-			checkReportRatio(t, row.LocalShare, 233, 285)
-			checkReportRatio(t, row.UpstreamShare, 233, 273)
-		case "local", "pending", "missing":
-			if row.MatchStatus != "local_only" || row.ActualYuan != nil || row.MarginYuan != nil || row.MarginRate != nil ||
-				((row.Model == "pending" || row.Model == "missing") && row.Local.Tokens != 0) {
+			matchedChannels[row.CredentialID] = true
+			checkReportRatio(t, row.LocalShare, wantTokens, 395)
+			checkReportRatio(t, row.UpstreamShare, wantTokens, 273)
+		case "pending", "missing":
+			if row.MatchStatus != "local_only" || row.ActualYuan != nil ||
+				(row.Model == "missing" && (row.Local.Tokens != 0 || row.Local.ChargedTokensMissingCalls != 1 ||
+					row.Local.Completeness != "missing")) {
 				t.Errorf("本地模型状态错误: %+v", row)
 			}
-		case "upstream-only":
-			if row.MatchStatus != "upstream_only" || row.LocalShare != "0" || reportDecimal(row.MarginYuan) != "-0.04" || reportDecimal(row.MarginRate) != "0" {
-				t.Errorf("上游独有模型错误: %+v", row)
+		case "one-sided":
+			switch row.CredentialID {
+			case first:
+				if row.MatchStatus != "upstream_only" || row.LocalShare != "0" || reportDecimal(row.ActualYuan) != "0.04" {
+					t.Errorf("上游独有模型错误: %+v", row)
+				}
+			case second:
+				if row.MatchStatus != "local_only" || row.ActualYuan != nil || row.Local.Tokens != 52 {
+					t.Errorf("本地独有模型错误: %+v", row)
+				}
+			default:
+				t.Errorf("同名模型归属错误: %+v", row)
 			}
 		default:
 			t.Errorf("跨日混入模型: %+v", row)
 		}
 	}
-	if len(view.Models) != 5 || len(view.Keys) != 2 || view.Totals.Local.EstimatedMicros != nil {
+	if len(view.Models) != 6 || len(matchedChannels) != 2 || len(view.Keys) != 2 || view.Totals.Local.EstimatedMicros != nil {
 		t.Fatalf("模型、渠道或缺价估算错误: %+v", view)
 	}
 	for _, row := range view.Keys {
-		if row.Label == nil || (row.CredentialID == first && row.Local.Tokens != 220) || (row.CredentialID == second && row.Local.Tokens != 65) {
+		if row.Label == nil || row.MarginAvailable || row.MarginYuan != nil || row.MarginRate != nil ||
+			(row.CredentialID == first && row.Local.Tokens != 330) || (row.CredentialID == second && row.Local.Tokens != 65) {
 			t.Errorf("渠道聚合错误: %+v", row)
 		}
 		if row.CredentialID == first && reportDecimal(row.ActualYuan) != "0.37" || row.CredentialID == second && reportDecimal(row.ActualYuan) != "0.01" {
@@ -310,16 +346,27 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 	for _, value := range []string{"month", "all"} {
 		period, _ = reportPeriod(value, now)
 		view, err = readReconciliation(ctx, tx, provider, period, now)
-		if err != nil || view.Coverage.ExpectedDays != 4 || view.Coverage.SyncedDays != 2 ||
+		if err != nil || view.Coverage.ExpectedDays != 4 || view.Coverage.SyncedDays != 2 || view.Coverage.ComparableDays != 1 ||
+			view.Totals.Money.MarginAvailable ||
 			strings.Join(view.Coverage.MissingDays, ",") != "2026-11-19,2026-11-20" || reportDecimal(view.Totals.Money.ActualYuan) != "0.88" {
 			t.Fatalf("%s 覆盖情况错误: %+v, err=%v", value, view, err)
 		}
 	}
+	execTestSQL(t, ctx, tx, `INSERT INTO beichen_usage_days(provider_id,credential_id,day,empty) VALUES
+ ($1,$2,'2026-11-19',false),($1,$3,'2026-11-20',false)`, provider, first, second)
+	view, err = readReconciliation(ctx, tx, provider, period, now)
+	if err != nil || view.Coverage.ComparableDays != 3 || len(view.Coverage.MissingDays) != 0 ||
+		!view.Totals.Money.MarginAvailable || reportDecimal(view.Totals.Money.MarginYuan) != "-0.4739999999999999999999" ||
+		view.Totals.Money.MarginRate == nil {
+		t.Fatalf("补齐账日后应恢复差额: %+v, err=%v", view, err)
+	}
 	// 凭据删除不删除已归档账单，本地存在 provider_id 的调用也仍可追溯。
+	execTestSQL(t, ctx, tx, "DELETE FROM beichen_usage_days WHERE credential_id=$1", second)
 	execTestSQL(t, ctx, tx, "DELETE FROM provider_credentials WHERE id=$1", second)
 	period, _ = reportPeriod("day", now)
 	view, err = readReconciliation(ctx, tx, provider, period, now)
-	if err != nil || len(view.Keys) != 2 {
+	if err != nil || len(view.Keys) != 2 || view.Coverage.ComparableDays != 0 ||
+		strings.Join(view.Coverage.MissingDays, ",") != "2026-11-20" || view.Totals.Money.MarginAvailable {
 		t.Fatalf("历史凭据记录丢失: %+v, err=%v", view, err)
 	}
 }
@@ -336,7 +383,8 @@ func TestReportsPostgresEmptyResults(t *testing.T) {
 		t.Fatalf("空用量应返回零和空数组: %+v, err=%v", usage, err)
 	}
 	view, err := readReconciliation(ctx, tx, provider, period, now)
-	if err != nil || view.Totals.Money.ActualYuan != nil || view.Totals.Money.MarginRate != nil || view.Totals.Money.MarginYuan != nil ||
+	if err != nil || view.Totals.Money.MarginAvailable || view.Totals.Money.ActualYuan != nil ||
+		view.Totals.Money.MarginRate != nil || view.Totals.Money.MarginYuan != nil || view.Coverage.ComparableDays != 0 ||
 		view.Models == nil || view.Keys == nil || view.Coverage.MissingDays == nil ||
 		view.Coverage.Credentials == nil || view.Totals.Local.EstimatedMicros != nil ||
 		view.Coverage.CoverageKind != "none" || view.Coverage.VerifiedMatchedCalls != 0 {
@@ -386,16 +434,21 @@ func TestReconciliationPostgresMissingCostRemainsUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Coverage.ExpectedDays != 3 || view.Coverage.SyncedDays != 3 || view.Coverage.CoverageKind != "full" || view.Totals.Upstream.BilledMicros != nil ||
+	if view.Coverage.ExpectedDays != 3 || view.Coverage.SyncedDays != 3 || view.Coverage.ComparableDays != 1 ||
+		view.Coverage.CoverageKind != "full" || view.Totals.Upstream.BilledMicros != nil || view.Totals.Money.MarginAvailable ||
 		view.Totals.Money.ActualYuan != nil || view.Totals.Money.MarginYuan != nil || view.Totals.Money.MarginRate != nil {
 		t.Fatalf("覆盖完整但成本缺失时不能伪造零实扣或利润: %+v", view)
 	}
 	for _, row := range view.Models {
 		if row.Model == "zero" {
-			if reportDecimal(row.ActualYuan) != "0" || reportDecimal(row.MarginYuan) != "0" || reportDecimal(row.MarginRate) != "0" {
+			if !row.MarginAvailable || reportDecimal(row.ActualYuan) != "0" || reportDecimal(row.MarginYuan) != "0" || reportDecimal(row.MarginRate) != "0" {
 				t.Errorf("明确零实扣必须保留: %+v", row)
 			}
-		} else if row.Upstream.BilledMicros != nil || row.ActualYuan != nil || row.MarginYuan != nil || row.MarginRate != nil {
+		} else if row.CredentialID == first {
+			if !row.MarginAvailable || reportDecimal(row.ActualYuan) != "0.005" || reportDecimal(row.MarginYuan) != "0.105" {
+				t.Errorf("已知金额的渠道模型应可比较: %+v", row)
+			}
+		} else if row.Upstream.BilledMicros != nil || row.ActualYuan != nil || row.MarginAvailable || row.MarginYuan != nil || row.MarginRate != nil {
 			t.Errorf("模型的全部或部分成本未知时应返回 null: %+v", row)
 		}
 	}

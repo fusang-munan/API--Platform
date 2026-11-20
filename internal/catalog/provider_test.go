@@ -1,6 +1,20 @@
 package catalog
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
+
+func TestParseBeichenModelsRegistersDeclaredProtocols(t *testing.T) {
+	entries, err := ParseBeichenModels([]byte(`{"data":[{"id":"shared",
+		"supported_protocols":["/v1/messages","google_gemini_v1beta","anthropic","unknown-protocol"]}]}`))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("parse Beichen catalog: %v", err)
+	}
+	if !slices.Equal(entries[0].SupportedProtocols, []string{"anthropic", "google_gemini_v1beta"}) {
+		t.Fatalf("registered protocols: %v", entries[0].SupportedProtocols)
+	}
+}
 
 func TestParseProviderModels_llmapiShape(t *testing.T) {
 	body := []byte(`{

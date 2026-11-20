@@ -9,6 +9,7 @@ import componentSource from './BeichenSchoolModels.vue?raw'
 const api = vi.hoisted(() => ({
   beichenOverview: vi.fn(), modelUsage: vi.fn(), enableBeichenModelsBatch: vi.fn(), enableBeichenModel: vi.fn(),
   updateModel: vi.fn(), syncBeichen: vi.fn(), setBeichenModelPrice: vi.fn(),
+  requestBeichenProbes: vi.fn(), beichenProbes: vi.fn(),
 }))
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }))
 vi.mock('../../api/teacher', () => ({ teacherAPI: api }))
@@ -80,6 +81,58 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('北辰模型管理', () => {
+  it('分别展示四维健康、报价覆盖、线路异常和手动探活结果', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const initial: BeichenOverview = {
+      ...overview([
+        { model: 'lab/tiered', priced: false, catalog: {
+          price_state: 'conditional', price_covered: true, credential_ids: ['first'], activation: 'ready',
+          protocols: ['openai_responses'], probe_state: 'unprobed', ready_count: 0,
+        } },
+        { model: 'lab/dropped', active: true, priced: false, catalog: {
+          credential_ids: [], protocols: [], ready_count: 0, probe_state: 'unprobed',
+          binding_issue: { code: 'catalog_missing', message: '当前 Key 目录里已找不到它。' },
+        } },
+      ]),
+      credentials: [{ credential_id: 'first', label: '渠道一', health: {
+        available_dimensions: 3, credential: { state: 'available', message: '已配置' },
+        catalog: { state: 'available', message: '目录已读取' },
+        pricing: { state: 'available', message: '可计算条件价' },
+        probe: { state: 'pending', message: '等待首次探活' },
+      } }],
+      probe_run: { state: 'idle', started_at: null, finished_at: null, error_code: null },
+    }
+    const completed = { state: 'completed', started_at: '2026-11-20T00:00:00Z', finished_at: '2026-11-20T00:01:00Z', error_code: null } as const
+    api.beichenOverview.mockResolvedValueOnce(initial).mockResolvedValue({
+      ...initial, probe_run: completed, model_catalog: initial.model_catalog?.map(row => row.model === 'lab/tiered'
+        ? { ...row, probe_state: 'failed', last_probe_at: '2026-11-20T00:01:00Z' } : row),
+    })
+    api.requestBeichenProbes.mockResolvedValue({ ...initial.probe_run, state: 'queued' })
+    api.beichenProbes.mockResolvedValue({ run: completed, results: [] })
+    const wrapper = view()
+    await flushPromises()
+    const health = wrapper.get('.key-health')
+    expect(health.get('summary').text()).toContain('3/4 维可用')
+    expect(health.findAll('dt').map(node => node.text())).toEqual(['凭据 · 可用', '目录 · 可用', '报价 · 可用', '探活 · 待确认'])
+    expect(wrapper.get('.model-summary').text()).toContain('报价覆盖1 / 1')
+    expect(wrapper.get('[data-model="lab/dropped"]').classes()).toContain('binding-issue-row')
+    expect(wrapper.get('[data-model="lab/dropped"]').text()).toContain('当前 Key 目录里已找不到它')
+    expect(wrapper.get('[data-model="lab/tiered"]').text()).toContain('OpenAI Responses')
+    expect(wrapper.get('[data-model="lab/tiered"] .model-probe').text()).toContain('待探活')
+
+    await button(wrapper, '立即探活').trigger('click')
+    await flushPromises()
+    expect(api.requestBeichenProbes).toHaveBeenCalledWith('north')
+    expect(button(wrapper, '立即探活').attributes('disabled')).toBeDefined()
+    expect(wrapper.text()).toContain('探活已排队')
+    await vi.advanceTimersByTimeAsync(5_000)
+    await flushPromises()
+    expect(api.beichenProbes).toHaveBeenCalledWith('north')
+    expect(wrapper.get('[data-model="lab/tiered"]').text()).toContain('探活失败')
+    expect(wrapper.get('[data-model="lab/tiered"]').text()).toContain('可启用')
+    expect(button(wrapper, '立即探活').attributes('disabled')).toBeUndefined()
+  })
+
   it('一键启用只提交当前筛选中可启用的新旧模型', async () => {
     const entries: Entry[] = [
       { model: 'lab/active', active: true, catalog: { activation: 'ready' } },

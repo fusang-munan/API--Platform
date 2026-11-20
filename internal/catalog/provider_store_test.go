@@ -39,7 +39,7 @@ func TestProviderCatalogUpsertStoresExtendedFields(t *testing.T) {
 		WithArgs(syncedAt, credentialID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`INSERT INTO provider_model_catalog`).
-		WithArgs(sqlmock.AnyArg(), providerID, credentialID, "gpt-5.3-codex", "GPT 5.3 Codex", "coding model", "openai", "model", "2024-01-01T00:00:00Z", sqlmock.AnyArg(), syncedAt).
+		WithArgs(sqlmock.AnyArg(), providerID, credentialID, "gpt-5.3-codex", "GPT 5.3 Codex", "coding model", "openai", "model", "2024-01-01T00:00:00Z", sqlmock.AnyArg(), syncedAt, `["openai_responses","openai_compatible"]`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 

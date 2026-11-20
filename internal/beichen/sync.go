@@ -230,6 +230,9 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 			if err := recordSuccess(ctx, tx, job.credential, "catalog"); err != nil {
 				return err
 			}
+			if err := saveWebsiteCatalog(ctx, tx, job.credential, revision, quote); err != nil {
+				return err
+			}
 		}
 		return saveBillingObservation(ctx, tx, job.credential, revision, info, billingErr, quote.groupID, quote)
 	}}

@@ -11,6 +11,34 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/domain"
 )
 
+func (s *Server) requestBeichenProbes(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	provider, ok := pathID(c, "provider_id")
+	if !ok || !bindBeichenJSON(c, &struct{}{}, true) {
+		return
+	}
+	run, err := s.service.Beichen().RequestProbes(c.Request.Context(), provider)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusAccepted, run)
+}
+
+func (s *Server) latestBeichenProbes(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	provider, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	view, err := s.service.Beichen().LatestProbes(c.Request.Context(), provider)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
+}
+
 func (s *Server) enableBeichenModelsBatch(c *gin.Context) {
 	provider, ok := pathID(c, "provider_id")
 	if !ok {

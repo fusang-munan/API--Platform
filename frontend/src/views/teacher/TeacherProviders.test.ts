@@ -29,6 +29,29 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers())
 
 describe('北辰供应商行', () => {
+  it('分 Key 列出目录差异并提示换 Key 和补分组', async () => {
+    api.providers.mockResolvedValue([provider('north')])
+    api.beichenOverview.mockResolvedValue({ model_catalog: [
+      { model: 'tiered', price_state: 'conditional', price_covered: true },
+    ], comparison: [], catalog_differences: [
+      { credential_id: 'first', label: '渠道一', state: 'compared', group_id: 7,
+        checked_at: '2026-11-20T00:00:00Z', website_only: ['only-on-website'], key_only: ['only-on-key'] },
+      { credential_id: 'second', label: '渠道二', state: 'unverified', group_id: null,
+        checked_at: null, website_only: [], key_only: [] },
+    ] })
+    const wrapper = view()
+    await flushPromises()
+    const panel = wrapper.get('.catalog-differences')
+    expect(panel.get('summary').text()).toBe('目录差异')
+    expect(panel.text()).toContain('网页有 Key 无（1）')
+    expect(panel.text()).toContain('Key 有 网页无（1）')
+    expect(panel.text()).toContain('更换为能访问这些模型的 Key')
+    expect(panel.text()).toContain('补齐分组')
+    expect(panel.text()).toContain('待核对')
+    expect(panel.findAll('li').map(item => item.text())).toEqual(['only-on-website', 'only-on-key'])
+    expect(wrapper.get('[aria-label="北辰供应商概览"]').text()).toContain('缺价模型 0 个')
+  })
+
   it('每个北辰供应商都有对账对比入口，跳到对应的既有对账视图', async () => {
     api.providers.mockResolvedValue([
       provider('north-a'), provider('north-b', 'https://api.beichenapi.com/v1/'), provider('other', 'https://example.test'),

@@ -39,9 +39,11 @@ func TestReconciliationPostgresStudentAndSchoolChargesAndTokenCompleteness(t *te
 	insertReportCall(t, ctx, tx, call)
 	call.credential = second
 	insertReportCall(t, ctx, tx, call)
-	execTestSQL(t, ctx, tx, `UPDATE gateway_calls SET student_credits=10, school_absorbed_credits=1.000000000000000001
+	execTestSQL(t, ctx, tx, `UPDATE gateway_calls SET student_credits=10, actual_credits=11.000000000000000001,
+ school_absorbed_credits=1.000000000000000001, beichen_base_credits=NULL,
+ pricing_detail='{"base_credits":"11.000000000000000001"}'
  WHERE beichen_dispatch_credential_id=$1`, first)
-	execTestSQL(t, ctx, tx, `UPDATE gateway_calls SET student_credits=4.5, school_absorbed_credits=4.000000000000000003
+	execTestSQL(t, ctx, tx, `UPDATE gateway_calls SET student_credits=4.5, actual_credits=4.5, beichen_base_credits=4.5
  WHERE beichen_dispatch_credential_id=$1`, second)
 	call.model, call.prompt = "partial-local", 10
 	insertReportCall(t, ctx, tx, call)
@@ -63,10 +65,12 @@ func TestReconciliationPostgresStudentAndSchoolChargesAndTokenCompleteness(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Coverage.ExpectedDays != 3 || view.Coverage.SyncedDays != 0 || view.Coverage.CoverageKind != "none" {
+	if view.Coverage.ExpectedDays != 3 || view.Coverage.SyncedDays != 0 || view.Coverage.ComparableDays != 0 ||
+		view.Coverage.CoverageKind != "none" || view.Coverage.UnpricedCalls != 0 || view.Totals.Money.MarginAvailable {
 		t.Fatalf("没有确认完整账单的日期应是未同步: %+v", view.Coverage)
 	}
-	if len(view.Models) != 4 || len(view.Keys) != 3 || view.Totals.Local.Credits != "94.5" {
+	if len(view.Models) != 5 || len(view.Keys) != 3 || view.Totals.Local.Credits != "94.5" ||
+		view.Totals.Local.ChargedTokensMissingCalls != 2 || view.Totals.Upstream.Requests != 6 {
 		t.Fatalf("汇总未区分阶段 2 已扣积分与历史扣分: %+v", view)
 	}
 	wantCompleteness := map[string]string{"zero-tokens": "complete", "partial-local": "partial", "partial-upstream": "partial", "no-tokens": "missing"}
@@ -75,17 +79,25 @@ func TestReconciliationPostgresStudentAndSchoolChargesAndTokenCompleteness(t *te
 			t.Errorf("模型记录状态和 Token 回报状态错误: %+v", row)
 		}
 		if row.Model == "zero-tokens" {
-			if row.Local.Tokens != 0 || row.Upstream.Tokens != 0 || row.SchoolAbsorbedCredits != "5.000000000000000004" || row.StudentYuan != "0.145" {
-				t.Errorf("零 Token 或跨渠道金额未精确保留: %+v", row)
+			wantSchool := map[uuid.UUID]string{first: "1.000000000000000001", second: "0"}[row.CredentialID]
+			wantStudent := map[uuid.UUID]string{first: "0.1", second: "0.045"}[row.CredentialID]
+			wantBase := map[uuid.UUID]string{first: "0.11000000000000000001", second: "0.045"}[row.CredentialID]
+			if row.Local.Tokens != 0 || row.Upstream.Tokens != 0 || reportDecimal(row.SchoolAbsorbedCredits) != wantSchool ||
+				row.StudentYuan != wantStudent || row.BaseYuan != wantBase {
+				t.Errorf("零 Token 或触顶前的基础金额未精确保留: %+v", row)
 			}
-		} else if row.SchoolAbsorbedCredits != "0" || row.StudentYuan == "0" {
+		} else if row.SchoolAbsorbedCredits != nil || row.StudentYuan == "0" {
 			t.Errorf("历史记录的学校承担或学生已扣错误: %+v", row)
+		}
+		if row.Model == "no-tokens" && (row.Local.ChargedTokensMissingCalls != 1 || row.Local.Completeness != "missing" ||
+			row.Local.TokensMissing != 10 || row.Upstream.Completeness != "missing") {
+			t.Errorf("已扣款但没有回报 Token 的调用须单独计数: %+v", row)
 		}
 	}
 	for _, row := range view.Keys {
 		wantStatus := map[uuid.UUID]string{first: "complete", second: "partial", third: "missing"}[row.CredentialID]
-		wantSchool := map[uuid.UUID]string{first: "1.000000000000000001", second: "4.000000000000000003", third: "0"}[row.CredentialID]
-		if row.Completeness != wantStatus || row.SchoolAbsorbedCredits != wantSchool {
+		wantSchool := map[uuid.UUID]string{first: "1.000000000000000001", second: "0", third: "<null>"}[row.CredentialID]
+		if row.Completeness != wantStatus || reportDecimal(row.SchoolAbsorbedCredits) != wantSchool {
 			t.Errorf("渠道账本汇总错误: %+v", row)
 		}
 	}
@@ -100,16 +112,26 @@ func TestReconciliationPostgresVerifiedCallsRequireUnconflictedReceipt(t *testin
 		protocol: "anthropic", state: "charged", usage: "reported", credits: "1", base: "1", multiplier: "1",
 		prompt: 10, output: 0, read: 0, write: 0}
 	for index, tc := range []struct {
-		model, day                              string
+		model, day, usage                       string
 		receipt, claimConflict, gatewayConflict bool
+		partial                                 bool
 	}{
 		{model: "verified", day: "2026-11-20", receipt: true},
+		{model: "verified-partial", day: "2026-11-20", receipt: true, partial: true},
+		{model: "verified-no-usage", day: "2026-11-20", receipt: true, usage: "missing"},
 		{model: "previous-day", day: "2026-11-19", receipt: true},
 		{model: "claim-without-receipt", day: "2026-11-20"},
 		{model: "claim-conflict", day: "2026-11-20", receipt: true, claimConflict: true},
 		{model: "gateway-conflict", day: "2026-11-20", receipt: true, gatewayConflict: true},
 	} {
 		call.model, call.sent = tc.model, tc.day+"T10:00:00+08:00"
+		call.usage, call.read = "reported", 0
+		if tc.usage != "" {
+			call.usage = tc.usage
+		}
+		if tc.partial {
+			call.read = nil
+		}
 		insertReportCall(t, ctx, tx, call)
 		responseID := uuid.New()
 		var callID uuid.UUID
@@ -127,13 +149,14 @@ func TestReconciliationPostgresVerifiedCallsRequireUnconflictedReceipt(t *testin
 	}
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, beijing)
 	for _, tc := range []struct {
-		rangeValue string
-		wantCount  int64
-	}{{"day", 1}, {"month", 2}} {
+		rangeValue            string
+		wantCount, wantTokens int64
+	}{{"day", 3, 1}, {"month", 4, 2}} {
 		period, _ := reportPeriod(tc.rangeValue, now)
 		view, err := readReconciliation(ctx, tx, provider, period, now)
-		if err != nil || view.Coverage.VerifiedMatchedCalls != tc.wantCount {
-			t.Fatalf("%s 逐笔关联数 = %d，期望 %d，错误 %v", tc.rangeValue, view.Coverage.VerifiedMatchedCalls, tc.wantCount, err)
+		if err != nil || view.Coverage.VerifiedMatchedCalls != tc.wantCount ||
+			view.Coverage.VerifiedMatchedCompleteTokenCalls != tc.wantTokens || view.Coverage.ComparableDays != 0 {
+			t.Fatalf("%s 逐笔关联数或本地 Token 完整笔数错误: %+v, err=%v", tc.rangeValue, view.Coverage, err)
 		}
 	}
 }

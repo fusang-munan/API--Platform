@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 
@@ -34,8 +35,14 @@ type Model struct {
 	PriceConditionsExact map[string]any  `json:"price_conditions_exact,omitempty"`
 	UpstreamRates        *DisplayRates   `json:"upstream_rates"`
 	SchoolRates          *DisplayRates   `json:"school_rates"`
+	PriceCovered         bool            `json:"price_covered"`
 
-	candidateAdapters []modelbinding.Adapter
+	available          bool
+	protocols          []string
+	probeState         string
+	lastProbeAt        *time.Time
+	credentialRejected bool
+	priceReadiness     activationPrice
 }
 
 // The effective multiplier can yield fractions of a micro-unit. Decimal
@@ -71,27 +78,30 @@ type Comparison struct {
 }
 
 type Overview struct {
-	WebLoginRequired bool                `json:"web_login_required,omitempty"`
-	WebsiteSync      WebsiteSyncStatus   `json:"website_sync"`
-	ArchivedUsage    []ArchivedUsage     `json:"archived_usage"`
-	Credentials      []CredentialSummary `json:"credentials"`
-	Datasets         []Dataset           `json:"datasets"`
-	Models           []Model             `json:"models"`
-	ModelCatalog     []CatalogModel      `json:"model_catalog"`
-	Comparison       []Comparison        `json:"comparison"`
+	WebLoginRequired   bool                `json:"web_login_required,omitempty"`
+	WebsiteSync        WebsiteSyncStatus   `json:"website_sync"`
+	ArchivedUsage      []ArchivedUsage     `json:"archived_usage"`
+	Credentials        []CredentialSummary `json:"credentials"`
+	Datasets           []Dataset           `json:"datasets"`
+	Models             []Model             `json:"models"`
+	ModelCatalog       []CatalogModel      `json:"model_catalog"`
+	Comparison         []Comparison        `json:"comparison"`
+	CatalogDifferences []CatalogDifference `json:"catalog_differences"`
+	ProbeRun           ProbeRun            `json:"probe_run"`
 }
 
 type CredentialSummary struct {
-	CredentialID       uuid.UUID  `json:"credential_id"`
-	Label              string     `json:"label"`
-	Status             string     `json:"status"`
-	CatalogLastSuccess *time.Time `json:"catalog_last_success"`
-	PricesLastSuccess  *time.Time `json:"prices_last_success"`
-	BillingLastSuccess *time.Time `json:"billing_last_success"`
-	UsageLastSuccess   *time.Time `json:"usage_last_success"`
-	LastError          *string    `json:"last_error"`
-	ModelCount         int        `json:"model_count"`
-	PricedModelCount   int        `json:"priced_model_count"`
+	CredentialID       uuid.UUID        `json:"credential_id"`
+	Label              string           `json:"label"`
+	Status             string           `json:"status"`
+	CatalogLastSuccess *time.Time       `json:"catalog_last_success"`
+	PricesLastSuccess  *time.Time       `json:"prices_last_success"`
+	BillingLastSuccess *time.Time       `json:"billing_last_success"`
+	UsageLastSuccess   *time.Time       `json:"usage_last_success"`
+	LastError          *string          `json:"last_error"`
+	ModelCount         int              `json:"model_count"`
+	PricedModelCount   int              `json:"priced_model_count"`
+	Health             CredentialHealth `json:"health"`
 }
 
 type CatalogModel struct {
@@ -105,8 +115,13 @@ type CatalogModel struct {
 	RouteCount      int              `json:"route_count"`
 	ReadyCount      int              `json:"ready_count"`
 	PriceState      string           `json:"price_state"`
+	PriceCovered    bool             `json:"price_covered"`
 	Blockers        []CatalogBlocker `json:"blockers"`
 	Activation      string           `json:"activation"`
+	Protocols       []string         `json:"protocols"`
+	ProbeState      string           `json:"probe_state"`
+	LastProbeAt     *time.Time       `json:"last_probe_at"`
+	BindingIssue    *CatalogBlocker  `json:"binding_issue,omitempty"`
 }
 
 type CatalogBlocker struct {
@@ -179,6 +194,12 @@ func (s *Service) Overview(ctx context.Context, providerID uuid.UUID, day string
 		err = readPreferredRoutes(ctx, tx, providerID, &view)
 	}
 	if err == nil {
+		err = readCatalogDifferences(ctx, tx, providerID, &view)
+	}
+	if err == nil {
+		view.ProbeRun, err = readProbeRun(ctx, tx, providerID)
+	}
+	if err == nil {
 		err = readComparison(ctx, tx, providerID, start, &view)
 	}
 	if err == nil {
@@ -242,7 +263,9 @@ SELECT m.credential_id, m.model_id::text, p.mode,
   trim_scale(p.upstream_cache_read)::text, trim_scale(p.upstream_cache_write)::text,
   trim_scale(p.school_input * f.factor)::text, trim_scale(p.school_output * f.factor)::text,
   trim_scale(p.school_cache_read * f.factor)::text, trim_scale(p.school_cache_write * f.factor)::text,
-  owner.status = 'active' AND c.status = 'active', m.raw_entry
+  owner.status = 'active' AND c.status = 'active', m.raw_entry, to_json(m.supported_protocols),
+  probe.checked_at, COALESCE(probe.passed, false), COALESCE(probe.credential_rejected, false),
+  `+activationFixedSchoolPriceSQL+`
 FROM provider_model_catalog m
 JOIN provider_credentials c ON c.id = m.credential_id AND c.provider_id = m.provider_id
 JOIN providers owner ON owner.id = c.provider_id
@@ -260,6 +283,15 @@ LEFT JOIN LATERAL (
     (school.status = 'pending_configuration') DESC, b.priority, b.id
   LIMIT 1
 ) route ON true
+LEFT JOIN LATERAL (
+  SELECT max(r.checked_at) AS checked_at, bool_or(r.error_code IS NULL) AS passed,
+    bool_and(r.status_code = 401 OR r.error_code IS NOT DISTINCT FROM 'credential_unreadable') AS credential_rejected
+  FROM upstream_probes r
+  WHERE owner.status = 'active' AND c.status = 'active'
+    AND r.provider_id = m.provider_id AND r.credential_id = m.credential_id AND r.model = m.model_id::text
+    AND r.checked_at >= c.updated_at
+    AND (cardinality(m.supported_protocols) = 0 OR r.protocol = ANY(m.supported_protocols))
+) probe ON true
 CROSS JOIN LATERAL beichen_price_at(m.credential_id, m.model_id::text, statement_timestamp()) p
 CROSS JOIN LATERAL (SELECT CASE WHEN p.mode = 'follow' THEN 100 ELSE 1 END AS factor) f
 WHERE m.provider_id = $1 AND m.status = 'active'
@@ -271,21 +303,29 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 	for rows.Next() {
 		var model Model
 		var upstream, school DisplayRates
-		var terms, rawEntry []byte
-		var available bool
+		var terms, rawEntry, protocols []byte
+		var passed, fixedPrice bool
 		err := rows.Scan(&model.CredentialID, &model.Model, &model.Mode,
 			&model.SchoolStatus, &model.RouteReady, &terms,
 			&upstream.Input, &upstream.Output, &upstream.CacheRead, &upstream.CacheWrite,
-			&school.Input, &school.Output, &school.CacheRead, &school.CacheWrite, &available, &rawEntry)
+			&school.Input, &school.Output, &school.CacheRead, &school.CacheWrite, &model.available, &rawEntry, &protocols,
+			&model.lastProbeAt, &passed, &model.credentialRejected, &fixedPrice)
 		if err != nil {
 			return err
 		}
-		if available {
-			entry := catalog.ProviderEntry{ID: model.Model}
-			if err := json.Unmarshal(rawEntry, &entry.Raw); err != nil {
-				return err
+		entry, err := storedCatalogEntry(model.Model, rawEntry, protocols)
+		if err != nil {
+			return err
+		}
+		model.protocols = catalog.RegisteredProtocols(entry)
+		model.probeState = "unprobed"
+		if model.lastProbeAt != nil {
+			at := model.lastProbeAt.UTC()
+			model.lastProbeAt = &at
+			model.probeState = "failed"
+			if passed {
+				model.probeState = "passed"
 			}
-			model.candidateAdapters = catalog.AdaptersFromUpstream(entry)
 		}
 		model.PriceStatus = "pending_confirmation"
 		if bytes.Equal(terms, []byte("null")) {
@@ -301,15 +341,17 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 			}
 			stringifyPriceNumbers(model.PriceConditionsExact)
 		}
+		model.priceReadiness = routePriceReadiness(fixedPrice, terms)
 		if upstream.Input != nil && upstream.Output != nil {
 			model.PriceStatus = "confirmed"
 			model.UpstreamRates = &upstream
-		} else if conditionalPanelPricing(terms) {
+		} else if model.priceReadiness == activationPriceConditional || conditionalPanelPricing(terms) {
 			model.PriceStatus = "conditional"
 		}
 		if school.Input != nil {
 			model.SchoolRates = &school
 		}
+		model.PriceCovered = model.priceReadiness.ready()
 		view.Models = append(view.Models, model)
 	}
 	return rows.Err()
@@ -329,23 +371,22 @@ func (m *Model) catalogPriceState() string {
 }
 
 func readCredentials(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Overview) error {
-	type modelCounts struct{ total, priced int }
-	counts := make(map[uuid.UUID]modelCounts)
-	for _, model := range view.Models {
-		count := counts[model.CredentialID]
-		count.total++
-		if model.SchoolRates != nil {
-			count.priced++
+	counts := credentialModelCounts(view.Models)
+	datasetErrors := make(map[uuid.UUID]map[string]*string)
+	for _, data := range view.Datasets {
+		if datasetErrors[data.CredentialID] == nil {
+			datasetErrors[data.CredentialID] = make(map[string]*string)
 		}
-		counts[model.CredentialID] = count
+		datasetErrors[data.CredentialID][data.Kind] = data.LastError
 	}
 
 	// The datasets store retry deadlines, not failure times. Undo the usual
 	// retry interval when comparing errors from usage and the billing job.
 	// Catalog and price errors can be written as part of that billing job.
 	rows, err := tx.QueryContext(ctx, `
-SELECT c.id, c.label::text, c.status, s.catalog_at, s.prices_at, s.billing_at, s.usage_at, s.last_error
-FROM provider_credentials c
+SELECT c.id, c.label::text, c.status, s.catalog_at, s.prices_at, s.billing_at, s.usage_at, s.last_error,
+  p.status = 'active' AND c.status = 'active', octet_length(c.credential_ciphertext) > 0, c.updated_at
+FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
 LEFT JOIN beichen_datasets b ON b.credential_id = c.id AND b.kind = 'billing'
 CROSS JOIN LATERAL (
   SELECT max(d.last_success) FILTER (WHERE d.kind = 'catalog') AS catalog_at,
@@ -369,8 +410,11 @@ ORDER BY c.label, c.id`, providerID)
 	view.Credentials = []CredentialSummary{}
 	for rows.Next() {
 		var item CredentialSummary
+		var enabled, configured bool
+		var revision time.Time
 		times := []**time.Time{&item.CatalogLastSuccess, &item.PricesLastSuccess, &item.BillingLastSuccess, &item.UsageLastSuccess}
-		if err := rows.Scan(&item.CredentialID, &item.Label, &item.Status, times[0], times[1], times[2], times[3], &item.LastError); err != nil {
+		if err := rows.Scan(&item.CredentialID, &item.Label, &item.Status, times[0], times[1], times[2], times[3], &item.LastError,
+			&enabled, &configured, &revision); err != nil {
 			return err
 		}
 		for _, timestamp := range times {
@@ -381,6 +425,7 @@ ORDER BY c.label, c.id`, providerID)
 		}
 		count := counts[item.CredentialID]
 		item.ModelCount, item.PricedModelCount = count.total, count.priced
+		item.Health = buildCredentialHealth(item, count, enabled, configured, revision, datasetErrors[item.CredentialID])
 		view.Credentials = append(view.Credentials, item)
 	}
 	return rows.Err()
@@ -439,6 +484,8 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 ) (CatalogModel, error) {
 	item := m.overview()
 	item.Blockers = []CatalogBlocker{}
+	item.Protocols = []string{}
+	item.ProbeState = "unprobed"
 	source := strings.ToLower(m.name)
 	type routeKey struct {
 		credential uuid.UUID
@@ -453,13 +500,27 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 		if row == nil {
 			continue
 		}
-		if state != "missing" || len(row.candidateAdapters) > 0 {
+		if state != "missing" || row.available && len(row.protocols) > 0 {
 			item.KeyCount++
 		}
-		for _, adapter := range row.candidateAdapters {
-			candidates[routeKey{id, adapter}] = true
+		if !row.available {
+			continue
+		}
+		item.PriceCovered = item.PriceCovered || row.PriceCovered
+		for _, protocol := range row.protocols {
+			candidates[routeKey{id, modelbinding.Adapter(protocol)}] = true
+			if !slices.Contains(item.Protocols, protocol) {
+				item.Protocols = append(item.Protocols, protocol)
+			}
+		}
+		if row.lastProbeAt != nil && (item.LastProbeAt == nil || row.lastProbeAt.After(*item.LastProbeAt)) {
+			item.LastProbeAt = row.lastProbeAt
+		}
+		if row.probeState == "passed" || row.probeState == "failed" && item.ProbeState == "unprobed" {
+			item.ProbeState = row.probeState
 		}
 	}
+	slices.Sort(item.Protocols)
 	item.PriceState = "missing"
 	for state := range priceStates {
 		item.PriceState = state
@@ -469,10 +530,12 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 	}
 	// Preferred routes collapse competing routes for the same protocol. Count
 	// every distinct published North protocol and credential, including aliases.
+	hasPublishedSchool := false
 	for _, school := range m.schools {
 		if school.status != "active" {
 			continue
 		}
+		hasPublishedSchool = true
 		for _, binding := range school.bindings {
 			r := binding.route
 			if binding.active && binding.reachable && r.ProviderID == m.provider && r.CredentialID != nil &&
@@ -487,53 +550,33 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 		item.Activation = "active"
 		return item, nil
 	}
+	if hasPublishedSchool {
+		item.BindingIssue = &CatalogBlocker{"no_ready_binding", "学校已启用该模型，北辰线路不可用。请检查 Key 状态和模型绑定。"}
+		if len(m.keys) == 0 {
+			item.BindingIssue = &CatalogBlocker{"catalog_missing", "学校已启用该模型，当前 Key 目录里已找不到它。请同步目录并核查供货渠道。"}
+		}
+	}
 
 	target := m.target("")
 	missingPrice, conditionalPrice := priceStates["missing"], priceStates["conditional"]
-	if item.CanEnable {
-		// Batch enable validates the current school price for the routes in
-		// this plan. A missing quote on an unused alternative does not block it.
-		missingPrice, conditionalPrice = false, false
-		for _, r := range m.plan(target).routes {
-			if r.ProviderID != m.provider || r.CredentialID == nil {
-				continue
-			}
-			record := records[strings.ToLower(strings.TrimSpace(r.UpstreamModel))][*r.CredentialID]
-			state := record.catalogPriceState()
-			// 纯 Token 的分档条件价可以直接启用；结算时由价格评估器按实际用量选档。
-			if state == "conditional" && record != nil && activationTokenPriceReady(record.PriceConditions) {
-				continue
-			}
-			if record == nil || record.Model != r.UpstreamModel {
-				// Existing bindings can keep a different spelling from the
-				// directory. Batch enable looks up the exact binding name.
-				var priced bool
-				err := tx.QueryRowContext(ctx, `SELECT school_input IS NOT NULL FROM beichen_price_at($1,$2,statement_timestamp())`,
-					*r.CredentialID, r.UpstreamModel).Scan(&priced)
-				if err != nil {
-					return CatalogModel{}, err
-				}
-				if priced {
-					continue
-				}
-				if state != "conditional" {
-					state = "missing"
-				}
-			}
-			missingPrice = missingPrice || state == "missing"
-			conditionalPrice = conditionalPrice || state == "conditional"
+	routeReady := item.CanEnable
+	if routeReady {
+		price, err := m.plan(target).priceReadiness(ctx, tx, records)
+		if err != nil {
+			return CatalogModel{}, err
 		}
-		if !missingPrice && !conditionalPrice {
+		if price.ready() {
 			item.Activation = "ready"
 			return item, nil
 		}
+		missingPrice, conditionalPrice = price == activationPriceMissing, price == activationPriceUnusableConditional
 	}
 
 	item.Activation = "blocked"
 	if target == nil || target.status == "not_configured" {
 		item.Blockers = append(item.Blockers, CatalogBlocker{"not_configured", "请确认此目录模型对应的校内模型和线路"})
 	}
-	if !item.CanEnable {
+	if !routeReady {
 		item.Blockers = append(item.Blockers, CatalogBlocker{"no_ready_route", "没有可启用的北辰线路，请检查渠道状态和线路配置"})
 	}
 	if missingPrice {

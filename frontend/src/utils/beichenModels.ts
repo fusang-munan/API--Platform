@@ -126,9 +126,9 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
     input: scaledNumber(schoolRates.input, 6), output: scaledNumber(schoolRates.output, 6),
     cache_read: scaledNumber(schoolRates.cache_read, 6), cache_write: scaledNumber(schoolRates.cache_write, 6),
   } : null
-  const priceReady = mode === 'manual'
+  const priceReady = record?.price_covered ?? (mode === 'manual'
     ? Boolean(actualRates?.input != null && actualRates?.output != null)
-    : !priceError && Boolean(record?.upstream_rates?.input != null && record?.upstream_rates?.output != null)
+    : !priceError && Boolean(record?.upstream_rates?.input != null && record?.upstream_rates?.output != null))
   const statusLabel = priceError
     ? (status === 'pending' ? '价格同步失败' : '上次报价状态 · ' + priceStatusLabels[status])
     : (status === 'pending' && standard ? '官网单价待核对' : priceStatusLabels[status])

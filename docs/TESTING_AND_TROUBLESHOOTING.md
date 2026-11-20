@@ -205,6 +205,13 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 ### 北辰教师端用量、定价与对账
 
+#### 探活与目录差异
+
+设置 `NEBULA_TEST_POSTGRES` 为隔离的本机 `nebula_test` 后运行 `go test ./internal/beichen -run 'TestBeichenProbeAndCatalogPostgres|TestSingleAndBatchEnableUseSamePricesPostgres' -count=1`。探活测试使用模拟 HTTP 响应，核对协议请求的输出限制、重复排队、每小时触发、结果脱敏和 Key 轮换后的隔离。前端运行 `npm test -- BeichenSchoolModels TeacherProviders` 验证健康项、探活状态和目录差异。
+
+- 「待探活」时先核对该 Key 是否启用、目录是否已同步，以及模型是否登记了可限制为 1 个输出 Token 的生成协议。检查 `BEICHEN_PROBES_ENABLED` 后可点「立即探活」，再用教师探活 GET 查看状态、错误代码及 HTTP 状态。北辰若拒绝 1 Token 限制，失败结果会保留，方便核实当前协议及其参数要求。
+- 「已启用 · 线路异常」时查看模型下的说明，并在供应商页核对 Key 状态和目录差异。目录差异显示「待核对」时，先核实网页读取授权和渠道分组，再同步。纯 Token 条件价需有有效的输入、输出费率及可判定的档位，才能计入报价覆盖。
+
 后端先指向隔离 PostgreSQL，再按风险分组运行：
 
 ```powershell
