@@ -164,6 +164,7 @@ func TestSetModelPriceFourCredentialsPostgres(t *testing.T) {
 VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now())`, provider, key, model)
 		}
 	}
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", keys[1])
 	service := New(db, nil)
 	input, output, zero := int64(1234567), int64(6000000), int64(0)
 	manual := PriceInput{Mode: "manual", Rates: &Rates{Input: &input, Output: &output, CacheRead: &zero, CacheWrite: &zero}}
@@ -209,5 +210,57 @@ CREATE TRIGGER reject_price_fixture BEFORE INSERT ON beichen_price_versions FOR 
 		if _, err := service.SetModelPrice(ctx, id, actor, "rollback", manual); domain.ErrorCode(err) != domain.CodeNotFound {
 			t.Fatalf("没有有效目录凭据时应返回 404: %v", err)
 		}
+	}
+}
+
+func TestSetModelPriceCredentialsPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	otherProvider, otherKey := uuid.New(), uuid.New()
+	exec(`INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES($1,'Other','https://other.invalid',now(),now())`, otherProvider)
+	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
+VALUES($1,$2,'other','fixture',now(),now())`, otherKey, otherProvider)
+	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,'Shared',now(),now(),now(),now()),
+ (gen_random_uuid(),$1,$3,'shared',now(),now(),now(),now()),
+ (gen_random_uuid(),$1,$4,'Shared',now(),now(),now(),now()),
+ (gen_random_uuid(),$5,$6,'Shared',now(),now(),now(),now())`, provider, keys[3], keys[0], keys[1], otherProvider, otherKey)
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", keys[1])
+
+	service := New(db, nil)
+	value := int64(1250000)
+	price := PriceInput{Mode: "manual", Rates: &Rates{Input: &value, Output: &value}}
+	for _, invalidKey := range []uuid.UUID{keys[1], keys[2], otherKey, uuid.New()} {
+		scope := ModelPriceScope{Scope: "credentials", CredentialIDs: []uuid.UUID{keys[3], invalidKey}}
+		if refs, err := service.SetModelPrice(ctx, provider, actor, "SHARED", price, scope); domain.ErrorCode(err) != domain.CodeNotFound || len(refs) != 0 {
+			t.Fatalf("非可用线路应使整批失败: refs=%v, err=%v", refs, err)
+		}
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM beichen_price_versions").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("拒绝的范围产生了价格版本: count=%d, err=%v", count, err)
+	}
+
+	scope := ModelPriceScope{Scope: "credentials", CredentialIDs: []uuid.UUID{keys[0], keys[3], keys[0]}}
+	for range 2 {
+		refs, err := service.SetModelPrice(ctx, provider, actor, "SHARED", price, scope)
+		if err != nil || len(refs) != 2 || refs[0].CredentialID != keys[3] || refs[1].CredentialID != keys[0] ||
+			refs[0].Label != "CC1" || refs[1].Label != "Gemini" {
+			t.Fatalf("定价渠道范围错误: refs=%v, err=%v", refs, err)
+		}
+	}
+	var times int
+	var correct bool
+	err := db.QueryRowContext(ctx, `SELECT count(*),count(DISTINCT effective_at),bool_and(
+ ((credential_id=$1 AND model='Shared') OR (credential_id=$2 AND model='shared')) AND
+ track='school' AND basis='manual' AND input_rate=1250000 AND output_rate=1250000)
+FROM beichen_price_versions`, keys[3], keys[0]).Scan(&count, &times, &correct)
+	if err != nil || count != 2 || times != 1 || !correct {
+		t.Fatalf("范围、同一生效时间或幂等错误: count=%d, times=%d, correct=%t, err=%v", count, times, correct, err)
 	}
 }

@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"time"
 
@@ -27,15 +28,33 @@ func (g *Gateway) proxyBeichenWebSocket(ctx context.Context, client, upstream *w
 	var callMu, clientWriteMu sync.Mutex
 	var turnID uuid.UUID
 	seen := make(map[string]struct{})
+	writeRejection := func(err error) error {
+		clientWriteMu.Lock()
+		defer clientWriteMu.Unlock()
+		return client.WriteJSON(modelCallErrorEvent(err))
+	}
 	send := func(reservation usage.Reservation, data []byte) error {
 		call := &beichenSocketCall{reservation: reservation, route: selected.callRoute(), started: time.Now()}
 		call.review = beichenPayloadReview(data, call.route.UpstreamModelName, true)
 		call.route.DefinitelyNotSent = true
-		attempt, err := g.usage.StartAttempt(ctx, reservation.CallID, call.route)
-		if err == nil {
-			err = g.usage.PrepareDispatch(ctx, reservation.CallID, call.route)
+		field := quotaTokenField("/v1/responses")
+		var quotaBudget int64
+		if limit := g.quotaTokenLimit(ctx, reservation, call.route, field); limit > 0 {
+			payload := jsonObject(data)
+			quotaBudget = applyOutputBudget(payload, field, limit)
+			var err error
+			data, err = json.Marshal(payload)
+			if err != nil {
+				_ = g.finalizeCall(ctx, reservation, false, "request_rewrite", "Unable to prepare the upstream message.", call.route, usage.CallMetrics{})
+				return err
+			}
 		}
+		attempt, err := g.usage.StartAttempt(ctx, reservation, call.route, quotaBudget)
 		if err != nil {
+			_ = g.finalizeCall(ctx, reservation, false, "dispatch_rejected", "Unable to authorize upstream dispatch.", call.route, usage.CallMetrics{})
+			return writeRejection(err)
+		}
+		if err = g.usage.PrepareDispatch(ctx, reservation.CallID, call.route); err != nil {
 			g.finishAttempt(ctx, attempt, call.started, false, nil, "connection", "Unable to record upstream attempt.")
 			_ = g.finalizeCall(ctx, reservation, false, "connection", "Unable to record upstream attempt.", call.route, usage.CallMetrics{State: usage.UsageMissing})
 			return err
@@ -140,7 +159,7 @@ func (g *Gateway) proxyBeichenWebSocket(ctx context.Context, client, upstream *w
 			reservation, err := g.usage.Reserve(ctx, keyID, selected.Binding.ModelID, requestID, string(adapter), "/v1/responses", prompt, source, correlation, selected.callRoute())
 			if err != nil {
 				callMu.Unlock()
-				if writeError("quota_exceeded", "Unable to reserve credits for the response.") != nil {
+				if writeRejection(err) != nil {
 					return
 				}
 				continue

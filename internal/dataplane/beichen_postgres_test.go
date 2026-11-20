@@ -96,9 +96,13 @@ VALUES ($1,$2,'upstream','base','billing',2000000,10000000,100000,2500000)`, cre
 	} {
 		t.Run(tc.id, func(t *testing.T) {
 			servedModel := upstreamModel
+			requestLimit, wantBudget := `,"max_output_tokens":5`, int64(5)
 			if tc.id == "g3-original-sse" || tc.id == "gm1-original-json" {
 				multiplier := "0.2"
+				// 10 credits balance and 2 yuan per million output tokens.
+				requestLimit, wantBudget = "", 50_000
 				if tc.id == "gm1-original-json" {
+					requestLimit, wantBudget = `,"max_output_tokens":3`, 3
 					servedModel, multiplier = gmModel, "0.08"
 					if _, err := db.ExecContext(ctx, `
 INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,cache_read_rate,cache_write_rate)
@@ -131,11 +135,15 @@ VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now())`, provider, credentia
 					t.Fatal("student-supplied receipt reached the upstream")
 				}
 				var payload struct {
-					Model string `json:"model"`
+					Model           string `json:"model"`
+					MaxOutputTokens int64  `json:"max_output_tokens"`
 				}
 				stream := tc.contentType == "text/event-stream"
 				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Model != servedModel {
 					t.Fatal("gateway did not rewrite the model")
+				}
+				if payload.MaxOutputTokens != wantBudget {
+					t.Fatalf("upstream max_output_tokens=%d, want %d", payload.MaxOutputTokens, wantBudget)
 				}
 				if !tc.send {
 					return nil, io.ErrClosedPipe
@@ -165,7 +173,7 @@ VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now())`, provider, credentia
 				return &http.Response{StatusCode: http.StatusOK, Header: headers, Body: io.NopCloser(body)}, nil
 			})
 			r := httptest.NewRequest(http.MethodPost, "/v1/responses",
-				strings.NewReader(fmt.Sprintf(`{"model":%q,"stream":%t,"input":"Fixture prompt"}`, publicModel, tc.contentType == "text/event-stream"))).
+				strings.NewReader(fmt.Sprintf(`{"model":%q,"stream":%t,"input":"Fixture prompt"%s}`, publicModel, tc.contentType == "text/event-stream", requestLimit))).
 				WithContext(usage.WithRequestID(ctx, tc.id))
 			r.Header.Set("Content-Type", "application/json")
 			r.Header.Set("Authorization", "Bearer "+studentKey)
@@ -177,6 +185,12 @@ VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now())`, provider, credentia
 			}
 			if !tc.send && w.Code != http.StatusBadGateway {
 				t.Fatalf("not sent: status=%d", w.Code)
+			}
+			var budget int64
+			var truncated bool
+			if err := db.QueryRowContext(ctx, "SELECT quota_budget_tokens,truncated_quota FROM gateway_calls WHERE request_id=$1", tc.id).
+				Scan(&budget, &truncated); err != nil || budget != wantBudget || truncated != (tc.id == "gm1-original-json") {
+				t.Fatalf("quota budget=%d truncated=%t: %v", budget, truncated, err)
 			}
 			var state, protocol, gotModel string
 			var exact, review sql.NullString

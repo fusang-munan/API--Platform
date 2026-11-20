@@ -240,7 +240,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
             </div>
             <StatusProgress :current="key.progress.current" :completed="key.progress.completed_steps" />
             <div v-if="['active', 'inactive'].includes(key.status)" class="key-material">
-              <p class="secret">{{ maskedKey(key) }}</p>
+              <p class="secret" data-testid="api-key-mask">{{ maskedKey(key) }}</p>
             </div>
             <p v-if="['active', 'inactive'].includes(key.status) && !key.key_prefix" class="muted">
               当前密钥是旧版记录，重新生成后才能查看。
@@ -277,10 +277,10 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
           <button class="button ghost" @click="withdrawConfirm = detail">撤回申请</button>
         </div>
         <div v-if="detail.api_key" class="key-material">
-          <p class="secret">{{ detail.api_key }}</p>
+          <p class="secret" data-testid="api-key-detail">{{ detail.api_key }}</p>
           <div class="actions key-card-actions">
-            <button class="button secondary" @click="copy(detail.api_key!)">复制密钥</button>
-            <button v-if="keySupportsHarness(detail)" class="button secondary" @click="openHarness(detail)">一键配置</button>
+            <button class="button secondary" data-testid="copy-api-key" @click="copy(detail.api_key!)">复制密钥</button>
+            <button v-if="keySupportsHarness(detail)" class="button secondary" data-testid="configure-api-key" @click="openHarness(detail)">一键配置</button>
           </div>
         </div>
         <p v-else-if="['active', 'inactive'].includes(detail.status)" class="muted">

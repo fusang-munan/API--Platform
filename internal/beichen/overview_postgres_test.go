@@ -170,6 +170,9 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 	readRoute := func(upstream, school, adapter string) PreferredRoute {
 		t.Helper()
 		var view Overview
+		if err := readModels(ctx, tx, provider, &view); err != nil {
+			t.Fatal(err)
+		}
 		if err := readPreferredRoutes(ctx, tx, provider, &view); err != nil {
 			t.Fatal(err)
 		}
@@ -182,6 +185,13 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 			}
 			if upstream == "shared" && len(m.CredentialIDs) != 2 {
 				t.Fatal("lost shared credential")
+			}
+			if upstream == "shared" && (m.PriceState != "confirmed" || m.ReadyCount != 1 || m.Activation != "active") {
+				t.Fatalf("共享模型的已发布北辰线路或报价状态不正确: %+v", m)
+			}
+			if upstream == "special" && (m.PriceState != "conditional" || m.Activation != "blocked" ||
+				len(m.Blockers) != 1 || m.Blockers[0].Code != "conditional_price") {
+				t.Fatalf("条件计价模型的状态或阻塞原因不正确: %+v", m)
 			}
 			for _, r := range m.PreferredRoutes {
 				if r.SchoolModel == school && r.Adapter == adapter {
@@ -200,6 +210,10 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 	preview := readRoute("no-quote", "no-quote", "openai_responses")
 	if preview.State != "candidate" || preview.CredentialID == nil || *preview.CredentialID != first || preview.Priority != 50 {
 		t.Fatalf("unconfigured model must retain a prospective channel: %+v", preview)
+	}
+	conditional := readRoute("special", "special", "openai_responses")
+	if conditional.State != "candidate" {
+		t.Fatalf("待配置的条件计价模型不应显示为已发布: %+v", conditional)
 	}
 	// A different supplier can win the school's route for the same protocol.
 	other, otherKey := uuid.New(), uuid.New()
@@ -221,5 +235,99 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 	snapshot(first, `{"data":[]}`)
 	if rows := read(); len(rows[first]) != 0 || len(rows[second]) != 1 {
 		t.Fatal("empty snapshot changed another key or retained historical models")
+	}
+}
+
+func TestOverviewCatalogAndCredentialsPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, second, disabled, empty := keys[3], keys[2], keys[1], keys[0]
+	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,'Mixed',now(),now(),now(),now()),
+ (gen_random_uuid(),$1,$3,'MIXED',now(),now(),now(),now()),
+ (gen_random_uuid(),$1,$2,'manual',now(),now(),now(),now()),
+ (gen_random_uuid(),$1,$3,'unpriced',now(),now(),now(),now()),
+ (gen_random_uuid(),$1,$4,'offline',now(),now(),now(),now())`, provider, first, second, disabled)
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", disabled)
+	exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,actor_id)
+VALUES($1,'Mixed','upstream','effective','billing',0,2000000,NULL),
+ ($1,'manual','school','manual','teacher',1000000,1000000,$2)`, first, actor)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, beijing)
+	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success,last_error,failure_count,next_attempt)
+VALUES($1,'catalog',$3,NULL,0,'-infinity'),
+ ($1,'billing',$3+interval '1 minute','账单同步失败',2,$3+interval '7 minutes'),
+ ($1,'usage',$3+interval '2 minutes','较早的用量同步失败',1,$3+interval '24 hours 4 minutes'),
+ ($1,'prices',$3+interval '3 minutes',NULL,0,'-infinity'),
+ ($2,'catalog',NULL,'目录同步失败',0,'-infinity')`, first, second, base)
+
+	service := New(db, nil)
+	view, err := service.Overview(ctx, provider, "2026-01-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byKey := make(map[uuid.UUID]CredentialSummary)
+	for _, entry := range view.Credentials {
+		byKey[entry.CredentialID] = entry
+	}
+	entry := byKey[first]
+	if len(byKey) != 4 || entry.Label != "CC1" || entry.Status != "active" ||
+		entry.ModelCount != 2 || entry.PricedModelCount != 2 || entry.LastError == nil || *entry.LastError != "账单同步失败" {
+		t.Fatalf("渠道汇总有误: %+v", view.Credentials)
+	}
+	for i, timestamp := range []*time.Time{entry.CatalogLastSuccess, entry.BillingLastSuccess, entry.UsageLastSuccess, entry.PricesLastSuccess} {
+		if timestamp == nil || timestamp.Location() != time.UTC || !timestamp.Equal(base.Add(time.Duration(i)*time.Minute)) {
+			t.Errorf("渠道成功时间 %d 有误: %v", i, timestamp)
+		}
+	}
+	entry = byKey[empty]
+	if entry.Label != "Gemini" || entry.ModelCount != 0 || entry.PricedModelCount != 0 ||
+		entry.LastError != nil || entry.CatalogLastSuccess != nil || entry.BillingLastSuccess != nil ||
+		entry.PricesLastSuccess != nil || entry.UsageLastSuccess != nil || byKey[disabled].Status != "inactive" {
+		t.Fatalf("空渠道或停用状态有误: %+v", view.Credentials)
+	}
+
+	models := make(map[string]CatalogModel)
+	for _, model := range view.ModelCatalog {
+		models[strings.ToLower(model.Model)] = model
+	}
+	mixed := models["mixed"]
+	if mixed.Activation != "ready" || mixed.PriceState != "mixed" || mixed.KeyCount != 2 ||
+		mixed.RouteCount != 4 || mixed.ReadyCount != 0 || mixed.Blockers == nil || len(mixed.Blockers) != 0 {
+		t.Errorf("首选 Key 有价时，备用 Key 缺价不应阻止启用: %+v", mixed)
+	}
+	manual := models["manual"]
+	if manual.PriceState != "manual" || manual.Activation != "ready" {
+		t.Errorf("仅手动价的模型应可启用: %+v", manual)
+	}
+	for name, want := range map[string]string{"unpriced": "not_configured,missing_price,sync_failed", "offline": "not_configured,no_ready_route,missing_price"} {
+		model := models[name]
+		var codes []string
+		for _, blocker := range model.Blockers {
+			if blocker.Message == "" {
+				t.Errorf("%s 缺少原因文案: %+v", name, blocker)
+			}
+			codes = append(codes, blocker.Code)
+		}
+		if model.Activation != "blocked" || model.PriceState != "missing" || strings.Join(codes, ",") != want {
+			t.Errorf("%s 的阻塞原因有误: %+v", name, model)
+		}
+	}
+	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{mixed.Model, manual.Model})
+	if err != nil || len(result.Enabled) != 2 || len(result.Skipped) != 0 {
+		t.Fatalf("标为可启用的模型未通过批量启用: %+v, %v", result, err)
+	}
+	view, err = service.Overview(ctx, provider, "2026-01-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range view.ModelCatalog {
+		if strings.EqualFold(model.Model, mixed.Model) && (model.Activation != "active" || model.RouteCount != 4 || model.ReadyCount != 2) {
+			t.Errorf("发布后的候选和就绪线路数有误: %+v", model)
+		}
 	}
 }

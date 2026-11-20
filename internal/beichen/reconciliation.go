@@ -47,11 +47,13 @@ type ReconciliationTotals struct {
 }
 
 type ReconciliationLine struct {
-	Local         ReconciliationLocal    `json:"local"`
-	Upstream      ReconciliationUpstream `json:"upstream"`
-	MatchStatus   string                 `json:"match_status"`
-	LocalShare    string                 `json:"local_share"`
-	UpstreamShare string                 `json:"upstream_share"`
+	Local                 ReconciliationLocal    `json:"local"`
+	Upstream              ReconciliationUpstream `json:"upstream"`
+	MatchStatus           string                 `json:"match_status"`
+	Completeness          string                 `json:"completeness"`
+	LocalShare            string                 `json:"local_share"`
+	UpstreamShare         string                 `json:"upstream_share"`
+	SchoolAbsorbedCredits string                 `json:"school_absorbed_credits"`
 	ReconciliationMoney
 }
 
@@ -75,13 +77,15 @@ type ReconciliationCredentialCoverage struct {
 }
 
 type ReconciliationCoverage struct {
-	ExpectedDays    int64                              `json:"days_expected"`
-	SyncedDays      int64                              `json:"days_present"`
-	MissingDays     []string                           `json:"missing_days"`
-	Credentials     []ReconciliationCredentialCoverage `json:"credentials"`
-	PendingCalls    int64                              `json:"pending_calls"`
-	UnpricedCalls   int64                              `json:"unpriced_calls"`
-	MultiplierMixed bool                               `json:"multiplier_mixed"`
+	ExpectedDays         int64                              `json:"days_expected"`
+	SyncedDays           int64                              `json:"days_present"`
+	MissingDays          []string                           `json:"missing_days"`
+	Credentials          []ReconciliationCredentialCoverage `json:"credentials"`
+	PendingCalls         int64                              `json:"pending_calls"`
+	UnpricedCalls        int64                              `json:"unpriced_calls"`
+	MultiplierMixed      bool                               `json:"multiplier_mixed"`
+	VerifiedMatchedCalls int64                              `json:"verified_matched_calls"`
+	CoverageKind         string                             `json:"coverage_kind"`
 }
 
 type ReconciliationReport struct {
@@ -94,8 +98,20 @@ type ReconciliationReport struct {
 
 // grouping=2 按模型，grouping=1 按供应商凭据，grouping=3 为总计。
 // 两侧先各自聚合再 FULL JOIN，同名模型跨渠道时不会把学生扣分乘上账单行数。
-const reconciliationSQL = reportCallsSQL + `,
-priced_calls AS (
+const reconciliationSQL = reportAttributionSQL + `,
+   c.id AS call_id, c.beichen_receipt_response_id, c.beichen_receipt_conflict,
+   COALESCE(c.student_credits, c.beichen_credit_exact) AS settled_student_credits,
+   c.school_absorbed_credits AS settled_school_credits
+` + reportCallsFromSQL + `,
+verified_calls AS (
+ SELECT count(*) AS requests
+ FROM attributed a
+ JOIN beichen_receipt_response_claims claim ON claim.first_call_id = a.call_id
+   AND claim.response_id = a.beichen_receipt_response_id AND claim.conflicted_at IS NULL
+ JOIN beichen_call_receipts r ON r.call_id = a.call_id AND r.response_id = claim.response_id
+   AND r.credential_id = a.credential_id AND r.model = a.model
+ WHERE a.beichen_state = 'charged' AND NOT a.beichen_receipt_conflict
+), priced_calls AS (
  SELECT a.*, CASE WHEN a.tokens_reported THEN
    beichen_weighted_tokens(a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_write_tokens,
      p.upstream_input, p.upstream_output, p.upstream_cache_read, p.upstream_cache_write)
@@ -104,13 +120,15 @@ priced_calls AS (
  CROSS JOIN LATERAL beichen_price_at(a.credential_id, a.model, a.sent_at) p
 ), local_summary AS (
  SELECT credential_id, model, grouping(credential_id, model) AS level, count(*) AS requests,
+   count(*) FILTER (WHERE tokens_reported) AS token_calls,
    COALESCE(sum(tokens), 0) AS tokens,
    COALESCE(sum(input_tokens) FILTER (WHERE tokens_reported), 0) AS input_tokens,
    COALESCE(sum(output_tokens) FILTER (WHERE tokens_reported), 0) AS output_tokens,
    COALESCE(sum(cache_read_tokens) FILTER (WHERE tokens_reported), 0) AS cache_read_tokens,
    COALESCE(sum(cache_write_tokens) FILTER (WHERE tokens_reported), 0) AS cache_write_tokens,
    CASE WHEN count(estimated_weight) = count(*) THEN round(sum(estimated_weight) / 1000000) END AS estimated_micros,
-   COALESCE(sum(beichen_credit_exact) FILTER (WHERE beichen_state = 'charged'), 0) AS student_credits,
+   COALESCE(sum(settled_student_credits) FILTER (WHERE beichen_state = 'charged'), 0) AS student_credits,
+   COALESCE(sum(settled_school_credits) FILTER (WHERE beichen_state = 'charged'), 0) AS school_absorbed_credits,
    COALESCE(sum(COALESCE(beichen_base_credits,
      beichen_credit_exact / NULLIF(COALESCE(beichen_school_multiplier, 1), 0)))
      FILTER (WHERE beichen_state = 'charged'), 0) AS base_credits,
@@ -120,6 +138,8 @@ priced_calls AS (
  FROM priced_calls GROUP BY GROUPING SETS ((model), (credential_id), ())
 ), upstream_summary AS (
  SELECT credential_id, model, grouping(credential_id, model) AS level, count(*) AS row_count,
+   count(*) FILTER (WHERE num_nonnulls(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) = 4) AS complete_token_rows,
+   count(*) FILTER (WHERE num_nonnulls(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) > 0) AS token_rows,
    COALESCE(sum(requests), 0) AS requests,
    COALESCE(sum(input_tokens), 0) AS input_tokens, COALESCE(sum(output_tokens), 0) AS output_tokens,
    COALESCE(sum(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(sum(cache_write_tokens), 0) AS cache_write_tokens,
@@ -133,6 +153,10 @@ priced_calls AS (
    COALESCE(l.credential_id, u.credential_id) AS credential_id,
    CASE WHEN COALESCE(l.requests, 0) > 0 AND COALESCE(u.row_count, 0) > 0 THEN 'matched'
         WHEN COALESCE(l.requests, 0) > 0 THEN 'local_only' ELSE 'upstream_only' END AS match_status,
+   CASE WHEN l.token_calls > 0 AND l.token_calls = l.requests
+          AND u.complete_token_rows > 0 AND u.complete_token_rows = u.row_count THEN 'complete'
+        WHEN l.token_calls > 0 OR u.token_rows > 0 THEN 'partial' ELSE 'missing' END AS completeness,
+   trim_scale(COALESCE(l.school_absorbed_credits, 0))::text AS school_absorbed_credits,
    jsonb_build_object('requests', COALESCE(l.requests, 0),
      'credits', trim_scale(COALESCE(l.student_credits, 0))::text, 'pending_calls', COALESCE(l.pending_calls, 0),
      'tokens', COALESCE(l.tokens, 0),
@@ -160,6 +184,7 @@ priced_calls AS (
  FROM paired p
 ), lines AS (
  SELECT a.*, jsonb_build_object('local', a.local, 'upstream', a.upstream, 'match_status', a.match_status,
+   'completeness', a.completeness, 'school_absorbed_credits', a.school_absorbed_credits,
    'local_share', trim_scale(CASE WHEN t.local_tokens = 0 THEN 0 ELSE a.local_tokens / t.local_tokens END)::text,
    'upstream_share', trim_scale(CASE WHEN t.upstream_tokens = 0 THEN 0 ELSE a.upstream_tokens / t.upstream_tokens END)::text) || a.money AS item
  FROM amounts a CROSS JOIN amounts t WHERE t.level = 3
@@ -193,6 +218,7 @@ SELECT jsonb_build_object(
      FROM credential_coverage), '[]'::jsonb),
    'pending_calls', (SELECT pending_calls FROM local_summary WHERE level = 3),
    'unpriced_calls', (SELECT unpriced_calls FROM local_summary WHERE level = 3),
+   'verified_matched_calls', (SELECT requests FROM verified_calls),
    'multiplier_mixed', (SELECT multiplier_mixed FROM local_summary WHERE level = 3)))`
 
 func readReconciliation(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, period ReportPeriod, now time.Time) (ReconciliationReport, error) {
@@ -217,6 +243,14 @@ func readReconciliation(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, p
 	}
 	if err := json.Unmarshal(raw, &report); err != nil {
 		return report, err
+	}
+	switch {
+	case report.Coverage.SyncedDays == 0:
+		report.Coverage.CoverageKind = "none"
+	case report.Coverage.SyncedDays == report.Coverage.ExpectedDays:
+		report.Coverage.CoverageKind = "full"
+	default:
+		report.Coverage.CoverageKind = "partial"
 	}
 	report.ReportPeriod = period
 	return report, nil

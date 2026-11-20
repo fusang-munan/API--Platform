@@ -52,14 +52,18 @@ ON CONFLICT(project_id,month) DO NOTHING`, projectID, month, now)
 }
 
 func (s *Store) UpdateMemberQuota(ctx context.Context, mentorID, projectID, userID uuid.UUID, quota int64, reason string) error {
-	return s.updateMemberQuota(ctx, mentorID, projectID, userID, quota, reason, false)
+	return s.updateMemberQuota(ctx, mentorID, projectID, userID, quota, reason, false, false)
 }
 
 func (s *Store) UpdateStudentQuotaAsTeacher(ctx context.Context, teacherID, projectID, userID uuid.UUID, quota int64, reason string) error {
-	return s.updateMemberQuota(ctx, teacherID, projectID, userID, quota, reason, true)
+	return s.updateMemberQuota(ctx, teacherID, projectID, userID, quota, reason, true, false)
 }
 
-func (s *Store) updateMemberQuota(ctx context.Context, actorID, projectID, userID uuid.UUID, quota int64, reason string, asTeacher bool) error {
+func (s *Store) IncreaseStudentQuotaAsTeacher(ctx context.Context, teacherID, projectID, userID uuid.UUID, quota int64, reason string) error {
+	return s.updateMemberQuota(ctx, teacherID, projectID, userID, quota, reason, true, true)
+}
+
+func (s *Store) updateMemberQuota(ctx context.Context, actorID, projectID, userID uuid.UUID, quota int64, reason string, asTeacher, increaseOnly bool) error {
 	if quota < 0 || quota > domain.MaxCreditMilli {
 		return domain.NewError(domain.CodeValidation, "monthly credits are out of range")
 	}
@@ -93,6 +97,9 @@ func (s *Store) updateMemberQuota(ctx context.Context, actorID, projectID, userI
 		return domain.NewError(domain.CodeNotFound, "project member not found")
 	} else if err != nil {
 		return err
+	}
+	if increaseOnly && quota < oldQuota {
+		return domain.NewError(domain.CodeInvalidTransition, "member quota is already higher")
 	}
 	month, now := Month(time.Now()), time.Now().UTC()
 	if err = insertProjectMonthBucketTx(ctx, tx, projectID, month, now); err != nil {

@@ -1,0 +1,203 @@
+package usage
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/domain"
+)
+
+func TestGatewayQuotaPostgres(t *testing.T) {
+	ctx, db := newBeichenLedgerTestDB(t)
+	t.Setenv("NEBULA_STUDENT_CONCURRENCY_LIMIT", "")
+	t.Setenv("NEBULA_STUDENT_PENDING_REVIEW_LIMIT", "")
+	store := NewStore(db)
+	exec := func(stmt string, args ...any) {
+		t.Helper()
+		ledgerTestExec(t, ctx, db, stmt, args...)
+	}
+	student, org, model := uuid.New(), uuid.New(), uuid.New()
+	project, otherProject, key, otherKey := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	exec(`INSERT INTO users(id,name,email,password_hash,role,created_at,updated_at)
+		VALUES($1,'Quota student','quota-student@example.test','fixture','student',now(),now())`, student)
+	exec(`INSERT INTO organizations(id,name,created_at,updated_at)
+		VALUES($1,'Quota organization',now(),now())`, org)
+	exec(`INSERT INTO projects(id,organization_id,name,monthly_credit_quota_milli,created_at,updated_at)
+		VALUES($1,$3,'Quota project',1500,now(),now()),($2,$3,'Other quota project',1500,now(),now())`, project, otherProject, org)
+	const addMember = `INSERT INTO project_members(id,project_id,user_id,monthly_credit_quota_milli,created_at)
+		VALUES(gen_random_uuid(),$1,$3,1000,now()),(gen_random_uuid(),$2,$3,1000,now()) ON CONFLICT DO NOTHING`
+	exec(addMember, project, otherProject, student)
+	exec(`INSERT INTO api_keys(id,project_id,owner_user_id,name,status,key_hash,key_prefix,claimed_at,created_at,updated_at)
+		VALUES($1,$3,$5,'Quota key','active','quota-hash','fixture',now(),now(),now()),
+		      ($2,$4,$5,'Other key','active','other-quota-hash','fixture',now(),now(),now())`, key, otherKey, project, otherProject, student)
+	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+		VALUES($1,'quota-model','Quota model','active',1000,now(),now())`, model)
+	exec(`INSERT INTO api_key_models(id,api_key_id,model_id,created_at)
+		VALUES(gen_random_uuid(),$1,$3,now()),(gen_random_uuid(),$2,$3,now())`, key, otherKey, model)
+
+	route := CallRoute{Beichen: true, ProviderID: uuid.New(), BindingID: uuid.New(), CredentialID: uuid.New(), UpstreamModelName: "quota-model"}
+	reserve := func(keyID uuid.UUID) (Reservation, error) {
+		return store.Reserve(ctx, keyID, model, uuid.NewString(), "openai_responses", "/v1/responses", "", "", CallCorrelation{}, route)
+	}
+	mustReserve := func(t *testing.T, keyID uuid.UUID) Reservation {
+		t.Helper()
+		reservation, err := reserve(keyID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reservation
+	}
+	release := func(t *testing.T, r Reservation) {
+		t.Helper()
+		if err := store.Finalize(ctx, r, false, "upstream_failed", "", "", CallRoute{DefinitelyNotSent: true}, CallMetrics{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("inactive access", func(t *testing.T) {
+		for _, tt := range []struct {
+			name, disable, restore string
+			id                     uuid.UUID
+		}{
+			{"key", "UPDATE api_keys SET status='inactive',revoked_at=now() WHERE id=$1", "UPDATE api_keys SET status='active',revoked_at=NULL WHERE id=$1", key},
+			{"model", "UPDATE models SET status='inactive' WHERE id=$1", "UPDATE models SET status='active' WHERE id=$1", model},
+			{"student", "UPDATE users SET status='disabled' WHERE id=$1", "UPDATE users SET status='active' WHERE id=$1", student},
+			{"project", "UPDATE projects SET status='inactive' WHERE id=$1", "UPDATE projects SET status='active' WHERE id=$1", project},
+			{"organization", "UPDATE organizations SET status='inactive' WHERE id=$1", "UPDATE organizations SET status='active' WHERE id=$1", org},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				exec(tt.disable, tt.id)
+				defer exec(tt.restore, tt.id)
+				if _, err := reserve(key); domain.ErrorCode(err) != domain.CodeNotFound {
+					t.Fatalf("inactive %s: %v", tt.name, err)
+				}
+			})
+		}
+		exec("DELETE FROM project_members WHERE project_id=$1 AND user_id=$2", project, student)
+		defer exec(addMember, project, otherProject, student)
+		if _, err := reserve(key); domain.ErrorCode(err) != domain.CodeNotFound {
+			t.Fatalf("removed membership: %v", err)
+		}
+		var calls int
+		if err := db.QueryRowContext(ctx, "SELECT count(*) FROM gateway_calls WHERE user_id=$1", student).Scan(&calls); err != nil || calls != 0 {
+			t.Fatalf("rejected access wrote %d calls: %v", calls, err)
+		}
+	})
+
+	t.Run("balance before the new hold", func(t *testing.T) {
+		first := mustReserve(t, key)
+		second := mustReserve(t, key)
+		if first.MemberAvailableMilli != 1000 || first.ProjectAvailableMilli != 1500 ||
+			second.MemberAvailableMilli != 999 || second.ProjectAvailableMilli != 1499 {
+			t.Fatalf("available member/project: first=%d/%d second=%d/%d",
+				first.MemberAvailableMilli, first.ProjectAvailableMilli, second.MemberAvailableMilli, second.ProjectAvailableMilli)
+		}
+		var capMilli int64
+		if err := db.QueryRowContext(ctx, "SELECT student_cap_milli FROM gateway_calls WHERE id=$1", first.CallID).Scan(&capMilli); err != nil || capMilli != 1000 {
+			t.Fatalf("student cap=%d: %v", capMilli, err)
+		}
+		release(t, first)
+		release(t, second)
+		exec("UPDATE project_member_month_credit_buckets SET charged_milli=999, charged_milli_remainder=0.5 WHERE project_id=$1 AND user_id=$2", project, student)
+		last := mustReserve(t, key)
+		if last.MemberAvailableMilli != 0 {
+			t.Fatalf("fractional remaining balance exposed as %d milli-credits", last.MemberAvailableMilli)
+		}
+		release(t, last)
+		exec("UPDATE project_member_month_credit_buckets SET charged_milli=0, charged_milli_remainder=0 WHERE project_id=$1 AND user_id=$2", project, student)
+	})
+
+	t.Run("membership checked again before dispatch", func(t *testing.T) {
+		request := mustReserve(t, key)
+		exec("DELETE FROM project_members WHERE project_id=$1 AND user_id=$2", project, student)
+		defer exec(addMember, project, otherProject, student)
+		defer release(t, request)
+		if _, err := store.StartAttempt(ctx, request, route, 0); domain.ErrorCode(err) != domain.CodeNotFound {
+			t.Fatalf("dispatch after membership removal: %v", err)
+		}
+	})
+
+	t.Run("effective output price", func(t *testing.T) {
+		check := func(want string) {
+			t.Helper()
+			got, err := store.BeichenOutputPrice(ctx, route)
+			if err != nil || got != want {
+				t.Fatalf("output price=%q, want %q: %v", got, want, err)
+			}
+		}
+		check("")
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate)
+			VALUES ($1,$2,'upstream','effective','billing',1000000,8000000)`, route.CredentialID, route.UpstreamModelName)
+		check("8")
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+			VALUES ($1,$2,'school','manual','teacher',$3,100000000,600000000)`, route.CredentialID, route.UpstreamModelName, student)
+		check("6")
+	})
+
+	t.Run("dispatch shares a limit across keys and projects", func(t *testing.T) {
+		requests := []Reservation{mustReserve(t, key), mustReserve(t, otherKey), mustReserve(t, key)}
+		results := make(chan error, len(requests))
+		for _, request := range requests {
+			go func() {
+				_, err := store.StartAttempt(ctx, request, route, 0)
+				results <- err
+			}()
+		}
+		rejected := 0
+		for range requests {
+			if err := <-results; err != nil {
+				expectQuotaRejection(t, err, StudentConcurrencyExceeded)
+				rejected++
+			}
+		}
+		if rejected != 1 {
+			t.Fatalf("rejected %d dispatches out of 3, want 1", rejected)
+		}
+		_, err := reserve(otherKey)
+		expectQuotaRejection(t, err, StudentConcurrencyExceeded)
+		for _, request := range requests {
+			release(t, request)
+		}
+
+		t.Setenv("NEBULA_STUDENT_CONCURRENCY_LIMIT", "1")
+		inFlight := mustReserve(t, otherKey)
+		if _, err := store.StartAttempt(ctx, inFlight, route, 0); err != nil {
+			t.Fatal(err)
+		}
+		_, err = reserve(key)
+		expectQuotaRejection(t, err, StudentConcurrencyExceeded)
+		release(t, inFlight)
+		release(t, mustReserve(t, key))
+	})
+
+	t.Run("pending review has its own limit", func(t *testing.T) {
+		for range 20 {
+			request := mustReserve(t, key)
+			if _, err := store.StartAttempt(ctx, request, route, 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.PrepareDispatch(ctx, request.CallID, route); err != nil {
+				t.Fatal(err)
+			}
+			sent := route
+			sent.SentAt = time.Now()
+			if err := store.Finalize(ctx, request, true, "succeeded", "", "", sent, CallMetrics{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, err := reserve(otherKey)
+		expectQuotaRejection(t, err, PendingReviewLimit)
+		t.Setenv("NEBULA_STUDENT_PENDING_REVIEW_LIMIT", "21")
+		release(t, mustReserve(t, otherKey))
+	})
+}
+
+func expectQuotaRejection(t *testing.T, err error, code string) {
+	t.Helper()
+	var quota *QuotaError
+	if !errors.As(err, &quota) || quota.Code != code {
+		t.Fatalf("quota rejection=%v, want %s", err, code)
+	}
+}

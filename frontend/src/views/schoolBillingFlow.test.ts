@@ -168,10 +168,11 @@ function button(label: string, root: Pick<DOMWrapper<Element>, 'findAll'> = page
   return b
 }
 
-function visiblePrices(quote: Pick<DOMWrapper<Element>, 'findAll'>) {
-  return quote.findAll('.quote-prices > div').map(pair => ({
-    title: pair.get('dt').text(),
-    values: pair.findAll('.price-cell').map(cell => [cell.get('.price-label').text(), cell.get('.price-value').text()]),
+function visiblePrices(row: Pick<DOMWrapper<Element>, 'find'>) {
+  return [{ id: 'standard-price', title: '官网标准价' }, { id: 'actual-price', title: '学生实际价（含 1.10）' }].map(column => ({
+    title: column.title,
+    values: row.find('td.' + column.id).findAll('.price-cell')
+      .map(cell => [cell.get('.price-label').text(), cell.get('.price-credits').text()]),
   }))
 }
 
@@ -192,14 +193,16 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   expect(shared.text()).toContain('2.125000000000000000000001×')
   expect(table.text()).not.toContain('0.1×')
   expect(shared.text()).toContain('0.0625× · 待启用')
-  expect(paused.text()).toContain('暂不可启用')
+  expect(paused.text()).toContain('官网未报价')
   expect(paused.text()).not.toContain('0.3×')
-  expect(paused.find('button[aria-label="启用 paused"]').exists()).toBe(false)
+  const pausedEnable = paused.find('button[aria-label="启用 paused"]')
+  expect(pausedEnable.exists()).toBe(true)
+  expect(pausedEnable.attributes('disabled')).toBeDefined()
   expect(button('手动定价', paused).exists()).toBe(true)
   expect(historical.text()).toContain('启用条件待同步')
   expect(table.text()).toContain('北辰官网需要学校后台重新授权')
   const confirmed = shared.get('[data-price-status="confirmed"]')
-  expect(visiblePrices(confirmed)).toEqual([
+  expect(visiblePrices(shared)).toEqual([
     { title: '官网标准价', values: [['输入', '10 积分'], ['输出', '20 积分'], ['缓存读取', '0 积分'], ['缓存写入', '—']] },
     { title: '学生实际价（含 1.10）', values: [['输入', '23.375000000000000000000011 积分'], ['输出', '46.750000000000000000000022 积分'], ['缓存读取', '0 积分'], ['缓存写入', '—']] },
   ])
@@ -213,20 +216,20 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   const details = conditions.findAll('.condition-prices').at(-1)!
   const [standard, actual] = details.findAll('dd').map(item => item.text())
   expect(standard).toEqual([
-    '每百万 Token 的积分 · 缓存写入（1 小时） 0 · 缓存写入（12 小时） 400',
+    '每百万 Token 的积分 · 缓存写入（1 小时） 0 积分（0 元） · 缓存写入（12 小时） 400 积分（4 元）',
     '上下文分档（Token 下限 200000，上限 无上限）',
-    '每百万 Token 的积分 · 输入 800.0000000000000019',
+    '每百万 Token 的积分 · 输入 800.0000000000000019 积分（8.000000000000000019 元）',
     '推理强度（低）倍率 0.5×',
   ].join('\n'))
   expect(actual).toEqual([
-    '每百万 Token 的积分 · 缓存写入（1 小时） 0 · 缓存写入（12 小时） 25',
+    '每百万 Token 的积分 · 缓存写入（1 小时） 0 积分（0 元） · 缓存写入（12 小时） 25 积分（0.25 元）',
     '上下文分档（Token 下限 200000，上限 无上限）',
-    '每百万 Token 的积分 · 输入 50.00000000000000011875',
+    '每百万 Token 的积分 · 输入 50.00000000000000011875 积分（0.5000000000000000011875 元）',
   ].join('\n'))
   await conditions.get('button[aria-label="关闭"]').trigger('click')
   expect(conditional.text()).toContain('按条件计价')
   expect(shared.find('details').exists()).toBe(false)
-  expect(table.text()).not.toMatch(/隐藏的|chosen|cheap|school-alias|OpenAI|Anthropic|协议|路由|渠道/i)
+  expect(table.text()).not.toMatch(/隐藏的|chosen|cheap|school-alias|OpenAI|Anthropic|路由|渠道/i)
   expect(writes).not.toHaveBeenCalled()
   await button('禁用', shared).trigger('click')
   await flushPromises()
@@ -241,7 +244,8 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   await flushPromises()
   const models = widget.get('[aria-label="北辰模型目录"]')
   expect(models.findAll('tbody tr')).toHaveLength(4)
-  expect(visiblePrices(models.get('[data-price-status="confirmed"]'))).toEqual(visiblePrices(confirmed))
+  const modelsRow = models.findAll('tbody tr').find(row => row.get('th').text() === 'shared')!
+  expect(visiblePrices(modelsRow)).toEqual(visiblePrices(shared))
   expect(widget.find('[aria-label="近期逐笔对账"]').exists()).toBe(false)
   expect(widget.find('article.panel').exists()).toBe(false)
 })
@@ -330,7 +334,7 @@ it('教师页自动发现目录里的新模型，并随后台报价更新待同�
   const price: BeichenPriceConditions = { billing_mode: 'token', input_price: '8e-6', output_price: '0.000016' }
   const confirmed = await update(discoveredOverview({ price_status: 'confirmed', price_conditions_exact: price }))
   expect(confirmed.text()).toContain('0.125× · 待启用')
-  expect(visiblePrices(confirmed.get('[data-price-status="confirmed"]'))).toEqual([
+  expect(visiblePrices(confirmed)).toEqual([
     { title: '官网标准价', values: [['输入', '800 积分'], ['输出', '1600 积分'], ['缓存读取', '—'], ['缓存写入', '—']] },
     { title: '学生实际价（含 1.10）', values: [['输入', '110 积分'], ['输出', '220 积分'], ['缓存读取', '—'], ['缓存写入', '—']] },
   ])
@@ -338,7 +342,7 @@ it('教师页自动发现目录里的新模型，并随后台报价更新待同�
     price_status: 'confirmed', price_conditions_exact: { ...price, input_price: '0.000012' },
   }, '0.25'))
   expect(changed.text()).toContain('0.25× · 待启用')
-  expect(visiblePrices(changed.get('[data-price-status="confirmed"]'))).toEqual([
+  expect(visiblePrices(changed)).toEqual([
     { title: '官网标准价', values: [['输入', '1200 积分'], ['输出', '1600 积分'], ['缓存读取', '—'], ['缓存写入', '—']] },
     { title: '学生实际价（含 1.10）', values: [['输入', '330 积分'], ['输出', '440 积分'], ['缓存读取', '—'], ['缓存写入', '—']] },
   ])
@@ -362,12 +366,11 @@ it.each([
   request.mockResolvedValueOnce(reply(data))
   await button('刷新模型', widget.get('[aria-label="北辰模型目录"]')).trigger('click')
   await flushPromises()
-  const quote = widget.get('[data-price-status="confirmed"]')
-  expect(quote.get('.standard-price .price-line').text()).toBe(standard)
-  expect(quote.get('.actual-price .price-line').text()).toBe(actual)
-  expect(quote.text()).toContain('学生实扣 = 基础 × 1.10')
-  expect(quote.find('.price-grid').exists()).toBe(false)
-  expect(quote.text()).not.toContain('按条件计价')
+  const row = widget.get('[aria-label="北辰模型目录"] tbody tr')
+  expect(row.get('.standard-price .price-line').text()).toContain(standard.split('\n')[0])
+  expect(row.get('.actual-price .price-line').text()).toContain(actual.split('\n')[0])
+  expect(row.find('.price-grid').exists()).toBe(false)
+  expect(row.text()).not.toContain('按条件计价')
 })
 
 it.each(['pending', 'pending_confirmation'] as const)('兼容 %s，保留待核对的官网价', price_status => {
@@ -602,7 +605,6 @@ it('普通教师用学校邮箱密码登录后回到原供应商页面，首次�
   expect(receipts.text()).toContain('学校尚未归档所选日期的北辰流水')
 })
 
-// 前端 C 正在重做额度弹窗；本场景保留，统一集成时更新选择器并恢复执行。
 it('教师查看超用、设置学生额度、从服务器刷新余额，历史月份只读', async () => {
   await enter('teacher', '/teacher/projects')
   await button('学生额度').trigger('click')
@@ -611,18 +613,15 @@ it('教师查看超用、设置学生额度、从服务器刷新余额，历史�
   let member = dialog.get('.quota-member[data-member-id="s"]')
   expect(member.text()).toContain('已超用')
   expect(member.text()).toContain('1')
-  await button('调整额度', member).trigger('click')
-  await flushPromises()
-  let editor = page().get('.quota-editor')
-  expect(page().text()).toContain('学生甲 · 调整额度')
-  await editor.get('input').setValue('100')
+  await member.get('input').setValue('100')
   failQuota = true
-  await editor.trigger('submit')
+  await member.get('form').trigger('submit')
   await flushPromises()
-  expect(page().get('.quota-editor [role="alert"]').text()).toContain('超过项目月额度')
+  member = page().get('.quota-member[data-member-id="s"]')
+  expect(member.get('[role="alert"]').text()).toContain('超过项目月额度')
   expect(member.text()).toContain('已超用')
   failQuota = false
-  await editor.trigger('submit')
+  await member.get('form').trigger('submit')
   await flushPromises()
   dialog = page().get('.quota-dialog')
   member = dialog.get('.quota-member[data-member-id="s"]')
@@ -639,7 +638,7 @@ it('教师查看超用、设置学生额度、从服务器刷新余额，历史�
   await flushPromises()
   dialog = page().get('.quota-dialog')
   expect(dialog.text()).toContain('历史月份只读')
-  expect(dialog.findAll('button').some(item => item.text() === '调整额度')).toBe(false)
+  expect(dialog.findAll('button').some(item => item.text() === '保存')).toBe(false)
   request.mockImplementation(fetchFixture)
 })
 

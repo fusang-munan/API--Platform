@@ -10,10 +10,12 @@ ALTER TABLE gateway_calls
   ADD COLUMN IF NOT EXISTS student_credits numeric,
   ADD COLUMN IF NOT EXISTS school_absorbed_credits numeric NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS truncated_quota boolean NOT NULL DEFAULT false,
-  ADD COLUMN IF NOT EXISTS quota_budget_tokens bigint;
+  ADD COLUMN IF NOT EXISTS quota_budget_tokens bigint,
+  ADD COLUMN IF NOT EXISTS student_cap_milli bigint;
 
 COMMENT ON COLUMN gateway_calls.actual_credits IS 'Full computed charge before the student quota cap';
 COMMENT ON COLUMN gateway_calls.student_credits IS 'Amount actually deducted from the student bucket';
 COMMENT ON COLUMN gateway_calls.school_absorbed_credits IS 'Amount over the student quota cap, carried by the school';
 COMMENT ON COLUMN gateway_calls.quota_budget_tokens IS 'max_output_tokens injected from the remaining quota; NULL when not capped';
+COMMENT ON COLUMN gateway_calls.student_cap_milli IS 'Milli-credits the student can still be charged for this call; the rest is school-absorbed';
 

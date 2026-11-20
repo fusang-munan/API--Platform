@@ -128,7 +128,22 @@ func newProxyUsageTest(t *testing.T) (*Gateway, sqlmock.Sqlmock, route, usage.Re
 		Binding:  &ent.ModelBinding{ID: uuid.New(), Adapter: modelbinding.AdapterOpenaiCompatible, UpstreamModelName: "served-model"},
 		Provider: &ent.Provider{ID: uuid.New(), Name: "Test Provider", BaseURL: "http://fake-upstream.test"}, CredentialID: uuid.New(),
 	}
-	return &Gateway{usage: usage.NewStore(db)}, mock, candidate, usage.Reservation{CallID: uuid.New()}
+	return &Gateway{usage: usage.NewStore(db)}, mock, candidate, usage.Reservation{
+		CallID: uuid.New(), APIKeyID: uuid.New(), ModelID: uuid.New(), UserID: uuid.New(),
+	}
+}
+
+func expectProxyAttempt(mock sqlmock.Sqlmock, candidate route, reservation usage.Reservation) {
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT u.id .*FOR NO KEY UPDATE OF u`).WithArgs(reservation.APIKeyID, reservation.ModelID).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id"}).AddRow(reservation.UserID))
+	mock.ExpectQuery(`SELECT EXISTS.*OFFSET.*EXISTS.*pending_review`).
+		WillReturnRows(sqlmock.NewRows([]string{"concurrency", "review"}).AddRow(false, false))
+	mock.ExpectExec(`WITH started AS .*quota_budget_tokens`).WithArgs(
+		sqlmock.AnyArg(), reservation.CallID, candidate.Provider.ID, candidate.Binding.ID, candidate.Provider.Name,
+		candidate.CredentialID, candidate.Binding.UpstreamModelName, int64(0), reservation.UserID, reservation.APIKeyID, reservation.ModelID,
+	).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 }
 
 func expectSuccessfulProxyCharge(mock sqlmock.Sqlmock, candidate route, reservation usage.Reservation, sentAt driver.Value) {
@@ -175,10 +190,7 @@ func expectUsageWrite(mock sqlmock.Sqlmock, callID uuid.UUID, responseID string,
 
 func TestSSEForwardsFirstReadAndLongEventBeforeTail(t *testing.T) {
 	gateway, mock, candidate, reservation := newProxyUsageTest(t)
-	mock.ExpectExec(`WITH started AS .*UPDATE gateway_calls SET provider_id`).WithArgs(
-		sqlmock.AnyArg(), reservation.CallID, candidate.Provider.ID, candidate.Binding.ID, candidate.Provider.Name,
-		candidate.CredentialID, candidate.Binding.UpstreamModelName,
-	).WillReturnResult(sqlmock.NewResult(0, 1))
+	expectProxyAttempt(mock, candidate, reservation)
 	mock.ExpectExec(`UPDATE gateway_calls SET sent_at`).WithArgs(reservation.CallID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	expectSuccessfulProxyCharge(mock, candidate, reservation, nil)
@@ -236,7 +248,7 @@ func TestResponsesSSEFlushesPreludeThenReleasesUnchargedReservation(t *testing.T
 			candidate.Binding.Adapter = modelbinding.AdapterOpenaiResponses
 			reservation.MultiplierMilli = 1000
 			reservation.Month = usage.Month(time.Now())
-			mock.ExpectExec(`WITH started AS`).WillReturnResult(sqlmock.NewResult(0, 1))
+			expectProxyAttempt(mock, candidate, reservation)
 			mock.ExpectExec(`UPDATE gateway_calls SET sent_at`).WillReturnResult(sqlmock.NewResult(0, 1))
 			expectProxyReservationReleased(mock, candidate, reservation)
 			expectUsageWrite(mock, reservation.CallID, "resp_prepared", nil, nil, nil, usage.UsageInterrupted)
@@ -351,7 +363,7 @@ func TestGatewayFinalizesAtActualRetrySendTime(t *testing.T) {
 			gateway, mock, candidate, reservation := newProxyUsageTest(t)
 			var window atomic.Pointer[upstreamSendWindow]
 			expectStartedAndSent := func() {
-				mock.ExpectExec(`WITH started AS`).WillReturnResult(sqlmock.NewResult(0, 1))
+				expectProxyAttempt(mock, candidate, reservation)
 				mock.ExpectExec(`UPDATE gateway_calls SET sent_at=COALESCE\(sent_at,now\(\)\).*billing_state='pending'`).
 					WithArgs(reservation.CallID).WillReturnResult(sqlmock.NewResult(0, 1))
 			}

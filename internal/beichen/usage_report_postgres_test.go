@@ -3,6 +3,7 @@ package beichen
 import (
 	"context"
 	"database/sql"
+	"math"
 	"math/big"
 	"os"
 	"strconv"
@@ -44,7 +45,7 @@ CREATE TABLE users(id uuid PRIMARY KEY);
 CREATE TABLE gateway_calls(
  provider_id uuid, provider_credential_id uuid, binding_id uuid, upstream_model_name text,
  created_at timestamptz, sent_at timestamptz, outcome text, protocol text, usage_state text,
- prompt_tokens int, completion_tokens int, cache_hit_tokens bigint, cache_miss_tokens bigint, cache_write_tokens bigint,
+ prompt_tokens int, completion_tokens int, total_tokens int, cache_hit_tokens bigint, cache_miss_tokens bigint, cache_write_tokens bigint,
  beichen_state text, beichen_credit_exact numeric, beichen_dispatch_kind text, beichen_dispatch_at timestamptz,
  beichen_dispatch_credential_id uuid, beichen_dispatch_model text, beichen_price_at timestamptz,
  project_id uuid, project_name text, user_id uuid, user_name text, api_key_id uuid, api_key_name text,
@@ -62,7 +63,7 @@ type reportCallFixture struct {
 	provider, credential, project, user, key                       uuid.UUID
 	model, protocol, state, usage, credits, base, multiplier, sent string
 	prompt, output                                                 int64
-	read, miss, write                                              any
+	read, miss, write, total                                       any
 	legacy, unfinalized                                            bool
 }
 
@@ -84,12 +85,82 @@ func insertReportCall(t *testing.T, ctx context.Context, tx *sql.Tx, call report
  prompt_tokens, completion_tokens, cache_hit_tokens, cache_miss_tokens, cache_write_tokens,
  beichen_state, beichen_credit_exact, beichen_dispatch_kind, beichen_dispatch_at, beichen_dispatch_credential_id,
  beichen_dispatch_model, beichen_price_at, project_id, project_name, user_id, user_name, api_key_id, api_key_name,
- beichen_base_credits, beichen_school_multiplier)
+ beichen_base_credits, beichen_school_multiplier, total_tokens)
 VALUES($1,$2,$3,$4,$5::text::timestamptz - interval '1 day',$5::text::timestamptz - CASE WHEN $10::text='beichen' THEN interval '1 day' ELSE interval '0' END,
  $6,$7,$8,$11,$12,$13,$14,$15,$9,$16::text::numeric,$10,$5::text::timestamptz,$2,$4,$5::text::timestamptz,
- $17::uuid,'项目 ' || $17::uuid::text,$18::uuid,'学生 ' || $18::uuid::text,$19::uuid,'Key ' || $19::uuid::text,$20::text::numeric,$21::text::numeric)`,
+ $17::uuid,'项目 ' || $17::uuid::text,$18::uuid,'学生 ' || $18::uuid::text,$19::uuid,'Key ' || $19::uuid::text,$20::text::numeric,$21::text::numeric,$22)`,
 		provider, call.credential, binding, call.model, call.sent, outcome, call.protocol, call.usage, call.state, kind,
-		call.prompt, call.output, call.read, call.miss, call.write, call.credits, call.project, call.user, call.key, base, call.multiplier)
+		call.prompt, call.output, call.read, call.miss, call.write, call.credits, call.project, call.user, call.key, base, call.multiplier, call.total)
+}
+
+func TestModelUsageCompletenessPostgres(t *testing.T) {
+	ctx, tx := reportTestTransaction(t)
+	provider, credential, project, first, second, key, secondKey := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	execTestSQL(t, ctx, tx, "INSERT INTO providers VALUES($1,$2)", provider, origin)
+	execTestSQL(t, ctx, tx, "INSERT INTO provider_credentials VALUES($1,$2,'测试渠道','2026-11-19 00:00+08')", credential, provider)
+	call := reportCallFixture{provider: provider, credential: credential, project: project, user: first, key: key,
+		model: "ready", protocol: "anthropic", state: "charged", usage: "reported", credits: "1", base: "1", multiplier: "1",
+		sent: "2026-11-20T00:00:00+08:00", prompt: 10, output: 2, read: 0, write: 0}
+	insertReportCall(t, ctx, tx, call)
+	call.user, call.key, call.model, call.protocol = second, secondKey, "mixed", "openai_responses"
+	call.prompt, call.output, call.read, call.write = 100, 20, 25, 5
+	insertReportCall(t, ctx, tx, call)
+	call.state = "pending_review"
+	insertReportCall(t, ctx, tx, call)
+	call.model, call.usage, call.state = "interrupted", "interrupted", "charged"
+	call.prompt, call.output, call.read, call.write, call.total = 50, 4, 10, nil, 73
+	insertReportCall(t, ctx, tx, call)
+	call.model, call.usage, call.protocol = "incomplete", "reported", "anthropic"
+	call.prompt, call.output, call.read, call.write, call.total = 9, 2, nil, 4, nil
+	insertReportCall(t, ctx, tx, call)
+	call.model, call.usage, call.state = "unknown", "missing", "pending_review"
+	call.write = nil
+	insertReportCall(t, ctx, tx, call)
+	execTestSQL(t, ctx, tx, "UPDATE gateway_calls SET prompt_tokens=NULL,completion_tokens=NULL WHERE beichen_dispatch_model='unknown'")
+
+	period, _ := reportPeriod("month", time.Date(2026, 11, 20, 4, 0, 0, 0, beijing))
+	report, err := readModelUsage(ctx, tx, &provider, period)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(label string, got ModelUsageMetrics, tokens, missing int64, completeness string, rate *float64) {
+		t.Helper()
+		if got.Tokens != tokens || got.TokensMissing != missing || got.Completeness != completeness {
+			t.Errorf("%s 的 Token 或完整度有误: %+v", label, got)
+		}
+		if rate == nil {
+			if got.CacheHitRate != nil {
+				t.Errorf("%s 的缓存命中率应为空: %v", label, *got.CacheHitRate)
+			}
+		} else if got.CacheHitRate == nil || math.Abs(*got.CacheHitRate-*rate) > 1e-12 {
+			t.Errorf("%s 的缓存命中率有误: got=%v, want=%v", label, got.CacheHitRate, *rate)
+		}
+	}
+	totalRate, mixedRate, zero := 25.0/105, 25.0/95, 0.0
+	check("总计", report.Totals, 132, 208, "partial", &totalRate)
+	models := make(map[string]ModelUsageMetrics)
+	for _, row := range report.Models {
+		models[row.Model] = row.ModelUsageMetrics
+	}
+	check("完整", models["ready"], 12, 0, "complete", &zero)
+	check("部分", models["mixed"], 120, 120, "partial", &mixedRate)
+	check("上游有总数", models["interrupted"], 0, 73, "missing", nil)
+	check("只有部分分项", models["incomplete"], 0, 15, "missing", nil)
+	check("上游未回报", models["unknown"], 0, 0, "missing", nil)
+	if len(report.Students) != 2 {
+		t.Fatalf("应包含两个学生: %+v", report.Students)
+	}
+	for _, row := range report.Students {
+		if row.UserID == first {
+			check("第一个学生", row.ModelUsageMetrics, 12, 0, "complete", &zero)
+		} else {
+			check("第二个学生", row.ModelUsageMetrics, 120, 208, "partial", &mixedRate)
+			for _, detail := range row.Models {
+				check("第二个学生的 "+detail.Model, detail.ModelUsageMetrics, models[detail.Model].Tokens,
+					models[detail.Model].TokensMissing, models[detail.Model].Completeness, models[detail.Model].CacheHitRate)
+			}
+		}
+	}
 }
 
 func TestModelUsagePostgresRangeAndAttribution(t *testing.T) {
@@ -135,7 +206,7 @@ func TestModelUsagePostgresRangeAndAttribution(t *testing.T) {
 }
 
 func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
-	ctx, tx := reportTestTransaction(t)
+	ctx, tx := reconciliationTestTransaction(t)
 	provider, first, second, future := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	project, otherProject, student, otherStudent, key, otherKey, thirdKey := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	execTestSQL(t, ctx, tx, "INSERT INTO providers VALUES($1,$2)", provider, origin)
@@ -199,15 +270,16 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 		t.Fatalf("金额或 Token 汇总错误: %+v", view.Totals)
 	}
 	if view.Coverage.ExpectedDays != 2 || view.Coverage.SyncedDays != 1 || strings.Join(view.Coverage.MissingDays, ",") != "2026-11-20" ||
-		view.Coverage.PendingCalls != 1 || view.Coverage.UnpricedCalls != 1 || !view.Coverage.MultiplierMixed {
+		view.Coverage.PendingCalls != 1 || view.Coverage.UnpricedCalls != 1 || !view.Coverage.MultiplierMixed ||
+		view.Coverage.CoverageKind != "partial" || view.Coverage.VerifiedMatchedCalls != 0 {
 		t.Fatalf("覆盖情况错误: %+v", view.Coverage)
 	}
 	for _, row := range view.Models {
 		switch row.Model {
 		case "matched":
-			if row.MatchStatus != "matched" || row.Local.Tokens != 233 || row.Upstream.Tokens != 233 || row.Local.InputTokens != 160 ||
+			if row.MatchStatus != "matched" || row.Completeness != "complete" || row.Local.Tokens != 233 || row.Upstream.Tokens != 233 || row.Local.InputTokens != 160 ||
 				row.Local.EstimatedMicros == nil || *row.Local.EstimatedMicros != 256 || row.LocalShare == "0" || row.UpstreamShare == "0" {
-				t.Errorf("已匹配模型归一化错误: %+v", row)
+				t.Errorf("两边均有记录的模型归一化错误: %+v", row)
 			}
 			checkReportRatio(t, row.LocalShare, 233, 285)
 			checkReportRatio(t, row.UpstreamShare, 233, 273)
@@ -253,19 +325,21 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 }
 
 func TestReportsPostgresEmptyResults(t *testing.T) {
-	ctx, tx := reportTestTransaction(t)
+	ctx, tx := reconciliationTestTransaction(t)
 	provider := uuid.New()
 	execTestSQL(t, ctx, tx, "INSERT INTO providers VALUES($1,$2)", provider, origin)
 	now := time.Date(2026, 11, 20, 0, 0, 0, 0, beijing)
 	period, _ := reportPeriod("all", now)
 	usage, err := readModelUsage(ctx, tx, &provider, period)
-	if err != nil || usage.Totals.Credits != "0" || usage.Models == nil || usage.Students == nil || usage.Keys == nil {
+	if err != nil || usage.Totals.Credits != "0" || usage.Models == nil || usage.Students == nil || usage.Keys == nil ||
+		usage.Totals.CacheHitRate != nil || usage.Totals.TokensMissing != 0 || usage.Totals.Completeness != "missing" {
 		t.Fatalf("空用量应返回零和空数组: %+v, err=%v", usage, err)
 	}
 	view, err := readReconciliation(ctx, tx, provider, period, now)
 	if err != nil || view.Totals.Money.ActualYuan != nil || view.Totals.Money.MarginRate != nil || view.Totals.Money.MarginYuan != nil ||
 		view.Models == nil || view.Keys == nil || view.Coverage.MissingDays == nil ||
-		view.Coverage.Credentials == nil || view.Totals.Local.EstimatedMicros != nil {
+		view.Coverage.Credentials == nil || view.Totals.Local.EstimatedMicros != nil ||
+		view.Coverage.CoverageKind != "none" || view.Coverage.VerifiedMatchedCalls != 0 {
 		t.Fatalf("空对账应返回零和空数组: %+v, err=%v", view, err)
 	}
 }
@@ -290,7 +364,7 @@ func checkReportRatio(t *testing.T, value string, numerator, denominator int64) 
 }
 
 func TestReconciliationPostgresMissingCostRemainsUnknown(t *testing.T) {
-	ctx, tx := reportTestTransaction(t)
+	ctx, tx := reconciliationTestTransaction(t)
 	provider, first, second, zero := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	execTestSQL(t, ctx, tx, "INSERT INTO providers VALUES($1,$2)", provider, origin)
 	execTestSQL(t, ctx, tx, `INSERT INTO provider_credentials VALUES
@@ -312,7 +386,7 @@ func TestReconciliationPostgresMissingCostRemainsUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Coverage.ExpectedDays != 3 || view.Coverage.SyncedDays != 3 || view.Totals.Upstream.BilledMicros != nil ||
+	if view.Coverage.ExpectedDays != 3 || view.Coverage.SyncedDays != 3 || view.Coverage.CoverageKind != "full" || view.Totals.Upstream.BilledMicros != nil ||
 		view.Totals.Money.ActualYuan != nil || view.Totals.Money.MarginYuan != nil || view.Totals.Money.MarginRate != nil {
 		t.Fatalf("覆盖完整但成本缺失时不能伪造零实扣或利润: %+v", view)
 	}

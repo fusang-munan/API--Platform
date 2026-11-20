@@ -15,7 +15,8 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/domain"
 )
 
-func TestBeichenLedgerPostgres(t *testing.T) {
+func newBeichenLedgerTestDB(t *testing.T) (context.Context, *sql.DB) {
+	t.Helper()
 	dsn := os.Getenv("NEBULA_TEST_POSTGRES")
 	if dsn == "" {
 		t.Skip("requires a disposable local nebula_test database")
@@ -26,15 +27,15 @@ func TestBeichenLedgerPostgres(t *testing.T) {
 		t.Fatal("requires a loopback-only nebula_test database with sslmode=disable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	db := stdlib.OpenDB(*config)
-	defer db.Close()
+	t.Cleanup(func() { _ = db.Close() })
 	schema := pgx.Identifier{"beichen_ledger_" + uuid.NewString()}.Sanitize()
 	ledgerTestExec(t, ctx, db, "CREATE SCHEMA "+schema)
-	defer db.ExecContext(context.Background(), "DROP SCHEMA "+schema+" CASCADE")
+	t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP SCHEMA "+schema+" CASCADE") })
 	config.RuntimeParams["search_path"] = schema + ",public"
 	isolated := stdlib.OpenDB(*config)
-	defer isolated.Close()
+	t.Cleanup(func() { _ = isolated.Close() })
 	paths, err := filepath.Glob("../infrastructure/db/migrations/*.sql")
 	if err != nil || len(paths) == 0 {
 		t.Fatalf("locate migrations: %v", err)
@@ -46,6 +47,11 @@ func TestBeichenLedgerPostgres(t *testing.T) {
 		}
 		ledgerTestExec(t, ctx, isolated, string(migration))
 	}
+	return ctx, isolated
+}
+
+func TestBeichenLedgerPostgres(t *testing.T) {
+	ctx, isolated := newBeichenLedgerTestDB(t)
 	student, org, project, key, model := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	ledgerTestExec(t, ctx, isolated, `INSERT INTO users(id,name,email,password_hash,role,created_at,updated_at)
 		VALUES($1,'Student','student@example.test','fixture','student',now(),now())`, student)
@@ -144,6 +150,10 @@ func TestBeichenLedgerPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	check(revokedBeforeSend.CallID, "released", "")
+	check(revokedAfterDispatch.CallID, "reserved", "")
+	// The already dispatched call reaches its ordinary settlement path.
+	route.SentAt = time.Now()
+	finalize(revokedAfterDispatch, route, CallMetrics{})
 	check(revokedAfterDispatch.CallID, "pending_review", "")
 	if err := store.PrepareDispatch(ctx, revokedBeforeSend.CallID, route); err == nil {
 		t.Fatal("dispatch permitted after key deactivation")
@@ -182,6 +192,9 @@ func TestBeichenLedgerPostgres(t *testing.T) {
 		})
 	}
 	t.Run("external-receipts", func(t *testing.T) {
+		// The school pricing fixture keeps three calls in flight to verify
+		// dispatch-time ownership. Dispatch limits have their own tests.
+		t.Setenv("NEBULA_STUDENT_CONCURRENCY_LIMIT", "3")
 		if _, err := store.ActivateKey(ctx, student, key); err != nil {
 			t.Fatal(err)
 		}

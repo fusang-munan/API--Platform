@@ -155,6 +155,8 @@ type Reservation struct {
 	MultiplierMilli                                                           int64
 	CallIndex                                                                 int
 	Month                                                                     time.Time
+	// Balances include earlier holds and are rounded down before this call's hold.
+	MemberAvailableMilli, ProjectAvailableMilli int64
 }
 
 type QuotaError struct {
@@ -165,7 +167,7 @@ type QuotaError struct {
 func (e *QuotaError) Error() string { return e.Code }
 
 func (s *Store) Reserve(ctx context.Context, keyID, modelID uuid.UUID, requestID, protocol, path, prompt, promptSource string, correlation CallCorrelation, routes ...CallRoute) (Reservation, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return Reservation{}, err
 	}
@@ -176,16 +178,11 @@ func (s *Store) Reserve(ctx context.Context, keyID, modelID uuid.UUID, requestID
 	var multiplier sql.NullInt64
 	err = tx.QueryRowContext(ctx, `
 SELECT k.project_id,p.organization_id,k.owner_user_id,k.name,p.name,o.name,u.name,m.display_name,m.credit_multiplier_milli
-FROM api_keys k
-JOIN projects p ON p.id=k.project_id JOIN organizations o ON o.id=p.organization_id
-JOIN users u ON u.id=k.owner_user_id JOIN api_key_models km ON km.api_key_id=k.id
-JOIN models m ON m.id=km.model_id
-WHERE k.id=$1 AND k.status='active' AND m.id=$2 AND m.status='active'
-FOR UPDATE OF p,k,m`, keyID, modelID).Scan(&r.ProjectID, &r.OrganizationID, &r.UserID, &r.APIKeyName, &r.ProjectName, &r.OrganizationName, &r.UserName, &r.ModelName, &multiplier)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Reservation{}, domain.NewError(domain.CodeNotFound, "active API key or model is unavailable")
-	}
+`+activeCallAccessSQL, keyID, modelID).Scan(&r.ProjectID, &r.OrganizationID, &r.UserID, &r.APIKeyName, &r.ProjectName, &r.OrganizationName, &r.UserName, &r.ModelName, &multiplier)
 	if err != nil {
+		return Reservation{}, callAccessError(err)
+	}
+	if err = checkStudentCallLimits(ctx, tx, r.UserID, uuid.Nil); err != nil {
 		return Reservation{}, err
 	}
 	hasBeichen, hasLegacy := false, len(routes) == 0
@@ -206,15 +203,16 @@ FOR UPDATE OF p,k,m`, keyID, modelID).Scan(&r.ProjectID, &r.OrganizationID, &r.U
 SELECT $1,p.id,$2,p.monthly_credit_quota_milli,COALESCE((SELECT sum(monthly_credit_quota_milli) FROM project_members WHERE project_id=p.id),0),0,0,$3,$3 FROM projects p WHERE p.id=$4 ON CONFLICT(project_id,month) DO NOTHING`, uuid.Must(uuid.NewV7()), r.Month, now, r.ProjectID); err != nil {
 		return Reservation{}, err
 	}
-	var projectQuota, projectCharged, projectPending int64
-	if err = tx.QueryRowContext(ctx, `SELECT quota_milli,charged_milli,pending_milli FROM project_month_credit_buckets WHERE project_id=$1 AND month=$2 FOR UPDATE`, r.ProjectID, r.Month).Scan(&projectQuota, &projectCharged, &projectPending); err != nil {
+	const balanceSQL = `quota_milli::numeric-charged_milli-charged_milli_remainder-pending_milli`
+	const availableSQL = `GREATEST(floor(` + balanceSQL + `),0)::bigint, (` + balanceSQL + `)>0`
+	var projectHasBalance, memberHasBalance bool
+	if err = tx.QueryRowContext(ctx, `SELECT `+availableSQL+` FROM project_month_credit_buckets WHERE project_id=$1 AND month=$2 FOR UPDATE`, r.ProjectID, r.Month).Scan(&r.ProjectAvailableMilli, &projectHasBalance); err != nil {
 		return Reservation{}, err
 	}
 	if err = ensureMemberMonthBucketTx(ctx, tx, r.ProjectID, r.UserID, r.Month, now); err != nil {
 		return Reservation{}, err
 	}
-	var memberQuota, memberCharged, memberPending int64
-	if err = tx.QueryRowContext(ctx, `SELECT quota_milli,charged_milli,pending_milli FROM project_member_month_credit_buckets WHERE project_id=$1 AND user_id=$2 AND month=$3 FOR UPDATE`, r.ProjectID, r.UserID, r.Month).Scan(&memberQuota, &memberCharged, &memberPending); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT `+availableSQL+` FROM project_member_month_credit_buckets WHERE project_id=$1 AND user_id=$2 AND month=$3 FOR UPDATE`, r.ProjectID, r.UserID, r.Month).Scan(&r.MemberAvailableMilli, &memberHasBalance); err != nil {
 		return Reservation{}, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO api_key_month_credit_buckets(id,api_key_id,project_id,month,quota_milli,allocation_active,charged_milli,pending_milli,created_at,updated_at)
@@ -222,10 +220,10 @@ SELECT $1,k.id,k.project_id,$2,0,true,0,0,$3,$3 FROM api_keys k WHERE k.id=$4 ON
 		return Reservation{}, err
 	}
 	ends := r.Month.In(shanghai).AddDate(0, 1, 0).UTC()
-	if hold > 0 && memberCharged+memberPending >= memberQuota {
+	if hold > 0 && !memberHasBalance {
 		return Reservation{}, &QuotaError{Code: "member_quota_exceeded", Name: r.UserName, EndsAt: ends}
 	}
-	if hold > 0 && projectCharged+projectPending >= projectQuota {
+	if hold > 0 && !projectHasBalance {
 		return Reservation{}, &QuotaError{Code: "project_quota_exceeded", Name: r.ProjectName, EndsAt: ends}
 	}
 	correlation.ModelID = modelID
@@ -257,7 +255,9 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16,'pending','pen
 		return Reservation{}, err
 	}
 	if hasBeichen {
-		if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_state='reserved',credit_milli=$2 WHERE id=$1`, r.CallID, hold); err != nil {
+		const maxStudentCallMilli = 1_000_000 // 1,000 credits
+		studentCap := min(r.MemberAvailableMilli, r.ProjectAvailableMilli, maxStudentCallMilli)
+		if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_state='reserved',credit_milli=$2,student_cap_milli=$3 WHERE id=$1`, r.CallID, hold, studentCap); err != nil {
 			return Reservation{}, err
 		}
 	}
@@ -483,7 +483,8 @@ func (s *Store) DeactivateKey(ctx context.Context, mentorID, keyID uuid.UUID, co
 		return uuid.Nil, domain.NewError(domain.CodeNotFound, "API key not found")
 	}
 	month, now := Month(time.Now()), time.Now().UTC()
-	rows, err := tx.QueryContext(ctx, `SELECT id,request_id,month,organization_id,project_id,user_id,api_key_id,model_id,organization_name,project_name,user_name,api_key_name,model_name,multiplier_milli FROM gateway_calls WHERE api_key_id=$1 AND billing_state='pending' FOR UPDATE`, keyID)
+	rows, err := tx.QueryContext(ctx, `SELECT id,request_id,month,organization_id,project_id,user_id,api_key_id,model_id,organization_name,project_name,user_name,api_key_name,model_name,multiplier_milli
+		FROM gateway_calls c WHERE api_key_id=$1 AND billing_state='pending' AND NOT (`+callDispatchStartedSQL+`) FOR UPDATE`, keyID)
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -597,21 +598,6 @@ ON CONFLICT(api_key_id,month) DO UPDATE SET allocation_active=true,updated_at=EX
 	return ownerID, nil
 }
 
-func (s *Store) StartAttempt(ctx context.Context, callID uuid.UUID, route CallRoute) (uuid.UUID, error) {
-	id := uuid.Must(uuid.NewV7())
-	_, err := s.db.ExecContext(ctx, `WITH started AS (
-		INSERT INTO gateway_call_attempts(id,call_id,provider_id,binding_id,provider_name,status,created_at)
-		VALUES($1,$2,$3,$4,$5,'connecting',now()) RETURNING call_id
-	)
-	UPDATE gateway_calls SET provider_id=$3,binding_id=$4,provider_name=$5,
-		provider_credential_id=$6,upstream_model_name=NULLIF($7,'')
-	WHERE id=(SELECT call_id FROM started) AND billing_state='pending'`,
-		id, callID, route.ProviderID, route.BindingID, route.ProviderName, nullableUUID(route.CredentialID), route.UpstreamModelName)
-	if err != nil {
-		return uuid.Nil, err
-	}
-	return id, nil
-}
 func (s *Store) FinishAttempt(ctx context.Context, id uuid.UUID, succeeded bool, status *int, category, message string, started time.Time) error {
 	state := "failed"
 	if succeeded {
@@ -791,6 +777,7 @@ func writeCallMetrics(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET upstream_response_id=COALESCE(NULLIF($2,''),upstream_response_id),
 		prompt_tokens=COALESCE($3,prompt_tokens),completion_tokens=COALESCE($4,completion_tokens),
+		truncated_quota=truncated_quota OR COALESCE($4>=quota_budget_tokens,false),
 		total_tokens=COALESCE($5,total_tokens),reply_closed=COALESCE($6,reply_closed),
 		cache_hit_tokens=COALESCE($7,cache_hit_tokens),cache_miss_tokens=COALESCE($8,cache_miss_tokens),
 		cache_write_tokens=COALESCE($9,cache_write_tokens),reasoning_tokens=COALESCE($10,reasoning_tokens),

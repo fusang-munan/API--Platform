@@ -138,33 +138,48 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 	ctx := original.Context()
 	routed := reservation != nil && len(beichenReservationRoutes(routes)) != 0
 	attempted := usage.CallRoute{DefinitelyNotSent: routed}
+	var rejection error
 	category, message := "connection", "No upstream provider is available."
 	for attempt := 0; len(routes) != 0 && attempt < upstreamRetryAttempts; attempt++ {
 		if ctx.Err() != nil || !sleepUpstreamRetry(ctx, attempt) {
 			break
 		}
 		candidate := routes[0]
-		north := isBeichenAPI(candidate.Provider.BaseURL)
+		candidateRoute := candidate.callRoute()
+		north := candidateRoute.Beichen
 		review := ""
+		var adjustments []func(map[string]json.RawMessage) error
+		var quotaBudget int64
 		if north && reservation != nil {
 			review = beichenHTTPRequestReview(original.URL.Path, replay, candidate.Binding.UpstreamModelName)
+			field := quotaTokenField(original.URL.Path)
+			if limit := g.quotaTokenLimit(ctx, *reservation, candidateRoute, field); limit > 0 {
+				adjustments = append(adjustments, func(payload map[string]json.RawMessage) error {
+					quotaBudget = applyOutputBudget(payload, field, limit)
+					return nil
+				})
+			}
 		}
-		request, cleanup, err := g.upstreamRequest(original, replay, candidate)
+		request, cleanup, err := g.upstreamRequest(original, replay, candidate, adjustments...)
 		if err != nil {
 			category, message = "request_rewrite", "Unable to prepare the upstream request."
 			break
 		}
-		attempted = candidate.callRoute()
+		attempted = candidateRoute
 		started := time.Now()
 		var attemptID uuid.UUID
 		var writeObservation func() (time.Time, bool)
 		if reservation != nil {
-			attemptID, err = g.usage.StartAttempt(ctx, reservation.CallID, attempted)
+			attempted.DefinitelyNotSent = true
+			attemptID, err = g.usage.StartAttempt(ctx, *reservation, attempted, quotaBudget)
+			if err != nil {
+				cleanup()
+				category, message = "dispatch_rejected", "Unable to authorize upstream dispatch."
+				rejection = err
+				break
+			}
 			if routed {
-				attempted.DefinitelyNotSent = true
-				if err == nil {
-					err = g.usage.PrepareDispatch(ctx, reservation.CallID, attempted)
-				}
+				err = g.usage.PrepareDispatch(ctx, reservation.CallID, attempted)
 				if err != nil {
 					cleanup()
 					category, message = "connection", "Unable to record upstream dispatch."
@@ -259,6 +274,10 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 			state = usage.UsageInterrupted
 		}
 		_ = g.finalizeCall(ctx, *reservation, false, category, message, attempted, usage.CallMetrics{State: state})
+	}
+	if rejection != nil {
+		writeModelCallRejection(w, original.URL.Path, rejection)
+		return
 	}
 	writeProtocolError(w, original.URL.Path, http.StatusBadGateway, "server_error", "upstream_unavailable", message, "")
 }
