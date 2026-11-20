@@ -1,8 +1,8 @@
 import { DOMWrapper, enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { defineComponent } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { BeichenModelUsage, BeichenOverview, BeichenUsageRange, BeichenUsageTotals } from '../../api/types'
-import BeichenUsageDrawer from '../../components/BeichenUsageDrawer.vue'
+import type { BeichenBatchEnableResult, BeichenCatalogModel, BeichenModelUsage, BeichenOverview, BeichenUsageRange, BeichenUsageTotals } from '../../api/types'
+import BeichenPriceDrawer from '../../components/BeichenPriceDrawer.vue'
 import BeichenSchoolModels from './BeichenSchoolModels.vue'
 import componentSource from './BeichenSchoolModels.vue?raw'
 
@@ -16,7 +16,7 @@ vi.mock('../../composables/useToast', () => ({ useToast: () => toast }))
 const Dialog = defineComponent({ props: ['open', 'title'], template: '<section v-if="open" role="dialog" :aria-label="title"><h2>{{ title }}</h2><slot /></section>' })
 const stubs = { AppDialog: Dialog, BeichenRecentReceipts: true }
 enableAutoUnmount(afterEach)
-type Entry = { model: string; active?: boolean; priced?: boolean; canEnable?: boolean; manual?: boolean }
+type Entry = { model: string; active?: boolean; priced?: boolean; canEnable?: boolean; manual?: boolean; catalog?: Partial<BeichenCatalogModel> }
 function overview(entries: Entry[]): BeichenOverview {
   return {
     datasets: [], comparison: [],
@@ -31,15 +31,17 @@ function overview(entries: Entry[]): BeichenOverview {
       model: entry.model, school_status: entry.active ? 'active' : 'not_configured', can_enable: entry.canEnable ?? !entry.active,
       preferred_routes: [{ school_model: entry.model, provider_id: 'north', credential_id: 'key-' + entry.model,
         credential_label: '教学 Key', adapter: 'openai_responses', priority: 1, state: entry.active ? 'ready' : 'candidate', effective_multiplier_text: '0.1' }],
+      ...entry.catalog,
     })),
   }
 }
 function total(credits = '11', tokens = 1000): BeichenUsageTotals {
   return { credits, tokens, input_tokens: tokens - 400, output_tokens: 200, cache_read_tokens: 100, cache_write_tokens: 100, calls: 4, pending_calls: 1 }
 }
-function usage(range: BeichenUsageRange = 'all'): BeichenModelUsage {
+function usage(range: BeichenUsageRange = 'month'): BeichenModelUsage {
   return {
-    range, start: null, end: '2026-11-20T12:00:00+08:00', timezone: 'Asia/Shanghai', totals: { ...total('33', 2000), students: 2, keys: 2 },
+    range, start: null, end: '2026-11-20T12:00:00+08:00', timezone: 'Asia/Shanghai',
+    totals: { ...total('33.00000000000000000001', 2000), cache_hit_rate: 0.125, pending_calls: 3, completeness: 'partial', students: 2, keys: 2 },
     models: [{ model: 'lab/a', ...total() }, { model: 'lab/b', ...total('22', 1000) }],
     students: [
       { user_id: 'student-a', user_name: '学生甲', project_id: 'project', project_name: '教学项目', credits: '33', tokens: 2000, calls: 8,
@@ -60,8 +62,9 @@ function button(root: Pick<DOMWrapper<Element>, 'findAll'>, label: string) {
 }
 function deferred<T>() {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>(done => { resolve = done })
-  return { promise, resolve }
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail })
+  return { promise, resolve, reject }
 }
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset()
@@ -77,29 +80,38 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('北辰模型管理', () => {
-  it('一键启用只处理当前搜索及常用筛选，预览明确列出启用和跳过原因', async () => {
-    const entries: Entry[] = [{ model: 'lab/active', active: true }, { model: 'lab/ready' }, { model: 'lab/missing', priced: false }, { model: 'lab/not-ready', canEnable: false }, { model: 'outside/model' }]
+  it('一键启用只提交当前筛选中可启用的新旧模型', async () => {
+    const entries: Entry[] = [
+      { model: 'lab/active', active: true, catalog: { activation: 'ready' } },
+      { model: 'lab/active-new', catalog: { activation: 'active' } },
+      { model: 'lab/ready', canEnable: false, catalog: { activation: 'ready' } },
+      { model: 'lab/legacy', priced: false, catalog: { activation: null, can_enable: true } },
+      { model: 'lab/blocked', catalog: { activation: 'blocked', blockers: [{ code: 'sync_failed', message: '请先同步该渠道报价' }] } },
+      { model: 'lab/not-ready', canEnable: false },
+      { model: 'lab/not-common' },
+      { model: 'outside/model' },
+    ]
     api.beichenOverview.mockResolvedValue(overview(entries))
-    api.enableBeichenModelsBatch.mockResolvedValue({ enabled: [{ model: 'lab/ready', model_id: 'school-id' }], skipped: [] })
-    const wrapper = view({ query: 'lab/', commonIds: new Set(entries.map(entry => entry.model)) })
+    api.enableBeichenModelsBatch.mockResolvedValue({
+      enabled: ['lab/ready', 'lab/legacy'].map(model => ({ model, model_id: model })), skipped: [],
+    })
+    const wrapper = view({ query: 'lab/', commonIds: new Set(entries.filter(entry => entry.model !== 'lab/not-common').map(entry => entry.model)) })
     await flushPromises()
     await button(wrapper, '一键启用').trigger('click')
     const dialog = wrapper.get('[role="dialog"][aria-label="一键启用当前筛选模型"]')
-    expect(dialog.text()).toContain('将启用 1 个 · 跳过 3 个')
-    expect(dialog.text()).toContain('已启用')
-    expect(dialog.text()).toContain('官网未报价，请先手动定价')
+    expect(dialog.text()).toContain('将启用 2 个 · 跳过 4 个')
     expect(dialog.text()).toContain('线路未就绪')
-    expect(dialog.text()).not.toContain('outside/model')
+    expect(dialog.text()).toContain('请先同步该渠道报价')
+    expect(dialog.text()).not.toMatch(/outside\/model|lab\/not-common/)
     expect(api.enableBeichenModelsBatch).not.toHaveBeenCalled()
-    await button(dialog, '确认启用 1 个').trigger('click')
+    await button(dialog, '确认启用 2 个').trigger('click')
     await flushPromises()
-    expect(api.enableBeichenModelsBatch).toHaveBeenCalledExactlyOnceWith('north', ['lab/ready'])
-    expect(dialog.text()).toContain('已启用 1 个 · 跳过 3 个 · 失败 0 个')
-    expect(toast.success).toHaveBeenCalledWith('已启用 1 个，跳过 3 个，失败 0 个')
+    expect(api.enableBeichenModelsBatch).toHaveBeenCalledExactlyOnceWith('north', ['lab/ready', 'lab/legacy'])
+    expect(dialog.text()).toContain('已启用 2 个 · 跳过 4 个 · 失败 0 个')
     expect(api.beichenOverview).toHaveBeenCalledTimes(2)
   })
 
-  it('状态筛选会改变一键启用范围，手动价不再被当作无报价', async () => {
+  it('状态筛选会改变一键启用范围，手动价不会被当作无报价', async () => {
     api.beichenOverview.mockResolvedValue(overview([{ model: 'lab/active', active: true }, { model: 'lab/manual', manual: true }, { model: 'lab/missing', priced: false }]))
     const wrapper = view()
     await flushPromises()
@@ -107,90 +119,210 @@ describe('北辰模型管理', () => {
     expect(wrapper.findAll('.model-table tbody tr').map(row => row.attributes('data-model'))).toEqual(['lab/manual'])
     await button(wrapper, '一键启用').trigger('click')
     expect(wrapper.get('[role="dialog"]').text()).toContain('将启用 1 个 · 跳过 0 个')
-    expect(wrapper.get('.model-multiplier').text()).toBe('手动定价')
+    expect(wrapper.get('.actual-price').text()).toContain('手动定价')
+    expect(wrapper.get('.actual-price .price-value').text()).toContain('110 积分')
   })
 
-  it('超过 200 个时分批调用，服务器跳过和失败逐项保留', async () => {
+  it('按 200 个分批显示进度，展示逐项原因，重试只发送失败项', async () => {
     const entries = Array.from({ length: 201 }, (_, index) => ({ model: 'batch/' + index }))
+    const first = deferred<BeichenBatchEnableResult>()
+    const second = deferred<BeichenBatchEnableResult>()
     api.beichenOverview.mockResolvedValue(overview(entries))
-    api.enableBeichenModelsBatch.mockImplementationOnce(async (_provider: string, models: string[]) => ({
-      enabled: models.slice(1).map(model => ({ model, model_id: model })), skipped: [{ model: models[0], reason: 'not_ready', message: '后台线路已变化' }],
-    })).mockRejectedValueOnce(new Error('服务暂不可用'))
+    api.enableBeichenModelsBatch.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+      .mockImplementationOnce(async (_provider: string, models: string[]) => ({
+        enabled: models.map(model => ({ model, model_id: model })), skipped: [],
+      }))
     const wrapper = view()
     await flushPromises()
     await button(wrapper, '一键启用').trigger('click')
-    await button(wrapper.get('[role="dialog"]'), '确认启用 201 个').trigger('click')
+    const dialog = wrapper.get('[role="dialog"]')
+    await button(dialog, '确认启用 201 个').trigger('click')
+    expect(dialog.get('progress').attributes()).toMatchObject({ value: '0', max: '201' })
+    first.resolve({
+      enabled: entries.slice(2, 200).map(({ model }) => ({ model, model_id: model })),
+      skipped: [
+        { model: 'batch/0', reason: 'already_active', message: '后台已启用' },
+        { model: 'batch/1', reason: 'enable_failed', message: '后台线路已变化' },
+      ],
+    })
+    await flushPromises()
+    expect(dialog.get('progress').attributes('value')).toBe('200')
+    second.reject(new Error('服务暂不可用'))
     await flushPromises()
     expect(api.enableBeichenModelsBatch.mock.calls.map(call => call[1].length)).toEqual([200, 1])
     expect(api.enableBeichenModelsBatch.mock.calls[1]).toEqual(['north', ['batch/200']])
-    expect(wrapper.get('[role="dialog"]').text()).toContain('已启用 199 个 · 跳过 1 个 · 失败 1 个')
-    expect(wrapper.get('[role="dialog"]').text()).toContain('后台线路已变化')
+    expect(dialog.text()).toContain('已启用 198 个 · 跳过 1 个 · 失败 2 个')
+    expect(dialog.findAll('[data-batch-status="failed"]').map(row => row.text())).toEqual([
+      'batch/1失败 · 后台线路已变化', 'batch/200失败 · 启用失败，请稍后重试',
+    ])
     expect(toast.error).toHaveBeenCalled()
+    await button(dialog, '重试失败项').trigger('click')
+    await flushPromises()
+    expect(api.enableBeichenModelsBatch.mock.calls[2]).toEqual(['north', ['batch/1', 'batch/200']])
+    expect(dialog.text()).toContain('已启用 200 个 · 跳过 1 个 · 失败 0 个')
+    expect(dialog.findAll('[data-batch-status="failed"]')).toHaveLength(0)
+    expect(api.beichenOverview).toHaveBeenCalledTimes(3)
   })
 
-  it('首次并行读取概览和总计用量，切换范围只读取用量且旧响应不能覆盖新范围', async () => {
+  it('批次响应缺项时列出原因，重试前跳过刷新后已启用的行', async () => {
+    const entries = [{ model: 'lab/committed' }, { model: 'lab/retry' }]
+    api.beichenOverview.mockResolvedValueOnce(overview(entries))
+      .mockResolvedValue(overview([{ model: 'lab/committed', active: true }, entries[1]]))
+    api.enableBeichenModelsBatch.mockResolvedValueOnce({ enabled: [], skipped: [] })
+      .mockResolvedValueOnce({ enabled: [{ model: 'lab/retry', model_id: 'school-id' }], skipped: [] })
+    const wrapper = view()
+    await flushPromises()
+    await button(wrapper, '一键启用').trigger('click')
+    const dialog = wrapper.get('[role="dialog"]')
+    await button(dialog, '确认启用 2 个').trigger('click')
+    await flushPromises()
+    expect(dialog.findAll('[data-batch-status="failed"]')).toHaveLength(2)
+    expect(dialog.text()).toContain('服务器未返回结果')
+    await button(dialog, '重试失败项').trigger('click')
+    await flushPromises()
+    expect(api.enableBeichenModelsBatch.mock.calls[1]).toEqual(['north', ['lab/retry']])
+    expect(dialog.text()).toContain('已启用 1 个 · 跳过 1 个 · 失败 0 个')
+  })
+
+  it('本月汇总和行用量固定为本月，抽屉切换时段不覆盖本月用量', async () => {
     const firstOverview = deferred<BeichenOverview>()
+    const day = deferred<BeichenModelUsage>()
     api.beichenOverview.mockReturnValueOnce(firstOverview.promise)
+    api.modelUsage.mockImplementation(async (period: BeichenUsageRange) => {
+      if (period === 'day') return day.promise
+      if (period === 'all') return { ...usage(period), totals: total('999') }
+      return usage()
+    })
     const wrapper = view()
     expect(api.beichenOverview).toHaveBeenCalledTimes(1)
-    expect(api.modelUsage).toHaveBeenCalledWith('all', 'north')
+    expect(api.modelUsage).toHaveBeenCalledExactlyOnceWith('month', 'north')
     firstOverview.resolve(overview([{ model: 'lab/a' }]))
     await flushPromises()
-    const month = deferred<BeichenModelUsage>()
-    api.modelUsage.mockReturnValueOnce(month.promise)
-    await button(wrapper.get('[aria-label="模型用量时间范围"]'), '本月').trigger('click')
-    await button(wrapper.get('[aria-label="模型用量时间范围"]'), '当天').trigger('click')
+    const summary = wrapper.get('[aria-label="本月用量汇总"]')
+    expect(summary.findAll('dd').map(cell => cell.text())).toEqual(['33.00000000000000000001', '2,000', '12.5%', '3'])
+    expect(wrapper.get('.model-usage').text()).toBe('11 积分Token 1,000待核 1 笔')
+    await button(wrapper, '查看全部明细').trigger('click')
+    const dialog = wrapper.get('[role="dialog"][aria-label="北辰 · 用量明细"]')
+    expect(dialog.get('[aria-pressed="true"]').text()).toBe('本月')
+    await button(dialog.get('[aria-label="用量时间范围"]'), '当天').trigger('click')
+    await button(dialog.get('[aria-label="用量时间范围"]'), '总计').trigger('click')
     await flushPromises()
-    month.resolve({ ...usage('month'), totals: total('999') })
+    day.resolve({ ...usage('day'), totals: total('500') })
     await flushPromises()
-    expect(api.modelUsage.mock.calls).toEqual([['all', 'north'], ['month', 'north'], ['day', 'north']])
+    expect(api.modelUsage.mock.calls).toEqual([['month', 'north'], ['day', 'north'], ['all', 'north']])
     expect(api.beichenOverview).toHaveBeenCalledTimes(1)
-    expect(wrapper.get('[aria-label="模型与用量概况"]').text()).toContain('当天已扣积分33')
-    expect(wrapper.get('[aria-label="模型与用量概况"]').text()).not.toContain('999')
+    expect(dialog.get('[aria-label="用量汇总"]').text()).toContain('总计已扣积分999')
+    expect(summary.findAll('dd').map(cell => cell.text())).toEqual(['33.00000000000000000001', '2,000', '12.5%', '3'])
   })
 
-  it('每 60 秒只轮询概览，保留定价与使用抽屉的范围', async () => {
+  it('每 60 秒只轮询模型概览，模型行打开本月学生用量', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
     const wrapper = view()
     await flushPromises()
     await vi.advanceTimersByTimeAsync(60_000)
     expect(api.beichenOverview).toHaveBeenCalledTimes(2)
     expect(api.modelUsage).toHaveBeenCalledTimes(1)
-    await button(wrapper, '用量总览').trigger('click')
-    await button(wrapper.get('[role="dialog"] [aria-label="用量时间范围"]'), '本月').trigger('click')
-    await flushPromises()
-    expect(wrapper.get('[aria-label="模型用量时间范围"] button[aria-pressed="true"]').text()).toBe('本月')
-    expect(api.modelUsage).toHaveBeenLastCalledWith('month', 'north')
+    await wrapper.get('button[aria-label="查看 lab/a 用量"]').trigger('click')
+    const dialog = wrapper.get('[role="dialog"]')
+    expect(dialog.get('button[aria-expanded="true"]').text()).toContain('lab/a')
+    expect(dialog.get('tbody').text()).toContain('学生甲')
+    expect(dialog.get('tbody').text()).not.toMatch(/学生乙|lab\/b/)
   })
 
-  it('禁用必须确认，无报价不可直接启用，手动定价入口始终可见', async () => {
-    api.beichenOverview.mockResolvedValue(overview([{ model: 'lab/a', active: true }, { model: 'lab/missing', priced: false }]))
+  it('禁用已启用模型需确认，启用按钮旁显示下一步并可打开现有定价入口', async () => {
+    api.beichenOverview.mockResolvedValue(overview([
+      { model: 'lab/a', active: true },
+      { model: 'lab/missing', priced: false },
+      { model: 'lab/blocked', catalog: {
+        activation: 'blocked',
+        blockers: [{ code: 'no_ready_route', message: '请先配置发布线路' }, { code: 'sync_failed', message: '再同步渠道目录' }],
+      } },
+    ]))
     const wrapper = view()
     await flushPromises()
-    const rows = wrapper.findAll('.model-table tbody tr')
+    const [active, missing, blocked] = wrapper.findAll('.model-table tbody tr')
     vi.mocked(window.confirm).mockReturnValueOnce(false)
-    await button(rows[0], '禁用').trigger('click')
+    await button(active, '禁用').trigger('click')
     expect(api.updateModel).not.toHaveBeenCalled()
-    await button(rows[0], '禁用').trigger('click')
+    await button(active, '禁用').trigger('click')
     await flushPromises()
     expect(api.updateModel).toHaveBeenCalledWith({ model_id: 'lab/a', status: 'inactive' })
-    expect(button(rows[1], '启用').element.disabled).toBe(true)
-    await button(rows[1], '手动定价').trigger('click')
-    expect(wrapper.get('[role="dialog"]').attributes('aria-label')).toBe('lab/missing · 价格设置')
+    expect(button(blocked, '启用').element.disabled).toBe(true)
+    expect(blocked.get('.enable-reason').text()).toBe('请先配置发布线路；再同步渠道目录')
+    expect(button(blocked, '启用').attributes('aria-describedby')).toBe(blocked.get('.enable-reason').attributes('id'))
+    expect(button(missing, '启用').element.disabled).toBe(true)
+    expect(missing.get('.enable-reason').text()).toBe('官网未报价，请先手动定价')
+    await button(missing, '手动定价').trigger('click')
+    const drawer = wrapper.getComponent(BeichenPriceDrawer)
+    expect(drawer.props('open')).toBe(true)
+    expect(drawer.props('row')?.model).toBe('lab/missing')
   })
 
-  it('价格按四项结构展示，保留零价与基础价，使用响应式卡片而非横向滚动', async () => {
+  it('官网价和学生实价精确换算积分及元，保留字符串零价与缺项', async () => {
+    const data = overview([{ model: 'lab/a' }])
+    const [model] = data.models!
+    model.price_conditions_exact = {
+      billing_mode: 'token', input_price: '0.000001234567890123', output_price: '0.000002', cache_read_price: '0', cache_write_price: null,
+    }
+    const route = data.model_catalog![0].preferred_routes![0]
+    route.effective_multiplier_text = '0.125'
+    route.effective_multiplier = '2'
+    api.beichenOverview.mockResolvedValue(data)
     const wrapper = view()
     await flushPromises()
-    expect(wrapper.findAll('.standard-price .price-grid > div')).toHaveLength(4)
-    expect(wrapper.findAll('.actual-price .price-grid > div')).toHaveLength(4)
-    expect(wrapper.get('.actual-price').text()).toContain('110 积分')
-    expect(wrapper.get('.actual-price').text()).toContain('基础 100 积分')
-    expect(wrapper.get('.standard-price').text()).toContain('缓存读取0 积分')
-    expect(wrapper.find('[data-layout="responsive-cards"]').exists()).toBe(true)
-    expect(wrapper.find('.model-scroll').exists()).toBe(false)
-    expect(componentSource).toContain('@media (max-width: 900px)')
+    expect(wrapper.findAll('.model-table thead th').map(cell => cell.text())).toEqual(['模型', '状态与覆盖', '官网价', '学生实价', '本月用量', '操作'])
+    const amounts = (selector: string) => wrapper.findAll(selector + ' .price-value').map(cell => [
+      cell.get('.price-credits').text(), cell.element.querySelector('.price-sub')?.textContent ?? null,
+    ])
+    expect(amounts('.standard-price')).toEqual([['123.4567890123 积分', '1.234567890123 元'], ['200 积分', '2 元'], ['0 积分', '0 元'], ['—', null]])
+    expect(amounts('.actual-price')).toEqual([['16.97530848919125 积分', '0.1697530848919125 元'], ['27.5 积分', '0.275 元'], ['0 积分', '0 元'], ['—', null]])
+    expect(wrapper.get('.actual-price .quote-caption').text()).toContain('0.125×')
+    expect(componentSource).toContain('@container (max-width: 54rem)')
     expect(componentSource).not.toContain('overflow-x: auto')
+  })
+
+  it.each([
+    ['per_request', { per_request_price: '0.3' }, '积分/次 · 每次请求 30 积分（0.3 元）', '积分/次 · 每次请求 3 积分（0.03 元）'],
+    ['video', { per_request_price: '3e-1' }, '积分/秒 · 每秒 30 积分（0.3 元）', '积分/秒 · 每秒 3 积分（0.03 元）'],
+    ['image', { image_output_price: '0.8', image_input_price: '0.4' },
+      '积分/次 · 图像输出 80 积分（0.8 元）\n官网原值（单位未知） · 图像输入 0.4', '积分/次 · 图像输出 8 积分（0.08 元）'],
+  ] as const)('按 %s 的计费单位换算积分和元', async (billing_mode, fields, official, student) => {
+    const data = overview([{ model: 'lab/a' }])
+    data.models![0].price_conditions_exact = { billing_mode, ...fields }
+    api.beichenOverview.mockResolvedValue(data)
+    const wrapper = view()
+    await flushPromises()
+    expect(wrapper.get('.standard-price .price-line').element.textContent).toBe(official)
+    expect(wrapper.get('.actual-price .price-line').element.textContent).toBe(student)
+    expect(wrapper.find('.price-grid').exists()).toBe(false)
+  })
+
+  it('显示五维状态，重复协议只算一次，新字段为 null 时仍能读旧数据', async () => {
+    const data = overview([
+      { model: 'lab/new', catalog: { key_count: 2, route_count: 4, ready_count: 2, activation: 'ready', price_state: 'confirmed' } },
+      { model: 'lab/old', active: true, catalog: { key_count: null, route_count: null, ready_count: null, activation: null, price_state: null, blockers: null } },
+      { model: 'lab/empty', priced: false, catalog: { preferred_routes: null, can_enable: null, school_status: null, blockers: null } },
+    ])
+    const routes = data.model_catalog![0].preferred_routes!
+    routes.push({ ...routes[0], credential_id: 'key-lab/old' }, { ...routes[0], adapter: 'anthropic' })
+    api.beichenOverview.mockResolvedValue({
+      ...data,
+      credentials: ['key-lab/new', 'key-lab/old', 'key-lab/empty'].map(credential_id => ({ credential_id, label: '渠道' })),
+    })
+    api.modelUsage.mockResolvedValue({ ...usage(), totals: { ...total(), cache_hit_rate: null, completeness: null }, models: [], students: [] })
+    const wrapper = view()
+    await flushPromises()
+    const states = wrapper.findAll('.model-state').map(row => row.text())
+    expect(states).toEqual([
+      '2/3 把 Key 覆盖 · 2 种协议 · 2 条已发布 · 报价已确认 · 可启用',
+      '1/3 把 Key 覆盖 · 1 种协议 · 1 条已发布 · 报价已确认 · 已启用',
+      '1/3 把 Key 覆盖 · 0 种协议 · 0 条已发布 · 缺少报价 · 未发布',
+    ])
+    expect(wrapper.get('.model-state [title]').attributes('title')).toBe('4 条候选线路')
+    const empty = wrapper.get('[data-model="lab/empty"]')
+    expect(empty.findAll('.price-value').map(cell => cell.text())).toEqual(Array(8).fill('—'))
+    expect(wrapper.get('[aria-label="本月用量汇总"]').findAll('dd')[2].text()).toBe('—')
+    expect(wrapper.text()).not.toMatch(/undefined|NaN/)
   })
 
   it('用量失败不影响模型目录，可单独重试', async () => {
@@ -202,44 +334,6 @@ describe('北辰模型管理', () => {
     await button(wrapper, '重试用量').trigger('click')
     await flushPromises()
     expect(api.beichenOverview).toHaveBeenCalledTimes(1)
-    expect(api.modelUsage).toHaveBeenCalledTimes(2)
-  })
-})
-
-describe('北辰用量抽屉', () => {
-  it('单模型入口按学生列出该模型用量，切到 Key 明确恢复全模型合计', async () => {
-    const wrapper = mount(BeichenUsageDrawer, { props: { open: true, range: 'all', usage: usage(), initialModel: 'lab/a' }, global: { stubs } })
-    expect(wrapper.get('[aria-label="用量汇总"]').text()).toContain('已扣积分11')
-    expect(wrapper.get('[aria-label="用量汇总"]').text()).toContain('使用学生1')
-    expect(wrapper.get('tbody').text()).toContain('学生甲')
-    expect(wrapper.get('tbody').text()).not.toContain('学生乙')
-    expect(wrapper.get('tbody').text()).toContain('100%')
-    expect(wrapper.text()).toContain('待核账 1 笔')
-    expect(wrapper.text()).toContain('总 Token = 未缓存输入 + 输出 + 缓存读取 + 缓存写入')
-    await button(wrapper, '按 Key').trigger('click')
-    expect(wrapper.get('[aria-label="用量汇总"]').text()).toContain('已扣积分33')
-    expect(wrapper.text()).toContain('全部模型合计')
-    expect(wrapper.get('tbody').text()).toContain('学校 Key 甲')
-    expect(wrapper.get('select').element.disabled).toBe(true)
-  })
-
-  it('按模型可下钻到学生，用量范围通过事件与页面共享', async () => {
-    const wrapper = mount(BeichenUsageDrawer, { props: { open: true, range: 'all', usage: usage() }, global: { stubs } })
-    await wrapper.get('button[aria-label="查看 lab/a 的学生用量"]').trigger('click')
-    expect(wrapper.get('[role="tab"][aria-selected="true"]').text()).toBe('按学生')
-    expect(wrapper.get('tbody').text()).toContain('学生甲')
-    await button(wrapper.get('[aria-label="用量时间范围"]'), '当天').trigger('click')
-    expect(wrapper.emitted('update:range')).toEqual([['day']])
-  })
-
-  it('清楚区分加载、错误、空集，并提供重试', async () => {
-    const wrapper = mount(BeichenUsageDrawer, { props: { open: true, range: 'all', loading: true }, global: { stubs } })
-    expect(wrapper.get('[role="status"]').text()).toContain('正在读取用量')
-    await wrapper.setProps({ loading: false, error: '用量暂不可用' })
-    await button(wrapper, '重试读取用量').trigger('click')
-    expect(wrapper.emitted('retry')).toHaveLength(1)
-    await wrapper.setProps({ error: '', usage: { ...usage(), models: [], students: [], keys: [], totals: total('0', 0) } })
-    expect(wrapper.text()).toContain('此范围暂无用量')
-    expect(wrapper.find('table').exists()).toBe(false)
+    expect(api.modelUsage.mock.calls).toEqual([['month', 'north'], ['month', 'north']])
   })
 })

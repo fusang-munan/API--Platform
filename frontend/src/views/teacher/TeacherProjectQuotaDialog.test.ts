@@ -1,12 +1,17 @@
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { APIError, patch } from '../../api/client'
 import { teacherAPI } from '../../api/teacher'
-import { APIError } from '../../api/client'
 import type { Project, ProjectUsage } from '../../api/types'
 import AppDialog from '../../components/AppDialog.vue'
+import { calculateCredits } from '../../utils/format'
 import TeacherProjects from './TeacherProjects.vue'
 import TeacherProjectQuotaDialog from './TeacherProjectQuotaDialog.vue'
 
+vi.mock('../../api/client', async original => ({
+  ...await original<typeof import('../../api/client')>(),
+  patch: vi.fn(),
+}))
 vi.mock('../../api/teacher', () => ({ teacherAPI: {
   projectUsage: vi.fn(), updateMemberQuota: vi.fn(), organizations: vi.fn(), projects: vi.fn(),
   mentorApplications: vi.fn(), projectBudgets: vi.fn(),
@@ -42,13 +47,32 @@ function fixture(): ProjectUsage {
   }
 }
 
+function addStudent(quota = '0') {
+  snapshot.members.push({
+    user_id: 'student-2', user_name: '学生乙', is_student: true, quota, available: quota, credits: '0', keys: [], free_models: [],
+  })
+  snapshot.allocated = calculateCredits(snapshot.allocated, quota, 'add')
+  snapshot.available = calculateCredits(snapshot.quota, snapshot.allocated, 'subtract')
+}
+
+function saveFixtureQuota(id: string, quota: string) {
+  const member = snapshot.members.find(item => item.user_id === id)!
+  const otherQuota = calculateCredits(snapshot.allocated, member.quota, 'subtract')
+  snapshot.allocated = calculateCredits(otherQuota, quota, 'add')
+  snapshot.available = calculateCredits(snapshot.quota, snapshot.allocated, 'subtract')
+  member.quota = quota
+  const minimum = calculateCredits(member.credits, member.pending ?? '0', 'add')
+  member.available = calculateCredits(quota, minimum, 'subtract')
+}
+
 beforeEach(() => {
   vi.resetAllMocks()
   vi.useFakeTimers({ toFake: ['Date'] })
   vi.setSystemTime(new Date('2026-11-20T08:00:00Z'))
   snapshot = fixture()
-  vi.mocked(teacherAPI.projectUsage).mockImplementation(async (_id, month) => ({ ...snapshot, month: month ?? currentMonth }))
-  vi.mocked(teacherAPI.updateMemberQuota).mockResolvedValue(undefined)
+  vi.mocked(teacherAPI.projectUsage).mockImplementation(async (_id, month) => ({ ...structuredClone(snapshot), month: month ?? currentMonth }))
+  vi.mocked(teacherAPI.updateMemberQuota).mockImplementation(async (_projectID, id, quota) => saveFixtureQuota(id, quota))
+  vi.mocked(patch).mockResolvedValue(undefined)
   vi.mocked(teacherAPI.organizations).mockResolvedValue([])
   vi.mocked(teacherAPI.projects).mockResolvedValue([project])
   vi.mocked(teacherAPI.mentorApplications).mockResolvedValue([])
@@ -71,130 +95,249 @@ async function render(props: { project?: Project; initialMonth?: string } = {}) 
 
 function button(wrapper: VueWrapper, text: string) {
   const found = wrapper.findAll('button').find(item => item.text() === text)
-  if (!found) throw new Error(`找不到按钮：${text}`)
+  if (!found) throw new Error(`找不到按钮 ${text}`)
   return found
 }
 
-async function edit(wrapper: Pick<VueWrapper, 'get'>) {
-  await wrapper.get('[data-member-id="student-1"] button').trigger('click')
-  return wrapper.get('.quota-editor')
+function memberRow(wrapper: Pick<VueWrapper, 'get'>, id = 'student-1') {
+  return wrapper.get(`.quota-member[data-member-id="${id}"]`)
+}
+
+async function batchFill(wrapper: VueWrapper, value: string) {
+  const batch = wrapper.get('.quota-batch')
+  await batch.get('input').setValue(value)
+  await batch.trigger('submit')
 }
 
 describe('学生额度弹窗', () => {
-  it('用 xwide 打开，汇总与分配图显示积分，单成员保存后发事件并重读数据', async () => {
+  it('两栏内容位于独立滚动区，语义化成员表与底部操作区没有内嵌横向滚动容器', async () => {
     const wrapper = await render()
     expect(wrapper.get('[role="dialog"]').attributes('data-size')).toBe('xwide')
-    expect(wrapper.get('[aria-label="项目额度汇总"]').text()).toContain('1,000')
-    expect(wrapper.get('[aria-label="项目额度汇总"]').text()).not.toContain('.000')
+    expect(wrapper.findAll('[role="dialog"]')).toHaveLength(1)
+    const scroll = wrapper.get('.quota-dialog > .quota-scroll[tabindex="0"]')
+    const overview = scroll.get('.quota-layout > .quota-overview')
+    expect(overview.get('.quota-summary').findAll('dt').map(term => term.text()))
+      .toEqual(['项目月额度', '已分配', '可再分配', '本月已消耗', '待核'])
+    const table = scroll.get('.quota-layout > .quota-members > table.quota-table')
+    expect(table.findAll('thead th[scope="col"]').map(cell => cell.text()))
+      .toEqual(['成员', '已分配', '已用', '待核', '剩余', '本月新额度'])
+    const row = memberRow(wrapper)
+    expect(row.get('th[scope="row"]').text()).toContain('学生甲')
+    expect(row.findAll('.quota-cell-label').map(label => label.text()))
+      .toEqual(['已分配', '已用', '待核', '剩余', '本月新额度'])
+    expect(row.get('.quota-entry > .quota-row-form').find('input[inputmode="decimal"]').exists()).toBe(true)
+    expect(wrapper.get('.quota-dialog > .quota-footer').find('.quota-save-batch').exists()).toBe(true)
+    expect(scroll.find('.quota-footer').exists()).toBe(false)
+  })
+
+  it('项目汇总和占比环图显示积分，行内保存后重读额度并通知父页面', async () => {
+    const wrapper = await render()
+    expect(wrapper.get('.quota-summary').text()).toContain('1,000')
+    expect(wrapper.get('.quota-summary').text()).not.toContain('.000')
     expect(wrapper.findComponent(stubs.CreditDonut).props('segments')).toEqual([
-      { name: '学生甲', value: 100, displayValue: '100 积分' },
-      { name: '可再分配', value: 900, color: '#dfe3ec', displayValue: '900 积分' },
+      { name: '学生甲', value: 100000, displayValue: '100' },
+      { name: '可再分配', value: 900000, color: '#dfe3ec', displayValue: '900' },
     ])
-    const editor = await edit(wrapper)
-    expect(wrapper.findAll('[role="dialog"]')).toHaveLength(2)
-    expect(editor.get('input').element.value).toBe('100')
-    await editor.get('input').setValue('150.125')
-    expect(editor.get('.quota-preview').text()).toContain('115.125 积分')
-    vi.mocked(teacherAPI.updateMemberQuota).mockImplementationOnce(async () => {
-      snapshot.members[0] = { ...snapshot.members[0], quota: '150.125', available: '115.125' }
-      snapshot.allocated = '150.125'
-    })
-    await editor.trigger('submit')
+    const row = memberRow(wrapper)
+    expect(row.get('input').element.value).toBe('100')
+    await row.get('input').setValue('150.125')
+    await row.get('form').trigger('submit')
     await flushPromises()
     expect(teacherAPI.updateMemberQuota).toHaveBeenCalledExactlyOnceWith(project.id, 'student-1', '150.125')
     expect(wrapper.emitted('saved')).toHaveLength(1)
     expect(teacherAPI.projectUsage).toHaveBeenCalledTimes(2)
-    expect(wrapper.find('.quota-editor').exists()).toBe(false)
-    expect(wrapper.get('[data-member-id="student-1"]').text()).toContain('150.125')
+    expect(row.text()).toContain('115.125')
+    expect(row.get('[role="status"]').text()).toBe('已保存')
   })
 
-  it('新额度低于已用与待核合计时禁用保存，直接提交也不能调用接口', async () => {
+  it('允许手动下调至覆盖已用和待核的额度，拦住少于下限的请求', async () => {
     const wrapper = await render()
-    const editor = await edit(wrapper)
-    await editor.get('input').setValue('34.999')
-    expect(editor.get('[role="alert"]').text()).toContain('至少需 35 积分')
-    expect(editor.get('button[type="submit"], button.primary').attributes('disabled')).toBeDefined()
-    await editor.trigger('submit')
+    const row = memberRow(wrapper)
+    await row.get('input').setValue('34.999')
+    expect(row.get('[role="alert"]').text()).toContain('至少需 35 积分')
+    expect(row.get('.quota-save-row').attributes('disabled')).toBeDefined()
+    await row.get('form').trigger('submit')
     expect(teacherAPI.updateMemberQuota).not.toHaveBeenCalled()
-    await editor.get('input').setValue('35')
-    expect(editor.get('button.primary').attributes('disabled')).toBeUndefined()
-    expect(editor.get('.quota-preview').text()).toContain('0 积分')
-  })
-
-  it.each(['-1', '10.1234', '1e3', '', 'NaN'])('拒绝非法额度 %s', async value => {
-    const wrapper = await render()
-    const editor = await edit(wrapper)
-    await editor.get('input').setValue(value)
-    expect(editor.get('button.primary').attributes('disabled')).toBeDefined()
-    await editor.trigger('submit')
-    expect(teacherAPI.updateMemberQuota).not.toHaveBeenCalled()
-  })
-
-  it('快捷按钮累加当前输入，补足已用会覆盖待核并向上取足三位小数', async () => {
-    snapshot.members[0].credits = '25.000000000001'
-    const wrapper = await render()
-    const editor = await edit(wrapper)
-    await button(wrapper, '+100').trigger('click')
-    expect(editor.get('input').element.value).toBe('200.000')
-    await button(wrapper, '+500').trigger('click')
-    expect(editor.get('input').element.value).toBe('700.000')
-    await button(wrapper, '+1000').trigger('click')
-    expect(editor.get('input').element.value).toBe('1700.000')
-    await editor.get('input').setValue('35')
-    expect(editor.get('button.primary').attributes('disabled')).toBeDefined()
-    await button(wrapper, '补足已用').trigger('click')
-    expect(editor.get('input').element.value).toBe('35.001')
-    expect(editor.get('button.primary').attributes('disabled')).toBeUndefined()
-  })
-
-  it('超过项目可分配额度时提示，后端拒绝后保留输入且不发成功事件', async () => {
-    const wrapper = await render()
-    const editor = await edit(wrapper)
-    await editor.get('input').setValue('1000.001')
-    expect(editor.get('[role="status"]').text()).toContain('超过项目可再分配的 900 积分')
-    expect(editor.get('button.primary').attributes('disabled')).toBeUndefined()
-    vi.mocked(teacherAPI.updateMemberQuota).mockRejectedValueOnce(new APIError('额度超过项目可分配额度', 409, 'PROJECT_QUOTA_ALLOCATION_EXCEEDED'))
-    await editor.trigger('submit')
+    await row.get('input').setValue('35')
+    await row.get('form').trigger('submit')
     await flushPromises()
-    expect(editor.text()).toContain('超过项目月额度')
-    expect(editor.get('input').element.value).toBe('1000.001')
-    expect(wrapper.emitted('saved')).toBeUndefined()
-    expect(teacherAPI.projectUsage).toHaveBeenCalledTimes(1)
+    expect(teacherAPI.updateMemberQuota).toHaveBeenCalledExactlyOnceWith(project.id, 'student-1', '35')
   })
 
-  it('历史月份只读，导师在本月也不可编辑', async () => {
+  it.each(['-1', '10.1234', '1e3', '', 'NaN'])('行内提示非法额度 %s', async value => {
+    const row = memberRow(await render())
+    await row.get('input').setValue(value)
+    expect(row.get('input').attributes('aria-invalid')).toBe('true')
+    expect(row.get('[role="alert"]').text()).toContain('非负积分')
+    expect(row.get('.quota-save-row').attributes('disabled')).toBeDefined()
+    await row.get('form').trigger('submit')
+    expect(teacherAPI.updateMemberQuota).not.toHaveBeenCalled()
+  })
+
+  it('增加量超过项目可再分配额度时在本行拦截，输入可以继续修改', async () => {
+    const row = memberRow(await render())
+    await row.get('input').setValue('1000.001')
+    expect(row.get('[role="alert"]').text()).toContain('超过项目可再分配的 900 积分')
+    expect(row.get('.quota-save-row').attributes('disabled')).toBeDefined()
+    await row.get('form').trigger('submit')
+    expect(teacherAPI.updateMemberQuota).not.toHaveBeenCalled()
+    expect(row.get('input').element.value).toBe('1000.001')
+    await row.get('input').setValue('1000')
+    expect(row.get('.quota-save-row').attributes('disabled')).toBeUndefined()
+  })
+
+  it('额度已覆盖已用与待核时补足预览保持原额度', async () => {
+    const row = memberRow(await render())
+    await row.get('input').setValue('35')
+    await row.get('.quota-top-up').trigger('click')
+    expect(row.get('input').element.value).toBe('100')
+    expect(row.get('.quota-preview').text()).toContain('100 → 100 积分')
+    expect(row.get('.quota-preview').text()).toContain('无需补足')
+    expect(row.get('.quota-save-row').attributes('disabled')).toBeDefined()
+    await row.get('form').trigger('submit')
+    expect(patch).not.toHaveBeenCalled()
+    expect(teacherAPI.updateMemberQuota).not.toHaveBeenCalled()
+  })
+
+  it('补足已用覆盖待核并向上取足三位小数，预览后才提交只升不降的写入', async () => {
+    snapshot.members[0].credits = '95.000000000001'
+    vi.mocked(patch).mockImplementationOnce(async () => saveFixtureQuota('student-1', '105.001'))
+    const row = memberRow(await render())
+    await row.get('.quota-top-up').trigger('click')
+    expect(row.get('input').element.value).toBe('105.001')
+    expect(row.get('.quota-preview').text()).toContain('100 → 105.001 积分')
+    expect(patch).not.toHaveBeenCalled()
+    await row.get('form').trigger('submit')
+    await flushPromises()
+    expect(patch).toHaveBeenCalledExactlyOnceWith(
+      '/api/v1/teacher/projects/project-1/members/student-1/monthly-credit-quota',
+      { monthly_credits: '105.001', increase_only: true },
+    )
+    expect(teacherAPI.updateMemberQuota).not.toHaveBeenCalled()
+    expect(row.get('[role="status"]').text()).toBe('已保存')
+  })
+
+  it('补足与服务端更新冲突后保留原输入，重读已提高的额度并要求重新预览', async () => {
+    snapshot.members[0].credits = '95'
+    vi.mocked(patch).mockImplementationOnce(async () => {
+      saveFixtureQuota('student-1', '120')
+      throw new APIError('member quota is already higher', 409, 'INVALID_STATE_TRANSITION')
+    })
+    const wrapper = await render()
+    const row = memberRow(wrapper)
+    await row.get('.quota-top-up').trigger('click')
+    await row.get('form').trigger('submit')
+    await flushPromises()
+    expect(row.get('input').element.value).toBe('105.000')
+    expect(row.get('[role="alert"]').text()).toContain('当前额度已提高')
+    expect(row.find('.quota-preview').exists()).toBe(false)
+    expect(row.get('.quota-save-row').attributes('disabled')).toBeDefined()
+    expect(wrapper.emitted('saved')).toBeUndefined()
+    await row.get('.quota-top-up').trigger('click')
+    expect(row.get('input').element.value).toBe('120')
+    expect(row.get('.quota-preview').text()).toContain('120 → 120 积分')
+  })
+
+  it('待核列分别显示积分和 Token，并区分确认的零值、未知和有调用待核', async () => {
+    addStudent()
+    Object.assign(snapshot, { tokens_missing: 1250 })
+    Object.assign(snapshot.members[0], { pending: '0.000', tokens_missing: 1210 })
+    Object.assign(snapshot.members[1], { tokens_missing: 0 })
+    const wrapper = await render()
+    expect(wrapper.get('.quota-summary .quota-pending').text()).toContain('积分 10')
+    expect(wrapper.get('.quota-summary .quota-pending').text()).toContain('Token 1,250')
+    const unpriced = memberRow(wrapper).get('.quota-pending')
+    expect(unpriced.text()).toContain('积分 —')
+    expect(unpriced.text()).toContain('Token 1,210')
+    expect(unpriced.text()).toContain('有调用待核')
+    expect(memberRow(wrapper, 'mentor-1').get('.quota-pending').text()).toContain('积分 0')
+    expect(memberRow(wrapper, 'mentor-1').get('.quota-pending').text()).toContain('Token 0')
+    const missing = memberRow(wrapper, 'student-2').get('.quota-pending')
+    expect(missing.text()).toContain('积分 —')
+    expect(missing.text()).toContain('Token —')
+  })
+
+  it('批量填入只写学生输入，逐行报告保存状态，失败行可用原输入重试', async () => {
+    addStudent()
+    let finishFirst!: () => void
+    vi.mocked(teacherAPI.updateMemberQuota)
+      .mockImplementationOnce(async (_projectID, id, quota) => {
+        await new Promise<void>(resolve => { finishFirst = resolve })
+        saveFixtureQuota(id, quota)
+      })
+      .mockRejectedValueOnce(new Error('模拟保存失败'))
+    const wrapper = await render()
+    const first = memberRow(wrapper)
+    const second = memberRow(wrapper, 'student-2')
+    await batchFill(wrapper, '180.125')
+    expect(first.get('input').element.value).toBe('180.125')
+    expect(second.get('input').element.value).toBe('180.125')
+    expect(memberRow(wrapper, 'mentor-1').find('input').exists()).toBe(false)
+    expect(teacherAPI.updateMemberQuota).not.toHaveBeenCalled()
+
+    await wrapper.get('.quota-save-batch').trigger('click')
+    expect(first.get('[role="status"]').text()).toBe('正在保存…')
+    expect(second.get('[role="status"]').text()).toBe('待保存')
+    expect(teacherAPI.updateMemberQuota).toHaveBeenCalledTimes(1)
+    finishFirst()
+    await flushPromises()
+    expect(first.get('[role="status"]').text()).toBe('已保存')
+    expect(second.get('[role="alert"]').text()).toContain('保存失败')
+    expect(second.get('input').element.value).toBe('180.125')
+    expect(second.get('.quota-save-row').text()).toBe('重试')
+    expect(wrapper.emitted('saved')).toHaveLength(1)
+
+    await second.get('form').trigger('submit')
+    await flushPromises()
+    expect(teacherAPI.updateMemberQuota).toHaveBeenNthCalledWith(2, project.id, 'student-2', '180.125')
+    expect(teacherAPI.updateMemberQuota).toHaveBeenNthCalledWith(3, project.id, 'student-2', '180.125')
+    expect(second.get('[role="status"]').text()).toBe('已保存')
+    expect(wrapper.emitted('saved')).toHaveLength(2)
+  })
+
+  it('批量保存每成功一行就扣减可再分配额度，后续超额行留在表内提示', async () => {
+    snapshot.quota = '250'
+    addStudent()
+    const wrapper = await render()
+    await batchFill(wrapper, '140')
+    expect(memberRow(wrapper, 'student-2').find('[role="alert"]').exists()).toBe(false)
+    await wrapper.get('.quota-save-batch').trigger('click')
+    await flushPromises()
+    expect(teacherAPI.updateMemberQuota).toHaveBeenCalledExactlyOnceWith(project.id, 'student-1', '140')
+    const second = memberRow(wrapper, 'student-2')
+    expect(second.get('[role="alert"]').text()).toContain('超过项目可再分配的 110 积分')
+    expect(second.get('input').element.value).toBe('140')
+  })
+
+  it('批量保存先释放确认下调的额度，再使用可再分配额度', async () => {
+    snapshot.quota = '400'
+    addStudent('250')
+    const wrapper = await render()
+    await batchFill(wrapper, '200')
+    expect(memberRow(wrapper).get('[role="alert"]').text()).toContain('50 积分')
+    await wrapper.get('.quota-save-batch').trigger('click')
+    await flushPromises()
+    expect(teacherAPI.updateMemberQuota).toHaveBeenNthCalledWith(1, project.id, 'student-2', '200')
+    expect(teacherAPI.updateMemberQuota).toHaveBeenNthCalledWith(2, project.id, 'student-1', '200')
+    expect(memberRow(wrapper).get('[role="status"]').text()).toBe('已保存')
+  })
+
+  it('历史月份与停用项目只读，导师和未知身份在本月也不可编辑', async () => {
     const historical = await render({ initialMonth: '2026-10' })
     expect(historical.text()).toContain('历史月份只读')
-    expect(historical.find('[data-member-id="student-1"] button').exists()).toBe(false)
-    const current = await render()
-    expect(current.get('[data-member-id="mentor-1"]').text()).toContain('导师只读')
-    expect(current.find('[data-member-id="mentor-1"] button').exists()).toBe(false)
-    expect(current.find('[data-member-id="student-1"] button').exists()).toBe(true)
-    expect(teacherAPI.updateMemberQuota).not.toHaveBeenCalled()
-  })
-
-  it('停用项目只读，未标明学生身份的成员也不能调整', async () => {
+    expect(memberRow(historical).find('input').exists()).toBe(false)
+    const inactive = await render({ project: { ...project, status: 'inactive' } })
+    expect(inactive.text()).toContain('项目已停用')
+    expect(memberRow(inactive).find('input').exists()).toBe(false)
     snapshot.members[0].is_student = undefined
-    const wrapper = await render({ project: { ...project, status: 'inactive' } })
-    expect(wrapper.text()).toContain('项目已停用')
-    expect(wrapper.find('.quota-member button').exists()).toBe(false)
-    expect(teacherAPI.updateMemberQuota).not.toHaveBeenCalled()
+    const current = await render()
+    expect(memberRow(current, 'mentor-1').text()).toContain('导师只读')
+    expect(memberRow(current, 'mentor-1').find('input').exists()).toBe(false)
+    expect(memberRow(current).find('input').exists()).toBe(false)
+    expect(current.find('.quota-batch').exists()).toBe(false)
   })
 
-  it('月份由弹窗独立持有，切换只重读本项目用量且不触发页面事件', async () => {
-    const wrapper = await render()
-    await wrapper.get('input[type="month"]').setValue('2026-10')
-    await flushPromises()
-    expect(teacherAPI.projectUsage).toHaveBeenLastCalledWith(project.id, '2026-10')
-    expect(teacherAPI.projectUsage).toHaveBeenCalledTimes(2)
-    expect(wrapper.props('initialMonth')).toBe(currentMonth)
-    expect(wrapper.emitted('close')).toBeUndefined()
-    expect(wrapper.emitted('saved')).toBeUndefined()
-    expect(teacherAPI.projects).not.toHaveBeenCalled()
-    expect(teacherAPI.projectBudgets).not.toHaveBeenCalled()
-  })
-
-  it('挂到项目页后，切月不刷新页面，保存才刷新页面，关闭可重开', async () => {
+  it('挂到项目页后切月只刷新弹窗，保存刷新项目页，关闭后可以重开', async () => {
     const page = mount(TeacherProjects, { global: { stubs } })
     wrappers.push(page)
     await flushPromises()
@@ -203,18 +346,19 @@ describe('学生额度弹窗', () => {
     const dialog = page.getComponent(TeacherProjectQuotaDialog)
     await dialog.get('input[type="month"]').setValue('2026-10')
     await flushPromises()
+    expect(teacherAPI.projectUsage).toHaveBeenLastCalledWith(project.id, '2026-10')
     expect(page.get<HTMLInputElement>('.page-heading input[type="month"]').element.value).toBe(currentMonth)
     expect(teacherAPI.projects).toHaveBeenCalledTimes(1)
     expect(teacherAPI.projectBudgets).toHaveBeenCalledTimes(1)
     await dialog.get('input[type="month"]').setValue(currentMonth)
     await flushPromises()
-    const editor = await edit(dialog)
-    await editor.get('input').setValue('200')
-    await editor.trigger('submit')
+    const row = memberRow(dialog)
+    await row.get('input').setValue('200')
+    await row.get('form').trigger('submit')
     await flushPromises()
     expect(teacherAPI.projects).toHaveBeenCalledTimes(2)
     expect(teacherAPI.projectBudgets).toHaveBeenCalledTimes(2)
-    await dialog.get('[aria-label="关闭"]').trigger('click')
+    await dialog.get('.quota-footer button').trigger('click')
     expect(page.findComponent(TeacherProjectQuotaDialog).exists()).toBe(false)
     await button(page, '学生额度').trigger('click')
     await flushPromises()
@@ -229,15 +373,15 @@ describe('学生额度弹窗', () => {
     await flushPromises()
     finish({ ...snapshot, quota: '9999' })
     await flushPromises()
-    expect(wrapper.get('[aria-label="项目额度汇总"]').text()).toContain('1,000')
-    expect(wrapper.get('[aria-label="项目额度汇总"]').text()).not.toContain('9,999')
-    expect(wrapper.find('.quota-member button').exists()).toBe(false)
+    expect(wrapper.get('.quota-summary').text()).toContain('1,000')
+    expect(wrapper.get('.quota-summary').text()).not.toContain('9,999')
+    expect(wrapper.find('.quota-row-form').exists()).toBe(false)
   })
 
-  it('零分配显示尚未分配而不挂载灰环，读取失败后可重试', async () => {
+  it('读取失败后可重试，零分配显示尚未分配', async () => {
     snapshot.members[0].quota = '0'
     snapshot.allocated = '0'
-    vi.mocked(teacherAPI.projectUsage).mockRejectedValueOnce(new Error('测试读取失败'))
+    vi.mocked(teacherAPI.projectUsage).mockRejectedValueOnce(new Error('模拟读取失败'))
     const wrapper = await render()
     expect(wrapper.get('[role="alert"]').text()).toContain('读取学生额度失败')
     await button(wrapper, '重新加载').trigger('click')

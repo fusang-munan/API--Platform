@@ -86,7 +86,7 @@ func TestEnableModelsBatchPostgres(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{"already", "conditional", "mixed-price", "flat", "manual-only", "fail-enable", "fresh"} {
+	for _, name := range []string{"already", "unpriced", "mixed-price", "flat", "manual-only", "fail-enable", "fresh"} {
 		exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at)
 VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now())`, provider, keys[0], name)
 	}
@@ -95,11 +95,11 @@ VALUES(gen_random_uuid(),$1,$2,'blocked',now(),now(),now(),now()),
 (gen_random_uuid(),$1,$3,'mixed-price',now(),now(),now(),now())`, provider, keys[3], keys[1])
 	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", keys[3])
 	for _, name := range []string{"flat", "mixed-price", "fail-enable", "fresh"} {
-		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate)
-VALUES($1,$2,'upstream','effective','billing',0,2000000)`, keys[0], name)
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,cache_read_rate,cache_write_rate)
+VALUES($1,$2,'upstream','effective','billing',0,2000000,0,0)`, keys[0], name)
 	}
-	exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
-VALUES($1,'manual-only','school','manual','teacher',$2,1000000,1000000)`, keys[0], actor)
+	exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate,cache_read_rate,cache_write_rate)
+VALUES($1,'manual-only','school','manual','teacher',$2,1000000,1000000,0,0)`, keys[0], actor)
 	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
 VALUES(gen_random_uuid(),'already','已启用','active',1000,now(),now()),
 (gen_random_uuid(),'mixed-price','多线路','inactive',1000,now(),now())`)
@@ -112,7 +112,7 @@ BEGIN IF NEW.model_id='fail-enable' THEN RAISE EXCEPTION '测试单项失败'; E
 CREATE TRIGGER reject_action_fixture BEFORE INSERT ON models FOR EACH ROW EXECUTE FUNCTION reject_action_fixture()`)
 	service := New(db, nil)
 	result, err := service.EnableModelsBatch(ctx, provider, actor,
-		[]string{"absent", "already", "blocked", "conditional", "mixed-price", "flat", "manual-only", "fail-enable", "fresh", "FLAT"})
+		[]string{"absent", "already", "blocked", "unpriced", "mixed-price", "flat", "manual-only", "fail-enable", "fresh", "FLAT"})
 	if err != nil || len(result.Enabled) != 3 || len(result.Skipped) != 6 {
 		t.Fatalf("批量结果错误: %+v, %v", result, err)
 	}
@@ -126,7 +126,7 @@ CREATE TRIGGER reject_action_fixture BEFORE INSERT ON models FOR EACH ROW EXECUT
 			t.Fatalf("跳过原因错误: %+v", result.Skipped)
 		}
 	}
-	if result.Skipped[3].Message != "官网未报价或按条件计价，请先手动定价" {
+	if result.Skipped[3].Message != "北辰线路缺少可自动结算的报价，请先手动定价" {
 		t.Fatal("缺价提示错误")
 	}
 	replay, err := service.EnableModelsBatch(ctx, provider, actor, []string{"flat", "manual-only", "fresh"})
@@ -145,8 +145,87 @@ CREATE TRIGGER reject_action_fixture BEFORE INSERT ON models FOR EACH ROW EXECUT
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM models WHERE model_id='fail-enable'`).Scan(&failed); err != nil || failed != 0 {
 		t.Fatalf("失败项未回滚: %d, %v", failed, err)
 	}
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM models WHERE model_id='conditional'`).Scan(&unpriced); err != nil || unpriced != 0 {
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM models WHERE model_id='unpriced'`).Scan(&unpriced); err != nil || unpriced != 0 {
 		t.Fatalf("无价格项不应创建模型: %d, %v", unpriced, err)
+	}
+}
+
+func TestSingleAndBatchEnableUseSamePricesPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	service := New(db, nil)
+	for _, tc := range []struct {
+		name       string
+		conditions string
+		cacheRate  *int64
+		enable     bool
+	}{
+		{name: "fixed", cacheRate: new(int64), enable: true},
+		{name: "fixed-without-cache-prices"},
+		{name: "tiered", enable: true, conditions: `{"billing_mode":"token","intervals":[
+			{"min_tokens":0,"max_tokens":100,"input_price":0,"output_price":0.000002},
+			{"min_tokens":"100","max_tokens":null,"input_price":"0.000003","output_price":"0.000004"}]}`},
+		{name: "per-request", conditions: `{"billing_mode":"per_request","per_request_price":1}`},
+		{name: "missing-output", conditions: `{"billing_mode":"token","intervals":[{"min_tokens":0,"input_price":1}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := func(q string, args ...any) {
+				t.Helper()
+				if _, err := db.ExecContext(ctx, q, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			single, batch := tc.name+"-single", tc.name+"-batch"
+			key := keys[0]
+			exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now()),
+      (gen_random_uuid(),$1,$2,$4,now(),now(),now(),now())`, provider, key, single, batch)
+			if tc.conditions == "" {
+				exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,cache_read_rate,cache_write_rate)
+VALUES($1,$2,'upstream','effective','billing',0,2000000,$4,$4),
+      ($1,$3,'upstream','effective','billing',0,2000000,$4,$4)`, key, single, batch, tc.cacheRate)
+			} else {
+				exec(`WITH rate AS (
+  INSERT INTO beichen_multiplier_versions(credential_id,effective_at,multiplier)
+  VALUES($1,statement_timestamp(),1) RETURNING id,effective_at
+)
+INSERT INTO beichen_panel_snapshots(credential_id,effective_at,credential_revision,group_id,expires_at,
+  multiplier_version,model_pricing,credential_ciphertext_sha256)
+SELECT c.id,rate.effective_at,c.updated_at,1,rate.effective_at+interval '1 hour',rate.id,
+  jsonb_build_object($2::text,$4::jsonb,$3::text,$4::jsonb),sha256(c.credential_ciphertext)
+FROM provider_credentials c CROSS JOIN rate WHERE c.id=$1`, key, single, batch, tc.conditions)
+			}
+
+			id, singleErr := service.EnableModel(ctx, provider, actor, single, "")
+			result, err := service.EnableModelsBatch(ctx, provider, actor, []string{batch})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.enable {
+				wantMessage := ""
+				if tc.conditions != "" {
+					wantMessage = "按条件价自动结算"
+				}
+				if singleErr != nil || id == uuid.Nil || len(result.Skipped) != 0 || len(result.Enabled) != 1 ||
+					result.Enabled[0].Model != batch || result.Enabled[0].ModelID == uuid.Nil || result.Enabled[0].Message != wantMessage {
+					t.Fatalf("两种入口都应启用: single=%s %v batch=%+v", id, singleErr, result)
+				}
+				var active int
+				if err := db.QueryRowContext(ctx, `SELECT count(*) FROM models WHERE status='active' AND id IN ($1,$2)`,
+					id, result.Enabled[0].ModelID).Scan(&active); err != nil || active != 2 {
+					t.Fatalf("两种入口都应发布模型: active=%d err=%v", active, err)
+				}
+				return
+			}
+			if id != uuid.Nil || domain.ErrorCode(singleErr) != domain.CodeValidation || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
+				result.Skipped[0].Reason != "no_price" || result.Skipped[0].Message != singleErr.Error() ||
+				!strings.Contains(result.Skipped[0].Message, "请先手动定价") {
+				t.Fatalf("两种入口都应按相同原因拒绝: single=%s %v batch=%+v", id, singleErr, result)
+			}
+			var created int
+			if err := db.QueryRowContext(ctx, `SELECT count(*) FROM models WHERE model_id IN ($1,$2)`, single, batch).Scan(&created); err != nil || created != 0 {
+				t.Fatalf("缺少可用报价时不应创建模型: created=%d err=%v", created, err)
+			}
+		})
 	}
 }
 
@@ -164,6 +243,7 @@ func TestSetModelPriceFourCredentialsPostgres(t *testing.T) {
 VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now())`, provider, key, model)
 		}
 	}
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", keys[1])
 	service := New(db, nil)
 	input, output, zero := int64(1234567), int64(6000000), int64(0)
 	manual := PriceInput{Mode: "manual", Rates: &Rates{Input: &input, Output: &output, CacheRead: &zero, CacheWrite: &zero}}
@@ -209,5 +289,57 @@ CREATE TRIGGER reject_price_fixture BEFORE INSERT ON beichen_price_versions FOR 
 		if _, err := service.SetModelPrice(ctx, id, actor, "rollback", manual); domain.ErrorCode(err) != domain.CodeNotFound {
 			t.Fatalf("没有有效目录凭据时应返回 404: %v", err)
 		}
+	}
+}
+
+func TestSetModelPriceCredentialsPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	otherProvider, otherKey := uuid.New(), uuid.New()
+	exec(`INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES($1,'Other','https://other.invalid',now(),now())`, otherProvider)
+	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
+VALUES($1,$2,'other','fixture',now(),now())`, otherKey, otherProvider)
+	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,'Shared',now(),now(),now(),now()),
+ (gen_random_uuid(),$1,$3,'shared',now(),now(),now(),now()),
+ (gen_random_uuid(),$1,$4,'Shared',now(),now(),now(),now()),
+ (gen_random_uuid(),$5,$6,'Shared',now(),now(),now(),now())`, provider, keys[3], keys[0], keys[1], otherProvider, otherKey)
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", keys[1])
+
+	service := New(db, nil)
+	value := int64(1250000)
+	price := PriceInput{Mode: "manual", Rates: &Rates{Input: &value, Output: &value}}
+	for _, invalidKey := range []uuid.UUID{keys[1], keys[2], otherKey, uuid.New()} {
+		scope := ModelPriceScope{Scope: "credentials", CredentialIDs: []uuid.UUID{keys[3], invalidKey}}
+		if refs, err := service.SetModelPrice(ctx, provider, actor, "SHARED", price, scope); domain.ErrorCode(err) != domain.CodeNotFound || len(refs) != 0 {
+			t.Fatalf("非可用线路应使整批失败: refs=%v, err=%v", refs, err)
+		}
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM beichen_price_versions").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("拒绝的范围产生了价格版本: count=%d, err=%v", count, err)
+	}
+
+	scope := ModelPriceScope{Scope: "credentials", CredentialIDs: []uuid.UUID{keys[0], keys[3], keys[0]}}
+	for range 2 {
+		refs, err := service.SetModelPrice(ctx, provider, actor, "SHARED", price, scope)
+		if err != nil || len(refs) != 2 || refs[0].CredentialID != keys[3] || refs[1].CredentialID != keys[0] ||
+			refs[0].Label != "CC1" || refs[1].Label != "Gemini" {
+			t.Fatalf("定价渠道范围错误: refs=%v, err=%v", refs, err)
+		}
+	}
+	var times int
+	var correct bool
+	err := db.QueryRowContext(ctx, `SELECT count(*),count(DISTINCT effective_at),bool_and(
+ ((credential_id=$1 AND model='Shared') OR (credential_id=$2 AND model='shared')) AND
+ track='school' AND basis='manual' AND input_rate=1250000 AND output_rate=1250000)
+FROM beichen_price_versions`, keys[3], keys[0]).Scan(&count, &times, &correct)
+	if err != nil || count != 2 || times != 1 || !correct {
+		t.Fatalf("范围、同一生效时间或幂等错误: count=%d, times=%d, correct=%t, err=%v", count, times, correct, err)
 	}
 }

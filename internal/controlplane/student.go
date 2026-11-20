@@ -286,7 +286,7 @@ func (s *Service) StudentAPIKeys(ctx context.Context, studentID uuid.UUID) ([]AP
 		if err := s.populateKeyAvailability(ctx, &view); err != nil {
 			return nil, err
 		}
-		s.populateStudentAPIKeySecret(ctx, row.ID, &view)
+		// 列表只返回前缀；完整密钥必须通过单把 Key 详情主动查看，避免一次请求解密全部明文。
 		result = append(result, view)
 	}
 	return result, nil

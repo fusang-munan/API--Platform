@@ -56,7 +56,7 @@ const selectableProjects = computed(() => projects.value.filter(project =>
   project.status === 'active' && !blockedProjectIds.value.has(project.id),
 ))
 const canSubmit = computed(() => Boolean(form.organization_id && form.project_id && form.name.trim() && form.requested_monthly_credits && form.models.length > 0 && form.models.length <= 100))
-const hasMaterializedKey = (key: ApiKey) => Boolean(key.api_key && ['active', 'inactive'].includes(key.status))
+const maskedKey = (key: ApiKey) => key.key_prefix ? key.key_prefix + '••••••' : '密钥已生成，点击「查看密钥」'
 const keySupportsHarness = (key: ApiKey) => {
   const support = keyHarnessSupport(key.models)
   return support.codex || support.claude
@@ -239,16 +239,15 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
               <StatusBadge :status="keyDisplayStatus(key)" />
             </div>
             <StatusProgress :current="key.progress.current" :completed="key.progress.completed_steps" />
-            <div v-if="hasMaterializedKey(key)" class="key-material">
-              <p class="secret">{{ key.api_key }}</p>
+            <div v-if="['active', 'inactive'].includes(key.status)" class="key-material">
+              <p class="secret" data-testid="api-key-mask">{{ maskedKey(key) }}</p>
             </div>
-            <p v-else-if="['active', 'inactive'].includes(key.status)" class="muted">
-              当前密钥无法读取（可能是旧版领取记录）。
+            <p v-if="['active', 'inactive'].includes(key.status) && !key.key_prefix" class="muted">
+              当前密钥是旧版记录，重新生成后才能查看。
               <button class="button ghost" :disabled="regeneratingId === key.id" @click="regenerate(key)">重新生成密钥</button>
             </p>
             <div class="actions key-card-actions">
-              <button v-if="hasMaterializedKey(key)" class="button secondary" @click="copy(key.api_key!)">复制密钥</button>
-              <button v-if="hasMaterializedKey(key) && keySupportsHarness(key)" class="button secondary" @click="openHarness(key)">一键配置</button>
+              <button v-if="['active', 'inactive'].includes(key.status)" class="button secondary" @click="show(key.id)">查看密钥</button>
               <button class="button ghost" @click="show(key.id)">审核状态</button>
               <button v-if="canWithdraw(key)" class="button ghost" @click="withdrawConfirm = key">撤回申请</button>
               <button v-if="key.status === 'approved'" class="button primary" @click="claimConfirm = key">领取并启用</button>
@@ -278,10 +277,10 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
           <button class="button ghost" @click="withdrawConfirm = detail">撤回申请</button>
         </div>
         <div v-if="detail.api_key" class="key-material">
-          <p class="secret">{{ detail.api_key }}</p>
+          <p class="secret" data-testid="api-key-detail">{{ detail.api_key }}</p>
           <div class="actions key-card-actions">
-            <button class="button secondary" @click="copy(detail.api_key!)">复制密钥</button>
-            <button v-if="keySupportsHarness(detail)" class="button secondary" @click="openHarness(detail)">一键配置</button>
+            <button class="button secondary" data-testid="copy-api-key" @click="copy(detail.api_key!)">复制密钥</button>
+            <button v-if="keySupportsHarness(detail)" class="button secondary" data-testid="configure-api-key" @click="openHarness(detail)">一键配置</button>
           </div>
         </div>
         <p v-else-if="['active', 'inactive'].includes(detail.status)" class="muted">

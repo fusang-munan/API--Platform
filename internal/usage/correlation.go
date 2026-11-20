@@ -63,6 +63,10 @@ type CallRoute struct {
 	CredentialID      uuid.UUID
 	BindingID         uuid.UUID
 	UpstreamModelName string
+	// ReasoningEffort is nil if unobserved and points to "" if omitted by the request.
+	ReasoningEffort *string
+	// CacheTTL is the verified single duration for cache writes. Empty means unknown.
+	CacheTTL string
 	// SentAt is the observed upstream write time of this HTTP attempt.
 	SentAt time.Time
 }

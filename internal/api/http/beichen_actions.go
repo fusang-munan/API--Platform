@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/beichen"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 )
@@ -39,6 +40,7 @@ func (s *Server) setBeichenModelPrice(c *gin.Context) {
 		return
 	}
 	var input struct {
+		beichen.ModelPriceScope
 		Model string `json:"model"`
 		Mode  string `json:"mode"`
 		Rates *struct {
@@ -96,10 +98,14 @@ func (s *Server) setBeichenModelPrice(c *gin.Context) {
 		}
 		price.Rates = rates
 	}
-	credentials, err := s.service.Beichen().SetModelPrice(c.Request.Context(), provider, identity(c).UserID, input.Model, price)
+	credentials, err := s.service.Beichen().SetModelPrice(c.Request.Context(), provider, identity(c).UserID, input.Model, price, input.ModelPriceScope)
 	if err != nil {
 		writeError(c, err)
 		return
 	}
-	respond(c, http.StatusOK, gin.H{"saved": true, "credentials": credentials})
+	applied := make([]uuid.UUID, len(credentials))
+	for i, credential := range credentials {
+		applied[i] = credential.CredentialID
+	}
+	respond(c, http.StatusOK, gin.H{"saved": true, "credentials": credentials, "applied_credential_ids": applied})
 }

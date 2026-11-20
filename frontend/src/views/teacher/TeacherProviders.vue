@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import type { Provider, ProviderCredential } from '../../api/types'
 import { APIError } from '../../api/client'
@@ -11,6 +11,7 @@ import { useToast } from '../../composables/useToast'
 import BeichenSchoolModels from './BeichenSchoolModels.vue'
 import BeichenReconcile from './BeichenReconcile.vue'
 import { isBeichenProvider } from '../../utils/beichenModels'
+import { schoolDay } from '../../utils/format'
 
 type KeyDraft = {
   id?: string
@@ -23,6 +24,7 @@ type KeyDraft = {
 const rows = ref<Provider[]>([])
 const schoolProvider = ref<Provider>()
 const reconcileProviderIds = ref<string[]>([])
+const anomalies = ref<Record<string, { pendingCalls?: number; missingModels?: number }>>({})
 const query = ref('')
 const status = ref('')
 const drawer = ref(false)
@@ -38,6 +40,7 @@ const loadState = useLoadState()
 const form = reactive({ name: '', base_url: '', status: 'active' as 'active' | 'inactive' })
 const keyRows = ref<KeyDraft[]>([])
 const deletedCredentialIds = ref<string[]>([])
+let loadVersion = 0
 
 const filtered = computed(() => rows.value.filter(p =>
   (!query.value || `${p.name} ${p.base_url}`.toLowerCase().includes(query.value.toLowerCase()))
@@ -54,6 +57,12 @@ function toggleReconciliation(providerId: string) {
   reconcileProviderIds.value = reconcileProviderIds.value.includes(providerId)
     ? reconcileProviderIds.value.filter(id => id !== providerId)
     : [...reconcileProviderIds.value, providerId]
+}
+
+async function jumpToReconciliation(providerId: string) {
+  if (!reconcileProviderIds.value.includes(providerId)) toggleReconciliation(providerId)
+  await nextTick()
+  document.getElementById(`beichen-reconcile-${providerId}`)?.focus()
 }
 
 function catalogSyncTime(provider: Provider) {
@@ -85,12 +94,43 @@ function keyRowsFromProvider(credentials: ProviderCredential[] = []): KeyDraft[]
   }))
 }
 
+async function loadAnomalies(providerId: string, day: string, version: number) {
+  try {
+    const overview = await teacherAPI.beichenOverview(providerId, day)
+    if (version !== loadVersion) return
+    const counts = overview.comparison?.flatMap(row => row.pending_review_calls == null ? [] : [row.pending_review_calls]) ?? []
+    const catalog = overview.model_catalog ?? []
+    const missing = new Set(catalog.filter(model => model.price_state === 'missing' ||
+      model.blockers?.some(blocker => blocker.code === 'missing_price')).map(model => model.model.trim().toLowerCase()))
+    const mixedModels = new Set(catalog.filter(model => model.price_state === 'mixed').map(model => model.model.trim().toLowerCase()))
+    for (const row of overview.models ?? []) {
+      const name = row.model.trim().toLowerCase()
+      if (mixedModels.has(name) && row.mode === 'follow' && row.price_status != null &&
+        row.price_status !== 'confirmed' && row.price_status !== 'conditional') missing.add(name)
+    }
+    anomalies.value[providerId] = {
+      pendingCalls: counts.length ? counts.reduce((sum, count) => sum + count, 0) : undefined,
+      missingModels: missing.size || (catalog.length && catalog.every(model => model.price_state != null) ? 0 : undefined),
+    }
+  } catch {
+    // 异常摘要可独立缺省，供应商操作和对账入口仍可用。
+  }
+}
+
 async function load() {
+  const version = ++loadVersion
   await loadState.run(async () => {
     try {
-      rows.value = await teacherAPI.providers()
+      const providers = await teacherAPI.providers()
+      if (version !== loadVersion) return
+      rows.value = providers
+      anomalies.value = {}
+      const day = schoolDay()
+      for (const provider of providers) {
+        if (isBeichenProvider(provider.base_url)) void loadAnomalies(provider.id, day, version)
+      }
     } catch (e) {
-      error.value = msg(e)
+      if (version === loadVersion) error.value = msg(e)
     }
   })
 }
@@ -264,6 +304,7 @@ async function remove(p: Provider) {
 function msg(e: unknown) { return e instanceof APIError ? e.message : '请求失败' }
 
 onMounted(load)
+onBeforeUnmount(() => { loadVersion++ })
 </script>
 
 <template>
@@ -297,6 +338,9 @@ onMounted(load)
                 <span class="chip">Key 数 {{ p.credentials ? p.credentials.length : '—' }}</span>
                 <span class="chip">启用 Key {{ p.credentials ? activeKeyCount(p) : '—' }}</span>
                 <span class="chip">最近目录同步 {{ catalogSyncTime(p) }}<template v-if="catalogSyncTime(p) !== '—'">（北京时间）</template></span>
+                <span v-if="anomalies[p.id]?.pendingCalls != null" class="chip">今日待核 {{ anomalies[p.id].pendingCalls }} 笔</span>
+                <span v-if="anomalies[p.id]?.missingModels != null" class="chip">缺价模型 {{ anomalies[p.id].missingModels }} 个</span>
+                <a :href="`#beichen-reconcile-${p.id}`" class="provider-compare" @click.prevent="jumpToReconciliation(p.id)">对账对比</a>
               </div>
             </div>
             <div class="actions">
@@ -311,7 +355,8 @@ onMounted(load)
               </template>
             </div>
           </div>
-          <div v-if="isBeichenProvider(p.base_url)" :id="`beichen-reconcile-${p.id}`" class="provider-reconciliation">
+          <div v-if="isBeichenProvider(p.base_url)" :id="`beichen-reconcile-${p.id}`" class="provider-reconciliation"
+            role="region" aria-label="北辰对账" tabindex="-1">
             <BeichenReconcile v-if="reconcileProviderIds.includes(p.id)" :provider-id="p.id" />
           </div>
         </article>
@@ -384,6 +429,7 @@ onMounted(load)
 .provider-row-head > .actions { flex-shrink: 0; flex-wrap: wrap; }
 .provider-overview { margin-top: 10px; gap: 6px; }
 .provider-overview .chip { white-space: normal; overflow-wrap: anywhere; }
+.provider-compare { align-self: center; padding: 4px 6px; color: var(--primary); text-decoration: underline; }
 .provider-reconciliation { width: 100%; min-width: 0; }
 .provider-reconciliation:has(> *) { margin-top: 16px; border-top: 1px solid var(--line); }
 @media (max-width: 900px) {

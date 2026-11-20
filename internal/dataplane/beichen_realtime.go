@@ -17,14 +17,18 @@ func (g *Gateway) serveBeichenRealtime(w http.ResponseWriter, r *http.Request, s
 	reservation, err := g.usage.Reserve(ctx, keyID, selected.Binding.ModelID, requestIDFromContext(r),
 		string(selected.Binding.Adapter), r.URL.Path, "", "", usage.CallCorrelation{}, callRoute)
 	if err != nil {
-		writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "quota_exceeded", "Unable to reserve credits for the Realtime connection.", "")
+		writeModelCallRejection(w, r.URL.Path, err)
 		return
 	}
 	started := time.Now()
-	attempt, err := g.usage.StartAttempt(ctx, reservation.CallID, callRoute)
-	if err == nil {
-		err = g.usage.PrepareDispatch(ctx, reservation.CallID, callRoute)
+	attempt, err := g.usage.StartAttempt(ctx, reservation, callRoute, 0)
+	if err != nil {
+		callRoute.DefinitelyNotSent = true
+		_ = g.finalizeCall(ctx, reservation, false, "dispatch_rejected", "Unable to authorize upstream dispatch.", callRoute, usage.CallMetrics{})
+		writeModelCallRejection(w, r.URL.Path, err)
+		return
 	}
+	err = g.usage.PrepareDispatch(ctx, reservation.CallID, callRoute)
 	if err == nil {
 		err = ctx.Err()
 	}

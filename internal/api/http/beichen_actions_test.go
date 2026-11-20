@@ -43,6 +43,11 @@ func TestBeichenActionsRejectInvalidBodies(t *testing.T) {
 		{"手动缺价", "PATCH", "price", `{"model":"model","mode":"manual"}`},
 		{"缺失输出", "PATCH", "price", `{"model":"model","mode":"manual","rates":{"input":"1"}}`},
 		{"数字类型", "PATCH", "price", `{"model":"model","mode":"manual","rates":{"input":1,"output":"1"}}`},
+		{"未知范围", "PATCH", "price", `{"model":"model","mode":"follow","scope":"one"}`},
+		{"缺少渠道", "PATCH", "price", `{"model":"model","mode":"follow","scope":"credentials","credential_ids":[]}`},
+		{"无效渠道", "PATCH", "price", `{"model":"model","mode":"follow","scope":"credentials","credential_ids":["invalid"]}`},
+		{"空渠道 ID", "PATCH", "price", `{"model":"model","mode":"follow","scope":"credentials","credential_ids":[null]}`},
+		{"指定渠道与全渠道冲突", "PATCH", "price", `{"model":"model","mode":"follow","scope":"all","credential_ids":["00000000-0000-4000-8000-000000000001"]}`},
 		{"尾随对象", "PATCH", "price", `{"model":"model","mode":"follow"}{}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -67,10 +72,11 @@ func TestBeichenModelPriceHandlerScalesDecimalsExactly(t *testing.T) {
 	for _, tc := range []struct {
 		name, mode, jsonRates      string
 		input, output, read, write any
+		scoped                     bool
 	}{
-		{"精确小数及缺省缓存", "manual", `,"rates":{"input":"1.234567","output":"0.000001"}`, int64(1234567), int64(1), int64(0), int64(0)},
-		{"边界与缓存价格", "manual", `,"rates":{"input":"1000000","output":"0","cache_read":"0.000001","cache_write":"12.5000000"}`, int64(1_000_000_000_000), int64(0), int64(1), int64(12500000)},
-		{"恢复跟随", "follow", "", nil, nil, nil, nil},
+		{"精确小数及缺省缓存", "manual", `,"rates":{"input":"1.234567","output":"0.000001"}`, int64(1234567), int64(1), int64(0), int64(0), false},
+		{"边界与缓存价格", "manual", `,"rates":{"input":"1000000","output":"0","cache_read":"0.000001","cache_write":"12.5000000"}`, int64(1_000_000_000_000), int64(0), int64(1), int64(12500000), false},
+		{"恢复选中渠道跟随", "follow", "", nil, nil, nil, nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, mock, err := sqlmock.New()
@@ -80,12 +86,19 @@ func TestBeichenModelPriceHandlerScalesDecimalsExactly(t *testing.T) {
 			defer db.Close()
 			provider, actor, credential := uuid.New(), uuid.New(), uuid.New()
 			at := time.Now()
+			lookup := `SELECT k.model_id::text,c.label::text`
+			var jsonScope string
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT c.id,c.label::text`).WithArgs(provider, "model").
-				WillReturnRows(sqlmock.NewRows([]string{"id", "label"}).AddRow(credential, "G3"))
+			if tc.scoped {
+				lookup += `.*AND c.status='active'`
+				jsonScope = `,"scope":"credentials","credential_ids":["` + credential.String() + `"]`
+			} else {
+				mock.ExpectQuery(`SELECT c.id,c.label::text`).WithArgs(provider, "model").
+					WillReturnRows(sqlmock.NewRows([]string{"id", "label"}).AddRow(credential, "G3"))
+			}
 			mock.ExpectQuery(`SELECT c.id FROM provider_credentials c JOIN providers p`).WithArgs(provider, credential).
 				WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(credential))
-			mock.ExpectQuery(`SELECT k.model_id::text,c.label::text`).WithArgs(provider, credential, "model").
+			mock.ExpectQuery(lookup).WithArgs(provider, credential, "model").
 				WillReturnRows(sqlmock.NewRows([]string{"model", "label"}).AddRow("model", "G3"))
 			mock.ExpectQuery(regexp.QuoteMeta("SELECT clock_timestamp()")).
 				WillReturnRows(sqlmock.NewRows([]string{"time"}).AddRow(at))
@@ -96,9 +109,11 @@ func TestBeichenModelPriceHandlerScalesDecimalsExactly(t *testing.T) {
 			service := controlplane.NewService(nil, db, nil, nil, nil, controlplane.Config{})
 			router := beichenActionsTestRouter(&Server{service: service}, actor)
 			w := httptest.NewRecorder()
-			body := `{"model":"model","mode":"` + tc.mode + `"` + tc.jsonRates + `}`
+			body := `{"model":"model","mode":"` + tc.mode + `"` + tc.jsonRates + jsonScope + `}`
 			router.ServeHTTP(w, httptest.NewRequest("PATCH", "/providers/"+provider.String()+"/price", strings.NewReader(body)))
-			if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"saved":true`) || !strings.Contains(w.Body.String(), `"credential_id":"`+credential.String()+`"`) || !strings.Contains(w.Body.String(), `"label":"G3"`) {
+			if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"saved":true`) ||
+				!strings.Contains(w.Body.String(), `"credential_id":"`+credential.String()+`"`) || !strings.Contains(w.Body.String(), `"label":"G3"`) ||
+				!strings.Contains(w.Body.String(), `"applied_credential_ids":["`+credential.String()+`"]`) {
 				t.Fatalf("响应契约错误: %d, %s", w.Code, w.Body.String())
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {

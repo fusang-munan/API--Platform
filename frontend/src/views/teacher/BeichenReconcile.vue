@@ -6,7 +6,7 @@ import type { BeichenReconcile as ReconcileData, BeichenReconcileModel, BeichenU
 import CompareBars from '../../components/CompareBars.vue'
 import CreditDonut from '../../components/CreditDonut.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
-import { creditsToYuan, formatCredits, formatPercent, formatTokens, formatYuan } from '../../utils/credits'
+import { creditsToYuan, formatCredits, formatPercent, formatTokens, formatYuan, shiftDecimal } from '../../utils/credits'
 
 const props = defineProps<{ providerId: string }>()
 const titleId = useId()
@@ -21,10 +21,25 @@ const error = ref('')
 const models = computed(() => data.value?.models ?? [])
 const keys = computed(() => data.value?.keys ?? [])
 const missingDays = computed(() => data.value?.coverage.missing_days ?? [])
+type ReconcileCoverage = ReconcileData['coverage'] & { credentials?: Array<{ expected_days: number }> }
+const completeDays = computed(() => {
+  const coverage: ReconcileCoverage | undefined = data.value?.coverage
+  if (!coverage || coverage.days_present === 0) return 0
+  if (!coverage.credentials?.length) return null
+  // 渠道的应同步区间共用截止日。最早开始的渠道覆盖全部应同步日期，再减去任一渠道缺失的日期。
+  const expectedDates = coverage.credentials.reduce((days, channel) => Math.max(days, channel.expected_days), 0)
+  return expectedDates - missingDays.value.length
+})
 const empty = computed(() => !models.value.length && !keys.value.length)
 const palette = ['#0071e3', '#168473', '#b77916', '#b44d76', '#7657b7', '#427886', '#646f80']
 const matchLabels: Record<BeichenReconcileModel['match_status'], string> = {
-  matched: '已匹配', local_only: '仅本地有记录', upstream_only: '仅北辰有记录',
+  matched: '两边均有记录', local_only: '仅本地有记录', upstream_only: '仅北辰有记录',
+}
+const completenessLabels: Record<NonNullable<BeichenReconcileModel['completeness']>, string> = {
+  complete: 'Token 回报完整', partial: 'Token 部分回报', missing: 'Token 待核',
+}
+const coverageLabels: Record<NonNullable<ReconcileCoverage['coverage_kind']>, string> = {
+  full: '同步完整', partial: '部分同步', none: '暂无已同步账日',
 }
 const period = computed(() => {
   if (!data.value) return ''
@@ -39,11 +54,17 @@ const upstreamSegments = computed(() => models.value.map((row, index) => ({
 })))
 const bars = computed(() => ({
   categories: models.value.map(row => row.model),
-  left: models.value.map(row => metric.value === 'tokens' ? row.local.tokens : chartNumber(row.student_yuan)),
-  right: models.value.map(row => metric.value === 'tokens' ? row.upstream.tokens : chartNumber(row.actual_yuan)),
+  left: models.value.map(row => metric.value === 'tokens' ? modelTokens(row, 'local') : chartNumber(row.student_yuan)),
+  right: models.value.map(row => metric.value === 'tokens' ? modelTokens(row, 'upstream') : chartNumber(row.actual_yuan)),
 }))
 const yuan = (value: string | number | null | undefined) => formatYuan(value, 6)
 let requestVersion = 0
+
+function modelTokens(row: BeichenReconcileModel, side: 'local' | 'upstream') {
+  if (row.completeness === 'missing') return null
+  if (row.match_status === (side === 'local' ? 'upstream_only' : 'local_only')) return null
+  return row[side].tokens
+}
 
 function beijingDate(value: string) {
   const date = new Date(value)
@@ -92,7 +113,7 @@ onBeforeUnmount(() => { requestVersion++ })
     <header class="beichen-toolbar reconcile-header">
       <div>
         <h2 :id="titleId">北辰对账</h2>
-        <p class="beichen-note">核对学校用量与北辰账单。金额按 100 积分 = 1 元展示。</p>
+        <p class="beichen-note">100 积分 = 1 元。学校承担的金额不从学生额度扣除。</p>
       </div>
       <div class="beichen-toolbar-group">
         <div class="range-switch" role="group" aria-label="对账时间范围">
@@ -120,19 +141,40 @@ onBeforeUnmount(() => { requestVersion++ })
           <div class="beichen-stat" data-kpi="margin-yuan"><span>差额（元）</span><strong :class="marginClass(data.totals.money.margin_yuan)">{{ margin(data.totals.money.margin_yuan) }}</strong><small>学生已扣折合金额 − 北辰实扣</small></div>
         </div>
 
-        <section class="coverage-strip" aria-label="数据完整性">
+        <section class="beichen-card coverage-card" aria-label="数据完整性">
+          <div class="beichen-section-head">
+            <h3>账单同步</h3>
+            <span v-if="data.coverage.coverage_kind" class="status-pill" :class="data.coverage.coverage_kind === 'full' ? 'confirmed' : 'pending'">
+              {{ coverageLabels[data.coverage.coverage_kind] }}
+            </span>
+          </div>
+          <dl class="coverage-days">
+            <div>
+              <dt>完整账日</dt>
+              <dd>{{ formatTokens(completeDays) }} 天 <small>当天应同步的渠道均已同步</small></dd>
+            </div>
+            <div>
+              <dt>渠道账日</dt>
+              <dd>{{ formatTokens(data.coverage.days_present) }} / {{ formatTokens(data.coverage.days_expected) }} <small>已同步 / 应同步，每渠道每天计一次</small></dd>
+            </div>
+          </dl>
           <div class="coverage-facts">
-            <strong>账单覆盖：已有 {{ formatTokens(data.coverage.days_present) }} / 应有 {{ formatTokens(data.coverage.days_expected) }} 天</strong>
+            <strong>可逐笔关联 {{ formatTokens(data.coverage.verified_matched_calls) }} 笔</strong>
             <span :class="{ 'coverage-warning': data.coverage.pending_calls > 0 }">待核账 {{ formatTokens(data.coverage.pending_calls) }} 笔</span>
             <span :class="{ 'coverage-warning': data.coverage.unpriced_calls > 0 }">无报价调用 {{ formatTokens(data.coverage.unpriced_calls) }} 笔</span>
           </div>
-          <p v-if="missingDays.length" class="coverage-warning">缺失日期：{{ missingDays.slice(0, 8).join('、') }}<template v-if="missingDays.length > 8"> 等 {{ missingDays.length }} 天</template>。数据尚未齐全，差额仅供参考。</p>
-          <p v-else-if="data.coverage.days_present < data.coverage.days_expected" class="coverage-warning">仍有 {{ data.coverage.days_expected - data.coverage.days_present }} 天待同步，差额仅供参考。</p>
+          <p v-if="missingDays.length" class="coverage-warning">待同步日期包括 {{ missingDays.slice(0, 8).join('、') }}<template v-if="missingDays.length > 8"> 等 {{ missingDays.length }} 天</template>。数据尚未齐全，差额仅供参考。</p>
+          <p v-else-if="data.coverage.days_present < data.coverage.days_expected" class="coverage-warning">仍有 {{ formatTokens(data.coverage.days_expected - data.coverage.days_present) }} 个渠道账日待同步，差额仅供参考。</p>
           <p v-if="data.coverage.multiplier_mixed" class="coverage-warning">当前范围包含不同学校扣费倍率，不能统一按 1.10 倍推算差额。</p>
-          <p class="beichen-note">基础成本 {{ yuan(data.totals.money.base_yuan) }} 元；差额率 {{ formatPercent(data.totals.money.margin_rate) }}。差额会受计价、同步进度和未匹配记录影响。</p>
+          <p class="beichen-note">基础成本 {{ yuan(data.totals.money.base_yuan) }} 元，差额率 {{ formatPercent(data.totals.money.margin_rate) }}。差额会受计价、同步进度和单边记录影响。</p>
         </section>
 
-        <div v-if="empty" class="beichen-empty" role="status"><strong>当前范围暂无对账记录</strong><span>可切换到“总计”，或待北辰账单同步后刷新。</span></div>
+        <div v-if="empty" class="beichen-empty" role="status">
+          <strong>当前范围暂无对账记录</strong>
+          <span v-if="data.coverage.coverage_kind !== 'full'">先到「查看模型」同步北辰数据，完成后返回并点击「刷新对账」。</span>
+          <span v-else-if="range !== 'all'">账单已同步，可切换到「总计」查看其他账日。</span>
+          <span v-else>账单已同步，当前没有记录可对账。</span>
+        </div>
         <template v-if="models.length">
           <div class="compare-grid reconcile-donuts">
             <section class="compare-card">
@@ -158,23 +200,41 @@ onBeforeUnmount(() => { requestVersion++ })
             <CompareBars :categories="bars.categories" :left="bars.left" :right="bars.right" :left-label="metric === 'tokens' ? '本地 Token' : '学生已扣'" :right-label="metric === 'tokens' ? '北辰 Token' : '北辰实扣'" :value-formatter="metric === 'tokens' ? formatTokens : yuan" :unit="metric === 'tokens' ? 'Token' : '元'" />
           </section>
 
-          <section class="beichen-stack">
-            <h3 class="table-title">模型对账明细</h3>
+          <section class="beichen-card reconcile-detail">
+            <h3>模型对账明细</h3>
+            <p class="beichen-note">本地占比和北辰占比分别按各自已回报的 Token 总量计算。</p>
             <div class="reconcile-table-wrap">
               <table class="beichen-table reconcile-table model-details">
                 <caption class="sr-only">模型对账明细，金额单位为元</caption>
-                <thead><tr><th scope="col">模型</th><th scope="col" class="numeric-cell">本地 Token</th><th scope="col" class="numeric-cell">北辰 Token</th><th scope="col" class="numeric-cell">本地占比</th><th scope="col" class="numeric-cell">北辰占比</th><th scope="col" class="numeric-cell">学生已扣（元）</th><th scope="col" class="numeric-cell">北辰实扣（元）</th><th scope="col" class="numeric-cell">差额（元）</th><th scope="col">匹配状态</th></tr></thead>
+                <thead><tr>
+                  <th scope="col">模型</th>
+                  <th scope="col" class="numeric-cell">本地 Token</th>
+                  <th scope="col" class="numeric-cell">北辰 Token</th>
+                  <th scope="col" class="numeric-cell">本地占比</th>
+                  <th scope="col" class="numeric-cell">北辰占比</th>
+                  <th scope="col" class="numeric-cell">学生已扣（元）</th>
+                  <th scope="col" class="numeric-cell">北辰实扣（元）</th>
+                  <th scope="col" class="numeric-cell">学校承担（元）</th>
+                  <th scope="col" class="numeric-cell">差额（元）</th>
+                  <th scope="col">记录情况</th>
+                </tr></thead>
                 <tbody>
                   <tr v-for="row in models" :key="row.model" :class="{ 'unmatched-row': row.match_status !== 'matched' }">
                     <th scope="row">{{ row.model }}</th>
-                    <td class="numeric-cell" data-label="本地 Token">{{ formatTokens(row.local.tokens) }}</td>
-                    <td class="numeric-cell" data-label="北辰 Token">{{ formatTokens(row.upstream.tokens) }}</td>
+                    <td class="numeric-cell" data-label="本地 Token">{{ formatTokens(modelTokens(row, 'local')) }}</td>
+                    <td class="numeric-cell" data-label="北辰 Token">{{ formatTokens(modelTokens(row, 'upstream')) }}</td>
                     <td class="numeric-cell" data-label="本地占比">{{ formatPercent(row.local_share) }}</td>
                     <td class="numeric-cell" data-label="北辰占比">{{ formatPercent(row.upstream_share) }}</td>
                     <td class="numeric-cell" data-label="学生已扣（元）">{{ yuan(row.student_yuan) }}</td>
                     <td class="numeric-cell" data-label="北辰实扣（元）">{{ yuan(row.actual_yuan) }}</td>
+                    <td class="numeric-cell" data-label="学校承担（元）">{{ shiftDecimal(row.school_absorbed_credits, -2) }}</td>
                     <td class="numeric-cell" :class="marginClass(row.margin_yuan)" data-label="差额（元）">{{ margin(row.margin_yuan) }}</td>
-                    <td data-label="匹配状态"><span class="status-pill" :class="row.match_status === 'matched' ? 'confirmed' : row.match_status">{{ matchLabels[row.match_status] }}</span></td>
+                    <td data-label="记录情况">
+                      <div class="reconcile-row-status">
+                        <span class="status-pill" :class="row.match_status === 'matched' ? 'confirmed' : row.match_status">{{ matchLabels[row.match_status] }}</span>
+                        <small v-if="row.completeness" class="beichen-note">{{ completenessLabels[row.completeness] }}</small>
+                      </div>
+                    </td>
                   </tr>
                 </tbody>
               </table>
@@ -182,21 +242,32 @@ onBeforeUnmount(() => { requestVersion++ })
           </section>
         </template>
 
-        <section v-if="!empty" class="beichen-stack">
-          <h3 class="table-title">按渠道 Key 对账</h3>
+        <section v-if="!empty" class="beichen-card reconcile-detail">
+          <h3>按渠道 Key 对账</h3>
           <p class="beichen-note">此处的 Key 是学校配置的北辰渠道。</p>
           <div v-if="keys.length" class="reconcile-table-wrap">
             <table class="beichen-table reconcile-table key-details">
               <caption class="sr-only">按渠道 Key 对账，金额单位为元</caption>
-              <thead><tr><th scope="col">Key 名称</th><th scope="col" class="numeric-cell">本地 Token</th><th scope="col" class="numeric-cell">北辰 Token</th><th scope="col" class="numeric-cell">学生已扣（元）</th><th scope="col" class="numeric-cell">北辰实扣（元）</th><th scope="col" class="numeric-cell">差额（元）</th></tr></thead>
+              <thead><tr>
+                <th scope="col">Key 名称</th>
+                <th scope="col" class="numeric-cell">本地 Token</th>
+                <th scope="col" class="numeric-cell">北辰 Token</th>
+                <th scope="col" class="numeric-cell">学生已扣（元）</th>
+                <th scope="col" class="numeric-cell">北辰实扣（元）</th>
+                <th scope="col" class="numeric-cell">学校承担（元）</th>
+                <th scope="col" class="numeric-cell">差额（元）</th>
+                <th scope="col">Token 回报</th>
+              </tr></thead>
               <tbody>
                 <tr v-for="row in keys" :key="row.credential_id">
                   <th scope="row">{{ row.label || '未命名 Key' }}</th>
-                  <td class="numeric-cell" data-label="本地 Token">{{ formatTokens(row.local.tokens) }}</td>
-                  <td class="numeric-cell" data-label="北辰 Token">{{ formatTokens(row.upstream.tokens) }}</td>
+                  <td class="numeric-cell" data-label="本地 Token">{{ formatTokens(row.completeness === 'missing' || row.local.requests === 0 ? null : row.local.tokens) }}</td>
+                  <td class="numeric-cell" data-label="北辰 Token">{{ formatTokens(row.completeness === 'missing' || row.upstream.source === null ? null : row.upstream.tokens) }}</td>
                   <td class="numeric-cell" data-label="学生已扣（元）">{{ yuan(row.student_yuan) }}</td>
                   <td class="numeric-cell" data-label="北辰实扣（元）">{{ yuan(row.actual_yuan) }}</td>
+                  <td class="numeric-cell" data-label="学校承担（元）">{{ shiftDecimal(row.school_absorbed_credits, -2) }}</td>
                   <td class="numeric-cell" :class="marginClass(row.margin_yuan)" data-label="差额（元）">{{ margin(row.margin_yuan) }}</td>
+                  <td data-label="Token 回报">{{ row.completeness ? completenessLabels[row.completeness] : '—' }}</td>
                 </tr>
               </tbody>
             </table>
@@ -217,8 +288,13 @@ onBeforeUnmount(() => { requestVersion++ })
 .reconcile .negative { color: #b4233d; }
 .reconcile-error { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-radius: 12px; background: #fff0f1; color: #b4233d; }
 .reconcile-error p { margin: 0; }
-.coverage-strip { display: grid; gap: 8px; padding: 14px 0; border-block: 1px solid var(--line); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
-.coverage-strip p { margin: 0; }
+.coverage-card { display: grid; gap: 10px; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.coverage-card h3, .coverage-card p, .coverage-days { margin: 0; }
+.coverage-days { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.coverage-days div { padding: 10px 12px; border-radius: 10px; background: #f6f8fc; }
+.coverage-days dt, .coverage-days small { color: var(--ink-soft); }
+.coverage-days dd { margin: 2px 0 0; font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.coverage-days small { display: block; font-size: 11px; font-weight: 400; }
 .coverage-facts { display: flex; flex-wrap: wrap; gap: 8px 20px; }
 .coverage-warning { color: #8a5b10; }
 .compare-section { display: grid; gap: 16px; }
@@ -227,14 +303,16 @@ onBeforeUnmount(() => { requestVersion++ })
 .reconcile-donuts :deep(.credit-donut) { width: 140px; min-width: 0; height: 150px; }
 .reconcile-donuts :deep(.credit-legend) { min-width: 0; max-height: 260px; overflow-y: auto; padding-inline: 0; }
 .reconcile-donuts :deep(.credit-legend-name) { min-width: 0; overflow-wrap: anywhere; }
-.table-title { margin: 4px 0 0; font-size: 15px; }
+.reconcile-detail { display: grid; gap: 10px; }
+.reconcile-detail h3 { margin: 0; font-size: 15px; }
 .reconcile-table-wrap { border: 1px solid var(--line); border-radius: 14px; }
 .reconcile-table { table-layout: fixed; }
 .reconcile-table th, .reconcile-table td { padding: 12px 8px; overflow-wrap: anywhere; }
 .reconcile-table thead th { white-space: normal; }
-.reconcile-table .numeric-cell { white-space: normal; }
+.reconcile-table .numeric-cell { text-align: right; font-variant-numeric: tabular-nums; white-space: normal; }
 .model-details th:first-child { width: 17%; }
-.model-details th:last-child { width: 12%; }
+.model-details th:last-child { width: 15%; }
+.reconcile-row-status { display: grid; gap: 4px; justify-items: start; }
 .reconcile-table .status-pill { max-width: 100%; white-space: normal; }
 .reconcile-table .unmatched-row, .reconcile-table .unmatched-row:hover { background: #fff8f0; }
 /* 隐藏表格按块裁切，避免表格的最小内容宽度撑开窄屏。 */
@@ -252,6 +330,7 @@ onBeforeUnmount(() => { requestVersion++ })
   .reconcile-table th[scope="row"] { width: 100%; padding: 4px 12px 10px; }
   .reconcile-table td { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 5px 12px; border: 0; text-align: right; }
   .reconcile-table td::before { content: attr(data-label); flex: 0 0 45%; color: var(--ink-soft); text-align: left; }
+  .reconcile-row-status { justify-items: end; }
 }
 @media (max-width: 480px) {
   .reconcile-header > *, .reconcile-header .beichen-toolbar-group { width: 100%; }

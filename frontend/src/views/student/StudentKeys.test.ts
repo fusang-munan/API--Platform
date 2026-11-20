@@ -74,3 +74,80 @@ describe('model selection', () => {
     expect(wrapper.text()).toContain('Common Model')
   })
 })
+
+describe('key visibility', () => {
+  it('shows only the prefix in the list while keeping copy and one-click setup in the detail dialog', async () => {
+    const { studentAPI } = await import('../../api/student')
+    const fullKey = 'neb_sk_abcdefghijklmnopqrstuvwxyz123456'
+    const model = {
+      model_id: 'gpt-5-codex',
+      display_name: 'GPT-5 Codex',
+      description: null,
+      category: 'text',
+      capabilities: ['coding'],
+      input_modalities: ['text'],
+      output_modalities: ['text'],
+      context_window: 128000,
+      max_input_tokens: null,
+      max_output_tokens: null,
+      is_common: false,
+      status: 'active',
+      route_ready: true,
+      credit_multiplier: '1.00',
+      provider_name: 'gpt',
+      primary_adapter: 'openai_responses',
+      responses_ready: true,
+    }
+    const key = {
+      id: 'key-1',
+      name: '我的 Key',
+      status: 'active',
+      route_ready: true,
+      progress: { current: 'active', completed_steps: ['submitted', 'mentor_review', 'teacher_review', 'claimed'] },
+      organization: { id: 'org', name: 'Org', status: 'active' },
+      project: { id: 'project', organization_id: 'org', name: 'Project', status: 'active', has_mentor: true, monthly_credit_quota: '200.000' },
+      models: [model],
+      key_prefix: 'neb_sk_abcdefgh',
+      // Even if a list payload accidentally contains the full secret, the list must still mask it.
+      api_key: fullKey,
+      requested_monthly_credits: '200.000',
+      created_at: '2026-11-20T00:00:00Z',
+      updated_at: '2026-11-20T00:00:00Z',
+    }
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([key] as never)
+    vi.mocked(studentAPI.key).mockResolvedValueOnce({ ...key, api_key: fullKey } as never)
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+
+    const wrapper = mount(StudentKeys, {
+      global: {
+        stubs: {
+          LoadingRegion: { template: '<div><slot/></div>' },
+          AppDialog: { props: ['open', 'title'], template: '<section v-if="open" :data-title="title"><slot/></section>' },
+          StatusProgress: true,
+          StatusBadge: true,
+          EmptyState: true,
+          StudentHarnessConfig: { template: '<div data-testid="harness-config">配置内容</div>' },
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="api-key-mask"]').text()).toBe('neb_sk_abcdefgh••••••')
+    expect(wrapper.text()).not.toContain(fullKey)
+
+    const viewButton = wrapper.findAll('button').find(button => button.text() === '查看密钥')
+    expect(viewButton).toBeTruthy()
+    await viewButton!.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="api-key-detail"]').text()).toBe(fullKey)
+    await wrapper.get('[data-testid="copy-api-key"]').trigger('click')
+    await flushPromises()
+    expect(writeText).toHaveBeenCalledWith(fullKey)
+
+    await wrapper.get('[data-testid="configure-api-key"]').trigger('click')
+    expect(wrapper.find('[data-testid="harness-config"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+})

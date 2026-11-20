@@ -6,10 +6,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 )
 
 type Dataset struct {
@@ -31,6 +34,8 @@ type Model struct {
 	PriceConditionsExact map[string]any  `json:"price_conditions_exact,omitempty"`
 	UpstreamRates        *DisplayRates   `json:"upstream_rates"`
 	SchoolRates          *DisplayRates   `json:"school_rates"`
+
+	candidateAdapters []modelbinding.Adapter
 }
 
 // The effective multiplier can yield fractions of a micro-unit. Decimal
@@ -66,13 +71,27 @@ type Comparison struct {
 }
 
 type Overview struct {
-	WebLoginRequired bool              `json:"web_login_required,omitempty"`
-	WebsiteSync      WebsiteSyncStatus `json:"website_sync"`
-	ArchivedUsage    []ArchivedUsage   `json:"archived_usage"`
-	Datasets         []Dataset         `json:"datasets"`
-	Models           []Model           `json:"models"`
-	ModelCatalog     []CatalogModel    `json:"model_catalog"`
-	Comparison       []Comparison      `json:"comparison"`
+	WebLoginRequired bool                `json:"web_login_required,omitempty"`
+	WebsiteSync      WebsiteSyncStatus   `json:"website_sync"`
+	ArchivedUsage    []ArchivedUsage     `json:"archived_usage"`
+	Credentials      []CredentialSummary `json:"credentials"`
+	Datasets         []Dataset           `json:"datasets"`
+	Models           []Model             `json:"models"`
+	ModelCatalog     []CatalogModel      `json:"model_catalog"`
+	Comparison       []Comparison        `json:"comparison"`
+}
+
+type CredentialSummary struct {
+	CredentialID       uuid.UUID  `json:"credential_id"`
+	Label              string     `json:"label"`
+	Status             string     `json:"status"`
+	CatalogLastSuccess *time.Time `json:"catalog_last_success"`
+	PricesLastSuccess  *time.Time `json:"prices_last_success"`
+	BillingLastSuccess *time.Time `json:"billing_last_success"`
+	UsageLastSuccess   *time.Time `json:"usage_last_success"`
+	LastError          *string    `json:"last_error"`
+	ModelCount         int        `json:"model_count"`
+	PricedModelCount   int        `json:"priced_model_count"`
 }
 
 type CatalogModel struct {
@@ -82,6 +101,17 @@ type CatalogModel struct {
 	Model           string           `json:"model"`
 	CredentialIDs   []uuid.UUID      `json:"credential_ids"`
 	PreferredRoutes []PreferredRoute `json:"preferred_routes"`
+	KeyCount        int              `json:"key_count"`
+	RouteCount      int              `json:"route_count"`
+	ReadyCount      int              `json:"ready_count"`
+	PriceState      string           `json:"price_state"`
+	Blockers        []CatalogBlocker `json:"blockers"`
+	Activation      string           `json:"activation"`
+}
+
+type CatalogBlocker struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 type PreferredRoute struct {
@@ -141,6 +171,9 @@ func (s *Service) Overview(ctx context.Context, providerID uuid.UUID, day string
 	}
 	if err = readDatasets(ctx, tx, providerID, &view); err == nil {
 		err = readModels(ctx, tx, providerID, &view)
+	}
+	if err == nil {
+		err = readCredentials(ctx, tx, providerID, &view)
 	}
 	if err == nil {
 		err = readPreferredRoutes(ctx, tx, providerID, &view)
@@ -208,7 +241,8 @@ SELECT m.credential_id, m.model_id::text, p.mode,
   trim_scale(p.upstream_input)::text, trim_scale(p.upstream_output)::text,
   trim_scale(p.upstream_cache_read)::text, trim_scale(p.upstream_cache_write)::text,
   trim_scale(p.school_input * f.factor)::text, trim_scale(p.school_output * f.factor)::text,
-  trim_scale(p.school_cache_read * f.factor)::text, trim_scale(p.school_cache_write * f.factor)::text
+  trim_scale(p.school_cache_read * f.factor)::text, trim_scale(p.school_cache_write * f.factor)::text,
+  owner.status = 'active' AND c.status = 'active', m.raw_entry
 FROM provider_model_catalog m
 JOIN provider_credentials c ON c.id = m.credential_id AND c.provider_id = m.provider_id
 JOIN providers owner ON owner.id = c.provider_id
@@ -237,13 +271,21 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 	for rows.Next() {
 		var model Model
 		var upstream, school DisplayRates
-		var terms []byte
+		var terms, rawEntry []byte
+		var available bool
 		err := rows.Scan(&model.CredentialID, &model.Model, &model.Mode,
 			&model.SchoolStatus, &model.RouteReady, &terms,
 			&upstream.Input, &upstream.Output, &upstream.CacheRead, &upstream.CacheWrite,
-			&school.Input, &school.Output, &school.CacheRead, &school.CacheWrite)
+			&school.Input, &school.Output, &school.CacheRead, &school.CacheWrite, &available, &rawEntry)
 		if err != nil {
 			return err
+		}
+		if available {
+			entry := catalog.ProviderEntry{ID: model.Model}
+			if err := json.Unmarshal(rawEntry, &entry.Raw); err != nil {
+				return err
+			}
+			model.candidateAdapters = catalog.AdaptersFromUpstream(entry)
 		}
 		model.PriceStatus = "pending_confirmation"
 		if bytes.Equal(terms, []byte("null")) {
@@ -273,6 +315,77 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 	return rows.Err()
 }
 
+func (m *Model) catalogPriceState() string {
+	switch {
+	case m != nil && m.Mode == "manual":
+		return "manual"
+	case m != nil && m.PriceStatus == "confirmed":
+		return "confirmed"
+	case m != nil && m.PriceStatus == "conditional":
+		return "conditional"
+	default:
+		return "missing"
+	}
+}
+
+func readCredentials(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Overview) error {
+	type modelCounts struct{ total, priced int }
+	counts := make(map[uuid.UUID]modelCounts)
+	for _, model := range view.Models {
+		count := counts[model.CredentialID]
+		count.total++
+		if model.SchoolRates != nil {
+			count.priced++
+		}
+		counts[model.CredentialID] = count
+	}
+
+	// The datasets store retry deadlines, not failure times. Undo the usual
+	// retry interval when comparing errors from usage and the billing job.
+	// Catalog and price errors can be written as part of that billing job.
+	rows, err := tx.QueryContext(ctx, `
+SELECT c.id, c.label::text, c.status, s.catalog_at, s.prices_at, s.billing_at, s.usage_at, s.last_error
+FROM provider_credentials c
+LEFT JOIN beichen_datasets b ON b.credential_id = c.id AND b.kind = 'billing'
+CROSS JOIN LATERAL (
+  SELECT max(d.last_success) FILTER (WHERE d.kind = 'catalog') AS catalog_at,
+    max(d.last_success) FILTER (WHERE d.kind = 'prices') AS prices_at,
+    max(d.last_success) FILTER (WHERE d.kind = 'billing') AS billing_at,
+    max(d.last_success) FILTER (WHERE d.kind = 'usage') AS usage_at,
+    (array_agg(d.last_error ORDER BY GREATEST(d.last_success,
+      CASE WHEN d.kind = 'usage' THEN d.next_attempt - interval '24 hours'
+           WHEN b.last_error IS NOT NULL THEN
+             b.next_attempt - make_interval(mins => 1 << greatest(b.failure_count - 1, 0))
+           ELSE b.last_success END) DESC NULLS LAST, d.kind)
+      FILTER (WHERE d.last_error IS NOT NULL))[1] AS last_error
+  FROM beichen_datasets d WHERE d.credential_id = c.id
+) s
+WHERE c.provider_id = $1
+ORDER BY c.label, c.id`, providerID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	view.Credentials = []CredentialSummary{}
+	for rows.Next() {
+		var item CredentialSummary
+		times := []**time.Time{&item.CatalogLastSuccess, &item.PricesLastSuccess, &item.BillingLastSuccess, &item.UsageLastSuccess}
+		if err := rows.Scan(&item.CredentialID, &item.Label, &item.Status, times[0], times[1], times[2], times[3], &item.LastError); err != nil {
+			return err
+		}
+		for _, timestamp := range times {
+			if *timestamp != nil {
+				utc := (*timestamp).UTC()
+				*timestamp = &utc
+			}
+		}
+		count := counts[item.CredentialID]
+		item.ModelCount, item.PricedModelCount = count.total, count.priced
+		view.Credentials = append(view.Credentials, item)
+	}
+	return rows.Err()
+}
+
 // Rates and tier boundaries can exceed JavaScript's numeric precision.
 func stringifyPriceNumbers(value any) any {
 	switch v := value.(type) {
@@ -295,11 +408,147 @@ func readPreferredRoutes(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, 
 	if err != nil {
 		return err
 	}
+	records := make(map[string]map[uuid.UUID]*Model)
+	for i := range view.Models {
+		row := &view.Models[i]
+		name := strings.ToLower(row.Model)
+		if records[name] == nil {
+			records[name] = make(map[uuid.UUID]*Model)
+		}
+		records[name][row.CredentialID] = row
+	}
+	syncFailed := make(map[uuid.UUID]bool)
+	for _, d := range view.Datasets {
+		if d.Kind != "usage" && d.LastError != nil {
+			syncFailed[d.CredentialID] = true
+		}
+	}
 	view.ModelCatalog = make([]CatalogModel, 0, len(models))
 	for _, model := range models {
-		view.ModelCatalog = append(view.ModelCatalog, model.overview())
+		item, err := model.overviewWithStatus(ctx, tx, records, syncFailed)
+		if err != nil {
+			return err
+		}
+		view.ModelCatalog = append(view.ModelCatalog, item)
 	}
 	return nil
+}
+
+func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
+	records map[string]map[uuid.UUID]*Model, syncFailed map[uuid.UUID]bool,
+) (CatalogModel, error) {
+	item := m.overview()
+	item.Blockers = []CatalogBlocker{}
+	source := strings.ToLower(m.name)
+	type routeKey struct {
+		credential uuid.UUID
+		adapter    modelbinding.Adapter
+	}
+	candidates, published := make(map[routeKey]bool), make(map[routeKey]bool)
+	priceStates := make(map[string]bool)
+	for _, id := range m.keys {
+		row := records[source][id]
+		state := row.catalogPriceState()
+		priceStates[state] = true
+		if row == nil {
+			continue
+		}
+		if state != "missing" || len(row.candidateAdapters) > 0 {
+			item.KeyCount++
+		}
+		for _, adapter := range row.candidateAdapters {
+			candidates[routeKey{id, adapter}] = true
+		}
+	}
+	item.PriceState = "missing"
+	for state := range priceStates {
+		item.PriceState = state
+	}
+	if len(priceStates) > 1 {
+		item.PriceState = "mixed"
+	}
+	// Preferred routes collapse competing routes for the same protocol. Count
+	// every distinct published North protocol and credential, including aliases.
+	for _, school := range m.schools {
+		if school.status != "active" {
+			continue
+		}
+		for _, binding := range school.bindings {
+			r := binding.route
+			if binding.active && binding.reachable && r.ProviderID == m.provider && r.CredentialID != nil &&
+				strings.EqualFold(strings.TrimSpace(r.UpstreamModel), m.name) {
+				key := routeKey{*r.CredentialID, modelbinding.Adapter(r.Adapter)}
+				published[key], candidates[key] = true, true
+			}
+		}
+	}
+	item.RouteCount, item.ReadyCount = len(candidates), len(published)
+	if item.ReadyCount > 0 {
+		item.Activation = "active"
+		return item, nil
+	}
+
+	target := m.target("")
+	missingPrice, conditionalPrice := priceStates["missing"], priceStates["conditional"]
+	if item.CanEnable {
+		// Batch enable validates the current school price for the routes in
+		// this plan. A missing quote on an unused alternative does not block it.
+		missingPrice, conditionalPrice = false, false
+		for _, r := range m.plan(target).routes {
+			if r.ProviderID != m.provider || r.CredentialID == nil {
+				continue
+			}
+			record := records[strings.ToLower(strings.TrimSpace(r.UpstreamModel))][*r.CredentialID]
+			state := record.catalogPriceState()
+			// 纯 Token 的分档条件价可以直接启用；结算时由价格评估器按实际用量选档。
+			if state == "conditional" && record != nil && activationTokenPriceReady(record.PriceConditions) {
+				continue
+			}
+			if record == nil || record.Model != r.UpstreamModel {
+				// Existing bindings can keep a different spelling from the
+				// directory. Batch enable looks up the exact binding name.
+				var priced bool
+				err := tx.QueryRowContext(ctx, `SELECT school_input IS NOT NULL FROM beichen_price_at($1,$2,statement_timestamp())`,
+					*r.CredentialID, r.UpstreamModel).Scan(&priced)
+				if err != nil {
+					return CatalogModel{}, err
+				}
+				if priced {
+					continue
+				}
+				if state != "conditional" {
+					state = "missing"
+				}
+			}
+			missingPrice = missingPrice || state == "missing"
+			conditionalPrice = conditionalPrice || state == "conditional"
+		}
+		if !missingPrice && !conditionalPrice {
+			item.Activation = "ready"
+			return item, nil
+		}
+	}
+
+	item.Activation = "blocked"
+	if target == nil || target.status == "not_configured" {
+		item.Blockers = append(item.Blockers, CatalogBlocker{"not_configured", "请确认此目录模型对应的校内模型和线路"})
+	}
+	if !item.CanEnable {
+		item.Blockers = append(item.Blockers, CatalogBlocker{"no_ready_route", "没有可启用的北辰线路，请检查渠道状态和线路配置"})
+	}
+	if missingPrice {
+		item.Blockers = append(item.Blockers, CatalogBlocker{"missing_price", "线路缺少可用报价，请同步官网价或设置手动价"})
+	}
+	if conditionalPrice {
+		item.Blockers = append(item.Blockers, CatalogBlocker{"conditional_price", "线路按条件计价，请先设置手动价"})
+	}
+	for _, id := range m.keys {
+		if syncFailed[id] {
+			item.Blockers = append(item.Blockers, CatalogBlocker{"sync_failed", "关联渠道的目录、账单倍率或价格同步失败，请查看渠道错误"})
+			break
+		}
+	}
+	return item, nil
 }
 
 func readComparison(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, start time.Time, view *Overview) error {

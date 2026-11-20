@@ -135,13 +135,14 @@ func (s *Server) updateTeacherMemberQuota(c *gin.Context) {
 	var input struct {
 		MonthlyCredits string `json:"monthly_credits" binding:"required"`
 		Reason         string `json:"quota_change_reason" binding:"max=1000"`
+		IncreaseOnly   bool   `json:"increase_only"`
 	}
 	if !bindJSON(c, &input) {
 		return
 	}
 	quota, err := domain.ParseCredits(input.MonthlyCredits)
 	if err == nil {
-		err = s.service.UpdateTeacherMemberQuota(c.Request.Context(), identity(c).UserID, projectID, userID, quota, input.Reason)
+		err = s.service.UpdateTeacherMemberQuota(c.Request.Context(), identity(c).UserID, projectID, userID, quota, input.Reason, input.IncreaseOnly)
 	}
 	if err != nil {
 		writeError(c, err)

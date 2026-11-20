@@ -65,10 +65,10 @@ WITH facts AS (
 	FROM monthly_usage_cube WHERE project_id=$1 AND month=$2
 	UNION ALL
 	SELECT c.user_id,c.api_key_id,c.model_id,NULL,0,0,0,
-	       sum(r.actual_cost),count(*)-count(r.call_id),sum(coalesce(c.beichen_base_credits,c.beichen_credit_exact)),
+	       sum(r.actual_cost),count(*)-count(r.call_id),sum(` + beichenBaseCreditsSQL + `),
 	       sum(c.beichen_credit_exact),min(coalesce(c.beichen_school_multiplier,1)),max(coalesce(c.beichen_school_multiplier,1)),
-	       min(coalesce(c.beichen_base_source,'legacy')) FILTER (WHERE c.beichen_state='charged'),
-	       max(coalesce(c.beichen_base_source,'legacy')) FILTER (WHERE c.beichen_state='charged')
+	       min(coalesce(` + beichenBaseSourceSQL + `,'legacy')) FILTER (WHERE c.beichen_state='charged'),
+	       max(coalesce(` + beichenBaseSourceSQL + `,'legacy')) FILTER (WHERE c.beichen_state='charged')
 	FROM gateway_calls c
 	LEFT JOIN beichen_receipt_response_claims claim
 	  ON claim.first_call_id=c.id AND claim.response_id=c.beichen_receipt_response_id

@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -155,12 +156,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	prompt, usageCorrelation := turnCorrelation(prompt, extractCallCorrelation(r.URL.Path, r.Header.Get("Content-Type"), replay, r.Header), uuid.Nil)
 	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, routes[0].Binding.ModelID, requestIDFromContext(r), string(adapter), r.URL.Path, prompt, promptSource, usageCorrelation, beichenReservationRoutes(routes)...)
 	if reserveErr != nil {
-		var quotaErr *usage.QuotaError
-		if errors.As(reserveErr, &quotaErr) {
-			writeProtocolError(w, r.URL.Path, http.StatusTooManyRequests, "rate_limit_error", quotaErr.Code, fmt.Sprintf("%s quota is exhausted until %s.", quotaErr.Name, quotaErr.EndsAt.In(time.FixedZone("Asia/Shanghai", 8*60*60)).Format("2006-01-02 15:04 MST")), "")
-			return
-		}
-		writeProtocolError(w, r.URL.Path, http.StatusBadRequest, "invalid_request_error", "billing_unavailable", "Unable to authorize this model call.", "model")
+		writeModelCallRejection(w, r.URL.Path, reserveErr)
 		return
 	}
 	g.proxyHTTP(w, r, replay, routes, &reservation)
@@ -353,7 +349,7 @@ func (g *Gateway) resolveBindingCredential(ctx context.Context, binding *ent.Mod
 	return credential, row.ID, err
 }
 
-func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, candidate route) (*http.Request, func(), error) {
+func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, candidate route, adjustments ...func(map[string]json.RawMessage) error) (*http.Request, func(), error) {
 	requestPath, err := upstreamPath(original.URL.Path, candidate.Binding.UpstreamModelName, candidate.Binding.Adapter)
 	if err != nil {
 		return nil, func() {}, err
@@ -363,7 +359,7 @@ func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, ca
 		return nil, func() {}, err
 	}
 	body, contentType, contentLength, cleanup, err := rewriteUpstreamBody(
-		original.Header.Get("Content-Type"), replay, candidate.Binding.UpstreamModelName, candidate.Binding.Adapter, candidate.Provider.BaseURL, original.URL.Path,
+		original.Header.Get("Content-Type"), replay, candidate.Binding.UpstreamModelName, candidate.Binding.Adapter, candidate.Provider.BaseURL, original.URL.Path, adjustments...,
 	)
 	if err != nil {
 		return nil, func() {}, err
@@ -544,19 +540,21 @@ func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request
 	wsPrompt, usageCorrelation := turnCorrelation(wsPrompt, extractCallCorrelationFromJSON(firstMessage), uuid.Nil)
 	reservation, reserveErr := g.usage.Reserve(r.Context(), key.ID, selected.Binding.ModelID, requestIDFromContext(r), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, usageCorrelation, beichenReservationRoutes([]route{selected})...)
 	if reserveErr != nil {
-		_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "rate_limit_error", "code": "quota_exceeded", "message": "The API key or project credit quota is exhausted."}})
+		_ = client.WriteJSON(modelCallErrorEvent(reserveErr))
 		return
 	}
 	if isBeichenAPI(selected.Provider.BaseURL) {
 		g.proxyBeichenWebSocket(r.Context(), client, upstream, selected, key.ID, reservation, rewritten)
 		return
 	}
-	if err := upstream.WriteMessage(messageType, rewritten); err != nil {
-		_ = g.usage.Finalize(r.Context(), reservation, false, "outcome_unknown", "connection", "Unable to send upstream WebSocket message.", selected.callRoute(), usage.CallMetrics{})
+	rejection, err := g.sendLegacyWebSocketCall(r.Context(), upstream, reservation, selected.callRoute(), messageType, rewritten)
+	if rejection != nil {
+		_ = client.WriteJSON(modelCallErrorEvent(rejection))
 		return
 	}
-	_ = g.usage.MarkSent(r.Context(), reservation.CallID)
-	_ = g.usage.Finalize(r.Context(), reservation, true, "succeeded", "", "", selected.callRoute(), usage.CallMetrics{})
+	if err != nil {
+		return
+	}
 	proxyResponsesWebSockets(client, upstream, selected.callRoute(), g, key.ID, selected.Binding.ModelID, reservation.TurnID)
 }
 
@@ -614,9 +612,29 @@ func rewriteResponsesWebSocketModel(message []byte, upstreamModel string) ([]byt
 	return json.Marshal(payload)
 }
 
+func (g *Gateway) sendLegacyWebSocketCall(ctx context.Context, upstream *websocket.Conn, r usage.Reservation, selected usage.CallRoute, messageType int, data []byte) (rejection, writeErr error) {
+	started := time.Now()
+	attempt, err := g.usage.StartAttempt(ctx, r, selected, 0)
+	if err != nil {
+		_ = g.finalizeCall(ctx, r, false, "dispatch_rejected", "Unable to authorize upstream dispatch.", selected, usage.CallMetrics{})
+		return err, nil
+	}
+	if err = upstream.WriteMessage(messageType, data); err != nil {
+		const message = "Unable to send upstream WebSocket message."
+		g.finishAttempt(ctx, attempt, started, false, nil, "connection", message)
+		_ = g.usage.Finalize(ctx, r, false, "outcome_unknown", "connection", message, selected, usage.CallMetrics{})
+		return nil, err
+	}
+	g.markCallSent(ctx, r.CallID)
+	g.finishAttempt(ctx, attempt, started, true, nil, "", "")
+	_ = g.finalizeCall(ctx, r, true, "", "", selected, usage.CallMetrics{})
+	return nil, nil
+}
+
 func proxyResponsesWebSockets(client, upstream *websocket.Conn, selected usage.CallRoute, gateway *Gateway, keyID, modelID, sessionTurnID uuid.UUID) {
 	errs := make(chan error, 2)
 	activeTurnID := sessionTurnID
+	var clientWriteMu sync.Mutex
 	go func() {
 		for {
 			messageType, data, err := client.ReadMessage()
@@ -632,25 +650,29 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, selected usage.C
 					wsPrompt, wsPromptSource := extractPromptFromJSON(data)
 					wsPrompt, usageCorrelation := turnCorrelation(wsPrompt, extractCallCorrelationFromJSON(data), activeTurnID)
 					reservation, reserveErr := gateway.usage.Reserve(context.Background(), keyID, modelID, uuid.Must(uuid.NewV7()).String(), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, usageCorrelation)
-					if reserveErr == nil {
-						activeTurnID = reservation.TurnID
-					}
 					if reserveErr != nil {
-						_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "rate_limit_error", "code": "quota_exceeded", "message": "The API key or project credit quota is exhausted."}})
+						clientWriteMu.Lock()
+						_ = client.WriteJSON(modelCallErrorEvent(reserveErr))
+						clientWriteMu.Unlock()
 						continue
 					}
+					activeTurnID = reservation.TurnID
 					data, err = rewriteResponsesWebSocketModel(data, selected.UpstreamModelName)
 					if err != nil {
 						errs <- err
 						return
 					}
-					if err := upstream.WriteMessage(messageType, data); err != nil {
-						_ = gateway.usage.Finalize(context.Background(), reservation, false, "outcome_unknown", "connection", "Unable to send upstream WebSocket message.", selected, usage.CallMetrics{})
+					rejection, err := gateway.sendLegacyWebSocketCall(context.Background(), upstream, reservation, selected, messageType, data)
+					if rejection != nil {
+						clientWriteMu.Lock()
+						_ = client.WriteJSON(modelCallErrorEvent(rejection))
+						clientWriteMu.Unlock()
+						continue
+					}
+					if err != nil {
 						errs <- err
 						return
 					}
-					_ = gateway.usage.MarkSent(context.Background(), reservation.CallID)
-					_ = gateway.usage.Finalize(context.Background(), reservation, true, "succeeded", "", "", selected, usage.CallMetrics{})
 					continue
 				}
 			}
@@ -667,7 +689,10 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, selected usage.C
 				errs <- err
 				return
 			}
-			if err := client.WriteMessage(messageType, data); err != nil {
+			clientWriteMu.Lock()
+			err = client.WriteMessage(messageType, data)
+			clientWriteMu.Unlock()
+			if err != nil {
 				errs <- err
 				return
 			}
@@ -679,6 +704,7 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, selected usage.C
 func proxyRealtimeWebSocket(client, upstream *websocket.Conn, selected usage.CallRoute, gateway *Gateway, keyID, modelID, sessionTurnID uuid.UUID) {
 	errs := make(chan error, 2)
 	activeTurnID := sessionTurnID
+	var clientWriteMu sync.Mutex
 	go func() {
 		for {
 			messageType, data, err := client.ReadMessage()
@@ -694,20 +720,24 @@ func proxyRealtimeWebSocket(client, upstream *websocket.Conn, selected usage.Cal
 					wsPrompt, wsPromptSource := extractPromptFromJSON(data)
 					wsPrompt, usageCorrelation := turnCorrelation(wsPrompt, extractCallCorrelationFromJSON(data), activeTurnID)
 					reservation, reserveErr := gateway.usage.Reserve(context.Background(), keyID, modelID, uuid.Must(uuid.NewV7()).String(), string(modelbinding.AdapterOpenaiRealtime), "/v1/realtime", wsPrompt, wsPromptSource, usageCorrelation)
-					if reserveErr == nil {
-						activeTurnID = reservation.TurnID
-					}
 					if reserveErr != nil {
-						_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "rate_limit_error", "code": "quota_exceeded", "message": "The API key or project credit quota is exhausted."}})
+						clientWriteMu.Lock()
+						_ = client.WriteJSON(modelCallErrorEvent(reserveErr))
+						clientWriteMu.Unlock()
 						continue
 					}
-					if err := upstream.WriteMessage(messageType, data); err != nil {
-						_ = gateway.usage.Finalize(context.Background(), reservation, false, "outcome_unknown", "connection", "Unable to send upstream WebSocket message.", selected, usage.CallMetrics{})
+					activeTurnID = reservation.TurnID
+					rejection, err := gateway.sendLegacyWebSocketCall(context.Background(), upstream, reservation, selected, messageType, data)
+					if rejection != nil {
+						clientWriteMu.Lock()
+						_ = client.WriteJSON(modelCallErrorEvent(rejection))
+						clientWriteMu.Unlock()
+						continue
+					}
+					if err != nil {
 						errs <- err
 						return
 					}
-					_ = gateway.usage.MarkSent(context.Background(), reservation.CallID)
-					_ = gateway.usage.Finalize(context.Background(), reservation, true, "succeeded", "", "", selected, usage.CallMetrics{})
 					continue
 				}
 			}
@@ -724,7 +754,10 @@ func proxyRealtimeWebSocket(client, upstream *websocket.Conn, selected usage.Cal
 				errs <- err
 				return
 			}
-			if err := client.WriteMessage(messageType, data); err != nil {
+			clientWriteMu.Lock()
+			err = client.WriteMessage(messageType, data)
+			clientWriteMu.Unlock()
+			if err != nil {
 				errs <- err
 				return
 			}
@@ -1015,7 +1048,7 @@ func upstreamPath(requestPath, upstreamModel string, adapter modelbinding.Adapte
 	}
 }
 
-func rewriteUpstreamBody(contentType string, replay *replayBody, upstreamModel string, adapter modelbinding.Adapter, baseURL, requestPath string) (
+func rewriteUpstreamBody(contentType string, replay *replayBody, upstreamModel string, adapter modelbinding.Adapter, baseURL, requestPath string, adjustments ...func(map[string]json.RawMessage) error) (
 	io.ReadCloser,
 	string,
 	int64,
@@ -1029,13 +1062,12 @@ func rewriteUpstreamBody(contentType string, replay *replayBody, upstreamModel s
 				return rewriteRealtimeBody(contentType, replay, upstreamModel)
 			}
 		}
-		var adjust func(map[string]json.RawMessage) error
 		if adapter == modelbinding.AdapterAnthropic && deepseekHost(baseURL) {
-			adjust = repairDeepSeekAnthropicThinking
+			adjustments = append(adjustments, repairDeepSeekAnthropicThinking)
 		} else if adapter == modelbinding.AdapterOpenaiCompatible && requestPath == "/v1/chat/completions" && isBeichenAPI(baseURL) {
-			adjust = requestBeichenStreamUsage
+			adjustments = append(adjustments, requestBeichenStreamUsage)
 		}
-		return rewriteRequestBodyAdjusted(contentType, replay, upstreamModel, adjust)
+		return rewriteRequestBodyAdjusted(contentType, replay, upstreamModel, adjustments...)
 	}
 	if replay == nil {
 		return nil, contentType, 0, func() {}, nil
@@ -1374,10 +1406,10 @@ func rewriteRequestBody(contentType string, replay *replayBody, upstreamModel st
 	func(),
 	error,
 ) {
-	return rewriteRequestBodyAdjusted(contentType, replay, upstreamModel, nil)
+	return rewriteRequestBodyAdjusted(contentType, replay, upstreamModel)
 }
 
-func rewriteRequestBodyAdjusted(contentType string, replay *replayBody, upstreamModel string, adjust func(map[string]json.RawMessage) error) (
+func rewriteRequestBodyAdjusted(contentType string, replay *replayBody, upstreamModel string, adjustments ...func(map[string]json.RawMessage) error) (
 	io.ReadCloser,
 	string,
 	int64,
@@ -1406,7 +1438,7 @@ func rewriteRequestBodyAdjusted(contentType string, replay *replayBody, upstream
 			return nil, "", 0, func() {}, err
 		}
 		payload["model"] = modelValue
-		if adjust != nil {
+		for _, adjust := range adjustments {
 			if err := adjust(payload); err != nil {
 				return nil, "", 0, func() {}, err
 			}

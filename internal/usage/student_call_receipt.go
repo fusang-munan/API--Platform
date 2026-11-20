@@ -31,7 +31,7 @@ const studentCallReceiptSQL = `
 	WITH candidates AS MATERIALIZED (
 		SELECT c.id, c.request_id, c.model_id, c.beichen_dispatch_kind,
 		       c.beichen_state,c.beichen_credit_exact,c.beichen_base_credits,c.beichen_base_source,c.beichen_school_multiplier,
-		       c.beichen_receipt_response_id,c.beichen_receipt_conflict
+		       c.beichen_receipt_response_id,c.beichen_receipt_conflict,c.pricing_detail
 		FROM gateway_calls c
 		JOIN api_keys k ON k.id = c.api_key_id AND k.owner_user_id = c.user_id
 		WHERE c.user_id = $1 AND c.request_id = $2
@@ -40,8 +40,8 @@ const studentCallReceiptSQL = `
 	SELECT c.request_id, m.model_id,
 	       CASE c.beichen_state WHEN 'reserved' THEN 'pending' ELSE c.beichen_state END,
 	       trim_scale(c.beichen_credit_exact)::text, trim_scale(r.actual_cost)::text, r.applied,
-	       trim_scale(coalesce(c.beichen_base_credits,c.beichen_credit_exact))::text,
-	       coalesce(c.beichen_base_source,CASE WHEN c.beichen_state='charged' THEN 'legacy' END),
+	       trim_scale(` + beichenBaseCreditsSQL + `)::text,
+	       coalesce(` + beichenBaseSourceSQL + `,CASE WHEN c.beichen_state='charged' THEN 'legacy' END),
 	       coalesce(c.beichen_school_multiplier,1)::text
 	FROM candidates c
 	JOIN models m ON m.id = c.model_id

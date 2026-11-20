@@ -110,11 +110,12 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 	}
 	var callID uuid.UUID
 	var state string
-	err = tx.QueryRowContext(ctx, `SELECT c.id,c.beichen_state
+	var terms []byte
+	err = tx.QueryRowContext(ctx, `SELECT c.id,c.beichen_state,quote.terms
 		FROM beichen_receipt_response_claims r
 		JOIN gateway_calls c ON c.id=r.first_call_id
 		JOIN beichen_receipt_active_bindings a ON a.credential_id=c.beichen_dispatch_credential_id
-		JOIN beichen_panel_access panel ON panel.credential_id=a.credential_id
+		JOIN beichen_panel_access panel ON panel.credential_id=a.credential_id`+beichenConditionQuoteJoin+`
 		WHERE r.response_id=$1 AND r.conflicted_at IS NULL
 		  AND c.beichen_receipt_response_id=$1 AND NOT c.beichen_receipt_conflict
 		  AND c.beichen_dispatch_kind='beichen' AND c.beichen_dispatch_credential_id=$2
@@ -123,7 +124,7 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 		  AND c.beichen_dispatch_model=$4 AND c.beichen_state IN ('pending_review','charged')
 		  AND $5::timestamptz BETWEEN c.sent_at-interval '2 seconds' AND c.finalized_at+interval '2 minutes'
 		FOR UPDATE OF c FOR SHARE OF panel`, receipt.ResponseID, credentialID, receipt.APIKeyID, receipt.Model, receipt.OccurredAt).
-		Scan(&callID, &state)
+		Scan(&callID, &state, &terms)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -131,11 +132,11 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 		return false, err
 	}
 	applied := state == "pending_review"
-	var base, source sql.NullString
-	var upstream, multiplier sql.NullInt64
+	var charge beichenCharge
 	if applied {
 		// 回执的输入、缓存计数已经互斥；直接加权，不能再次按协议扣除缓存。
 		// 跟随费率沿用 0042 的余额单位；教师费率以积分保存，结果须除以 100。
+		// 条件价无法使用固定官网价补记，已验证的北辰实扣仍可作为依据。
 		err = tx.QueryRowContext(ctx, `SELECT coalesce(cost.gateway,cost.receipt,$2::numeric*100)::text,
 			CASE WHEN p.mode='manual' AND coalesce(cost.gateway,cost.receipt) IS NOT NULL THEN 'teacher_manual_price'
 			     WHEN cost.gateway IS NOT NULL THEN 'gateway_usage_price'
@@ -144,55 +145,51 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 			CASE WHEN coalesce(cost.gateway,cost.receipt) IS NOT NULL THEN p.multiplier_version END
 			FROM gateway_calls c
 			LEFT JOIN LATERAL beichen_price_at(c.beichen_dispatch_credential_id,c.beichen_dispatch_model,coalesce(c.beichen_price_at,c.sent_at)) p
-			  ON c.beichen_school_multiplier=1.10 OR p.mode='manual'
+			  ON (c.beichen_school_multiplier=1.10 AND NOT $7::boolean) OR p.mode='manual'
 			CROSS JOIN LATERAL (SELECT
 			  CASE WHEN c.usage_state='reported' THEN coalesce(
 			    beichen_token_credits(c.protocol,c.prompt_tokens,c.completion_tokens,c.cache_hit_tokens,c.cache_miss_tokens,
 			      c.cache_write_tokens,p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)
 			      /CASE WHEN p.mode='manual' THEN 100 ELSE 1 END,
-			    beichen_token_credits(c.protocol,c.prompt_tokens,c.completion_tokens,c.cache_hit_tokens,c.cache_miss_tokens,
-			      c.cache_write_tokens,p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write)) END AS gateway,
+			    CASE WHEN NOT $7::boolean THEN
+			      beichen_token_credits(c.protocol,c.prompt_tokens,c.completion_tokens,c.cache_hit_tokens,c.cache_miss_tokens,
+			        c.cache_write_tokens,p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write)
+			    END) END AS gateway,
 			  coalesce(
 			    beichen_weighted_tokens($3,$4,$5,$6,p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)
 			      /CASE WHEN p.mode='manual' THEN 100 ELSE 1 END,
-			    beichen_weighted_tokens($3,$4,$5,$6,p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write))
+			    CASE WHEN NOT $7::boolean THEN
+			      beichen_weighted_tokens($3,$4,$5,$6,p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write)
+			    END)
 			      *0.0000000001::numeric AS receipt) cost
 			WHERE c.id=$1`, callID, receipt.ActualCost, receipt.InputTokens, receipt.OutputTokens, receipt.CacheReadTokens,
-			receipt.CacheWriteTokens).Scan(&base, &source, &upstream, &multiplier)
+			receipt.CacheWriteTokens, isBeichenConditional(terms)).Scan(
+			&charge.base, &charge.source, &charge.upstreamVersion, &charge.multiplierVersion)
 		if err != nil {
 			return false, err
 		}
 	}
-	var exact, milli string
-	err = tx.QueryRowContext(ctx, `INSERT INTO beichen_call_receipts
+	// The receipt's legacy check ties credits_booked to its full base and
+	// school multiplier. The gateway call records the debit and cap split.
+	result, err := tx.ExecContext(ctx, `INSERT INTO beichen_call_receipts
 		(row_id,call_id,credential_id,response_id,api_key_id,model,occurred_at,actual_cost,
 		 input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,credits_booked,applied,base_credits,school_multiplier)
 		SELECT $2,c.id,$3,$4,$5,$6,$7,$8::numeric,$9,$10,$11,$12,
-		  CASE WHEN $13::boolean THEN $14::numeric*coalesce(c.beichen_school_multiplier,1) ELSE c.beichen_credit_exact END,$13,
-		  coalesce($14::numeric,c.beichen_base_credits,c.beichen_credit_exact),coalesce(c.beichen_school_multiplier,1)
-		FROM gateway_calls c WHERE c.id=$1 ON CONFLICT DO NOTHING
-		RETURNING credits_booked::text,(credits_booked*1000)::text`, callID, receipt.RowID, credentialID,
+		  CASE WHEN $13::boolean THEN NULLIF($14,'')::numeric*coalesce(c.beichen_school_multiplier,1)
+		       ELSE coalesce(c.actual_credits,c.beichen_credit_exact) END,$13,
+		  coalesce(NULLIF($14,'')::numeric,`+beichenBaseCreditsSQL+`),coalesce(c.beichen_school_multiplier,1)
+		FROM gateway_calls c WHERE c.id=$1 ON CONFLICT DO NOTHING`, callID, receipt.RowID, credentialID,
 		receipt.ResponseID, receipt.APIKeyID, receipt.Model, receipt.OccurredAt, receipt.ActualCost,
-		receipt.InputTokens, receipt.OutputTokens, receipt.CacheReadTokens, receipt.CacheWriteTokens, applied, base).Scan(&exact, &milli)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
+		receipt.InputTokens, receipt.OutputTokens, receipt.CacheReadTokens, receipt.CacheWriteTokens, applied, charge.base)
 	if err != nil {
 		return false, err
 	}
+	inserted, err := result.RowsAffected()
+	if err != nil || inserted == 0 {
+		return false, err
+	}
 	if applied {
-		if err := postLedgerCharge(ctx, tx, callID, milli); err != nil {
-			return false, err
-		}
-		result, err := tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_state='charged',billing_state='charged',
-			beichen_credit_exact=$2::numeric,credit_milli=trunc($2::numeric*1000)::bigint,
-			beichen_base_credits=$3,beichen_base_source=$4,beichen_review_reason=NULL,
-			beichen_upstream_price_version=$5,beichen_multiplier_version=$6
-			WHERE id=$1 AND beichen_state='pending_review'`, callID, exact, base, source, upstream, multiplier)
-		if err := requireLedgerRow(result, err); err != nil {
-			return false, err
-		}
-		if err := refreshLedgerTurn(ctx, tx, callID, milli, true); err != nil {
+		if err := bookBeichenCharge(ctx, tx, callID, charge); err != nil {
 			return false, err
 		}
 	}

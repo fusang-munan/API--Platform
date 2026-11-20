@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -26,9 +27,11 @@ func (s *Store) PrepareDispatch(ctx context.Context, callID uuid.UUID, route Cal
 		) THEN 1.10 ELSE 1 END END,
 		beichen_dispatch_kind=$2,beichen_dispatch_at=$5,
 		beichen_dispatch_credential_id=$3,beichen_dispatch_model=NULLIF($4,''),
+		reasoning_effort=CASE WHEN $2='beichen' THEN $7::text ELSE reasoning_effort END,
+		cache_ttl=CASE WHEN $2='beichen' THEN NULLIF($8,'') ELSE cache_ttl END,
 		lease_expires_at=clock_timestamp()+interval '15 minutes'
 		WHERE id=$1 AND billing_state='pending'`, callID, kind, nullableUUID(route.CredentialID), route.UpstreamModelName,
-		time.Now().UTC().Truncate(time.Microsecond), nullableUUID(route.ProviderID))
+		time.Now().UTC().Truncate(time.Microsecond), nullableUUID(route.ProviderID), route.ReasoningEffort, route.CacheTTL)
 	return requireLedgerRow(result, err)
 }
 
@@ -126,59 +129,162 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 	return refreshLedgerTurn(ctx, tx, callID, "0", false)
 }
 
+// Use the same dispatch-time snapshot and credential validation as beichen_price_at.
+// Applying the validity checks after LIMIT prevents a fallback to a superseded quote.
+const beichenConditionQuoteJoin = `
+	LEFT JOIN LATERAL (
+		SELECT NULLIF(s.model_pricing -> c.beichen_dispatch_model,'null'::jsonb) AS terms,
+			m.id AS multiplier_version,m.multiplier
+		FROM (
+			SELECT * FROM beichen_panel_snapshots
+			WHERE credential_id=c.beichen_dispatch_credential_id
+				AND effective_at<=COALESCE(c.beichen_price_at,c.sent_at)
+			ORDER BY effective_at DESC LIMIT 1
+		) s
+		LEFT JOIN beichen_multiplier_versions m ON m.id=s.multiplier_version
+			AND m.credential_id=s.credential_id AND m.effective_at<=s.effective_at
+		WHERE COALESCE(c.beichen_price_at,c.sent_at)<s.expires_at AND NOT EXISTS (
+			SELECT 1 FROM provider_credentials credential WHERE credential.id=s.credential_id
+				AND credential.updated_at<=COALESCE(c.beichen_price_at,c.sent_at)
+				AND NOT COALESCE(s.credential_ciphertext_sha256=sha256(credential.credential_ciphertext),
+					s.credential_revision=credential.updated_at)
+		)
+	) quote ON true`
+
+type beichenCharge struct {
+	base, source      string
+	upstreamVersion   sql.NullInt64
+	multiplierVersion sql.NullInt64
+	quoteMultiplier   sql.NullString
+	tier              string
+	snapshot, detail  json.RawMessage
+}
+
+const beichenBaseCreditsSQL = `coalesce(c.beichen_base_credits,(c.pricing_detail->>'base_credits')::numeric,c.beichen_credit_exact)`
+const beichenBaseSourceSQL = `coalesce(c.beichen_base_source,c.pricing_detail->>'base_source')`
+
 func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics) error {
-	// An interrupted usage report can contain only the initial stream counters.
-	// Price lookup uses the dispatch identity and observed time pinned by Finalize.
-	var base, exact, milli sql.NullString
-	var source string
-	var upstream, multiplier sql.NullInt64
+	var school, upstream, effort sql.NullString
+	var mode, protocol, ttl string
+	var terms []byte
+	var quoteVersion sql.NullInt64
+	var quoteMultiplier sql.NullString
+	var noFixedSchool bool
+	var charge beichenCharge
 	// 0042 的跟随费率仍是上游余额单位；仅手动费率已换成积分，须除以 100，避免多扣。
-	err := tx.QueryRowContext(ctx, `SELECT cost.credits::text,booked.credits::text,(booked.credits*1000)::text,
-		p.upstream_version,p.multiplier_version,
-		CASE WHEN p.mode='manual' THEN 'teacher_manual_price' ELSE 'gateway_usage_price' END
+	err := tx.QueryRowContext(ctx, `SELECT cost.school::text,cost.upstream::text,
+		p.mode,p.upstream_version,p.multiplier_version,
+		num_nonnulls(p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)=0,
+		c.protocol,c.reasoning_effort,COALESCE(c.cache_ttl,''),
+		quote.terms,quote.multiplier_version,quote.multiplier::text
 		FROM gateway_calls c
 		CROSS JOIN LATERAL beichen_price_at(c.beichen_dispatch_credential_id,c.beichen_dispatch_model,c.beichen_price_at) p
-		CROSS JOIN LATERAL (SELECT COALESCE(
+		CROSS JOIN LATERAL (SELECT
 			beichen_token_credits(c.protocol,$2,$3,$4,$5,$6,
 				p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)
-				/CASE WHEN p.mode='manual' THEN 100 ELSE 1 END,
+				/CASE WHEN p.mode='manual' THEN 100 ELSE 1 END AS school,
 			beichen_token_credits(c.protocol,$2,$3,$4,$5,$6,
-				p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write)) AS credits) cost
-		CROSS JOIN LATERAL (SELECT cost.credits*COALESCE(c.beichen_school_multiplier,1) AS credits) booked
+				p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write) AS upstream
+		) cost`+beichenConditionQuoteJoin+`
 		WHERE c.id=$1 AND c.beichen_state='pending_review'
 		  AND c.beichen_price_at IS NOT NULL
 		FOR UPDATE OF c`, callID, metrics.PromptTokens, metrics.CompletionTokens,
-		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens).Scan(&base, &exact, &milli, &upstream, &multiplier, &source)
+		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens).Scan(
+		&school, &upstream, &mode, &charge.upstreamVersion, &charge.multiplierVersion, &noFixedSchool,
+		&protocol, &effort, &ttl, &terms, &quoteVersion, &quoteMultiplier)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if !exact.Valid {
+	charge.source = "gateway_usage_price"
+	if mode == "manual" {
+		charge.source = "teacher_manual_price"
+	}
+	base := school
+	if !base.Valid {
+		base = upstream
+	}
+	reason := ""
+	manualPriced := mode == "manual" && school.Valid
+	if len(terms) != 0 && !manualPriced && (noFixedSchool || isBeichenConditional(terms)) {
+		var observedEffort *string
+		if effort.Valid {
+			observedEffort = &effort.String
+		}
+		var evaluated beichenConditionalPrice
+		evaluated, reason = evaluateBeichenConditional(terms, metrics, observedEffort, ttl, protocol)
+		if reason == "" && !quoteMultiplier.Valid {
+			reason = "missing_upstream_multiplier"
+		}
+		base = sql.NullString{String: evaluated.Credits, Valid: reason == ""}
+		charge = beichenCharge{
+			source: "gateway_usage_price", multiplierVersion: quoteVersion, quoteMultiplier: quoteMultiplier,
+			tier: evaluated.Tier, snapshot: terms, detail: evaluated.Detail,
+		}
+	}
+	if !base.Valid {
 		_, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_review_reason=CASE
+			WHEN $4<>'' THEN $4
 			WHEN $2::bigint IS NULL THEN 'missing_upstream_price'
 			WHEN $3::bigint IS NULL AND EXISTS (SELECT 1 FROM beichen_price_versions WHERE id=$2 AND basis='base')
 				THEN 'missing_upstream_multiplier'
 			ELSE 'missing_price_or_token_breakdown' END,
-			beichen_upstream_price_version=$2,beichen_multiplier_version=$3 WHERE id=$1`, callID, upstream, multiplier)
+			beichen_upstream_price_version=$2,beichen_multiplier_version=$3 WHERE id=$1`,
+			callID, charge.upstreamVersion, charge.multiplierVersion, reason)
 		if err != nil {
 			return err
 		}
 		return refreshLedgerTurn(ctx, tx, callID, "0", false)
 	}
-	if err := postLedgerCharge(ctx, tx, callID, milli.String); err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_state='charged',billing_state='charged',
-		beichen_credit_exact=$2::numeric,credit_milli=trunc($2::numeric*1000)::bigint,
-		beichen_base_credits=$5::numeric,beichen_base_source=$6,
-		beichen_review_reason=NULL,beichen_upstream_price_version=$3,beichen_multiplier_version=$4
-		WHERE id=$1`, callID, exact.String, upstream, multiplier, base.String, source)
+	charge.base = base.String
+	return bookBeichenCharge(ctx, tx, callID, charge)
+}
+
+// Both terminal usage and verified receipts book the student's part once.
+// The legacy base fields require base * school_multiplier = debit. A capped
+// debit keeps its full base and source in pricing_detail for audit.
+func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge beichenCharge) error {
+	var milli string
+	err := tx.QueryRowContext(ctx, `WITH price AS (
+		SELECT $2::numeric * COALESCE($9::numeric,1) AS base,
+			COALESCE(beichen_school_multiplier,1) AS school_multiplier,
+			CASE WHEN student_cap_milli IS NOT NULL
+				THEN GREATEST(student_cap_milli,0)*0.001::numeric END AS cap
+		FROM gateway_calls WHERE id=$1 AND beichen_state='pending_review'
+	), full_price AS (
+		SELECT *,base*school_multiplier AS actual FROM price
+	), amount AS (
+		SELECT *,LEAST(actual,cap) AS student FROM full_price
+	)
+	UPDATE gateway_calls c SET beichen_state='charged',billing_state='charged',
+		beichen_credit_exact=amount.student,credit_milli=trunc(amount.student*1000)::bigint,
+		actual_credits=amount.actual,student_credits=amount.student,school_absorbed_credits=amount.actual-amount.student,
+		beichen_base_credits=CASE WHEN amount.actual=amount.student THEN amount.base END,
+		beichen_base_source=CASE WHEN amount.actual=amount.student THEN $3::text END,
+		beichen_review_reason=NULL,beichen_upstream_price_version=$4,beichen_multiplier_version=$5,
+		price_tier=COALESCE(NULLIF($6,''),c.price_tier),
+		price_snapshot=COALESCE(NULLIF($7,'')::jsonb,c.price_snapshot),
+		pricing_detail=CASE WHEN $8<>'' OR amount.actual>amount.student THEN
+			COALESCE(NULLIF($8,'')::jsonb,c.pricing_detail,'{}'::jsonb) ||
+			jsonb_build_object('base_credits',trim_scale(amount.base)::text,'base_source',$3::text,
+				'school_multiplier',trim_scale(amount.school_multiplier)::text) ||
+			CASE WHEN $9::numeric IS NOT NULL
+				THEN jsonb_build_object('upstream_multiplier',trim_scale($9::numeric)::text)
+				ELSE '{}'::jsonb END
+			ELSE c.pricing_detail END
+	FROM amount WHERE c.id=$1 AND c.beichen_state='pending_review'
+	RETURNING (amount.student*1000)::text`, callID, charge.base, charge.source,
+		charge.upstreamVersion, charge.multiplierVersion, charge.tier, string(charge.snapshot), string(charge.detail),
+		charge.quoteMultiplier).Scan(&milli)
 	if err != nil {
 		return err
 	}
-	return refreshLedgerTurn(ctx, tx, callID, milli.String, true)
+	if err := postLedgerCharge(ctx, tx, callID, milli); err != nil {
+		return err
+	}
+	return refreshLedgerTurn(ctx, tx, callID, milli, true)
 }
 
 func postLedgerBuckets(ctx context.Context, tx *sql.Tx, callID uuid.UUID, hold int64, milli string) error {
