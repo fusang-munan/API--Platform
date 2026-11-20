@@ -130,18 +130,25 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 	// An interrupted usage report can contain only the initial stream counters.
 	// Price lookup uses the dispatch identity and observed time pinned by Finalize.
 	var base, exact, milli sql.NullString
+	var source string
 	var upstream, multiplier sql.NullInt64
+	// 0042 的跟随费率仍是上游余额单位；仅手动费率已换成积分，须除以 100，避免多扣。
 	err := tx.QueryRowContext(ctx, `SELECT cost.credits::text,booked.credits::text,(booked.credits*1000)::text,
-		p.upstream_version,p.multiplier_version
+		p.upstream_version,p.multiplier_version,
+		CASE WHEN p.mode='manual' THEN 'teacher_manual_price' ELSE 'gateway_usage_price' END
 		FROM gateway_calls c
 		CROSS JOIN LATERAL beichen_price_at(c.beichen_dispatch_credential_id,c.beichen_dispatch_model,c.beichen_price_at) p
-		CROSS JOIN LATERAL (SELECT beichen_token_credits(c.protocol,$2,$3,$4,$5,$6,
-			p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write) AS credits) cost
+		CROSS JOIN LATERAL (SELECT COALESCE(
+			beichen_token_credits(c.protocol,$2,$3,$4,$5,$6,
+				p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)
+				/CASE WHEN p.mode='manual' THEN 100 ELSE 1 END,
+			beichen_token_credits(c.protocol,$2,$3,$4,$5,$6,
+				p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write)) AS credits) cost
 		CROSS JOIN LATERAL (SELECT cost.credits*COALESCE(c.beichen_school_multiplier,1) AS credits) booked
 		WHERE c.id=$1 AND c.beichen_state='pending_review'
 		  AND c.beichen_price_at IS NOT NULL
 		FOR UPDATE OF c`, callID, metrics.PromptTokens, metrics.CompletionTokens,
-		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens).Scan(&base, &exact, &milli, &upstream, &multiplier)
+		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens).Scan(&base, &exact, &milli, &upstream, &multiplier, &source)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -165,9 +172,9 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_state='charged',billing_state='charged',
 		beichen_credit_exact=$2::numeric,credit_milli=trunc($2::numeric*1000)::bigint,
-		beichen_base_credits=$5::numeric,beichen_base_source='gateway_usage_price',
+		beichen_base_credits=$5::numeric,beichen_base_source=$6,
 		beichen_review_reason=NULL,beichen_upstream_price_version=$3,beichen_multiplier_version=$4
-		WHERE id=$1`, callID, exact.String, upstream, multiplier, base.String)
+		WHERE id=$1`, callID, exact.String, upstream, multiplier, base.String, source)
 	if err != nil {
 		return err
 	}

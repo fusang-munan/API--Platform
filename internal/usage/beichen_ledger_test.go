@@ -372,6 +372,9 @@ func TestBeichenLedgerPostgres(t *testing.T) {
 		t.Run("school billing and teacher allocation", func(t *testing.T) {
 			testSchoolBilling(t, ctx, isolated, org, student, model, provider, other.CredentialID)
 		})
+		t.Run("教师手动价实际扣费", func(t *testing.T) {
+			testBeichenManualBilling(t, ctx, isolated, org, student, model, provider, other.CredentialID)
+		})
 	})
 	t.Run("project receipt attribution", func(t *testing.T) {
 		testProjectReceiptAttribution(t, ctx, isolated, org, project, student, key, model)

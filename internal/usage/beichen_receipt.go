@@ -134,22 +134,29 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 	var base, source sql.NullString
 	var upstream, multiplier sql.NullInt64
 	if applied {
-		// Receipt token columns are already disjoint. Never feed their uncached
-		// input count through a protocol parser that subtracts cached tokens.
+		// 回执的输入、缓存计数已经互斥；直接加权，不能再次按协议扣除缓存。
+		// 跟随费率沿用 0042 的余额单位；教师费率以积分保存，结果须除以 100。
 		err = tx.QueryRowContext(ctx, `SELECT coalesce(cost.gateway,cost.receipt,$2::numeric*100)::text,
-			CASE WHEN cost.gateway IS NOT NULL THEN 'gateway_usage_price'
+			CASE WHEN p.mode='manual' AND coalesce(cost.gateway,cost.receipt) IS NOT NULL THEN 'teacher_manual_price'
+			     WHEN cost.gateway IS NOT NULL THEN 'gateway_usage_price'
 			     WHEN cost.receipt IS NOT NULL THEN 'receipt_usage_price' ELSE 'receipt_actual_cost' END,
 			CASE WHEN coalesce(cost.gateway,cost.receipt) IS NOT NULL THEN p.upstream_version END,
 			CASE WHEN coalesce(cost.gateway,cost.receipt) IS NOT NULL THEN p.multiplier_version END
 			FROM gateway_calls c
 			LEFT JOIN LATERAL beichen_price_at(c.beichen_dispatch_credential_id,c.beichen_dispatch_model,coalesce(c.beichen_price_at,c.sent_at)) p
-			  ON c.beichen_school_multiplier=1.10
+			  ON c.beichen_school_multiplier=1.10 OR p.mode='manual'
 			CROSS JOIN LATERAL (SELECT
-			  CASE WHEN c.usage_state='reported' THEN beichen_token_credits(c.protocol,c.prompt_tokens,c.completion_tokens,
-			    c.cache_hit_tokens,c.cache_miss_tokens,c.cache_write_tokens,p.upstream_input,p.upstream_output,
-			    p.upstream_cache_read,p.upstream_cache_write) END AS gateway,
-			  beichen_weighted_tokens($3,$4,$5,$6,p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write)
-			    *0.0000000001::numeric AS receipt) cost
+			  CASE WHEN c.usage_state='reported' THEN coalesce(
+			    beichen_token_credits(c.protocol,c.prompt_tokens,c.completion_tokens,c.cache_hit_tokens,c.cache_miss_tokens,
+			      c.cache_write_tokens,p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)
+			      /CASE WHEN p.mode='manual' THEN 100 ELSE 1 END,
+			    beichen_token_credits(c.protocol,c.prompt_tokens,c.completion_tokens,c.cache_hit_tokens,c.cache_miss_tokens,
+			      c.cache_write_tokens,p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write)) END AS gateway,
+			  coalesce(
+			    beichen_weighted_tokens($3,$4,$5,$6,p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)
+			      /CASE WHEN p.mode='manual' THEN 100 ELSE 1 END,
+			    beichen_weighted_tokens($3,$4,$5,$6,p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write))
+			      *0.0000000001::numeric AS receipt) cost
 			WHERE c.id=$1`, callID, receipt.ActualCost, receipt.InputTokens, receipt.OutputTokens, receipt.CacheReadTokens,
 			receipt.CacheWriteTokens).Scan(&base, &source, &upstream, &multiplier)
 		if err != nil {

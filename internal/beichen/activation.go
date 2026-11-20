@@ -313,17 +313,144 @@ func (m *activationModel) overview() CatalogModel {
 	return result
 }
 
-// EnableModel rechecks the snapshot under a transaction before applying it.
-// Concurrent first clicks may both see no model. Retry a serialization conflict
-// with a fresh snapshot, preserving any route or governance change that won.
+type BatchEnabledModel struct {
+	Model   string    `json:"model"`
+	ModelID uuid.UUID `json:"model_id"`
+}
+
+type BatchSkippedModel struct {
+	Model   string `json:"model"`
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+}
+
+type BatchEnableResult struct {
+	Enabled []BatchEnabledModel `json:"enabled"`
+	Skipped []BatchSkippedModel `json:"skipped"`
+}
+
+// EnableModelsBatch 逐模型提交，单项失败不会撤销同批已经成功的启用。
+func (s *Service) EnableModelsBatch(ctx context.Context, provider, actor uuid.UUID, models []string) (BatchEnableResult, error) {
+	result := BatchEnableResult{Enabled: []BatchEnabledModel{}, Skipped: []BatchSkippedModel{}}
+	if provider == uuid.Nil || actor == uuid.Nil || len(models) == 0 || len(models) > 200 {
+		return result, invalid("需要有效的供应商、教师 ID 和 1 至 200 个模型")
+	}
+	unique := make([]string, 0, len(models))
+	seen := make(map[string]bool, len(models))
+	for _, model := range models {
+		if !validModel(model) {
+			return result, invalid("请指定有效的北辰目录模型")
+		}
+		key := strings.ToLower(model)
+		if !seen[key] {
+			seen[key] = true
+			unique = append(unique, model)
+		}
+	}
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM providers p WHERE p.id=$1 AND `+beichenProvider+`)`, provider).Scan(&exists); err != nil {
+		return result, unavailable("读取北辰供应商失败", err)
+	}
+	if !exists {
+		return result, domain.NewError(domain.CodeNotFound, "北辰供应商不存在")
+	}
+	for _, model := range unique {
+		var id uuid.UUID
+		var skipped *BatchSkippedModel
+		var err error
+		for attempt := 0; ; attempt++ {
+			id, skipped, err = s.enableBatchModel(ctx, provider, actor, model)
+			if attempt >= 2 || !activationRetryable(err) {
+				break
+			}
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return result, ctx.Err()
+			}
+			message := "启用模型失败，请重试或联系管理员"
+			var appErr *domain.Error
+			if errors.As(err, &appErr) {
+				message = appErr.Message
+			}
+			skipped = &BatchSkippedModel{Model: model, Reason: "enable_failed", Message: message}
+		}
+		if skipped != nil {
+			result.Skipped = append(result.Skipped, *skipped)
+		} else {
+			result.Enabled = append(result.Enabled, BatchEnabledModel{Model: model, ModelID: id})
+		}
+	}
+	return result, nil
+}
+
+func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUID, source string) (uuid.UUID, *BatchSkippedModel, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return uuid.Nil, nil, err
+	}
+	defer tx.Rollback()
+	skip := func(reason, message string) (uuid.UUID, *BatchSkippedModel, error) {
+		return uuid.Nil, &BatchSkippedModel{Model: source, Reason: reason, Message: message}, nil
+	}
+	models, err := loadActivationCatalog(ctx, tx, provider, source)
+	if err != nil {
+		return uuid.Nil, nil, err
+	}
+	if len(models) != 1 {
+		return skip("not_found", "当前北辰目录中没有此模型")
+	}
+	m := models[0]
+	target := m.target("")
+	if target == nil {
+		return skip("route_not_ready", "存在多个校内模型，请先明确该模型的线路")
+	}
+	plan := m.plan(target)
+	if target.status == "active" && len(plan.writes) == 0 {
+		return skip("already_active", "模型已启用")
+	}
+	if !plan.allowed(target) {
+		return skip("route_not_ready", "当前北辰凭据、已配置的线路或其他供应商计价尚未就绪")
+	}
+	seen := make(map[string]bool)
+	for _, route := range plan.routes {
+		if route.ProviderID != provider || route.CredentialID == nil {
+			continue
+		}
+		key := route.CredentialID.String() + ":" + route.UpstreamModel
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		var priced bool
+		if err := tx.QueryRowContext(ctx, `SELECT school_input IS NOT NULL FROM beichen_price_at($1,$2,statement_timestamp())`,
+			*route.CredentialID, route.UpstreamModel).Scan(&priced); err != nil {
+			return uuid.Nil, nil, err
+		}
+		if !priced {
+			return skip("no_price", "官网未报价或按条件计价，请先手动定价")
+		}
+	}
+	id, err := applyActivationPlan(ctx, tx, provider, actor, target, plan)
+	if err == nil {
+		err = tx.Commit()
+	}
+	return id, nil, err
+}
+
+func activationRetryable(err error) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg) && (pg.Code == "40001" || pg.Code == "40P01")
+}
+
+// EnableModel 在事务内重新检查目录；并发首次启用使用新快照重试，保留已胜出的线路修改。
 func (s *Service) EnableModel(ctx context.Context, provider, actor uuid.UUID, source, school string) (uuid.UUID, error) {
 	if !validModel(source) || school != "" && !validModel(school) {
 		return uuid.Nil, invalid("请指定有效的北辰目录模型")
 	}
 	for attempt := 0; ; attempt++ {
 		id, err := s.enableModel(ctx, provider, actor, source, school)
-		var pg *pgconn.PgError
-		if attempt >= 2 || !errors.As(err, &pg) || pg.Code != "40001" && pg.Code != "40P01" {
+		if attempt >= 2 || !activationRetryable(err) {
 			return id, err
 		}
 	}
@@ -351,6 +478,15 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 	if !plan.allowed(target) {
 		return uuid.Nil, invalid("当前北辰凭据、已配置的路线或其他供应商计价不支持直接启用")
 	}
+	id, err := applyActivationPlan(ctx, tx, provider, actor, target, plan)
+	if err == nil {
+		err = tx.Commit()
+	}
+	return id, err
+}
+
+func applyActivationPlan(ctx context.Context, tx *sql.Tx, provider, actor uuid.UUID, target *activationSchool, plan activationPlan) (uuid.UUID, error) {
+	var err error
 	if target.id == uuid.Nil {
 		err = tx.QueryRowContext(ctx, `INSERT INTO models(id,model_id,display_name,created_at,updated_at)
  VALUES(gen_random_uuid(),$1::text,$1::text,now(),now()) ON CONFLICT(model_id) DO UPDATE SET model_id=models.model_id RETURNING id`, target.name).Scan(&target.id)
@@ -370,8 +506,7 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 			return uuid.Nil, err
 		}
 	}
-	// A positive neutral governance value makes the model eligible for student
-	// applications. The Beichen ledger prices actual usage independently.
+	// 正的中性倍率用于学生申请资格，北辰账本独立计算实际用量费用。
 	if target.multiplier == nil || *target.multiplier <= 0 {
 		_, err = tx.ExecContext(ctx, `INSERT INTO model_multiplier_audits(id,model_id,actor_user_id,old_multiplier_milli,new_multiplier_milli,reason,created_at)
  VALUES(gen_random_uuid(),$1,$2,$3,1000,'教师启用北辰目录模型，使用北辰基础计价',now())`, target.id, actor, target.multiplier)
@@ -384,5 +519,5 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 	if err != nil {
 		return uuid.Nil, err
 	}
-	return target.id, tx.Commit()
+	return target.id, nil
 }
