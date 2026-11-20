@@ -15,6 +15,7 @@ import (
 )
 
 func (s *Server) beichenOverview(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
 	providerID, ok := pathID(c, "provider_id")
 	if !ok {
 		return
@@ -24,7 +25,7 @@ func (s *Server) beichenOverview(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	respond(c, http.StatusOK, view)
+	respond(c, http.StatusOK, s.config.SchoolWorkspace.overview(view, identity(c), c.Request))
 }
 
 func (s *Server) beichenArchivedReceipts(c *gin.Context) {

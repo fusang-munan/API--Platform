@@ -37,6 +37,12 @@ bash scripts/compose-local.sh logs --no-color --tail=300 backend | grep 'mainten
 
 维护入口的 `GET /.well-known/nebula-maintenance` 供无凭据的上线检查使用。`email_delivery` 为 `log_only` 表示该实例只写开发日志，为 `smtp_configured` 表示已选择 SMTP，实际投递需要收件方确认。此接口不发信。
 
+### 校方北辰工作区入口
+
+校方给维护教师开通远程应用并在该应用中限定访问者后，将教师的中转站用户 UUID 填入 `LAB_BEICHEN_WORKSPACE_TEACHER_ID`，将受管应用稳定的 HTTPS 地址填入 `LAB_BEICHEN_WORKSPACE_URL`。这两项由学校部署配置读取。工作区使用独立主机名，以隔离中转站登录 Cookie。地址应直接指向工作区，使用不含用户名、密码、查询参数和片段的长期入口。
+
+同一教师登录已核实的学校 HTTPS 站点后，在「供应商管理 → 北辰 → 查看模型」打开工作区。只指定教师时，页面显示应用地址待配置。进入工作区时由该应用独立验证用户。入口只是导航，后台获取网页数据还需要已接通的数据读取方式，可通过价格和逐笔归档成功时间核验。
+
 ### 随 GitHub 更新交付北辰配置
 
 1. 学校按现有流程更新至 0.14.0 后，在已核实的学校 HTTPS 入口读取 `/.well-known/nebula-beichen-recipient`。该入口只返回收件公钥和算法。学校持久卷内的收件私钥与 HTTPS 身份各自保存。 首次取得证书时，可在浏览器的学校 HTTPS 证书详情中导出单张 DER 格式的服务器证书，用 `Get-FileHash -Algorithm SHA256 <证书路径>` 计算指纹，与校方通过独立渠道确认的 SHA-256 逐字核对。

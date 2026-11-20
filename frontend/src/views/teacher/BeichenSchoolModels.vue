@@ -17,6 +17,19 @@ const rows = computed(() => overview.value ? schoolCatalog(overview.value, props
   (!props.commonIds || props.commonIds.has(row.model.toLowerCase()))) : [])
 const loginNeeded = computed(() => overview.value?.web_login_required ?? overview.value?.datasets?.some(row =>
   /重新授权|重新登录|完成登录验证|(?:官网|网站).*(?:授权|会话)(?:已)?(?:失效|过期)/u.test(row.last_error ?? '')))
+const workspaceUrl = computed(() => {
+  const raw = overview.value?.maintenance_workspace?.launch_url
+  if (typeof raw !== 'string' || !/^https:\/\/[^/@]+(?:\/|$)/i.test(raw)) return null
+  // 只接受原始的主机和路径，拒绝参数、片段及浏览器会自动修正的分隔符。
+  if (/[?#\\\s\u0000-\u001f\u007f]/u.test(raw)) return null
+  try {
+    const target = new URL(raw)
+    // 同一主机即使端口不同，也可能收到学校的会话 Cookie。
+    return target.hostname === window.location.hostname ? null : target.href
+  } catch {
+    return null
+  }
+})
 
 async function load() {
   loading.value = true
@@ -56,6 +69,11 @@ onMounted(load)
 </script>
 
 <template>
+  <section v-if="providerMaintenance && overview?.maintenance_workspace" aria-label="校方北辰工作区">
+    <a v-if="workspaceUrl" class="button secondary" :href="workspaceUrl" target="_blank"
+      rel="noopener noreferrer" referrerpolicy="no-referrer">打开校方北辰工作区</a>
+    <p v-else class="muted">校方尚未配置远程应用地址</p>
+  </section>
   <BeichenRecentReceipts v-if="providerMaintenance" :provider-id="providerId" :website-sync="overview?.website_sync"
     @refresh-overview="refreshOverview" />
   <section aria-label="北辰模型目录">

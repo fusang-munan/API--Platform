@@ -432,6 +432,8 @@ data: {"revision":"01K2..."}
 
 `website_sync` 汇总当前学校预配的有效渠道。按 `channels` 查看渠道总数，`priced_channels` 表示当前有有效网页报价的数量，`price_last_seen` 表示最近观察到网页模型价格的时间。`receipt_checked_channels` 计数曾成功读取逐笔流水分页的渠道，`receipt_last_checked` 为最近成功读取一页的时间，`receipt_caught_up_channels` 计数已读到末页的渠道。时间可为空。这组状态反映当前同步进度，查询不同账日时含义相同。
 
+该概览响应使用 `Cache-Control: private, no-store`。通过学校维护 HTTPS 登录的指定教师可收到 `maintenance_workspace` 对象。对象为空表示等待校方提供远程应用地址，配置完成时包含 `launch_url`。其他账号的概览省略此字段。该字段只提供导航，网页授权状态和采集进度分别由 `web_login_required` 与 `website_sync` 表示。
+
 逐笔对账的 `day` 默认为北京时间当天。第一页省略 `cursor`，后续传入上页的 `data.next_cursor`，保持同一供应商和日期。每页最多 50 行，以流水发生时间倒序排列。最后一页的游标为 `null`。游标错用到其他账日或供应商、游标内容错误及日期格式错误均返回 400。每行含 `occurred_at`、`model`、`matched`、`student_name`、`base_credits`、`school_multiplier`、`charged_credits`、`actual_cost` 和 `difference_credits`。金额和积分用十进制字符串表示。缺少依据的字段返回 `null`，确认零金额返回 `"0"`。差额等于学校已扣积分减去北辰原始实扣乘 100。此查询只读取学校的账本。
 
 价格请求包含 `credential_id`、`model`、`mode`。设置 `manual` 时同时提供 `rates`，其中 `input`、`output` 必填，`cache_read`、`cache_write` 可空，四项均为每百万 Token 的试算价格，以百万分之一校内积分表示。恢复 `follow` 时省略 `rates`。跟随试算和学生正式扣费均以 1 北辰余额单位折合 100 积分；手填校内试算价只影响试算列。

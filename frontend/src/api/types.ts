@@ -135,6 +135,7 @@ export type BeichenComparison = {
 export type BeichenOverview = {
   web_login_required?: boolean | null
   website_sync?: BeichenWebsiteSync | null
+  maintenance_workspace?: { launch_url?: string | null } | null
   model_catalog?: BeichenCatalogModel[] | null
   datasets: BeichenDataset[] | null
   models: BeichenModel[] | null

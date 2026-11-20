@@ -12,10 +12,11 @@ import (
 )
 
 type Config struct {
-	CookieSecure  bool
-	RefreshTTL    time.Duration
-	SSEHeartbeat  time.Duration
-	AllowedOrigin string
+	CookieSecure    bool
+	RefreshTTL      time.Duration
+	SSEHeartbeat    time.Duration
+	AllowedOrigin   string
+	SchoolWorkspace SchoolWorkspace
 }
 
 type Server struct {
