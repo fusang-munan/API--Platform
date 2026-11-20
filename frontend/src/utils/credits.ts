@@ -46,7 +46,8 @@ export function formatTokens(value: number | string | null | undefined): string 
 export function shiftDecimal(value: string | number | null | undefined, places: number): string {
   const parsed = parts(value)
   if (!parsed) return '—'
-  const digits = (parsed.whole + parsed.fraction).replace(/^0+(?=\d)/, '') || '0'
+  // Keep leading zeros: they carry the decimal point position.
+  const digits = parsed.whole + parsed.fraction
   const point = parsed.whole.length + places
   let whole: string
   let fraction: string
