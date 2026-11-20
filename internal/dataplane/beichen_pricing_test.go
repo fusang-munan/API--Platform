@@ -32,6 +32,38 @@ func TestBeichenTextPricingReview(t *testing.T) {
 	}
 }
 
+func TestBeichenRequestPricingEvidence(t *testing.T) {
+	cases := []struct {
+		name, path, body string
+		effort, ttl      string
+	}{
+		{"chat", "/v1/chat/completions", `{"reasoning_effort":"high"}`, "high", ""},
+		{"responses", "/v1/responses", `{"reasoning":{"effort":"low"}}`, "low", ""},
+		{"responses default", "/v1/responses", `{"reasoning":{"summary":"auto"}}`, "medium", ""},
+		{"thinking effort", "/v1/messages", `{"thinking":{"effort":"high"},"messages":[{"content":[{"type":"text","cache_control":{"ttl":"1h"}}]}]}`, "high", "1h"},
+		{"Anthropic output effort", "/v1/messages", `{"output_config":{"effort":"max"},"thinking":{"effort":"high"},"cache_control":{"type":"ephemeral"}}`, "max", "5m"},
+		{"Anthropic effort fallback", "/v1/messages", `{"effort":"low","cache_control":{"ttl":"1h"}}`, "low", "1h"},
+		{"only a thinking budget", "/v1/messages", `{"thinking":{"type":"enabled","budget_tokens":1024}}`, "medium", ""},
+		{"same TTL", "/v1/messages", `{"cache_control":{"ttl":"5m"},"system":[{"type":"text","cache_control":{"type":"ephemeral"}}]}`, "medium", "5m"},
+		{"mixed TTL", "/v1/messages", `{"cache_control":{"ttl":"1h"},"system":[{"type":"text","cache_control":{"ttl":"5m"}}]}`, "medium", ""},
+		{"invalid TTL", "/v1/messages", `{"cache_control":{"ttl":"2h"}}`, "medium", ""},
+		{"empty cache declaration", "/v1/messages", `{"cache_control":{}}`, "medium", ""},
+		{"similarly named metadata", "/v1/messages", `{"metadata":{"cache_control":{"ttl":"1h"}}}`, "medium", ""},
+		{"OpenAI uses implicit cache", "/v1/chat/completions", `{"cache_control":{"ttl":"1h"}}`, "medium", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var route usage.CallRoute
+			if reason := beichenRequestReview([]byte(tc.body), tc.path, &route); reason != "" {
+				t.Fatalf("unexpected pricing review: %s", reason)
+			}
+			if route.ReasoningEffort == nil || *route.ReasoningEffort != tc.effort || route.CacheTTL != tc.ttl {
+				t.Fatalf("expected effort %q and TTL %q, got effort %v and TTL %q", tc.effort, tc.ttl, route.ReasoningEffort, route.CacheTTL)
+			}
+		})
+	}
+}
+
 func TestBeichenPricingRequiresCompleteCompatibleCounters(t *testing.T) {
 	for _, tc := range []struct{ usage, reason string }{
 		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}`, ""},
@@ -42,10 +74,27 @@ func TestBeichenPricingRequiresCompleteCompatibleCounters(t *testing.T) {
 	} {
 		route := usage.CallRoute{SentAt: time.Now()}
 		response := parseJSONResponseMetrics(modelbinding.AdapterOpenaiResponses, []byte(`{"usage":`+tc.usage+`}`)).finished(false)
-		metrics, reason := beichenReviewMetrics(&route, response, "")
+		metrics, reason := beichenReviewMetrics(&route, modelbinding.AdapterOpenaiResponses, response, "")
 		if reason != tc.reason || (metrics.State == usage.UsageReported) != (tc.reason == "") ||
 			metrics.PromptTokens == nil || *metrics.PromptTokens != 59 || route.SentAt.IsZero() {
 			t.Fatalf("unexpected pricing eligibility for %s: %q, %+v", tc.usage, reason, metrics)
 		}
+	}
+}
+
+func TestBeichenAnthropicStreamPricingUsesMessageModelAndSeparateCounters(t *testing.T) {
+	const opening = "data: {\"type\":\"message_start\",\"message\":{\"model\":\"bound\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0,\"cache_read_input_tokens\":50,\"cache_creation_input_tokens\":500}}}\n\n"
+	const terminal = "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+	observer := sseObserver{adapter: modelbinding.AdapterAnthropic, beichen: true, expectedModel: "bound"}
+	observer.observe([]byte(opening + terminal))
+	route := usage.CallRoute{SentAt: time.Now()}
+	metrics, reason := beichenReviewMetrics(&route, observer.adapter, observer.metrics.finished(!observer.terminal), observer.review)
+	if !observer.modelReported || reason != "" || metrics.State != usage.UsageReported {
+		t.Fatalf("Anthropic stream was not eligible for token pricing: %q, %+v", reason, metrics)
+	}
+	mismatch := sseObserver{adapter: modelbinding.AdapterAnthropic, beichen: true, expectedModel: "different"}
+	mismatch.observe([]byte(opening + terminal))
+	if mismatch.review != beichenModelMismatch {
+		t.Fatalf("nested model mismatch was not detected: %q", mismatch.review)
 	}
 }

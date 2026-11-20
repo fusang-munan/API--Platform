@@ -54,6 +54,7 @@ type Config struct {
 	GatewayMaxRequestBytes        int64
 	GatewayResourceRouteTTL       time.Duration
 	BeichenProbesEnabled          bool
+	BeichenProbeDailyLimit        int
 }
 
 type BootstrapAccount struct {
@@ -223,6 +224,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.BeichenProbesEnabled, err = boolValue("BEICHEN_PROBES_ENABLED", true); err != nil {
+		return Config{}, err
+	}
+	if cfg.BeichenProbeDailyLimit, err = intValue("BEICHEN_PROBE_DAILY_LIMIT", 500); err != nil {
 		return Config{}, err
 	}
 

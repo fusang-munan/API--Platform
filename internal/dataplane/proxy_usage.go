@@ -151,7 +151,7 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 		var adjustments []func(map[string]json.RawMessage) error
 		var quotaBudget int64
 		if north && reservation != nil {
-			review = beichenHTTPRequestReview(original.URL.Path, replay, candidate.Binding.UpstreamModelName)
+			review = beichenHTTPRequestReview(original.URL.Path, replay, &candidateRoute)
 			field := quotaTokenField(original.URL.Path)
 			if limit := g.quotaTokenLimit(ctx, *reservation, candidateRoute, field); limit > 0 {
 				adjustments = append(adjustments, func(payload map[string]json.RawMessage) error {
@@ -339,7 +339,7 @@ func (g *Gateway) proxyHTTPBody(w http.ResponseWriter, original *http.Request, r
 		}
 	}
 	if north && success {
-		metrics, review = beichenReviewMetrics(&candidate, metrics, review)
+		metrics, review = beichenReviewMetrics(&candidate, adapter, metrics, review)
 		if review != "" {
 			category, message = review, "The response requires billing review."
 		}
@@ -423,7 +423,7 @@ func (g *Gateway) proxySSE(w http.ResponseWriter, original *http.Request, respon
 		if observer.review == "" && !observer.modelReported {
 			observer.review = beichenModelUnconfirmed
 		}
-		metrics, review := beichenReviewMetrics(&candidate, metrics, observer.review)
+		metrics, review := beichenReviewMetrics(&candidate, observer.adapter, metrics, observer.review)
 		if interrupted {
 			_ = g.finalizeCall(ctx, reservation, false, "stream", "Upstream stream did not complete.", candidate, metrics)
 		} else {

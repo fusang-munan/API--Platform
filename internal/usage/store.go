@@ -90,6 +90,9 @@ func (s *Store) RunMaintenance(ctx context.Context, clean bool) error {
 	}
 	if clean {
 		err = s.RecoverAndClean(ctx)
+		if err == nil {
+			err = s.refreshBeichenBillingChecks(ctx, time.Now())
+		}
 	} else {
 		err = s.RecoverExpired(ctx)
 	}

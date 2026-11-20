@@ -109,9 +109,10 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 		return false, err
 	}
 	var callID uuid.UUID
-	var state string
+	var state, protocol, ttl string
+	var recordedWrites int64
 	var terms []byte
-	err = tx.QueryRowContext(ctx, `SELECT c.id,c.beichen_state,quote.terms
+	err = tx.QueryRowContext(ctx, `SELECT c.id,c.beichen_state,quote.terms,c.protocol,COALESCE(c.cache_ttl,''),COALESCE(c.cache_write_tokens,0)
 		FROM beichen_receipt_response_claims r
 		JOIN gateway_calls c ON c.id=r.first_call_id
 		JOIN beichen_receipt_active_bindings a ON a.credential_id=c.beichen_dispatch_credential_id
@@ -124,7 +125,7 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 		  AND c.beichen_dispatch_model=$4 AND c.beichen_state IN ('pending_review','charged')
 		  AND $5::timestamptz BETWEEN c.sent_at-interval '2 seconds' AND c.finalized_at+interval '2 minutes'
 		FOR UPDATE OF c FOR SHARE OF panel`, receipt.ResponseID, credentialID, receipt.APIKeyID, receipt.Model, receipt.OccurredAt).
-		Scan(&callID, &state, &terms)
+		Scan(&callID, &state, &terms, &protocol, &ttl, &recordedWrites)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -137,6 +138,8 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 		// 回执的输入、缓存计数已经互斥；直接加权，不能再次按协议扣除缓存。
 		// 跟随费率沿用 0042 的余额单位；教师费率以积分保存，结果须除以 100。
 		// 条件价无法使用固定官网价补记，已验证的北辰实扣仍可作为依据。
+		conditional := isBeichenConditional(terms) ||
+			(protocol == "anthropic" && (receipt.CacheWriteTokens > 0 || recordedWrites > 0) && beichenCacheTTL(ttl) != "5m")
 		err = tx.QueryRowContext(ctx, `SELECT coalesce(cost.gateway,cost.receipt,$2::numeric*100)::text,
 			CASE WHEN p.mode='manual' AND coalesce(cost.gateway,cost.receipt) IS NOT NULL THEN 'teacher_manual_price'
 			     WHEN cost.gateway IS NOT NULL THEN 'gateway_usage_price'
@@ -163,7 +166,7 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 			    END)
 			      *0.0000000001::numeric AS receipt) cost
 			WHERE c.id=$1`, callID, receipt.ActualCost, receipt.InputTokens, receipt.OutputTokens, receipt.CacheReadTokens,
-			receipt.CacheWriteTokens, isBeichenConditional(terms)).Scan(
+			receipt.CacheWriteTokens, conditional).Scan(
 			&charge.base, &charge.source, &charge.upstreamVersion, &charge.multiplierVersion)
 		if err != nil {
 			return false, err

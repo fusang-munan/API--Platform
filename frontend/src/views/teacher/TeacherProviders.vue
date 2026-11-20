@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { teacherAPI } from '../../api/teacher'
-import type { BeichenCatalogDifference, Provider, ProviderCredential } from '../../api/types'
+import type { BeichenCatalogDifference, BeichenModelAlias, BeichenModelAliasUpdate, Provider, ProviderCredential } from '../../api/types'
 import { APIError } from '../../api/client'
 import StatusBadge from '../../components/StatusBadge.vue'
 import AppDialog from '../../components/AppDialog.vue'
@@ -23,6 +23,14 @@ type KeyDraft = {
 
 const rows = ref<Provider[]>([])
 const schoolProvider = ref<Provider>()
+const aliasProvider = ref<Provider>()
+const aliases = ref<BeichenModelAlias[]>([])
+const aliasDraft = reactive<BeichenModelAlias>({ credential_id: null, upstream_model: '', school_model: '' })
+const editingAlias = ref(false)
+const readingAliases = ref(false)
+const savingAlias = ref(false)
+const aliasError = ref('')
+let aliasRequest = 0
 const reconcileProviderIds = ref<string[]>([])
 const anomalies = ref<Record<string, { pendingCalls?: number; missingModels?: number; differences?: BeichenCatalogDifference[] }>>({})
 const query = ref('')
@@ -127,6 +135,79 @@ async function loadAnomalies(providerId: string, day: string, version: number) {
 
 function refreshSchoolCatalog() {
   if (schoolProvider.value) void loadAnomalies(schoolProvider.value.id, schoolDay(), loadVersion)
+}
+
+function resetAliasDraft() {
+  aliasDraft.credential_id = aliasProvider.value?.credentials?.find(key => key.status === 'active')?.id ?? null
+  aliasDraft.upstream_model = ''
+  aliasDraft.school_model = ''
+  editingAlias.value = false
+}
+
+async function loadAliases(providerId: string) {
+  const request = ++aliasRequest
+  readingAliases.value = true
+  aliasError.value = ''
+  try {
+    const result = await teacherAPI.beichenAliases(providerId)
+    if (request === aliasRequest) aliases.value = result
+  } catch (e) {
+    if (request === aliasRequest) aliasError.value = msg(e)
+  } finally {
+    if (request === aliasRequest) readingAliases.value = false
+  }
+}
+
+function openAliases(provider: Provider) {
+  aliasProvider.value = provider
+  aliases.value = []
+  resetAliasDraft()
+  void loadAliases(provider.id)
+}
+
+function closeAliases() {
+  if (savingAlias.value) return
+  aliasProvider.value = undefined
+  aliasRequest++
+}
+
+function editAlias(row: BeichenModelAlias) {
+  Object.assign(aliasDraft, row)
+  editingAlias.value = true
+}
+
+function aliasChannel(id: string | null) {
+  if (id == null) return '所有渠道的默认别名'
+  return aliasProvider.value?.credentials?.find(key => key.id === id)?.label ?? id
+}
+
+async function writeAlias(body: BeichenModelAliasUpdate) {
+  const provider = aliasProvider.value
+  if (!provider || savingAlias.value || readingAliases.value) return
+  savingAlias.value = true
+  aliasError.value = ''
+  try {
+    await teacherAPI.putBeichenAlias(provider.id, body)
+    resetAliasDraft()
+    toast.success(body.school_model == null ? '已移除模型别名' : '已保存模型别名')
+    await loadAliases(provider.id)
+  } catch (e) {
+    aliasError.value = msg(e)
+  } finally {
+    savingAlias.value = false
+  }
+}
+
+function saveAlias() {
+  const upstream = aliasDraft.upstream_model.trim()
+  const school = aliasDraft.school_model.trim()
+  if (upstream && school) void writeAlias({ ...aliasDraft, upstream_model: upstream, school_model: school })
+}
+
+function removeAlias(row: BeichenModelAlias) {
+  if (window.confirm(`移除「${aliasChannel(row.credential_id)}」的 ${row.upstream_model} 别名？`)) {
+    void writeAlias({ ...row, school_model: null })
+  }
 }
 
 async function load() {
@@ -359,6 +440,7 @@ onBeforeUnmount(() => { loadVersion++ })
               <StatusBadge :status="p.status" />
               <button v-if="isBeichenProvider(p.base_url)" type="button" class="button secondary" :aria-expanded="reconcileProviderIds.includes(p.id)" :aria-controls="`beichen-reconcile-${p.id}`" @click="toggleReconciliation(p.id)">北辰对账</button>
               <button v-if="isBeichenProvider(p.base_url)" class="button secondary" @click="schoolProvider = p">查看模型</button>
+              <button v-if="isBeichenProvider(p.base_url)" type="button" class="button secondary" @click="openAliases(p)">模型别名</button>
               <template v-else>
                 <button class="button secondary" :disabled="resetting === p.id" @click="resetCatalog(p)">{{ resetting === p.id ? '重置中…' : '配置重置' }}</button>
                 <button class="button ghost" @click="open(p)">编辑</button>
@@ -401,6 +483,37 @@ onBeforeUnmount(() => { loadVersion++ })
 
     <AppDialog :open="Boolean(schoolProvider)" title="北辰模型" description="查看学校首选倍率并管理模型启用状态。" wide @update:open="open => { if (!open) schoolProvider = undefined }">
       <BeichenSchoolModels v-if="schoolProvider" :key="schoolProvider.id" :provider-id="schoolProvider.id" provider-maintenance @catalog-synced="refreshSchoolCatalog" />
+    </AppDialog>
+    <AppDialog :open="Boolean(aliasProvider)" title="北辰模型别名" description="把指定渠道的上游模型归到已有校内模型。" wide
+      @update:open="open => { if (!open) closeAliases() }">
+      <section v-if="aliasProvider" class="alias-panel" :aria-busy="readingAliases || savingAlias">
+        <p class="muted">保存后，对账按校内名称汇总。要更新调用线路，请在「查看模型」中预览并确认重建绑定。</p>
+        <ul v-if="aliases.length" class="alias-list" aria-label="模型别名">
+          <li v-for="row in aliases" :key="(row.credential_id ?? '') + '/' + row.upstream_model">
+            <div><small>{{ aliasChannel(row.credential_id) }}</small><div>{{ row.upstream_model }} → <strong>{{ row.school_model }}</strong></div></div>
+            <div class="actions">
+              <button type="button" class="button ghost" :disabled="savingAlias || readingAliases" @click="editAlias(row)">编辑</button>
+              <button type="button" class="button ghost" :disabled="savingAlias || readingAliases" @click="removeAlias(row)">移除</button>
+            </div>
+          </li>
+        </ul>
+        <p v-else-if="!readingAliases && !aliasError" class="muted">还没有模型别名。</p>
+        <p v-if="aliasError" class="error" role="alert">{{ aliasError }}</p>
+        <form class="provider-form" @submit.prevent="saveAlias">
+          <div class="grid two">
+            <label>渠道<select v-model="aliasDraft.credential_id" :disabled="editingAlias || savingAlias || readingAliases">
+              <option :value="null">所有渠道的默认别名</option>
+              <option v-for="key in aliasProvider.credentials ?? []" :key="key.id" :value="key.id">{{ key.label }}</option>
+            </select></label>
+            <label>上游模型名称<input v-model="aliasDraft.upstream_model" required maxlength="256" :disabled="editingAlias || savingAlias || readingAliases"></label>
+          </div>
+          <label>校内模型编号<input v-model="aliasDraft.school_model" required maxlength="256" placeholder="填写模型管理中的模型编号" :disabled="savingAlias || readingAliases"></label>
+          <div class="actions">
+            <button v-if="editingAlias" type="button" class="button ghost" :disabled="savingAlias" @click="resetAliasDraft">取消编辑</button>
+            <button type="submit" class="button primary" :disabled="savingAlias || readingAliases">{{ savingAlias ? '保存中…' : '保存别名' }}</button>
+          </div>
+        </form>
+      </section>
     </AppDialog>
     <AppDialog :open="drawer" :title="editing ? '编辑供应商' : '创建供应商'" description="维护供应商地址、渠道凭据与启用状态。" @update:open="drawer = $event">
       <form class="provider-form" @submit.prevent="save">
@@ -481,6 +594,10 @@ onBeforeUnmount(() => { loadVersion++ })
   .provider-row-head > .actions { width: 100%; }
 }
 .provider-form { display: grid; gap: 1rem; }
+.alias-panel { display: grid; gap: 1rem; }
+.alias-panel p, .alias-list { margin: 0; }
+.alias-list { padding: 0; list-style: none; }
+.alias-list li { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .key-panel {
   display: grid;
   gap: 0.875rem;

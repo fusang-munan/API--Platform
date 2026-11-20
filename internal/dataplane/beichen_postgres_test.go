@@ -260,6 +260,75 @@ FROM gateway_calls WHERE id=$1`, callID, want).Scan(&charged); err != nil || !ch
 		t.Fatal(err)
 	}
 	testBeichenRealtimeConnection(t, ctx, db, gateway, publicModel, gmModel, studentKey, upstreamKey, credential)
+	testBeichenHTTPConditions(t, ctx, db, gateway, binding, credential, publicModel, gmModel, studentKey)
+}
+
+func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, gateway *Gateway, binding, credential uuid.UUID, publicModel, upstreamModel, studentKey string) {
+	t.Helper()
+	if _, err := db.ExecContext(ctx, `WITH multiplier AS (
+		INSERT INTO beichen_multiplier_versions(credential_id,multiplier) VALUES($1,1)
+		RETURNING credential_id,id,effective_at
+	)
+	INSERT INTO beichen_panel_snapshots
+		(credential_id,effective_at,credential_revision,group_id,expires_at,multiplier_version,model_pricing,credential_ciphertext_sha256)
+	SELECT c.id,m.effective_at,c.updated_at,1,now()+interval '1 hour',m.id,
+		jsonb_build_object($2::text,'{"billing_mode":"token","input_price":0.000001,"output_price":0.000002,
+		  "cache_read_price":0.0000005,"cache_write_price":0.000001,"cache_write_1h_price":0.000003,
+		  "reasoning_effort_multipliers":{"medium":1,"high":2}}'::jsonb), sha256(c.credential_ciphertext)
+	FROM multiplier m JOIN provider_credentials c ON c.id=m.credential_id`, credential, upstreamModel); err != nil {
+		t.Fatal(err)
+	}
+	const chatUsage = `"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":2,"prompt_cache_write_tokens":3}`
+	const responsesUsage = `"status":"completed","usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}`
+	const messagesUsage = `"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":3}`
+	const messagesNoWrite = `"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":0}`
+	for _, tc := range []struct {
+		name, adapter, path, input, report string
+		effort, ttl, credits, review       string
+	}{
+		{"chat-high", "openai_compatible", "/v1/chat/completions", `"messages":[],"reasoning_effort":"high"`, chatUsage, "high", "", "0.0026", ""},
+		{"responses-default", "openai_responses", "/v1/responses", `"input":"fixture"`, responsesUsage, "medium", "", "0.0013", ""},
+		{"responses-absent-tier", "openai_responses", "/v1/responses", `"input":"fixture","reasoning":{"effort":"low"}`, responsesUsage, "low", "", "", "missing_reasoning_effort_multiplier"},
+		{"messages-1h", "anthropic", "/v1/messages", `"max_tokens":10,"thinking":{"effort":"high"},"messages":[{"role":"user","content":[{"type":"text","text":"fixture","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]`, messagesUsage, "high", "1h", "0.0038", ""},
+		{"messages-5m", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[],"cache_control":{"type":"ephemeral"}`, messagesUsage, "medium", "5m", "0.0013", ""},
+		{"messages-unknown-ttl", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[]`, messagesUsage, "medium", "", "", "unknown_cache_ttl"},
+		{"messages-no-writes", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[]`, messagesNoWrite, "medium", "", "0.001", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := db.ExecContext(ctx, "UPDATE model_bindings SET adapter=$2 WHERE id=$1", binding, tc.adapter); err != nil {
+				t.Fatal(err)
+			}
+			gateway.client.Transport = beichenGatewayTestTransport(func(r *http.Request) (*http.Response, error) {
+				defer r.Body.Close()
+				if r.URL.Path != tc.path {
+					t.Fatalf("unexpected fixture path %q", r.URL.Path)
+				}
+				httptrace.ContextClientTrace(r.Context()).WroteRequest(httptrace.WroteRequestInfo{})
+				body := fmt.Sprintf(`{"model":%q,%s}`, upstreamModel, tc.report)
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+			})
+			r := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(fmt.Sprintf(`{"model":%q,%s}`, publicModel, tc.input))).
+				WithContext(usage.WithRequestID(ctx, tc.name))
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("Authorization", "Bearer "+studentKey)
+			w := httptest.NewRecorder()
+			gateway.ServeHTTP(w, r)
+			if w.Code != http.StatusOK {
+				t.Fatalf("fixture gateway status=%d", w.Code)
+			}
+			var effort, ttl, credits, review, state string
+			err := db.QueryRowContext(ctx, `SELECT reasoning_effort,coalesce(cache_ttl,''),
+				coalesce(trim_scale(beichen_credit_exact)::text,''),coalesce(beichen_review_reason,''),beichen_state
+				FROM gateway_calls WHERE request_id=$1`, tc.name).Scan(&effort, &ttl, &credits, &review, &state)
+			wantState := "charged"
+			if tc.review != "" {
+				wantState = "pending_review"
+			}
+			if err != nil || effort != tc.effort || ttl != tc.ttl || credits != tc.credits || review != tc.review || state != wantState {
+				t.Fatalf("ledger effort=%q TTL=%q credits=%q review=%q state=%q: %v", effort, ttl, credits, review, state, err)
+			}
+		})
+	}
 }
 
 func testBeichenRealtimeConnection(t *testing.T, ctx context.Context, db *sql.DB, gateway *Gateway, publicModel, upstreamModel, studentKey, upstreamKey string, credential uuid.UUID) {
@@ -439,6 +508,7 @@ func testBeichenResponsesSocket(t *testing.T, ctx context.Context, db *sql.DB, g
 			err = db.QueryRowContext(ctx, `SELECT beichen_state='pending_review' AND protocol='openai_responses'
 				AND usage_state=$2 AND sent_at IS NOT NULL AND provider_credential_id=$3
 				AND beichen_receipt_response_id IS NULL
+				AND reasoning_effort='medium'
 				AND ($2 <> 'missing' OR (prompt_tokens=59 AND completion_tokens=3 AND cache_hit_tokens IS NULL))
 				FROM gateway_calls WHERE request_id=$1`, id, want, credential).Scan(&ok)
 			if err != nil || !ok {

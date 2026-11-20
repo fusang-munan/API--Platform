@@ -2,7 +2,8 @@
 import { computed, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
-import type { BeichenCatalogModel, BeichenHealthDimension, BeichenModelUsage, BeichenOverview, BeichenProbeRun, BeichenUsageRange } from '../../api/types'
+import type { BeichenCatalogModel, BeichenHealthDimension, BeichenModelUsage, BeichenOverview, BeichenProbeRun, BeichenUsageRange, BindingAdapter } from '../../api/types'
+import type { BeichenRebindPlan, BeichenRebindRoute } from '../../api/types'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { useToast } from '../../composables/useToast'
 import { priceFields, schoolCatalog, type SchoolCatalogRow, type SchoolQuote } from '../../utils/beichenModels'
@@ -19,6 +20,8 @@ const emit = defineEmits<{ 'catalog-synced': [] }>()
 type UsageState = { data?: BeichenModelUsage; loading?: boolean; error?: string }
 type PriceState = NonNullable<BeichenCatalogModel['price_state']>
 type BatchOutcome = { model: string; status: 'enabled' | 'skipped' | 'failed'; reason: string }
+type ProbeBudget = { date: string; used: number; limit: number; remaining: number; exhausted: boolean }
+type ProbeRunWithBudget = BeichenProbeRun & { budget?: ProbeBudget }
 
 const overview = ref<BeichenOverview>()
 const usageStates = ref<Partial<Record<BeichenUsageRange, UsageState>>>({})
@@ -26,8 +29,16 @@ const range = ref<BeichenUsageRange>('month')
 const loading = ref(false)
 const updating = ref('')
 const syncing = ref(false)
+const rescanKey = ref('')
+const rescanning = ref(false)
+const rescanError = ref('')
+const rebindOpen = ref(false)
+const rebindPlan = ref<BeichenRebindPlan>()
+const rebinding = ref(false)
+const rebindError = ref('')
+const rebindActions = { add: '新增', update: '调整', enable: '启用', disable: '停用' } as const
 const probeSubmitting = ref(false)
-const probeOverride = ref<BeichenProbeRun>()
+const probeOverride = ref<ProbeRunWithBudget>()
 const probeError = ref('')
 const error = ref('')
 const toast = useToast()
@@ -39,11 +50,17 @@ const priceStateLabels: Record<PriceState, string> = {
 const tokenPriceUnit = '每百万 Token 的积分'
 const convertibleUnits = new Set([tokenPriceUnit, '积分/次', '积分/秒'])
 const filters = [{ id: 'all', label: '全部' }, { id: 'active', label: '已启用' }, { id: 'pending', label: '待配置' }, { id: 'unpriced', label: '无报价' }, { id: 'manual', label: '手动价' }] as const
+function adapterLabel(value: string) { return bindingAdapterMeta(value as BindingAdapter).label }
 const filter = ref<typeof filters[number]['id']>('all')
 const priceRow = ref<SchoolCatalogRow>()
 const conditionsRow = ref<SchoolCatalogRow>()
 const usageOpen = ref(false)
 const initialModel = ref('')
+const websiteOnly = computed(() => overview.value?.website_only_models ?? [])
+const websiteOnlyNames = computed(() => new Set(websiteOnly.value.map(row => row.model.toLowerCase())))
+const rescanKeys = computed(() => (overview.value?.credentials ?? []).filter(key => key.status === 'active'))
+const rescanKeyAvailable = computed(() => rescanKeys.value.some(key => key.credential_id === rescanKey.value))
+const rebindModelCount = computed(() => new Set(rebindPlan.value?.changes.map(row => row.model_id)).size)
 const catalog = computed(() => {
   const data = overview.value
   if (!data) return []
@@ -84,7 +101,7 @@ const catalog = computed(() => {
     }))
     return {
       ...row, active, activation, canDisable, blockers, keyCoverage, routeCount, readyCount, priceState, priceCovered, pricing,
-      listed: entry?.credential_ids?.length !== 0,
+      listed: !websiteOnlyNames.value.has(model) && entry?.credential_ids?.length !== 0,
       protocolCount: entry?.protocols?.length ?? (protocols.size || (routeCount === 0 ? 0 : null)),
       protocolLabels: entry?.protocols?.map(protocol => bindingAdapterMeta(protocol).label) ?? [],
       probeState: entry?.probe_state,
@@ -95,7 +112,8 @@ const catalog = computed(() => {
 })
 type CatalogRow = (typeof catalog.value)[number]
 const listedModels = computed(() => catalog.value.filter(row => row.listed))
-const probeRun = computed(() => probeOverride.value ?? overview.value?.probe_run)
+const probeRun = computed<ProbeRunWithBudget | undefined>(() => probeOverride.value ?? overview.value?.probe_run as ProbeRunWithBudget | undefined)
+const probeBudget = computed(() => probeRun.value?.budget)
 const probeInProgress = computed(() => probeRun.value?.state === 'queued' || probeRun.value?.state === 'running')
 const probeLabels = { passed: '探活通过', failed: '探活失败', unprobed: '待探活' } as const
 const probeRunLabel = computed(() => {
@@ -111,6 +129,7 @@ const probeRunLabel = computed(() => {
 })
 const catalogByModel = computed(() => new Map(catalog.value.map(row => [row.model.toLowerCase(), row])))
 const searchedRows = computed(() => catalog.value.filter(row =>
+  (row.active || !websiteOnlyNames.value.has(row.model.toLowerCase())) &&
   row.model.toLowerCase().includes((props.query ?? '').trim().toLowerCase()) &&
   (!props.commonIds || props.commonIds.has(row.model.toLowerCase()))))
 const rows = computed(() => searchedRows.value.filter(row => filter.value === 'all' ||
@@ -118,6 +137,7 @@ const rows = computed(() => searchedRows.value.filter(row => filter.value === 'a
   filter.value === 'pending' && !row.active ||
   filter.value === 'unpriced' && !row.priceCovered ||
   filter.value === 'manual' && (row.mode !== 'follow' || row.priceState === 'manual')))
+const batchRows = computed(() => rows.value.filter(row => !websiteOnlyNames.value.has(row.model.toLowerCase())))
 const monthlyUsage = computed<UsageState>(() => usageStates.value.month ?? {})
 const drawerUsage = computed<UsageState>(() => usageStates.value[range.value] ?? {})
 const usageByModel = computed(() => new Map((monthlyUsage.value.data?.models ?? []).map(row => [row.model.toLowerCase(), row])))
@@ -136,7 +156,7 @@ const batchSelection = ref<string[]>()
 const batchBusy = ref(false)
 const batchProgress = ref<{ completed: number; total: number }>()
 const batchResults = ref<BatchOutcome[]>([])
-const busy = computed(() => loading.value || syncing.value || Boolean(updating.value) || batchBusy.value)
+const busy = computed(() => loading.value || syncing.value || rescanning.value || rebinding.value || Boolean(updating.value) || batchBusy.value)
 const batchPlan = computed(() => planBatch(batchSelection.value ?? []))
 const batchEligible = computed(() => batchPlan.value.filter(item => !item.reason))
 const batchSkipped = computed(() => batchPlan.value.filter(item => item.reason))
@@ -237,6 +257,7 @@ function publicationLabel(row: CatalogRow) {
 }
 
 function canEnableReason(row: CatalogRow) {
+  if (!row.listed) return '当前没有渠道 Key 列出此模型'
   if (row.activation === 'ready') return ''
   if (row.blockers.length) return row.blockers.join('；')
   if (row.activation == null && row.canEnable == null) return '启用条件待同步，请先刷新模型'
@@ -249,7 +270,7 @@ function planBatch(models: string[]) {
   return models.map(model => {
     const row = catalogByModel.value.get(model.toLowerCase())
     const active = row?.active ?? false
-    const canEnable = row?.activation === 'ready' || (row?.activation == null && row?.canEnable === true)
+    const canEnable = row?.listed && (row.activation === 'ready' || (row.activation == null && row.canEnable === true))
     const reason = active ? '已启用' : canEnable ? '' : row ? canEnableReason(row) : '当前目录中没有此模型'
     return { model, active, reason }
   })
@@ -275,8 +296,77 @@ async function syncPrices() {
   }
 }
 
+async function rescanCatalog() {
+  const credentialId = rescanKey.value
+  if (busy.value || !rescanKeyAvailable.value) return
+  const providerId = props.providerId
+  const current = () => !disposed && props.providerId === providerId
+  rescanning.value = true
+  rescanError.value = ''
+  try {
+    await teacherAPI.rescanBeichenCatalog(providerId, credentialId)
+    if (current()) toast.success('所选渠道目录已重扫')
+  } catch (e) {
+    if (current()) rescanError.value = apiErrorMessage(e, '所选渠道重扫失败，请稍后重试')
+  } finally {
+    if (current()) {
+      await load()
+      if (current()) {
+        rescanning.value = false
+        emit('catalog-synced')
+      }
+    }
+  }
+}
+
+async function previewRebind() {
+  if (busy.value) return
+  const providerId = props.providerId
+  const current = () => !disposed && props.providerId === providerId
+  rebindOpen.value = true
+  rebinding.value = true
+  rebindPlan.value = undefined
+  rebindError.value = ''
+  try {
+    const result = await teacherAPI.previewBeichenRebind(providerId)
+    if (current()) rebindPlan.value = result
+  } catch (e) {
+    if (current()) rebindError.value = apiErrorMessage(e, '生成绑定预览失败，请重试')
+  } finally {
+    if (current()) rebinding.value = false
+  }
+}
+
+async function confirmRebind() {
+  const plan = rebindPlan.value
+  if (busy.value || !plan?.changes.length) return
+  const providerId = props.providerId
+  const current = () => !disposed && props.providerId === providerId
+  rebinding.value = true
+  try {
+    const result = await teacherAPI.applyBeichenRebind(providerId, plan.preview_token)
+    if (!current()) return
+    rebindOpen.value = false
+    toast.success(`已重建 ${result.changes.length} 条北辰线路`)
+    await load()
+    if (current()) emit('catalog-synced')
+  } catch (e) {
+    if (current()) {
+      rebindPlan.value = undefined
+      rebindError.value = apiErrorMessage(e, '应用绑定失败，请重新预览')
+    }
+  } finally {
+    if (current()) rebinding.value = false
+  }
+}
+
+function routeDescription(route: BeichenRebindRoute) {
+  const channel = route.credential_label ?? route.credential_id ?? '自动选 Key'
+  return `${channel} · ${route.upstream_model} · 优先级 ${route.priority} · ${route.status === 'active' ? '启用' : '停用'}`
+}
+
 async function requestProbes() {
-  if (probeSubmitting.value || probeInProgress.value) return
+  if (probeSubmitting.value || probeInProgress.value || probeBudget.value?.exhausted) return
   const providerId = props.providerId
   const current = () => !disposed && props.providerId === providerId
   probeSubmitting.value = true
@@ -330,7 +420,7 @@ async function changeStatus(row: CatalogRow, enable: boolean) {
 
 function previewBatch() {
   if (busy.value) return
-  batchSelection.value = Array.from(new Map(rows.value.map(row => [row.model.toLowerCase(), row.model])).values())
+  batchSelection.value = Array.from(new Map(batchRows.value.map(row => [row.model.toLowerCase(), row.model])).values())
   batchProgress.value = undefined
   batchResults.value = []
 }
@@ -456,6 +546,13 @@ watch(() => props.providerId, () => {
   probeOverride.value = undefined
   probeError.value = ''
   probeSubmitting.value = false
+  rescanKey.value = ''
+  rescanning.value = false
+  rescanError.value = ''
+  rebindOpen.value = false
+  rebindPlan.value = undefined
+  rebinding.value = false
+  rebindError.value = ''
   usageStates.value = {}
   priceRow.value = undefined
   conditionsRow.value = undefined
@@ -520,17 +617,43 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
         </dl>
       </details>
     </section>
+    <section v-if="overview?.website_only_status" class="beichen-card website-catalog" aria-label="仅网页可见">
+      <div class="beichen-section-head">
+        <h3>仅网页可见</h3>
+        <form v-if="rescanKeys.length" class="actions" @submit.prevent="rescanCatalog">
+          <label class="sr-only" :for="reasonId + '-rescan-key'">选择要重扫的渠道 Key</label>
+          <select :id="reasonId + '-rescan-key'" v-model="rescanKey" :disabled="busy">
+            <option value="">选择渠道 Key</option>
+            <option v-for="key in rescanKeys" :key="key.credential_id" :value="key.credential_id">{{ key.label }}</option>
+          </select>
+          <button type="submit" class="button secondary" :disabled="busy || !rescanKeyAvailable">{{ rescanning ? '重扫中…' : '用指定 Key 重扫' }}</button>
+        </form>
+      </div>
+      <p v-if="overview.website_only_status === 'unverified'" class="beichen-note">待核对。需要官网分组清单以及每个启用 Key 的目录。</p>
+      <p v-else-if="!websiteOnly.length" class="beichen-note">没有仅网页可见的模型。</p>
+      <details v-else>
+        <summary>{{ websiteOnly.length }} 个模型未出现在任何已启用 Key 的目录里</summary>
+        <ul>
+          <li v-for="row in websiteOnly" :key="row.model"><strong>{{ row.model }}</strong> · {{ row.channels.map(channel => channel.label).join('、') }}</li>
+        </ul>
+      </details>
+    </section>
+    <p v-if="rescanError" class="error" role="alert">{{ rescanError }}</p>
     <div class="beichen-toolbar model-toolbar">
       <div class="beichen-toolbar-group">
         <button type="button" class="button ghost" :disabled="busy" @click="refreshOverview">刷新模型</button>
         <button type="button" class="button secondary" :disabled="busy" @click="syncPrices">{{ syncing ? '同步中…' : '立即同步价格' }}</button>
-        <button v-if="probeRun" type="button" class="button secondary" :disabled="probeSubmitting || probeInProgress || !listedModels.length" @click="requestProbes">
-          {{ probeSubmitting ? '提交中…' : '立即探活' }}
+        <button v-if="probeRun" type="button" class="button secondary" :disabled="probeSubmitting || probeInProgress || probeBudget?.exhausted || !listedModels.length" @click="requestProbes">
+          {{ probeSubmitting ? '提交中…' : probeBudget?.exhausted ? '今日已达上限' : '立即探活' }}
         </button>
-        <button type="button" class="button primary" :disabled="busy || !rows.length" @click="previewBatch">一键启用</button>
+        <button type="button" class="button secondary" :disabled="busy" @click="previewRebind">重建绑定</button>
+        <button type="button" class="button primary" :disabled="busy || !batchRows.length" @click="previewBatch">一键启用</button>
       </div>
     </div>
     <p v-if="probeRunLabel" class="beichen-note" role="status">{{ probeRunLabel }}</p>
+    <p v-if="probeBudget" class="beichen-note" data-testid="probe-budget" role="status">
+      今日探活 {{ probeBudget.used }}/{{ probeBudget.limit }} 次 · 剩余 {{ probeBudget.remaining }} 次<template v-if="probeBudget.exhausted"> · 已达上限，剩余模型明日继续</template>
+    </p>
     <p v-if="probeError" class="error" role="alert">{{ probeError }}</p>
     <div class="model-filters" role="group" aria-label="模型状态筛选"><button v-for="item in filters" :key="item.id" type="button" :aria-pressed="filter === item.id" @click="filter = item.id">{{ item.label }}</button><small>当前筛选 {{ rows.length }} 个模型</small></div>
     <p class="beichen-note">Token 单价按每百万 Token 计，1 元 = 100 积分。跟随官网时，学生实价按该线路的倍率计算。</p>
@@ -615,6 +738,33 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
   <BeichenPriceDrawer :open="Boolean(priceRow)" :provider-id="providerId" :row="priceRow" @update:open="open => { if (!open) priceRow = undefined }" @saved="priceSaved" />
   <BeichenModelUsageDrawer v-model:open="usageOpen" :range="range" :usage="drawerUsage.data" :loading="drawerUsage.loading"
     :error="drawerUsage.error" :initial-model="initialModel" @update:range="changeUsageRange" @retry="loadUsage(range)" />
+  <AppDialog :open="rebindOpen" title="预览北辰绑定重建" description="按当前渠道目录和模型别名更新线路。逐条确认变化后再执行。" wide
+    @update:open="open => { if (!open && !rebinding) rebindOpen = false }">
+    <section class="beichen-stack" :aria-busy="rebinding">
+      <p v-if="rebinding && !rebindPlan" role="status">正在读取绑定预览…</p>
+      <p v-if="rebindError" class="error" role="alert">{{ rebindError }}</p>
+      <template v-if="rebindPlan">
+        <p v-if="!rebindPlan.changes.length" role="status">当前绑定与目录一致。</p>
+        <template v-else>
+          <p role="status">将影响 {{ rebindModelCount }} 个校内模型、{{ rebindPlan.changes.length }} 条北辰线路。</p>
+          <ul class="rebind-changes">
+            <li v-for="row in rebindPlan.changes" :key="row.model_id + '/' + row.adapter">
+              <strong>{{ row.school_model }} · {{ adapterLabel(row.adapter) }} · {{ rebindActions[row.action] }}</strong>
+              <span v-if="row.before">当前 {{ routeDescription(row.before) }}</span>
+              <span>重建后 {{ routeDescription(row.after) }}</span>
+            </li>
+          </ul>
+        </template>
+      </template>
+      <div class="actions">
+        <button type="button" class="button ghost" :disabled="rebinding" @click="rebindOpen = false">关闭预览</button>
+        <button v-if="rebindError" type="button" class="button secondary" :disabled="busy" @click="previewRebind">重新预览</button>
+        <button v-if="rebindPlan?.changes.length" type="button" class="button primary" :disabled="busy" @click="confirmRebind">
+          {{ rebinding ? '重建中…' : '确认重建' }}
+        </button>
+      </div>
+    </section>
+  </AppDialog>
   <AppDialog :open="Boolean(batchSelection)" title="一键启用当前筛选模型" description="确认当前筛选结果中的可启用模型，其他模型将跳过。"
     @update:open="open => { if (!open && !batchBusy) batchSelection = undefined }">
     <section class="batch-preview beichen-stack" :aria-busy="batchBusy">
@@ -669,6 +819,12 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 </template>
 
 <style scoped>
+.website-catalog .actions { flex-wrap: wrap; }
+.website-catalog h3, .website-catalog p, .website-catalog ul, .rebind-changes { margin: 0; }
+.website-catalog summary { margin: 8px 0; cursor: pointer; }
+.website-catalog ul, .rebind-changes { overflow-wrap: anywhere; }
+.rebind-changes { padding: 0; list-style: none; }
+.rebind-changes li { display: grid; gap: 4px; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .beichen-models, .model-list { min-width: 0; max-width: 100%; }
 .beichen-models { grid-template-columns: minmax(0, 1fr); overflow-wrap: anywhere; }
 .monthly-usage { display: grid; gap: 12px; }

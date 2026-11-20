@@ -3,6 +3,7 @@ package httpapi
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +73,58 @@ func (s *Server) studentUsage(c *gin.Context) {
 	}
 	respond(c, http.StatusOK, v)
 }
+
+func studentRecentRangeQuery(c *gin.Context) (string, bool) {
+	value := c.DefaultQuery("range", "today")
+	if value == "" {
+		value = "today"
+	}
+	switch value {
+	case "today", "month", "all":
+		return value, true
+	default:
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
+			"error": gin.H{"code": domain.CodeValidation, "message": "range 须为 today、month 或 all",
+				"details": []gin.H{{"field": "range", "reason": "invalid_enum"}}},
+			"request_id": requestID(c),
+		})
+		return "", false
+	}
+}
+
+func (s *Server) studentRecentCalls(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	value, ok := studentRecentRangeQuery(c)
+	if !ok {
+		return
+	}
+	start, err := usage.StudentRecentStart(value, time.Now())
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	limit := 20
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		parsed, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || parsed < 1 || parsed > 100 {
+			writeError(c, domain.NewError(domain.CodeValidation, "limit must be between 1 and 100"))
+			return
+		}
+		limit = parsed
+	}
+	cursor, err := usage.DecodeCursor(c.Query("cursor"))
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	v, err := s.service.StudentRecentCalls(c.Request.Context(), identity(c).UserID, start, cursor, limit)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, v)
+}
+
 func (s *Server) studentCallReceipt(c *gin.Context) {
 	v, err := s.service.StudentCallReceipt(c.Request.Context(), identity(c).UserID, c.Param("request_id"))
 	if err != nil {

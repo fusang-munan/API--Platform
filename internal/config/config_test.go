@@ -42,6 +42,24 @@ func TestLoadBeichenProbeSchedule(t *testing.T) {
 	}
 }
 
+func TestLoadBeichenProbeDailyLimit(t *testing.T) {
+	setValidEnvironment(t)
+	for _, tc := range []struct {
+		value string
+		want  int
+	}{{"", 500}, {"25", 25}} {
+		t.Setenv("BEICHEN_PROBE_DAILY_LIMIT", tc.value)
+		cfg, err := Load()
+		if err != nil || cfg.BeichenProbeDailyLimit != tc.want {
+			t.Fatalf("probe daily limit = %d, want %d, %v", cfg.BeichenProbeDailyLimit, tc.want, err)
+		}
+	}
+	t.Setenv("BEICHEN_PROBE_DAILY_LIMIT", "0")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "BEICHEN_PROBE_DAILY_LIMIT") {
+		t.Fatalf("expected daily limit validation error, got %v", err)
+	}
+}
+
 func TestLoadParsesBootstrapTestAccounts(t *testing.T) {
 	setValidEnvironment(t)
 	t.Setenv("TEST_STUDENT_1_NAME", " Student One ")

@@ -11,10 +11,22 @@ import (
 )
 
 type ProbeRun struct {
-	State      string     `json:"state"`
-	StartedAt  *time.Time `json:"started_at"`
-	FinishedAt *time.Time `json:"finished_at"`
-	ErrorCode  *string    `json:"error_code"`
+	State      string       `json:"state"`
+	StartedAt  *time.Time   `json:"started_at"`
+	FinishedAt *time.Time   `json:"finished_at"`
+	ErrorCode  *string      `json:"error_code"`
+	Budget     *ProbeBudget `json:"budget,omitempty"`
+}
+
+// ProbeBudget is a soft daily cap shared by scheduled and manual sweeps. The
+// used count is the number of distinct key/model/protocol probes observed
+// today (Asia/Shanghai), matching the once-per-day skip rule in listProbeTargets.
+type ProbeBudget struct {
+	Date      string `json:"date"`
+	Used      int    `json:"used"`
+	Limit     int    `json:"limit"`
+	Remaining int    `json:"remaining"`
+	Exhausted bool   `json:"exhausted"`
 }
 
 type ProbeResult struct {
@@ -49,6 +61,17 @@ func (s *Service) RequestProbes(ctx context.Context, providerID uuid.UUID) (Prob
 	}
 	if err := checkProvider(ctx, s.db, providerID); err != nil {
 		return ProbeRun{}, err
+	}
+	budget, err := readProbeBudget(ctx, s.db)
+	if err != nil {
+		return ProbeRun{}, unavailable("读取北辰探活额度失败", err)
+	}
+	if budget.Exhausted {
+		run, readErr := readProbeRun(ctx, s.db, providerID)
+		if readErr != nil {
+			return ProbeRun{}, unavailable("读取北辰探活进度失败", readErr)
+		}
+		return run, nil
 	}
 	result, err := s.db.ExecContext(ctx, `
 INSERT INTO beichen_probe_jobs AS job(provider_id, requested_at)
@@ -109,9 +132,30 @@ SELECT CASE WHEN lease_until > statement_timestamp() THEN 'running'
        started_at, finished_at, last_error
 FROM beichen_probe_jobs WHERE provider_id = $1`, providerID).Scan(&run.State, &run.StartedAt, &run.FinishedAt, &run.ErrorCode)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ProbeRun{State: "idle"}, nil
+		run = ProbeRun{State: "idle"}
+		err = nil
 	}
-	return run, err
+	if err != nil {
+		return ProbeRun{}, err
+	}
+	budget, err := readProbeBudget(ctx, db)
+	if err != nil {
+		return ProbeRun{}, err
+	}
+	run.Budget = &budget
+	return run, nil
+}
+
+const probeBudgetUsedSQL = `SELECT count(*) FROM upstream_probes
+WHERE checked_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'`
+
+func readProbeBudget(ctx context.Context, db rowQueryer) (ProbeBudget, error) {
+	limit := probeDailyLimit()
+	var used int
+	if err := db.QueryRowContext(ctx, probeBudgetUsedSQL).Scan(&used); err != nil {
+		return ProbeBudget{}, err
+	}
+	return probeBudget(used, limit, time.Now()), nil
 }
 
 func readRecentProbes(ctx context.Context, tx *sql.Tx, providerID uuid.UUID) ([]ProbeResult, error) {

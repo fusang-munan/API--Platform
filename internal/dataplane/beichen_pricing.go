@@ -3,9 +3,11 @@ package dataplane
 import (
 	"encoding/json"
 	"io"
+	"math"
 	"strings"
 	"time"
 
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
@@ -16,8 +18,13 @@ const (
 	beichenIncompleteUsage  = "incomplete_token_breakdown"
 )
 
-func beichenHTTPRequestReview(path string, replay *replayBody, model string) string {
-	if (path != "/v1/chat/completions" && path != "/v1/responses") || replay == nil {
+func beichenHTTPRequestReview(path string, replay *replayBody, route *usage.CallRoute) string {
+	switch path {
+	case "/v1/chat/completions", "/v1/responses", "/v1/messages":
+	default:
+		return beichenUnsupportedPrice
+	}
+	if replay == nil {
 		return beichenUnsupportedPrice
 	}
 	body, err := replay.Open()
@@ -29,12 +36,106 @@ func beichenHTTPRequestReview(path string, replay *replayBody, model string) str
 	if err != nil || len(data) > maxHTTPMetricsBody {
 		return beichenUnsupportedPrice
 	}
-	return beichenPayloadReview(data, model, true)
+	return beichenRequestReview(data, path, route)
+}
+
+func beichenRequestReview(data []byte, path string, route *usage.CallRoute) string {
+	var payload map[string]any
+	if json.Unmarshal(data, &payload) != nil || payload == nil {
+		return beichenUnsupportedPrice
+	}
+	var rawEffort any
+	switch path {
+	case "/v1/chat/completions":
+		rawEffort = payload["reasoning_effort"]
+	case "/v1/responses":
+		rawEffort = objectField(payload, "reasoning")["effort"]
+	case "/v1/messages":
+		rawEffort = objectField(payload, "output_config")["effort"]
+		if rawEffort == nil {
+			rawEffort = objectField(payload, "thinking")["effort"]
+		}
+		if rawEffort == nil {
+			rawEffort = payload["effort"]
+		}
+		route.CacheTTL = anthropicCacheTTL(payload)
+	}
+	effort := usage.DefaultReasoningEffort
+	if rawEffort != nil {
+		value, ok := rawEffort.(string)
+		if !ok || len(value) > 32 {
+			return beichenUnsupportedPrice
+		}
+		value = strings.ToLower(strings.TrimSpace(value))
+		if strings.IndexFunc(value, func(r rune) bool {
+			return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-')
+		}) >= 0 {
+			return beichenUnsupportedPrice
+		}
+		if value != "" {
+			effort = value
+		}
+	}
+	route.ReasoningEffort = &effort
+	if !beichenTextValue(payload) {
+		return beichenUnsupportedPrice
+	}
+	return ""
+}
+
+// A single TTL is usable when all Anthropic cache breakpoints agree. Only
+// protocol-defined cache_control fields count, including the automatic one.
+func anthropicCacheTTL(payload map[string]any) string {
+	var ttl string
+	observe := func(node map[string]any) bool {
+		raw := node["cache_control"]
+		if raw == nil {
+			return true
+		}
+		control, ok := raw.(map[string]any)
+		if !ok || (control["type"] != nil && control["type"] != "ephemeral") {
+			return false
+		}
+		duration, _ := control["ttl"].(string)
+		if control["ttl"] == nil && control["type"] == "ephemeral" {
+			duration = "5m"
+		}
+		if (duration != "5m" && duration != "1h") || (ttl != "" && ttl != duration) {
+			return false
+		}
+		ttl = duration
+		return true
+	}
+	observeBlocks := func(raw any) bool {
+		blocks, _ := raw.([]any)
+		for _, block := range blocks {
+			node, _ := block.(map[string]any)
+			if !observe(node) {
+				return false
+			}
+		}
+		return true
+	}
+	if !observe(payload) || !observeBlocks(payload["system"]) || !observeBlocks(payload["tools"]) {
+		return ""
+	}
+	messages, _ := payload["messages"].([]any)
+	for _, message := range messages {
+		node, _ := message.(map[string]any)
+		if !observeBlocks(node["content"]) {
+			return ""
+		}
+	}
+	return ttl
 }
 
 func beichenModelReported(payload map[string]json.RawMessage, model string) bool {
+	envelope := "response"
+	if rawString(payload["type"]) == "message_start" {
+		envelope = "message"
+	}
 	return model != "" && (rawString(payload["model"]) == model ||
-		rawString(jsonObject(payload["response"])["model"]) == model)
+		rawString(jsonObject(payload[envelope])["model"]) == model)
 }
 
 func beichenPayloadReview(data []byte, model string, request bool) string {
@@ -43,7 +144,12 @@ func beichenPayloadReview(data []byte, model string, request bool) string {
 		return beichenUnsupportedPrice
 	}
 	if !request {
-		for _, object := range []map[string]any{payload, objectField(payload, "response")} {
+		envelope := "response"
+		if payload["type"] == "message_start" {
+			envelope = "message"
+		}
+		nested := objectField(payload, envelope)
+		for _, object := range []map[string]any{payload, nested} {
 			if actual, ok := object["model"]; ok && actual != model {
 				return beichenModelMismatch
 			}
@@ -54,7 +160,7 @@ func beichenPayloadReview(data []byte, model string, request bool) string {
 				return beichenIncompleteUsage
 			}
 		}
-		if payload["usage"] != nil && objectField(payload, "response")["usage"] != nil {
+		if payload["usage"] != nil && nested["usage"] != nil {
 			return beichenIncompleteUsage
 		}
 	}
@@ -145,7 +251,7 @@ func beichenTextValue(value any) bool {
 	return true
 }
 
-func beichenReviewMetrics(route *usage.CallRoute, metrics usage.CallMetrics, reason string) (usage.CallMetrics, string) {
+func beichenReviewMetrics(route *usage.CallRoute, adapter modelbinding.Adapter, metrics usage.CallMetrics, reason string) (usage.CallMetrics, string) {
 	if reason == beichenUnsupportedPrice || reason == beichenModelMismatch {
 		// MarkSent still records dispatch. Without a valid pricing identity,
 		// the ledger must not replay this call against the bound text price.
@@ -160,9 +266,16 @@ func beichenReviewMetrics(route *usage.CallRoute, metrics usage.CallMetrics, rea
 			reason = beichenIncompleteUsage
 		} else {
 			input, hit, write := *metrics.PromptTokens, *metrics.CacheHitTokens, *metrics.CacheWriteTokens
-			if hit > input || write > input-hit ||
+			output := *metrics.CompletionTokens
+			if adapter == modelbinding.AdapterAnthropic {
+				// Anthropic reports uncached input and each cache category separately.
+				if hit > math.MaxInt64-input-output || write > math.MaxInt64-input-output-hit ||
+					(metrics.TotalTokens != nil && *metrics.TotalTokens != input+hit+write+output) {
+					reason = beichenIncompleteUsage
+				}
+			} else if hit > input || write > input-hit ||
 				(metrics.CacheMissTokens != nil && *metrics.CacheMissTokens != input-hit-write) ||
-				(metrics.TotalTokens != nil && *metrics.TotalTokens != input+*metrics.CompletionTokens) {
+				(metrics.TotalTokens != nil && *metrics.TotalTokens != input+output) {
 				reason = beichenIncompleteUsage
 			}
 		}

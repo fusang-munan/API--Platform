@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,10 +18,43 @@ import (
 )
 
 const (
-	probePollInterval = 5 * time.Second
-	probeParallelism  = 4
-	probeDBTimeout    = 15 * time.Second
+	probePollInterval      = 5 * time.Second
+	probeParallelism       = 4
+	probeDBTimeout         = 15 * time.Second
+	defaultProbeDailyLimit = 500
 )
+
+// probeDailyLimit reads the cap on each call so a changed environment is
+// picked up without rebuilding the service. Invalid values fall back to the
+// default; config.Load still rejects them at server startup.
+func probeDailyLimit() int {
+	raw := strings.TrimSpace(os.Getenv("BEICHEN_PROBE_DAILY_LIMIT"))
+	if raw == "" {
+		return defaultProbeDailyLimit
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return defaultProbeDailyLimit
+	}
+	return n
+}
+
+func probeBudget(used, limit int, now time.Time) ProbeBudget {
+	if limit < 1 {
+		limit = defaultProbeDailyLimit
+	}
+	if used < 0 {
+		used = 0
+	}
+	remaining := limit - used
+	if remaining < 0 {
+		remaining = 0
+	}
+	return ProbeBudget{
+		Date: now.In(beijing).Format(dayLayout), Used: used, Limit: limit,
+		Remaining: remaining, Exhausted: remaining == 0,
+	}
+}
 
 type probeJob struct {
 	provider, lease uuid.UUID
@@ -119,11 +154,32 @@ func (s *Service) executeProbeJob(ctx context.Context, job probeJob) (string, er
 	if !hasTargets {
 		return "no_token_protocols", nil
 	}
+	remaining, err := s.probeRemaining(ctx)
+	if err != nil {
+		return "", err
+	}
+	if remaining <= 0 {
+		return "", nil
+	}
+	if len(targets) > remaining {
+		targets = targets[:remaining]
+	}
 	for offset := 0; offset < len(targets); offset += probeParallelism {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		batch := targets[offset:min(offset+probeParallelism, len(targets))]
+		remaining, err := s.probeRemaining(ctx)
+		if err != nil {
+			return "", err
+		}
+		if remaining <= 0 {
+			return "", nil
+		}
+		end := min(offset+probeParallelism, len(targets))
+		if end-offset > remaining {
+			end = offset + remaining
+		}
+		batch := targets[offset:end]
 		observations := make([]probeObservation, len(batch))
 		var wg sync.WaitGroup
 		for i, target := range batch {
@@ -138,7 +194,7 @@ func (s *Service) executeProbeJob(ctx context.Context, job probeJob) (string, er
 			return "", ctx.Err()
 		}
 		saveCtx, cancel := context.WithTimeout(ctx, probeDBTimeout)
-		err := s.saveProbeBatch(saveCtx, job, observations)
+		err = s.saveProbeBatch(saveCtx, job, observations)
 		cancel()
 		if err != nil {
 			return "", err
@@ -152,12 +208,13 @@ func (s *Service) listProbeTargets(ctx context.Context, job probeJob) ([]probeTa
 SELECT c.id, c.updated_at, c.credential_ciphertext, m.model_id::text, m.raw_entry, to_json(m.supported_protocols),
        (SELECT COALESCE(json_agg(r.protocol), '[]') FROM upstream_probes r
         WHERE r.provider_id = p.id AND r.credential_id = c.id AND r.model = m.model_id::text
-          AND r.checked_at >= $2 AND r.checked_at >= c.updated_at)
+          AND r.checked_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'
+          AND r.checked_at >= c.updated_at)
 FROM providers p JOIN provider_credentials c ON c.provider_id = p.id
 JOIN provider_model_catalog m ON m.provider_id = p.id AND m.credential_id = c.id
 WHERE p.id = $1 AND `+beichenProvider+` AND p.status = 'active' AND c.status = 'active' AND m.status = 'active'
   AND m.last_seen_at >= c.updated_at
-ORDER BY c.id, m.model_id`, job.provider, job.startedAt)
+ORDER BY c.id, m.model_id`, job.provider)
 	if err != nil {
 		return nil, false, err
 	}
@@ -213,6 +270,11 @@ ORDER BY c.id, m.model_id`, job.provider, job.startedAt)
 		}
 	}
 	return targets, hasTargets, rows.Err()
+}
+
+func (s *Service) probeRemaining(ctx context.Context) (int, error) {
+	budget, err := readProbeBudget(ctx, s.db)
+	return budget.Remaining, err
 }
 
 func storedCatalogEntry(model string, raw, protocols []byte) (catalog.ProviderEntry, error) {

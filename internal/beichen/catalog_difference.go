@@ -21,6 +21,13 @@ type CatalogDifference struct {
 	KeyOnly      []string   `json:"key_only"`
 }
 
+type WebsiteOnlyModel struct {
+	Model    string          `json:"model"`
+	Channels []CredentialRef `json:"channels"`
+}
+
+const keyCatalogCurrentSQL = `(d.last_error IS NULL AND COALESCE(d.last_success >= c.updated_at, false))`
+
 func saveWebsiteCatalog(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, revision time.Time, quote panelQuote) error {
 	if quote.websiteModels == nil {
 		_, err := tx.ExecContext(ctx, `DELETE FROM beichen_website_catalogs WHERE credential_id = $1`, credentialID)
@@ -41,14 +48,12 @@ ON CONFLICT (credential_id) DO UPDATE SET credential_revision = EXCLUDED.credent
 
 func readCatalogDifferences(ctx context.Context, tx *sql.Tx, provider uuid.UUID, view *Overview) error {
 	rows, err := tx.QueryContext(ctx, `
-SELECT c.id, c.label::text, w.group_id, w.checked_at, to_json(w.models)
+SELECT c.id, c.label::text, w.group_id, w.checked_at, to_json(w.models),
+  p.status = 'active' AND `+keyCatalogCurrentSQL+`
 FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
 LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = 'catalog'
 LEFT JOIN beichen_website_catalogs w ON w.credential_id = c.id AND w.credential_revision = c.updated_at
-  AND p.status = 'active' AND d.last_error IS NULL AND w.checked_at >= d.last_success
-  AND NOT EXISTS (
-    SELECT 1 FROM provider_model_catalog m WHERE m.credential_id = c.id AND m.synced_at > w.checked_at
-  )
+  AND p.status = 'active' AND `+keyCatalogCurrentSQL+`
 WHERE c.provider_id = $1 AND c.status = 'active'
 ORDER BY c.label, c.id`, provider)
 	if err != nil {
@@ -61,13 +66,17 @@ ORDER BY c.label, c.id`, provider)
 		keyModels[model.CredentialID] = append(keyModels[model.CredentialID], model.Model)
 	}
 	view.CatalogDifferences = []CatalogDifference{}
+	allKeysScanned, anyWebsite := true, false
 	for rows.Next() {
 		diff := CatalogDifference{State: "unverified", WebsiteOnly: []string{}, KeyOnly: []string{}}
 		var website []byte
-		if err := rows.Scan(&diff.CredentialID, &diff.Label, &diff.GroupID, &diff.CheckedAt, &website); err != nil {
+		var scanned bool
+		if err := rows.Scan(&diff.CredentialID, &diff.Label, &diff.GroupID, &diff.CheckedAt, &website, &scanned); err != nil {
 			return err
 		}
+		allKeysScanned = allKeysScanned && scanned
 		if diff.CheckedAt != nil {
+			anyWebsite = true
 			var websiteModels []string
 			if err := json.Unmarshal(website, &websiteModels); err != nil {
 				return err
@@ -78,7 +87,49 @@ ORDER BY c.label, c.id`, provider)
 		}
 		view.CatalogDifferences = append(view.CatalogDifferences, diff)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	view.WebsiteOnlyStatus = "unverified"
+	view.WebsiteOnlyModels = []WebsiteOnlyModel{}
+	if anyWebsite && allKeysScanned {
+		view.WebsiteOnlyStatus = "compared"
+		view.WebsiteOnlyModels = collectWebsiteOnlyModels(view.CatalogDifferences, keyModels)
+	}
+	return nil
+}
+
+// A per-channel difference is not a website-only model if another active Key lists it.
+func collectWebsiteOnlyModels(differences []CatalogDifference, keyModels map[uuid.UUID][]string) []WebsiteOnlyModel {
+	listed := map[string]bool{}
+	for _, diff := range differences {
+		for _, model := range keyModels[diff.CredentialID] {
+			listed[strings.ToLower(model)] = true
+		}
+	}
+	website := map[string]WebsiteOnlyModel{}
+	for _, diff := range differences {
+		for _, name := range diff.WebsiteOnly {
+			key := strings.ToLower(name)
+			if listed[key] {
+				continue
+			}
+			row := website[key]
+			if row.Model == "" || name < row.Model {
+				row.Model = name
+			}
+			row.Channels = append(row.Channels, CredentialRef{CredentialID: diff.CredentialID, Label: diff.Label})
+			website[key] = row
+		}
+	}
+	result := make([]WebsiteOnlyModel, 0, len(website))
+	for _, row := range website {
+		result = append(result, row)
+	}
+	slices.SortFunc(result, func(a, b WebsiteOnlyModel) int {
+		return strings.Compare(strings.ToLower(a.Model), strings.ToLower(b.Model))
+	})
+	return result
 }
 
 func diffModelNames(website, key []string) ([]string, []string) {

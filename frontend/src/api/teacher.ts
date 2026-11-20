@@ -1,4 +1,5 @@
 import { del, get, page, patch, post, request } from './client'
+import type { BeichenModelAlias, BeichenModelAliasUpdate, BeichenRebindPlan } from './types'
 import type { BeichenBatchEnableResult, BeichenImport, BeichenModelPriceResult, BeichenModelPriceUpdate, BeichenModelUsage, BeichenOverview, BeichenPriceUpdate, BeichenProbeRun, BeichenProbes, BeichenReceiptPage, BeichenReconcile, BeichenUsageRange } from './types'
 import type { Application, Binding, BindingCreate, BindingRouteProbeEndpoint, BindingRouteProbeStep, BindingUpdate, MentorCandidate, Model, ModelCatalogPage, ModelCreate, ModelUpdate, Organization, OrganizationCreate, OrganizationUpdate, ProbeEndpoint, ProbeResponse, Project, ProjectBudget, ProjectBudgetUpdate, ProjectCreate, ProjectUpdate, Provider, ProviderCatalogSyncView, ProviderCreate, ProviderCredential, ProviderCredentialCreate, ProviderCredentialUpdate, ProviderUpdate, ProjectUsage, StudentAccount } from './types'
 interface BeichenPanelStatus { configured: boolean; group_id?: number; upstream_key_id?: number }
@@ -58,6 +59,17 @@ export const teacherAPI = {
   beichenReconciliation: (id: string, range: BeichenUsageRange) =>
     get<BeichenReconcile>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/reconciliation?${new URLSearchParams({ range })}`),
   syncBeichen: (id: string) => post<{ synced: boolean }>(`/api/v1/teacher/providers/${id}/beichen/sync`),
+  beichenAliases: (id: string) =>
+    get<BeichenModelAlias[]>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/aliases`),
+  putBeichenAlias: (id: string, body: BeichenModelAliasUpdate) =>
+    request<{ saved: boolean }>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/aliases`,
+      { method: 'PUT', body: JSON.stringify(body) }),
+  previewBeichenRebind: (id: string) =>
+    post<BeichenRebindPlan>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/rebind`, { preview: true }),
+  applyBeichenRebind: (id: string, token: string) =>
+    post<BeichenRebindPlan>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/rebind`, { preview: false, preview_token: token }),
+  rescanBeichenCatalog: (id: string, credentialId: string) =>
+    post<{ synced: boolean }>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/catalog/rescan`, { credential_id: credentialId }),
   setBeichenPrice: (id: string, body: BeichenPriceUpdate) => patch<{ saved: boolean }>(`/api/v1/teacher/providers/${id}/beichen/price`, body),
   importBeichen: (id: string, body: BeichenImport) => post<{ imported: boolean }>(`/api/v1/teacher/providers/${id}/beichen/import`, body),
   models: () => get<Model[]>('/api/v1/teacher/models'),
