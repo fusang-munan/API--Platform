@@ -330,6 +330,25 @@ it.each(['pending', 'pending_confirmation'] as const)('兼容 %s，保留待核�
   })
 })
 
+it('旧接口极小报价解析为数字零时待核对，官网精确字符串零照常展示', () => {
+  const decoded = JSON.parse('{"billing_mode":"token","input_price":1e-400}') as BeichenPriceConditions
+  expect(decoded.input_price).toBe(0)
+  const legacy = { price_status: 'confirmed', price_conditions: decoded } as const
+  const [row] = schoolCatalog(discoveredOverview(legacy), 'north')
+  expect(row.quotes[0]).toMatchObject({
+    standard: '每百万 Token 的北辰余额单位 · 输入 待核对',
+    actual: null,
+    notes: ['官网原始小数精度未知'],
+  })
+
+  const exact = discoveredOverview({ ...legacy, price_conditions_exact: { billing_mode: 'token', input_price: '0' } })
+  expect(schoolCatalog(exact, 'north')[0].quotes[0]).toMatchObject({
+    standard: '每百万 Token 的北辰余额单位 · 输入 0',
+    actual: '每百万 Token 的北辰余额单位 · 输入 0',
+    notes: [],
+  })
+})
+
 it('官网或倍率同步失败时显示对应错误，并保留上次读取的官网报价', () => {
   const data = discoveredOverview({
     price_status: 'conditional', price_conditions_exact: { billing_mode: 'per_request', per_request_price: '0.3' },
@@ -347,12 +366,12 @@ it('官网或倍率同步失败时显示对应错误，并保留上次读取的�
 
 it('缺少官网价时仍可展示后台已有报价，并区分零元与未知缓存价', () => {
   const data = discoveredOverview({
-    price_status: 'confirmed', upstream_rates: { input: '0.000000031', output: '0', cache_write: null },
+    price_status: 'confirmed', upstream_rates: { input: '0.000000031', output: '0', cache_read: 0, cache_write: null },
   })
   expect(schoolCatalog(data, 'north')[0].quotes[0]).toMatchObject({
     standard: null,
     actual: '每百万 Token 的北辰余额单位 · 输入 0.000000000000031 · 输出 0 · 缓存读取 未知 · 缓存写入 未知',
-    notes: ['官网标准价待同步', '实际单价来自后台已有报价'],
+    notes: ['官网标准价待同步', '后台已有报价小数精度未知，零值待核对', '实际单价来自后台已有报价'],
   })
 })
 
@@ -370,6 +389,31 @@ it('保留分档原值和顺序，实际价只使用单位明确、范围有效�
   expect(quote.standard).toContain('上下文分档（Token 下限 9007199254740993，上限 9007199254740992） · 档位无效')
   expect(quote.standard).toContain('官网原值（单位未知） · 输入 0.000002')
   expect(quote.actual).toBe('上下文分档（Token 下限 30，上限 无上限）\n每百万 Token 的北辰余额单位 · 输入 0')
+})
+
+it('分档边界未知时保留条件和标准价，只有适用范围已知的分档显示实际价', () => {
+  const data = discoveredOverview({
+    price_status: 'conditional', price_conditions_exact: {
+      billing_mode: 'token', intervals: [
+        { max_tokens: '100', input_price: '0.000001' },
+        { min_tokens: '100', input_price: '0.000002' },
+        { min_tokens: null, max_tokens: null, input_price: '0.000004' },
+        { min_tokens: '300', max_tokens: null, input_price: '0.000008' },
+      ],
+    },
+  })
+  const quote = schoolCatalog(data, 'north')[0].quotes[0]
+  expect(quote.standard).toBe([
+    '上下文分档（Token 下限 未知，上限 100） · 适用范围待核对',
+    '每百万 Token 的北辰余额单位 · 输入 1',
+    '上下文分档（Token 下限 100，上限 未知） · 适用范围待核对',
+    '每百万 Token 的北辰余额单位 · 输入 2',
+    '上下文分档（Token 下限 未知，上限 无上限） · 适用范围待核对',
+    '每百万 Token 的北辰余额单位 · 输入 4',
+    '上下文分档（Token 下限 300，上限 无上限）',
+    '每百万 Token 的北辰余额单位 · 输入 8',
+  ].join('\n'))
+  expect(quote.actual).toBe('上下文分档（Token 下限 300，上限 无上限）\n每百万 Token 的北辰余额单位 · 输入 1')
 })
 
 it('教师从维护抽屉打开校方工作区，授权提示和网页时间仍来自概览，模型主目录隐藏维护入口', async () => {

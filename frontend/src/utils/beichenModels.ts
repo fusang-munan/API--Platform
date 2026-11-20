@@ -70,8 +70,8 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
   const prices = terms ? formatPriceConditions(terms, canCalculate) : null
   const standard = prices?.standard ?? null
   // Older confirmed quotes can have effective token rates without a website pricing object.
-  const legacyActual = !terms && canCalculate && status === 'confirmed' ? legacyEffectivePrice(record?.upstream_rates) : null
-  const actual = prices?.actual ?? legacyActual
+  const legacy = !terms && canCalculate && status === 'confirmed' ? legacyEffectivePrice(record?.upstream_rates) : null
+  const actual = prices?.actual ?? legacy?.actual ?? null
   const statusLabel = priceError
     ? (status === 'pending' ? '价格同步失败' : '上次报价状态 · ' + priceStatusLabels[status])
     : (status === 'pending' && standard ? '官网单价待核对' : priceStatusLabels[status])
@@ -81,7 +81,8 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
   if (status === 'confirmed' && !standard && !priceError) notes.push('官网标准价待同步')
   if (status === 'conditional' && !standard && !priceError) notes.push('条件明细待同步')
   if (prices?.precisionUnknown) notes.push('官网原始小数精度未知')
-  if (legacyActual) notes.push('实际单价来自后台已有报价')
+  if (legacy?.zeroUncertain) notes.push('后台已有报价小数精度未知，零值待核对')
+  if (legacy?.actual) notes.push('实际单价来自后台已有报价')
   return { multiplier, standard, actual, status, statusLabel, notes }
 }
 
@@ -123,7 +124,13 @@ function priceLines(tier: BeichenPriceTier, mode: BeichenPriceTier['billing_mode
     if (rate && unit === 'unknown') continue
     const values: string[] = []
     for (const [key, label] of fields) {
-      const value = nonNegativeDecimal(tier[key])
+      const raw = tier[key]
+      // 旧接口的极小报价可能在 JSON 解析时变成数字 0。
+      if (raw === 0) {
+        if (!rate) values.push(label + ' 待核对')
+        continue
+      }
+      const value = nonNegativeDecimal(raw)
       if (!value) continue
       const coefficient = value.coefficient * (rate?.coefficient ?? 1n)
       const scale = value.scale + (rate?.scale ?? 0) - (unit === 'token' ? 6 : 0)
@@ -157,11 +164,13 @@ function formatPriceConditions(terms: BeichenPriceConditions, rate: Decimal | nu
     const from = tokenBoundary(tier.min_tokens)
     const to = tokenBoundary(tier.max_tokens, true)
     const invalid = from.invalid || to.invalid || (from.tokens != null && to.tokens != null && from.tokens > to.tokens)
+    const boundsUnknown = tier.min_tokens == null || tier.max_tokens === undefined
     const label = '上下文分档（Token 下限 ' + from.label + '，上限 ' + to.label + '）'
+    const warning = invalid ? ' · 档位无效' : boundsUnknown ? ' · 适用范围待核对' : ''
     const mode = tier.billing_mode ?? terms.billing_mode
     const tierStandard = priceLines(tier, mode)
-    standard.push(label + (invalid ? ' · 档位无效' : ''), ...(tierStandard.length ? tierStandard : ['分档单价未知']))
-    if (rate && !invalid) {
+    standard.push(label + warning, ...(tierStandard.length ? tierStandard : ['分档单价未知']))
+    if (rate && !invalid && !boundsUnknown) {
       const tierActual = priceLines(tier, mode, rate)
       if (tierActual.length) actual.push(label, ...tierActual)
     }
@@ -179,10 +188,13 @@ function formatPriceConditions(terms: BeichenPriceConditions, rate: Decimal | nu
 function legacyEffectivePrice(rates: BeichenModel['upstream_rates']) {
   const formatted = priceFields.map(({ key, label }) => {
     const value = rates?.[key]
-    return { label, amount: nonNegativeDecimal(value) ? scaledNumber(value, 6) : null }
+    const zeroUncertain = value === 0
+    return { label, amount: !zeroUncertain && nonNegativeDecimal(value) ? scaledNumber(value, 6) : null, zeroUncertain }
   })
-  if (formatted.every(({ amount }) => amount === null)) return null
-  return unitLabels.token + ' · ' + formatted.map(({ label, amount }) => label + ' ' + (amount ?? '未知')).join(' · ')
+  const actual = formatted.some(({ amount }) => amount !== null)
+    ? unitLabels.token + ' · ' + formatted.map(({ label, amount }) => label + ' ' + (amount ?? '未知')).join(' · ')
+    : null
+  return { actual, zeroUncertain: formatted.some(field => field.zeroUncertain) }
 }
 
 type Decimal = { coefficient: bigint; scale: number }
