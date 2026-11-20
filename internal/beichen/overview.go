@@ -323,12 +323,8 @@ func readComparison(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, start
 	return rows.Err()
 }
 
-// Upstream input_tokens is uncached. Anthropic reports it directly; OpenAI
-// chat/responses report inclusive input, so require cache details or a
-// separately reported miss count before treating it as uncached.
-const comparisonSQL = `
-WITH attributed AS (
-  SELECT a.credential_id, a.model, a.sent_at, c.beichen_state, c.beichen_credit_exact,
+// 日对账、区间对账和学校用量共用归属及缓存归一化，避免把 OpenAI 的缓存输入重复计数。
+const attributedColumnsSQL = `a.credential_id, a.model, a.sent_at, c.beichen_state, c.beichen_credit_exact,
     CASE WHEN c.usage_state = 'reported' THEN
       CASE WHEN c.cache_miss_tokens IS NOT NULL THEN c.cache_miss_tokens
            WHEN c.protocol = 'anthropic' THEN c.prompt_tokens::bigint
@@ -339,7 +335,9 @@ WITH attributed AS (
     END AS input_tokens,
     CASE WHEN c.usage_state = 'reported' THEN c.completion_tokens::bigint END AS output_tokens,
     CASE WHEN c.usage_state = 'reported' THEN cache.reads END AS cache_read_tokens,
-    CASE WHEN c.usage_state = 'reported' THEN cache.writes END AS cache_write_tokens
+    CASE WHEN c.usage_state = 'reported' THEN cache.writes END AS cache_write_tokens`
+
+const attributedFromSQL = `
   FROM gateway_calls c
   CROSS JOIN LATERAL (SELECT
     COALESCE(c.cache_hit_tokens, CASE WHEN c.protocol IN ('openai_compatible','openai_responses','openai_realtime')
@@ -352,11 +350,15 @@ WITH attributed AS (
     CASE WHEN c.beichen_dispatch_kind = 'beichen' THEN c.beichen_dispatch_model ELSE c.upstream_model_name END AS model,
     CASE WHEN c.beichen_dispatch_kind = 'beichen' THEN COALESCE(c.beichen_price_at, c.beichen_dispatch_at) ELSE c.sent_at END AS sent_at
   ) a
-  WHERE (c.provider_id = $1 OR (c.provider_id IS NULL AND c.beichen_dispatch_kind = 'beichen' AND EXISTS (
+  WHERE ($1::uuid IS NULL OR c.provider_id = $1 OR (c.provider_id IS NULL AND c.beichen_dispatch_kind = 'beichen' AND EXISTS (
     SELECT 1 FROM provider_credentials pc WHERE pc.id = a.credential_id AND pc.provider_id = $1
-  ))) AND a.sent_at >= $2 AND a.sent_at < $3
+  ))) AND ($2::timestamptz IS NULL OR a.sent_at >= $2) AND a.sent_at < $3::timestamptz
     AND a.credential_id IS NOT NULL AND a.model <> ''
-    AND (c.beichen_dispatch_kind = 'beichen' OR c.binding_id IS NOT NULL) AND c.outcome <> 'pending'
+    AND (c.beichen_dispatch_kind = 'beichen' OR c.binding_id IS NOT NULL) AND c.outcome <> 'pending'`
+
+const comparisonSQL = `
+WITH attributed AS (
+  SELECT ` + attributedColumnsSQL + attributedFromSQL + `
 ), priced_calls AS (
   SELECT a.*,
     CASE WHEN cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN

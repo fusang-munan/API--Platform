@@ -86,6 +86,7 @@ func TestRegistersControlPlaneAndGatewayRoutes(t *testing.T) {
 		"GET /api/v1/teacher/projects",
 		"GET /api/v1/teacher/projects/:project_id/mentor-candidates",
 		"GET /api/v1/teacher/project-spend",
+		"GET /api/v1/teacher/model-usage",
 		"POST /api/v1/teacher/projects",
 		"PATCH /api/v1/teacher/projects/:project_id",
 		"GET /api/v1/teacher/mentor-project-applications",
@@ -102,6 +103,7 @@ func TestRegistersControlPlaneAndGatewayRoutes(t *testing.T) {
 		"DELETE /api/v1/teacher/providers/:provider_id/credentials/:credential_id",
 		"POST /api/v1/teacher/providers/:provider_id/reset-catalog",
 		"GET /api/v1/teacher/providers/:provider_id/beichen",
+		"GET /api/v1/teacher/providers/:provider_id/beichen/reconciliation",
 		"GET /api/v1/teacher/providers/:provider_id/beichen/receipts",
 		"POST /api/v1/teacher/providers/:provider_id/beichen/sync",
 		"GET /api/v1/teacher/providers/:provider_id/beichen/access/:credential_id",
@@ -149,6 +151,8 @@ func TestBeichenTeacherRoutesRequireLogin(t *testing.T) {
 	base := "/api/v1/teacher/providers/123/beichen"
 	for _, route := range []struct{ method, path string }{
 		{http.MethodGet, base},
+		{http.MethodGet, "/api/v1/teacher/model-usage"},
+		{http.MethodGet, base + "/reconciliation"},
 		{http.MethodGet, base + "/receipts"},
 		{http.MethodPost, base + "/sync"},
 		{http.MethodPatch, base + "/price"},

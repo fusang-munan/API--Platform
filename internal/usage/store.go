@@ -981,6 +981,7 @@ type MemberUsage struct {
 	UserID        string           `json:"user_id"`
 	UserName      string           `json:"user_name"`
 	Quota         string           `json:"quota"`
+	Pending       string           `json:"pending"`
 	Available     string           `json:"available"`
 	Credits       string           `json:"credits"`
 	Keys          []KeyMemberUsage `json:"keys"`
@@ -1029,7 +1030,7 @@ func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month tim
 		trim_scale(GREATEST(0,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0)::numeric-
 			COALESCE(mb.charged_milli,0)-COALESCE(mb.pending_milli,0)-COALESCE(mb.charged_milli_remainder,0))*0.001)::text,
 		EXISTS(SELECT 1 FROM gateway_calls review WHERE review.beichen_state='pending_review' AND review.month=$2 AND review.project_id=$1 AND review.user_id=u.id),
-		(sp.id IS NOT NULL)
+		(sp.id IS NOT NULL), trim_scale(COALESCE(mb.pending_milli,0)*0.001)::text
 		FROM project_members pm JOIN users u ON u.id=pm.user_id
 		LEFT JOIN student_profiles sp ON sp.user_id=u.id AND sp.status='active' AND u.status='active' AND u.role='student'
 		LEFT JOIN project_member_month_credit_buckets mb ON mb.project_id=pm.project_id AND mb.user_id=u.id AND mb.month=$2
@@ -1049,7 +1050,7 @@ func (s *Store) ProjectUsage(ctx context.Context, projectID uuid.UUID, month tim
 		var uid uuid.UUID
 		var m MemberUsage
 		var memberQuota int64
-		if err := rows.Scan(&uid, &m.UserName, &memberQuota, &m.Available, &m.PendingReview, &m.IsStudent); err != nil {
+		if err := rows.Scan(&uid, &m.UserName, &memberQuota, &m.Available, &m.PendingReview, &m.IsStudent, &m.Pending); err != nil {
 			rows.Close()
 			return v, err
 		}

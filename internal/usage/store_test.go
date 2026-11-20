@@ -17,7 +17,7 @@ func TestUsageJSONContractUsesSnakeCase(t *testing.T) {
 	raw, err := json.Marshal(ProjectUsage{
 		ProjectID: "project", ProjectName: "Project", Quota: "20.000",
 		Members: []MemberUsage{{
-			UserID: "user", UserName: "User", Quota: "2.000", Available: "1.000",
+			UserID: "user", UserName: "User", Quota: "2.000", Available: "1.000", Pending: "0.7",
 			Keys:       []KeyMemberUsage{{ID: "key", Used: "1.000", Models: []ProjectModelUsage{{UsageSlice: UsageSlice{ID: "model", Name: "Free"}}}}},
 			FreeModels: []UsageSlice{{ID: "model", Name: "Free", Credits: "0.000", Calls: 3}},
 		}},
@@ -30,7 +30,7 @@ func TestUsageJSONContractUsesSnakeCase(t *testing.T) {
 	if strings.Count(text, `"beichen_actual_cost":null`) != 2 || strings.Count(text, `"beichen_unmatched_calls":0`) != 2 {
 		t.Fatalf("missing receipt fields on member or key model: %s", text)
 	}
-	for _, field := range []string{`"project_id"`, `"project_name"`, `"quota"`, `"members"`, `"user_id"`, `"keys"`, `"models"`, `"free_models"`, `"calls":3`} {
+	for _, field := range []string{`"project_id"`, `"project_name"`, `"quota"`, `"members"`, `"user_id"`, `"pending":"0.7"`, `"keys"`, `"models"`, `"free_models"`, `"calls":3`} {
 		if !strings.Contains(text, field) {
 			t.Fatalf("missing %s in %s", field, text)
 		}
@@ -39,6 +39,37 @@ func TestUsageJSONContractUsesSnakeCase(t *testing.T) {
 		if strings.Contains(text, legacy) {
 			t.Fatalf("legacy field %s leaked in %s", legacy, text)
 		}
+	}
+}
+
+func TestProjectUsageIncludesMemberPendingCredits(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	project, member := uuid.New(), uuid.New()
+	month := Month(time.Now()).AddDate(0, -2, 0)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT p.name,b.quota_milli`).WithArgs(project, month).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "quota", "allocated", "charged", "pending", "review"}).
+			AddRow("测试项目", 10000, 5000, "1.25", 700, false))
+	mock.ExpectQuery(`SELECT u.id,u.name,COALESCE\(mb.quota_milli`).WithArgs(project, month).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "quota", "available", "review", "student", "pending"}).
+			AddRow(member, "测试学生", 5000, "3.05", false, true, "0.7"))
+	mock.ExpectQuery(`SELECT c.user_id,m.model_id,c.model_name,sum`).WithArgs(project, month).
+		WillReturnRows(sqlmock.NewRows([]string{"user", "model", "name", "calls"}))
+	mock.ExpectQuery(`SELECT k.owner_user_id,k.id,k.name,k.status`).WithArgs(project, month).
+		WillReturnRows(sqlmock.NewRows([]string{"user", "key", "name", "status", "used", "review"}))
+	mock.ExpectQuery(regexp.QuoteMeta(projectModelUsageSQL)).WithArgs(project, month).
+		WillReturnRows(sqlmock.NewRows([]string{"user", "key", "model", "name", "credits", "calls", "actual", "unmatched", "base", "booked", "factor", "source"}))
+	mock.ExpectCommit()
+	got, err := NewStore(db).ProjectUsage(context.Background(), project, month)
+	if err != nil || len(got.Members) != 1 || got.Members[0].Pending != "0.7" || got.Members[0].Available != "3.050" || got.Members[0].Quota != "5.000" {
+		t.Fatalf("成员待核金额未保留: %+v, err=%v", got, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
 
