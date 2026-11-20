@@ -122,7 +122,18 @@ func (s *Service) fetchChannelQuote(ctx context.Context, job syncJob, key string
 }
 
 func panelQuoteUsable(quote panelQuote) bool {
-	return quote.err == nil && (len(quote.rows) > 0 || len(quote.terms) > 0)
+	if quote.err != nil {
+		return false
+	}
+	if len(quote.rows) > 0 {
+		return true
+	}
+	for _, terms := range quote.terms {
+		if len(terms) > 0 && terms[0] == '{' {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) fetchPanelQuote(ctx context.Context, token, key string, group int64, info billingInfo) panelQuote {
@@ -365,16 +376,30 @@ func parsePanelPrices(body []byte, groupID int64, info billingInfo, entries []ca
 	if section == nil || len(section.Models) > maxRows {
 		return nil, nil, errors.New("北辰面板找不到映射分组或模型数量超限")
 	}
+	if len(section.Models) == 0 {
+		return nil, nil, errors.New("北辰可用渠道页未返回该分组的模型表")
+	}
 	available := make(map[string]bool, len(entries))
 	for _, model := range entries {
 		available[model.ID] = true
 	}
 	occurrences := make(map[string]int, len(section.Models))
+	completeNames := true
 	for _, model := range section.Models {
+		if !validModel(model.Name) || model.Platform != section.Platform {
+			completeNames = false
+		}
 		occurrences[model.Name]++
 	}
 	var rows []priceRow
 	terms := make(map[string]json.RawMessage)
+	// Record negative results only for names actually checked in this pass.
+	// A model first seen by a later catalog sync still needs a price lookup.
+	for id := range available {
+		if completeNames && validModel(id) && occurrences[id] == 0 {
+			terms[id] = json.RawMessage("null")
+		}
+	}
 	for _, model := range section.Models {
 		if !available[model.Name] || !validModel(model.Name) {
 			continue
@@ -486,7 +511,8 @@ func conditionalPanelPricing(raw json.RawMessage) bool {
 func saveBillingObservation(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, revision time.Time, info billingInfo, billingErr error, group int64, quote panelQuote) error {
 	if group == 0 && quote.err == nil {
 		var managed bool
-		err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM beichen_panel_snapshots WHERE credential_id = $1)`, credentialID).Scan(&managed)
+		err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM beichen_provision_channels WHERE credential_id = $1)
+			OR EXISTS (SELECT 1 FROM beichen_panel_snapshots WHERE credential_id = $1)`, credentialID).Scan(&managed)
 		if err != nil {
 			return err
 		}
@@ -496,7 +522,7 @@ func saveBillingObservation(ctx context.Context, tx *sql.Tx, credentialID uuid.U
 			}
 			return saveBilling(ctx, tx, credentialID, info)
 		}
-		quote.err = errors.New("北辰面板分组映射已移除")
+		quote.err = errors.New("缺少该 Key 的北辰分组编号，暂时无法匹配官网标准价")
 	}
 	effectiveAt, err := priceTimestamp(ctx, tx)
 	if err != nil {

@@ -104,7 +104,7 @@ export type BeichenModel = {
   mode: BeichenPriceUpdate['mode']
   school_status?: BeichenSchoolStatus | null
   route_ready?: boolean | null
-  price_status?: 'confirmed' | 'pending_confirmation' | 'conditional' | null
+  price_status?: 'confirmed' | 'pending_confirmation' | 'conditional' | 'not_listed' | null
   price_conditions?: BeichenPriceConditions | null
   price_conditions_exact?: BeichenPriceConditions | null
   upstream_rates?: BeichenDisplayRates | null

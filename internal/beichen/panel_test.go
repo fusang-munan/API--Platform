@@ -110,10 +110,50 @@ func TestPanelRetainsVisibleConditionalPricing(t *testing.T) {
 		const original = `{"billing_mode":"token","input_price":0.000001,"output_price":0,"intervals":[]}`
 		body := panelPayload(strings.Replace(panelFirst, original, tc.pricing, 1), panelSecond)
 		rows, terms, err := parsePanelPrices([]byte(body), 1, info, []catalog.ProviderEntry{{ID: "shared"}, {ID: "missing"}})
-		if err != nil || len(rows) != 0 || len(terms) != 1 || string(terms["shared"]) != tc.pricing ||
+		if err != nil || len(rows) != 0 || len(terms) != 2 || string(terms["missing"]) != "null" || string(terms["shared"]) != tc.pricing ||
 			conditionalPanelPricing(terms["shared"]) != tc.conditional {
 			t.Fatalf("expected original per-key terms and no flat ledger price: %s %v", terms["shared"], err)
 		}
+	}
+}
+
+func TestPanelRechecksMissingModelInEachCatalog(t *testing.T) {
+	peak := false
+	info := billingInfo{PeakEnabled: &peak, GroupRate: "1", ResolvedRate: "1", Multiplier: "1"}
+	entries := []catalog.ProviderEntry{{ID: "new-model"}, {ID: "shared"}}
+	first := panelPayload(panelFirst)
+	_, terms, err := parsePanelPrices([]byte(first), 1, info, entries)
+	if err != nil || string(terms["new-model"]) != "null" || !panelQuoteUsable(panelQuote{terms: terms}) {
+		t.Fatalf("expected an explicitly unlisted model alongside a real price: %v", err)
+	}
+	second := strings.Replace(first, `"name":"unlisted"`, `"name":"new-model"`, 1)
+	rows, terms, err := parsePanelPrices([]byte(second), 1, info, entries)
+	if err != nil || len(rows) != 2 || string(terms["new-model"]) == "null" || len(terms["new-model"]) == 0 {
+		t.Fatalf("newly listed model did not acquire a price on the next pass: %v", err)
+	}
+	_, terms, err = parsePanelPrices([]byte(first), 1, info, entries[:1])
+	if err != nil || string(terms["new-model"]) != "null" || panelQuoteUsable(panelQuote{terms: terms}) {
+		t.Fatal("an absent name must never count as a usable price")
+	}
+	end := strings.Index(panelFirst, `"supported_models":[`)
+	empty := panelPayload(panelFirst[:end] + `"supported_models":[]}]}`)
+	if _, _, err := parsePanelPrices([]byte(empty), 1, info, entries); err == nil {
+		t.Fatal("an empty upstream table must not mark catalog names as missing")
+	}
+	incomplete := strings.Replace(first, `"name":"unlisted"`, `"name":""`, 1)
+	_, terms, err = parsePanelPrices([]byte(incomplete), 1, info, entries)
+	if _, marked := terms["new-model"]; err != nil || marked || len(terms["shared"]) == 0 {
+		t.Fatal("an unnamed row must not hide confirmed prices or prove another name is absent")
+	}
+	wrongPlatform := strings.Replace(first, `"name":"unlisted","platform":"openai"`, `"name":"unlisted","platform":"other"`, 1)
+	_, terms, err = parsePanelPrices([]byte(wrongPlatform), 1, info, entries)
+	if _, marked := terms["new-model"]; err != nil || marked || len(terms["shared"]) == 0 {
+		t.Fatal("a misplaced row must not prove absence or hide a correctly attributed price")
+	}
+	onlyWrong := strings.Replace(wrongPlatform, `"name":"shared","platform":"openai"`, `"name":"shared","platform":""`, 1)
+	_, terms, err = parsePanelPrices([]byte(onlyWrong), 1, info, entries)
+	if err != nil || len(terms) != 0 {
+		t.Fatal("a list entirely outside the expected platform does not establish any match")
 	}
 }
 

@@ -130,6 +130,7 @@ func parseBilling(body []byte) (billingInfo, error) {
 
 // Sub2API v1 provides the multiplier only. A provider pricing extension must
 // declare both its token-rate unit and whether the rates are base or effective.
+// The legacy format supports unconditional token rates only.
 func parsePricing(data json.RawMessage) (string, []priceRow, error) {
 	var pricing struct {
 		Basis  string     `json:"basis"`
@@ -137,6 +138,7 @@ func parsePricing(data json.RawMessage) (string, []priceRow, error) {
 		Models []priceRow `json:"models"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
 	if decoder.Decode(&pricing) != nil || pricing.Unit != "usd_micros_per_million_tokens" ||
 		(pricing.Basis != "base" && pricing.Basis != "effective") || len(pricing.Models) == 0 || len(pricing.Models) > maxRows {
 		return "", nil, errors.New("北辰账单未提供可确认单位和口径的模型单价，可导入报价 CSV")

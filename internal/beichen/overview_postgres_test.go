@@ -134,10 +134,13 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 	const actualTerms = `{"billing_mode":"token","input_price":0.000008,"output_price":0.000016,
 		"cache_read_price":0,"cache_write_price":0.000001,"cache_write_1h_price":0.000002,
 		"cache_write_12h_price":0.000004,"intervals":[{"min_tokens":200000,"input_price":0.000012000000000000000019}]}`
-	quote.terms = map[string]json.RawMessage{"special": json.RawMessage(actualTerms)}
+	quote.terms = map[string]json.RawMessage{"special": json.RawMessage(actualTerms), "no-quote": json.RawMessage("null")}
 	saveQuote()
 	rows = read()
 	special := rows[first]["special"]
+	if missing := rows[first]["no-quote"]; missing.PriceStatus != "not_listed" || missing.UpstreamRates != nil {
+		t.Fatalf("missing name must be distinguishable from an unscanned model: %+v", missing)
+	}
 	if special.PriceStatus != "conditional" || special.UpstreamRates != nil || special.SchoolRates != nil ||
 		rows[first]["shared"].PriceStatus != "confirmed" || *rows[first]["shared"].UpstreamRates.Input != "0.375" ||
 		*rows[first]["shared"].SchoolRates.Input != "37.5" || *rows[second]["shared"].UpstreamRates.Input != "19" {
@@ -213,6 +216,11 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 	if external.ProviderID != other || external.EffectiveMultiplier != nil || external.UpstreamModel != "remote-alias" {
 		t.Fatalf("preferred external route borrowed Beichen's rate: %+v", external)
 	}
+	execTestSQL(t, ctx, tx, `UPDATE beichen_panel_snapshots SET expires_at=effective_at+interval '1 microsecond'
+		WHERE credential_id=$1 AND model_pricing ? 'no-quote'`, first)
+	if missing := read()[first]["no-quote"]; missing.PriceStatus != "pending_confirmation" || missing.UpstreamRates != nil {
+		t.Fatal("an expired website table must not claim that a model is currently unlisted")
+	}
 	execTestSQL(t, ctx, tx, "UPDATE provider_credentials SET status='inactive' WHERE id=$1", first)
 	if read()[first]["shared"].RouteReady {
 		t.Fatal("inactive key reported an active route")
@@ -220,5 +228,22 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 	snapshot(first, `{"data":[]}`)
 	if rows := read(); len(rows[first]) != 0 || len(rows[second]) != 1 {
 		t.Fatal("empty snapshot changed another key or retained historical models")
+	}
+	// Once the school manages a key, an effective price left by legacy billing
+	// cannot stand in for the missing group's website quote.
+	execTestSQL(t, ctx, tx, `INSERT INTO beichen_provision_channels(credential_id,channel,key_fingerprint,discover_ids)
+		VALUES($1,'CC1',decode(repeat('00',32),'hex'),true)`, second)
+	if err := tx.QueryRowContext(ctx, "SELECT updated_at FROM provider_credentials WHERE id=$1", second).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveBillingObservation(ctx, tx, second, revision, billingInfo{Multiplier: "0.15"}, nil, 0, panelQuote{}); err != nil {
+		t.Fatal(err)
+	}
+	if row := read()[second]["shared"]; row.PriceStatus != "pending_confirmation" || row.UpstreamRates != nil {
+		t.Fatal("school catalog displayed a legacy billing price without a verified website group")
+	}
+	var reason string
+	if err := tx.QueryRowContext(ctx, "SELECT last_error FROM beichen_datasets WHERE credential_id=$1 AND kind='prices'", second).Scan(&reason); err != nil || !strings.Contains(reason, "分组编号") {
+		t.Fatalf("missing price diagnostic: %q, %v", reason, err)
 	}
 }

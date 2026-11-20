@@ -129,6 +129,25 @@ func TestBillingDoesNotInferRatesFromMultiplier(t *testing.T) {
 	}
 }
 
+func TestBillingRejectsUnknownPricingConditions(t *testing.T) {
+	for _, tc := range []struct{ name, modelCondition, quoteCondition string }{
+		{"token tiers", `,"intervals":[{"min_tokens":200000,"input":500}]`, ""},
+		{"cache duration", `,"cache_write_1h_price":0.000002`, ""},
+		{"reasoning multiplier", `,"reasoning_effort_multipliers":{"high":2}`, ""},
+		{"quote condition", "", `,"billing_mode":"per_request"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pricing := json.RawMessage(`{"basis":"base","unit":"usd_micros_per_million_tokens","models":[
+				{"model":"flat","input":100,"output":200},
+				{"model":"example","input":150,"output":300` + tc.modelCondition + `}]` + tc.quoteCondition + `}`)
+			basis, rows, err := parsePricing(pricing)
+			if err == nil || basis != "" || rows != nil {
+				t.Fatalf("accepted an unknown pricing condition: basis=%q rows=%+v error=%v", basis, rows, err)
+			}
+		})
+	}
+}
+
 func TestUsageNeedsVerifiedDayAndActualCurrency(t *testing.T) {
 	payload := `{"mode":"unrestricted","isValid":true,"unit":"USD","date":"2026-11-18","timezone":"Asia/Shanghai","model_stats":[
 		{"model":"example","requests":0,"input_tokens":20,"cache_tokens":7,"actual_cost":0.0000015,"cost":1000},

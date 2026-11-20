@@ -135,6 +135,8 @@ func TestOverviewWebsiteSyncPostgres(t *testing.T) {
 	gm1 := addChannel(provider, "GM1", "GM1", "active", 12)
 	g3 := addChannel(provider, "G3", "G3", "active", 13)
 	cc1 := addChannel(provider, "CC1", "CC1", "active", 14)
+	snapshot(gm1, revision, hourAgo.Add(-time.Minute), live, `{"unlisted":null}`)
+	check("a checked name without a quote is not a priced channel", 4, 0, 0, 0, nil, nil)
 	for _, ignored := range []uuid.UUID{
 		addChannel(provider, "ordinary", "", "active", 20),
 		addChannel(provider, "retired", "CC1", "inactive", 20),

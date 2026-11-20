@@ -134,16 +134,17 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 	var base, source sql.NullString
 	var upstream, multiplier sql.NullInt64
 	if applied {
-		// Receipt token columns are already disjoint. Never feed their uncached
-		// input count through a protocol parser that subtracts cached tokens.
+		// An ordinary quote requires the gateway's pinned pricing time.
+		// sent_at can be present even after the pricing review rejects a call.
+		// Receipt token counts already separate uncached input from cache usage.
 		err = tx.QueryRowContext(ctx, `SELECT coalesce(cost.gateway,cost.receipt,$2::numeric*100)::text,
 			CASE WHEN cost.gateway IS NOT NULL THEN 'gateway_usage_price'
 			     WHEN cost.receipt IS NOT NULL THEN 'receipt_usage_price' ELSE 'receipt_actual_cost' END,
 			CASE WHEN coalesce(cost.gateway,cost.receipt) IS NOT NULL THEN p.upstream_version END,
 			CASE WHEN coalesce(cost.gateway,cost.receipt) IS NOT NULL THEN p.multiplier_version END
 			FROM gateway_calls c
-			LEFT JOIN LATERAL beichen_price_at(c.beichen_dispatch_credential_id,c.beichen_dispatch_model,coalesce(c.beichen_price_at,c.sent_at)) p
-			  ON c.beichen_school_multiplier=1.10
+			LEFT JOIN LATERAL beichen_price_at(c.beichen_dispatch_credential_id,c.beichen_dispatch_model,c.beichen_price_at) p
+			  ON c.beichen_school_multiplier=1.10 AND c.beichen_price_at IS NOT NULL
 			CROSS JOIN LATERAL (SELECT
 			  CASE WHEN c.usage_state='reported' THEN beichen_token_credits(c.protocol,c.prompt_tokens,c.completion_tokens,
 			    c.cache_hit_tokens,c.cache_miss_tokens,c.cache_write_tokens,p.upstream_input,p.upstream_output,

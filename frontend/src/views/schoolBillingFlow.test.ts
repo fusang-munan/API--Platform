@@ -5,7 +5,8 @@ import App from '../App.vue'
 import router from '../router'
 import { token } from '../api/client'
 import { useAuthStore } from '../store/auth'
-import type { ProjectUsage, Role } from '../api/types'
+import type { BeichenOverview, ProjectUsage, Role } from '../api/types'
+import { schoolCatalog } from '../utils/beichenModels'
 import { schoolDay, schoolMonth } from '../utils/format'
 
 vi.mock('../api/client', async original => ({
@@ -78,15 +79,15 @@ async function fetchFixture(url: string, init?: RequestInit) {
       { kind: 'billing', credential_id: 'stale', last_error: '本轮读取失败', effective_multiplier: 0.3 },
     ],
     models: [
-      { credential_id: 'chosen', model: 'shared', price_status: 'confirmed', price_conditions: {
+      { credential_id: 'chosen', model: 'shared', price_status: 'confirmed', price_conditions: { billing_mode: 'token',
         input_price: '0.0000001', output_price: '0.0000002', cache_read_price: '0', cache_write_price: null,
       }, upstream_rates: {
         input: '0.000000031', output: '2', cache_read: '0', cache_write: null,
       } },
       { credential_id: 'cheap', model: 'shared', price_status: 'conditional', price_conditions: { cache_write_1h_price: 0.1 },
-        price_conditions_exact: { cache_write_1h_price: '0', cache_write_12h_price: '0.000004', internal_route: '隐藏的渠道',
+        price_conditions_exact: { billing_mode: 'token', cache_write_1h_price: '0', cache_write_12h_price: '0.000004', per_request_price: '0.3', image_input_price: '0.0000004', image_output_price: '0.0000008', internal_route: '隐藏的渠道',
           intervals: [{ min_tokens: '200000', max_tokens: null, input_price: '0.000008000000000000000019' }],
-        } },
+          reasoning_effort_multipliers: { low: '0.5' } } },
     ],
     model_catalog: [
       { model: 'shared', school_model: 'school-alias', school_status: enabled ? 'active' : 'inactive', can_enable: !enabled, preferred_routes: [
@@ -164,11 +165,15 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   expect(paused.find('button').exists()).toBe(false)
   expect(historical.text()).toContain('启用条件待同步')
   expect(table.text()).toContain('北辰官网需要学校后台重新授权')
-  expect(shared.text()).toContain('输入 0.000000000000031 · 输出 0.000002 · 缓存读取 0 · 缓存写入 未知')
-  expect(shared.text()).toContain('官网标准价 · 每 Token · 输入 0.0000001 · 输出 0.0000002 · 缓存读取 0')
-  expect(shared.text()).toContain('每 Token · 缓存写入（1 小时） 0 · 缓存写入（12 小时） 0.000004')
-  expect(shared.text()).toContain('阶梯（Token 下限 200000，上限 未知） · 每 Token · 输入 0.000008000000000000000019')
-  expect(table.text()).not.toMatch(/隐藏的|chosen|cheap|school-alias|OpenAI|Anthropic|协议|路由|渠道/i)
+  expect(shared.text()).toContain('渠道单价（已乘倍率） · 每百万 Token 的北辰余额单位 · 输入 0.000000000000031 · 输出 0.000002 · 缓存读取 0 · 缓存写入 未知')
+  expect(shared.text()).toContain('官网标准价 · 按 Token\n每百万 Token 的北辰余额单位 · 输入 0.1 · 输出 0.2 · 缓存读取 0 · 缓存写入 未知')
+  expect(shared.text()).toContain('官网条件报价 · 按 Token')
+  expect(shared.text()).toContain('每百万 Token 的北辰余额单位 · 缓存写入（1 小时） 0 · 缓存写入（12 小时） 4 · 图像输入 0.4 · 图像输出 0.8')
+  expect(shared.text()).toContain('上下文分档（Token 下限 200000，Token 上限 无上限）')
+  expect(shared.text()).toContain('每百万 Token 的北辰余额单位 · 输入 8.000000000000000019')
+  expect(shared.text()).toContain('无量纲条件（不计入单价） · 推理强度（低） 0.5×')
+  expect(shared.text()).toContain('按当前倍率计算（×0.0625）')
+  expect(table.text()).not.toMatch(/隐藏的|chosen|cheap|school-alias|OpenAI|Anthropic|协议|路由/i)
   expect(writes).not.toHaveBeenCalled()
   await button('禁用', shared).trigger('click')
   await flushPromises()
@@ -412,4 +417,232 @@ it('学生从个人用量读取 100、11、89，超额时展示精确超用，�
   await flushPromises()
   expect(widget.get('.usage-summary').text()).toContain('已超用0.001')
   expect(writes).not.toHaveBeenCalled()
+})
+
+function priceQuote(model: Record<string, unknown>, multiplier: unknown, datasets: Array<Record<string, unknown>> = []) {
+  const overview = {
+    datasets,
+    models: [model],
+    comparison: [],
+    model_catalog: [{
+      model: model.model, school_model: 'school-model', school_status: 'active', can_enable: false,
+      preferred_routes: [{
+        school_model: 'school-model', upstream_model: model.model, adapter: 'openai_responses',
+        provider_id: 'north', credential_id: model.credential_id, priority: 1, state: 'ready', effective_multiplier: multiplier,
+      }],
+    }],
+  } as unknown as BeichenOverview
+  return schoolCatalog(overview, 'north')[0].quotes[0]
+}
+
+it('普通价按精确报价换算到每百万 Token，标准价不依赖实际价格版本', () => {
+  const quote = priceQuote({
+    credential_id: 'key', model: 'standard-model', mode: 'follow', price_status: 'confirmed',
+    price_conditions_exact: {
+      billing_mode: 'token', input_price: '0.000008', output_price: '0.000016',
+      cache_read_price: '0', cache_write_price: null,
+    },
+    upstream_rates: { input: '3000000', output: '6000000', cache_read: '0', cache_write: null },
+  }, '0.375')
+  expect(quote.multiplier).toBe('0.375×')
+  expect(quote.price).toContain('官网标准价 · 按 Token\n每百万 Token 的北辰余额单位 · 输入 8 · 输出 16 · 缓存读取 0 · 缓存写入 未知')
+  expect(quote.price).toContain('渠道单价（已乘倍率） · 每百万 Token 的北辰余额单位 · 输入 3 · 输出 6 · 缓存读取 0 · 缓存写入 未知')
+  expect(quote.price).not.toContain('每 Token ·')
+})
+
+it('独立核价失败时保留当前原始标准价，但隐藏旧渠道价和未列报价结论', () => {
+  const failed = [{ credential_id: 'key', kind: 'prices', last_error: '独立核价失败' }]
+  const quote = priceQuote({
+    credential_id: 'key', model: 'standard-model', mode: 'follow', price_status: 'confirmed',
+    price_conditions_exact: { billing_mode: 'token', input_price: '0.000008', output_price: '0.000016' },
+    upstream_rates: { input: '3000000', output: '6000000' },
+  }, '0.375', failed)
+  expect(quote.price).toContain('官网标准价 · 按 Token')
+  expect(quote.price).toContain('输入 8 · 输出 16')
+  expect(quote.price).not.toContain('渠道单价')
+
+  const oldOnly = priceQuote({
+    credential_id: 'key', model: 'old-only', mode: 'follow', price_status: 'confirmed',
+    upstream_rates: { input: '3000000', output: '6000000' },
+  }, '0.375', failed)
+  expect(oldOnly.price).toBeNull()
+
+  const missing = priceQuote({
+    credential_id: 'key', model: 'missing-model', mode: 'follow', price_status: 'not_listed',
+  }, '1', failed)
+  expect(missing.price).toBeNull()
+})
+
+it('不安全 JavaScript 整数不使用四舍五入后的精确值', () => {
+  const unsafe = 9_007_199_254_740_993
+  const quote = priceQuote({
+    credential_id: 'key', model: 'unsafe-number', mode: 'follow', price_status: 'confirmed',
+    price_conditions_exact: { billing_mode: 'token', input_price: unsafe, output_price: '0.000001' },
+    upstream_rates: { input: unsafe, output: '1000000' },
+  }, '1')
+  expect(quote.price).toContain('输入 未知 · 输出 1 · 缓存读取 未知 · 缓存写入 未知')
+  expect(quote.price).toContain('渠道单价（已乘倍率） · 每百万 Token 的北辰余额单位 · 输入 未知 · 输出 1')
+  expect(quote.price).not.toContain('9007199254740992')
+})
+
+it('存在 exact 条件时不回退旧原始价字段', () => {
+  const quote = priceQuote({
+    credential_id: 'key', model: 'exact-only', mode: 'follow', price_status: 'pending_confirmation',
+    price_conditions: { billing_mode: 'token', input_price: '0.000001', output_price: '0.000016' },
+    price_conditions_exact: { billing_mode: 'token', input_price: '0.000008' },
+  }, '1')
+  expect(quote.price).toContain('输入 8 · 输出 未知 · 缓存读取 未知 · 缓存写入 未知')
+  expect(quote.price).not.toContain('输入 1 ·')
+  expect(quote.price).not.toContain('输出 16')
+})
+
+it('旧 API 数字零标记原始精度未知，exact 字符串零和整数微单位零保持精确', () => {
+  const legacy = priceQuote({
+    credential_id: 'key', model: 'legacy-zero', mode: 'follow', price_status: 'pending_confirmation',
+    price_conditions: { billing_mode: 'token', input_price: 0, output_price: 0 },
+  }, '1')
+  expect(legacy.price).toContain('官网标准价（待核对） · 按 Token · 原始精度未知')
+  expect(legacy.price).toContain('输入 0 · 输出 0 · 缓存读取 未知 · 缓存写入 未知')
+
+  const exact = priceQuote({
+    credential_id: 'key', model: 'exact-zero', mode: 'follow', price_status: 'confirmed',
+    price_conditions_exact: { billing_mode: 'token', input_price: '0', output_price: '0' },
+    upstream_rates: { input: '0', output: '0' },
+  }, '1')
+  expect(exact.price).not.toContain('原始精度未知')
+  expect(exact.price).toContain('官网标准价 · 按 Token\n每百万 Token 的北辰余额单位 · 输入 0 · 输出 0')
+  expect(exact.price).toContain('渠道单价（已乘倍率） · 每百万 Token 的北辰余额单位 · 输入 0 · 输出 0')
+})
+
+it('待核对和官网未提供同名报价使用明确状态', () => {
+  const pending = priceQuote({
+    credential_id: 'key', model: 'pending-model', mode: 'follow', price_status: 'pending_confirmation',
+    price_conditions_exact: { billing_mode: 'token', input_price: '0.000008', output_price: '0.000016' },
+  }, '1')
+  expect(pending.price).toContain('官网标准价（待核对） · 按 Token')
+  expect(pending.price).toContain('输入 8 · 输出 16')
+  expect(pending.price).not.toContain('渠道单价')
+
+  const missing = priceQuote({
+    credential_id: 'key', model: 'missing-model', mode: 'follow', price_status: 'not_listed',
+  }, '1')
+  expect(missing.price).toBe('官网未提供同名报价')
+})
+
+it('token 条件价按每百万 Token 精确乘倍率，图像价同按每百万 Token，推理强度保持无量纲', () => {
+  const quote = priceQuote({
+    credential_id: 'key', model: 'token-conditional', mode: 'follow', price_status: 'conditional',
+    price_conditions_exact: {
+      billing_mode: 'token', input_price: '0.000008', output_price: '0.000016',
+      cache_read_price: '0', cache_write_price: '0.000001', cache_write_1h_price: '0', cache_write_12h_price: '0.000004',
+      per_request_price: '0.3', image_input_price: '0.0000004', image_output_price: '0.0000008',
+      intervals: [{ min_tokens: '200000', max_tokens: null, input_price: '0.000012000000000000000019', output_price: '0.000024' }],
+      reasoning_effort_multipliers: { low: '0.5' },
+    },
+  }, '0.125')
+  expect(quote.price).toContain('官网条件报价 · 按 Token')
+  expect(quote.price).toContain('每百万 Token 的北辰余额单位 · 输入 8 · 输出 16 · 缓存读取 0 · 缓存写入 1 · 缓存写入（1 小时） 0 · 缓存写入（12 小时） 4 · 图像输入 0.4 · 图像输出 0.8')
+  expect(quote.price).toContain('上下文分档（Token 下限 200000，Token 上限 无上限）')
+  expect(quote.price).toContain('每百万 Token 的北辰余额单位 · 输入 12.000000000000000019 · 输出 24')
+  expect(quote.price).toContain('无量纲条件（不计入单价） · 推理强度（低） 0.5×')
+  expect(quote.price).toContain('每百万 Token 的北辰余额单位 · 输入 1 · 输出 2 · 缓存读取 0 · 缓存写入 0.125 · 缓存写入（1 小时） 0 · 缓存写入（12 小时） 0.5 · 图像输入 0.05 · 图像输出 0.1')
+  expect(quote.price).toContain('输入 1.500000000000000002375 · 输出 3')
+  expect(quote.price).not.toContain('每次请求')
+})
+
+it('非法上下文边界保留档位原值但不计算该档倍率价', () => {
+  const quote = priceQuote({
+    credential_id: 'key', model: 'invalid-tiers', mode: 'follow', price_status: 'conditional',
+    price_conditions_exact: {
+      billing_mode: 'token', input_price: '0.000016',
+      intervals: [
+        { min_tokens: '-1', max_tokens: '100', input_price: '0.000004' },
+        { min_tokens: '1.5', max_tokens: '10', input_price: '0.000002' },
+        { min_tokens: '9007199254740993', max_tokens: '9007199254740992', input_price: '0.000001' },
+        { min_tokens: '200.0', max_tokens: '300.0', input_price: '0.000008' },
+      ],
+    },
+  }, '0.125')
+  const price = quote.price ?? ''
+  expect(price).toContain('上下文分档（Token 下限 -1，Token 上限 100） · 档位无效')
+  expect(price).toContain('上下文分档（Token 下限 1.5，Token 上限 10） · 档位无效')
+  expect(price).toContain('上下文分档（Token 下限 9007199254740993，Token 上限 9007199254740992） · 档位无效')
+  expect(price).toContain('上下文分档（Token 下限 200，Token 上限 300）')
+  expect(price.match(/档位无效/g)).toHaveLength(3)
+  expect(price.match(/按当前倍率计算/g)).toHaveLength(2)
+})
+
+it.each([
+  ['per_request', { per_request_price: '0.3', input_price: '999' }, '北辰余额单位/次 · 每次请求 0.3', '北辰余额单位/次 · 每次请求 0.0375', '999'],
+  ['video', { per_request_price: '0.3', input_price: '999' }, '北辰余额单位/秒 · 每秒 0.3', '北辰余额单位/秒 · 每秒 0.0375', '999'],
+  ['image', { image_input_price: '0.4', image_output_price: '0.8', input_price: '999' }, '北辰余额单位/次 · 图像输出 0.8', '北辰余额单位/次 · 图像输出 0.1', '999'],
+] as const)('%s 模式仅按已确认单位展示条件价', (mode, prices, rawUnit, multipliedUnit, ignored) => {
+  const quote = priceQuote({
+    credential_id: 'key', model: mode + '-model', mode: 'follow', price_status: 'conditional',
+    price_conditions_exact: { billing_mode: mode, ...prices },
+  }, '0.125')
+  expect(quote.price).toContain(rawUnit)
+  expect(quote.price).toContain(multipliedUnit)
+  expect(quote.price).not.toContain(ignored)
+  expect(quote.price).not.toContain('每百万 Token')
+  if (mode === 'image') {
+    expect(quote.price).toContain('官网原值（单位未知） · 图像输入 0.4')
+    expect(quote.price).not.toContain('图像输入 0.05')
+  }
+})
+
+it('image 模式仅有无单位依据的字段时保留原值但不计算', () => {
+  const quote = priceQuote({
+    credential_id: 'key', model: 'image-unknown', mode: 'follow', price_status: 'conditional',
+    price_conditions_exact: { billing_mode: 'image', image_input_price: '0.4', per_request_price: '0.3' },
+  }, '0.125')
+  expect(quote.price).toContain('官网条件报价 · 按图像')
+  expect(quote.price).toContain('官网原值（单位未知） · 图像输入 0.4 · 基础价格 0.3')
+  expect(quote.price).not.toMatch(/每百万 Token|北辰余额单位\/次|北辰余额单位\/秒|按当前倍率计算/)
+})
+
+it('未知计费模式保留原值并明确不推断单位', () => {
+  const quote = priceQuote({
+    credential_id: 'key', model: 'unknown-mode', mode: 'follow', price_status: 'conditional',
+    price_conditions_exact: { billing_mode: 'future', input_price: '0.000008', per_request_price: '0.3' },
+  }, '0.125')
+  expect(quote.price).toContain('官网条件报价 · 计费模式未知')
+  expect(quote.price).toContain('官网原值（单位未知） · 输入 0.000008 · 基础价格 0.3')
+  expect(quote.price).not.toMatch(/每百万 Token|余额单位\/次|余额单位\/秒|按当前倍率计算/)
+})
+
+it.each([
+  ['缺倍率', undefined, '待同步'],
+  ['负倍率', '-0.125', '倍率无效'],
+  ['无效倍率', 'not-a-number', '倍率无效'],
+] as const)('条件价在%s时只展示原值，不生成推算金额', (_label, multiplier, label) => {
+  const quote = priceQuote({
+    credential_id: 'key', model: 'no-rate', mode: 'follow', price_status: 'conditional',
+    price_conditions_exact: { billing_mode: 'per_request', per_request_price: '0.3' },
+  }, multiplier)
+  expect(quote.multiplier).toBe(label)
+  expect(quote.price).toContain('北辰余额单位/次 · 每次请求 0.3')
+  expect(quote.price).toContain('当前倍率未知或无效，未生成倍率后单价。')
+  expect(quote.price).not.toContain('按当前倍率计算')
+})
+
+it('倍率同步失败时不使用上一次倍率生成条件价', () => {
+  const quote = priceQuote({
+    credential_id: 'key', model: 'billing-error', mode: 'follow', price_status: 'conditional',
+    price_conditions_exact: { billing_mode: 'per_request', per_request_price: '0.3' },
+  }, '0.125', [{ credential_id: 'key', kind: 'billing', last_error: '倍率读取失败', effective_multiplier: 0.125 }])
+  expect(quote.multiplier).toBe('待同步')
+  expect(quote.price).toContain('每次请求 0.3')
+  expect(quote.price).toContain('当前倍率未知或无效，未生成倍率后单价。')
+  expect(quote.price).not.toContain('按当前倍率计算')
+})
+
+it('零倍率是已确认数值，会得到零条件价', () => {
+  const quote = priceQuote({
+    credential_id: 'key', model: 'zero-rate', mode: 'follow', price_status: 'conditional',
+    price_conditions_exact: { billing_mode: 'per_request', per_request_price: '0.3' },
+  }, '0')
+  expect(quote.multiplier).toBe('0×')
+  expect(quote.price).toContain('北辰余额单位/次 · 每次请求 0')
+  expect(quote.price).not.toContain('倍率未知或无效')
 })

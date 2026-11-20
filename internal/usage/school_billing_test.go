@@ -147,6 +147,23 @@ func testSchoolBilling(t *testing.T, ctx context.Context, db *sql.DB, org, stude
 		t.Fatalf("report: %+v, %v", view, err)
 	}
 
+	// The gateway keeps the dispatch record when it rejects ordinary pricing.
+	r, route, bill = reserve(priced, 715)
+	if err := store.MarkSent(ctx, r.CallID); err != nil {
+		t.Fatal(err)
+	}
+	bill.OccurredAt = time.Now().UTC()
+	bill.ActualCost = "0.2"
+	route.SentAt = time.Time{}
+	if err := store.Finalize(ctx, r, true, "succeeded", "unsupported_text_pricing", "", route, CallMetrics{State: UsageMissing}); err != nil {
+		t.Fatal(err)
+	}
+	check(r, "", "", "", "")
+	apply(bill, true)
+	apply(bill, false)
+	check(r, "20", "receipt_actual_cost", "22", "0.2")
+	available("55.99999999999989")
+
 	// Both requests were admitted before the balance was exhausted.
 	r, route, _ = reserve(priced, 713)
 	late, lateRoute, _ := reserve(priced, 714)

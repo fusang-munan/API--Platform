@@ -101,13 +101,14 @@ onMounted(load)
         {{ syncing ? '同步中…' : '立即同步价格' }}
       </button>
     </div>
+    <p class="muted">单价按官网计费口径展示。官网标准价可独立于账单当前报价，倍率后金额按当前倍率计算。</p>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <p v-if="providerMaintenance && loginNeeded" role="status">北辰官网需要学校后台重新授权。</p>
     <p v-if="priceErrors.length" class="error" role="alert">价格同步失败：{{ priceErrors.join('；') }}</p>
     <p v-if="loading" role="status">正在读取模型…</p>
     <div v-if="rows.length" class="model-scroll">
       <table class="usage-table">
-        <thead><tr><th scope="col">模型</th><th scope="col">可用状态</th><th scope="col">学校首选倍率与单价</th></tr></thead>
+        <thead><tr><th scope="col">模型</th><th scope="col">可用状态</th><th scope="col">学校首选倍率与当前报价</th></tr></thead>
         <tbody>
           <tr v-for="row in rows" :key="row.model">
             <th scope="row">{{ row.model }}</th>
