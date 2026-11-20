@@ -174,6 +174,10 @@ export type BeichenUsageTotals = {
   pending_calls: number
   students?: number
   keys?: number
+  cache_hit_rate?: number | null
+  tokens_missing?: number | null
+  completeness?: 'complete' | 'partial' | 'missing' | null
+  school_absorbed_credits?: string | null
 }
 export type BeichenModelUsageRow = BeichenUsageTotals & { model: string }
 export type BeichenStudentModelUsage = { model: string; credits: string; tokens: number; calls: number }
@@ -235,6 +239,8 @@ export type BeichenReconcileCoverage = {
   pending_calls: number
   unpriced_calls: number
   multiplier_mixed: boolean
+  verified_matched_calls?: number | null
+  coverage_kind?: 'full' | 'partial' | 'none' | null
 }
 export type BeichenReconcileModel = {
   model: string
@@ -247,6 +253,8 @@ export type BeichenReconcileModel = {
   margin_yuan: string | null
   local_share: string
   upstream_share: string
+  school_absorbed_credits?: string | null
+  completeness?: 'complete' | 'partial' | 'missing' | null
 }
 export type BeichenReconcileKey = {
   credential_id: string
@@ -257,6 +265,8 @@ export type BeichenReconcileKey = {
   base_yuan: string
   actual_yuan: string | null
   margin_yuan: string | null
+  school_absorbed_credits?: string | null
+  completeness?: 'complete' | 'partial' | 'missing' | null
 }
 export type BeichenReconcile = {
   range: BeichenUsageRange
@@ -268,7 +278,8 @@ export type BeichenReconcile = {
   models: BeichenReconcileModel[]
   keys: BeichenReconcileKey[]
 }
-export type BeichenModelPriceUpdate = { model: string } & (
+export type BeichenPriceScope = { scope?: 'all' | 'credentials'; credential_ids?: string[] }
+export type BeichenModelPriceUpdate = { model: string } & BeichenPriceScope & (
   { mode: 'follow' } | { mode: 'manual'; rates: { input: string; output: string; cache_read: string; cache_write: string } }
 )
 export type BeichenBatchEnableResult = {
@@ -278,6 +289,7 @@ export type BeichenBatchEnableResult = {
 export type BeichenModelPriceResult = {
   saved: boolean
   credentials: Array<{ credential_id: string; label: string }>
+  applied_credential_ids?: string[]
 }
 export type BeichenCatalogModel = {
   model: string
@@ -286,6 +298,12 @@ export type BeichenCatalogModel = {
   can_enable?: boolean | null
   credential_ids?: string[]
   preferred_routes?: BeichenPreferredRoute[] | null
+  key_count?: number | null
+  route_count?: number | null
+  ready_count?: number | null
+  price_state?: 'confirmed' | 'conditional' | 'manual' | 'missing' | 'mixed' | null
+  blockers?: Array<{ code: string; message: string }> | null
+  activation?: 'active' | 'ready' | 'blocked' | null
 }
 export type BeichenPreferredRoute = {
   school_model: string; upstream_model?: string; adapter: string; provider_id: string; credential_id?: string | null; credential_label?: string | null
