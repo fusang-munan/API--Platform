@@ -35,7 +35,7 @@ func (g *Gateway) proxyBeichenWebSocket(ctx context.Context, client, upstream *w
 	}
 	send := func(reservation usage.Reservation, data []byte) error {
 		call := &beichenSocketCall{reservation: reservation, route: selected.callRoute(), started: time.Now()}
-		call.review = beichenPayloadReview(data, call.route.UpstreamModelName, true)
+		call.review = beichenRequestReview(data, "/v1/responses", &call.route)
 		call.route.DefinitelyNotSent = true
 		field := quotaTokenField("/v1/responses")
 		var quotaBudget int64
@@ -89,7 +89,7 @@ func (g *Gateway) proxyBeichenWebSocket(ctx context.Context, client, upstream *w
 		if active.review == "" && !active.modelReported {
 			active.review = beichenModelUnconfirmed
 		}
-		metrics, review := beichenReviewMetrics(&active.route, active.metrics.finished(!success), active.review)
+		metrics, review := beichenReviewMetrics(&active.route, adapter, active.metrics.finished(!success), active.review)
 		if success && review != "" {
 			category, message = review, "The response requires billing review."
 		}

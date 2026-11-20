@@ -89,6 +89,10 @@ func (s *Service) enrichStudentModelView(ctx context.Context, item ModelView, pl
 		item.ProviderName = binding.Edges.Provider.Name
 		item.PrimaryAdapter = string(binding.Adapter)
 	}
+	item.SupportedProtocols, err = s.modelSupportedProtocols(ctx, platformModelID)
+	if err != nil {
+		return item, domain.WrapError(domain.CodeDependencyUnavailable, "query supported protocols", err)
+	}
 	item.AnthropicReady, err = catalog.ModelHasActiveRouteForAdapter(ctx, s.db, platformModelID, modelbinding.AdapterAnthropic)
 	if err != nil {
 		return item, domain.WrapError(domain.CodeDependencyUnavailable, "query anthropic route", err)
@@ -102,6 +106,37 @@ func (s *Service) enrichStudentModelView(ctx context.Context, item ModelView, pl
 		return item, err
 	}
 	return item, nil
+}
+
+// modelSupportedProtocols is the set of currently routable adapters. The
+// student plaza uses it to show which wire protocol each model accepts; the
+// gateway never converts between them.
+func (s *Service) modelSupportedProtocols(ctx context.Context, platformModelID uuid.UUID) ([]string, error) {
+	rows, err := s.db.ModelBinding.Query().
+		Where(modelbinding.ModelIDEQ(platformModelID), modelbinding.StatusEQ(modelbinding.StatusActive)).
+		All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(rows))
+	protocols := make([]string, 0, len(rows))
+	for _, row := range rows {
+		ready, err := catalog.BindingRouteReady(ctx, s.db, row)
+		if err != nil {
+			return nil, err
+		}
+		if !ready {
+			continue
+		}
+		value := string(row.Adapter)
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		protocols = append(protocols, value)
+	}
+	sort.Strings(protocols)
+	return protocols, nil
 }
 
 func (s *Service) StudentModelPlaza(ctx context.Context, studentID uuid.UUID) (StudentModelPlazaView, error) {

@@ -51,6 +51,7 @@ function stat(wrapper: ReturnType<typeof mountUsage>, name: string) {
 describe('StudentUsage', () => {
   beforeEach(() => {
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    vi.mocked(get).mockResolvedValue({ items: [], next_cursor: null })
   })
 
   afterEach(() => {
@@ -115,7 +116,55 @@ describe('StudentUsage', () => {
     wrapper.unmount()
   })
 
+  it('loads recent calls for the selected range and appends the next cursor page', async () => {
+    vi.mocked(get).mockResolvedValueOnce({
+      items: [
+        { id: 'call-2', request_id: 'req-2', model_id: 'gpt-5', model_name: 'GPT-5', project_name: '项目一',
+          input_tokens: 120, output_tokens: 30, cache_read_tokens: 80, cache_write_tokens: 10,
+          credits: '1.250', status: 'succeeded', billing_state: 'charged', created_at: '2026-11-21T10:00:00Z' },
+        { id: 'call-1', request_id: 'req-1', model_id: 'claude', model_name: 'Claude', project_name: '项目一',
+          input_tokens: null, output_tokens: null, cache_read_tokens: null, cache_write_tokens: null,
+          credits: '0.000', status: 'pending_review', billing_state: 'pending_review', created_at: '2026-11-21T09:00:00Z' },
+      ],
+      next_cursor: 'cursor-1',
+    })
+    const wrapper = mountUsage(baseUsage)
+    await flushPromises()
+
+    expect(get).toHaveBeenCalledWith('/api/v1/student/usage/recent?range=today&limit=20')
+    let rows = wrapper.findAll('.student-recent-table tbody tr')
+    expect(rows).toHaveLength(2)
+    expect(rows[0].text()).toContain('GPT-5')
+    expect(rows[0].text()).toContain('120')
+    expect(rows[0].text()).toContain('1.25')
+    expect(rows[1].text()).toContain('待核账')
+    expect(rows[1].findAll('td').map(cell => cell.text()).slice(2, 6)).toEqual(['—', '—', '—', '—'])
+
+    vi.mocked(get).mockResolvedValueOnce({
+      items: [{ id: 'call-0', request_id: 'req-0', model_id: 'gpt-5', model_name: 'GPT-5', project_name: '项目一',
+        input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_write_tokens: 0,
+        credits: '0.010', status: 'upstream_failed', billing_state: 'failed', created_at: '2026-11-21T08:00:00Z' }],
+      next_cursor: null,
+    })
+    await wrapper.get('.student-recent-actions button').trigger('click')
+    await flushPromises()
+    expect(get).toHaveBeenLastCalledWith('/api/v1/student/usage/recent?range=today&limit=20&cursor=cursor-1')
+    rows = wrapper.findAll('.student-recent-table tbody tr')
+    expect(rows).toHaveLength(3)
+    expect(rows[2].text()).toContain('上游失败')
+    expect(wrapper.text()).toContain('已显示全部')
+
+    vi.mocked(get).mockResolvedValueOnce({ items: [], next_cursor: null })
+    await wrapper.get('[data-testid="recent-range-month"]').trigger('click')
+    await flushPromises()
+    expect(get).toHaveBeenLastCalledWith('/api/v1/student/usage/recent?range=month&limit=20')
+    expect(wrapper.findAll('.student-recent-table tbody tr')).toHaveLength(0)
+    wrapper.unmount()
+  })
+
   it('looks up one receipt by request id and displays the available fields', async () => {
+    const wrapper = mountUsage(baseUsage)
+    await flushPromises()
     vi.mocked(get).mockResolvedValue({
       request_id: 'req-123',
       model_id: 'gpt-5',
@@ -128,8 +177,6 @@ describe('StudentUsage', () => {
       actual_cost: '0.1100',
       receipt_applied: true,
     })
-    const wrapper = mountUsage(baseUsage)
-    await flushPromises()
 
     await wrapper.get('input[placeholder="输入请求编号"]').setValue('req-123')
     await wrapper.get('.student-receipt-search').trigger('submit')
@@ -146,9 +193,9 @@ describe('StudentUsage', () => {
   })
 
   it('explains a missing receipt instead of showing a stale row', async () => {
-    vi.mocked(get).mockRejectedValueOnce(new APIError('call receipt not found', 404, 'RESOURCE_NOT_FOUND'))
     const wrapper = mountUsage(baseUsage)
     await flushPromises()
+    vi.mocked(get).mockRejectedValueOnce(new APIError('call receipt not found', 404, 'RESOURCE_NOT_FOUND'))
 
     await wrapper.get('input[placeholder="输入请求编号"]').setValue('missing-request')
     await wrapper.get('.student-receipt-search').trigger('submit')

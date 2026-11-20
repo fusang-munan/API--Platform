@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ func reconciliationTestTransaction(t *testing.T) (context.Context, *sql.Tx) {
 ALTER TABLE providers ADD COLUMN status text;
 ALTER TABLE provider_credentials ADD COLUMN status text, ADD COLUMN updated_at timestamptz;
 ALTER TABLE gateway_calls ADD COLUMN id uuid PRIMARY KEY DEFAULT gen_random_uuid();`)
-	for _, name := range []string{"0034_beichen_panel_access.sql", "0035_beichen_receipts.sql", "0044_beichen_conditional_billing.sql"} {
+	for _, name := range []string{"0034_beichen_panel_access.sql", "0035_beichen_receipts.sql", "0044_beichen_conditional_billing.sql", "0046_beichen_billing_checks_and_aliases.sql"} {
 		migration, err := os.ReadFile("../infrastructure/db/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -25,6 +26,80 @@ ALTER TABLE gateway_calls ADD COLUMN id uuid PRIMARY KEY DEFAULT gen_random_uuid
 		execTestSQL(t, ctx, tx, string(migration))
 	}
 	return ctx, tx
+}
+
+func TestCatalogQualityAliasAggregationPostgres(t *testing.T) {
+	ctx, tx := reconciliationTestTransaction(t)
+	provider, first, second, actor := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	execTestSQL(t, ctx, tx, "INSERT INTO providers VALUES($1,$2)", provider, origin)
+	execTestSQL(t, ctx, tx, "INSERT INTO users(id) VALUES($1)", actor)
+	execTestSQL(t, ctx, tx, `INSERT INTO provider_credentials(id,provider_id,label,created_at) VALUES
+ ($1,$3,'第一渠道','2026-11-20 00:00+08'),($2,$3,'第二渠道','2026-11-20 00:00+08')`, first, second, provider)
+	call := reportCallFixture{provider: provider, credential: first, project: uuid.New(), user: uuid.New(), key: uuid.New(),
+		model: "historical", protocol: "anthropic", state: "charged", usage: "reported", credits: "20", base: "20", multiplier: "1",
+		sent: "2026-11-20T10:00:00+08:00", prompt: 10, output: 1, read: 0, write: 0}
+	insertReportCall(t, ctx, tx, call)
+	call.model = "Current"
+	insertReportCall(t, ctx, tx, call)
+	call.credential, call.model = second, "historical"
+	insertReportCall(t, ctx, tx, call)
+	call.model = "untouched"
+	insertReportCall(t, ctx, tx, call)
+	execTestSQL(t, ctx, tx, `INSERT INTO beichen_price_versions (credential_id,model,track,basis,source,effective_at,input_rate,output_rate,cache_read_rate,cache_write_rate)
+VALUES ($1,'historical','upstream','effective','billing','2026-01-01',1000000,2000000,0,0),
+($1,'Current','upstream','effective','billing','2026-01-01',1000000,2000000,0,0)`, first)
+	execTestSQL(t, ctx, tx, `INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros,source)
+VALUES($1,$2,'2026-11-20','historical',2,20,2,0,0,30,'usage'),($1,$2,'2026-11-20','current',1,20,2,0,0,NULL,'usage'),
+($1,$3,'2026-11-20','historical',1,10,1,0,0,10,'usage'),($1,$3,'2026-11-20','untouched',1,10,1,0,0,0,'usage')`, provider, first, second)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, beijing)
+	period, _ := reportPeriod("day", now)
+	baseline, err := readReconciliation(ctx, tx, provider, period, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execTestSQL(t, ctx, tx, `INSERT INTO upstream_model_aliases (provider_id,credential_id,upstream_model,school_model,created_by)
+VALUES ($1,$2,'HISTORICAL','school-specific',$3),($1,$2,'current','school-specific',$3),
+       ($1,NULL,'historical','school-default',$3)`, provider, first, actor)
+	view, err := readReconciliation(ctx, tx, provider, period, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(view.Totals, baseline.Totals) || !reflect.DeepEqual(view.Coverage, baseline.Coverage) ||
+		!reflect.DeepEqual(view.Keys, baseline.Keys) || len(view.Models) != 3 {
+		t.Fatal("别名应只改变同渠道的模型分组")
+	}
+	for _, row := range view.Models {
+		if row.MatchStatus != "matched" {
+			t.Fatal("两侧没有按同一校内名称合并")
+		}
+		switch row.Model {
+		case "school-specific":
+			if row.CredentialID != first || row.Local.Requests != 2 || row.Upstream.Requests != 3 ||
+				row.Local.EstimatedMicros == nil || *row.Local.EstimatedMicros != 24 || row.Upstream.BilledMicros != nil {
+				t.Fatalf("渠道优先、按原始名称查价或缺失成本处理错误: %+v", row)
+			}
+		case "school-default", "untouched":
+			if row.CredentialID != second || row.Local.Requests != 1 || row.Upstream.Requests != 1 {
+				t.Fatalf("默认别名或原名回退错误: %+v", row)
+			}
+		default:
+			t.Fatalf("意外的对账模型分组: %s", row.Model)
+		}
+	}
+	daily := Overview{}
+	start, _ := dayStart("2026-11-20")
+	if err := readComparison(ctx, tx, provider, start, &daily); err != nil {
+		t.Fatal(err)
+	}
+	if len(daily.Comparison) != 3 {
+		t.Fatalf("日对账应按相同规则合并: %+v", daily.Comparison)
+	}
+	for _, row := range daily.Comparison {
+		if row.LocalRequests == nil || row.UpstreamRequests == nil ||
+			(row.Model == "school-specific" && (*row.LocalRequests != 2 || *row.UpstreamRequests != 3 || row.BilledUpstreamMicros != nil)) {
+			t.Fatalf("日对账合并缺失同渠道明细或缺失成本处理错误: %+v", row)
+		}
+	}
 }
 
 func TestReconciliationPostgresStudentAndSchoolChargesAndTokenCompleteness(t *testing.T) {

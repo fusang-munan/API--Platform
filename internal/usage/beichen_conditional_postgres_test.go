@@ -66,11 +66,15 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 		WHERE c.id=$1 ORDER BY m.effective_at DESC LIMIT 1`, credential)
 
 	store := NewStore(db)
-	dispatch := func(name string, effort *string, ttl string, cap any) (Reservation, CallRoute) {
+	dispatch := func(name, protocol string, effort *string, ttl string, cap any) (Reservation, CallRoute) {
 		t.Helper()
 		route := CallRoute{Beichen: true, ProviderID: provider, CredentialID: credential, UpstreamModelName: name,
 			ReasoningEffort: effort, CacheTTL: ttl}
-		r, err := store.Reserve(ctx, key, model, uuid.NewString(), "openai_responses", "/v1/responses", "", "", CallCorrelation{}, route)
+		path := "/v1/responses"
+		if protocol == "anthropic" {
+			path = "/v1/messages"
+		}
+		r, err := store.Reserve(ctx, key, model, uuid.NewString(), protocol, path, "", "", CallCorrelation{}, route)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -89,6 +93,9 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 	}
 	input, output, read, write := int64(100), int64(3), int64(2), int64(4)
 	report := CallMetrics{State: UsageReported, PromptTokens: &input, CompletionTokens: &output, CacheHitTokens: &read, CacheWriteTokens: &write}
+	anthropicReport := report
+	uncached := input - read - write
+	anthropicReport.PromptTokens = &uncached
 	checkCharge := func(r Reservation, actual, debit, school, base, source string) {
 		t.Helper()
 		var ok bool
@@ -121,7 +128,7 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 		{"zero cap", int64(0), "0", actual},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r, route := dispatch("conditional-model", &high, "1h", tc.cap)
+			r, route := dispatch("conditional-model", "anthropic", &high, "1h", tc.cap)
 			var response uuid.UUID
 			if tc.name == "over cap" {
 				response = uuid.New()
@@ -131,7 +138,7 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 				finalize(r, route, CallMetrics{})
 				replays := make(chan error, 4)
 				for range cap(replays) {
-					go func() { replays <- store.CompleteCallMetrics(ctx, r.CallID, report) }()
+					go func() { replays <- store.CompleteCallMetrics(ctx, r.CallID, anthropicReport) }()
 				}
 				for range cap(replays) {
 					if err := <-replays; err != nil {
@@ -139,8 +146,8 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 					}
 				}
 			}
-			finalize(r, route, report)
-			finalize(r, route, report)
+			finalize(r, route, anthropicReport)
+			finalize(r, route, anthropicReport)
 			checkCharge(r, actual, tc.debit, tc.school, base, "gateway_usage_price")
 			var ok bool
 			err := db.QueryRowContext(ctx, `SELECT price_tier='[100,)' AND price_snapshot=$2::jsonb
@@ -167,17 +174,17 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 		})
 	}
 	t.Run("fixed price uses the same cap", func(t *testing.T) {
-		r, route := dispatch("fixed-model", nil, "", int64(20))
+		r, route := dispatch("fixed-model", "openai_responses", nil, "", int64(20))
 		finalize(r, route, report)
 		checkCharge(r, "0.02805", "0.02", "0.00805", "0.0255", "gateway_usage_price")
 	})
 	t.Run("missing condition never falls back to flat, receipt uses the same cap", func(t *testing.T) {
-		r, route := dispatch("conditional-with-flat", &high, "", int64(29))
+		r, route := dispatch("conditional-with-flat", "anthropic", &high, "", int64(29))
 		response := uuid.New()
 		if err := store.RecordBeichenReceiptID(ctx, r.CallID, credential, response); err != nil {
 			t.Fatal(err)
 		}
-		finalize(r, route, report)
+		finalize(r, route, anthropicReport)
 		var pending bool
 		err := db.QueryRowContext(ctx, `SELECT beichen_state='pending_review' AND beichen_review_reason='unknown_cache_ttl'
 			AND actual_credits IS NULL AND student_credits IS NULL AND school_absorbed_credits=0
@@ -194,7 +201,7 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 				t.Fatalf("receipt applied=%t, want %t: %v", applied, expected, err)
 			}
 		}
-		finalize(r, route, report)
+		finalize(r, route, anthropicReport)
 		checkCharge(r, "0.22", "0.029", "0.191", "0.2", "receipt_actual_cost")
 	})
 

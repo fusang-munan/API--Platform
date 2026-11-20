@@ -208,7 +208,14 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 	}
 	reason := ""
 	manualPriced := mode == "manual" && school.Valid
-	if len(terms) != 0 && !manualPriced && (noFixedSchool || isBeichenConditional(terms)) {
+	anthropicWrite := protocol == "anthropic" && metrics.CacheWriteTokens != nil && *metrics.CacheWriteTokens > 0
+	cacheDuration := beichenCacheTTL(ttl)
+	switch {
+	// A complete teacher-set price has one fixed rate for all cache writes.
+	case anthropicWrite && cacheDuration == "" && !manualPriced:
+		base = sql.NullString{}
+		reason = "unknown_cache_ttl"
+	case len(terms) != 0 && !manualPriced && (noFixedSchool || isBeichenConditional(terms) || anthropicWrite):
 		var observedEffort *string
 		if effort.Valid {
 			observedEffort = &effort.String
@@ -223,6 +230,9 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 			source: "gateway_usage_price", multiplierVersion: quoteVersion, quoteMultiplier: quoteMultiplier,
 			tier: evaluated.Tier, snapshot: terms, detail: evaluated.Detail,
 		}
+	case anthropicWrite && cacheDuration != "5m" && !manualPriced:
+		base = sql.NullString{}
+		reason = "missing_cache_write_price"
 	}
 	if !base.Valid {
 		_, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_review_reason=CASE

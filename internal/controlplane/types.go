@@ -34,15 +34,15 @@ type StudentProjectView struct {
 }
 
 type ProjectView struct {
-	ID                 string  `json:"id"`
-	OrganizationID     string  `json:"organization_id"`
-	Name               string  `json:"name"`
-	Description        *string `json:"description"`
-	Status             string  `json:"status"`
-	HasMentor          bool    `json:"has_mentor"`
-	IsResponsible      bool    `json:"is_responsible,omitempty"`
-	ApplicationStatus  *string `json:"application_status,omitempty"`
-	MonthlyCreditQuota string            `json:"monthly_credit_quota"`
+	ID                 string              `json:"id"`
+	OrganizationID     string              `json:"organization_id"`
+	Name               string              `json:"name"`
+	Description        *string             `json:"description"`
+	Status             string              `json:"status"`
+	HasMentor          bool                `json:"has_mentor"`
+	IsResponsible      bool                `json:"is_responsible,omitempty"`
+	ApplicationStatus  *string             `json:"application_status,omitempty"`
+	MonthlyCreditQuota string              `json:"monthly_credit_quota"`
 	Mentors            []MentorSummaryView `json:"mentors,omitempty"`
 }
 
@@ -52,28 +52,29 @@ type StudentModelPlazaView struct {
 }
 
 type ModelView struct {
-	ModelID          string   `json:"model_id"`
-	DisplayName      string   `json:"display_name"`
-	Description      *string  `json:"description"`
-	Category         string   `json:"category"`
-	Capabilities     []string `json:"capabilities"`
-	InputModalities  []string `json:"input_modalities"`
-	OutputModalities []string `json:"output_modalities"`
-	ContextWindow    *int     `json:"context_window"`
-	MaxInputTokens   *int     `json:"max_input_tokens"`
-	MaxOutputTokens  *int     `json:"max_output_tokens"`
-	IsCommon         bool     `json:"is_common"`
-	Status           string   `json:"status"`
-	RouteReady       bool     `json:"route_ready"`
-	CreditMultiplier *string          `json:"credit_multiplier"`
-	UpstreamMetadata map[string]any   `json:"upstream_metadata"`
-	ProviderID       string           `json:"provider_id,omitempty"`
-	ProviderName     string           `json:"provider_name,omitempty"`
-	PrimaryAdapter   string           `json:"primary_adapter,omitempty"`
-	AnthropicReady   bool             `json:"anthropic_ready"`
-	ResponsesReady   bool             `json:"responses_ready"`
-	CredentialID     string           `json:"credential_id,omitempty"`
-	CredentialLabel  string           `json:"credential_label,omitempty"`
+	ModelID            string         `json:"model_id"`
+	DisplayName        string         `json:"display_name"`
+	Description        *string        `json:"description"`
+	Category           string         `json:"category"`
+	Capabilities       []string       `json:"capabilities"`
+	InputModalities    []string       `json:"input_modalities"`
+	OutputModalities   []string       `json:"output_modalities"`
+	ContextWindow      *int           `json:"context_window"`
+	MaxInputTokens     *int           `json:"max_input_tokens"`
+	MaxOutputTokens    *int           `json:"max_output_tokens"`
+	IsCommon           bool           `json:"is_common"`
+	Status             string         `json:"status"`
+	RouteReady         bool           `json:"route_ready"`
+	CreditMultiplier   *string        `json:"credit_multiplier"`
+	UpstreamMetadata   map[string]any `json:"upstream_metadata"`
+	ProviderID         string         `json:"provider_id,omitempty"`
+	ProviderName       string         `json:"provider_name,omitempty"`
+	PrimaryAdapter     string         `json:"primary_adapter,omitempty"`
+	SupportedProtocols []string       `json:"supported_protocols,omitempty"`
+	AnthropicReady     bool           `json:"anthropic_ready"`
+	ResponsesReady     bool           `json:"responses_ready"`
+	CredentialID       string         `json:"credential_id,omitempty"`
+	CredentialLabel    string         `json:"credential_label,omitempty"`
 }
 
 type MentorCandidateView struct {

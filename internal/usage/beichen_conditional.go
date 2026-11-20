@@ -141,8 +141,7 @@ type beichenBillableTokens struct {
 }
 
 // evaluateBeichenConditional returns base credits before the upstream group
-// and school multipliers. An empty effort means the request omitted it.
-// A nil effort means the gateway did not record whether it was omitted.
+// and school multipliers. Missing effort uses the default pricing tier.
 func evaluateBeichenConditional(raw json.RawMessage, metrics CallMetrics, effort *string, ttl, protocol string) (beichenConditionalPrice, string) {
 	terms := decodeBeichenConditions(raw)
 	if terms == nil {
@@ -166,12 +165,9 @@ func evaluateBeichenConditional(raw json.RawMessage, metrics CallMetrics, effort
 	multiplier := big.NewRat(1, 1)
 	appliedEffort := ""
 	if len(terms.EffortMultiplier) != 0 {
-		if effort == nil {
-			return beichenConditionalPrice{}, "unknown_reasoning_effort"
-		}
-		appliedEffort = *effort
-		if appliedEffort == "" {
-			appliedEffort = "medium"
+		appliedEffort = DefaultReasoningEffort
+		if effort != nil && *effort != "" {
+			appliedEffort = *effort
 		}
 		multiplier = beichenPriceDecimal(terms.EffortMultiplier[appliedEffort])
 		if multiplier == nil {
@@ -181,7 +177,8 @@ func evaluateBeichenConditional(raw json.RawMessage, metrics CallMetrics, effort
 
 	appliedTTL := ""
 	writePrice := rates.CacheWrite
-	if tokens.Write > 0 && timedCache {
+	// OpenAI reports implicit cache writes at the base write rate.
+	if tokens.Write > 0 && (protocol == "anthropic" || (protocol == "google_gemini_v1beta" && timedCache)) {
 		appliedTTL = beichenCacheTTL(ttl)
 		switch appliedTTL {
 		case "5m":

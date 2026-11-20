@@ -87,6 +87,8 @@ type Overview struct {
 	ModelCatalog       []CatalogModel      `json:"model_catalog"`
 	Comparison         []Comparison        `json:"comparison"`
 	CatalogDifferences []CatalogDifference `json:"catalog_differences"`
+	WebsiteOnlyModels  []WebsiteOnlyModel  `json:"website_only_models"`
+	WebsiteOnlyStatus  string              `json:"website_only_status"`
 	ProbeRun           ProbeRun            `json:"probe_run"`
 }
 
@@ -652,7 +654,7 @@ const comparisonSQL = `
 WITH attributed AS (
   SELECT ` + attributedColumnsSQL + attributedFromSQL + `
 ), priced_calls AS (
-  SELECT a.*,
+  SELECT a.*, COALESCE(alias.school_model, a.model) AS school_model,
     CASE WHEN cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN
       beichen_weighted_tokens(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
       p.upstream_input, p.upstream_output, p.upstream_cache_read, p.upstream_cache_write) END AS estimated_weight,
@@ -660,9 +662,10 @@ WITH attributed AS (
       beichen_weighted_tokens(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
       p.school_input, p.school_output, p.school_cache_read, p.school_cache_write)
       * CASE WHEN p.mode = 'follow' THEN 100 ELSE 1 END END AS trial_weight
-  FROM attributed a CROSS JOIN LATERAL beichen_price_at(a.credential_id, a.model, a.sent_at) p
+  FROM attributed a ` + joinModelAliasSQL + `
+  CROSS JOIN LATERAL beichen_price_at(a.credential_id, a.model, a.sent_at) p
 ), local AS (
-  SELECT credential_id, model, count(*) AS requests,
+  SELECT credential_id, school_model AS model, count(*) AS requests,
     CASE WHEN count(input_tokens) = count(*) THEN sum(input_tokens) END AS input_tokens,
     CASE WHEN count(output_tokens) = count(*) THEN sum(output_tokens) END AS output_tokens,
     CASE WHEN count(cache_read_tokens) = count(*) THEN sum(cache_read_tokens) END AS cache_read_tokens,
@@ -674,19 +677,36 @@ WITH attributed AS (
     count(*) FILTER (WHERE beichen_state = 'pending_review') AS pending_review_calls,
     count(*) FILTER (WHERE trial_weight IS NULL) AS unpriced_calls
   FROM priced_calls
-  GROUP BY credential_id, model
+  GROUP BY credential_id, school_model
+), upstream_rows AS (
+  SELECT a.*, COALESCE(alias.school_model, a.model) AS school_model
+  FROM beichen_daily_usage a ` + joinModelAliasSQL + `
+  WHERE a.provider_id = $1 AND a.day = $4::text::date
 ), upstream AS (
-  SELECT * FROM beichen_daily_usage WHERE provider_id = $1 AND day = $4::text::date
+  SELECT credential_id, school_model AS model,
+    CASE WHEN count(requests) = count(*) THEN sum(requests) END AS requests,
+    CASE WHEN count(input_tokens) = count(*) THEN sum(input_tokens) END AS input_tokens,
+    CASE WHEN count(output_tokens) = count(*) THEN sum(output_tokens) END AS output_tokens,
+    CASE WHEN count(cache_read_tokens) = count(*) THEN sum(cache_read_tokens) END AS cache_read_tokens,
+    CASE WHEN count(cache_write_tokens) = count(*) THEN sum(cache_write_tokens) END AS cache_write_tokens,
+    CASE WHEN count(billed_upstream_micros) = count(*) THEN sum(billed_upstream_micros) END AS billed_upstream_micros,
+    string_agg(DISTINCT source, ',' ORDER BY source) AS source
+  FROM upstream_rows GROUP BY credential_id, school_model
 ), confirmed_empty AS (
   SELECT credential_id FROM beichen_usage_days WHERE provider_id = $1 AND day = $4::text::date AND empty
 )
 SELECT COALESCE(l.credential_id, u.credential_id), COALESCE(l.model, u.model), l.requests,
-  CASE WHEN u.credential_id IS NOT NULL THEN u.requests WHEN e.credential_id IS NOT NULL THEN 0::bigint END,
-  CASE WHEN l.input_tokens <= 9223372036854775807 THEN l.input_tokens::bigint END, u.input_tokens,
-  CASE WHEN l.output_tokens <= 9223372036854775807 THEN l.output_tokens::bigint END, u.output_tokens,
-  CASE WHEN l.cache_read_tokens <= 9223372036854775807 THEN l.cache_read_tokens::bigint END, u.cache_read_tokens,
-  CASE WHEN l.cache_write_tokens <= 9223372036854775807 THEN l.cache_write_tokens::bigint END, u.cache_write_tokens,
-  CASE WHEN l.estimated_micros <= 9223372036854775807 THEN l.estimated_micros::bigint END, u.billed_upstream_micros,
+  CASE WHEN u.requests <= 9223372036854775807 THEN u.requests::bigint WHEN u.credential_id IS NULL AND e.credential_id IS NOT NULL THEN 0::bigint END,
+  CASE WHEN l.input_tokens <= 9223372036854775807 THEN l.input_tokens::bigint END,
+  CASE WHEN u.input_tokens <= 9223372036854775807 THEN u.input_tokens::bigint END,
+  CASE WHEN l.output_tokens <= 9223372036854775807 THEN l.output_tokens::bigint END,
+  CASE WHEN u.output_tokens <= 9223372036854775807 THEN u.output_tokens::bigint END,
+  CASE WHEN l.cache_read_tokens <= 9223372036854775807 THEN l.cache_read_tokens::bigint END,
+  CASE WHEN u.cache_read_tokens <= 9223372036854775807 THEN u.cache_read_tokens::bigint END,
+  CASE WHEN l.cache_write_tokens <= 9223372036854775807 THEN l.cache_write_tokens::bigint END,
+  CASE WHEN u.cache_write_tokens <= 9223372036854775807 THEN u.cache_write_tokens::bigint END,
+  CASE WHEN l.estimated_micros <= 9223372036854775807 THEN l.estimated_micros::bigint END,
+  CASE WHEN u.billed_upstream_micros <= 9223372036854775807 THEN u.billed_upstream_micros::bigint END,
   CASE WHEN l.trial_credit_milli <= 9223372036854775807 THEN l.trial_credit_milli::bigint END, l.unpriced_calls,
   COALESCE(u.source, CASE WHEN e.credential_id IS NOT NULL THEN 'usage' END), l.trial_credits,
   l.charged_credits, l.pending_review_calls

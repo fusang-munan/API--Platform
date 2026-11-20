@@ -1,11 +1,13 @@
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { defineComponent } from 'vue'
 import type { Provider } from '../../api/types'
 import BeichenReconcile from './BeichenReconcile.vue'
 import TeacherProviders from './TeacherProviders.vue'
 
-const api = vi.hoisted(() => ({ providers: vi.fn(), beichenOverview: vi.fn() }))
+const api = vi.hoisted(() => ({ providers: vi.fn(), beichenOverview: vi.fn(), beichenAliases: vi.fn(), putBeichenAlias: vi.fn() }))
 vi.mock('../../api/teacher', () => ({ teacherAPI: api }))
+const Dialog = defineComponent({ props: ['open', 'title'], template: '<section v-if="open" role="dialog" :aria-label="title"><slot /></section>' })
 enableAutoUnmount(afterEach)
 
 function provider(id: string, baseUrl = 'https://api.beichenapi.com'): Provider {
@@ -18,17 +20,56 @@ function provider(id: string, baseUrl = 'https://api.beichenapi.com'): Provider 
 function view() {
   return mount(TeacherProviders, {
     attachTo: document.body,
-    global: { stubs: { AppDialog: true, BeichenSchoolModels: true, BeichenReconcile: true } },
+    global: { stubs: { AppDialog: Dialog, BeichenSchoolModels: true, BeichenReconcile: true } },
   })
 }
 
 beforeEach(() => {
   api.providers.mockReset()
   api.beichenOverview.mockReset()
+  api.beichenAliases.mockReset()
+  api.putBeichenAlias.mockReset()
 })
-afterEach(() => vi.useRealTimers())
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
 
 describe('北辰供应商行', () => {
+  it('按渠道创建、更新和移除模型别名', async () => {
+    api.providers.mockResolvedValue([{ ...provider('north'), credentials: [
+      { id: 'first', provider_id: 'north', label: '渠道一', status: 'active', credential_configured: true, created_at: '', updated_at: '' },
+    ] }])
+    api.beichenOverview.mockResolvedValue({ model_catalog: [], comparison: [] })
+    const original = { credential_id: 'first', upstream_model: 'upstream/a', school_model: 'school/a' }
+    api.beichenAliases.mockResolvedValueOnce([]).mockResolvedValueOnce([original])
+      .mockResolvedValueOnce([{ ...original, school_model: 'school/b' }]).mockResolvedValueOnce([])
+    api.putBeichenAlias.mockResolvedValue({ saved: true })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const wrapper = view()
+    await flushPromises()
+    await wrapper.findAll('button').find(node => node.text() === '模型别名')!.trigger('click')
+    await flushPromises()
+    const dialog = wrapper.get('[aria-label="北辰模型别名"]')
+    const form = dialog.get('form')
+    expect(form.get('select').element.value).toBe('first')
+    const [upstream, school] = form.findAll('input')
+    await upstream.setValue('upstream/a')
+    await school.setValue('school/a')
+    await form.trigger('submit')
+    await flushPromises()
+    expect(dialog.get('.alias-list').text()).toContain('upstream/a → school/a')
+    await dialog.findAll('button').find(node => node.text() === '编辑')!.trigger('click')
+    expect(upstream.element.disabled).toBe(true)
+    await school.setValue('school/b')
+    await form.trigger('submit')
+    await flushPromises()
+    expect(dialog.get('.alias-list').text()).toContain('upstream/a → school/b')
+    await dialog.findAll('button').find(node => node.text() === '移除')!.trigger('click')
+    await flushPromises()
+    expect(dialog.text()).toContain('还没有模型别名')
+    expect(api.putBeichenAlias.mock.calls).toEqual([
+      ['north', original], ['north', { ...original, school_model: 'school/b' }], ['north', { ...original, school_model: null }],
+    ])
+  })
+
   it('分 Key 列出目录差异并提示换 Key 和补分组', async () => {
     api.providers.mockResolvedValue([provider('north')])
     api.beichenOverview.mockResolvedValue({ model_catalog: [

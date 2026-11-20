@@ -141,6 +141,8 @@ export type BeichenOverview = {
   model_catalog?: BeichenCatalogModel[] | null
   credentials?: BeichenCredentialSummary[] | null
   catalog_differences?: BeichenCatalogDifference[] | null
+  website_only_models?: BeichenWebsiteOnlyModel[]
+  website_only_status?: 'compared' | 'unverified'
   probe_run?: BeichenProbeRun
   datasets: BeichenDataset[] | null
   models: BeichenModel[] | null
@@ -161,6 +163,32 @@ export type BeichenCatalogDifference = {
   checked_at: string | null
   website_only: string[]
   key_only: string[]
+}
+export type BeichenWebsiteOnlyModel = {
+  model: string
+  channels: Array<{ credential_id: string; label: string }>
+}
+export type BeichenModelAlias = { credential_id: string | null; upstream_model: string; school_model: string }
+export type BeichenModelAliasUpdate = Omit<BeichenModelAlias, 'school_model'> & { school_model: string | null }
+export type BeichenRebindRoute = {
+  credential_id: string | null
+  credential_label: string | null
+  upstream_model: string
+  priority: number
+  status: 'active' | 'inactive'
+}
+export type BeichenRebindPlan = {
+  preview: boolean
+  preview_token: string
+  changes: Array<{
+    model_id: string
+    school_model: string
+    adapter: string
+    binding_id?: string
+    action: 'add' | 'update' | 'enable' | 'disable'
+    before: BeichenRebindRoute | null
+    after: BeichenRebindRoute
+  }>
 }
 export type BeichenProbeRun = {
   state: 'idle' | 'queued' | 'running' | 'completed' | 'failed'

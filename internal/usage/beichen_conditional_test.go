@@ -29,7 +29,7 @@ func TestEvaluateBeichenConditional(t *testing.T) {
 	provenZero.CacheMissTokens, provenZero.CacheWriteTokens = &zero, nil
 	incomplete := provenZero
 	incomplete.CacheMissTokens = nil
-	omitted, high := "", "high"
+	omitted, high, low := "", "high", "low"
 	tests := []struct {
 		name, terms                       string
 		usage                             CallMetrics
@@ -43,7 +43,7 @@ func TestEvaluateBeichenConditional(t *testing.T) {
 		{name: "tier 3 lower edge", terms: tiers, usage: metrics(200, 0, 0, 0), credits: "0.18", tier: "[200,)"},
 		{name: "tier 3 unbounded", terms: tiers, usage: metrics(10000, 0, 0, 0), credits: "9", tier: "[200,)"},
 		{name: "OpenAI cache already in prompt", terms: tiers, usage: openaiCache, credits: "0.0545", tier: "[100,200)"},
-		{name: "Anthropic cache counts separate", terms: tiers, usage: metrics(80, 0, 15, 5), protocol: "anthropic", credits: "0.0545", tier: "[100,200)"},
+		{name: "Anthropic cache counts separate", terms: tiers, usage: metrics(80, 0, 15, 5), protocol: "anthropic", ttl: "5m", credits: "0.0545", tier: "[100,200)"},
 		{name: "tier gap ignores base rates", terms: rates + `,"intervals":[{"min_tokens":100}]}`,
 			usage: metrics(99, 0, 0, 0), review: "missing_price_tier"},
 		{name: "tiers overlap", terms: rates + `,"intervals":[{"min_tokens":0},{"min_tokens":50}]}`,
@@ -54,15 +54,18 @@ func TestEvaluateBeichenConditional(t *testing.T) {
 			effort: &omitted, credits: "0.008", multiplier: "2"},
 		{name: "medium absent", terms: rates + `,"reasoning_effort_multipliers":{"high":1.5}}`,
 			usage: metrics(11, 3, 4, 5), effort: &omitted, review: "missing_reasoning_effort_multiplier"},
-		{name: "effort unrecorded", terms: reasoning, usage: metrics(11, 3, 4, 5), review: "unknown_reasoning_effort"},
-		{name: "5m uses base rate", terms: timed, usage: metrics(4, 0, 0, 3), ttl: "5m", credits: "0.0013"},
-		{name: "1h rate", terms: timed, usage: metrics(4, 0, 0, 3), ttl: "3600", credits: "0.0022"},
-		{name: "12h rate", terms: timed, usage: metrics(4, 0, 0, 3), ttl: "12h", credits: "0.0025"},
-		{name: "unknown cache duration", terms: timed, usage: metrics(4, 0, 0, 3), ttl: "20m", review: "unknown_cache_ttl"},
-		{name: "unrecorded cache duration", terms: timed, usage: metrics(4, 0, 0, 3), review: "unknown_cache_ttl"},
-		{name: "no cache writes needs no duration", terms: timed, usage: metrics(1, 0, 0, 0), credits: "0.0001"},
+		{name: "unrecorded effort defaults to medium", terms: reasoning, usage: metrics(11, 3, 4, 5), credits: "0.008", multiplier: "2"},
+		{name: "unquoted observed effort", terms: reasoning, usage: metrics(11, 3, 4, 5), effort: &low, review: "missing_reasoning_effort_multiplier"},
+		{name: "5m uses base rate", terms: timed, protocol: "anthropic", usage: metrics(1, 0, 0, 3), ttl: "5m", credits: "0.0013"},
+		{name: "1h rate", terms: timed, protocol: "anthropic", usage: metrics(1, 0, 0, 3), ttl: "3600", credits: "0.0022"},
+		{name: "12h rate", terms: timed, protocol: "anthropic", usage: metrics(1, 0, 0, 3), ttl: "12h", credits: "0.0025"},
+		{name: "unknown cache duration", terms: timed, protocol: "anthropic", usage: metrics(1, 0, 0, 3), ttl: "20m", review: "unknown_cache_ttl"},
+		{name: "unrecorded cache duration", terms: timed, protocol: "anthropic", usage: metrics(1, 0, 0, 3), review: "unknown_cache_ttl"},
+		{name: "no cache writes needs no duration", terms: timed, protocol: "anthropic", usage: metrics(1, 0, 0, 0), credits: "0.0001"},
+		{name: "OpenAI prices implicit cache at base", terms: timed, usage: metrics(4, 0, 0, 3), ttl: "1h", credits: "0.0013"},
+		{name: "OpenAI missing TTL uses base", terms: timed, protocol: "openai_compatible", usage: metrics(4, 0, 0, 3), credits: "0.0013"},
 		{name: "TTL rate missing", terms: rates + `,"cache_write_1h_price":7e-6}`,
-			usage: metrics(4, 0, 0, 3), ttl: "12h", review: "missing_cache_write_price"},
+			protocol: "anthropic", usage: metrics(1, 0, 0, 3), ttl: "12h", review: "missing_cache_write_price"},
 		{name: "cache write without price", terms: noCache, usage: metrics(4, 0, 0, 3), review: "missing_cache_write_price"},
 		{name: "cache read without price", terms: noCache, usage: metrics(4, 0, 3, 0), review: "missing_cache_read_price"},
 		{name: "confirmed zero write price", terms: noCache[:len(noCache)-1] + `,"cache_write_price":0}`,

@@ -107,4 +107,32 @@ describe('StudentModels key whitelist', () => {
     expect(wrapper.find('[data-testid="confirm-reapply"]').exists()).toBe(false)
     wrapper.unmount()
   })
+
+  it('shows supported protocols and suggests alternatives for a mismatch', async () => {
+    const { studentAPI } = await import('../../api/student')
+    vi.mocked(studentAPI.models).mockResolvedValueOnce({
+      common_models: [
+        { ...fixture.model('gpt-5.3-codex'), supported_protocols: ['openai_compatible', 'openai_responses'] },
+        { ...fixture.model('claude-sonnet-4-5'), supported_protocols: ['anthropic'] },
+      ],
+      library_models: [],
+    } as never)
+    const wrapper = mountPage()
+    await flushPromises()
+
+    const chips = wrapper.findAll('[data-testid="protocol-chip"]').map(chip => chip.text())
+    expect(chips).toContain('Chat')
+    expect(chips).toContain('Responses')
+    expect(chips).toContain('Anthropic')
+    let warnings = wrapper.findAll('[data-testid="protocol-alternatives"]')
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0].text()).toContain('Anthropic Messages')
+    expect(warnings[0].text()).toContain('网关不做协议转换')
+
+    await wrapper.get('[data-testid="protocol-select"]').setValue('anthropic')
+    warnings = wrapper.findAll('[data-testid="protocol-alternatives"]')
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0].text()).toContain('OpenAI Chat / Completions')
+    wrapper.unmount()
+  })
 })

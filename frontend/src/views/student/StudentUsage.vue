@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { studentAPI } from '../../api/student'
 import { APIError, get } from '../../api/client'
 import type { KeyUsage, StudentProjectUsage, StudentUsage, UsageSlice } from '../../api/types'
@@ -10,6 +10,7 @@ import { formatPercent, formatTokens, shiftDecimal } from '../../utils/credits'
 import { beichenBillingExplanation, calculateCredits, fullTime, quotaBalance, schoolMonth, statusLabel } from '../../utils/format'
 
 type UsageRange = 'day' | 'month' | 'all'
+type RecentRange = 'today' | 'month' | 'all'
 type ModelUsageSlice = UsageSlice & {
   tokens?: number | null
   input_tokens?: number | null
@@ -48,9 +49,30 @@ type ModelRow = {
   keyName: string
   model: ModelUsageSlice
 }
+type StudentRecentCall = {
+  id: string
+  request_id: string
+  model_id: string
+  model_name: string
+  project_name: string
+  input_tokens: number | null
+  output_tokens: number | null
+  cache_read_tokens: number | null
+  cache_write_tokens: number | null
+  credits: string
+  status: string
+  billing_state: string
+  created_at: string
+}
+type StudentRecentPage = { items: StudentRecentCall[]; next_cursor: string | null }
 
 const ranges: Array<{ id: UsageRange; label: string }> = [
   { id: 'day', label: '今天' },
+  { id: 'month', label: '本月' },
+  { id: 'all', label: '全部' },
+]
+const recentRanges: Array<{ id: RecentRange; label: string }> = [
+  { id: 'today', label: '今天' },
   { id: 'month', label: '本月' },
   { id: 'all', label: '全部' },
 ]
@@ -65,6 +87,13 @@ const receiptQuery = ref('')
 const receipt = ref<StudentCallReceipt | null>(null)
 const receiptLoading = ref(false)
 const receiptError = ref('')
+const recentRange = ref<RecentRange>('today')
+const recentItems = ref<StudentRecentCall[]>([])
+const recentCursor = ref<string | null>(null)
+const recentLoading = ref(false)
+const recentLoaded = ref(false)
+const recentError = ref('')
+let recentRequest = 0
 
 async function load() {
   loading.value = true
@@ -80,6 +109,41 @@ async function load() {
 }
 
 const { refresh } = useVisibilityPolling(load)
+
+async function loadRecent(reset = false) {
+  const request = ++recentRequest
+  recentLoading.value = true
+  if (reset) {
+    recentItems.value = []
+    recentCursor.value = null
+    recentLoaded.value = false
+  }
+  try {
+    const params = new URLSearchParams({ range: recentRange.value, limit: '20' })
+    if (!reset && recentCursor.value) params.set('cursor', recentCursor.value)
+    const page = await get<StudentRecentPage>(`/api/v1/student/usage/recent?${params.toString()}`)
+    if (request !== recentRequest) return
+    const items = page.items ?? []
+    recentItems.value = reset ? items : [...recentItems.value, ...items]
+    recentCursor.value = page.next_cursor ?? null
+    recentError.value = ''
+  } catch (caught) {
+    if (request === recentRequest) {
+      recentError.value = caught instanceof APIError ? caught.message : '加载最近调用失败'
+    }
+  } finally {
+    if (request === recentRequest) {
+      recentLoading.value = false
+      recentLoaded.value = true
+    }
+  }
+}
+
+function changeRecentRange(value: RecentRange) {
+  if (recentRange.value === value) return
+  recentRange.value = value
+  void loadRecent(true)
+}
 
 const selectedRange = computed(() => ranges.find(item => item.id === range.value) ?? ranges[1])
 
@@ -190,6 +254,27 @@ function receiptCost(value?: string | null) {
   return value == null || value === '' ? '—' : `${value} 元`
 }
 
+const recentStatusLabels: Record<string, string> = {
+  succeeded: '成功',
+  upstream_failed: '上游失败',
+  quota_rejected: '额度不足',
+  outcome_unknown: '结果未知',
+  pending_review: '待核账',
+  pending: '处理中',
+}
+
+function recentStatusLabel(value?: string | null) {
+  if (!value) return '—'
+  return recentStatusLabels[value] ?? statusLabel(value) ?? value
+}
+
+function recentStatusClass(value?: string | null) {
+  if (value === 'succeeded') return 'active'
+  if (value === 'upstream_failed') return 'danger'
+  if (value && ['pending_review', 'pending', 'outcome_unknown'].includes(value)) return 'pending'
+  return 'muted'
+}
+
 async function lookupReceipt() {
   const query = receiptQuery.value.trim()
   if (!query) {
@@ -230,6 +315,8 @@ function projectSegments(project: StudentProjectUsageView) {
     { name: '剩余额度', value: Number(project.available), displayValue: project.available, color: '#dfe3ec' },
   ]
 }
+
+onMounted(() => { void loadRecent(true) })
 </script>
 
 <template>
@@ -308,6 +395,62 @@ function projectSegments(project: StudentProjectUsageView) {
       <p v-else class="muted" role="status">正在加载模型用量…</p>
     </section>
 
+    <section class="panel student-recent-panel">
+      <div class="beichen-section-head">
+        <div>
+          <h2>最近调用</h2>
+          <p class="muted">只显示本人经学校网关发起的调用；Token 与缓存数据来自上游回报。</p>
+        </div>
+        <div class="range-switch" role="group" aria-label="最近调用范围">
+          <button v-for="item in recentRanges" :key="item.id" type="button"
+            :aria-pressed="recentRange === item.id" :data-testid="`recent-range-${item.id}`"
+            @click="changeRecentRange(item.id)">{{ item.label }}</button>
+        </div>
+      </div>
+      <p v-if="recentError" class="error banner" role="alert">{{ recentError }}</p>
+      <div v-if="recentItems.length" class="beichen-table-wrap">
+        <table class="beichen-table student-recent-table" data-testid="recent-calls-table">
+          <caption class="sr-only">最近调用</caption>
+          <thead>
+            <tr>
+              <th scope="col">时间</th>
+              <th scope="col">模型</th>
+              <th scope="col" class="numeric-cell">输入</th>
+              <th scope="col" class="numeric-cell">输出</th>
+              <th scope="col" class="numeric-cell">缓存读</th>
+              <th scope="col" class="numeric-cell">缓存写</th>
+              <th scope="col" class="numeric-cell">扣分</th>
+              <th scope="col">状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in recentItems" :key="item.id">
+              <td data-label="时间">{{ fullTime(item.created_at) }}</td>
+              <td data-label="模型">
+                <strong>{{ item.model_name || item.model_id }}</strong>
+                <small class="recent-request">{{ item.model_id }} · {{ item.request_id }}</small>
+              </td>
+              <td class="numeric-cell" data-label="输入">{{ formatTokens(item.input_tokens) }}</td>
+              <td class="numeric-cell" data-label="输出">{{ formatTokens(item.output_tokens) }}</td>
+              <td class="numeric-cell" data-label="缓存读">{{ formatTokens(item.cache_read_tokens) }}</td>
+              <td class="numeric-cell" data-label="缓存写">{{ formatTokens(item.cache_write_tokens) }}</td>
+              <td class="numeric-cell" data-label="扣分">{{ creditText(item.credits) }}</td>
+              <td data-label="状态"><span class="status-pill" :class="recentStatusClass(item.status)">{{ recentStatusLabel(item.status) }}</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <EmptyState v-else-if="recentLoaded && !recentLoading" title="所选范围暂无调用记录" />
+      <p v-else class="muted" role="status">正在加载最近调用…</p>
+      <div class="student-recent-actions">
+        <button v-if="recentCursor" class="button ghost" :disabled="recentLoading" @click="loadRecent()">
+          {{ recentLoading ? '加载中…' : '加载更多' }}
+        </button>
+        <span v-else-if="recentLoaded && recentItems.length" class="muted">已显示全部</span>
+        <button class="button ghost" :disabled="recentLoading" @click="loadRecent(true)">刷新</button>
+      </div>
+    </section>
+
     <section class="panel student-receipt-panel">
       <div class="beichen-section-head">
         <div>
@@ -320,7 +463,7 @@ function projectSegments(project: StudentProjectUsageView) {
         </form>
       </div>
       <p v-if="receiptError" class="error banner" role="alert">{{ receiptError }}</p>
-      <p class="beichen-note">当前版本暂不提供“最近调用”列表，可按请求编号查询单笔明细；时间、输入/输出与缓存 Token 待接口补齐后显示。</p>
+      <p class="beichen-note">可按请求编号查询单笔明细；时间、输入/输出与缓存 Token 以学校网关和上游回报为准。</p>
       <div class="beichen-table-wrap">
         <table class="beichen-table student-call-table">
           <caption class="sr-only">单笔调用明细</caption>
@@ -411,6 +554,7 @@ function projectSegments(project: StudentProjectUsageView) {
 <style scoped>
 .student-usage-summary-panel,
 .student-model-panel,
+.student-recent-panel,
 .student-receipt-panel,
 .student-project-section {
   display: grid;
@@ -437,8 +581,27 @@ function projectSegments(project: StudentProjectUsageView) {
 }
 
 .student-model-table td[data-label],
+.student-recent-table td[data-label],
 .student-call-table td[data-label] {
   overflow-wrap: anywhere;
+}
+
+.student-recent-table th small,
+.student-recent-table td small {
+  display: block;
+  margin-top: 4px;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.student-recent-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .student-receipt-search {
@@ -476,6 +639,7 @@ function projectSegments(project: StudentProjectUsageView) {
 
 @media (max-width: 900px) {
   .student-model-table tbody tr,
+  .student-recent-table tbody tr,
   .student-call-table tbody tr {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -484,18 +648,22 @@ function projectSegments(project: StudentProjectUsageView) {
   }
 
   .student-model-table tbody th,
+  .student-recent-table tbody th,
   .student-call-table td[colspan] {
     grid-column: 1 / -1;
   }
 
   .student-model-table th,
   .student-model-table td,
+  .student-recent-table th,
+  .student-recent-table td,
   .student-call-table th,
   .student-call-table td {
     padding: 4px 8px;
   }
 
   .student-model-table td[data-label]::before,
+  .student-recent-table td[data-label]::before,
   .student-call-table td[data-label]::before {
     content: attr(data-label);
     display: block;
@@ -504,6 +672,7 @@ function projectSegments(project: StudentProjectUsageView) {
   }
 
   .student-model-table .numeric-cell,
+  .student-recent-table .numeric-cell,
   .student-call-table .numeric-cell {
     text-align: left;
   }

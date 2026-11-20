@@ -105,7 +105,7 @@ type ReconciliationReport struct {
 	Keys     []ReconciliationKey    `json:"keys"`
 }
 
-// grouping=0 按凭据和上游模型，grouping=1 按凭据，grouping=3 为总计。
+// grouping=0 按凭据和别名解析后的模型，grouping=1 按凭据，grouping=3 为总计。
 // 两侧先各自聚合再 FULL JOIN，保留每条渠道独有的模型记录。
 const reconciliationSQL = reportAttributionSQL + `,
    c.id AS call_id, c.beichen_receipt_response_id, c.beichen_receipt_conflict,
@@ -123,14 +123,15 @@ verified_calls AS (
    AND r.credential_id = a.credential_id AND r.model = a.model
  WHERE a.beichen_state = 'charged' AND NOT a.beichen_receipt_conflict
 ), priced_calls AS (
- SELECT a.*, CASE WHEN a.token_parts = 4 AND a.beichen_state IS DISTINCT FROM 'pending_review' THEN
+ SELECT a.*, COALESCE(alias.school_model, a.model) AS school_model,
+   CASE WHEN a.token_parts = 4 AND a.beichen_state IS DISTINCT FROM 'pending_review' THEN
    beichen_weighted_tokens(a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_write_tokens,
      p.upstream_input, p.upstream_output, p.upstream_cache_read, p.upstream_cache_write)
    END AS estimated_weight
- FROM report_calls a
+ FROM report_calls a ` + joinModelAliasSQL + `
  CROSS JOIN LATERAL beichen_price_at(a.credential_id, a.model, a.sent_at) p
 ), local_summary AS (
- SELECT credential_id, model, grouping(credential_id, model) AS level, count(*) AS requests,
+ SELECT credential_id, school_model AS model, grouping(credential_id, school_model) AS level, count(*) AS requests,
    ` + tokenCompletenessSQL + ` AS token_completeness,
    COALESCE(sum(missing_tokens), 0) AS tokens_missing,
    ` + chargedTokensMissingCallsSQL + ` AS charged_tokens_missing_calls,
@@ -148,13 +149,14 @@ verified_calls AS (
    count(*) FILTER (WHERE beichen_state = 'pending_review') AS pending_calls,
    count(*) FILTER (WHERE beichen_state = 'charged' AND recorded_base_credits IS NULL) AS unpriced_calls,
    count(DISTINCT COALESCE(beichen_school_multiplier, 1)) > 1 AS multiplier_mixed
- FROM priced_calls GROUP BY GROUPING SETS ((credential_id, model), (credential_id), ())
+ FROM priced_calls GROUP BY GROUPING SETS ((credential_id, school_model), (credential_id), ())
 ), daily_usage AS (
- SELECT credential_id, model, day, requests, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+ SELECT a.credential_id, COALESCE(alias.school_model, a.model) AS model, day,
+   requests, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
    num_nonnulls(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) AS token_parts,
    billed_upstream_micros, source
- FROM beichen_daily_usage
- WHERE provider_id = $1 AND ($4::text IS NULL OR day >= $4::text::date) AND day < $5::text::date
+ FROM beichen_daily_usage a ` + joinModelAliasSQL + `
+ WHERE a.provider_id = $1 AND ($4::text IS NULL OR day >= $4::text::date) AND day < $5::text::date
 ), upstream_summary AS (
  SELECT credential_id, model, grouping(credential_id, model) AS level, count(*) AS row_count,
    ` + tokenCompletenessSQL + ` AS token_completeness,

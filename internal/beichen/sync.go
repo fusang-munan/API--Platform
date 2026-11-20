@@ -27,6 +27,13 @@ type syncJob struct {
 	kind       string
 }
 
+func (j syncJob) leaseKind() string {
+	if j.kind == "catalog" {
+		return "billing"
+	}
+	return j.kind
+}
+
 type credentialRecord struct {
 	ciphertext []byte
 	updatedAt  time.Time
@@ -155,7 +162,7 @@ VALUES ($1, $2, $3, clock_timestamp() + $4::int * interval '1 second')
 ON CONFLICT (credential_id, kind) DO UPDATE SET lease_id = EXCLUDED.lease_id, lease_until = EXCLUDED.lease_until
 WHERE (beichen_datasets.lease_until IS NULL OR beichen_datasets.lease_until <= clock_timestamp())
   AND ($5::boolean OR beichen_datasets.next_attempt <= clock_timestamp())
-RETURNING lease_id`, job.credential, job.kind, lease, leaseSeconds, manual).Scan(&lease)
+RETURNING lease_id`, job.credential, job.leaseKind(), lease, leaseSeconds, manual).Scan(&lease)
 	if errors.Is(err, sql.ErrNoRows) {
 		return true, nil
 	}
@@ -185,6 +192,15 @@ WHERE c.id = $1 AND p.id = $2 AND p.status = 'active' AND c.status = 'active' AN
 
 func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credentialRecord, key string, manual bool) fetchResult {
 	switch job.kind {
+	case "catalog":
+		entries, err := s.fetchKeyCatalog(ctx, key)
+		catalogAt := s.now().UTC()
+		return fetchResult{err: err, save: func(ctx context.Context, tx *sql.Tx) error {
+			if err != nil {
+				return recordDatasetError(ctx, tx, job.credential, "catalog", err.Error())
+			}
+			return saveKeyCatalog(ctx, tx, job, entries, catalogAt)
+		}}
 	case "billing":
 		return s.fetchBillingJob(ctx, job, credential.updatedAt, key)
 	case "usage":
@@ -224,10 +240,7 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 				return err
 			}
 		} else {
-			if _, err := catalog.ReplaceCredentialEntries(ctx, tx, job.provider, job.credential, entries, catalogAt); err != nil {
-				return err
-			}
-			if err := recordSuccess(ctx, tx, job.credential, "catalog"); err != nil {
+			if err := saveKeyCatalog(ctx, tx, job, entries, catalogAt); err != nil {
 				return err
 			}
 			if err := saveWebsiteCatalog(ctx, tx, job.credential, revision, quote); err != nil {
@@ -236,6 +249,13 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 		}
 		return saveBillingObservation(ctx, tx, job.credential, revision, info, billingErr, quote.groupID, quote)
 	}}
+}
+
+func saveKeyCatalog(ctx context.Context, tx *sql.Tx, job syncJob, entries []catalog.ProviderEntry, at time.Time) error {
+	if _, err := catalog.ReplaceCredentialEntries(ctx, tx, job.provider, job.credential, entries, at); err != nil {
+		return err
+	}
+	return recordSuccess(ctx, tx, job.credential, "catalog")
 }
 
 func (s *Service) fetchKeyCatalog(ctx context.Context, key string) ([]catalog.ProviderEntry, error) {
@@ -384,7 +404,7 @@ FOR SHARE OF p FOR NO KEY UPDATE OF c`, job.provider, job.credential).Scan(&curr
 	err = tx.QueryRowContext(ctx, `
 SELECT lease_id = $3 AND lease_until > clock_timestamp() FROM beichen_datasets
 WHERE credential_id = $1 AND kind = $2 AND lease_id IS NOT NULL FOR UPDATE`,
-		job.credential, job.kind, lease).Scan(&ownsLease)
+		job.credential, job.leaseKind(), lease).Scan(&ownsLease)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -395,6 +415,16 @@ WHERE credential_id = $1 AND kind = $2 AND lease_id IS NOT NULL FOR UPDATE`,
 		if err := result.save(ctx, tx); err != nil {
 			return err
 		}
+	}
+	if job.kind == "catalog" {
+		// The Key catalog shares the regular billing job's lease. A targeted
+		// scan leaves billing and price results and their schedules intact.
+		_, err := tx.ExecContext(ctx, `UPDATE beichen_datasets SET lease_id=NULL, lease_until=NULL
+WHERE credential_id=$1 AND kind='billing'`, job.credential)
+		if err == nil {
+			err = tx.Commit()
+		}
+		return errors.Join(err, result.err)
 	}
 	var message *string
 	if result.err != nil {

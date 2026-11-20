@@ -1,7 +1,7 @@
 import { DOMWrapper, enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { defineComponent } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { BeichenBatchEnableResult, BeichenCatalogModel, BeichenModelUsage, BeichenOverview, BeichenUsageRange, BeichenUsageTotals } from '../../api/types'
+import type { BeichenBatchEnableResult, BeichenCatalogModel, BeichenModelUsage, BeichenOverview, BeichenRebindPlan, BeichenUsageRange, BeichenUsageTotals } from '../../api/types'
 import BeichenPriceDrawer from '../../components/BeichenPriceDrawer.vue'
 import BeichenSchoolModels from './BeichenSchoolModels.vue'
 import componentSource from './BeichenSchoolModels.vue?raw'
@@ -10,6 +10,7 @@ const api = vi.hoisted(() => ({
   beichenOverview: vi.fn(), modelUsage: vi.fn(), enableBeichenModelsBatch: vi.fn(), enableBeichenModel: vi.fn(),
   updateModel: vi.fn(), syncBeichen: vi.fn(), setBeichenModelPrice: vi.fn(),
   requestBeichenProbes: vi.fn(), beichenProbes: vi.fn(),
+  previewBeichenRebind: vi.fn(), applyBeichenRebind: vi.fn(), rescanBeichenCatalog: vi.fn(),
 }))
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }))
 vi.mock('../../api/teacher', () => ({ teacherAPI: api }))
@@ -81,6 +82,85 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('北辰模型管理', () => {
+  it('仅网页模型留在独立清单，重扫只传所选 Key 后读回目录', async () => {
+    const data: BeichenOverview = {
+      ...overview([{ model: 'lab/a' }, { model: 'only-web' }]),
+      credentials: [
+        { credential_id: 'first', label: '渠道一', status: 'active' },
+        { credential_id: 'second', label: '渠道二', status: 'active' },
+        { credential_id: 'inactive', label: '已停用渠道', status: 'inactive' },
+      ],
+      website_only_status: 'compared',
+      website_only_models: [{ model: 'only-web', channels: [{ credential_id: 'second', label: '渠道二' }] }],
+    }
+    api.beichenOverview.mockResolvedValueOnce(data).mockResolvedValue({ ...data, website_only_models: [] })
+    api.rescanBeichenCatalog.mockResolvedValue({ synced: true })
+    const wrapper = view()
+    await flushPromises()
+    const web = wrapper.get('[aria-label="仅网页可见"]')
+    expect(web.get('li').text()).toContain('only-web · 渠道二')
+    expect(web.get('select').text()).not.toContain('已停用渠道')
+    expect(wrapper.find('[aria-label="启用 only-web"]').exists()).toBe(false)
+    await button(wrapper, '一键启用').trigger('click')
+    const dialog = wrapper.get('[role="dialog"]')
+    expect(dialog.text()).toContain('lab/a')
+    expect(dialog.text()).not.toContain('only-web')
+    await button(dialog, '取消').trigger('click')
+    await web.get('select').setValue('second')
+    await web.get('form').trigger('submit')
+    await flushPromises()
+    expect(api.rescanBeichenCatalog).toHaveBeenCalledExactlyOnceWith('north', 'second')
+    expect(api.beichenOverview).toHaveBeenCalledTimes(2)
+    expect(web.text()).toContain('没有仅网页可见的模型')
+    expect(wrapper.find('[aria-label="启用 only-web"]').exists()).toBe(true)
+  })
+
+  it('展示重建的旧线路和新线路，预览变化后需要再次确认', async () => {
+    const plan: BeichenRebindPlan = { preview: true, preview_token: 'first-preview', changes: [{
+      model_id: 'model-id', school_model: 'school/a', adapter: 'openai_responses', action: 'update',
+      before: { credential_id: 'first', credential_label: '渠道一', upstream_model: 'old', priority: 10, status: 'active' },
+      after: { credential_id: 'second', credential_label: '渠道二', upstream_model: 'new', priority: 10, status: 'active' },
+    }] }
+    api.previewBeichenRebind.mockResolvedValueOnce(plan).mockResolvedValueOnce({ ...plan, preview_token: 'second-preview' })
+    api.applyBeichenRebind.mockRejectedValueOnce(new Error('预览已过期')).mockResolvedValueOnce({ ...plan, preview: false })
+    const wrapper = view()
+    await flushPromises()
+    await button(wrapper, '重建绑定').trigger('click')
+    await flushPromises()
+    const dialog = wrapper.get('[role="dialog"][aria-label="预览北辰绑定重建"]')
+    expect(dialog.text()).toContain('将影响 1 个校内模型、1 条北辰线路')
+    expect(dialog.text()).toContain('渠道一 · old · 优先级 10')
+    expect(dialog.text()).toContain('渠道二 · new · 优先级 10')
+    expect(api.applyBeichenRebind).not.toHaveBeenCalled()
+    await button(dialog, '确认重建').trigger('click')
+    await flushPromises()
+    expect(dialog.text()).toContain('应用绑定失败，请重新预览')
+    expect(dialog.findAll('button').some(node => node.text() === '确认重建')).toBe(false)
+    await button(dialog, '重新预览').trigger('click')
+    await flushPromises()
+    await button(dialog, '确认重建').trigger('click')
+    await flushPromises()
+    expect(api.applyBeichenRebind.mock.calls).toEqual([['north', 'first-preview'], ['north', 'second-preview']])
+    expect(wrapper.find('[aria-label="预览北辰绑定重建"]').exists()).toBe(false)
+    expect(api.beichenOverview).toHaveBeenCalledTimes(2)
+  })
+
+  it('展示探活日预算，达到上限后禁用立即探活', async () => {
+    const budget = { date: '2026-11-21', used: 500, limit: 500, remaining: 0, exhausted: true }
+    api.beichenOverview.mockResolvedValue({
+      ...overview([{ model: 'lab/a' }]),
+      probe_run: { state: 'completed', started_at: '2026-11-21T00:00:00Z', finished_at: '2026-11-21T00:01:00Z', error_code: null, budget },
+    } as never)
+    const wrapper = view()
+    await flushPromises()
+
+    const text = wrapper.get('[data-testid="probe-budget"]').text()
+    expect(text).toContain('500/500')
+    expect(text).toContain('剩余 0 次')
+    expect(text).toContain('已达上限')
+    expect(button(wrapper, '今日已达上限').attributes('disabled')).toBeDefined()
+  })
+
   it('分别展示四维健康、报价覆盖、线路异常和手动探活结果', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
     const initial: BeichenOverview = {

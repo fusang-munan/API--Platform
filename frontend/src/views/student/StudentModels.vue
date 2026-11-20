@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { studentAPI } from '../../api/student'
-import type { ApiKey, Model, ModelCatalogCandidate, ModelCategory, ModelStatus } from '../../api/types'
+import type { ApiKey, BindingAdapter, Model, ModelCatalogCandidate, ModelCategory, ModelStatus } from '../../api/types'
+import { BINDING_ADAPTER_OPTIONS, bindingAdapterMeta } from '../../utils/bindingAdapters'
 import { capabilityLabel, formatTokenK } from '../../utils/modelCatalog'
 import { buildKeyReapplyModels, keyCanWithdraw, keyReapplyQuota, selectCurrentStudentKey } from '../../utils/studentHarnessConfig'
 import { sortModelsByRecency } from '../../utils/modelSort'
@@ -15,14 +16,17 @@ import { useLoadState } from '../../composables/useLoadState'
 import { useToast } from '../../composables/useToast'
 import { APIError } from '../../api/client'
 
-const commonRows = ref<Model[]>([])
-const libraryRows = ref<Model[]>([])
+type ModelWithProtocols = Model & { supported_protocols?: string[] }
+
+const commonRows = ref<ModelWithProtocols[]>([])
+const libraryRows = ref<ModelWithProtocols[]>([])
 const keys = ref<ApiKey[]>([])
 const currentKeyID = ref('')
 const catalogItems = ref<ModelCatalogCandidate[]>([])
 const query = ref('')
 const category = ref<ModelCategory | ''>('')
 const status = ref<ModelStatus | ''>('')
+const protocol = ref('openai_compatible')
 const expanded = ref('')
 const addOpen = ref(false)
 const catalogQuery = ref('')
@@ -39,8 +43,8 @@ const libraryIDs = computed(() => new Set([
   ...commonRows.value.map(model => model.model_id.toLowerCase()),
   ...libraryRows.value.map(model => model.model_id.toLowerCase()),
 ]))
-const filteredCommon = computed(() => sortModelsByRecency(filterStudentModels(commonRows.value, query.value, category.value, status.value)))
-const filteredLibrary = computed(() => sortModelsByRecency(filterStudentModels(libraryRows.value, query.value, category.value, status.value)))
+const filteredCommon = computed(() => sortModelsByRecency(filterStudentModels(commonRows.value, query.value, category.value, status.value)) as ModelWithProtocols[])
+const filteredLibrary = computed(() => sortModelsByRecency(filterStudentModels(libraryRows.value, query.value, category.value, status.value)) as ModelWithProtocols[])
 const hasAnyModels = computed(() => filteredCommon.value.length > 0 || filteredLibrary.value.length > 0)
 const catalogPages = computed(() => Math.max(1, Math.ceil(catalogTotal.value / 20)))
 const allRows = computed(() => [...commonRows.value, ...libraryRows.value])
@@ -53,6 +57,47 @@ const reapplyModels = computed(() => currentKey.value && reapplyModel.value
   ? buildKeyReapplyModels(currentKey.value, reapplyModel.value.model_id)
   : [])
 const canReapply = computed(() => Boolean(currentKey.value && keyCanWithdraw(currentKey.value)))
+const protocolOptions = BINDING_ADAPTER_OPTIONS.filter(item =>
+  ['openai_compatible', 'openai_responses', 'anthropic', 'google_gemini_v1beta'].includes(item.value))
+const selectedProtocolLabel = computed(() => protocol.value ? protocolMeta(protocol.value).label : '')
+
+const protocolShortLabels: Record<string, string> = {
+  openai_compatible: 'Chat',
+  openai_responses: 'Responses',
+  anthropic: 'Anthropic',
+  google_gemini_v1beta: 'Gemini',
+  openai_embeddings: 'Embeddings',
+  openai_images: 'Images',
+  openai_audio: 'Audio',
+  openai_video: 'Video',
+  openai_realtime: 'Realtime',
+  openai_moderations: 'Moderations',
+  cohere_rerank_v2: 'Rerank',
+}
+
+function protocolsFor(model: ModelWithProtocols): string[] {
+  const values = new Set((model.supported_protocols ?? []).filter(Boolean))
+  if (model.primary_adapter) values.add(model.primary_adapter)
+  if (model.responses_ready) values.add('openai_responses')
+  if (model.anthropic_ready) values.add('anthropic')
+  return BINDING_ADAPTER_OPTIONS.map(item => item.value).filter(value => values.has(value))
+}
+
+function protocolShortLabel(value: string) {
+  return protocolShortLabels[value] ?? value
+}
+
+function protocolMeta(value: string) {
+  return bindingAdapterMeta(value as BindingAdapter)
+}
+
+function protocolMismatch(model: ModelWithProtocols) {
+  if (!protocol.value) return ''
+  const supported = protocolsFor(model)
+  if (!supported.length || supported.includes(protocol.value)) return ''
+  const alternatives = supported.map(value => protocolMeta(value).label)
+  return `不支持 ${selectedProtocolLabel.value}；可用替代协议：${alternatives.join('、')}。请在客户端切换协议，网关不做协议转换。`
+}
 
 watch(catalogQuery, () => { catalogPage.value = 1 })
 
@@ -228,6 +273,19 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
       <p v-else class="muted">还没有 Key。先到「申请密钥」页申领，模型才会与 Key 白名单同步。</p>
     </section>
 
+    <section class="panel protocol-context">
+      <label>准备使用的调用协议
+        <select v-model="protocol" data-testid="protocol-select">
+          <option v-for="item in protocolOptions" :key="item.value" :value="item.value">
+            {{ item.label }}（{{ item.gatewayPath }}）
+          </option>
+        </select>
+      </label>
+      <p class="muted">
+        每个模型卡片会列出当前可用线路支持的协议。协议不匹配时会提示可用替代协议；请把客户端切到对应协议，网关不会自动转换协议。
+      </p>
+    </section>
+
     <LoadingRegion :initial-loading="loadState.initialLoading.value" :refreshing="loadState.refreshing.value" variant="cards" label="正在加载模型" style="margin-top:20px">
       <div v-if="hasAnyModels" class="plaza-layout">
         <section class="plaza-column">
@@ -248,8 +306,11 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
                 <span v-if="requiresNewKey(model)" class="chip warn" data-testid="needs-new-key">需重新申领 Key</span>
                 <span class="chip">{{ modelCreditsLabel(model) }}</span>
                 <span v-if="model.provider_name" class="chip">{{ model.provider_name }}</span>
+                <span v-for="value in protocolsFor(model)" :key="value" class="chip protocol-chip" data-testid="protocol-chip">{{ protocolShortLabel(value) }}</span>
+                <span v-if="protocolMismatch(model)" class="chip warn" data-testid="protocol-mismatch">协议不匹配</span>
                 <span v-for="capability in model.capabilities" :key="capability" class="chip">{{ capabilityLabel(capability) }}</span>
               </div>
+              <p v-if="protocolMismatch(model)" class="protocol-warning" data-testid="protocol-alternatives">{{ protocolMismatch(model) }}</p>
               <p v-if="modelDescriptionText(model)" class="muted">{{ modelDescriptionText(model) }}</p>
               <div class="actions">
                 <button class="button ghost" @click="expanded = expanded === model.model_id ? '' : model.model_id">{{ expanded === model.model_id ? '收起' : '查看详情' }}</button>
@@ -260,6 +321,12 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
                   <dt>模型名</dt><dd>{{ model.model_id }}</dd>
                   <dt>中转厂商</dt><dd>{{ modelProviderLabel(model) }}</dd>
                   <dt>消耗点数</dt><dd>{{ modelCreditsLabel(model) }}</dd>
+                  <dt>支持协议</dt><dd>
+                    <template v-if="protocolsFor(model).length">
+                      <span v-for="(value, index) in protocolsFor(model)" :key="value">{{ index ? '、' : '' }}{{ protocolMeta(value).label }}（{{ protocolMeta(value).gatewayPath }}）</span>
+                    </template>
+                    <template v-else>协议信息待同步</template>
+                  </dd>
                   <dt>能力</dt><dd>{{ model.capabilities.map(capabilityLabel).join('、') || '—' }}</dd>
                   <dt>输入 / 输出</dt><dd>{{ model.input_modalities.join('、') || '—' }} / {{ model.output_modalities.join('、') || '—' }}</dd>
                   <dt>上下文 / 最大输入 / 最大输出</dt><dd>{{ formatTokenK(model.context_window) }} / {{ formatTokenK(model.max_input_tokens) }} / {{ formatTokenK(model.max_output_tokens) }}</dd>
@@ -287,8 +354,11 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
                 <span v-if="requiresNewKey(model)" class="chip warn" data-testid="needs-new-key">需重新申领 Key</span>
                 <span class="chip">{{ modelCreditsLabel(model) }}</span>
                 <span v-if="model.provider_name" class="chip">{{ model.provider_name }}</span>
+                <span v-for="value in protocolsFor(model)" :key="value" class="chip protocol-chip" data-testid="protocol-chip">{{ protocolShortLabel(value) }}</span>
+                <span v-if="protocolMismatch(model)" class="chip warn" data-testid="protocol-mismatch">协议不匹配</span>
                 <span v-for="capability in model.capabilities" :key="capability" class="chip">{{ capabilityLabel(capability) }}</span>
               </div>
+              <p v-if="protocolMismatch(model)" class="protocol-warning" data-testid="protocol-alternatives">{{ protocolMismatch(model) }}</p>
               <p v-if="modelDescriptionText(model)" class="muted">{{ modelDescriptionText(model) }}</p>
               <div class="actions">
                 <button class="button ghost" @click="expanded = expanded === model.model_id ? '' : model.model_id">{{ expanded === model.model_id ? '收起' : '查看详情' }}</button>
@@ -300,6 +370,12 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
                   <dt>模型名</dt><dd>{{ model.model_id }}</dd>
                   <dt>中转厂商</dt><dd>{{ modelProviderLabel(model) }}</dd>
                   <dt>消耗点数</dt><dd>{{ modelCreditsLabel(model) }}</dd>
+                  <dt>支持协议</dt><dd>
+                    <template v-if="protocolsFor(model).length">
+                      <span v-for="(value, index) in protocolsFor(model)" :key="value">{{ index ? '、' : '' }}{{ protocolMeta(value).label }}（{{ protocolMeta(value).gatewayPath }}）</span>
+                    </template>
+                    <template v-else>协议信息待同步</template>
+                  </dd>
                   <dt>能力</dt><dd>{{ model.capabilities.map(capabilityLabel).join('、') || '—' }}</dd>
                   <dt>输入 / 输出</dt><dd>{{ model.input_modalities.join('、') || '—' }} / {{ model.output_modalities.join('、') || '—' }}</dd>
                   <dt>上下文 / 最大输入 / 最大输出</dt><dd>{{ formatTokenK(model.context_window) }} / {{ formatTokenK(model.max_input_tokens) }} / {{ formatTokenK(model.max_output_tokens) }}</dd>
@@ -374,6 +450,11 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
 .plaza-cards { display: grid; gap: 16px; }
 .chip.preset { background: #eef3ff; color: #3b5bdb; }
 .chip.warn { background: #fff4e5; color: #9a4d00; }
+.chip.protocol-chip { background: #eef7f2; color: #1d6b52; }
+.protocol-context { display: grid; gap: 10px; margin-top: 16px; }
+.protocol-context select { max-width: 520px; }
+.protocol-context p { margin: 0; }
+.protocol-warning { margin: 8px 0 0; color: #9a4d00; font-size: 12px; line-height: 1.6; }
 .key-context { display: grid; gap: 10px; margin-top: 16px; }
 .key-context select { max-width: 520px; }
 .key-context p { margin: 0; }

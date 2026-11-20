@@ -56,6 +56,11 @@ CREATE TABLE gateway_calls (
 		t.Fatal(err)
 	}
 	execTestSQL(t, ctx, tx, string(migration))
+	aliases, err := os.ReadFile("../infrastructure/db/migrations/0046_beichen_billing_checks_and_aliases.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	execTestSQL(t, ctx, tx, string(aliases))
 
 	job := syncJob{provider: uuid.New(), credential: uuid.New()}
 	actor := uuid.New()

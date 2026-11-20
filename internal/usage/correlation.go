@@ -49,6 +49,8 @@ func (m CallMetrics) HasUsage() bool {
 
 type UsageState string
 
+const DefaultReasoningEffort = "medium"
+
 const (
 	UsageReported    UsageState = "reported"
 	UsageMissing     UsageState = "missing"
@@ -63,7 +65,8 @@ type CallRoute struct {
 	CredentialID      uuid.UUID
 	BindingID         uuid.UUID
 	UpstreamModelName string
-	// ReasoningEffort is nil if unobserved and points to "" if omitted by the request.
+	// ReasoningEffort is the observed level or the default for an omitted level.
+	// A nil value means the gateway could not observe the request.
 	ReasoningEffort *string
 	// CacheTTL is the verified single duration for cache writes. Empty means unknown.
 	CacheTTL string
