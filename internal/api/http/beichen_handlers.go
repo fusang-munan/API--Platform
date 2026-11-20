@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/starprince1234/Nebula-api/internal/beichen"
@@ -26,6 +27,24 @@ func (s *Server) beichenOverview(c *gin.Context) {
 		return
 	}
 	respond(c, http.StatusOK, s.config.SchoolWorkspace.overview(view, identity(c), c.Request))
+}
+
+func (s *Server) beichenReconciliation(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	value, ok := reportRangeQuery(c)
+	if !ok {
+		return
+	}
+	providerID, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	view, err := s.service.Beichen().Reconciliation(c.Request.Context(), providerID, value, time.Now())
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
 }
 
 func (s *Server) beichenArchivedReceipts(c *gin.Context) {

@@ -377,9 +377,13 @@ data: {"revision":"01K2..."}
 | 模型测试 | POST | `/api/v1/teacher/model-probes` | 自动读取供应商 `/v1/models` 并测试文本/检索端点，返回可应用的标准化配置 |
 | Binding | PATCH | `/api/v1/teacher/model-bindings/{binding_id}` | 修改上游名、adapter、priority 或状态 |
 | 北辰同步与对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen?day=YYYY-MM-DD` | 按北京时间查看同步状态、模型报价和日对账 |
+| 学校级模型用量 | GET | `/api/v1/teacher/model-usage?range=day\|month\|all&provider_id=uuid` | 教师按模型、项目成员、学校 Key 查看北辰调用用量；供应商筛选可省略 |
+| 北辰区间对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/reconciliation?range=day\|month\|all` | 按模型和供应商渠道比较本地扣分、Token 与北辰日账 |
 | 北辰逐笔对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/receipts?day=YYYY-MM-DD&cursor=…` | 教师按北京时间分页查看学校已归档的北辰流水及关联的校内扣分 |
 | 北辰手动同步 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/sync` | 执行一次有时限的同步，页面按数据类别显示各自结果 |
 | 启用北辰已发现模型 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/models/enable` | 教师提交 `model`，如已有校内别名可另传 `school_model`。学校复核当前目录和路由后，使模型可供学生申请或调用。 |
+| 批量启用北辰模型 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/models/enable-batch` | 教师提交当前筛选出的 1 至 200 个模型，分别返回启用或跳过结果 |
+| 按模型统一定价 | PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/models/price` | 为同一模型的全部目录渠道设置教师价或恢复官网价 |
 | 北辰采价授权 | GET / PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/access/{credential_id}` | 读取配置状态，设置、轮换或停用该凭据的面板读取授权 |
 | 北辰校内试算价 | PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/price` | 指定模型手动设价或恢复跟随 |
 | 北辰报价或账单导入 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/import` | 按凭据导入受支持的 CSV |
@@ -440,7 +444,71 @@ data: {"revision":"01K2..."}
 
 逐笔对账的 `day` 默认为北京时间当天。第一页省略 `cursor`，后续传入上页的 `data.next_cursor`，保持同一供应商和日期。每页最多 50 行，以流水发生时间倒序排列。最后一页的游标为 `null`。游标错用到其他账日或供应商、游标内容错误及日期格式错误均返回 400。每行含 `occurred_at`、`model`、`matched`、`student_name`、`base_credits`、`school_multiplier`、`charged_credits`、`actual_cost` 和 `difference_credits`。金额和积分用十进制字符串表示。缺少依据的字段返回 `null`，确认零金额返回 `"0"`。差额等于学校已扣积分减去北辰原始实扣乘 100。此查询只读取学校的账本。
 
-价格请求包含 `credential_id`、`model`、`mode`。设置 `manual` 时同时提供 `rates`，其中 `input`、`output` 必填，`cache_read`、`cache_write` 可空，四项均为每百万 Token 的试算价格，以百万分之一校内积分表示。恢复 `follow` 时省略 `rates`。跟随试算和学生正式扣费均以 1 北辰余额单位折合 100 积分；手填校内试算价只影响试算列。
+按凭据的旧价格请求包含 `credential_id`、`model`、`mode`。设置 `manual` 时同时提供 `rates`，其中 `input`、`output` 必填，`cache_read`、`cache_write` 可空，四项均以百万分之一校内积分/百万 Token 表示。恢复 `follow` 时省略 `rates`。教师页按模型统一定价使用下面的新接口，其请求直接使用积分十进制字符串，不能混用单位。新调用的教师基础价参与正式扣费，再应用请求发出时保存的学校系数；已入账调用保持原金额。
+
+### 7.1 北辰批量启用与按模型定价
+
+这两个接口仅允许教师访问，使用控制面响应 envelope。不存在或非北辰的 `provider_id` 返回 `404 RESOURCE_NOT_FOUND`；未登录为 401，非教师为 403。JSON 未知字段、模型名无效、数组长度或价格格式错误返回 `400 VALIDATION_ERROR`，数据库不可用返回 503。
+
+`POST .../beichen/models/enable-batch` 请求为 `{"models":["model-a","model-b"]}`，每批 1 至 200 个模型，名称不超过 256 字符，重复名称忽略大小写去重。响应 `data` 为：
+
+```json
+{
+  "enabled": [{"model": "model-a", "model_id": "uuid"}],
+  "skipped": [{"model": "model-b", "reason": "no_price", "message": "官网未报价或按条件计价，请先手动定价"}]
+}
+```
+
+`reason` 包括 `not_found`、`already_active`、`route_not_ready`、`no_price`、`enable_failed`。各模型独立提交，单项失败不会撤销已成功的其他模型；重复请求返回已启用的跳过结果。按条件计价且没有教师手动价的模型也会跳过。
+
+`PATCH .../beichen/models/price` 请求示例：
+
+```json
+{
+  "model": "model-a",
+  "mode": "manual",
+  "rates": {"input": "150", "output": "750", "cache_read": "15", "cache_write": "0"}
+}
+```
+
+新接口的 `rates` 是**积分/百万 Token 的十进制字符串**，不是 JSON 数字，也不是旧接口的百万分之一积分整数。输入与输出必填，缓存项省略按零；最多六位有效小数，范围为 0 至 1000000。服务端精确乘 1000000 后存储，不用浮点数转换。教师价是未乘学校系数的基础价，不再乘渠道倍率；学校渠道通常再乘 1.10 扣学生积分。`{"model":"model-a","mode":"follow"}` 恢复官网价且必须省略 `rates`。
+
+同一模型在供应商当前目录下的全部渠道在一个事务、同一生效时刻写入。教师价持续生效，直到主动恢复跟随；官网同步继续保存报价，不会覆盖教师选择。响应为 `{"saved":true,"credentials":[{"credential_id":"uuid","label":"渠道名称"}]}`，没有该目录模型时为 404。只影响保存之后派发的请求，不追改历史扣款。
+
+### 7.2 学校级北辰用量与区间对账
+
+`GET /api/v1/teacher/model-usage` 与 `GET .../beichen/reconciliation` 仅允许教师，均返回 `Cache-Control: private, no-store`。`range` 省略或为空时为 `all`；只接受 `day`、`month`、`all`，其他值返回 **422 `VALIDATION_ERROR`**（`details.field=range`）。无效 UUID 返回 400；显式指定不存在或非北辰供应商返回 404；未登录 401、角色不符 403、数据库不可用 503。
+
+共同顶层字段为 `range`、`start`、`end`、`timezone`。时区固定 `Asia/Shanghai`，时间以 RFC 3339 UTC 返回，区间左闭右开。`day` 是北京时间当天 00:00 至次日 00:00；`month` 是本月 1 日至次月 1 日；`all` 的 `start=null`、`end` 为查询时刻。总计基于当前数据库中仍保存的业务记录，不补造已经清理的历史 Token。
+
+学校用量可选 `provider_id`；省略时汇总所有北辰供应商，其他供应商调用不计入。调用归属沿用日对账的派发渠道、上游模型和发送时刻；只计已完成结算流程的调用，排除 `outcome=pending`。
+
+| 学校用量字段 | 内容 |
+| --- | --- |
+| `totals` | `credits`（积分字符串）、`tokens`、`input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens`、`calls`、`pending_calls`、去重 `students` / `keys` 数量 |
+| `models[]` | `model` 与上述用量字段，按模型名排序 |
+| `students[]` | `user_id`、`user_name`、`project_id`、`project_name` 与用量字段；同一账号在不同项目分行，`models[]` 给出各模型积分、Token 和调用数 |
+| `keys[]` | `api_key_id`、`api_key_name`、`user_id`、`user_name`、`project_id`、`project_name` 与用量字段，另含该 Key 的 `models[]` |
+
+`credits` 只累计 `beichen_state=charged` 的精确扣分。待核账计入 `calls`、`pending_calls`，不计入已扣积分和 Token。**Token = 未缓存输入 + 输出 + 缓存读取 + 缓存写入**：只累计 `usage_state=reported` 且四项均可归一化确认的调用；缺一项则该笔 Token 不进入汇总，调用数仍保留。Anthropic 输入本来就不含缓存；OpenAI Chat/Responses/Realtime 的输入含缓存，按明确的缓存明细或未命中数扣除，避免重复计数。所有 Token 和计数为 JSON 数字，积分为去尾零的十进制字符串，空集是零和 `[]`。
+
+区间对账响应为 `{range,start,end,timezone,coverage,totals,models,keys}`：
+
+| 对账字段 | 内容 |
+| --- | --- |
+| `totals.local` | `requests`、`credits`、`pending_calls`、`tokens` 及四项 Token 拆分、可空 `estimated_micros`（本地按调用时有效上游价加权估算的微元） |
+| `totals.upstream` | `requests`、`tokens` 及四项 Token 拆分、可空 `billed_micros`；`source` 是按字母排序去重后的日账来源，多个来源以逗号连接，无日账时为空 |
+| `totals.money` | `student_yuan`、`base_yuan` 为十进制字符串；`actual_yuan`、`margin_yuan`、`margin_rate` 为十进制字符串或 `null` |
+| `models[]` | `model`、`local`、`upstream`、上述五个金额字段、`local_share` / `upstream_share`，按模型名排序 |
+| `keys[]` | 按供应商凭据聚合的 `credential_id`、`label`、`local`、`upstream`、金额、占比；不是学生的学校 API Key，已删除渠道的标签可空，历史账单仍保留 |
+| `models[].match_status` / `keys[].match_status` | `matched`、`local_only`、`upstream_only`，表示该分组两侧是否有记录，不表示逐笔账单已全部核对成功 |
+| `coverage` | `days_expected`、`days_present`（按“渠道 × 账日”计数）、去重 `missing_days` 日期数组、`pending_calls`、`unpriced_calls`、`multiplier_mixed`，以及逐渠道 `credentials[]` 覆盖明细 |
+
+本地侧与学校用量使用同一归属和 Token 口径。上游侧来自 `beichen_daily_usage`，以北京时间 `day` 筛选后独立聚合，再按模型 FULL JOIN；只在一侧存在的模型不会被丢弃。同名模型跨渠道先各自汇总，避免重复累计扣分。上游没有记录，或任一日账的 `billed_upstream_micros` 缺失时，该聚合组的 `billed_micros`、`actual_yuan`、`margin_yuan`、`margin_rate` 全部为 JSON `null`，总计、模型和渠道均遵循此规则，不能把部分成本当完整实扣；明确为零的实扣仍返回 `"0"`。Token 只汇总已知分项，还须结合覆盖状态与单侧记录判断差额。`estimated_micros` 无完整报价或用量时为 `null`，不伪造估算。
+
+金额按 **100 积分 = 1 元** 换算：`student_yuan = 已扣积分 × 0.01`；`base_yuan` 使用保存的基础积分，缺少时用已扣积分除以该笔学校系数（历史缺失系数按 1）；`actual_yuan = 已确认完整的北辰 billed_upstream_micros 总和 × 0.000001`；`margin_yuan = student_yuan - actual_yuan`；`margin_rate = margin_yuan / student_yuan`。实扣已知且学生已扣为零时比率为 `"0"`，实扣未知时比率为 `null`。`local_share` / `upstream_share` 分别是模型或渠道 Token 占对应侧总 Token 的 0 至 1 十进制字符串，总 Token 为零时为 `"0"`。
+
+覆盖范围从每条当前供应商凭据的北京时间创建日与所选区间起点较晚者开始，截止到区间结束或北京时间今天（包含今天）较早者；尚未开始的未来账日不算缺失。`beichen_usage_days` 中明确确认的空账日也算已同步。`missing_days` 按日期排序且去重，`credentials[]` 给出各渠道的 `credential_id`、`label`、`expected_days`、`synced_days`、`missing_days`，可定位同一天缺哪条渠道。`unpriced_calls` 是已扣款但未保存基础积分的调用数，`multiplier_mixed` 表示范围内出现过不同学校系数。尚未整日确认的今天可能显示缺失，日账覆盖不等同于分钟级流水扫描进度。
 
 导入请求包含 `credential_id`、`kind`、`csv`。报价表头为 `model,input,output,cache_read,cache_write`，价格为每百万 Token 的百万分之一北辰余额单位。用 `prices` 导入已应用倍率的最终报价，用 `prices_base` 导入需乘北辰倍率的已确认基础报价。日用量 `usage` 表头为 `date,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros`，日期为北京时间，缓存和实际扣款留空表示缺失。
 
@@ -627,6 +695,8 @@ Anthropic-compatible 示例：
 | `request_id`、`model_id`、`channel`、`billing_state` | 请求归属和当前结算状态。 |
 
 教师使用 `PATCH /api/v1/teacher/projects/{project_id}/members/{user_id}/monthly-credit-quota` 调整学生的项目月额度。请求必填积分字符串 `monthly_credits`，可选 `quota_change_reason` 记录原因，成功返回 HTTP 204。学生用完当月个人额度后，新网关请求返回 `member_quota_exceeded`。已发出的请求按实际用量结算。
+
+项目用量的 `members[].pending` 返回月桶中仍预留、尚未结算的积分十进制字符串（`pending_milli × 0.001`），与 `pending_review` 布尔状态区分；教师调整额度时可连同已用金额计算可下调的下限。
 
 匿名返回 401，其他身份返回 403。在本人范围内找不到唯一、可读的北辰调用时统一返回 404，包含本人请求编号重用、他人的调用和其他供应商的调用。
 

@@ -2,16 +2,16 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ArrowLeftRight } from 'lucide-vue-next'
 import { teacherAPI } from '../../api/teacher'
-import type { Application, MentorCandidate, MentorSummary, Organization, Project, ProjectBudget, ProjectUsage } from '../../api/types'
+import type { Application, MentorCandidate, MentorSummary, Organization, Project, ProjectBudget } from '../../api/types'
 import { APIError } from '../../api/client'
 import StatusBadge from '../../components/StatusBadge.vue'
 import AppDialog from '../../components/AppDialog.vue'
-import CreditDonut, { type CreditSegment } from '../../components/CreditDonut.vue'
+import TeacherProjectQuotaDialog from './TeacherProjectQuotaDialog.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
 import EmptyState from '../../components/EmptyState.vue'
 import { useLoadState } from '../../composables/useLoadState'
 import { useToast } from '../../composables/useToast'
-import { beichenBillingExplanation, quotaBalance, schoolMonth } from '../../utils/format'
+import { schoolMonth } from '../../utils/format'
 
 const orgs = ref<Organization[]>([])
 const projects = ref<Project[]>([])
@@ -35,20 +35,11 @@ const error = ref('')
 const toast = useToast()
 const loadState = useLoadState()
 const candidateLoadState = useLoadState()
-const usageLoadState = useLoadState()
 const detailProject = ref<Project | null>(null)
-const projectUsage = ref<ProjectUsage | null>(null)
-const quotaStudent = ref('')
-const quotaDraft = ref('')
-const quotaError = ref('')
-const savingQuota = ref(false)
-let usageRequest = 0
 const form = reactive({ organization_id: '', name: '', description: '', status: 'active' as 'active' | 'inactive', monthly_credit_quota: '' })
 
 type Tab = 'projects' | 'pending'
 const tab = ref<Tab>('projects')
-
-type MemberUsage = ProjectUsage['members'][number]
 
 const quotaChanged = computed(() => editing.value != null && form.monthly_credit_quota.trim() !== editing.value.monthly_credit_quota)
 const budgetsById = computed(() => new Map(budgets.value.map(row => [row.id, row])))
@@ -268,62 +259,6 @@ function statsLine(project: Project) {
   return `月额度 ${stats.quota} · 已发给学生 ${stats.allocated} · 可再分配 ${stats.available} · 已消耗 ${stats.charged}`
 }
 
-async function showDetail(project: Project) {
-  const request = ++usageRequest
-  const forMonth = month.value
-  quotaStudent.value = quotaError.value = ''
-  detailProject.value = project
-  projectUsage.value = null
-  await usageLoadState.run(async () => {
-    try {
-      const result = await teacherAPI.projectUsage(project.id, forMonth)
-      if (request !== usageRequest || detailProject.value?.id !== project.id) return
-      projectUsage.value = result
-      error.value = ''
-    } catch (e) {
-      if (request !== usageRequest) return
-      quotaError.value = '读取学生额度失败。' + msg(e)
-    }
-  })
-}
-
-function editMemberQuota(member: MemberUsage) {
-  quotaStudent.value = member.user_id
-  quotaDraft.value = member.quota
-  quotaError.value = ''
-}
-
-async function saveMemberQuota(member: MemberUsage) {
-  const project = detailProject.value
-  const amount = quotaDraft.value.trim()
-  if (project?.status !== 'active' || !member.is_student || savingQuota.value || quotaStudent.value !== member.user_id || projectUsage.value?.month !== schoolMonth()) return
-  if (!/^\d+(\.\d{1,3})?$/.test(amount)) {
-    quotaError.value = '请输入非负积分，最多三位小数。'
-    return
-  }
-  savingQuota.value = true
-  quotaError.value = ''
-  try {
-    await teacherAPI.updateMemberQuota(project.id, member.user_id, amount)
-    toast.success('学生月额度已保存')
-    if (detailProject.value?.id === project.id) await showDetail(project)
-    await load()
-  } catch (e) {
-    quotaError.value = msg(e)
-  } finally {
-    savingQuota.value = false
-  }
-}
-
-function allocationSegments(usage: ProjectUsage): CreditSegment[] {
-  return [
-    ...usage.members
-      .map(member => ({ name: member.user_name, value: Number(member.quota) }))
-      .filter(item => item.value > 0),
-    { name: '可再分配', value: Number(usage.available), color: '#dfe3ec' },
-  ]
-}
-
 function msg(e: unknown) {
   return e instanceof APIError ? e.message : '请求失败'
 }
@@ -374,7 +309,7 @@ onMounted(load)
             </div>
             <div class="actions">
               <StatusBadge :status="project.status" />
-              <button class="button ghost" @click="showDetail(project)">学生额度</button>
+              <button class="button ghost" @click="detailProject = project">学生额度</button>
               <button class="button ghost" @click="openMentorManage(project)">导师管理</button>
               <button class="button ghost" @click="open(project)">编辑</button>
               <button class="button" :class="project.status === 'active' ? 'danger' : 'secondary'" @click="toggle(project)">
@@ -462,79 +397,14 @@ onMounted(load)
       <button class="button" :class="approve ? 'primary' : 'danger'" @click="review">确认</button>
     </AppDialog>
 
-    <AppDialog
-      :open="Boolean(detailProject)"
-      :title="`${detailProject?.name || ''} · 学生额度`"
-      description="查看各学生的月额度与已用积分，可在当月调整分配。"
-      wide
-      @update:open="detailProject = $event ? detailProject : null"
-    >
-      <div class="row">
-        <label>月份<input v-model="month" type="month" :disabled="savingQuota" @change="detailProject && showDetail(detailProject); load()"></label>
-      </div>
-      <p class="muted">{{ beichenBillingExplanation }}</p>
-      <p v-if="quotaError" role="alert" class="error">{{ quotaError }}</p>
-      <LoadingRegion
-        :initial-loading="usageLoadState.initialLoading.value"
-        :refreshing="usageLoadState.refreshing.value"
-        variant="list"
-        label="正在加载额度分配"
-      >
-        <template v-if="projectUsage">
-          <div class="usage-summary usage-dialog-summary">
-            <div class="usage-stat">项目月额度<strong>{{ projectUsage.quota }}</strong></div>
-            <div class="usage-stat">已分配给学生<strong>{{ projectUsage.allocated }}</strong></div>
-            <div class="usage-stat">可再分配<strong>{{ projectUsage.available }}</strong></div>
-            <div class="usage-stat">本月已消耗<strong>{{ projectUsage.charged }}</strong><small v-if="projectUsage.pending_review">有调用待核账</small></div>
-          </div>
-          <section class="usage-chart-card">
-            <h2>成员分配占比</h2>
-            <CreditDonut
-              :segments="allocationSegments(projectUsage)"
-              :total="Number(projectUsage.quota)"
-              label="项目额度：各学生月额度与剩余可分配额度"
-            />
-          </section>
-          <section v-if="projectUsage.members.length" class="member-usage-section">
-            <h2>成员用量</h2>
-            <table class="usage-table member-quota-table">
-              <caption class="sr-only">各成员月额度与消耗</caption>
-              <colgroup>
-                <col class="member-col">
-                <col class="metric-col" span="3">
-              </colgroup>
-              <thead>
-                <tr>
-                  <th scope="col">成员</th>
-                  <th scope="col" class="numeric-cell">已分配月额度</th>
-                  <th scope="col" class="numeric-cell">已用</th>
-                  <th scope="col" class="numeric-cell">剩余 / 已超用</th>
-                  <th v-if="projectUsage.month === schoolMonth()" scope="col">调整额度</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="member in projectUsage.members" :key="member.user_id">
-                  <th scope="row">{{ member.user_name }}</th>
-                  <td class="numeric-cell">{{ member.quota }}</td>
-                  <td class="numeric-cell">{{ member.credits }}<small v-if="member.pending_review"> · 有调用待核账</small></td>
-                  <td class="numeric-cell">{{ quotaBalance(member.quota, member.credits, member.available).label }} {{ quotaBalance(member.quota, member.credits, member.available).amount }}</td>
-                  <td v-if="projectUsage.month === schoolMonth()">
-                    <form v-if="quotaStudent === member.user_id" class="row" @submit.prevent="saveMemberQuota(member)">
-                      <label>新月额度（本月起，积分）<input v-model="quotaDraft" inputmode="decimal" required :disabled="savingQuota"></label>
-                      <button class="button primary" :disabled="savingQuota">保存</button>
-                      <button type="button" class="button ghost" :disabled="savingQuota" @click="quotaStudent = quotaError = ''">取消</button>
-                    </form>
-                    <button v-else-if="member.is_student && detailProject?.status === 'active'" type="button" class="button ghost" :disabled="savingQuota" :aria-label="member.user_name + ' · 设置月额度'" @click="editMemberQuota(member)">设置月额度</button>
-                    <span v-else>—</span>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </section>
-          <div v-else class="empty">该项目本月暂无成员用量</div>
-        </template>
-      </LoadingRegion>
-    </AppDialog>
+    <TeacherProjectQuotaDialog
+      v-if="detailProject"
+      :key="detailProject.id"
+      :project="detailProject"
+      :initial-month="month"
+      @close="detailProject = null"
+      @saved="load"
+    />
   </section>
 </template>
 

@@ -37,6 +37,11 @@ type PriceInput struct {
 	Rates *Rates `json:"rates,omitempty"`
 }
 
+type CredentialRef struct {
+	CredentialID uuid.UUID `json:"credential_id"`
+	Label        string    `json:"label"`
+}
+
 type Service struct {
 	db          *sql.DB
 	crypto      *security.Manager
@@ -123,17 +128,8 @@ func (s *Service) SetPrice(ctx context.Context, providerID, credentialID, actorI
 	if actorID == uuid.Nil || !validModel(model) {
 		return invalid("需要有效的教师 ID 和模型名")
 	}
-	switch input.Mode {
-	case "follow":
-		if input.Rates != nil {
-			return invalid("跟随模式无须提交校内单价")
-		}
-	case "manual":
-		if !validRates(input.Rates) {
-			return invalid("手动单价必须包含非负整数输入价和输出价，单价上限为 1000000000000")
-		}
-	default:
-		return invalid("价格模式须为 follow 或 manual")
+	if err := validatePriceInput(input); err != nil {
+		return err
 	}
 	return s.write(ctx, providerID, credentialID, func(tx *sql.Tx) error {
 		var exists bool
@@ -158,6 +154,100 @@ func (s *Service) SetPrice(ctx context.Context, providerID, credentialID, actorI
 		}
 		return savePrice(ctx, tx, credentialID, model, "school", input.Mode, "teacher", &actorID, rates, effectiveAt)
 	})
+}
+
+func validatePriceInput(input PriceInput) error {
+	switch input.Mode {
+	case "follow":
+		if input.Rates != nil {
+			return invalid("跟随模式无须提交校内单价")
+		}
+	case "manual":
+		if !validRates(input.Rates) {
+			return invalid("手动单价必须包含非负整数输入价和输出价，单价上限为 1000000000000")
+		}
+	default:
+		return invalid("价格模式须为 follow 或 manual")
+	}
+	return nil
+}
+
+// SetModelPrice 锁定同模型的全部目录凭据，以统一生效时间原子保存教师价格。
+func (s *Service) SetModelPrice(ctx context.Context, provider, actor uuid.UUID, model string, input PriceInput) ([]CredentialRef, error) {
+	if provider == uuid.Nil || actor == uuid.Nil || !validModel(model) {
+		return nil, invalid("需要有效的供应商、教师 ID 和模型名")
+	}
+	if err := validatePriceInput(input); err != nil {
+		return nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, unavailable("开启北辰价格事务失败", err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT c.id,c.label::text
+FROM provider_model_catalog k
+JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
+JOIN providers p ON p.id=c.provider_id
+WHERE p.id=$1 AND `+beichenProvider+` AND k.status='active' AND k.model_id=$2::citext
+ORDER BY c.id`, provider, model)
+	if err != nil {
+		return nil, unavailable("读取北辰模型凭据失败", err)
+	}
+	credentials := []CredentialRef{}
+	for rows.Next() {
+		var credential CredentialRef
+		if err := rows.Scan(&credential.CredentialID, &credential.Label); err != nil {
+			rows.Close()
+			return nil, unavailable("读取北辰模型凭据失败", err)
+		}
+		credentials = append(credentials, credential)
+	}
+	err = rows.Err()
+	closeErr := rows.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return nil, unavailable("读取北辰模型凭据失败", err)
+	}
+	if len(credentials) == 0 {
+		return nil, domain.NewError(domain.CodeNotFound, "当前北辰目录中没有此模型的凭据")
+	}
+	names := make([]string, len(credentials))
+	for i := range credentials {
+		if err := s.lockCredential(ctx, tx, provider, credentials[i].CredentialID); err != nil {
+			return nil, err
+		}
+		// 同步也持有凭据锁；取得锁后复核目录，并使用目录中的原始大小写保存价格。
+		err := tx.QueryRowContext(ctx, `SELECT k.model_id::text,c.label::text FROM provider_model_catalog k
+JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
+WHERE k.provider_id=$1 AND k.credential_id=$2 AND k.model_id=$3::citext AND k.status='active'`,
+			provider, credentials[i].CredentialID, model).Scan(&names[i], &credentials[i].Label)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.NewError(domain.CodeNotFound, "模型目录已变化，请刷新后重试")
+		}
+		if err != nil {
+			return nil, unavailable("复核北辰模型目录失败", err)
+		}
+	}
+	effectiveAt, err := priceTimestamp(ctx, tx)
+	if err != nil {
+		return nil, unavailable("读取北辰价格生效时间失败", err)
+	}
+	var rates Rates
+	if input.Rates != nil {
+		rates = *input.Rates
+	}
+	for i, credential := range credentials {
+		if err := savePrice(ctx, tx, credential.CredentialID, names[i], "school", input.Mode, "teacher", &actor, rates, effectiveAt); err != nil {
+			return nil, unavailable("保存北辰模型价格失败", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, unavailable("保存北辰模型价格失败", err)
+	}
+	return credentials, nil
 }
 
 func priceTimestamp(ctx context.Context, tx *sql.Tx) (time.Time, error) {

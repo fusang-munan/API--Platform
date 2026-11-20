@@ -33,7 +33,7 @@ export type UsageSlice = BeichenReceiptSpend & { id: string; name: string; credi
 export type KeyUsage = { id: string; name: string; status: ApiKeyStatus; used: string; available?: string; pending: string; pending_review?: boolean; models: UsageSlice[] }
 export type StudentProjectUsage = { project_id: string; project_name: string; quota: string; used: string; pending: string; available: string; pending_review?: boolean; keys: KeyUsage[] }
 export type StudentUsage = { month: string; projects: StudentProjectUsage[] }
-export type ProjectUsage = { month: string; project_id: string; project_name: string; quota: string; allocated: string; charged: string; pending: string; available: string; pending_review?: boolean; members: Array<BeichenReceiptSpend & { is_student?: boolean; user_id: string; user_name: string; quota: string; available: string; credits: string; pending_review?: boolean; keys: Array<{ id: string; name: string; status: ApiKeyStatus; used: string; pending_review?: boolean; models: UsageSlice[] }>; free_models: UsageSlice[] }>; models: UsageSlice[]; free_models: UsageSlice[] }
+export type ProjectUsage = { month: string; project_id: string; project_name: string; quota: string; allocated: string; charged: string; pending: string; available: string; pending_review?: boolean; members: Array<BeichenReceiptSpend & { is_student?: boolean; user_id: string; user_name: string; quota: string; available: string; credits: string; pending?: string; pending_review?: boolean; keys: Array<{ id: string; name: string; status: ApiKeyStatus; used: string; pending_review?: boolean; models: UsageSlice[] }>; free_models: UsageSlice[] }>; models: UsageSlice[]; free_models: UsageSlice[] }
 export type CallLog = { id: string; request_id: string; turn_id?: string; call_index?: number; project_id: string; project_name: string; user_id: string; user_name: string; api_key_id: string; api_key_name: string; model_id: string; model_name: string; provider_name: string; protocol: string; path: string; multiplier: string; credits: string; prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; billing_state: string; outcome: string; error_category: string; error_message: string; created_at: string; attempts?: Array<{ provider_name: string; status: string; error_category: string; error_message: string; http_status?: number; latency_ms: number }> }
 export type CallTurn = { id: string; project_id: string; project_name: string; user_id: string; user_name: string; api_key_id: string; api_key_name: string; model_id: string; model_name: string; task_key?: string; root_prompt: string; root_prompt_preview: string; root_prompt_bytes: number; call_count: number; credits: string; prompt_tokens: number; completion_tokens: number; total_tokens: number; outcome: string; started_at: string; finished_at?: string; calls?: CallLog[] }
 export type InputMonitorItem = { call_id: string; project_id: string; project_name: string; user_id: string; user_name: string; api_key_name: string; model_name: string; provider_name: string; credits: string; outcome: string; preview: string; content_bytes: number; truncated: boolean; created_at: string; content?: string }
@@ -162,6 +162,123 @@ export type BeichenReceiptItem = {
   matched: boolean
 }
 export type BeichenReceiptPage = { items: BeichenReceiptItem[]; next_cursor: string | null }
+export type BeichenUsageRange = 'day' | 'month' | 'all'
+export type BeichenUsageTotals = {
+  credits: string
+  tokens: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  calls: number
+  pending_calls: number
+  students?: number
+  keys?: number
+}
+export type BeichenModelUsageRow = BeichenUsageTotals & { model: string }
+export type BeichenStudentModelUsage = { model: string; credits: string; tokens: number; calls: number }
+export type BeichenStudentUsageRow = {
+  user_id: string
+  user_name: string
+  project_id: string
+  project_name: string
+  credits: string
+  tokens: number
+  calls: number
+  models: BeichenStudentModelUsage[]
+}
+export type BeichenKeyUsageRow = {
+  api_key_id: string
+  api_key_name: string
+  user_id: string
+  user_name: string
+  project_name: string
+  credits: string
+  tokens: number
+  calls: number
+}
+export type BeichenModelUsage = {
+  range: BeichenUsageRange
+  start: string | null
+  end: string
+  timezone: string
+  totals: BeichenUsageTotals
+  models: BeichenModelUsageRow[]
+  students: BeichenStudentUsageRow[]
+  keys: BeichenKeyUsageRow[]
+}
+export type BeichenReconcileSide = {
+  credits?: string
+  tokens: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  calls?: number
+  requests?: number
+  billed_micros?: number | null
+  estimated_micros?: number | null
+  source?: string | null
+  sources?: string[]
+}
+export type BeichenReconcileMoney = {
+  student_yuan: string
+  base_yuan: string
+  actual_yuan: string | null
+  margin_yuan: string | null
+  margin_rate: string | null
+}
+export type BeichenReconcileCoverage = {
+  days_expected: number
+  days_present: number
+  missing_days: string[]
+  pending_calls: number
+  unpriced_calls: number
+  multiplier_mixed: boolean
+}
+export type BeichenReconcileModel = {
+  model: string
+  match_status: 'matched' | 'local_only' | 'upstream_only'
+  local: BeichenReconcileSide
+  upstream: BeichenReconcileSide
+  student_yuan: string
+  base_yuan: string
+  actual_yuan: string | null
+  margin_yuan: string | null
+  local_share: string
+  upstream_share: string
+}
+export type BeichenReconcileKey = {
+  credential_id: string
+  label: string
+  local: BeichenReconcileSide
+  upstream: BeichenReconcileSide
+  student_yuan: string
+  base_yuan: string
+  actual_yuan: string | null
+  margin_yuan: string | null
+}
+export type BeichenReconcile = {
+  range: BeichenUsageRange
+  start: string | null
+  end: string
+  timezone: string
+  coverage: BeichenReconcileCoverage
+  totals: { local: BeichenReconcileSide; upstream: BeichenReconcileSide; money: BeichenReconcileMoney }
+  models: BeichenReconcileModel[]
+  keys: BeichenReconcileKey[]
+}
+export type BeichenModelPriceUpdate = { model: string } & (
+  { mode: 'follow' } | { mode: 'manual'; rates: { input: string; output: string; cache_read: string; cache_write: string } }
+)
+export type BeichenBatchEnableResult = {
+  enabled: Array<{ model: string; model_id: string }>
+  skipped: Array<{ model: string; reason: string; message: string }>
+}
+export type BeichenModelPriceResult = {
+  saved: boolean
+  credentials: Array<{ credential_id: string; label: string }>
+}
 export type BeichenCatalogModel = {
   model: string
   school_model?: string | null
@@ -171,7 +288,7 @@ export type BeichenCatalogModel = {
   preferred_routes?: BeichenPreferredRoute[] | null
 }
 export type BeichenPreferredRoute = {
-  school_model: string; upstream_model?: string; adapter: string; provider_id: string; credential_id?: string | null
+  school_model: string; upstream_model?: string; adapter: string; provider_id: string; credential_id?: string | null; credential_label?: string | null
   priority: number; state: 'ready' | 'candidate'; effective_multiplier?: number | string | null
   effective_multiplier_text?: string | null
 }

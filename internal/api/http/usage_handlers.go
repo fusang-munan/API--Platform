@@ -16,6 +16,49 @@ import (
 func monthQuery(c *gin.Context) (time.Time, error) {
 	return usage.ParseMonth(strings.TrimSpace(c.Query("month")), time.Now())
 }
+
+func reportRangeQuery(c *gin.Context) (string, bool) {
+	value := c.DefaultQuery("range", "all")
+	if value == "" {
+		value = "all"
+	}
+	switch value {
+	case "day", "month", "all":
+		return value, true
+	default:
+		// 区间参数沿用统一错误 envelope，但按报表契约使用 422。
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
+			"error": gin.H{"code": domain.CodeValidation, "message": "range 须为 day、month 或 all",
+				"details": []gin.H{{"field": "range", "reason": "invalid_enum"}}},
+			"request_id": requestID(c),
+		})
+		return "", false
+	}
+}
+
+func (s *Server) teacherModelUsage(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	value, ok := reportRangeQuery(c)
+	if !ok {
+		return
+	}
+	var providerID *uuid.UUID
+	if raw := c.Query("provider_id"); raw != "" {
+		id, err := controlplane.UUID(raw)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		providerID = &id
+	}
+	view, err := s.service.Beichen().ModelUsage(c.Request.Context(), providerID, value, time.Now())
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
+}
+
 func (s *Server) studentUsage(c *gin.Context) {
 	month, err := monthQuery(c)
 	if err != nil {

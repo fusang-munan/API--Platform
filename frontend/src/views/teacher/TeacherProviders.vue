@@ -9,6 +9,7 @@ import LoadingRegion from '../../components/LoadingRegion.vue'
 import { useLoadState } from '../../composables/useLoadState'
 import { useToast } from '../../composables/useToast'
 import BeichenSchoolModels from './BeichenSchoolModels.vue'
+import BeichenReconcile from './BeichenReconcile.vue'
 import { isBeichenProvider } from '../../utils/beichenModels'
 
 type KeyDraft = {
@@ -21,6 +22,7 @@ type KeyDraft = {
 
 const rows = ref<Provider[]>([])
 const schoolProvider = ref<Provider>()
+const reconcileProviderIds = ref<string[]>([])
 const query = ref('')
 const status = ref('')
 const drawer = ref(false)
@@ -46,6 +48,21 @@ const activeKey = computed(() => keyRows.value[activeKeyIndex.value] ?? null)
 
 function activeKeyCount(provider: Provider) {
   return (provider.credentials ?? []).filter(item => item.status === 'active').length
+}
+
+function toggleReconciliation(providerId: string) {
+  reconcileProviderIds.value = reconcileProviderIds.value.includes(providerId)
+    ? reconcileProviderIds.value.filter(id => id !== providerId)
+    : [...reconcileProviderIds.value, providerId]
+}
+
+function catalogSyncTime(provider: Provider) {
+  const date = provider.last_catalog_sync?.synced_at ? new Date(provider.last_catalog_sync.synced_at) : null
+  return date && Number.isFinite(date.getTime())
+    ? new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    }).format(date)
+    : '—'
 }
 
 function emptyKeyRow(): KeyDraft {
@@ -266,25 +283,36 @@ onMounted(load)
           <label>搜索<input v-model="query" placeholder="名称或 Base URL"></label>
           <label>状态<select v-model="status"><option value="">全部状态</option><option value="active">启用</option><option value="inactive">停用</option></select></label>
         </div>
-        <article v-for="p in filtered" :key="p.id" class="list-row">
-          <div>
-            <strong>{{ p.name }}</strong>
-            <p v-if="!isBeichenProvider(p.base_url)" class="muted">{{ p.base_url }} · {{ activeKeyCount(p) }} 个启用 Key / {{ (p.credentials ?? []).length }} 个 Key</p>
-            <div v-if="!isBeichenProvider(p.base_url) && p.credentials?.length" class="chip-list">
-              <span v-for="key in p.credentials" :key="key.id" class="chip">
-                {{ key.label }} · {{ key.status === 'active' ? '启用' : '停用' }}
-              </span>
+        <article v-for="p in filtered" :key="p.id" class="list-row provider-row">
+          <div class="provider-row-head">
+            <div>
+              <strong>{{ p.name }}</strong>
+              <p v-if="!isBeichenProvider(p.base_url)" class="muted">{{ p.base_url }} · {{ activeKeyCount(p) }} 个启用 Key / {{ (p.credentials ?? []).length }} 个 Key</p>
+              <div v-if="!isBeichenProvider(p.base_url) && p.credentials?.length" class="chip-list">
+                <span v-for="key in p.credentials" :key="key.id" class="chip">
+                  {{ key.label }} · {{ key.status === 'active' ? '启用' : '停用' }}
+                </span>
+              </div>
+              <div v-if="isBeichenProvider(p.base_url)" class="chip-list provider-overview" aria-label="北辰供应商概览">
+                <span class="chip">Key 数 {{ p.credentials ? p.credentials.length : '—' }}</span>
+                <span class="chip">启用 Key {{ p.credentials ? activeKeyCount(p) : '—' }}</span>
+                <span class="chip">最近目录同步 {{ catalogSyncTime(p) }}<template v-if="catalogSyncTime(p) !== '—'">（北京时间）</template></span>
+              </div>
+            </div>
+            <div class="actions">
+              <StatusBadge :status="p.status" />
+              <button v-if="isBeichenProvider(p.base_url)" type="button" class="button secondary" :aria-expanded="reconcileProviderIds.includes(p.id)" :aria-controls="`beichen-reconcile-${p.id}`" @click="toggleReconciliation(p.id)">北辰对账</button>
+              <button v-if="isBeichenProvider(p.base_url)" class="button secondary" @click="schoolProvider = p">查看模型</button>
+              <template v-else>
+                <button class="button secondary" :disabled="resetting === p.id" @click="resetCatalog(p)">{{ resetting === p.id ? '重置中…' : '配置重置' }}</button>
+                <button class="button ghost" @click="open(p)">编辑</button>
+                <button class="button danger" :disabled="deleting === p.id" @click="remove(p)">{{ deleting === p.id ? '删除中…' : '删除' }}</button>
+                <button class="button" :class="p.status === 'active' ? 'danger' : 'secondary'" @click="toggle(p)">{{ p.status === 'active' ? '停用' : '启用' }}</button>
+              </template>
             </div>
           </div>
-          <div class="actions">
-            <StatusBadge :status="p.status" />
-            <button v-if="isBeichenProvider(p.base_url)" class="button secondary" @click="schoolProvider = p">查看模型</button>
-            <template v-else>
-            <button class="button secondary" :disabled="resetting === p.id" @click="resetCatalog(p)">{{ resetting === p.id ? '重置中…' : '配置重置' }}</button>
-            <button class="button ghost" @click="open(p)">编辑</button>
-            <button class="button danger" :disabled="deleting === p.id" @click="remove(p)">{{ deleting === p.id ? '删除中…' : '删除' }}</button>
-            <button class="button" :class="p.status === 'active' ? 'danger' : 'secondary'" @click="toggle(p)">{{ p.status === 'active' ? '停用' : '启用' }}</button>
-            </template>
+          <div v-if="isBeichenProvider(p.base_url)" :id="`beichen-reconcile-${p.id}`" class="provider-reconciliation">
+            <BeichenReconcile v-if="reconcileProviderIds.includes(p.id)" :provider-id="p.id" />
           </div>
         </article>
       </section>
@@ -350,6 +378,18 @@ onMounted(load)
 </template>
 
 <style scoped>
+.provider-row { display: block; min-width: 0; }
+.provider-row-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; min-width: 0; }
+.provider-row-head > div:first-child { min-width: 0; overflow-wrap: anywhere; }
+.provider-row-head > .actions { flex-shrink: 0; flex-wrap: wrap; }
+.provider-overview { margin-top: 10px; gap: 6px; }
+.provider-overview .chip { white-space: normal; overflow-wrap: anywhere; }
+.provider-reconciliation { width: 100%; min-width: 0; }
+.provider-reconciliation:has(> *) { margin-top: 16px; border-top: 1px solid var(--line); }
+@media (max-width: 900px) {
+  .provider-row-head { flex-direction: column; }
+  .provider-row-head > .actions { width: 100%; }
+}
 .provider-form { display: grid; gap: 1rem; }
 .key-panel {
   display: grid;

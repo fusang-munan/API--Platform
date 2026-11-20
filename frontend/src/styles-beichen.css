@@ -1,0 +1,58 @@
+/* Teacher Beichen panels: shared layout, price grids and usage tables. */
+.beichen-stack{display:grid;gap:16px;min-width:0}
+.beichen-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.beichen-toolbar-group{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.beichen-section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.beichen-section-head h2,.beichen-section-head h3{margin:0}
+.beichen-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.beichen-stat{min-width:0;border:1px solid rgba(83,99,136,.12);border-radius:14px;background:rgba(248,249,253,.9);padding:12px 14px}
+.beichen-stat span{display:block;color:var(--ink-soft);font-size:11px;font-weight:650;letter-spacing:.02em}
+.beichen-stat strong{display:block;margin-top:5px;color:var(--ink);font-size:20px;line-height:1.15;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.beichen-stat small{display:block;margin-top:4px;color:var(--ink-soft);font-size:11px;line-height:1.45}
+.range-switch{display:inline-flex;align-items:center;gap:2px;padding:3px;border:1px solid rgba(83,99,136,.14);border-radius:11px;background:rgba(237,240,247,.86)}
+.range-switch button{border:0;border-radius:8px;background:transparent;color:var(--ink-soft);padding:6px 11px;font-size:12px;font-weight:700;transition:background 160ms var(--ease-out),color 160ms var(--ease-out)}
+.range-switch button[aria-pressed="true"]{background:#fff;color:var(--ink);box-shadow:0 2px 7px rgba(32,45,80,.1)}
+.status-pill{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:4px 9px;font-size:10px;font-weight:760;letter-spacing:.01em;white-space:nowrap;background:#eef1f6;color:#66728a}
+.status-pill.active,.status-pill.confirmed{background:#e3f8ef;color:#16765e}
+.status-pill.pending,.status-pill.conditional{background:#fff4dd;color:#9a6a17}
+.status-pill.manual{background:#eee8ff;color:#5b3bd1}
+.status-pill.danger,.status-pill.local_only,.status-pill.upstream_only{background:#fdecef;color:#b53b55}
+.status-pill.muted,.status-pill.not_listed{background:#eef1f6;color:#66728a}
+.beichen-table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+.beichen-table th,.beichen-table td{padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left}
+.beichen-table thead th{position:sticky;top:0;z-index:1;background:rgba(255,255,255,.96);color:var(--ink-soft);font-size:11px;font-weight:720;letter-spacing:.02em;white-space:nowrap}
+.beichen-table tbody tr:hover{background:rgba(108,76,232,.025)}
+.beichen-table .numeric-cell{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.beichen-table th[scope="row"]{color:var(--ink);font-weight:700;overflow-wrap:anywhere}
+.beichen-table-wrap{overflow-x:auto;border:1px solid rgba(83,99,136,.1);border-radius:14px;background:#fff}
+.price-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 18px;min-width:0}
+.price-cell{min-width:0}
+.price-label{display:block;color:var(--ink-soft);font-size:10px;font-weight:650;letter-spacing:.02em}
+.price-value{display:block;color:var(--ink);font-size:14px;font-weight:720;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.price-sub{display:block;color:var(--ink-soft);font-size:10px;line-height:1.45;font-variant-numeric:tabular-nums}
+.price-empty{color:var(--ink-soft);font-size:12px}
+.usage-share{position:relative;height:5px;border-radius:999px;background:#edf0f7;overflow:hidden;min-width:52px}
+.usage-share i{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,#7a5af0,#6040d8)}
+.beichen-note{margin:0;color:var(--ink-soft);font-size:11px;line-height:1.55}
+.beichen-empty{display:grid;gap:6px;place-items:center;padding:36px 16px;text-align:center;border:1px dashed rgba(83,99,136,.2);border-radius:14px;color:var(--ink-soft)}
+.beichen-empty strong{color:var(--ink);font-size:14px}
+.compare-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.compare-card{border:1px solid rgba(83,99,136,.1);border-radius:14px;background:#fff;padding:14px}
+.compare-card h3{margin:0 0 8px;font-size:13px}
+.beichen-card{border:1px solid rgba(83,99,136,.1);border-radius:14px;background:#fff;padding:16px;min-width:0}
+.beichen-card h2,.beichen-card h3{margin-top:0}
+@media (max-width:900px){
+  .price-grid{grid-template-columns:1fr}
+  .compare-grid{grid-template-columns:1fr}
+  .beichen-table thead{display:none}
+  .beichen-table,.beichen-table tbody,.beichen-table tr,.beichen-table th,.beichen-table td{display:block;width:100%}
+  .beichen-table tr{border-bottom:1px solid var(--line);padding:12px 0}
+  .beichen-table th,.beichen-table td{border:0;padding:4px 12px}
+  .beichen-table .numeric-cell{text-align:left}
+}
+@media (max-width:560px){
+  .beichen-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .beichen-stat strong{font-size:17px}
+  .range-switch{width:100%;justify-content:space-between}
+  .range-switch button{flex:1}
+}
