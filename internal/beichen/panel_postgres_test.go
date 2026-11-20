@@ -36,9 +36,9 @@ func TestPanelPostgresPriceLifecycle(t *testing.T) {
 	execTestSQL(t, ctx, tx, "CREATE SCHEMA "+schema+"; SET LOCAL search_path TO "+schema)
 	execTestSQL(t, ctx, tx, `
 CREATE TABLE users (id uuid PRIMARY KEY);
-CREATE TABLE provider_credentials (id uuid PRIMARY KEY, updated_at timestamptz NOT NULL);
+CREATE TABLE provider_credentials (id uuid PRIMARY KEY, updated_at timestamptz NOT NULL, credential_ciphertext bytea NOT NULL);
 CREATE TABLE gateway_calls (provider_id uuid, provider_credential_id uuid, upstream_model_name text, sent_at timestamptz)`)
-	for _, name := range []string{"0030_beichen.sql", "0033_beichen_panel_prices.sql", "0040_beichen_panel_price_conditions.sql"} {
+	for _, name := range []string{"0030_beichen.sql", "0033_beichen_panel_prices.sql", "0040_beichen_panel_price_conditions.sql", "0042_beichen_price_credential_identity.sql"} {
 		migration, err := os.ReadFile("../infrastructure/db/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -50,7 +50,7 @@ CREATE TABLE gateway_calls (provider_id uuid, provider_credential_id uuid, upstr
 	if err != nil {
 		t.Fatal(err)
 	}
-	execTestSQL(t, ctx, tx, "INSERT INTO provider_credentials VALUES ($1,$2)", id, revision)
+	execTestSQL(t, ctx, tx, "INSERT INTO provider_credentials VALUES ($1,$2,'fixture')", id, revision)
 	rate := int64(10)
 	info := billingInfo{Multiplier: json.Number("0.125")}
 	quote := panelQuote{
@@ -78,7 +78,13 @@ CREATE TABLE gateway_calls (provider_id uuid, provider_credential_id uuid, upstr
 	check("shared", quote.expiresAt, "")
 	later := effectiveAt.Add(time.Second)
 	execTestSQL(t, ctx, tx, "UPDATE provider_credentials SET updated_at=$2 WHERE id=$1", id, later)
-	if err := (&Service{}).InvalidatePanelQuote(ctx, tx, id, later); err != nil {
+	check("shared", later, "1.25")
+	later = later.Add(time.Second)
+	execTestSQL(t, ctx, tx, "UPDATE provider_credentials SET updated_at=$2,credential_ciphertext='different fixture' WHERE id=$1", id, later)
+	check("shared", later, "")
+	check("shared", effectiveAt, "1.25")
+	execTestSQL(t, ctx, tx, "UPDATE provider_credentials SET credential_ciphertext='fixture' WHERE id=$1", id)
+	if err := invalidatePanelQuote(ctx, tx, id, later, later); err != nil {
 		t.Fatal(err)
 	}
 	check("shared", effectiveAt, "1.25")

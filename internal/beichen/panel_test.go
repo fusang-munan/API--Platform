@@ -3,13 +3,13 @@ package beichen
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 )
@@ -49,6 +49,14 @@ const panelSecond = `{"name":"example","description":"","platforms":[{"platform"
 
 func panelPayload(channels ...string) string {
 	return `{"code":0,"data":[` + strings.Join(channels, ",") + `]}`
+}
+
+func parsePanelPrices(body []byte, groupID int64, info billingInfo, entries []catalog.ProviderEntry) ([]priceRow, map[string]json.RawMessage, error) {
+	channels, err := decodePanelChannels(body)
+	if err != nil {
+		return nil, nil, err
+	}
+	return matchPanelPrices(channels, groupID, info, entries)
 }
 
 func TestPanelGroupIsolation(t *testing.T) {
@@ -149,80 +157,90 @@ type panelTransport func(*http.Request) (*http.Response, error)
 
 func (f panelTransport) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
-func TestChannelQuoteUsesPublicAccessBeforeLogin(t *testing.T) {
+func TestChannelQuoteUsesSavedWebSession(t *testing.T) {
 	now := time.Now().UTC()
 	peak := false
 	info := billingInfo{PeakEnabled: &peak, ObservedAt: now, GroupRate: "1", ResolvedRate: "1", Multiplier: "1"}
-	job := syncJob{provider: uuid.New(), credential: uuid.New()}
+	models := []catalog.ProviderEntry{{ID: "shared"}}
 	for _, tc := range []struct {
-		name                          string
-		panelStatus, keyStatus, calls int
-		needsLogin, priced            bool
+		name, legacyBody string
+		legacyStatus     int
+		school           bool
 	}{
-		{"public", 200, 200, 2, false, true},
-		{"login required", 401, 200, 4, true, true},
-		{"forbidden for anonymous", 403, 200, 3, true, true},
-		{"site unavailable", 503, 200, 1, false, false},
-		{"bad inference key", 200, 401, 2, false, false},
+		{name: "school uses the saved session even with a legacy binding", school: true},
+		{name: "legacy unauthorized", legacyStatus: http.StatusUnauthorized},
+		{name: "legacy forbidden", legacyStatus: http.StatusForbidden},
+		{name: "legacy empty array", legacyStatus: http.StatusOK, legacyBody: panelPayload()},
+		{name: "legacy no matching model", legacyStatus: http.StatusOK, legacyBody: panelPayload(strings.Replace(panelSecond, `"name":"shared"`, `"name":"different-model"`, 1))},
+		{name: "legacy pricing object without amounts", legacyStatus: http.StatusOK, legacyBody: panelPayload(
+			strings.Replace(strings.Replace(panelFirst, `"id":1`, `"id":2`, 1),
+				`"input_price":0.000001,"output_price":0,`, `"input_price":null,`, 1))},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db, mock, err := sqlmock.New()
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer db.Close()
-			s := New(db, nil)
+			s := New(nil, nil)
 			s.now = func() time.Time { return now }
-			// The resolver also supports explicitly configured existing authorizations.
-			s.panelGroups = map[uuid.UUID]int64{job.credential: 2}
-			if tc.panelStatus == http.StatusForbidden {
-				s.panelToken = "synthetic-web-session"
-			} else if err := s.ConfigureWebSession("school@example.test", "synthetic-password"); err != nil {
+			if err := s.ConfigureWebSessionTokens("school@example.test", "synthetic-web-session", "synthetic-refresh", now.Add(time.Hour)); err != nil {
 				t.Fatal(err)
 			}
-			if tc.needsLogin {
-				mock.ExpectQuery("SELECT group_id,token_ciphertext").WithArgs(job.credential).
-					WillReturnRows(sqlmock.NewRows([]string{"group_id", "token_ciphertext"}))
+			access := priceAccess{groupID: 2, legacyToken: "legacy-panel"}
+			if tc.school {
+				access.channel = "Gemini"
 			}
-			calls := 0
+			var seen []string
 			s.client.Transport = panelTransport(func(r *http.Request) (*http.Response, error) {
-				calls++
-				status, body := http.StatusOK, ""
-				auth := r.Header.Get("Authorization")
-				switch r.URL.String() {
-				case webAuthURL + "login":
-					if calls != 2 || tc.panelStatus != http.StatusUnauthorized || r.Method != http.MethodPost || auth != "" {
-						t.Fatal("unexpected website sign-in")
-					}
-					body = `{"code":0,"data":{"token_type":"Bearer","access_token":"synthetic-web-session","expires_in":900}}`
-				case panelURL:
-					if calls == 1 {
-						if auth != "" {
-							t.Fatal("public price check sent an authorization")
-						}
-						status = tc.panelStatus
-					} else if !tc.needsLogin || auth != "Bearer synthetic-web-session" {
-						t.Fatal("unexpected authenticated panel access")
-					}
-					body = panelPayload(panelSecond)
-				case origin + modelsPath:
-					if auth != "Bearer synthetic-inference" {
-						t.Fatal("catalog used the wrong credential")
-					}
-					status, body = tc.keyStatus, `{"data":[{"id":"shared"}]}`
+				if r.URL.String() != panelURL || r.Method != http.MethodGet {
+					t.Fatal("unexpected price request")
+				}
+				status, body := http.StatusOK, panelPayload(panelSecond)
+				switch r.Header.Get("Authorization") {
+				case "Bearer legacy-panel":
+					seen = append(seen, "legacy")
+					status, body = tc.legacyStatus, tc.legacyBody
+				case "Bearer synthetic-web-session":
+					seen = append(seen, "website")
 				default:
-					t.Fatal("unexpected URL")
+					t.Fatal("price request did not use a panel or website authority")
 				}
 				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
 			})
-			quote := s.fetchChannelQuote(context.Background(), job, "synthetic-inference", 2, info)
-			if (quote.err == nil) != tc.priced || (len(quote.rows) == 1) != tc.priced || calls != tc.calls {
-				t.Fatalf("price %+v, error %v, requests %d", quote.rows, quote.err, calls)
+			quote := s.fetchChannelQuote(context.Background(), access, "synthetic-inference", info, models)
+			want := "legacy,website"
+			if tc.school {
+				want = "website"
 			}
-			if err := mock.ExpectationsWereMet(); err != nil {
-				t.Fatal(err)
+			if quote.err != nil || len(quote.rows) != 1 || strings.Join(seen, ",") != want {
+				t.Fatalf("price %+v, error %v, requests %v", quote.rows, quote.err, seen)
 			}
 		})
+	}
+}
+
+func TestChannelQuoteReportsFailedRefresh(t *testing.T) {
+	now := time.Now().UTC()
+	peak := false
+	s := New(nil, nil)
+	s.now = func() time.Time { return now }
+	if err := s.ConfigureWebSessionTokens("school@example.test", "saved-access", "saved-refresh", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var requests []string
+	s.client.Transport = panelTransport(func(r *http.Request) (*http.Response, error) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch r.URL.String() {
+		case panelURL:
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":"UNAUTHORIZED"}`))}, nil
+		case webAuthURL + "refresh":
+			return &http.Response{StatusCode: http.StatusUnauthorized, Body: http.NoBody}, nil
+		default:
+			t.Fatal("unexpected URL")
+			return nil, nil
+		}
+	})
+	info := billingInfo{PeakEnabled: &peak, ObservedAt: now, GroupRate: "1", ResolvedRate: "1", Multiplier: "1"}
+	quote := s.fetchChannelQuote(context.Background(), priceAccess{groupID: 2, channel: "G3"}, "sk-synthetic", info, nil)
+	if !errors.Is(quote.err, errWebSignIn) || !s.webAccount.humanVerification.Load() ||
+		strings.Join(requests, ",") != "GET /api/v1/channels/available,POST /api/v1/auth/refresh" {
+		t.Fatalf("expected a failed authenticated read and a single refresh, got %v (%v)", requests, quote.err)
 	}
 }
 
@@ -234,25 +252,20 @@ func TestPanelFetchSeparatesCredentials(t *testing.T) {
 		t.Fatal("expected a valid standard billing response without group_id")
 	}
 	s := &Service{now: func() time.Time { return now }, client: newClient()}
+	models := []catalog.ProviderEntry{{ID: "shared"}}
 	calls := 0
 	s.client.Transport = panelTransport(func(req *http.Request) (*http.Response, error) {
 		calls++
-		var expected, body string
-		switch req.URL.String() {
-		case panelURL:
-			expected, body = "Bearer panel-test", panelPayload(panelFirst, panelSecond)
-		case origin + modelsPath:
-			expected, body = "Bearer inference-test", `{"object":"list","data":[{"id":"shared"}]}`
-		default:
+		if req.URL.String() != panelURL {
 			t.Fatalf("unexpected URL: %s", req.URL)
 		}
-		if req.Header.Get("Authorization") != expected {
+		if req.Header.Get("Authorization") != "Bearer panel-test" {
 			t.Fatal("credential was sent to the wrong endpoint")
 		}
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}, nil
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(panelPayload(panelFirst, panelSecond)))}, nil
 	})
-	quote := s.fetchPanelQuote(context.Background(), "panel-test", "inference-test", 2, info)
-	if quote.err != nil || len(quote.rows) != 1 || calls != 2 {
+	quote := s.fetchPanelQuote(context.Background(), "panel-test", "inference-test", 2, priceAccess{}, info, models)
+	if quote.err != nil || len(quote.rows) != 1 || calls != 1 {
 		t.Fatalf("quote %+v, calls %d", quote, calls)
 	}
 	if *quote.rows[0].Rates.Input != 2_000_000 || *quote.rows[0].Rates.Output != 0 || info.Multiplier != "0" {
@@ -260,11 +273,11 @@ func TestPanelFetchSeparatesCredentials(t *testing.T) {
 	}
 	otherGroup := int64(1)
 	info.GroupID = &otherGroup
-	if quote := s.fetchPanelQuote(context.Background(), "panel-test", "inference-test", 2, info); quote.err == nil || calls != 2 {
+	if quote := s.fetchPanelQuote(context.Background(), "panel-test", "inference-test", 2, priceAccess{}, info, models); quote.err == nil || calls != 1 {
 		t.Fatal("group mismatch should fail before fetching panel")
 	}
 	info.GroupID = &group
-	if quote := s.fetchPanelQuote(context.Background(), "inference-test", "inference-test", 2, info); quote.err == nil || calls != 2 {
+	if quote := s.fetchPanelQuote(context.Background(), "inference-test", "inference-test", 2, priceAccess{}, info, models); quote.err == nil || calls != 1 {
 		t.Fatal("inference key must not be sent to the panel")
 	}
 	s.client.Transport = panelTransport(func(req *http.Request) (*http.Response, error) {
@@ -274,7 +287,7 @@ func TestPanelFetchSeparatesCredentials(t *testing.T) {
 		}
 		return &http.Response{StatusCode: 401, Body: http.NoBody}, nil
 	})
-	if quote := s.fetchPanelQuote(context.Background(), "panel-test", "inference-test", 2, info); quote.err == nil || calls != 3 {
+	if quote := s.fetchPanelQuote(context.Background(), "panel-test", "inference-test", 2, priceAccess{}, info, models); quote.err == nil || calls != 2 {
 		t.Fatal("401 should fail without fallback")
 	}
 }
@@ -305,7 +318,7 @@ func TestPanelRejectsDisplayFallback(t *testing.T) {
 				}
 				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}, nil
 			})
-			if quote := s.fetchPanelQuote(context.Background(), "panel-test", "inference-test", group, info); (quote.err == nil && quote.verificationError == nil) || len(quote.rows) != 0 {
+			if quote := s.fetchPanelQuote(context.Background(), "panel-test", "inference-test", group, priceAccess{}, info, []catalog.ProviderEntry{{ID: "shared"}}); (quote.err == nil && quote.verificationError == nil) || len(quote.rows) != 0 {
 				t.Fatal("accepted unverified panel price")
 			}
 		})

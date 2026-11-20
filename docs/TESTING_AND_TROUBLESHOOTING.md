@@ -202,6 +202,37 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 4. 校内扣分应等于该次基础积分乘发件时的学校系数。把北辰实扣乘 100 换为积分后，再与校内扣分相减。此差额可为正或负。缺价格的调用可能靠官方流水补记，验证时也要记录基础积分来源。
 5. 后台目录、价格及流水均报超时时检查学校后端的 `HTTPS_PROXY`、`NO_PROXY` 和北辰官网授权状态。若提示官网要求额外登录验证，学校的网页登录仍待授权。在个人浏览器打开北辰官网只会影响该浏览器的登录状态。核对后台读取是否恢复时，查看「供应商管理 → 北辰 → 查看模型」中的网页报价及逐笔流水成功时间。
 6. 项目已经扣分但所选日期没有逐笔记录时，先核对北京日期和网页读取进度。最后成功读取一页和已读到末页分别反映最近活动和完整进度。没有成功时间时，空列表只能说明学校尚未归档该日流水。账单已有记录而学校扣分栏待核时，可在「项目监控」核对该学生的调用。使用隔离的本机测试库运行 `go test ./internal/beichen -run TestReceiptSweepPostgresG3 -count=1`，覆盖上游更正金额、同一时间分页、实扣为零和无法确认归属的记录。
+
+### 北辰网页报价持续为 0/4
+
+先从已核实的学校 HTTPS 入口读 `/.well-known/nebula-release.txt`。学校若显示 0.15.0，采价任务还依赖预配的分组行。同步可以先写入 Key 账单倍率，随后因缺少分组而跳过官网价表。北辰的标准 Key 账单格式可以省略分组 ID，网页价表本身要求登录。价格成功数统计有效的报价快照，流水成功数取决于有效的上游 Key 绑定和已成功读取的流水分页。
+
+有学校教师登录权限时，读取 `GET /api/v1/teacher/providers/{provider_id}/beichen`，核对 `datasets` 中 `catalog`、`billing`、`prices` 的时间和错误，以及 `website_sync` 的覆盖数。有校方授权的数据库维护者可用下列只读查询核对同一渠道的采价状态。结果只含分组、状态、时间和行数。
+
+```sql
+SELECT j.channel, a.group_id AS configured_group, a.upstream_key_id IS NOT NULL AS has_receipt_key,
+       j.discovery_error, b.last_success AS multiplier_seen, d.last_success AS price_seen, d.last_error,
+       snap.group_id AS quote_group, snap.effective_at AS quote_seen, snap.expires_at,
+       snap.credential_revision = c.updated_at AS same_metadata_revision,
+       (SELECT count(*) FROM beichen_price_versions v
+        WHERE v.credential_id = c.id AND v.effective_at = snap.effective_at AND v.source = 'panel') AS flat_prices,
+       cp.last_success AS receipt_seen
+FROM beichen_provision_channels j
+JOIN provider_credentials c ON c.id = j.credential_id
+LEFT JOIN beichen_panel_access a ON a.credential_id = c.id
+LEFT JOIN beichen_datasets b ON b.credential_id = c.id AND b.kind = 'billing'
+LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = 'prices'
+LEFT JOIN LATERAL (
+  SELECT group_id, effective_at, expires_at, credential_revision FROM beichen_panel_snapshots
+  WHERE credential_id = c.id ORDER BY effective_at DESC LIMIT 1
+) snap ON true
+LEFT JOIN beichen_usage_checkpoints cp ON cp.credential_id = c.id
+  AND cp.revision = a.updated_at AND cp.upstream_key_id = a.upstream_key_id
+WHERE c.status = 'active'
+ORDER BY j.channel;
+```
+
+用隔离的本机 PostgreSQL 运行 `go test ./internal/beichen -run 'TestScheduledWebsitePricesPostgres|TestChannelQuoteReportsFailedRefresh|TestUpstreamUsageWithoutSchoolCallsPostgres' -count=1`。测试模拟四把 Key 连续重读价表及目录、网页会话续期、新模型后来补价、有效快照跨凭据元数据更新，以及账号内逐笔归档。测试请求均在模拟接口处理。
 7. 预期的维护教师看不到工作区时，核对学校维护 HTTPS、登录账号的校内 UUID 和校方提供的固定应用地址。工作区配置无效时会记录简短的启动提示，学校网站继续提供服务。若能打开工作区但流水时间仍旧，需分别核验工作区登录状态和后台数据来源。运行 `go test ./internal/api/http -run 'TestSchoolWorkspace|TestBeichenOverviewPreventsSharedCaching'` 可检查教师隔离、空配置和缓存。
 
 | 现象 | 常见根因 | 解决方案 | 排查建议 |

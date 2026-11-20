@@ -196,7 +196,7 @@ VALUES ($1,$2,'cc不满血',$3,'active',now(),now())`, last, provider, legacy)
 	checkCount("SELECT count(*) FROM users WHERE role='teacher' OR status='active'", 0)
 	checkCount("SELECT count(*) FROM student_profiles", 0)
 	checkCount("SELECT count(*) FROM mentor_profiles", 0)
-	checkCount("SELECT count(*) FROM beichen_panel_snapshots", 8)
+	checkCount("SELECT count(*) FROM beichen_panel_snapshots", 0)
 	before = snapshot()
 	run(provisionFixture, panelFixture)
 	if snapshot() != before {

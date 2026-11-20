@@ -37,9 +37,10 @@ LEFT JOIN LATERAL (
     ORDER BY effective_at DESC LIMIT 1
 ) latest ON true
 LEFT JOIN LATERAL (
-    -- Keep the last actual observation for this revision even after expiry or revocation.
+    -- Keep the last actual observation for this key even after expiry or revocation.
     SELECT s.effective_at FROM beichen_panel_snapshots s
-    WHERE s.credential_id = c.id AND s.credential_revision = c.updated_at
+    WHERE s.credential_id = c.id
+      AND COALESCE(s.credential_ciphertext_sha256 = sha256(c.credential_ciphertext), s.credential_revision = c.updated_at)
       AND s.effective_at <= statement_timestamp() AND s.expires_at IS NOT NULL
       AND (EXISTS (
           SELECT 1 FROM jsonb_each(s.model_pricing) AS model(name, terms)

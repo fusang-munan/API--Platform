@@ -428,6 +428,8 @@ data: {"revision":"01K2..."}
 
 维护用的 `beichen/access/{credential_id}` 可读该凭据的同步状态、分组与北辰 Key 数字 ID。学校自动部署通过官网普通账号建立这些关联。旧版专用读取凭据的接口保留兼容。
 
+自动和手动同步都会重读每把 Key 的完整模型目录与倍率。学校预配渠道用学校网页会话读取价表。优先使用 Key 账单的分组 ID，其次使用已确认的显式分组或账号内 Key 的归属。手动同步遇到网页采价失败会返回同步未完成。已经成功读取的模型目录或倍率仍会保存，对应价格错误可在概览的 `datasets` 中查看。
+
 概览的 `archived_usage` 以北京时间按日、模型和凭据汇总持续采集的原始流水。`rows`、`unmatched_rows`、`unpriced_rows` 分别表示已采集笔数、未能归属学校扣款的笔数和无法确认余额实扣的笔数。`observed_cost` 汇总已知原始实扣，`matched_cost`、`matched_base_credits`、`matched_charged_credits` 与 `margin_credits` 只比较同一批可匹配且金额齐全的调用。官网更正金额后会更新差额，保留原学生扣分。
 
 `website_sync` 汇总当前学校预配的有效渠道。按 `channels` 查看渠道总数，`priced_channels` 表示当前有有效网页报价的数量，`price_last_seen` 表示最近观察到网页模型价格的时间。`receipt_checked_channels` 计数曾成功读取逐笔流水分页的渠道，`receipt_last_checked` 为最近成功读取一页的时间，`receipt_caught_up_channels` 计数已读到末页的渠道。时间可为空。这组状态反映当前同步进度，查询不同账日时含义相同。

@@ -66,30 +66,55 @@ func accountDigest(identity string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-// A disabled database row overrides deployment settings. Rotation never
-// exposes a stored token through the control plane.
-func (s *Service) panelAccess(ctx context.Context, credentialID uuid.UUID) (string, int64, error) {
+type priceAccess struct {
+	groupID     int64
+	channel     string
+	label       string
+	legacyToken string
+	disabled    bool
+	discoverIDs bool
+}
+
+func (s *Service) loadPriceAccess(ctx context.Context, credentialID uuid.UUID) (priceAccess, error) {
+	var access priceAccess
 	var group sql.NullInt64
+	var actor uuid.NullUUID
 	var encrypted []byte
-	err := s.db.QueryRowContext(ctx, `SELECT group_id,token_ciphertext FROM beichen_panel_access WHERE credential_id=$1`, credentialID).Scan(&group, &encrypted)
-	if errors.Is(err, sql.ErrNoRows) {
-		id := s.panelGroups[credentialID]
-		if id == 0 {
-			return "", 0, nil
-		}
-		return s.panelToken, id, nil
-	}
+	err := s.db.QueryRowContext(ctx, `
+SELECT a.group_id,a.token_ciphertext,a.updated_by,COALESCE(j.channel,''),c.label::text,COALESCE(j.discover_ids,false)
+FROM provider_credentials c
+LEFT JOIN beichen_panel_access a ON a.credential_id=c.id
+LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
+WHERE c.id=$1`, credentialID).Scan(&group, &encrypted, &actor, &access.channel, &access.label, &access.discoverIDs)
 	if err != nil {
-		return "", 0, errors.New("读取北辰采价配置失败")
+		return priceAccess{}, errors.New("读取北辰采价配置失败")
+	}
+	if !actor.Valid {
+		access.groupID = s.panelGroups[credentialID]
+		if access.groupID > 0 {
+			access.legacyToken = s.panelToken
+		}
+		return access, nil
 	}
 	if !group.Valid {
-		return "", 0, nil
+		// 自动预配的空行表示身份尚待发现，教师主动停用的空行才撤销采价。
+		access.disabled = actor.UUID.String() != ProvisionActorID
+		return access, nil
 	}
-	token, err := s.resolvePanelToken(ctx, credentialID, encrypted)
+	source, err := s.storedPanelAccess(credentialID, encrypted)
 	if err != nil {
-		return "", 0, err
+		return priceAccess{}, err
 	}
-	return token, group.Int64, nil
+	if source.webAccount != "" {
+		if !s.WebSessionConfigured() {
+			return priceAccess{}, errors.New("未配置北辰学校网页会话")
+		}
+		if source.webAccount != accountDigest(s.webPanelIdentity()) {
+			return priceAccess{}, errors.New("北辰绑定的学校网页登录身份与本机配置不一致")
+		}
+	}
+	access.groupID, access.legacyToken = group.Int64, source.Token
+	return access, nil
 }
 
 // PanelUsageAccess returns the current explicit per-key usage binding. The
@@ -224,5 +249,15 @@ SET group_id=excluded.group_id, token_ciphertext=excluded.token_ciphertext,
 	if _, err = tx.ExecContext(ctx, `UPDATE provider_credentials SET updated_at=$2 WHERE id=$1`, credential, version); err != nil {
 		return err
 	}
-	return s.InvalidatePanelQuote(ctx, tx, credential, version)
+	if !input.Enabled && actor.String() != ProvisionActorID {
+		if err := invalidatePanelQuote(ctx, tx, credential, version, version); err != nil {
+			return err
+		}
+	}
+	if input.Enabled {
+		if err := invalidateChangedPanelQuote(ctx, tx, credential, version, version, input.GroupID, ""); err != nil {
+			return err
+		}
+	}
+	return schedulePanelRefresh(ctx, tx, credential)
 }

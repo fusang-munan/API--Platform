@@ -202,7 +202,8 @@ func readModels(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Ove
 SELECT m.credential_id, m.model_id::text, p.mode,
   COALESCE(route.school_status, named.status, 'not_configured'),
   owner.status = 'active' AND c.status = 'active' AND COALESCE(route.binding_ready, false),
-  CASE WHEN snap.expires_at > statement_timestamp() AND snap.credential_revision = c.updated_at
+  CASE WHEN snap.expires_at > statement_timestamp()
+         AND COALESCE(snap.credential_ciphertext_sha256 = sha256(c.credential_ciphertext), snap.credential_revision = c.updated_at)
        THEN snap.model_pricing -> (m.model_id::text) END,
   trim_scale(p.upstream_input)::text, trim_scale(p.upstream_output)::text,
   trim_scale(p.upstream_cache_read)::text, trim_scale(p.upstream_cache_write)::text,
@@ -213,7 +214,7 @@ JOIN provider_credentials c ON c.id = m.credential_id AND c.provider_id = m.prov
 JOIN providers owner ON owner.id = c.provider_id
 LEFT JOIN models named ON named.model_id = m.model_id
 LEFT JOIN LATERAL (
-  SELECT expires_at, credential_revision, model_pricing FROM beichen_panel_snapshots
+  SELECT expires_at, credential_revision, credential_ciphertext_sha256, model_pricing FROM beichen_panel_snapshots
   WHERE credential_id = c.id AND effective_at <= statement_timestamp() ORDER BY effective_at DESC LIMIT 1
 ) snap ON true
 LEFT JOIN LATERAL (

@@ -2,6 +2,7 @@ package beichen
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -13,8 +14,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// Never decode the website's raw "key" property. Only account-scoped metadata
-// and explicitly masked/display fields are evidence for matching.
 type listedKey struct {
 	ID      int64 `json:"id"`
 	UserID  int64 `json:"user_id"`
@@ -22,11 +21,31 @@ type listedKey struct {
 	Group   *struct {
 		ID int64 `json:"id"`
 	} `json:"group"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	Masked string `json:"masked_key"`
-	Prefix string `json:"key_prefix"`
-	Suffix string `json:"key_suffix"`
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Masked      string `json:"masked_key"`
+	Prefix      string `json:"key_prefix"`
+	Suffix      string `json:"key_suffix"`
+	fingerprint *[sha256.Size]byte
+}
+
+// Some versions of the account endpoint return the owner's key in place of
+// masked metadata. Reduce it to an in-memory fingerprint during decoding.
+func (k *listedKey) UnmarshalJSON(body []byte) error {
+	type fields listedKey
+	item := struct {
+		*fields
+		Value string `json:"key"`
+	}{fields: (*fields)(k)}
+	if err := json.Unmarshal(body, &item); err != nil {
+		return err
+	}
+	if value := item.Value; strings.HasPrefix(value, "sk-") && len(value) <= 4096 &&
+		!strings.ContainsAny(value, "*•…. \r\n\t") {
+		fingerprint := sha256.Sum256([]byte(value))
+		k.fingerprint = &fingerprint
+	}
+	return nil
 }
 
 var errKeyList = errors.New("北辰账号的 Key 列表或分页无法确认")
@@ -97,29 +116,30 @@ func (s *Service) identifyChannel(ctx context.Context, secret, channel, label st
 	if err != nil {
 		return listedKey{}, err
 	}
-	var info struct {
-		Object  string `json:"object"`
-		Scope   string `json:"billing_scope"`
-		Version int    `json:"schema_version"`
-		Group   int64  `json:"group_id"`
-		ID      int64  `json:"api_key_id"`
-		KeyID   int64  `json:"key_id"`
-		Name    string `json:"api_key_name"`
-	}
-	if json.Unmarshal(body, &info) != nil || info.Object != "sub2api.key_billing" || info.Scope != "token" || info.Version != 1 {
+	var info billingInfo
+	if json.Unmarshal(body, &info) != nil || info.Object != "sub2api.key_billing" || info.Scope != "token" || info.SchemaVersion != 1 {
 		return listedKey{}, errKeyMatch
 	}
+	return info.matchWebsiteKey(keys, secret, channel, label)
+}
+
+func (info billingInfo) matchWebsiteKey(keys []listedKey, secret, channel, label string) (listedKey, error) {
+	var group int64
+	if info.GroupID != nil {
+		group = *info.GroupID
+	}
 	if info.KeyID != 0 {
-		if info.ID != 0 && info.ID != info.KeyID {
+		if info.APIKeyID != 0 && info.APIKeyID != info.KeyID {
 			return listedKey{}, errKeyMatch
 		}
-		info.ID = info.KeyID
+		info.APIKeyID = info.KeyID
 	}
-	return matchAccountKey(keys, secret, channel, label, info.Group, info.ID, info.Name)
+	return matchAccountKey(keys, secret, channel, label, group, info.APIKeyID, info.APIKeyName)
 }
 
 func matchAccountKey(keys []listedKey, secret, channel, label string, group, id int64, billingName string) (listedKey, error) {
 	var hit listedKey
+	fingerprint := sha256.Sum256([]byte(secret))
 	groupCount := 0
 	for _, k := range keys {
 		if k.GroupID == group {
@@ -135,7 +155,7 @@ func matchAccountKey(keys []listedKey, secret, channel, label string, group, id 
 		labelMatch := strings.EqualFold(name, channel) || strings.EqualFold(name, strings.TrimSpace(label)) || strings.EqualFold(name, aliases[channel])
 		wrongChannel := false
 		for other, alias := range aliases {
-			if other != channel && (strings.EqualFold(name, other) || strings.EqualFold(name, alias)) {
+			if channel != "" && other != channel && (strings.EqualFold(name, other) || strings.EqualFold(name, alias)) {
 				wrongChannel = true
 			}
 		}
@@ -157,7 +177,11 @@ func matchAccountKey(keys []listedKey, secret, channel, label string, group, id 
 		if billingName != "" && !strings.EqualFold(billingName, name) {
 			continue
 		}
-		if !(id == k.ID || maskMatch || labelMatch && group > 0 && (groupCount == 1 || billingName != "")) {
+		exactKey := k.fingerprint != nil && *k.fingerprint == fingerprint
+		if k.fingerprint != nil && !exactKey {
+			continue
+		}
+		if !(exactKey || id == k.ID || maskMatch || labelMatch && group > 0 && (groupCount == 1 || billingName != "")) {
 			continue
 		}
 		if hit.ID != 0 || (k.Status != "" && k.Status != "active") {
