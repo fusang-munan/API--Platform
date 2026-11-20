@@ -297,7 +297,6 @@ onMounted(load)
                 <span class="chip">Key 数 {{ p.credentials ? p.credentials.length : '—' }}</span>
                 <span class="chip">启用 Key {{ p.credentials ? activeKeyCount(p) : '—' }}</span>
                 <span class="chip">最近目录同步 {{ catalogSyncTime(p) }}<template v-if="catalogSyncTime(p) !== '—'">（北京时间）</template></span>
-                <span class="chip">报价覆盖 —</span>
               </div>
             </div>
             <div class="actions">

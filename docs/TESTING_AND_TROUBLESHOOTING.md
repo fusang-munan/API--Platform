@@ -203,6 +203,36 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 5. 后台目录、价格及流水均报超时时检查学校后端的 `HTTPS_PROXY`、`NO_PROXY` 和北辰官网授权状态。若提示官网要求额外登录验证，学校的网页登录仍待授权。在个人浏览器打开北辰官网只会影响该浏览器的登录状态。核对后台读取是否恢复时，查看「供应商管理 → 北辰 → 查看模型」中的网页报价及逐笔流水成功时间。
 6. 项目已经扣分但所选日期没有逐笔记录时，先核对北京日期和网页读取进度。最后成功读取一页和已读到末页分别反映最近活动和完整进度。没有成功时间时，空列表只能说明学校尚未归档该日流水。账单已有记录而学校扣分栏待核时，可在「项目监控」核对该学生的调用。使用隔离的本机测试库运行 `go test ./internal/beichen -run TestReceiptSweepPostgresG3 -count=1`，覆盖上游更正金额、同一时间分页、实扣为零和无法确认归属的记录。
 
+### 北辰教师端用量、定价与对账
+
+后端先指向隔离 PostgreSQL，再按风险分组运行：
+
+```powershell
+$env:NEBULA_TEST_POSTGRES = 'postgres://nebula_test@127.0.0.1:55841/nebula_test?sslmode=disable'
+go test ./internal/usage -run TestBeichenLedgerPostgres -count=1 -v
+go test ./internal/beichen -run 'TestEnableModelsBatch|TestModelUsagePostgresRangeAndAttribution|TestReportsPostgresModelsStudentsKeysAndReconciliation' -count=1 -v
+go test ./internal/api/http -run 'TestRegistersControlPlaneAndGatewayRoutes|TestBeichen' -count=1 -v
+go test ./...
+```
+
+第一条覆盖跟随官网、手动价、回执补记和调价不追溯；第二条覆盖批量启用、北京时间区间边界、成员与 Key 聚合以及本地/北辰 FULL JOIN；最后一条覆盖全部路由和鉴权。前端运行 `npm run typecheck`、`npm test` 和 `npm run build`，其中 `BeichenSchoolModels.test.ts`、`BeichenPriceDrawer.test.ts`、`BeichenReconcile.test.ts`、`TeacherProjectQuotaDialog.test.ts` 和 `schoolBillingFlow.test.ts` 直接覆盖本次页面。
+
+人工验收按以下顺序：
+
+1. 模型页的官网标准价和学生实际价都以积分显示，北辰原价在弱化小字中；四个字段（输入、输出、缓存读取、缓存写入）对齐，不再出现整段长句。切换当天/本月/总计后，每个模型的积分和 Token 与数据库一致，用量抽屉总量等于各模型之和。
+2. 一键启用先显示“将启用/跳过”数量和原因。手动给一个官网未报价的模型定价后，再一键启用应能成功；仅按条件计价且没有手动价的模型仍应跳过。
+3. 手动价保存后，四个 Key 的学生基础价一致；新发起的调用写入 `beichen_base_source='teacher_manual_price'`，学生实扣等于基础价乘 1.10；恢复跟随官网后，后续调用回到官网报价。保存前已经发出的调用不应改变。
+4. 学生额度弹窗在 1440、1024、768、375 宽度都没有横向滚动；学生额度不能低于“已用 + 待核”，超过项目可分配额度时显示服务器错误；导师和历史月份只读；切换弹窗月份不触发项目页重新加载。
+5. 北辰对账的学生已扣按“积分 ÷ 100”显示，北辰实扣按 `billed_upstream_micros ÷ 1,000,000` 显示；差额为前者减后者。北辰尚未回传实扣的模型显示“—”，不能显示 0。仅本地或仅北辰存在的模型必须出现在明细中并高亮。
+
+常见问题：
+
+- 手动价看起来没有生效：先用 `SELECT beichen_price_at(credential_id, model, sent_at) FROM gateway_calls WHERE id=...` 核对发件时刻。价格版本在 `effective_at` 之后才生效，调价不会追溯更早的调用。
+- 批量启用提示“官网未报价或按条件计价”：先给模型设置手动固定价，或在官网同步出可计算的输入/输出固定价后再试。按条件计价但没有固定价时不会批量启用。
+- 对账差额异常大：先看北辰实扣是否为未知、当天账单是否已同步、模型是否只有本地或只有北辰记录。缺失实扣时页面显示“—”，不会把未知当作零；差额仅供参考。
+- 学生额度保存返回 `PROJECT_QUOTA_ALLOCATION_EXCEEDED`：该学生增加后的总额超过项目月额度。先减少其他成员额度或提高项目额度，不能靠前端绕过。
+- 手动价出现 100 倍偏差：检查是否把“积分/百万 Token”又乘了一次 1,000,000。HTTP 新接口接收十进制积分字符串，服务端统一缩放；不要在浏览器里预先缩放。
+
 ### 北辰网页报价持续为 0/4
 
 先从已核实的学校 HTTPS 入口读 `/.well-known/nebula-release.txt`。学校若显示 0.15.0，采价任务还依赖预配的分组行。同步可以先写入 Key 账单倍率，随后因缺少分组而跳过官网价表。北辰的标准 Key 账单格式可以省略分组 ID，网页价表本身要求登录。价格成功数统计有效的报价快照，流水成功数取决于有效的上游 Key 绑定和已成功读取的流水分页。

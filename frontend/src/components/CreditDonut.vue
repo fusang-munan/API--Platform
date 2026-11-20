@@ -14,7 +14,8 @@ const props = withDefaults(defineProps<{
   total: number
   label?: string
   mini?: boolean
-}>(), { label: 'credit 用量图', mini: false })
+  unit?: string
+}>(), { label: 'credit 用量图', mini: false, unit: 'credits' })
 
 const root = ref<HTMLElement | null>(null)
 const palette = ['#7657e8', '#2fa8c4', '#e5a93f', '#e16d8b', '#45a779', '#8b79cb', '#64748b']
@@ -37,7 +38,7 @@ function render() {
     tooltip: {
       trigger: 'item',
       confine: true,
-      valueFormatter: (value: number, index: number) => `${chartSegments.value[index]?.displayValue ?? value.toFixed(3)} credits`,
+      valueFormatter: (value: number, index: number) => `${chartSegments.value[index]?.displayValue ?? value.toFixed(3)} ${props.unit}`,
     },
     legend: { show: false },
     series: [{ type: 'pie', radius: props.mini ? ['62%', '88%'] : ['58%', '82%'], silent: props.mini, label: { show: false }, data: chartSegments.value.map(item => ({ name: item.name, value: item.value, itemStyle: { color: item.color } })) }],
@@ -67,7 +68,7 @@ onBeforeUnmount(() => { resizeObserver?.disconnect(); chart?.dispose(); chart = 
     </ul>
     <table v-if="!mini" class="sr-only">
       <caption>{{ label }}</caption>
-      <thead><tr><th>分项</th><th>credits</th></tr></thead>
+      <thead><tr><th>分项</th><th>{{ unit }}</th></tr></thead>
       <tbody><tr v-for="segment in positiveSegments" :key="segment.name"><td>{{ segment.name }}</td><td>{{ segment.displayValue ?? segment.value.toFixed(3) }}</td></tr></tbody>
     </table>
   </div>

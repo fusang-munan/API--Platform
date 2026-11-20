@@ -170,7 +170,7 @@ onBeforeUnmount(() => { request += 1 })
           <div class="quota-body">
             <section class="quota-allocation" aria-label="成员分配占比">
               <h2>成员分配占比</h2>
-              <CreditDonut v-if="hasAllocation" :segments="allocation" :total="Number(usage.quota)" label="项目额度：学生分配与可再分配积分" />
+              <CreditDonut v-if="hasAllocation" :segments="allocation" :total="Number(usage.quota)" label="项目额度：学生分配与可再分配积分" unit="积分" />
               <div v-else class="quota-empty">
                 <strong>尚未分配</strong>
                 <p>{{ editable ? '选择右侧学生，点击「调整额度」开始分配。' : '该月没有学生额度分配。' }}</p>

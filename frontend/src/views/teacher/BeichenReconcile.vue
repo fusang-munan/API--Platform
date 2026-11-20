@@ -137,12 +137,12 @@ onBeforeUnmount(() => { requestVersion++ })
           <div class="compare-grid reconcile-donuts">
             <section class="compare-card">
               <h3>本地 Token 模型占比</h3>
-              <CreditDonut v-if="data.totals.local.tokens > 0" :segments="localSegments" :total="data.totals.local.tokens" label="本地 Token 模型占比" />
+              <CreditDonut v-if="data.totals.local.tokens > 0" :segments="localSegments" :total="data.totals.local.tokens" label="本地 Token 模型占比" unit="Token" />
               <p v-else class="beichen-empty">当前范围没有本地 Token 记录。</p>
             </section>
             <section class="compare-card">
               <h3>北辰 Token 模型占比</h3>
-              <CreditDonut v-if="data.totals.upstream.tokens > 0" :segments="upstreamSegments" :total="data.totals.upstream.tokens" label="北辰 Token 模型占比" />
+              <CreditDonut v-if="data.totals.upstream.tokens > 0" :segments="upstreamSegments" :total="data.totals.upstream.tokens" label="北辰 Token 模型占比" unit="Token" />
               <p v-else class="beichen-empty">当前范围没有北辰 Token 记录。</p>
             </section>
           </div>
