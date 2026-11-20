@@ -11,12 +11,16 @@ const props = defineProps<{ providerId: string; query?: string; commonIds?: Set<
 const overview = ref<BeichenOverview>()
 const loading = ref(false)
 const updating = ref('')
+const syncing = ref(false)
 const error = ref('')
 const rows = computed(() => overview.value ? schoolCatalog(overview.value, props.providerId).filter(row =>
   row.model.toLowerCase().includes((props.query ?? '').trim().toLowerCase()) &&
   (!props.commonIds || props.commonIds.has(row.model.toLowerCase()))) : [])
 const loginNeeded = computed(() => overview.value?.web_login_required ?? overview.value?.datasets?.some(row =>
   /重新授权|重新登录|完成登录验证|(?:官网|网站).*(?:授权|会话)(?:已)?(?:失效|过期)/u.test(row.last_error ?? '')))
+const priceErrors = computed(() => [...new Set((overview.value?.datasets ?? [])
+  .filter(row => row.kind === 'prices' && row.last_error)
+  .map(row => row.last_error as string))])
 const workspaceUrl = computed(() => {
   const raw = overview.value?.maintenance_workspace?.launch_url
   if (typeof raw !== 'string' || !/^https:\/\/[^/@]+(?:\/|$)/i.test(raw)) return null
@@ -48,6 +52,20 @@ function refreshOverview() {
   if (!loading.value && !updating.value) void load()
 }
 
+async function syncPrices() {
+  if (syncing.value || loading.value || updating.value) return
+  syncing.value = true
+  error.value = ''
+  try {
+    await teacherAPI.syncBeichen(props.providerId)
+    await load()
+  } catch (e) {
+    error.value = apiErrorMessage(e, '立即同步失败，请稍后重试')
+  } finally {
+    syncing.value = false
+  }
+}
+
 async function changeStatus(row: (typeof rows.value)[number], enable: boolean) {
   if (updating.value || loading.value) return
   updating.value = row.model
@@ -77,9 +95,15 @@ onMounted(load)
   <BeichenRecentReceipts v-if="providerMaintenance" :provider-id="providerId" :website-sync="overview?.website_sync"
     @refresh-overview="refreshOverview" />
   <section aria-label="北辰模型目录">
-    <button type="button" class="button ghost" :disabled="loading || Boolean(updating)" @click="load">刷新模型</button>
+    <div class="model-toolbar">
+      <button type="button" class="button ghost" :disabled="loading || Boolean(updating)" @click="load">刷新模型</button>
+      <button type="button" class="button secondary" :disabled="loading || syncing || Boolean(updating)" @click="syncPrices">
+        {{ syncing ? '同步中…' : '立即同步价格' }}
+      </button>
+    </div>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <p v-if="providerMaintenance && loginNeeded" role="status">北辰官网需要学校后台重新授权。</p>
+    <p v-if="priceErrors.length" class="error" role="alert">价格同步失败：{{ priceErrors.join('；') }}</p>
     <p v-if="loading" role="status">正在读取模型…</p>
     <div v-if="rows.length" class="model-scroll">
       <table class="usage-table">
@@ -100,9 +124,9 @@ onMounted(load)
               </div>
             </td>
             <td>
-              <div v-for="quote in row.quotes" :key="JSON.stringify([quote.multiplier, quote.price])">
-                {{ quote.multiplier }}
-                <details v-if="quote.price"><summary>单价</summary><small class="price-detail">{{ quote.price }}</small></details>
+              <div v-for="quote in row.quotes" :key="JSON.stringify([quote.multiplier, quote.price])" class="quote-row">
+                <span class="quote-multiplier">{{ quote.multiplier }}</span>
+                <span v-if="quote.price" class="price-detail">{{ quote.price }}</span>
                 <small v-else class="muted">单价待同步</small>
               </div>
               <span v-if="!row.quotes.length">待同步</span>
@@ -118,7 +142,10 @@ onMounted(load)
 <style scoped>
 .model-scroll { overflow-x: auto; }
 .model-actions { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin-top: .35rem; }
-.price-detail { white-space: pre-line; }
-summary { cursor: pointer; color: var(--ink-soft); }
+.model-toolbar { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: .5rem; }
+.quote-row { display: grid; gap: .2rem; }
+.quote-row + .quote-row { margin-top: .7rem; padding-top: .7rem; border-top: 1px solid var(--line, #e5e7eb); }
+.quote-multiplier { font-variant-numeric: tabular-nums; }
+.price-detail { display: block; white-space: pre-line; color: var(--ink-soft); }
 th[scope="row"] { white-space: normal; overflow-wrap: anywhere; }
 </style>

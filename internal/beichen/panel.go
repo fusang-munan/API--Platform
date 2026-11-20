@@ -78,14 +78,14 @@ var errPanelLoginRequired = errors.New("北辰渠道页要求登录")
 // own authorization response can trigger a normal authenticated read.
 func (s *Service) fetchChannelQuote(ctx context.Context, job syncJob, key string, group int64, info billingInfo) panelQuote {
 	quote := s.fetchPanelQuote(ctx, "", key, group, info)
-	if !errors.Is(quote.err, errPanelLoginRequired) {
+	if panelQuoteUsable(quote) {
 		return quote
 	}
 	token, current, err := s.panelAccess(ctx, job.credential)
 	if err != nil {
 		return panelQuote{err: err}
 	}
-	if current != group {
+	if current != 0 && current != group {
 		return panelQuote{err: errors.New("读取北辰渠道页期间分组配置已变更")}
 	}
 	if token == "" {
@@ -96,10 +96,33 @@ func (s *Service) fetchChannelQuote(ctx context.Context, job syncJob, key string
 			return panelQuote{err: err}
 		}
 		if token == "" {
-			return panelQuote{err: errPanelLoginRequired}
+			return quote
 		}
 	}
-	return s.fetchPanelQuote(ctx, token, key, group, info)
+	authenticated := s.fetchPanelQuote(ctx, token, key, group, info)
+	if panelQuoteUsable(authenticated) {
+		return authenticated
+	}
+	// A legacy panel token may still be stored while the school's current web
+	// session is the only valid authorization. Try the session after a failed
+	// static token instead of waiting for a manual panel-access rotation.
+	if s.WebSessionConfigured() {
+		webToken, webErr := s.webPanelToken(ctx)
+		if webErr == nil && webToken != "" && webToken != token {
+			retried := s.fetchPanelQuote(ctx, webToken, key, group, info)
+			if panelQuoteUsable(retried) || retried.err == nil {
+				return retried
+			}
+		}
+	}
+	if authenticated.err == nil || quote.err == nil {
+		return authenticated
+	}
+	return quote
+}
+
+func panelQuoteUsable(quote panelQuote) bool {
+	return quote.err == nil && (len(quote.rows) > 0 || len(quote.terms) > 0)
 }
 
 func (s *Service) fetchPanelQuote(ctx context.Context, token, key string, group int64, info billingInfo) panelQuote {

@@ -51,8 +51,20 @@ export function schoolCatalog(overview: BeichenOverview, providerId: string) {
 function unitPrice(record?: BeichenModel) {
   if (record?.price_status === 'conditional') return conditionalPrices(record.price_conditions_exact ?? record.price_conditions)
   if (record?.price_status !== 'confirmed') return null
-  return '每百万 Token 的北辰余额单位 · ' +
+  const effective = '实际单价（已乘倍率） · 每百万 Token 的北辰余额单位 · ' +
     priceFields.map(({ key, label }) => label + ' ' + (scaledNumber(record.upstream_rates?.[key], 6) ?? '未知')).join(' · ')
+  const standard = standardPrice(record)
+  return [standard, effective].filter(Boolean).join('\n')
+}
+
+function standardPrice(record: BeichenModel) {
+  const terms = record.price_conditions
+  if (!terms || typeof terms !== 'object') return null
+  const fields = tokenPrices
+    .map(([key, label]) => [key, label, (terms as unknown as Record<string, unknown>)[key]] as const)
+    .filter(([, , value]) => value != null)
+  if (!fields.length) return null
+  return '官网标准价 · 每 Token · ' + fields.map(([, label, value]) => label + ' ' + conditionNumber(value)).join(' · ')
 }
 
 const tokenPrices = [
