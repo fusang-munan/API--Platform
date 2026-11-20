@@ -58,12 +58,12 @@ function chartNumber(value: string | null | undefined) {
   return Number.isFinite(number) ? number : null
 }
 
-function marginClass(value: string) {
+function marginClass(value: string | null) {
   const number = chartNumber(value)
   return number != null && number > 0 ? 'positive' : number != null && number < 0 ? 'negative' : ''
 }
 
-function margin(value: string) {
+function margin(value: string | null) {
   return `${(chartNumber(value) ?? 0) > 0 ? '+' : ''}${yuan(value)}`
 }
 

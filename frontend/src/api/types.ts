@@ -218,14 +218,15 @@ export type BeichenReconcileSide = {
   requests?: number
   billed_micros?: number | null
   estimated_micros?: number | null
+  source?: string | null
   sources?: string[]
 }
 export type BeichenReconcileMoney = {
   student_yuan: string
   base_yuan: string
-  actual_yuan: string
-  margin_yuan: string
-  margin_rate: string
+  actual_yuan: string | null
+  margin_yuan: string | null
+  margin_rate: string | null
 }
 export type BeichenReconcileCoverage = {
   days_expected: number
@@ -242,8 +243,8 @@ export type BeichenReconcileModel = {
   upstream: BeichenReconcileSide
   student_yuan: string
   base_yuan: string
-  actual_yuan: string
-  margin_yuan: string
+  actual_yuan: string | null
+  margin_yuan: string | null
   local_share: string
   upstream_share: string
 }
@@ -254,8 +255,8 @@ export type BeichenReconcileKey = {
   upstream: BeichenReconcileSide
   student_yuan: string
   base_yuan: string
-  actual_yuan: string
-  margin_yuan: string
+  actual_yuan: string | null
+  margin_yuan: string | null
 }
 export type BeichenReconcile = {
   range: BeichenUsageRange
