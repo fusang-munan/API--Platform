@@ -39,7 +39,7 @@ type activationBinding struct {
 }
 
 type activationPlan struct {
-	routes                    []PreferredRoute
+	routes, northRoutes       []PreferredRoute
 	writes                    []activationBinding
 	northReady, foreignActive bool
 }
@@ -204,6 +204,7 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 			plan.writes = append(plan.writes, activationBinding{route: r})
 			plan.routes = append(plan.routes, r)
 		}
+		plan.northRoutes = plan.routes
 		plan.northReady = len(plan.routes) > 0
 		return plan
 	}
@@ -247,6 +248,9 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 				rank = 2
 			}
 		}
+		if rank > 0 && r.ProviderID == m.provider {
+			plan.northRoutes = append(plan.northRoutes, r)
+		}
 		// Bindings arrive in gateway priority and ID order.
 		if existing, ok := choices[r.Adapter]; !ok || rank > existing.rank {
 			choices[r.Adapter] = choice{r, rank}
@@ -269,6 +273,7 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 				choices[adapter] = choice{r, 2}
 			}
 			plan.writes = append(plan.writes, activationBinding{route: r})
+			plan.northRoutes = append(plan.northRoutes, r)
 			plan.northReady = true
 		}
 	}
@@ -280,6 +285,104 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 
 func (p activationPlan) allowed(s *activationSchool) bool {
 	return p.northReady && (!p.foreignActive || s.multiplier != nil && *s.multiplier > 0)
+}
+
+type activationPrice int
+
+const (
+	activationPriceMissing activationPrice = iota
+	activationPriceFixed
+	activationPriceConditional
+
+	activationManualPriceMessage = "北辰线路缺少可自动结算的报价，请先手动定价"
+)
+
+// Check the North routes that can actually be used after publication,
+// including fallbacks hidden by a higher-priority route in the preview.
+func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx) (activationPrice, error) {
+	type routeKey struct {
+		credential uuid.UUID
+		model      string
+	}
+	seen := make(map[routeKey]bool)
+	readiness := activationPriceFixed
+	for _, route := range p.northRoutes {
+		key := routeKey{*route.CredentialID, route.UpstreamModel}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		var fixed bool
+		var terms []byte
+		if err := tx.QueryRowContext(ctx, activationPriceSQL, key.credential, key.model).Scan(&fixed, &terms); err != nil {
+			return activationPriceMissing, err
+		}
+		if !fixed {
+			if !activationTokenPriceReady(terms) {
+				return activationPriceMissing, nil
+			}
+			readiness = activationPriceConditional
+		}
+	}
+	return readiness, nil
+}
+
+// Both price_conditions_exact and price_conditions come from model_pricing.
+// Read that original JSON without converting any prices to floating point.
+const activationPriceSQL = `
+SELECT p.school_input IS NOT NULL AND p.school_output IS NOT NULL,
+  CASE WHEN snap.expires_at > statement_timestamp()
+       AND COALESCE(snap.credential_ciphertext_sha256 = sha256(c.credential_ciphertext), snap.credential_revision = c.updated_at)
+       THEN snap.model_pricing -> ($2::text) END
+FROM provider_credentials c
+CROSS JOIN LATERAL beichen_price_at(c.id,$2,statement_timestamp()) p
+LEFT JOIN LATERAL (
+  SELECT expires_at,credential_ciphertext_sha256,credential_revision,model_pricing
+  FROM beichen_panel_snapshots
+  WHERE credential_id=c.id AND effective_at<=statement_timestamp()
+  ORDER BY effective_at DESC LIMIT 1
+) snap ON true
+WHERE c.id=$1`
+
+type activationTokenRates struct {
+	Mode        string       `json:"billing_mode"`
+	Input       *json.Number `json:"input_price"`
+	Output      *json.Number `json:"output_price"`
+	PerRequest  *json.Number `json:"per_request_price"`
+	ImageInput  *json.Number `json:"image_input_price"`
+	ImageOutput *json.Number `json:"image_output_price"`
+	VideoInput  *json.Number `json:"video_input_price"`
+	VideoOutput *json.Number `json:"video_output_price"`
+}
+
+func (r activationTokenRates) tokenOnly() bool {
+	return (r.Mode == "" || r.Mode == "token") && r.PerRequest == nil &&
+		r.ImageInput == nil && r.ImageOutput == nil && r.VideoInput == nil && r.VideoOutput == nil
+}
+
+func (r activationTokenRates) hasTokenPrices() bool {
+	return r.Input != nil && r.Output != nil &&
+		!strings.HasPrefix(r.Input.String(), "-") && !strings.HasPrefix(r.Output.String(), "-")
+}
+
+func activationTokenPriceReady(terms json.RawMessage) bool {
+	var quote struct {
+		activationTokenRates
+		Intervals []activationTokenRates `json:"intervals"`
+	}
+	if json.Unmarshal(terms, &quote) != nil || quote.Mode != "token" || !quote.tokenOnly() {
+		return false
+	}
+	if len(quote.Intervals) == 0 {
+		return quote.hasTokenPrices()
+	}
+	// Settlement uses the selected tier's rates without inheriting base prices.
+	for _, tier := range quote.Intervals {
+		if !tier.tokenOnly() || !tier.hasTokenPrices() {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *activationModel) overview() CatalogModel {
@@ -316,6 +419,7 @@ func (m *activationModel) overview() CatalogModel {
 type BatchEnabledModel struct {
 	Model   string    `json:"model"`
 	ModelID uuid.UUID `json:"model_id"`
+	Message string    `json:"message,omitempty"`
 }
 
 type BatchSkippedModel struct {
@@ -355,11 +459,11 @@ func (s *Service) EnableModelsBatch(ctx context.Context, provider, actor uuid.UU
 		return result, domain.NewError(domain.CodeNotFound, "北辰供应商不存在")
 	}
 	for _, model := range unique {
-		var id uuid.UUID
+		var enabled BatchEnabledModel
 		var skipped *BatchSkippedModel
 		var err error
 		for attempt := 0; ; attempt++ {
-			id, skipped, err = s.enableBatchModel(ctx, provider, actor, model)
+			enabled, skipped, err = s.enableBatchModel(ctx, provider, actor, model)
 			if attempt >= 2 || !activationRetryable(err) {
 				break
 			}
@@ -378,24 +482,25 @@ func (s *Service) EnableModelsBatch(ctx context.Context, provider, actor uuid.UU
 		if skipped != nil {
 			result.Skipped = append(result.Skipped, *skipped)
 		} else {
-			result.Enabled = append(result.Enabled, BatchEnabledModel{Model: model, ModelID: id})
+			result.Enabled = append(result.Enabled, enabled)
 		}
 	}
 	return result, nil
 }
 
-func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUID, source string) (uuid.UUID, *BatchSkippedModel, error) {
+func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUID, source string) (BatchEnabledModel, *BatchSkippedModel, error) {
+	var enabled BatchEnabledModel
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
-		return uuid.Nil, nil, err
+		return enabled, nil, err
 	}
 	defer tx.Rollback()
-	skip := func(reason, message string) (uuid.UUID, *BatchSkippedModel, error) {
-		return uuid.Nil, &BatchSkippedModel{Model: source, Reason: reason, Message: message}, nil
+	skip := func(reason, message string) (BatchEnabledModel, *BatchSkippedModel, error) {
+		return enabled, &BatchSkippedModel{Model: source, Reason: reason, Message: message}, nil
 	}
 	models, err := loadActivationCatalog(ctx, tx, provider, source)
 	if err != nil {
-		return uuid.Nil, nil, err
+		return enabled, nil, err
 	}
 	if len(models) != 1 {
 		return skip("not_found", "当前北辰目录中没有此模型")
@@ -412,30 +517,25 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 	if !plan.allowed(target) {
 		return skip("route_not_ready", "当前北辰凭据、已配置的线路或其他供应商计价尚未就绪")
 	}
-	seen := make(map[string]bool)
-	for _, route := range plan.routes {
-		if route.ProviderID != provider || route.CredentialID == nil {
-			continue
-		}
-		key := route.CredentialID.String() + ":" + route.UpstreamModel
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		var priced bool
-		if err := tx.QueryRowContext(ctx, `SELECT school_input IS NOT NULL FROM beichen_price_at($1,$2,statement_timestamp())`,
-			*route.CredentialID, route.UpstreamModel).Scan(&priced); err != nil {
-			return uuid.Nil, nil, err
-		}
-		if !priced {
-			return skip("no_price", "官网未报价或按条件计价，请先手动定价")
-		}
+	price, err := plan.priceReadiness(ctx, tx)
+	if err != nil {
+		return enabled, nil, err
+	}
+	if price == activationPriceMissing {
+		return skip("no_price", activationManualPriceMessage)
 	}
 	id, err := applyActivationPlan(ctx, tx, provider, actor, target, plan)
 	if err == nil {
 		err = tx.Commit()
 	}
-	return id, nil, err
+	if err != nil {
+		return enabled, nil, err
+	}
+	enabled = BatchEnabledModel{Model: source, ModelID: id}
+	if price == activationPriceConditional {
+		enabled.Message = "按条件价自动结算"
+	}
+	return enabled, nil, nil
 }
 
 func activationRetryable(err error) bool {
@@ -477,6 +577,16 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 	plan := m.plan(target)
 	if !plan.allowed(target) {
 		return uuid.Nil, invalid("当前北辰凭据、已配置的路线或其他供应商计价不支持直接启用")
+	}
+	if target.status == "active" && len(plan.writes) == 0 && target.multiplier != nil && *target.multiplier > 0 {
+		return target.id, nil
+	}
+	price, err := plan.priceReadiness(ctx, tx)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if price == activationPriceMissing {
+		return uuid.Nil, invalid(activationManualPriceMessage)
 	}
 	id, err := applyActivationPlan(ctx, tx, provider, actor, target, plan)
 	if err == nil {

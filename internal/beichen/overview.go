@@ -500,6 +500,10 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 			}
 			record := records[strings.ToLower(strings.TrimSpace(r.UpstreamModel))][*r.CredentialID]
 			state := record.catalogPriceState()
+			// 纯 Token 的分档条件价可以直接启用；结算时由价格评估器按实际用量选档。
+			if state == "conditional" && record != nil && activationTokenPriceReady(record.PriceConditions) {
+				continue
+			}
 			if record == nil || record.Model != r.UpstreamModel {
 				// Existing bindings can keep a different spelling from the
 				// directory. Batch enable looks up the exact binding name.
