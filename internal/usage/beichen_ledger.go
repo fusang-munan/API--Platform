@@ -189,7 +189,7 @@ const beichenBaseSourceSQL = `coalesce(c.beichen_base_source,c.pricing_detail->>
 
 func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics) error {
 	var school, upstream, effort sql.NullString
-	var mode, protocol, ttl, missingRate string
+	var mode, protocol, ttl, missingRate, upstreamSource string
 	var terms []byte
 	var quoteVersion sql.NullInt64
 	var quoteMultiplier sql.NullString
@@ -197,7 +197,7 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 	var charge beichenCharge
 	// 0042 的跟随费率仍是上游余额单位；仅手动费率已换成积分，须除以 100，避免多扣。
 	err := tx.QueryRowContext(ctx, `SELECT cost.school::text,cost.upstream::text,
-		p.mode,p.upstream_version,p.multiplier_version,
+		p.mode,p.upstream_version,p.multiplier_version,COALESCE(version.source,''),
 		num_nonnulls(p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)=0,
 		c.protocol,c.reasoning_effort,COALESCE(c.cache_ttl,''),
 		quote.terms,quote.multiplier_version,quote.multiplier::text,
@@ -207,6 +207,7 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 		  ELSE 'missing_price_or_token_breakdown' END
 		FROM gateway_calls c
 		CROSS JOIN LATERAL beichen_price_at(c.beichen_dispatch_credential_id,c.beichen_dispatch_model,c.beichen_price_at) p
+		LEFT JOIN beichen_price_versions version ON version.id=p.upstream_version
 		CROSS JOIN LATERAL (SELECT
 			beichen_token_credits(c.protocol,$2,$3,$4,$5,$6,
 				p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)
@@ -218,7 +219,7 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 		  AND c.beichen_price_at IS NOT NULL
 		FOR UPDATE OF c`, callID, metrics.PromptTokens, metrics.CompletionTokens,
 		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens).Scan(
-		&school, &upstream, &mode, &charge.upstreamVersion, &charge.multiplierVersion, &noFixedSchool,
+		&school, &upstream, &mode, &charge.upstreamVersion, &charge.multiplierVersion, &upstreamSource, &noFixedSchool,
 		&protocol, &effort, &ttl, &terms, &quoteVersion, &quoteMultiplier, &missingRate)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
@@ -227,7 +228,11 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 		return err
 	}
 	charge.source = "gateway_usage_price"
-	if mode == "manual" {
+	if mode == "manual" && school.Valid {
+		charge.source = "teacher_manual_price"
+	} else if upstreamSource == "derived_from_usage" {
+		charge.source = upstreamSource
+	} else if mode == "manual" {
 		charge.source = "teacher_manual_price"
 	}
 	base := school

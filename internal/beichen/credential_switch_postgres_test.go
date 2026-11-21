@@ -3,7 +3,6 @@ package beichen
 import (
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -36,7 +35,7 @@ func TestCredentialSwitchLifecyclePostgres(t *testing.T) {
 	exec("UPDATE provider_credentials SET credential_ciphertext=$2 WHERE id=$1", original, seal("sk-old-test-channel"))
 	exec(`INSERT INTO beichen_datasets(credential_id,kind,next_attempt)
 SELECT c.id,k.kind,now()+interval '1 hour' FROM provider_credentials c
-CROSS JOIN (VALUES ('billing'),('usage')) k(kind) WHERE c.id IN ($1,$2)`, original, other)
+CROSS JOIN (VALUES ('billing'),('usage'),('key_usage')) k(kind) WHERE c.id IN ($1,$2)`, original, other)
 
 	const fable = "claude-fable-5"
 	models := []string{fable, "no-quote", "wrong-protocol", "missing-model", "fallback"}
@@ -62,26 +61,35 @@ VALUES(gen_random_uuid(),$1,$2,$3,'fallback','anthropic',20,now(),now())`, model
 
 	const fakeKey = "sk-test-switch-only"
 	service := New(db, manager)
+	const bearer = "fixture-switch-session"
+	if err := service.ConfigureWebSessionTokens("switch@example.test", bearer, "fixture-switch-refresh", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	directory := websiteGroupFixture(7, "1.25", `
+	  {"name":"claude-fable-5","supported_protocols":["anthropic"],
+	   "pricing":{"input_price":0.0000000001,"output_price":0.0000000005,"cache_read_price":0,"cache_write_price":0}},
+	  {"name":"no-quote","supported_protocols":["anthropic"],"pricing":null},
+	  {"name":"wrong-protocol","supported_protocols":["openai_responses"],"pricing":{"input_price":0.0000000001,"output_price":0.0000000005}}`)
 	var requestLock sync.Mutex
 	requests := map[string]int{}
 	service.client.Transport = transportFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Host != "api.beichenapi.com" || r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer "+fakeKey {
-			return nil, errors.New("mock accepts only the replacement Key")
+		if r.URL.Host != publicKeyHost || r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer "+bearer {
+			return nil, errors.New("mock only accepts the authenticated website")
 		}
 		requestLock.Lock()
-		requests[r.URL.Path]++
+		requests[r.URL.Host+r.URL.Path]++
 		requestLock.Unlock()
 		var body string
 		switch r.URL.Path {
-		case modelsPath:
-			body = `{"data":[{"id":"claude-fable-5","supported_protocols":["anthropic"]},
-{"id":"no-quote","supported_protocols":["anthropic"]},{"id":"wrong-protocol","supported_protocols":["openai_responses"]}]}`
-		case billingPath:
-			body = `{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token","effective_rate_multiplier":1.25,
-"pricing":{"basis":"base","unit":"usd_micros_per_million_tokens",
-"models":[{"model":"claude-fable-5","input":100,"output":500,"cache_read":0,"cache_write":0}]}}`
-		case usagePath:
-			body = fmt.Sprintf(`{"mode":"unrestricted","date":%q,"timezone":"Asia/Shanghai","model_stats":[]}`, r.URL.Query().Get("start_date"))
+		case "/api/v1/keys":
+			body = websiteKeyListFixture(fakeKey, "Claude 新 Key", 41, 7)
+		case "/api/v1/channels/available":
+			body = directory
+		case "/api/v1/usage":
+			if r.URL.Query().Get("api_key_id") != "41" {
+				return nil, errors.New("usage request used an unexpected Key")
+			}
+			body = emptyWebsiteUsageFixture
 		default:
 			return nil, errors.New("unexpected mock request")
 		}
@@ -146,20 +154,22 @@ VALUES(gen_random_uuid(),$1,$2,$3,'fallback','anthropic',20,now(),now())`, model
 	}
 	assertRoute(false)
 	jobs, err := service.listJobs(ctx, nil)
-	if err != nil || len(jobs) != 2 || jobs[0].credential != to.ID || jobs[1].credential != to.ID {
+	if err != nil || len(jobs) != 2 || jobs[0].credential != to.ID || jobs[0].kind != "billing" ||
+		jobs[1].credential != to.ID || jobs[1].kind != "key_usage" {
 		t.Fatalf("后台应只排队接替 Key: %+v (%v)", jobs, err)
 	}
 	if err := service.syncJobs(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
-	if requests[modelsPath] != 1 || requests[billingPath] != 1 || requests[usagePath] != 3 {
+	if requests[publicKeyHost+"/api/v1/keys"] != 2 || requests[publicKeyHost+"/api/v1/channels/available"] != 2 ||
+		requests[publicKeyHost+"/api/v1/usage"] != 2 {
 		t.Fatalf("同步缺少目录、计费或日用量: %v", requests)
 	}
 	var multiplier, usageDays int
 	if err := db.QueryRowContext(ctx, `SELECT
 (SELECT count(*) FROM beichen_multiplier_versions WHERE credential_id=$1 AND multiplier=1.25),
-(SELECT count(*) FROM beichen_usage_days WHERE credential_id=$1)`, to.ID).Scan(&multiplier, &usageDays); err != nil ||
-		multiplier != 1 || usageDays != 3 {
+(SELECT count(*) FROM beichen_key_usage_days WHERE credential_id=$1 AND website_key_id=41)`, to.ID).Scan(&multiplier, &usageDays); err != nil ||
+		multiplier != 1 || usageDays != 2 {
 		t.Fatalf("倍率和用量未写入接替 Key: %d, %d (%v)", multiplier, usageDays, err)
 	}
 	preview := read().Preview
@@ -178,19 +188,19 @@ VALUES(gen_random_uuid(),$1,$2,$3,'fallback','anthropic',20,now(),now())`, model
 	// A delayed response from before retirement must not clear the scheduler
 	// entry created when the same Key is activated again.
 	lease := uuid.New()
-	exec("UPDATE beichen_datasets SET lease_id=$2,lease_until=now()+interval '1 minute' WHERE credential_id=$1 AND kind='usage'", to.ID, lease)
+	exec("UPDATE beichen_datasets SET lease_id=$2,lease_until=now()+interval '1 minute' WHERE credential_id=$1 AND kind='key_usage'", to.ID, lease)
 	for _, status := range []*string{&inactive, &active} {
 		if _, err := service.SaveCredential(ctx, provider, to.ID, CredentialEdit{Status: status}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := service.finishJob(ctx, syncJob{provider, to.ID, "usage"}, lease, credentialRecord{updatedAt: to.UpdatedAt},
+	if err := service.finishJob(ctx, syncJob{provider: provider, credential: to.ID, kind: "key_usage"}, lease, credentialRecord{updatedAt: to.UpdatedAt},
 		fetchResult{err: errors.New("obsolete use response")}, false); err == nil {
 		t.Fatal("接受了旧版本的同步结果")
 	}
 	var stillQueued bool
 	if err := db.QueryRowContext(ctx, `SELECT last_error IS NULL AND lease_id IS NULL AND next_attempt='-infinity'
-FROM beichen_datasets WHERE credential_id=$1 AND kind='usage'`, to.ID).Scan(&stillQueued); err != nil || !stillQueued {
+FROM beichen_datasets WHERE credential_id=$1 AND kind='key_usage'`, to.ID).Scan(&stillQueued); err != nil || !stillQueued {
 		t.Fatalf("旧任务覆盖了新任务: %v", err)
 	}
 	if err := service.SyncCredential(ctx, provider, to.ID); err != nil {

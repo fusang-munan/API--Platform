@@ -43,12 +43,12 @@ bash scripts/compose-local.sh logs --no-color --tail=300 backend | grep 'mainten
 
 同一教师登录已核实的学校 HTTPS 站点后，在「供应商管理 → 北辰 → 查看模型」打开工作区。只指定教师时，页面显示应用地址待配置。进入工作区时由该应用独立验证用户。入口只是导航，后台获取网页数据还需要已接通的数据读取方式，可通过价格和逐笔归档成功时间核验。
 
-### 随 GitHub 更新交付北辰配置
+### 北辰渠道配置和教师网页登录
 
 1. 学校按现有流程更新至 0.14.0 后，在已核实的学校 HTTPS 入口读取 `/.well-known/nebula-beichen-recipient`。该入口只返回收件公钥和算法。学校持久卷内的收件私钥与 HTTPS 身份各自保存。 首次取得证书时，可在浏览器的学校 HTTPS 证书详情中导出单张 DER 格式的服务器证书，用 `Get-FileHash -Algorithm SHA256 <证书路径>` 计算指纹，与校方通过独立渠道确认的 SHA-256 逐字核对。
 2. 在管理电脑的仓库目录运行 `scripts/seal-beichen.ps1 -Certificate <校方已核实的证书路径>`。工具先核对学校证书和公钥，再在本机读取四把推理 Key，写出 `internal/infrastructure/schoolseal/school-config.sealed.json`。
-3. 维护者本人在同一台管理电脑运行 `scripts/capture-beichen-session.ps1 -Certificate <校方已核实的证书路径>`。程序启动一个使用临时配置目录的独立 Edge 窗口并打开北辰登录页；维护者亲自完成账号登录和 Turnstile 人机验证。登录成功后，程序从页面自己的本地存储读取访问令牌、续期令牌和到期时间，只将令牌写入加密文件 `internal/infrastructure/schoolseal/school-session.sealed.json`，不保留密码。明文令牌不出现在屏幕、日志或 Git 中。
-4. 将两份密文随原来的 GitHub 发布交付。校内后台自行解密，优先使用导入的访问令牌；接近到期时用续期令牌换新。只有续期失败或北辰再次要求人工验证时，才需要重新执行第 3 步。如服务器更换了收件密钥，可用校方确认的 HTTPS 入口取回新公钥，重新加密发布。
+3. 渠道密文按学校现有的 GitHub 更新流程交付。服务器更换收件密钥时，可用校方确认的 HTTPS 入口取回新公钥，重新加密渠道配置。
+4. 教师在学校可信 HTTPS 入口进入「供应商管理 → 北辰 → 网页登录」，保存北辰网页会话，再点「测试抓取」查看平台、模型和失败项。会话加密持久保存在学校，由后台抓取与续期使用。
 
 ### 通过学校正式邮件确认指纹
 

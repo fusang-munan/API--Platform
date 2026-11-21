@@ -124,7 +124,9 @@ export type BeichenModel = {
   mode: BeichenPriceUpdate['mode']
   school_status?: BeichenSchoolStatus | null
   route_ready?: boolean | null
-  price_status?: 'confirmed' | 'conditional' | 'not_listed' | 'pending' | 'pending_confirmation' | null
+  price_status?: 'confirmed' | 'conditional' | 'derived' | 'not_listed' | 'pending' | 'pending_confirmation' | null
+  price_source?: string
+  price_observed_at?: string | null
   price_conditions?: BeichenPriceConditions | null
   price_conditions_exact?: BeichenPriceConditions | null
   upstream_rates?: BeichenDisplayRates | null
@@ -161,12 +163,24 @@ export type BeichenCrawlRun = {
   model_count: number
   expected_model_count: number
   failures: Array<{ channel_id?: number; channel?: string; platform?: string; path: string; reason: string }>
+  key_model_comparisons?: Array<{
+    channel: string
+    group_id: number | null
+    state: 'checked' | 'unverified' | 'unavailable'
+    error?: string
+    matched: Array<{ key_model: string; channel_model: string; match: 'exact' | 'normalized'; price_complete: boolean }>
+    only_key: string[]
+    only_channel: string[]
+  }>
+  key_model_error?: string
+  account_rate_error?: string
 }
 export type BeichenOverview = {
   web_login_required?: boolean | null
   website_sync?: BeichenWebsiteSync | null
   website_directory?: {
     state: 'fresh' | 'stale' | 'unverified'
+    price_unit?: string
     last_success: string | null
     last_error: string | null
     last_run?: BeichenCrawlRun | null
@@ -174,6 +188,7 @@ export type BeichenOverview = {
   maintenance_workspace?: { launch_url?: string | null } | null
   model_catalog?: BeichenCatalogModel[] | null
   credentials?: BeichenCredentialSummary[] | null
+  key_capabilities?: BeichenKeyCapability[]
   catalog_differences?: BeichenCatalogDifference[] | null
   website_only_models?: BeichenWebsiteOnlyModel[]
   website_only_status?: 'compared' | 'stale' | 'unverified'
@@ -189,6 +204,49 @@ export type BeichenCredentialSummary = {
   status?: ResourceStatus
   health?: Record<'credential' | 'catalog' | 'pricing' | 'probe', BeichenHealthDimension> & { available_dimensions: number }
 }
+export type BeichenKeyUsageMetric = {
+  date?: string
+  model?: string
+  requests: number | null
+  input_tokens: number | null
+  output_tokens: number | null
+  cache_read_tokens: number | null
+  cache_write_tokens: number | null
+  total_tokens: number | null
+  cost: string | null
+  actual_cost: string | null
+  account_cost: string | null
+  observed_multiplier: string | null
+  multiplier_diff: boolean
+}
+// 数据口径：后端当前提供的是 /v1/usage 账号级参考。
+// 分组数据接口（M）就绪后，再补充分组事实字段并替换页面上的账号级标记。
+export type BeichenKeyCapability = {
+  credential_id: string
+  label: string
+  website_key_id?: number | null
+  website_group?: BeichenWebsiteGroup | null
+  models: string[]
+  has_claude: boolean | null
+  models_state: 'fresh' | 'stale' | 'failed' | 'pending'
+  models_fetched_at: string | null
+  models_error: string | null
+  usage_state: BeichenKeyCapability['models_state']
+  usage_fetched_at: string | null
+  usage_error: string | null
+  balance: string | null
+  unit: string | null
+  day_unit: string | null
+  day_fetched_at: string | null
+  daily_usage: BeichenKeyUsageMetric | null
+  model_stats: BeichenKeyUsageMetric[]
+  model_stats_day: string | null
+  model_stats_fetched_at: string | null
+  stored_multiplier: string | null
+  target_multiplier: string | null
+  expect_claude: boolean
+  group_check: 'old_group' | 'mismatch' | 'target_observed' | 'pending'
+}
 export type BeichenCatalogDifference = {
   credential_id: string
   label: string
@@ -202,13 +260,21 @@ export type BeichenWebsiteOnlyModel = {
   model: string
   channels: Array<{ credential_id: string; label: string }>
 }
+export type BeichenWebsiteGroup = {
+  id?: number
+  name?: string
+  status?: string
+  rate_multiplier?: number | string
+  account_rate_multiplier?: number | string
+  peak_rate_multiplier?: number | string
+  peak_rate_enabled?: boolean
+}
 export type BeichenWebsiteLocation = {
   name: string
   channel_id?: number
   channel?: string
   platform?: string
-  groups: Array<{ id?: number; name?: string; status?: string; rate_multiplier?: number | string
-    peak_rate_multiplier?: number | string; peak_rate_enabled?: boolean }>
+  groups: BeichenWebsiteGroup[]
   observed_at: string
   has_price: boolean
   price_conditions_exact?: BeichenPriceConditions
@@ -255,6 +321,53 @@ export type BeichenProbeRun = {
   finished_at: string | null
   error_code: string | null
 }
+export type BeichenAccountStatus = 'active' | 'expired' | 'error' | 'none'
+export type BeichenWebsiteKey = {
+  id: number
+  name: string
+  key_prefix: string | null
+  group_id: number | null
+  group_name: string | null
+  rate: string | null
+  status: 'active' | 'inactive' | 'disabled' | 'expired' | 'quota_exhausted' | 'unknown'
+  enabled: boolean | null
+  created_at: string | null
+  last_seen: string | null
+  credential_id: string | null
+  match_status: 'matched' | 'unmatched' | 'ambiguous'
+}
+export type BeichenWebsiteKeyInventory = {
+  status: 'unsynced' | 'current' | 'stale' | 'session_expired' | 'unavailable'
+  last_seen: string | null
+  keys: BeichenWebsiteKey[]
+}
+export type BeichenCrawlFailure = {
+  channel_id?: number
+  channel?: string
+  platform?: string
+  path?: string
+  reason: string
+}
+export type BeichenCrawlSummary = {
+  last_run_at: string | null
+  platforms: number | string[] | null
+  models: number | string[] | null
+  failures: number | BeichenCrawlFailure[] | null
+  failure_details?: BeichenCrawlFailure[]
+}
+export type BeichenAccount = {
+  configured: boolean
+  mode: 'password' | 'token'
+  email: string
+  status: BeichenAccountStatus
+  expires_at: string | null
+  last_verified_at: string | null
+  last_error: string | null
+  crawl: BeichenCrawlSummary
+}
+export type BeichenAccountLogin =
+  | { mode: 'password'; email: string; password: string }
+  | { mode: 'token'; token: string }
 export type BeichenProbeResult = {
   provider_id: string
   credential_id: string
@@ -348,6 +461,11 @@ export type BeichenReconcileSide = {
   billed_micros?: number | null
   estimated_micros?: number | null
   source?: string | null
+  actual_cost?: string | null
+  unit?: string | null
+  mixed_units?: boolean
+  amounts_by_unit?: Array<{ unit: string | null; actual_cost: string | null }> | null
+  stale?: boolean
   sources?: string[]
 }
 export type BeichenReconcileMoney = {
@@ -361,6 +479,9 @@ export type BeichenReconcileCoverage = {
   days_expected: number
   days_present: number
   missing_days: string[]
+  key_usage_days?: number
+  key_usage_model_days?: number
+  stale_key_usage_days?: number
   pending_calls: number
   unpriced_calls: number
   multiplier_mixed: boolean
@@ -430,7 +551,7 @@ export type BeichenCatalogModel = {
   website_locations?: BeichenWebsiteLocation[]
   route_count?: number | null
   ready_count?: number | null
-  price_state?: 'confirmed' | 'conditional' | 'manual' | 'missing' | 'mixed' | null
+  price_state?: 'confirmed' | 'conditional' | 'derived' | 'manual' | 'missing' | 'mixed' | null
   price_covered?: boolean
   price_blocker?: { code: string; message: string } | null
   blockers?: Array<{ code: string; message: string }> | null

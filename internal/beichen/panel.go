@@ -76,6 +76,7 @@ type panelQuote struct {
 	expiresAt         time.Time
 	err               error
 	verificationError error
+	verifiedKeyModels bool
 }
 
 var errPanelLoginRequired = errors.New("北辰渠道页要求登录")
@@ -88,6 +89,12 @@ func (s *Service) fetchChannelQuote(ctx context.Context, access priceAccess, key
 	group := billingPanelGroup(info)
 	if access.disabled {
 		return panelQuote{groupID: group, err: errors.New("北辰面板采价已停用")}
+	}
+	if quote, handled := s.managedChannelQuote(ctx, access, key, group, info, entries); handled {
+		return quote
+	}
+	if err := s.checkLegacyPriceAccount(access); err != nil {
+		return panelQuote{groupID: group, err: err}
 	}
 	webConfigured := s.WebSessionConfigured()
 	// The school's channels use the saved account every round. Legacy bindings
@@ -232,6 +239,7 @@ func (s *Service) fetchPanelBody(ctx context.Context, token string) ([]byte, err
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-User-UI-Request", "1")
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Cache-Control", "no-cache")
@@ -313,6 +321,7 @@ func panelExpiry(info billingInfo, now time.Time) (time.Time, error) {
 
 type panelGroup struct {
 	ID               int64       `json:"id"`
+	Name             string      `json:"name"`
 	Platform         string      `json:"platform"`
 	SubscriptionType string      `json:"subscription_type"`
 	Status           string      `json:"status"`
@@ -648,13 +657,24 @@ func saveBillingObservation(ctx context.Context, tx *sql.Tx, credentialID uuid.U
 	} else if err := saveMultiplier(ctx, tx, credentialID, info, effectiveAt); err != nil {
 		return err
 	}
+	var derived []derivedPriceRow
+	if billingErr == nil && group > 0 && (quote.err == nil || errors.Is(quote.err, errPanelEmpty)) {
+		derived, err = readDerivedPrices(ctx, tx, credentialID, group, effectiveAt, quote.terms)
+		if err != nil {
+			return err
+		}
+		if len(derived) > 0 && errors.Is(quote.err, errPanelEmpty) {
+			quote.err = nil
+		}
+	}
 	if quote.err == nil && (effectiveAt.Before(info.ObservedAt) || !quote.expiresAt.After(effectiveAt)) {
 		quote.err = errors.New("北辰报价已过期或同步期间跨越高峰边界")
 	}
 	if quote.err != nil {
 		// A failed read retains the last quote only while this round can still
 		// verify its group and the complete multiplier rule.
-		if billingErr != nil || errors.Is(quote.err, errPanelGroupNotFound) || errors.Is(quote.err, errPanelRulesConflict) {
+		if billingErr != nil || errors.Is(quote.err, errPanelGroupNotFound) || errors.Is(quote.err, errPanelRulesConflict) ||
+			(quote.verifiedKeyModels && errors.Is(quote.err, errPanelEmpty)) {
 			group = 0
 		}
 		if err := invalidateChangedPanelQuote(ctx, tx, credentialID, revision, effectiveAt, group, true); err != nil {
@@ -685,10 +705,19 @@ ORDER BY m.effective_at DESC, m.id DESC LIMIT 1`, credentialID, effectiveAt, rev
 	}
 	for _, row := range quote.rows {
 		_, err := tx.ExecContext(ctx, `
-INSERT INTO beichen_price_versions (credential_id, model, track, basis, source, input_rate, output_rate, cache_read_rate, cache_write_rate, effective_at)
-VALUES ($1, $2, 'upstream', 'base', 'panel', $3, $4, $5, $6, $7)`,
-			credentialID, row.Model, row.Rates.Input, row.Rates.Output, row.Rates.CacheRead, row.Rates.CacheWrite, effectiveAt)
+INSERT INTO beichen_price_versions (credential_id, model, track, basis, source, input_rate, output_rate, cache_read_rate, cache_write_rate, effective_at, group_id)
+VALUES ($1, $2, 'upstream', 'base', 'panel', $3, $4, $5, $6, $7, $8)`,
+			credentialID, row.Model, row.Rates.Input, row.Rates.Output, row.Rates.CacheRead, row.Rates.CacheWrite, effectiveAt, group)
 		if err != nil {
+			return err
+		}
+	}
+	for _, row := range derived {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO beichen_price_versions (credential_id, model, track, basis, source, input_rate, output_rate,
+  cache_read_rate, cache_write_rate, effective_at, group_id, observed_at)
+VALUES ($1,$2,'upstream','base','derived_from_usage',$3,$4,$5,$6,$7,$8,$9)`,
+			credentialID, row.Model, row.Input, row.Output, row.CacheRead, row.CacheWrite, effectiveAt, group, row.observedAt); err != nil {
 			return err
 		}
 	}

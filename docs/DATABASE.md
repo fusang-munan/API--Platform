@@ -341,7 +341,7 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 迁移 0030 增加北辰同步状态、不可变的上游报价和倍率版本、校内手动价版本以及按凭据、模型和北京时间日期保存的北辰账单。试算按调用时刻选择对应的有效版本，日汇总按明示的缓存口径计算；数据缺失的比较项保持为空。同步任务的租约防止多实例重复拉取。
 
-迁移 0031 在已有北辰账单上增加逐笔明细来源 `export`。凭据标签与有无已确认日账的检测在同一个凭据锁事务内执行。入库只保存按日、凭据和模型汇总的用量、实付金额及操作人。自动确认整日时清理同日旧的 `usage` 和 `export` 记录，手工汇总 `csv` 优先保留。
+迁移 0031 在已有北辰账单上增加逐笔明细来源 `export`。凭据标签与有无已确认官网 Key 快照的检查在同一个凭据锁事务内执行。入库只保存按日、凭据和模型汇总的用量、实付金额及操作人。官网同步保留原有导入记录，手工汇总 `csv` 优先于同一模型的逐笔导入。
 
 迁移 0032 在 `gateway_calls` 记录北辰发件凭据、上游模型、发件时间、报价版本、倍率版本、核账原因和精确积分 `beichen_credit_exact`。状态 `beichen_state` 分为已预留 `reserved`、待核账 `pending_review`、已扣 `charged` 和已释放 `released`。只有已扣行有精确积分，待核账行的精确积分为空。最终结算锁定调用行，在同一事务释放预留并更新项目、成员、Key 月桶、用量汇总和对话轮次。已结算回执可安全重放。月桶、汇总和轮次中的 `charged_milli_remainder` 保存不足千分之一积分的余数，以 PostgreSQL `numeric` 精确累计。北辰待核和已扣记录保留供查账。用量在返回后确定，一次高用量调用的最终费用可能超出发出时的剩余额度。
 
@@ -363,7 +363,7 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 北辰报价快照中的空或省略 `billing_mode` 默认按 Token 处理。已明确以 Token 为主的报价可包含按次、图像和视频字段。原始 `model_pricing` 保留官网值。按报价扣分时在 `gateway_calls.pricing_detail.ignored_non_token_fields` 记录值非 `null` 的已忽略字段名，包括零值和空字符串。分档用 `intervals[0].image_output_price` 这样的路径表示。主计费模式未声明且存在非零附带费用时，须有明确的 Token 档位或有效的输入、输出价，其中至少一个价格大于零。
 
-每档独立提供输入和输出单价。空白单价按缺项处理，Token 单价为零时仍是有效报价。缺价档会阻止启用，已发出的调用可按命中的完整档结算。调用落在档位空档或缺少本次使用的缓存单价、推理强度倍率时进入待核账。
+仅含绝对单价的旧档位独立提供输入和输出单价。空白单价按缺项处理，Token 单价为零时仍是有效报价。带倍率的官网档位沿用符合条件的基础价，显式档位价优先，倍率用精确十进制计算。官网档位范围为 `(min_tokens, max_tokens]`，计价时转换为整数下限包含、上限不包含的范围。未命中倍率档时用基础价。绝对单价档有缺项或空档，以及缺少实际使用的缓存价或推理强度倍率时，结算进入待核账。
 
 迁移 0045 给 `provider_model_catalog` 添加非空 `supported_protocols text[]`。目录同步写入适配器枚举，保留同一 Key 版本最近探活确认的协议。已有空数组按目录记录推断，下一次目录写入或成功探活时落库。`upstream_probes` 按供应商、凭据、模型和协议存最新结果，记录 HTTP 状态、受限错误代码、耗时、时间和输出 Token 限制。入库时复核 Key 版本和目录归属，成功结果与协议确认在同一事务保存。概览和最近结果接口只使用当前 Key 版本及目录的证据。
 
@@ -373,9 +373,37 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 `0050_beichen_crawl_runs.sql` 新增 `beichen_crawl_runs`，按 `provider_id` 只保留每个供应商最近一次后台抓取的摘要，外键随供应商删除。`started_at` 记录发起时间，`duration_ms` 记录读取与解析耗时，`platform_count`、`group_count`、`model_count` 记录本轮读到的数据，`expected_model_count` 记录原响应中可辨认的去重型号数。`failures` 是 JSONB 数组，包含渠道、能辨认的平台、字段位置和错误原因。结果在同一条数据库语句中随快照及退避状态更新，只有持有有效抓取租约的任务可以写入。部分结果的计数基于合并旧快照之前的本轮响应。
 
+`0053_beichen_panel_accounts.sql` 以 `provider_id` 为主键记录北辰网页登录配置。邮箱、密码、访问 Token 和含 Cookie 名的续期凭证分别加密为 `bytea`，密文与供应商 ID、字段名绑定。`mode` 为 `password` 或 `token`，`status` 为 `none`、`active`、`expired` 或 `error`。
+
+`created_by` 指向最近一次提交或清除凭证的教师，`updated_at` 记录最近一次状态写入。`last_verified_at` 记录最近一次成功验证时间，`expires_at` 保存已知的访问 Token 到期时间。连续失败次数和中文原因分别保存到 `failure_count` 与 `last_error`。验证或续期成功会清空失败状态。清除保留状态为 `none` 的空凭证记录，防止后台重新使用启动时配置的凭证。
+
+同一供应商的登录、续期和清除在同一数据库内按事务锁串行执行。并发请求用访问 Token 的密文版本标识所用会话，迟到的认证失败不会覆盖已经续期或替换的新会话。教师手动抓取与定时抓取共用 `beichen_website_directories` 的租约和 `beichen_crawl_runs` 的最近结果。
+
+旧的学校本机授权由服务器随机生成。数据库仅保存 `local_grant_hash`、`local_granted_by` 和 `local_granted_at`。每个供应商保留一份授权，替换或清除网页登录配置会删除它。访问 Token 自动续期时保留授权。本机窗口保存的会话以系统用户目录下的加密文件持久化，由本机爬虫读取。
+
+迁移 `0055_beichen_website_keys.sql` 中的 `beichen_website_key_sync` 按供应商保存最近成功时间、同步状态和租约。`beichen_website_keys` 按供应商和北辰 Key ID 保存名称、最多 10 字符的前缀、官网分组 ID 和名称、精确分组倍率、上游状态及创建时间。唯一匹配的行关联 `provider_credentials.id` 和学校凭据密文的 SHA-256 摘要。密文轮换后，旧的匹配在读取时失效。同一事务替换完整清单、更新同步时间并写入变化的分组倍率版本。401、超时和分页不完整时只更新失败状态。
+
+迁移 `0056_beichen_website_key_rate_versions.sql` 新增官网 Key 倍率历史。`beichen_website_key_rate_versions` 的索引按供应商、北辰 Key ID 和版本序号倒序定位最新版本。分组 ID、名称、十进制倍率、高峰开关、倍率或时段有变化时，在刷新清单的同一事务内追加 `observed_at` 与 `changed=true`。首次观察的 `changed` 为 `false`。即使学校凭据尚未匹配、Key 从当前清单消失，已记录的官网倍率历史也能按原 Key ID 查阅。升级后首次成功同步会建立基线，已有当前清单在此之前仍可读取。
+
+官网 Key 清单确认分组或基础倍率变动后，在 `beichen_multiplier_versions` 写入新的 `group_id`、`group_rate` 和 `observed_at`，并结束先前仍有效的报价和在途旧采价任务。基础倍率观察项的 `stale_at` 等于 `effective_at`。最新分组的网页报价和生效规则核对后，采价任务会写入可用于结算的版本。未知分组或停用 Key 的旧价失效。
+
 迁移 `0051_beichen_billing_observations.sql` 在 `beichen_multiplier_versions` 保存当前 Key 的 `group_id`、`group_rate`、高峰开关、倍率及起止时间。版本的 `observed_at` 是首次采样时间，旧格式缺采样时间时记录本地读取时刻。迁移前的版本保留原生效时间，新增字段可为空。同步在核对 Key 版本及租约后，以数据库时刻作为新版本的 `effective_at`。相同计费规则重复读取只推进 `beichen_datasets.last_success`。分组或任一倍率规则变化时，报价快照与同一轮倍率版本关联。
 
 Key 账单读取失败时在最近版本写一次 `stale_at`，并结束仍有效的官网报价快照。倍率值、采样时间与上次成功时间保留。计价使用派发时刻查版本，在该时刻已经陈旧的倍率无法用于跟随价。确认 Key 分组后，跟随价使用该分组的有效报价。成功恢复时重新开立版本，即使数值相同。原有版本的用量仍按此前的派发时刻查询。
+
+迁移 `0052_beichen_key_usage.sql` 添加 `key_usage` 同步任务。迁移 `0054_beichen_key_website_evidence.sql` 增加 `website_key_id` 和 `website_group`。`beichen_key_observations` 以渠道凭据 ID 和密文摘要识别同一把 Key，保存官网身份、分组模型、目标倍率、是否预期含 Claude、抓取时间及最近错误。有效租约和凭据版本一致时才能提交。失败保留上次成功内容并标记陈旧。迁移前的公开账号观测保留历史行，教师查询只采用有官网身份的 Key 数据。
+
+`beichen_key_usage_days` 按 Key 和北京时间日期保存 `daily_usage`、`model_stats`、`unit` 和抓取时间。只有完整读完该 Key 该日的分页并核对每笔归属，才写入带 `website_key_id` 的新快照。`raw_website_pages` 加密保存完整响应字节，包括未知字段和可选的图像、视频字段。原价和实付以精确十进制相加，缺失值为 `null`，明确的零保持为零。
+
+日对账、区间对账和账务诊断按渠道和北京时间账日选一份上游用量，优先使用人工导入，其次使用完整归档流水，再使用官网单 Key 快照。归档以完成分页的检查点核对账号、上游 Key ID 和学校渠道。历史账日要求检查点达到次日零点，即使渠道已停用或当日没有单 Key 快照也可确认。人工导入的金额可以先展示，账日完整性来自已确认的归档或未陈旧的官网快照。已结束的快照须在账日结束后读取。
+
+`beichen_crawl_runs.raw_website_response` 保存最近一次可解析渠道响应的完整 JSON 字节。分组专属型号及报价在官网目录中带 `group_id`。采价成功时 `beichen_price_versions.group_id` 与同轮 `beichen_panel_snapshots.group_id` 和倍率版本对应。快照只供后台取证，教师接口返回归属和计费字段。
+
+迁移 `0057_beichen_group_price_observations.sql` 按 `provider_id`、`group_id`、模型原名和 `observed_at` 保存官网报价版本。`pricing` 保留原始报价结构，`group_rules` 保存默认倍率、同账号核实的 `account_rate_multiplier` 和高峰规则，`unit` 固定为「元（北辰余额单位）」。目录租约仍有效时，同一事务写入抓取结果和新版本。同一分组和模型的报价或规则改变时新增版本，重复观察只刷新最近抓取结果。部分失败时只记录本轮核实的分组。账户倍率读取失败时，已知账户倍率的上次版本继续保留，失败写入 `beichen_crawl_runs.account_rate_error`。`key_model_comparisons` 保存最近一轮按凭据查到的 `/v1/models` 对照，`key_model_error` 保存整批读取错误。
+
+迁移 `0058_beichen_usage_derived_prices.sql` 把 `source` 纳入分组报价观察的主键。官网抓取只追加 `source='website'`，历史流水证据为 `derived_from_usage`。Group 16 两条反推记录各来自 6 笔流水，取复核窗口结束时间 `2026-11-21 20:14 +08:00` 作为 `observed_at`。0.60× 保存为核对时观察到的倍率。输入和输出保存为每 Token 的基础元价，缓存单价缺省。
+
+同步在核实当前 Key 分组、实际型号与倍率后，将对应证据写入 `beichen_price_versions`。行的 `source` 和 `observed_at` 保留反推来源及时间，`effective_at` 为这次同步开始生效的时刻。反推费率依附同批分组与倍率快照，新调用优先使用同组官网价，已派发调用仍按当时的版本结算。用反推价结算的调用在 `gateway_calls.beichen_base_source` 标记 `derived_from_usage` 并引用原报价版本。缓存缺价与回执补记沿用现有待核账规则。
 
 老师终审必须在同一事务内锁定项目、待审 Key、相关模型与当月项目 bucket；更新 `project_month_credit_buckets.allocated_milli` 时，条件必须同时包含 `project_id` 和当前上海月份。任何 SQL 绑定、约束或提交错误都必须回滚 Key 状态、项目分配、Key bucket、成员关系和审核记录，不允许部分成功。
 

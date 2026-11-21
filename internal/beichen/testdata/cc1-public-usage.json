@@ -1,0 +1,46 @@
+{
+  "mode": "unrestricted",
+  "isValid": true,
+  "balance": 4.974,
+  "unit": "USD",
+  "daily_usage": [
+    {
+      "date": "2026-11-21",
+      "requests": 13,
+      "input_tokens": 24700,
+      "output_tokens": 1320,
+      "cache_read_tokens": 6450,
+      "cache_write_tokens": 128,
+      "total_tokens": 32598,
+      "cost": 0.0291924,
+      "actual_cost": 0.004670784,
+      "account_cost": 0.0041
+    }
+  ],
+  "model_stats": [
+    {
+      "model": "glm-5.3-flash",
+      "requests": 9,
+      "input_tokens": 18700,
+      "output_tokens": 700,
+      "cache_read_tokens": 5800,
+      "cache_creation_tokens": 100,
+      "total_tokens": 25300,
+      "cost": 0.02,
+      "actual_cost": 0.0032,
+      "account_cost": 0.0028
+    },
+    {
+      "model": "glm-5.3",
+      "requests": 4,
+      "input_tokens": 6000,
+      "output_tokens": 620,
+      "cache_read_tokens": 650,
+      "cache_creation_tokens": 28,
+      "total_tokens": 7298,
+      "cost": 0.0091924,
+      "actual_cost": 0.001470784,
+      "account_cost": 0.0013
+    }
+  ]
+}

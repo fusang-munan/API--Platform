@@ -57,8 +57,8 @@ func TestBeichenBillingDiagnosticsPostgres(t *testing.T) {
 	}
 	daily := func(credential uuid.UUID, model string, at time.Time, amount any) {
 		t.Helper()
-		exec(`INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,billed_upstream_micros,source)
-			VALUES($1,$2,$3::text::date,$4,1,$5,'usage')`, provider, credential, at.Format(dayLayout), model, amount)
+		exec(`INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,billed_upstream_micros,source,actor_id)
+			VALUES($1,$2,$3::text::date,$4,1,$5,'csv',$6)`, provider, credential, at.Format(dayLayout), model, amount, actor)
 	}
 	type wantCheck struct {
 		credential                        uuid.UUID
@@ -89,10 +89,17 @@ func TestBeichenBillingDiagnosticsPostgres(t *testing.T) {
 	daily(keys[0], "receipt-only", day, 30000)
 	daily(keys[1], "upstream-only", day, 25000)
 	call(keys[2], "empty-day", day, "4", "gateway_usage_price")
-	exec("INSERT INTO beichen_usage_days(provider_id,credential_id,day,empty) VALUES($1,$2,$3::text::date,true)", provider, keys[2], label)
+	// The verified empty day is evidence of zero, while an older public empty day is not.
+	seedVerifiedKeyDay(t, ctx, db, keys[2], 42, label, now, "unknown", `{"requests":0,"actual_cost":0}`, `[]`)
+	exec("INSERT INTO beichen_usage_days(provider_id,credential_id,day,empty) VALUES($1,$2,$3::text::date,true)", provider, keys[0], label)
 	prior := day.AddDate(0, 0, -1)
 	call(keys[0], "equal", prior, "6", "gateway_usage_price")
 	daily(keys[0], "equal", prior, 60000)
+	call(keys[3], "verified-website", day, "2", "gateway_usage_price")
+	seedVerifiedKeyDay(t, ctx, db, keys[3], 43, label, now, "CNY", `{"requests":1,"actual_cost":0.02}`,
+		`[{"model":"verified-website","requests":1,"actual_cost":0.02}]`)
+	exec(`INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,billed_upstream_micros,source)
+		VALUES($1,$2,$3::text::date,'verified-website',9,123456,'usage')`, provider, keys[3], label)
 	call(keys[0], "open-day", day.AddDate(0, 0, 1), "999", "gateway_usage_price")
 	want = append(want,
 		wantCheck{keys[0], "late-day", "missing", "8", "", ""},
@@ -101,6 +108,7 @@ func TestBeichenBillingDiagnosticsPostgres(t *testing.T) {
 		wantCheck{keys[0], "receipt-only", "missing", "", "3", ""},
 		wantCheck{keys[1], "upstream-only", "anomaly", "0", "2.5", "-2.5"},
 		wantCheck{keys[2], "empty-day", "anomaly", "4", "0", "4"},
+		wantCheck{keys[3], "verified-website", "ok", "2", "2", "0"},
 	)
 
 	other := uuid.New()
@@ -128,7 +136,7 @@ func TestBeichenBillingDiagnosticsPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.LocalCalls != 10 || report.UpstreamRows != 3 || report.StartDay != label || report.EndDay != label ||
+	if report.LocalCalls != 11 || report.UpstreamRows != 3 || report.StartDay != label || report.EndDay != label ||
 		report.Timezone != "Asia/Shanghai" || len(report.SuspectedBypassWindows) != 1 {
 		t.Fatalf("wrong diagnostic totals/windows: %+v", report)
 	}

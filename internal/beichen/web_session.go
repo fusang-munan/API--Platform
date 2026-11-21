@@ -1,9 +1,7 @@
 package beichen
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/mail"
@@ -14,8 +12,6 @@ import (
 
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/schoolseal"
 )
-
-const webAuthURL = "https://beichenapi.com/api/v1/auth/"
 
 var errWebSignIn = errors.New("北辰官网要求核实学校账号或完成登录验证")
 
@@ -82,6 +78,28 @@ func (s *Service) ConfigureSavedWebSession(store *schoolseal.SessionStore) error
 
 func (s *Service) WebSessionConfigured() bool { return s.webAccount != nil }
 
+func readWithCapturedWebSession[T any](ctx context.Context, s *Service, read func(string) (T, error)) (T, error) {
+	var zero T
+	token, err := s.webPanelToken(ctx)
+	if err != nil {
+		return zero, err
+	}
+	value, err := read(token)
+	if !panelAuthFailed(err) {
+		return value, err
+	}
+	s.webReadError(token, upstreamHTTPStatus(http.StatusUnauthorized))
+	token, err = s.webPanelToken(ctx)
+	if err != nil {
+		return zero, err
+	}
+	value, err = read(token)
+	if panelAuthFailed(err) {
+		s.webReadError(token, upstreamHTTPStatus(http.StatusUnauthorized))
+	}
+	return value, err
+}
+
 // A protected endpoint can reject a session before its advertised expiry. Only
 // invalidate the bearer used by that request, never a newer concurrent login.
 func (s *Service) webReadError(bearer string, err error) error {
@@ -101,14 +119,6 @@ func (s *Service) webPanelIdentity() string {
 		return ""
 	}
 	return s.webAccount.email
-}
-
-type webTokens struct {
-	Access   string `json:"access_token"`
-	Refresh  string `json:"refresh_token"`
-	Lifetime int64  `json:"expires_in"`
-	Type     string `json:"token_type"`
-	TwoStep  bool   `json:"requires_2fa"`
 }
 
 func (s *Service) webPanelToken(ctx context.Context) (string, error) {
@@ -202,39 +212,4 @@ func webSessionTTL(seconds int64) time.Duration {
 		return maxLifetime
 	}
 	return time.Duration(seconds) * time.Second
-}
-
-// The only callers use fixed first-party login and refresh endpoints. Never
-// include account details or the website response body in errors.
-func (s *Service) requestWebTokens(ctx context.Context, path string, fields map[string]string) (webTokens, error) {
-	raw, err := json.Marshal(fields)
-	if err != nil {
-		return webTokens{}, errors.New("构建北辰网页登录请求失败")
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webAuthURL+path, bytes.NewReader(raw))
-	if err != nil {
-		return webTokens{}, errors.New("构建北辰网页登录请求失败")
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	body, err := s.readResponse(req)
-	if err != nil {
-		return webTokens{}, err
-	}
-	var reply struct {
-		Code *int      `json:"code"`
-		Data webTokens `json:"data"`
-	}
-	if json.Unmarshal(body, &reply) != nil || reply.Code == nil || *reply.Code != 0 {
-		return webTokens{}, errors.New("北辰网页登录响应格式无效")
-	}
-	if reply.Data.TwoStep {
-		return webTokens{}, errWebSignIn
-	}
-	t := reply.Data
-	if !strings.EqualFold(t.Type, "Bearer") || !validPanelBearer(t.Access) || t.Lifetime < 0 ||
-		(t.Refresh != "" && !validPanelBearer(t.Refresh)) {
-		return webTokens{}, errors.New("北辰网页登录响应缺少有效会话")
-	}
-	return t, nil
 }

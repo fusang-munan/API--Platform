@@ -53,7 +53,7 @@ func TestBeichenWebsiteDirectoryPostgres(t *testing.T) {
 	})
 	exec(`INSERT INTO beichen_datasets (credential_id,kind,next_attempt)
 SELECT c.id,k.kind,now()+interval '1 hour'
-FROM provider_credentials c CROSS JOIN (VALUES ('billing'),('usage')) k(kind) WHERE c.provider_id=$1`, provider)
+FROM provider_credentials c CROSS JOIN (VALUES ('billing'),('usage'),('key_usage')) k(kind) WHERE c.provider_id=$1`, provider)
 	if err := service.syncWithWebsite(ctx, nil); err != nil || websiteReads != 1 {
 		t.Fatalf("独立调度没有读取官网: %d 次, %v", websiteReads, err)
 	}

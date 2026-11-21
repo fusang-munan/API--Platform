@@ -2,6 +2,7 @@ package beichen
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -23,9 +24,11 @@ const (
 )
 
 type syncJob struct {
-	provider   uuid.UUID
-	credential uuid.UUID
-	kind       string
+	provider       uuid.UUID
+	credential     uuid.UUID
+	kind           string
+	target         KeyUsageTarget
+	websiteCatalog bool
 }
 
 func (j syncJob) leaseKind() string {
@@ -99,23 +102,15 @@ func (s *Service) SyncCredential(ctx context.Context, providerID, credentialID u
 	}
 	ctx, cancel := context.WithTimeout(ctx, sweepTimeout)
 	defer cancel()
-	var found uuid.UUID
-	err := s.db.QueryRowContext(ctx, `
-SELECT c.id FROM provider_credentials c JOIN providers p ON p.id=c.provider_id
-WHERE p.id=$1 AND c.id=$2 AND p.status='active' AND c.status='active' AND `+beichenProvider,
-		providerID, credentialID).Scan(&found)
-	if errors.Is(err, sql.ErrNoRows) {
-		return domain.NewError(domain.CodeNotFound, "找不到该北辰供应商下已启用的渠道 Key")
-	}
-	if err != nil {
-		return unavailable("读取北辰渠道失败", err)
+	if err := checkActiveSyncCredential(ctx, s.db, providerID, credentialID); err != nil {
+		return err
 	}
 	discovery, finish := context.WithTimeout(ctx, receiptKeyTimeout)
 	discoveryErr := s.discoverChannelKeys(discovery, &credentialID)
 	finish()
 	if err := s.executeSyncJobs(ctx, []syncJob{
 		{provider: providerID, credential: credentialID, kind: "billing"},
-		{provider: providerID, credential: credentialID, kind: "usage"},
+		{provider: providerID, credential: credentialID, kind: "key_usage"},
 	}, true); err != nil {
 		return err
 	}
@@ -177,7 +172,7 @@ func (s *Service) listJobs(ctx context.Context, providerID *uuid.UUID) ([]syncJo
 	rows, err := s.db.QueryContext(ctx, `
 SELECT p.id, c.id, job.kind
 FROM providers p JOIN provider_credentials c ON c.provider_id = p.id
-CROSS JOIN (VALUES ('billing', 1), ('usage', 2)) AS job(kind, priority)
+CROSS JOIN (VALUES ('billing', 1), ('key_usage', 2)) AS job(kind, priority)
 LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = job.kind
 WHERE `+beichenProvider+` AND p.status = 'active' AND c.status = 'active'
   AND ($1::uuid IS NULL OR p.id = $1)
@@ -235,6 +230,15 @@ WHERE c.id = $1 AND p.id = $2 AND p.status = 'active' AND c.status = 'active' AN
 				return saveBillingObservation(ctx, tx, job.credential, credential.updatedAt, billingInfo{}, result.err, 0, panelQuote{})
 			}
 		}
+		if job.kind == "key_usage" {
+			result.save = func(ctx context.Context, tx *sql.Tx) error {
+				digest := sha256.Sum256(credential.ciphertext)
+				_, err := tx.ExecContext(ctx, `
+UPDATE beichen_key_observations SET models_error=$3,usage_error=$3 WHERE credential_id=$1 AND key_digest=$2`,
+					job.credential, digest[:], result.err.Error())
+				return err
+			}
+		}
 		return false, s.finishJob(ctx, job, lease, credential, result, manual)
 	}
 	deadline, cancel := context.WithTimeout(ctx, jobTimeout)
@@ -246,64 +250,59 @@ WHERE c.id = $1 AND p.id = $2 AND p.status = 'active' AND c.status = 'active' AN
 func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credentialRecord, key string, manual bool) fetchResult {
 	switch job.kind {
 	case "catalog":
-		entries, err := s.fetchKeyCatalog(ctx, key)
-		catalogAt := s.now().UTC()
+		if !job.websiteCatalog {
+			entries, err := s.fetchKeyCatalog(ctx, key)
+			at := s.now().UTC()
+			return fetchResult{err: err, save: func(ctx context.Context, tx *sql.Tx) error {
+				if err != nil {
+					return recordDatasetError(ctx, tx, job.credential, "catalog", err.Error())
+				}
+				return saveKeyCatalog(ctx, tx, job, entries, at)
+			}}
+		}
+		directory, err := s.readCredentialWebsiteCatalog(ctx, job.credential, key)
 		return fetchResult{err: err, save: func(ctx context.Context, tx *sql.Tx) error {
 			if err != nil {
 				return recordDatasetError(ctx, tx, job.credential, "catalog", err.Error())
 			}
-			return saveKeyCatalog(ctx, tx, job, entries, catalogAt)
+			if err := saveKeyCatalog(ctx, tx, job, directory.entries, directory.at); err != nil {
+				return err
+			}
+			return saveWebsiteCatalog(ctx, tx, job.credential, credential.updatedAt, directory.catalogQuote())
 		}}
 	case "billing":
 		return s.fetchBillingJob(ctx, job, credential.updatedAt, key)
-	case "usage":
-		return s.fetchUsage(ctx, job, key, manual)
+	case "key_usage":
+		return s.fetchWebsiteKeyUsage(ctx, job, credential, key)
 	default:
 		return fetchResult{err: errors.New("北辰同步任务类型无效")}
 	}
 }
 
 func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision time.Time, key string) fetchResult {
-	requestedAt := s.now()
-	body, billingErr := s.fetch(ctx, key, billingPath, nil)
+	directory, catalogErr := s.readBillingCatalog(ctx, job, key)
 	var info billingInfo
-	if billingErr == nil {
-		info, billingErr = parseBilling(body)
+	var quote panelQuote
+	billingErr := catalogErr
+	if catalogErr == nil {
+		info, quote, billingErr = directory.billing()
 	}
-	if billingErr == nil {
-		switch {
-		case info.ObservedAt.IsZero() && billingPanelGroup(info) == 0 && !s.WebSessionConfigured():
-			// The legacy multiplier-only response does not carry a sample time.
-			info.ObservedAt = s.now().UTC()
-		case info.ObservedAt.Before(requestedAt.Add(-2*time.Second)) || info.ObservedAt.After(s.now()):
-			billingErr = errors.New("北辰 Key 账单采样时间无效或早于本轮同步")
-		}
+	partialErr := quote.err
+	if directory.keyBilling != nil && billingErr == nil {
+		// A successful Key read establishes the billing rule. The official
+		// website quote remains unavailable and is reported separately.
+		partialErr = nil
 	}
-	entries, catalogErr := s.fetchKeyCatalog(ctx, key)
-	catalogAt := s.now().UTC()
-	access, accessErr := s.loadPriceAccess(ctx, job.credential)
-	group := billingPanelGroup(info)
-	quote := panelQuote{groupID: group}
-	switch {
-	case billingErr != nil:
-		quote.err = billingErr
-	case catalogErr != nil:
-		quote.err = catalogErr
-	case accessErr != nil:
-		quote.err = accessErr
-	default:
-		quote = s.fetchChannelQuote(ctx, access, key, info, entries)
-	}
-	return fetchResult{err: billingErr, partialErr: errors.Join(quote.err, quote.verificationError), save: func(ctx context.Context, tx *sql.Tx) error {
+	return fetchResult{err: billingErr, partialErr: partialErr, save: func(ctx context.Context, tx *sql.Tx) error {
 		if catalogErr != nil {
 			if err := recordDatasetError(ctx, tx, job.credential, "catalog", catalogErr.Error()); err != nil {
 				return err
 			}
 		} else {
-			if err := saveKeyCatalog(ctx, tx, job, entries, catalogAt); err != nil {
+			if err := saveKeyCatalog(ctx, tx, job, directory.entries, directory.at); err != nil {
 				return err
 			}
-			if err := saveWebsiteCatalog(ctx, tx, job.credential, revision, quote); err != nil {
+			if err := saveWebsiteCatalog(ctx, tx, job.credential, revision, directory.catalogQuote()); err != nil {
 				return err
 			}
 		}
@@ -539,7 +538,7 @@ UPDATE beichen_datasets SET
   lease_id = NULL, lease_until = NULL
 WHERE credential_id = $1 AND kind = $2
 RETURNING failure_count`, job.credential, job.kind,
-		(result.save != nil && job.kind != "billing") || result.err == nil, message, refreshMinutes(job.kind), manual && job.kind == "usage").Scan(&failures)
+		(result.save != nil && job.kind == "usage") || result.err == nil, message, refreshMinutes(job.kind), manual && job.kind == "usage").Scan(&failures)
 	if err != nil {
 		return err
 	}
@@ -553,7 +552,7 @@ RETURNING failure_count`, job.credential, job.kind,
 }
 
 func refreshMinutes(kind string) int {
-	if kind == "billing" {
+	if kind == "billing" || kind == "key_usage" {
 		return 15
 	}
 	return 1440

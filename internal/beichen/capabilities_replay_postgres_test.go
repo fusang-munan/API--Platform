@@ -54,35 +54,47 @@ func TestBeichenCapabilityRescanAndReplayPostgres(t *testing.T) {
 	}
 
 	s := New(db, manager)
+	const bearer = "fixture-replay-web"
+	if err := s.ConfigureWebSessionTokens("replay@example.test", bearer, "fixture-replay-refresh", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	directory := websiteGroupFixture(7, "1.25", `
+	  {"name":"claude-fixture-replay","supported_protocols":["anthropic","openai_compatible"],
+	   "pricing":{"input_price":0.0000000001,"output_price":0.0000000005,"cache_read_price":0,"cache_write_price":0}}`)
 	t.Setenv("BEICHEN_PROBE_DAILY_LIMIT", "20")
-	var scans, billing, usageReads, messages, chat atomic.Int32
+	var scans, groupReads, usageReads, messages, chat atomic.Int32
 	s.client.Transport = panelTransport(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Host != "api.beichenapi.com" {
-			return nil, errors.New("unexpected fixture host")
-		}
 		var body string
 		status := 200
-		switch {
-		case r.Method == http.MethodGet && r.Header.Get("Authorization") == "Bearer "+fakeKey:
+		if r.URL.Host == publicKeyHost && r.Method == http.MethodGet && r.Header.Get("Authorization") == "Bearer "+bearer {
 			switch r.URL.Path {
-			case modelsPath:
+			case "/api/v1/keys":
+				body = websiteKeyListFixture(fakeKey, "CC1", 41, 7)
+			case "/api/v1/channels/available":
+				groupReads.Add(1)
+				body = directory
+			case "/api/v1/usage":
+				usageReads.Add(1)
+				at := r.URL.Query().Get("start_date") + "T00:00:01+08:00"
+				if r.URL.Query().Get("api_key_id") != "41" {
+					return nil, errors.New("usage request used an unexpected Key")
+				}
+				body = fmt.Sprintf(`{"code":0,"data":{"page":1,"pages":1,"page_size":100,"total":1,"items":[
+ {"id":1,"user_id":13,"api_key_id":41,"model":%q,"created_at":%q,"currency":"CNY","input_tokens":10,
+  "output_tokens":1,"cache_read_tokens":0,"cache_creation_tokens":0,"actual_cost":0.000003}]}}`, model, at)
+			}
+		} else if r.URL.Host == "api.beichenapi.com" {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == modelsPath && r.Header.Get("Authorization") == "Bearer "+fakeKey:
 				scans.Add(1)
 				body = `{"data":[{"id":"claude-fixture-replay","supported_protocols":["anthropic","openai_compatible"]}]}`
-			case billingPath:
-				billing.Add(1)
-				body = `{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token","effective_rate_multiplier":1.25,
- "pricing":{"basis":"base","unit":"usd_micros_per_million_tokens","models":[{"model":"claude-fixture-replay","input":100,"output":500,"cache_read":0,"cache_write":0}]}}`
-			case usagePath:
-				usageReads.Add(1)
-				body = fmt.Sprintf(`{"mode":"unrestricted","unit":"USD","date":%q,"timezone":"Asia/Shanghai",
- "model_stats":[{"model":%q,"requests":1,"input_tokens":10,"output_tokens":1,"actual_cost":0.000003}]}`, r.URL.Query().Get("start_date"), model)
+			case r.Method == http.MethodPost && r.URL.Path == "/v1/messages" && r.Header.Get("x-api-key") == fakeKey:
+				messages.Add(1)
+				status, body = 403, `{"type":"error","error":{"type":"permission_error"}}`
+			case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" && r.Header.Get("Authorization") == "Bearer "+fakeKey:
+				chat.Add(1)
+				body = `{"choices":[{}]}`
 			}
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/messages" && r.Header.Get("x-api-key") == fakeKey:
-			messages.Add(1)
-			status, body = 403, `{"type":"error","error":{"type":"permission_error"}}`
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" && r.Header.Get("Authorization") == "Bearer "+fakeKey:
-			chat.Add(1)
-			body = `{"choices":[{}]}`
 		}
 		if body == "" {
 			return nil, errors.New("unexpected path or credential in fake upstream")
@@ -107,8 +119,8 @@ func TestBeichenCapabilityRescanAndReplayPostgres(t *testing.T) {
 		err := db.QueryRowContext(ctx, `
 SELECT (SELECT count(*) FROM model_bindings), (SELECT count(*) FROM provider_model_catalog),
        (SELECT count(*) FROM upstream_probes), (SELECT count(*) FROM beichen_price_versions),
-       (SELECT count(*) FROM beichen_multiplier_versions), (SELECT count(*) FROM beichen_daily_usage),
-       (SELECT COALESCE(sum(billed_upstream_micros),0) FROM beichen_daily_usage),
+       (SELECT count(*) FROM beichen_multiplier_versions), (SELECT count(*) FROM beichen_key_usage_days),
+       (SELECT (COALESCE(sum((daily_usage->>'actual_cost')::numeric),0)*1000000)::bigint FROM beichen_key_usage_days),
        (SELECT count(*) FROM gateway_calls)`).
 			Scan(&v.bindings, &v.catalogRows, &v.probes, &v.priceVersions, &v.multiplierVersions, &v.days, &v.actual, &v.studentCalls)
 		if err != nil {
@@ -116,7 +128,7 @@ SELECT (SELECT count(*) FROM model_bindings), (SELECT count(*) FROM provider_mod
 		}
 		return v
 	}
-	var first counts
+	want := counts{bindings: 2, catalogRows: 1, probes: 2, multiplierVersions: 1, days: 2, actual: 6}
 	for attempt := range 2 {
 		if err := s.Sync(ctx, provider); err != nil {
 			t.Fatal(err)
@@ -144,18 +156,26 @@ SELECT (SELECT count(*) FROM model_bindings), (SELECT count(*) FROM provider_mod
 			t.Fatalf("passing Chat did not become the available recommendation: %+v", got)
 		}
 		current := check()
-		if attempt == 0 {
-			first = current
-			want := counts{bindings: 2, catalogRows: 1, probes: 2, priceVersions: 1, multiplierVersions: 1, days: 2, actual: 6}
-			if first != want {
-				t.Fatalf("incorrect first reconciliation: got %+v, want %+v", first, want)
-			}
-		} else if current != first {
-			t.Fatalf("replay changed bindings, probes, or billing: first %+v second %+v", first, current)
+		want.priceVersions = attempt + 1
+		if current != want {
+			t.Fatalf("replay round %d: got %+v, want %+v", attempt+1, current, want)
 		}
 	}
-	if scans.Load() != 3 || billing.Load() != 2 || usageReads.Load() != 4 || messages.Load() != 1 || chat.Load() != 1 {
-		t.Fatalf("unexpected fake requests: catalog=%d billing=%d usage=%d messages=%d chat=%d",
-			scans.Load(), billing.Load(), usageReads.Load(), messages.Load(), chat.Load())
+	if scans.Load() != 1 || groupReads.Load() != 6 || usageReads.Load() != 4 || messages.Load() != 1 || chat.Load() != 1 {
+		t.Fatalf("unexpected fake requests: catalog=%d group=%d usage=%d messages=%d chat=%d",
+			scans.Load(), groupReads.Load(), usageReads.Load(), messages.Load(), chat.Load())
 	}
 }
+
+func websiteKeyListFixture(secret, name string, id, group int) string {
+	return fmt.Sprintf(`{"code":0,"data":{"items":[{"id":%d,"user_id":13,"key":%q,"group_id":%d,"name":%q,"status":"active"}],
+		"total":1,"page":1,"page_size":100,"pages":1}}`, id, secret, group, name)
+}
+
+func websiteGroupFixture(group int, multiplier, models string) string {
+	return fmt.Sprintf(`{"code":0,"data":[{"id":5,"name":"Fixture website channel","status":"active","platforms":[
+		{"platform":"anthropic","groups":[{"id":%d,"platform":"anthropic","subscription_type":"standard",
+		"rate_multiplier":%s,"peak_rate_enabled":false}],"supported_models":[%s]}]}]}`, group, multiplier, models)
+}
+
+const emptyWebsiteUsageFixture = `{"code":0,"data":{"items":[],"total":0,"page":1,"page_size":100,"pages":0}}`

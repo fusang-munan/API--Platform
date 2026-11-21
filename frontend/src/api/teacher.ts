@@ -1,6 +1,7 @@
 import { del, get, page, patch, post, request } from './client'
 import type { BeichenModelAlias, BeichenModelAliasUpdate, BeichenRebindPlan } from './types'
-import type { BeichenBatchEnableResult, BeichenCapabilities, BeichenImport, BeichenModelPriceResult, BeichenModelPriceUpdate, BeichenModelUsage, BeichenOverview, BeichenPriceUpdate, BeichenProbeRun, BeichenProbes, BeichenReceiptPage, BeichenReconcile, BeichenUsageRange } from './types'
+import type { BeichenWebsiteKeyInventory } from './types'
+import type { BeichenAccount, BeichenAccountLogin, BeichenBatchEnableResult, BeichenCapabilities, BeichenCrawlSummary, BeichenImport, BeichenModelPriceResult, BeichenModelPriceUpdate, BeichenModelUsage, BeichenOverview, BeichenPriceUpdate, BeichenProbeRun, BeichenProbes, BeichenReceiptPage, BeichenReconcile, BeichenUsageRange } from './types'
 import type { Application, Binding, BindingCreate, BindingRouteProbeEndpoint, BindingRouteProbeStep, BindingUpdate, MentorCandidate, Model, ModelCatalogPage, ModelCreate, ModelUpdate, Organization, OrganizationCreate, OrganizationUpdate, ProbeEndpoint, ProbeResponse, Project, ProjectBudget, ProjectBudgetUpdate, ProjectCreate, ProjectUpdate, Provider, ProviderCatalogSyncView, ProviderCreate, ProviderCredential, ProviderCredentialCreate, ProviderCredentialUpdate, ProviderUpdate, ProjectUsage, StudentAccount } from './types'
 interface BeichenPanelStatus { configured: boolean; group_id?: number; upstream_key_id?: number }
 export const teacherAPI = {
@@ -41,6 +42,19 @@ export const teacherAPI = {
   beichenCapabilities: (id: string) => get<BeichenCapabilities>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/capabilities`),
   beichenProbes: (id: string) => get<BeichenProbes>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/probes`),
   requestBeichenProbes: (id: string) => post<BeichenProbeRun>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/probes`),
+  beichenAccount: (id: string) => get<BeichenAccount>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/account`),
+  beichenWebsiteKeys: (id: string) =>
+    get<BeichenWebsiteKeyInventory>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/keys`),
+  refreshBeichenWebsiteKeys: (id: string) =>
+    post<BeichenWebsiteKeyInventory>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/keys/refresh`),
+  loginBeichenAccount: (id: string, body: BeichenAccountLogin) =>
+    post<BeichenAccount>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/account/login`, body),
+  verifyBeichenAccount: (id: string) =>
+    post<BeichenAccount>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/account/verify`),
+  clearBeichenAccount: (id: string) =>
+    del<BeichenAccount | null>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/account`),
+  crawlBeichen: (id: string) =>
+    post<BeichenCrawlSummary>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/crawl`),
   beichenReceipts: (id: string, day: string, cursor: string | null, signal: AbortSignal) => {
     const query = new URLSearchParams({ day })
     if (cursor) query.set('cursor', cursor)
@@ -72,6 +86,8 @@ export const teacherAPI = {
     post<BeichenRebindPlan>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/rebind`, { preview: false, preview_token: token }),
   rescanBeichenCatalog: (id: string, credentialId: string) =>
     post<{ synced: boolean }>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/catalog/rescan`, { credential_id: credentialId }),
+  refreshBeichenKeyUsage: (id: string, body: { credential_id: string; target_multiplier?: string; expect_claude?: boolean }) =>
+    post<{ synced: boolean }>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/key-usage`, body),
   setBeichenPrice: (id: string, body: BeichenPriceUpdate) => patch<{ saved: boolean }>(`/api/v1/teacher/providers/${id}/beichen/price`, body),
   importBeichen: (id: string, body: BeichenImport) => post<{ imported: boolean }>(`/api/v1/teacher/providers/${id}/beichen/import`, body),
   models: () => get<Model[]>('/api/v1/teacher/models'),

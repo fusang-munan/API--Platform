@@ -1,0 +1,52 @@
+{
+  "account": {
+    "id": 42,
+    "balance": 2.75,
+    "created_at": "2026-11-10T00:15:00+08:00",
+    "email": "fixture@example.invalid"
+  },
+  "keys": [
+    {"id": 11, "user_id": 42, "name": "fixture-first", "group_id": 1, "status": "active", "key": "sk-fixtureSecretNeverOutput", "group": {"id": 1, "name": "fixture-platform", "platform": "openai", "rate_multiplier": 0.5}},
+    {"id": 12, "user_id": 42, "name": "fixture-bearer-sensitive", "group_id": 2, "status": "active", "group": {"id": 2, "name": "fixture-claude", "platform": "anthropic", "rate_multiplier": 0.5}}
+  ],
+  "dashboard": {
+    "today_requests": 1,
+    "today_input_tokens": 2,
+    "today_output_tokens": 1,
+    "today_cache_read_tokens": 1,
+    "today_cache_creation_tokens": 1,
+    "today_tokens": 5,
+    "today_cost": 0.02,
+    "today_actual_cost": 0.01,
+    "total_requests": 101,
+    "total_input_tokens": 202,
+    "total_output_tokens": 101,
+    "total_cache_read_tokens": 101,
+    "total_cache_creation_tokens": 101,
+    "total_tokens": 505,
+    "total_cost": 2.02,
+    "total_actual_cost": 1.0100000000000000001,
+    "active_api_keys": 2,
+    "total_api_keys": 2,
+    "by_platform": [
+      {"platform": "openai", "today_requests": 0, "today_tokens": 0, "today_actual_cost": 0, "total_requests": 100, "total_tokens": 500, "total_actual_cost": 1},
+      {"platform": "anthropic", "today_requests": 1, "today_tokens": 5, "today_actual_cost": 0.01, "total_requests": 1, "total_tokens": 5, "total_actual_cost": 0.01}
+    ]
+  },
+  "record": {
+    "id": 101,
+    "api_key_id": 12,
+    "user_id": 42,
+    "model": "fixture-model",
+    "created_at": "2026-11-21T02:00:00+08:00",
+    "input_tokens": 2,
+    "output_tokens": 1,
+    "cache_read_tokens": 1,
+    "cache_creation_tokens": 1,
+    "total_cost": 0.02,
+    "actual_cost": 0.01,
+    "api_key": {"key": "sk-fixtureSecretNeverOutput"},
+    "group": {"platform": "anthropic"},
+    "request_id": "fixture-private-request-id"
+  }
+}

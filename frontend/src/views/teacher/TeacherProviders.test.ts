@@ -250,6 +250,16 @@ describe('北辰供应商行', () => {
     expect(api.beichenOverview.mock.calls.map(([id]) => id)).toEqual(['north-a', 'north-b'])
   })
 
+  it('只在北辰供应商行显示网页登录入口', async () => {
+    api.providers.mockResolvedValue([provider('north'), provider('other', 'https://example.test')])
+    api.beichenOverview.mockResolvedValue({ model_catalog: [], comparison: [] })
+    const wrapper = view()
+    await flushPromises()
+    const [north, other] = wrapper.findAll('article.provider-row')
+    expect(north.findAll('button').some(button => button.text() === '网页登录')).toBe(true)
+    expect(other.findAll('button').some(button => button.text() === '网页登录')).toBe(false)
+  })
+
   it('逐供应商显示北京时间当天待核笔数和去重后的缺价模型数', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(new Date('2026-11-19T17:00:00Z'))

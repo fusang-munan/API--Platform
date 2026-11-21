@@ -18,9 +18,10 @@ var beichenNonTokenPriceFields = []string{
 }
 
 type normalizedBeichenQuote struct {
-	terms         json.RawMessage
-	ignoredFields []string
-	nonTokenField string
+	terms            json.RawMessage
+	ignoredFields    []string
+	nonTokenField    string
+	tierBaseFallback bool
 }
 
 type beichenQuoteFields map[string]json.RawMessage
@@ -34,7 +35,11 @@ func (c *beichenPriceConditions) UnmarshalJSON(raw []byte) error {
 	if err != nil {
 		return err
 	}
-	return decodeBeichenPanelJSON(quote.terms, (*beichenPriceConditionsJSON)(c))
+	if err := decodeBeichenPanelJSON(quote.terms, (*beichenPriceConditionsJSON)(c)); err != nil {
+		return err
+	}
+	c.tierBaseFallback = quote.tierBaseFallback
+	return nil
 }
 
 func decodeBeichenPanelJSON(raw json.RawMessage, target any) error {
@@ -52,7 +57,7 @@ func normalizeBeichenPanelQuote(raw json.RawMessage) (normalizedBeichenQuote, er
 	if err != nil {
 		return normalizedBeichenQuote{}, errors.New("billing_mode")
 	}
-	var tiers []json.RawMessage
+	var tiers []beichenQuoteFields
 	if rawTiers := fields["intervals"]; len(rawTiers) != 0 && json.Unmarshal(rawTiers, &tiers) != nil {
 		return normalizedBeichenQuote{}, errors.New("intervals")
 	}
@@ -60,12 +65,8 @@ func normalizeBeichenPanelQuote(raw json.RawMessage) (normalizedBeichenQuote, er
 	var quote, tierNotes normalizedBeichenQuote
 	baseToken := mode == "token" || (mode == "" && fields.hasTokenPricePair())
 	tokenTier := false
-	for i, rawTier := range tiers {
-		var tier beichenQuoteFields
+	for i, tier := range tiers {
 		prefix := fmt.Sprintf("第 %d 档 ", i+1)
-		if json.Unmarshal(rawTier, &tier) != nil {
-			return normalizedBeichenQuote{}, fmt.Errorf("%sintervals[%d]", prefix, i)
-		}
 		tierMode, err := tier.billingMode()
 		if err != nil {
 			return normalizedBeichenQuote{}, errors.New(prefix + "billing_mode")
@@ -73,16 +74,6 @@ func normalizeBeichenPanelQuote(raw json.RawMessage) (normalizedBeichenQuote, er
 		primaryToken := tierMode == "token" || (tierMode == "" && (baseToken || tier.hasTokenPricePair()))
 		tokenTier = tokenTier || primaryToken
 		if err := tier.normalize(&tierNotes, tierMode, primaryToken, prefix, fmt.Sprintf("intervals[%d].", i)); err != nil {
-			return normalizedBeichenQuote{}, err
-		}
-		tiers[i], err = json.Marshal(tier)
-		if err != nil {
-			return normalizedBeichenQuote{}, err
-		}
-	}
-	if len(tiers) != 0 {
-		fields["intervals"], err = json.Marshal(tiers)
-		if err != nil {
 			return normalizedBeichenQuote{}, err
 		}
 	}
@@ -93,6 +84,16 @@ func normalizeBeichenPanelQuote(raw json.RawMessage) (normalizedBeichenQuote, er
 	quote.ignoredFields = append(quote.ignoredFields, tierNotes.ignoredFields...)
 	if quote.nonTokenField == "" {
 		quote.nonTokenField = tierNotes.nonTokenField
+	}
+	if len(tiers) != 0 {
+		quote.tierBaseFallback, err = normalizeBeichenMultiplierTiers(fields, tiers, quote.nonTokenField)
+		if err != nil {
+			return normalizedBeichenQuote{}, err
+		}
+		fields["intervals"], err = json.Marshal(tiers)
+		if err != nil {
+			return normalizedBeichenQuote{}, err
+		}
 	}
 	quote.terms, err = json.Marshal(fields)
 	return quote, err
@@ -136,13 +137,17 @@ func (fields beichenQuoteFields) normalize(quote *normalizedBeichenQuote, mode s
 		if !present || bytes.Equal(raw, []byte("null")) {
 			continue
 		}
-		if primaryToken || blankBeichenPrice(raw) || zeroBeichenNonTokenPrice(raw) {
+		if primaryToken || mode == "" && (blankBeichenPrice(raw) || zeroBeichenNonTokenPrice(raw)) {
 			delete(fields, name)
 			quote.ignoredFields = append(quote.ignoredFields, path+name)
 			continue
 		}
 		if quote.nonTokenField == "" {
 			quote.nonTokenField = path + name
+		}
+		if blankBeichenPrice(raw) {
+			fields[name] = json.RawMessage("null")
+			continue
 		}
 		var number json.Number
 		if json.Unmarshal(raw, &number) != nil || beichenPriceDecimal(&number) == nil {

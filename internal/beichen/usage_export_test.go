@@ -133,7 +133,7 @@ func TestImportUsageExportRejectsOpenOrConfirmedDay(t *testing.T) {
 			if tc.checkSnapshot {
 				mock.ExpectQuery(regexp.QuoteMeta("SELECT label::text FROM provider_credentials WHERE id = $1")).WithArgs(credential).
 					WillReturnRows(sqlmock.NewRows([]string{"label"}).AddRow(exportFixtureLabel))
-				mock.ExpectQuery(`SELECT EXISTS \( SELECT 1 FROM beichen_usage_days`).
+				mock.ExpectQuery(`SELECT EXISTS \( SELECT 1 FROM beichen_key_usage_days d JOIN provider_credentials c .+o\.website_key_id=d\.website_key_id.+d\.key_digest=sha256\(c\.credential_ciphertext\).+d\.fetched_at >=`).
 					WithArgs(provider, credential, "2026-11-18").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 			}
 			mock.ExpectRollback()

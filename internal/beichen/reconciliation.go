@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
 type ReconciliationLocal struct {
@@ -25,15 +26,25 @@ type ReconciliationLocal struct {
 }
 
 type ReconciliationUpstream struct {
-	Requests         int64   `json:"requests"` // 北辰日账回报的调用笔数。
-	Tokens           int64   `json:"tokens"`   // 北辰 Token 总量，为四项已回报分项的合计。
-	InputTokens      int64   `json:"input_tokens"`
-	OutputTokens     int64   `json:"output_tokens"`
-	CacheReadTokens  int64   `json:"cache_read_tokens"`
-	CacheWriteTokens int64   `json:"cache_write_tokens"`
-	Completeness     string  `json:"completeness"`
-	BilledMicros     *int64  `json:"billed_micros"`
-	Source           *string `json:"source"`
+	Requests         int64                      `json:"requests"` // 北辰日账回报的调用笔数。
+	Tokens           int64                      `json:"tokens"`   // 北辰 Token 总量，为四项已回报分项的合计。
+	InputTokens      int64                      `json:"input_tokens"`
+	OutputTokens     int64                      `json:"output_tokens"`
+	CacheReadTokens  int64                      `json:"cache_read_tokens"`
+	CacheWriteTokens int64                      `json:"cache_write_tokens"`
+	Completeness     string                     `json:"completeness"`
+	BilledMicros     *int64                     `json:"billed_micros"`
+	Source           *string                    `json:"source"`
+	ActualCost       *string                    `json:"actual_cost"`
+	Unit             *string                    `json:"unit"`
+	MixedUnits       bool                       `json:"mixed_units"`
+	Stale            bool                       `json:"stale"`
+	AmountsByUnit    []ReconciliationUnitAmount `json:"amounts_by_unit,omitempty"`
+}
+
+type ReconciliationUnitAmount struct {
+	Unit       *string `json:"unit"`
+	ActualCost *string `json:"actual_cost"`
 }
 
 type ReconciliationMoney struct {
@@ -95,6 +106,9 @@ type ReconciliationCoverage struct {
 	VerifiedMatchedCalls              int64                              `json:"verified_matched_calls"`
 	VerifiedMatchedCompleteTokenCalls int64                              `json:"verified_matched_complete_token_calls"`
 	CoverageKind                      string                             `json:"coverage_kind"`
+	KeyUsageDays                      int64                              `json:"key_usage_days"`
+	KeyUsageModelDays                 int64                              `json:"key_usage_model_days"`
+	StaleKeyUsageDays                 int64                              `json:"stale_key_usage_days"`
 }
 
 type ReconciliationReport struct {
@@ -150,24 +164,11 @@ verified_calls AS (
    count(*) FILTER (WHERE beichen_state = 'charged' AND recorded_base_credits IS NULL) AS unpriced_calls,
    count(DISTINCT COALESCE(beichen_school_multiplier, 1)) > 1 AS multiplier_mixed
  FROM priced_calls GROUP BY GROUPING SETS ((credential_id, school_model), (credential_id), ())
-), daily_usage AS (
- SELECT a.credential_id, COALESCE(alias.school_model, a.model) AS model, day,
-   requests, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-   num_nonnulls(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) AS token_parts,
-   billed_upstream_micros, source
- FROM beichen_daily_usage a ` + joinModelAliasSQL + `
- WHERE a.provider_id = $1 AND ($4::text IS NULL OR day >= $4::text::date) AND day < $5::text::date
-), upstream_summary AS (
- SELECT credential_id, model, grouping(credential_id, model) AS level, count(*) AS row_count,
-   CASE WHEN min(token_parts) = 4 THEN 'complete'
-        WHEN max(token_parts) > 0 THEN 'partial' ELSE 'missing' END AS token_completeness,
-   COALESCE(sum(requests), 0) AS requests,
-   COALESCE(sum(input_tokens), 0) AS input_tokens, COALESCE(sum(output_tokens), 0) AS output_tokens,
-   COALESCE(sum(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(sum(cache_write_tokens), 0) AS cache_write_tokens,
-   CASE WHEN count(billed_upstream_micros) = count(*) THEN sum(billed_upstream_micros) END AS billed,
-   string_agg(DISTINCT source, ',' ORDER BY source) AS source
- FROM daily_usage GROUP BY GROUPING SETS ((credential_id, model), (credential_id), ())
-), expected_days AS (
+), usage_scope AS (
+ SELECT $1::uuid AS provider_id,$4::text::date AS first_day,$5::text::date AS end_day,
+   $6::text::date AS today,$7::timestamptz AS as_of
+)` + usage.BeichenDailyEvidenceSQL + reconciliationSourcesSQL + `,
+expected_days AS (
  SELECT c.id AS credential_id, d.day::date AS day
  FROM provider_credentials c CROSS JOIN LATERAL generate_series(
    GREATEST((c.created_at AT TIME ZONE 'Asia/Shanghai')::date, $4::text::date)::timestamp,
@@ -176,10 +177,14 @@ verified_calls AS (
  UNION
  SELECT credential_id, (sent_at AT TIME ZONE 'Asia/Shanghai')::date FROM report_calls
  UNION
- SELECT credential_id, day FROM daily_usage
+ SELECT credential_id, day FROM model_usage_rows
+ UNION
+ SELECT credential_id, day FROM key_usage_days
 ), coverage_days AS (
- SELECT e.*, u.credential_id IS NOT NULL AS synced
- FROM expected_days e LEFT JOIN beichen_usage_days u ON u.provider_id = $1 AND u.credential_id = e.credential_id AND u.day = e.day
+ SELECT e.*, COALESCE(NOT d.stale,false) OR w.credential_id IS NOT NULL AS synced
+ FROM expected_days e
+ LEFT JOIN scoped_days d ON d.credential_id=e.credential_id AND d.day=e.day
+ LEFT JOIN website_days w ON w.credential_id=e.credential_id AND w.day=e.day
 ), day_coverage AS (
  SELECT day, bool_and(synced) AS comparable FROM coverage_days GROUP BY day
 ), day_summary AS (
@@ -212,16 +217,25 @@ verified_calls AS (
      'completeness', COALESCE(l.token_completeness, 'missing'),
      'estimated_micros', CASE WHEN l.estimated_micros <= 9223372036854775807 THEN l.estimated_micros END) AS local,
    jsonb_build_object('requests', COALESCE(u.requests, 0),
-     'tokens', COALESCE(u.input_tokens, 0) + COALESCE(u.output_tokens, 0) + COALESCE(u.cache_read_tokens, 0) + COALESCE(u.cache_write_tokens, 0),
+     'tokens', COALESCE(u.tokens, 0),
      'input_tokens', COALESCE(u.input_tokens, 0), 'output_tokens', COALESCE(u.output_tokens, 0),
      'cache_read_tokens', COALESCE(u.cache_read_tokens, 0), 'cache_write_tokens', COALESCE(u.cache_write_tokens, 0),
      'completeness', COALESCE(u.token_completeness, 'missing'),
-     'billed_micros', u.billed, 'source', u.source) AS upstream,
+     'billed_micros', CASE WHEN u.unit IS NULL AND NOT u.mixed_units AND u.actual_cost * 1000000 <= 9223372036854775807
+       THEN (u.actual_cost * 1000000)::bigint END,
+     'actual_cost', trim_scale(u.actual_cost)::text, 'unit', u.unit,
+     'amounts_by_unit', CASE WHEN u.mixed_units THEN (
+       SELECT jsonb_agg(jsonb_build_object('unit', a.unit, 'actual_cost', trim_scale(a.actual_cost)::text) ORDER BY a.unit NULLS LAST)
+       FROM upstream_amounts a WHERE a.level=u.level AND a.credential_id IS NOT DISTINCT FROM u.credential_id
+         AND a.model IS NOT DISTINCT FROM u.model
+     ) END,
+     'mixed_units', COALESCE(u.mixed_units,false), 'stale', COALESCE(u.stale,false), 'source', u.source) AS upstream,
    COALESCE(l.student_credits, 0) * 0.01::numeric AS student,
    COALESCE(l.base_credits, 0) * 0.01::numeric AS base,
-   u.billed * 0.000001::numeric AS actual,
+   CASE WHEN (u.unit IS NULL OR u.unit = 'CNY') AND NOT u.mixed_units THEN u.actual_cost END AS actual,
+   COALESCE(u.stale,false) AS upstream_stale,
    COALESCE(l.tokens, 0) AS local_tokens,
-   COALESCE(u.input_tokens, 0) + COALESCE(u.output_tokens, 0) + COALESCE(u.cache_read_tokens, 0) + COALESCE(u.cache_write_tokens, 0) AS upstream_tokens
+   COALESCE(u.tokens, 0) AS upstream_tokens
  FROM local_summary l FULL JOIN upstream_summary u
    ON l.level = u.level AND l.model IS NOT DISTINCT FROM u.model AND l.credential_id IS NOT DISTINCT FROM u.credential_id
 ), amounts AS (
@@ -232,7 +246,9 @@ verified_calls AS (
    'margin_yuan', CASE WHEN m.available THEN trim_scale(student - actual)::text END,
    'margin_rate', CASE WHEN m.available THEN trim_scale(CASE WHEN student = 0 THEN 0 ELSE (student - actual) / student END)::text END) AS money
  FROM paired p CROSS JOIN day_summary d
- CROSS JOIN LATERAL (SELECT d.all_days_complete AND p.actual IS NOT NULL AS available) m
+ CROSS JOIN LATERAL (SELECT d.all_days_complete AND p.actual IS NOT NULL AND NOT p.upstream_stale AND
+   (p.level <> 0 OR NOT EXISTS (SELECT 1 FROM key_usage_days k
+     WHERE k.credential_id=p.credential_id AND k.models_covered IS DISTINCT FROM true)) AS available) m
 ), lines AS (
  SELECT a.level, a.model, a.credential_id, c.label, jsonb_build_object(
    'credential_id', a.credential_id, 'label', c.label, 'local', a.local, 'upstream', a.upstream, 'match_status', a.match_status,
@@ -251,6 +267,9 @@ SELECT jsonb_build_object(
  'coverage', jsonb_build_object(
    'days_expected', (SELECT count(*) FROM coverage_days), 'days_present', (SELECT count(*) FROM coverage_days WHERE synced),
    'comparable_days', (SELECT comparable_days FROM day_summary),
+   'key_usage_days', (SELECT count(*) FROM key_usage_days),
+   'key_usage_model_days', (SELECT count(*) FROM key_usage_days WHERE models_covered AND NOT stale),
+   'stale_key_usage_days', (SELECT count(*) FROM key_usage_days WHERE stale),
    'missing_days', (SELECT missing_days FROM day_summary),
    'credentials', COALESCE((SELECT jsonb_agg(jsonb_build_object('credential_id', id, 'label', label,
      'expected_days', expected_days, 'synced_days', synced_days, 'missing_days', missing_days) ORDER BY label, id)
@@ -280,7 +299,7 @@ func readReconciliation(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, p
 	var report ReconciliationReport
 	var raw []byte
 	err := tx.QueryRowContext(ctx, reconciliationSQL, providerID, period.Start, end.UTC(),
-		startDay, endDay.Format(dayLayout)).Scan(&raw)
+		startDay, endDay.Format(dayLayout), localNow.Format(dayLayout), now.UTC()).Scan(&raw)
 	if err != nil {
 		return report, err
 	}

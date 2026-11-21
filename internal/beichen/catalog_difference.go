@@ -153,12 +153,12 @@ func readCatalogDifferences(ctx context.Context, tx *sql.Tx, provider uuid.UUID,
 	web := map[string][]WebsiteLocation{}
 	stale := status.State == "stale"
 	for _, section := range platforms {
-		groups := websiteGroups(section.Groups)
 		for _, model := range section.Models {
 			name := strings.ToLower(model.Name)
 			location := WebsiteLocation{
 				Name: model.Name, ChannelID: section.ChannelID, Channel: section.Channel, Platform: section.Platform,
-				Groups: groups, ObservedAt: model.ObservedAt, HasPrice: hasPanelPrice(model.Pricing),
+				Groups:     websiteGroups(directoryModelGroups(section, model)),
+				ObservedAt: model.ObservedAt, HasPrice: hasPanelPrice(model.Pricing),
 				Stale: stale, channelStatus: section.ChannelStatus,
 			}
 			if location.HasPrice {
@@ -287,7 +287,9 @@ func websiteGroupCatalog(platforms []directoryPlatform, groupID *int64) ([]strin
 				names = []string{}
 			}
 			for _, model := range section.Models {
-				names = append(names, model.Name)
+				if namesGroup(directoryModelGroups(section, model), *groupID) {
+					names = append(names, model.Name)
+				}
 			}
 			if checked == nil || section.ObservedAt.After(*checked) {
 				checked = &section.ObservedAt

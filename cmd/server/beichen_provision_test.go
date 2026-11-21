@@ -36,8 +36,10 @@ func TestBeichenProvisionStartupInputs(t *testing.T) {
 	if err := configureBeichen(ctx, s, "", panelFixture, `{"`+uuid.NewString()+`":4}`); err != nil {
 		t.Fatal("legacy price-only configuration failed", err)
 	}
+	if err := configureBeichen(ctx, s, "", panelFixture, ""); err != nil {
+		t.Fatal("standalone panel bearer was rejected", err)
+	}
 	for _, tc := range []struct{ name, raw, token, groups string }{
-		{"incomplete legacy", "", panelFixture, ""},
 		{"malformed legacy", provisionFixture, panelFixture, "[]"},
 		{"wrong root", "{}", panelFixture, ""},
 		{"absent channels", "[]", panelFixture, ""},

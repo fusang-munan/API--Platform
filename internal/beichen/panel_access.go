@@ -67,10 +67,13 @@ func accountDigest(identity string) string {
 }
 
 type priceAccess struct {
+	providerID  uuid.UUID
 	groupID     int64
 	channel     string
 	label       string
 	legacyToken string
+	legacyErr   error
+	webAccount  string
 	disabled    bool
 }
 
@@ -80,11 +83,11 @@ func (s *Service) loadPriceAccess(ctx context.Context, credentialID uuid.UUID) (
 	var actor uuid.NullUUID
 	var encrypted []byte
 	err := s.db.QueryRowContext(ctx, `
-SELECT a.group_id,a.token_ciphertext,a.updated_by,COALESCE(j.channel,''),c.label::text
+SELECT a.group_id,a.token_ciphertext,a.updated_by,COALESCE(j.channel,''),c.label::text,c.provider_id
 FROM provider_credentials c
 LEFT JOIN beichen_panel_access a ON a.credential_id=c.id
 LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
-WHERE c.id=$1`, credentialID).Scan(&group, &encrypted, &actor, &access.channel, &access.label)
+WHERE c.id=$1`, credentialID).Scan(&group, &encrypted, &actor, &access.channel, &access.label, &access.providerID)
 	if err != nil {
 		return priceAccess{}, errors.New("读取北辰采价配置失败")
 	}
@@ -102,44 +105,131 @@ WHERE c.id=$1`, credentialID).Scan(&group, &encrypted, &actor, &access.channel, 
 	}
 	source, err := s.storedPanelAccess(credentialID, encrypted)
 	if err != nil {
-		return priceAccess{}, err
+		access.legacyErr = err
+		return access, nil
 	}
-	if source.webAccount != "" {
-		if !s.WebSessionConfigured() {
-			return priceAccess{}, errors.New("未配置北辰学校网页会话")
-		}
-		if source.webAccount != accountDigest(s.webPanelIdentity()) {
-			return priceAccess{}, errors.New("北辰绑定的学校网页登录身份与本机配置不一致")
-		}
-	}
-	access.groupID, access.legacyToken = group.Int64, source.Token
+	access.groupID, access.legacyToken, access.webAccount = group.Int64, source.Token, source.webAccount
 	return access, nil
+}
+
+func (s *Service) checkLegacyPriceAccount(access priceAccess) error {
+	if access.legacyErr != nil {
+		return access.legacyErr
+	}
+	if access.webAccount != "" {
+		if !s.WebSessionConfigured() {
+			return errors.New("未配置北辰学校网页会话")
+		}
+		if access.webAccount != accountDigest(s.webPanelIdentity()) {
+			return errors.New("北辰绑定的学校网页登录身份与本机配置不一致")
+		}
+	}
+	return nil
 }
 
 // PanelUsageAccess returns the current explicit per-key usage binding. The
 // caller must match both ID and revision against the values pinned at dispatch.
 // A missing, disabled, or outdated binding returns zero values.
 func (s *Service) PanelUsageAccess(ctx context.Context, credentialID uuid.UUID) (token string, upstreamKeyID int64, revision time.Time, err error) {
+	binding, err := s.panelUsageAccess(ctx, credentialID)
+	return binding.auth.bearer, binding.key, binding.revision, err
+}
+
+type panelUsageBinding struct {
+	auth                panelAuthorization
+	managed             bool
+	provider            uuid.UUID
+	key, group, owner   int64
+	channel, label      string
+	inferenceCiphertext []byte
+	revision            time.Time
+}
+
+func (s *Service) panelUsageAccess(ctx context.Context, credentialID uuid.UUID) (panelUsageBinding, error) {
+	var binding panelUsageBinding
 	var encrypted []byte
-	err = s.db.QueryRowContext(ctx, `
-SELECT a.token_ciphertext, a.upstream_key_id, a.updated_at
+	err := s.db.QueryRowContext(ctx, `
+SELECT a.token_ciphertext,a.upstream_key_id,a.updated_at,c.provider_id,a.group_id,
+       COALESCE(j.upstream_user_id,0),COALESCE(j.channel,''),c.label::text,c.credential_ciphertext
 FROM beichen_panel_access a
 JOIN provider_credentials c ON c.id = a.credential_id
 JOIN providers p ON p.id = c.provider_id
+LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
 WHERE a.credential_id = $1 AND a.upstream_key_id IS NOT NULL
   AND a.updated_at = c.updated_at AND c.status = 'active' AND p.status = 'active'
-  AND `+beichenProvider, credentialID).Scan(&encrypted, &upstreamKeyID, &revision)
+  AND `+beichenProvider, credentialID).Scan(&encrypted, &binding.key, &binding.revision, &binding.provider,
+		&binding.group, &binding.owner, &binding.channel, &binding.label, &binding.inferenceCiphertext)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", 0, time.Time{}, nil
+		return panelUsageBinding{}, nil
 	}
 	if err != nil {
-		return "", 0, time.Time{}, errors.New("读取北辰逐笔查账配置失败")
+		return panelUsageBinding{}, errors.New("读取北辰逐笔查账配置失败")
 	}
-	token, err = s.resolvePanelToken(ctx, credentialID, encrypted)
+	auth, managed, err := s.managedPanelAuthorization(ctx, binding.provider, "")
 	if err != nil {
-		return "", 0, time.Time{}, err
+		return panelUsageBinding{}, err
 	}
-	return token, upstreamKeyID, revision, nil
+	if !managed {
+		binding.auth.bearer, err = s.resolvePanelToken(ctx, credentialID, encrypted)
+		return binding, err
+	}
+	// A legacy binding explicitly authorized with this same environment
+	// bearer has already assigned the Key to that session.
+	if auth.tokenVersion == nil && !auth.shared {
+		if legacy, err := s.storedPanelAccess(credentialID, encrypted); err == nil && legacy.Token == auth.bearer {
+			binding.auth, binding.managed = auth, true
+			return binding, nil
+		}
+	}
+	binding.auth, err = readWithPanelSession(ctx, s, binding.provider, auth, true,
+		func(candidate panelAuthorization) (panelAuthorization, error) {
+			return candidate, s.confirmPanelUsageBinding(ctx, binding, candidate.bearer)
+		})
+	if err != nil {
+		return panelUsageBinding{}, err
+	}
+	binding.managed = true
+	return binding, nil
+}
+
+func (s *Service) confirmPanelUsageBinding(ctx context.Context, binding panelUsageBinding, token string) error {
+	keys, err := s.accountKeys(ctx, token)
+	if err != nil {
+		return err
+	}
+	if binding.owner != 0 {
+		for _, key := range keys {
+			if key.ID == binding.key && key.UserID == binding.owner && (key.Status == "" || key.Status == "active") {
+				return nil
+			}
+		}
+		return errKeyMatch
+	}
+	secret, err := s.crypto.DecryptCredential(binding.inferenceCiphertext)
+	if err != nil {
+		return errors.New("无法核对北辰网页会话与渠道的归属")
+	}
+	key, err := identifyChannel(secret, binding.channel, binding.label, keys)
+	if err != nil || key.ID != binding.key {
+		return errKeyMatch
+	}
+	return nil
+}
+
+func readPanelUsage[T any](ctx context.Context, s *Service, binding *panelUsageBinding, read func(string) (T, error)) (T, error) {
+	if !binding.managed {
+		return read(binding.auth.bearer)
+	}
+	return readWithPanelSession(ctx, s, binding.provider, binding.auth, true, func(auth panelAuthorization) (T, error) {
+		if auth.bearer != binding.auth.bearer {
+			if err := s.confirmPanelUsageBinding(ctx, *binding, auth.bearer); err != nil {
+				var zero T
+				return zero, err
+			}
+			binding.auth = auth
+		}
+		return read(auth.bearer)
+	})
 }
 
 func (s *Service) storedPanelAccess(credentialID uuid.UUID, encrypted []byte) (PanelAccessInput, error) {

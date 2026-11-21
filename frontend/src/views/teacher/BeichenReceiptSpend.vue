@@ -4,6 +4,7 @@ defineProps<{ spend: BeichenReceiptSpend }>()
 const sources: Record<string, string> = {
   gateway_usage_price: '网关用量与报价', receipt_usage_price: '回执用量与报价',
   receipt_actual_cost: '回执实付补记', legacy: '历史记账', mixed: '多种来源',
+  teacher_manual_price: '教师手动价', derived_from_usage: '反推价，待核对',
 }
 </script>
 

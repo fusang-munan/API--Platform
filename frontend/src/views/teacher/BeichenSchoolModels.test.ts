@@ -652,6 +652,48 @@ describe('北辰模型管理', () => {
     expect(wrapper.find('.price-grid').exists()).toBe(false)
   })
 
+  it('把历史流水报价标为待核对并保留手动修正入口', async () => {
+    const data = overview([{ model: 'claude-opus-5-5', catalog: { price_state: 'derived', price_covered: true } }])
+    data.models![0].price_status = 'derived'
+    data.models![0].price_source = 'derived_from_usage'
+    data.models![0].price_observed_at = '2026-11-21T12:14:00Z'
+    data.models![0].price_conditions_exact = { billing_mode: 'token', input_price: '0.000004', output_price: '0.00002' }
+    api.beichenOverview.mockResolvedValue(data)
+    const wrapper = view()
+    await flushPromises()
+    const model = wrapper.get('[data-model="claude-opus-5-5"]')
+    expect(model.get('.standard-price .status-pill').text()).toBe('反推价，待核对')
+    expect(model.get('.standard-price').text()).toContain('反推时间')
+    expect(wrapper.findAll('th').some(header => header.text() === '基础报价')).toBe(true)
+    expect(model.get('[aria-label="定价 claude-opus-5-5"]').text()).toBe('手动定价')
+  })
+
+  it('显示四路核对的型号差异与官网报价单位', async () => {
+    const data = overview([{ model: 'claude-fable-5' }])
+    data.website_only_status = 'compared'
+    data.website_directory = {
+      state: 'fresh', last_success: '2026-11-21T12:00:00Z', last_error: null, price_unit: '元（北辰余额单位）',
+      last_run: {
+        started_at: '2026-11-21T12:00:00Z', duration_ms: 40, platform_count: 2, group_count: 2,
+        model_count: 2, expected_model_count: 2, failures: [],
+        key_model_comparisons: [
+          { channel: 'CC1', group_id: 2, state: 'checked', only_key: ['local-key-model'], only_channel: ['site-model'],
+            matched: [{ key_model: 'CLAUDE-FABLE-5', channel_model: 'claude-fable-5', match: 'normalized', price_complete: true }] },
+          { channel: 'Gemini', group_id: 5, state: 'unavailable', error: '北辰接口返回 HTTP 403', matched: [], only_key: [], only_channel: [] },
+        ],
+      },
+    }
+    api.beichenOverview.mockResolvedValue(data)
+    const wrapper = view()
+    await flushPromises()
+    const compare = wrapper.get('[aria-label="官网目录"] details')
+    expect(compare.text()).toContain('CLAUDE-FABLE-5 → claude-fable-5')
+    expect(compare.text()).toContain('仅 Key · local-key-model')
+    expect(compare.text()).toContain('仅官网 · site-model')
+    expect(compare.text()).toContain('北辰接口返回 HTTP 403')
+    expect(wrapper.text()).toContain('官网报价单位为元（北辰余额单位）')
+  })
+
   it('显示五维状态，重复协议只算一次，新字段为 null 时仍能读旧数据', async () => {
     const data = overview([
       { model: 'lab/new', catalog: { key_count: 2, route_count: 4, ready_count: 2, activation: 'ready', price_state: 'confirmed' } },

@@ -1,0 +1,51 @@
+{
+  "code": 0,
+  "data": [
+    {
+      "id": 80,
+      "name": "ClaudeCode",
+      "status": "active",
+      "platforms": [{
+        "platform": "anthropic",
+        "groups": [
+          {
+            "id": 301,
+            "name": "ClaudeCode 0.3 fixture",
+            "platform": "anthropic",
+            "subscription_type": "standard",
+            "rate_multiplier": 0.3,
+            "peak_rate_enabled": false,
+            "supported_models": [
+              {"name": "claude-sonnet-4-6", "pricing": {"billing_mode": "token", "input_price": 0.000006, "output_price": 0.000021, "cache_read_price": 0.0000006, "cache_write_price": 0.0000075}},
+              {"name": "claude-haiku-4-5", "pricing": {"billing_mode": "token", "input_price": 0.000001, "output_price": 0.000005, "cache_read_price": 0, "cache_write_price": null}, "group_id": 301}
+            ]
+          },
+          {
+            "id": 602,
+            "name": "[CC2]ClaudeCode高智",
+            "platform": "anthropic",
+            "subscription_type": "standard",
+            "rate_multiplier": 0.6,
+            "peak_rate_enabled": false,
+            "supported_models": [
+              {"name": "claude-opus-4-6", "pricing": {"billing_mode": "token", "input_price": 0.000010, "output_price": 0.000045, "cache_read_price": 0.000001, "cache_write_price": 0.0000125, "image_input_price": "", "video_output_price": null}},
+              {"name": "claude-sonnet-4-6", "pricing": {"billing_mode": "token", "input_price": 0.000004, "output_price": 0.000018, "cache_read_price": 0.0000004, "cache_write_price": 0.000005}}
+            ]
+          }
+        ]
+      }]
+    },
+    {
+      "id": 90,
+      "name": "GM1 fixture",
+      "platforms": [{
+        "platform": "openai",
+        "groups": [{"id": 160, "name": "GM1", "platform": "openai", "subscription_type": "standard", "rate_multiplier": 0.16, "peak_rate_enabled": false}],
+        "supported_models": [
+          {"name": "glm-5.3", "pricing": 0},
+          {"name": "kimi-k3.1-pro", "pricing": ""}
+        ]
+      }]
+    }
+  ]
+}

@@ -70,6 +70,18 @@ func receiptListResponse(t *testing.T, req *http.Request, entries []receiptRow) 
 	return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(raw))}, nil
 }
 
+func expectReceiptBinding(mock sqlmock.Sqlmock, credential, provider uuid.UUID, encrypted []byte, key int64, revision time.Time) {
+	rows := sqlmock.NewRows([]string{"token", "key", "revision", "provider", "group", "owner", "channel", "label", "inference"})
+	if key != 0 {
+		rows.AddRow(encrypted, key, revision, provider, 2, 0, "", "fixture", nil)
+	}
+	mock.ExpectQuery("SELECT a.token_ciphertext,a.upstream_key_id,a.updated_at").WithArgs(credential).WillReturnRows(rows)
+	if key != 0 {
+		mock.ExpectQuery("FROM beichen_panel_accounts WHERE provider_id").WithArgs(provider).
+			WillReturnRows(sqlmock.NewRows([]string{"mode"}))
+	}
+}
+
 func TestReceiptWorkerContinuesBusyDayAndRejectsLateDuplicate(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -83,6 +95,7 @@ func TestReceiptWorkerContinuesBusyDayAndRejectsLateDuplicate(t *testing.T) {
 	}
 	s := New(db, manager)
 	credential, response, duplicate := uuid.New(), uuid.New(), uuid.New()
+	provider := uuid.New()
 	now := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
 	day := now.In(beijing).Truncate(24 * time.Hour)
 	expectAccess := func(token string) {
@@ -91,8 +104,7 @@ func TestReceiptWorkerContinuesBusyDayAndRejectsLateDuplicate(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		mock.ExpectQuery("SELECT a.token_ciphertext, a.upstream_key_id, a.updated_at").WithArgs(credential).
-			WillReturnRows(sqlmock.NewRows([]string{"token", "key", "revision"}).AddRow(encrypted, 42, now))
+		expectReceiptBinding(mock, credential, provider, encrypted, 42, now)
 	}
 	mock.ExpectQuery("WITH eligible AS").WithArgs(credential, time.Time{}, "", uuid.Nil, 400).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "response", "key", "revision", "model", "sent", "finalized", "day"}).
@@ -193,13 +205,9 @@ func TestReceiptRequiresPinnedBindingThroughoutRead(t *testing.T) {
 			mock.ExpectQuery("WITH eligible AS").WithArgs(credential, time.Time{}, "", uuid.Nil, 400).
 				WillReturnRows(sqlmock.NewRows([]string{"id", "response", "key", "revision", "model", "sent", "finalized", "day"}).
 					AddRow(uuid.New(), response, 42, now, "model", now, now, now))
+			provider := uuid.New()
 			expectBinding := func(keyID int64, revision time.Time) {
-				rows := sqlmock.NewRows([]string{"token", "key", "revision"})
-				if keyID != 0 {
-					rows.AddRow(encrypted, keyID, revision)
-				}
-				mock.ExpectQuery("SELECT a.token_ciphertext, a.upstream_key_id, a.updated_at").
-					WithArgs(credential).WillReturnRows(rows)
+				expectReceiptBinding(mock, credential, provider, encrypted, keyID, revision)
 			}
 			expectBinding(tc.beforeKey, now)
 			if tc.fetches > 0 {

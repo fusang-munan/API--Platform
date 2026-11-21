@@ -456,7 +456,9 @@ async function savePrice() {
                 </thead>
                 <tbody>
                   <tr v-for="row in modelRows" :key="JSON.stringify([row.credential_id, row.model])">
-                    <th scope="row">{{ row.model }}<small class="muted">{{ credentialLabel(row.credential_id) }}</small></th>
+                    <th scope="row">{{ row.model }}<small class="muted">{{ credentialLabel(row.credential_id) }}</small>
+                      <small v-if="row.price_source === 'derived_from_usage'" class="muted">反推价，待核对</small>
+                    </th>
                     <td>
                       {{ row.mode === 'manual' ? '手填' : '跟随' }}
                       <button type="button" class="button ghost beichen-edit" :disabled="busy" :aria-label="`编辑价格 ${row.model} · ${credentialLabel(row.credential_id)}`" @click="editPrice(row, $event)">编辑价格</button>

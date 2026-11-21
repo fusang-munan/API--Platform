@@ -3,6 +3,7 @@ package beichen
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"maps"
 	"slices"
@@ -13,19 +14,28 @@ import (
 )
 
 type CrawlOptions struct {
-	Fixture    []byte
-	PanelToken string
-	MatchDB    bool
-	ProviderID uuid.UUID
+	Fixture       []byte
+	PanelToken    string
+	MatchDB       bool
+	IncludeKeys   bool
+	SaveKeys      bool
+	CompareModels bool
+	ProviderID    uuid.UUID
 }
 
 type CrawlReport struct {
 	CrawlRun
-	Source        string       `json:"source"`
-	Complete      bool         `json:"complete"`
-	KeyMatching   string       `json:"key_matching"`
-	KeyMatchError string       `json:"key_match_error,omitempty"`
-	Models        []CrawlModel `json:"models"`
+	Source         string       `json:"source"`
+	PriceUnit      string       `json:"price_unit"`
+	Complete       bool         `json:"complete"`
+	KeyMatching    string       `json:"key_matching"`
+	KeyMatchError  string       `json:"key_match_error,omitempty"`
+	Keys           *[]CrawlKey  `json:"keys,omitempty"`
+	KeyReadError   string       `json:"key_read_error,omitempty"`
+	KeyModelsError string       `json:"key_models_error,omitempty"`
+	KeyStorage     string       `json:"key_storage,omitempty"`
+	KeySaveError   string       `json:"key_save_error,omitempty"`
+	Models         []CrawlModel `json:"models"`
 }
 
 type CrawlModel struct {
@@ -35,20 +45,34 @@ type CrawlModel struct {
 }
 
 type CrawlSource struct {
-	ChannelID     int64          `json:"channel_id,omitempty"`
-	Channel       string         `json:"channel,omitempty"`
-	Platform      string         `json:"platform"`
-	Groups        []WebsiteGroup `json:"groups"`
-	PriceComplete bool           `json:"price_complete"`
-	PriceBlocker  string         `json:"price_blocker,omitempty"`
-	IgnoredFields []string       `json:"ignored_fields"`
+	ChannelID     int64           `json:"channel_id,omitempty"`
+	Channel       string          `json:"channel,omitempty"`
+	Platform      string          `json:"platform"`
+	Groups        []WebsiteGroup  `json:"groups"`
+	ObservedAt    time.Time       `json:"observed_at"`
+	PriceComplete bool            `json:"price_complete"`
+	PriceBlocker  string          `json:"price_blocker,omitempty"`
+	Pricing       json.RawMessage `json:"pricing"`
+	MissingFields []string        `json:"missing_price_fields"`
+	IgnoredFields []string        `json:"ignored_fields"`
 }
 
-// CrawlDirectory uses the scheduled website parser and can compare its result
-// with already saved Key catalogs. This path never runs a Key scan or probe.
+// CrawlDirectory uses the scheduled website parser. The optional inventory uses
+// the same website session and joins model membership by numeric group ID.
 func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (CrawlReport, error) {
+	includeKeys := options.IncludeKeys || options.SaveKeys
+	if options.Fixture != nil && includeKeys {
+		return CrawlReport{}, errors.New("离线 fixture 不读取或保存官网 Key 清单")
+	}
+	if options.CompareModels && (options.Fixture != nil || s.db == nil || s.crypto == nil) {
+		return CrawlReport{}, errors.New("实时核对型号需要官网会话、数据库和凭据加密密钥")
+	}
+	if options.SaveKeys && (s.db == nil || s.crypto == nil) {
+		return CrawlReport{}, errors.New("保存官网 Key 清单需要数据库和凭据加密密钥")
+	}
 	source := "website"
 	var crawl directoryCrawl
+	var keyCrawl crawlWebsiteKeys
 	var err error
 	if options.Fixture != nil {
 		source = "fixture"
@@ -56,11 +80,46 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 		crawl, err = decodeWebsiteDirectory(options.Fixture, start.UTC())
 		crawl.StartedAt, crawl.DurationMS = start.UTC(), time.Since(start).Milliseconds()
 	} else {
-		crawl, err = s.crawlWebsiteDirectory(ctx, options.PanelToken)
+		provider := options.ProviderID
+		if options.SaveKeys || options.CompareModels || provider == uuid.Nil && s.db != nil && s.crypto != nil {
+			provider, err = s.ResolvePanelProvider(ctx, provider)
+		}
+		if err == nil {
+			if includeKeys {
+				crawl, err, keyCrawl = s.crawlDirectoryAndKeys(ctx, provider, options)
+			} else {
+				crawl, err = s.crawlWebsiteDirectory(ctx, provider, options.PanelToken)
+			}
+			if options.CompareModels && crawl.membershipComplete {
+				crawl.KeyModelComparisons, crawl.KeyModelError = s.crawlKeyModels(ctx, provider, &crawl, options.PanelToken)
+				crawl.DurationMS = time.Since(crawl.StartedAt).Milliseconds()
+			}
+		}
 	}
 	report := CrawlReport{
-		CrawlRun: crawl.CrawlRun, Source: source, Complete: err == nil,
+		CrawlRun: crawl.CrawlRun, Source: source, PriceUnit: websitePriceUnit, Complete: err == nil,
 		KeyMatching: "not_checked", Models: make([]CrawlModel, 0, crawl.ModelCount),
+	}
+	if includeKeys {
+		keys := crawl.checkedKeys(keyCrawl.keys, keyCrawl.models)
+		report.Keys = &keys
+		if keyCrawl.readErr != nil {
+			report.KeyReadError = keyCrawl.readErr.Error()
+		}
+		if keyCrawl.modelsErr != nil {
+			report.KeyModelsError = keyCrawl.modelsErr.Error()
+		}
+		if options.SaveKeys {
+			report.KeyStorage = "failed"
+			if keyCrawl.saved {
+				report.KeyStorage = "saved"
+			}
+			if keyCrawl.saveErr != nil {
+				report.KeySaveError = keyCrawl.saveErr.Error()
+			}
+		}
+		err = errors.Join(err, keyCrawl.readErr, keyCrawl.modelsErr, keyCrawl.saveErr)
+		report.Complete = err == nil
 	}
 	var keys []discoveryKey
 	if options.MatchDB && crawl.ModelCount != 0 {
@@ -77,8 +136,8 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 	models := map[string]*CrawlModel{}
 	locations := map[string][]WebsiteLocation{}
 	for _, section := range crawl.platforms {
-		groups := websiteGroups(section.Groups)
 		for _, observation := range section.Models {
+			groups := websiteGroups(directoryModelGroups(section, observation))
 			name := observation.Name
 			if models[name] == nil {
 				models[name] = &CrawlModel{Name: name, KeyMatches: []CatalogKey{}}
@@ -86,7 +145,8 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 			row := models[name]
 			row.Sources = append(row.Sources, CrawlSource{
 				ChannelID: section.ChannelID, Channel: section.Channel, Platform: section.Platform, Groups: groups,
-				PriceComplete: observation.priceBlocker == "", PriceBlocker: observation.priceBlocker,
+				ObservedAt: observation.ObservedAt, MissingFields: websiteMissingPriceFields(observation.Pricing),
+				PriceComplete: observation.priceBlocker == "", PriceBlocker: observation.priceBlocker, Pricing: observation.Pricing,
 				IgnoredFields: append([]string{}, usage.BeichenPanelIgnoredFields(observation.Pricing)...),
 			})
 			locations[name] = append(locations[name], WebsiteLocation{
@@ -161,8 +221,10 @@ WHERE m.provider_id=$1 AND m.status='active' AND c.status='active' AND p.status=
 	return keys, nil
 }
 
-func findCrawlProvider(ctx context.Context, tx *sql.Tx) (uuid.UUID, error) {
-	rows, err := tx.QueryContext(ctx, "SELECT p.id FROM providers p WHERE p.status='active' AND "+beichenProvider+" LIMIT 2")
+func findCrawlProvider(ctx context.Context, db interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) (uuid.UUID, error) {
+	rows, err := db.QueryContext(ctx, "SELECT p.id FROM providers p WHERE p.status='active' AND "+beichenProvider+" LIMIT 2")
 	if err != nil {
 		return uuid.Nil, errors.New("查询北辰供应商失败，请检查数据库连接")
 	}

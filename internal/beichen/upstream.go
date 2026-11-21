@@ -46,11 +46,15 @@ func (s *Service) fetch(ctx context.Context, key, path string, query url.Values)
 	default:
 		return nil, errors.New("北辰接口路径无效")
 	}
+	return s.fetchKeyGET(ctx, key, "api.beichenapi.com", path, query)
+}
+
+func (s *Service) fetchKeyGET(ctx context.Context, key, host, path string, query url.Values) ([]byte, error) {
 	key = strings.TrimSpace(key)
 	if key == "" || len(key) > 4096 || strings.ContainsAny(key, "\r\n") {
 		return nil, errors.New("北辰凭据格式无效")
 	}
-	target := url.URL{Scheme: "https", Host: "api.beichenapi.com", Path: path, RawQuery: query.Encode()}
+	target := url.URL{Scheme: "https", Host: host, Path: path, RawQuery: query.Encode()}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return nil, errors.New("构建北辰请求失败")
@@ -164,11 +168,14 @@ func parsePricing(data json.RawMessage) (string, []priceRow, error) {
 }
 
 type usageCounters struct {
-	Requests   *int64       `json:"requests"`
-	Input      *int64       `json:"input_tokens"`
-	Output     *int64       `json:"output_tokens"`
-	CacheRead  *int64       `json:"cache_read_tokens"`
-	ActualCost *json.Number `json:"actual_cost"`
+	Requests    *int64       `json:"requests"`
+	Input       *int64       `json:"input_tokens"`
+	Output      *int64       `json:"output_tokens"`
+	CacheRead   *int64       `json:"cache_read_tokens"`
+	TotalTokens *int64       `json:"total_tokens"`
+	Cost        *json.Number `json:"cost"`
+	ActualCost  *json.Number `json:"actual_cost"`
+	AccountCost *json.Number `json:"account_cost"`
 }
 
 func (c usageCounters) counts(cacheWrite *int64) [5]*int64 {
@@ -178,21 +185,27 @@ func (c usageCounters) counts(cacheWrite *int64) [5]*int64 {
 type dailyUsagePoint struct {
 	Date string `json:"date"`
 	usageCounters
-	CacheWrite *int64 `json:"cache_write_tokens"`
+	CacheWrite    *int64 `json:"cache_write_tokens"`
+	CacheCreation *int64 `json:"cache_creation_tokens,omitempty"`
+}
+
+type modelUsagePoint struct {
+	Model string `json:"model"`
+	Date  string `json:"date,omitempty"`
+	usageCounters
+	CacheCreation *int64 `json:"cache_creation_tokens,omitempty"`
+	CacheWrite    *int64 `json:"cache_write_tokens,omitempty"`
 }
 
 type usageResponse struct {
-	Mode     string `json:"mode"`
-	Valid    *bool  `json:"isValid"`
-	Date     string `json:"date"`
-	Timezone string `json:"timezone"`
-	Unit     string `json:"unit"`
-	Models   []struct {
-		Model string `json:"model"`
-		usageCounters
-		CacheCreation *int64 `json:"cache_creation_tokens"`
-	} `json:"model_stats"`
-	Daily []dailyUsagePoint `json:"daily_usage"`
+	Mode     string            `json:"mode"`
+	Valid    *bool             `json:"isValid"`
+	Date     string            `json:"date"`
+	Timezone string            `json:"timezone"`
+	Unit     string            `json:"unit"`
+	Balance  *json.Number      `json:"balance"`
+	Models   []modelUsagePoint `json:"model_stats"`
+	Daily    []dailyUsagePoint `json:"daily_usage"`
 }
 
 func parseUsage(body []byte, day string) ([]usageRow, error) {
@@ -268,7 +281,7 @@ func verifyDailyUsage(response usageResponse, day string) error {
 	totals := [5]int64{}
 	complete := [5]bool{true, true, true, true, true}
 	cost := new(big.Rat)
-	costKnown := response.Unit == "USD"
+	costKnown := response.Unit != ""
 	for _, model := range response.Models {
 		for index, value := range model.counts(model.CacheCreation) {
 			if value == nil {
@@ -284,8 +297,11 @@ func verifyDailyUsage(response usageResponse, day string) error {
 			costKnown = false
 		}
 		if costKnown {
-			// parseUsage already validated every USD amount.
-			cost.Add(cost, exactDecimal(*model.ActualCost))
+			amount := exactDecimal(*model.ActualCost)
+			if amount == nil {
+				return errors.New("北辰模型用量实际费用格式无效")
+			}
+			cost.Add(cost, amount)
 		}
 	}
 	matches := func(point dailyUsagePoint) (bool, error) {

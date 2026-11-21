@@ -245,14 +245,16 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 	execTestSQL(t, ctx, tx, `INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,effective_at,input_rate,output_rate,cache_read_rate,cache_write_rate)
  VALUES($1,'matched','upstream','effective','billing','2026-01-01',1000000,2000000,1000000,1000000),
  ($2,'matched','upstream','effective','billing','2026-01-01',1000000,2000000,1000000,1000000)`, first, second)
-	execTestSQL(t, ctx, tx, `INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros,source)
- VALUES($1,$2,'2026-11-20','matched',2,150,20,40,10,330000,'usage'),
- ($1,$3,'2026-11-20','matched',1,10,3,0,0,10000,'usage'),
- ($1,$2,'2026-11-20','one-sided',1,40,0,0,0,40000,'usage'),
- ($1,$2,'2026-11-19','prior',1,1,1,0,0,500000,'usage')`, provider, first, second)
-	execTestSQL(t, ctx, tx, `INSERT INTO beichen_usage_days(provider_id,credential_id,day,empty) VALUES
- ($1,$2,'2026-11-18',true),($1,$2,'2026-11-20',false)`, provider, first)
+	execTestSQL(t, ctx, tx, `INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros,source,actor_id)
+ VALUES($1,$2,'2026-11-20','matched',2,150,20,40,10,330000,'csv',$4),
+ ($1,$3,'2026-11-20','matched',1,10,3,0,0,10000,'csv',$4),
+ ($1,$2,'2026-11-20','one-sided',1,40,0,0,0,40000,'csv',$4),
+ ($1,$2,'2026-11-19','prior',1,1,1,0,0,500000,'csv',$4)`, provider, first, second, reportImportActor)
 	now := time.Date(2026, 11, 20, 4, 0, 0, 0, beijing)
+	seedVerifiedKeyDay(t, ctx, tx, first, 41, "2026-11-18", now, "unknown",
+		`{"requests":0,"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"actual_cost":0}`, `[]`)
+	seedVerifiedKeyDay(t, ctx, tx, first, 41, "2026-11-20", now, "CNY",
+		`{"requests":3,"actual_cost":0.37}`, `[{"model":"matched","actual_cost":0.33},{"model":"one-sided","actual_cost":0.04}]`)
 	period, _ := reportPeriod("day", now)
 	usage, err := readModelUsage(ctx, tx, &provider, period)
 	if err != nil {
@@ -353,8 +355,10 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 			t.Fatalf("%s 覆盖情况错误: %+v, err=%v", value, view, err)
 		}
 	}
-	execTestSQL(t, ctx, tx, `INSERT INTO beichen_usage_days(provider_id,credential_id,day,empty) VALUES
- ($1,$2,'2026-11-19',false),($1,$3,'2026-11-20',false)`, provider, first, second)
+	seedVerifiedKeyDay(t, ctx, tx, first, 41, "2026-11-19", now, "CNY",
+		`{"requests":1,"actual_cost":0.5}`, `[{"model":"prior","actual_cost":0.5}]`)
+	seedVerifiedKeyDay(t, ctx, tx, second, 42, "2026-11-20", now, "CNY",
+		`{"requests":1,"actual_cost":0.01}`, `[{"model":"matched","actual_cost":0.01}]`)
 	view, err = readReconciliation(ctx, tx, provider, period, now)
 	if err != nil || view.Coverage.ComparableDays != 3 || len(view.Coverage.MissingDays) != 0 ||
 		!view.Totals.Money.MarginAvailable || reportDecimal(view.Totals.Money.MarginYuan) != "-0.4739999999999999999999" ||
@@ -362,7 +366,6 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 		t.Fatalf("补齐账日后应恢复差额: %+v, err=%v", view, err)
 	}
 	// 凭据删除不删除已归档账单，本地存在 provider_id 的调用也仍可追溯。
-	execTestSQL(t, ctx, tx, "DELETE FROM beichen_usage_days WHERE credential_id=$1", second)
 	execTestSQL(t, ctx, tx, "DELETE FROM provider_credentials WHERE id=$1", second)
 	period, _ = reportPeriod("day", now)
 	view, err = readReconciliation(ctx, tx, provider, period, now)
@@ -418,18 +421,22 @@ func TestReconciliationPostgresMissingCostRemainsUnknown(t *testing.T) {
 	execTestSQL(t, ctx, tx, "INSERT INTO providers VALUES($1,$2)", provider, origin)
 	execTestSQL(t, ctx, tx, `INSERT INTO provider_credentials VALUES
  ($1,$4,'已知渠道','2026-11-20 00:00+08'),($2,$4,'未知渠道','2026-11-20 00:00+08'),($3,$4,'零扣款渠道','2026-11-20 00:00+08')`, first, second, zero, provider)
-	execTestSQL(t, ctx, tx, `INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros,source)
- VALUES($1,$2,'2026-11-20','partial',1,10,1,0,0,5000,'usage'),
- ($1,$3,'2026-11-20','partial',1,10,1,0,0,NULL,'usage'),
- ($1,$3,'2026-11-20','unknown',1,10,1,0,0,NULL,'usage'),
- ($1,$4,'2026-11-20','zero',1,0,0,0,0,0,'usage')`, provider, first, second, zero)
-	execTestSQL(t, ctx, tx, `INSERT INTO beichen_usage_days(provider_id,credential_id,day,empty)
- VALUES($1,$2,'2026-11-20',false),($1,$3,'2026-11-20',false),($1,$4,'2026-11-20',false)`, provider, first, second, zero)
+	execTestSQL(t, ctx, tx, `INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros,source,actor_id)
+ VALUES($1,$2,'2026-11-20','partial',1,10,1,0,0,5000,'csv',$5),
+ ($1,$3,'2026-11-20','partial',1,10,1,0,0,NULL,'csv',$5),
+ ($1,$3,'2026-11-20','unknown',1,10,1,0,0,NULL,'csv',$5),
+ ($1,$4,'2026-11-20','zero',1,0,0,0,0,0,'csv',$5)`, provider, first, second, zero, reportImportActor)
 	call := reportCallFixture{provider: provider, credential: first, project: uuid.New(), user: uuid.New(), key: uuid.New(),
 		model: "partial", protocol: "anthropic", state: "charged", usage: "reported", credits: "11", base: "10", multiplier: "1.1",
 		sent: "2026-11-20T00:10:00+08:00", prompt: 10, output: 1, read: 0, write: 0}
 	insertReportCall(t, ctx, tx, call)
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, beijing)
+	seedVerifiedKeyDay(t, ctx, tx, first, 41, "2026-11-20", now, "CNY",
+		`{"requests":1,"actual_cost":0.005}`, `[{"model":"partial","actual_cost":0.005}]`)
+	seedVerifiedKeyDay(t, ctx, tx, second, 42, "2026-11-20", now, "CNY",
+		`{"requests":2,"actual_cost":null}`, `[{"model":"partial"},{"model":"unknown"}]`)
+	seedVerifiedKeyDay(t, ctx, tx, zero, 43, "2026-11-20", now, "CNY",
+		`{"requests":1,"actual_cost":0}`, `[{"model":"zero","actual_cost":0}]`)
 	period, _ := reportPeriod("day", now)
 	view, err := readReconciliation(ctx, tx, provider, period, now)
 	if err != nil {

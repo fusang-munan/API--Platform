@@ -86,6 +86,30 @@ beforeEach(() => {
 })
 
 describe('北辰模型定价范围', () => {
+  it('标注反推来源，并可按正常的手动价格入口保存修正', async () => {
+    const data = overview()
+    data.model_catalog[0].price_state = 'derived'
+    data.models[0].price_source = 'derived_from_usage'
+    data.models[0].price_status = 'derived'
+    api.beichenOverview.mockResolvedValue(data)
+    const model = row()
+    model.quotes[0].status = 'derived'
+    model.quotes[0].statusLabel = '反推价，待核对'
+    const wrapper = await view(model)
+    expect(wrapper.get<HTMLInputElement>('input[value="follow"]').element.checked).toBe(true)
+    expect(wrapper.text()).toContain('反推价，待核对')
+    expect(summary(wrapper)).toEqual(['4', '4', '自动计价'])
+    await manual(wrapper)
+    await button(wrapper, '从反推价带入').trigger('click')
+    await wrapper.get('input[name="input"]').setValue('240')
+    await wrapper.get('input[name="output"]').setValue('1200')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(api.setBeichenModelPrice).toHaveBeenCalledWith('north', expect.objectContaining({
+      model: 'lab/model', mode: 'manual', rates: { input: '240', output: '1200', cache_read: '0', cache_write: '0' },
+    }))
+  })
+
   it('默认确认全部渠道，按模型和 Key 计算影响行数，保存后显示核对一致的 Key 数', async () => {
     const wrapper = await view()
     expect(wrapper.get<HTMLInputElement>('input[value="all"]').element.checked).toBe(true)

@@ -42,14 +42,16 @@ func (r beichenPanelRates) usesTokenBilling() bool {
 
 type beichenPanelTier struct {
 	beichenPanelRates
-	Min *json.Number `json:"min_tokens"`
-	Max *json.Number `json:"max_tokens"`
+	Min   *json.Number `json:"min_tokens"`
+	Max   *json.Number `json:"max_tokens"`
+	Label string       `json:"tier_label"`
 }
 
 type beichenPriceConditions struct {
 	beichenPanelRates
 	Intervals        []beichenPanelTier      `json:"intervals"`
 	EffortMultiplier map[string]*json.Number `json:"reasoning_effort_multipliers"`
+	tierBaseFallback bool
 }
 
 func decodeBeichenConditions(raw json.RawMessage) *beichenPriceConditions {
@@ -72,6 +74,17 @@ func BeichenTokenQuoteUsable(raw json.RawMessage) bool {
 // BeichenTokenQuoteBlocker returns the first obstacle to enabling a quote,
 // or two empty strings when the quote can be enabled.
 func BeichenTokenQuoteBlocker(raw json.RawMessage) (code, message string) {
+	return beichenQuoteBlocker(raw, false)
+}
+
+// BeichenDirectoryQuoteBlocker also accepts a complete fixed non-Token quote
+// for the directory. Publication and settlement still use the Token check.
+func BeichenDirectoryQuoteBlocker(raw json.RawMessage) string {
+	code, _ := beichenQuoteBlocker(raw, true)
+	return code
+}
+
+func beichenQuoteBlocker(raw json.RawMessage, directory bool) (code, message string) {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return "missing_price", "北辰线路缺少可用报价，请同步官网价或设置手动价"
@@ -79,6 +92,18 @@ func BeichenTokenQuoteBlocker(raw json.RawMessage) (code, message string) {
 	quote := decodeBeichenConditions(raw)
 	if quote == nil {
 		return "price_conditions_invalid", "官网报价格式无效或含有暂不支持的计价字段"
+	}
+	if directory && len(quote.Intervals) == 0 {
+		switch quote.BillingMode {
+		case "image", "per_request", "video":
+			if quote.PerRequest == nil {
+				return "missing_per_request", "官网报价缺少每次请求或每秒单价"
+			}
+			if code, message := quote.optionalTokenRateBlocker(); code != "" {
+				return code, "官网报价" + message
+			}
+			return "", ""
+		}
 	}
 	const nonTokenCode = "billing_mode_non_token"
 	const nonTokenMessage = "包含按次、图像或视频等非 Token 计价"
@@ -90,12 +115,11 @@ func BeichenTokenQuoteBlocker(raw json.RawMessage) (code, message string) {
 			return "effort_multiplier_invalid", "官网推理强度倍率无效，应为非负数"
 		}
 	}
-	if len(quote.Intervals) == 0 {
+	if len(quote.Intervals) == 0 || quote.tierBaseFallback {
 		code, message := quote.tokenRateBlocker()
-		if code == "" {
-			return "", ""
+		if code != "" {
+			return code, "官网报价" + message
 		}
-		return code, "官网报价" + message
 	}
 
 	ranges := make([]tokenRange, 0, len(quote.Intervals))
@@ -128,6 +152,10 @@ func (r beichenPanelRates) tokenRateBlocker() (code, message string) {
 	case r.Output == nil:
 		return "missing_output", "缺少输出 Token 单价"
 	}
+	return r.optionalTokenRateBlocker()
+}
+
+func (r beichenPanelRates) optionalTokenRateBlocker() (code, message string) {
 	for _, field := range []struct {
 		label string
 		price *json.Number
@@ -303,6 +331,9 @@ func (c beichenPriceConditions) ratesFor(total int64) (beichenPanelRates, string
 		}
 	}
 	if label == "" {
+		if c.tierBaseFallback {
+			return c.beichenPanelRates, "base", timedCache, ""
+		}
 		return beichenPanelRates{}, "", false, "missing_price_tier"
 	}
 	return rates, label, timedCache, ""

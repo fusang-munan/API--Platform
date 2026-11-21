@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>北辰本机登录 · Nebula</title>
+  <link rel="stylesheet" href="/window.css">
+  <script src="/window.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>北辰本机登录</h1>
+      <p>登录一次，供这台电脑上的北辰爬虫使用。</p>
+    </header>
+    <p id="notice" role="status">正在连接本机服务…</p>
+    <p id="error" role="alert" hidden></p>
+
+    <section id="saved" aria-label="已保存的会话" hidden>
+      <dl>
+        <div><dt>账号</dt><dd id="account"></dd></div>
+        <div><dt>会话到期</dt><dd id="expiry"></dd></div>
+        <div><dt>最后验证</dt><dd id="verified"></dd></div>
+      </dl>
+      <p id="renewal"></p>
+      <div class="actions">
+        <button id="crawl" type="button" class="primary">测试抓取</button>
+        <button id="refresh" type="button">刷新会话</button>
+        <button id="change" type="button">重新登录</button>
+      </div>
+    </section>
+
+    <section id="result" aria-label="测试抓取结果" hidden>
+      <h2>测试抓取结果</h2>
+      <p id="counts"></p>
+      <ul id="failures" hidden></ul>
+    </section>
+
+    <form id="login" autocomplete="off" hidden>
+      <fieldset id="fields">
+        <legend>登录方式</legend>
+        <div class="actions modes">
+          <label><input name="mode" value="password" type="radio" checked> 账号密码</label>
+          <label><input name="mode" value="token" type="radio"> Token 模式</label>
+        </div>
+        <fieldset id="passwordFields" class="inputs">
+          <label for="email">北辰账号邮箱</label>
+          <input id="email" name="email" type="email" required maxlength="254" autocomplete="off">
+          <label for="password">密码</label>
+          <input id="password" name="password" type="password" required maxlength="4096" autocomplete="new-password">
+          <label for="code">验证码（可选）</label>
+          <input id="code" name="code" type="text" maxlength="128" autocomplete="off" spellcheck="false">
+          <label class="remember"><input name="remember" type="checkbox"> 记住账号密码以便续期</label>
+          <p class="help">勾选后，密码会随会话一起加密保存在本机。平时优先使用北辰签发的续期凭证。</p>
+        </fieldset>
+        <fieldset id="tokenFields" class="inputs" disabled hidden>
+          <label for="token">北辰网页 access_token</label>
+          <input id="token" name="token" type="password" required maxlength="4096" autocomplete="off" spellcheck="false">
+          <p class="help">可先在北辰网站完成人机验证，再粘贴该网页会话的 Token。</p>
+        </fieldset>
+        <button id="submit" type="submit" class="primary">登录并保存</button>
+      </fieldset>
+    </form>
+
+    <footer><button id="close" type="button" disabled>关闭窗口</button></footer>
+  </main>
+</body>
+</html>

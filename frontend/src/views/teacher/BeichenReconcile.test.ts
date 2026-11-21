@@ -123,6 +123,28 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
+it('用公开日账对账时保留 USD 金额、来源和模型覆盖率', async () => {
+  const data = response()
+  const upstream = side(32598, '0', { requests: 13, unit: 'USD', actual_cost: '0.004670784', source: 'key_usage' })
+  data.totals.upstream = upstream
+  Object.assign(data.totals.money, { actual_yuan: null, margin_yuan: null, margin_available: false })
+  data.keys[0].upstream = upstream
+  data.models[0].upstream = { ...upstream, actual_cost: '0.0032' }
+  Object.assign(data.coverage, { key_usage_days: 2, key_usage_model_days: 1, stale_key_usage_days: 1 })
+  mocks.reconciliation.mockResolvedValueOnce(data)
+  const view = mountView()
+  await flushPromises()
+  const amount = view.get('[data-kpi="actual-yuan"]')
+  expect(amount.text()).toContain('0.004670784')
+  expect(amount.text()).toContain('USD')
+  expect(amount.text()).not.toContain('元')
+  expect(amount.attributes('data-source')).toBe('key_usage')
+  expect(view.get('.model-details tbody').text()).toContain('0.0032 USD')
+  expect(view.get('.key-details tbody').text()).toContain('0.004670784 USD')
+  expect(view.get('[aria-label="日账覆盖"]').text()).toContain('1 / 2（50%）')
+  expect(button(view, '金额对比').attributes('disabled')).toBeDefined()
+})
+
 beforeEach(() => {
   mocks.reconciliation.mockReset().mockImplementation(async (_id: string, range: BeichenUsageRange) => response(range))
   mocks.providers.mockReset().mockResolvedValue([])

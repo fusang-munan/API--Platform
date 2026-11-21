@@ -232,7 +232,8 @@ func run() error {
 }
 
 func configureBeichen(ctx context.Context, service *controlplane.Service, channels, token, legacyGroups string) error {
-	if channels == "" || legacyGroups != "" {
+	service.Beichen().ConfigurePanelFallback(token)
+	if legacyGroups != "" {
 		if err := service.Beichen().ConfigurePanel(token, legacyGroups); err != nil {
 			return err
 		}

@@ -24,6 +24,12 @@ func (s *Service) runUpstreamUsage(ctx context.Context) {
 		if err != nil && ctx.Err() == nil {
 			slog.Warn("北辰渠道身份待确认")
 		}
+		keySync, cancel := context.WithTimeout(ctx, receiptSweepTimeout)
+		err = s.syncWebsiteKeyInventories(keySync)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			slog.Warn("北辰官网 Key 清单同步未完成")
+		}
 		sweep, cancel := context.WithTimeout(ctx, receiptSweepTimeout)
 		err = s.archiveUsage(sweep)
 		cancel()
@@ -103,20 +109,26 @@ WHERE beichen_usage_checkpoints.revision < excluded.revision`, j.credential, j.r
 	if err != nil {
 		return err
 	}
-	token, key, revision, err := s.PanelUsageAccess(ctx, j.credential)
+	binding, err := s.panelUsageAccess(ctx, j.credential)
 	if err != nil {
 		return err
 	}
-	if token == "" || key != j.key || !revision.Equal(j.revision) {
+	if binding.auth.bearer == "" || binding.key != j.key || !binding.revision.Equal(j.revision) {
 		return nil
 	}
-	query := url.Values{"api_key_id": {strconv.FormatInt(key, 10)}, "start_date": {"1970-01-01"},
+	query := url.Values{"api_key_id": {strconv.FormatInt(binding.key, 10)}, "start_date": {"1970-01-01"},
 		"end_date": {s.now().In(beijing).Format(dayLayout)}, "timezone": {"Asia/Shanghai"},
 		"page_size": {strconv.Itoa(receiptPageSize)}, "sort_by": {"id"}, "sort_order": {"asc"}}
+	fetchPage := func(page int) (receiptPage, error) {
+		return readPanelUsage(ctx, s, &binding, func(token string) (receiptPage, error) {
+			data, err := fetchReceiptPage(ctx, s.client, token, query, page)
+			return data, s.webReadError(token, err)
+		})
+	}
 	if !j.restart && j.page > 1 {
-		prior, err := fetchReceiptPage(ctx, s.client, token, query, j.page-1)
+		prior, err := fetchPage(j.page - 1)
 		if err != nil && !errors.Is(err, errReceiptPagination) {
-			return s.webReadError(token, err)
+			return err
 		}
 		last := prior.Data.Items
 		j.restart = err != nil || len(last) != receiptPageSize || last[len(last)-1].ID != j.previous
@@ -139,9 +151,9 @@ WHERE beichen_usage_checkpoints.revision < excluded.revision`, j.credential, j.r
 		if i > 0 && !waitReceiptInterval(ctx, receiptPageInterval) {
 			return ctx.Err()
 		}
-		data, err := fetchReceiptPage(ctx, s.client, token, query, j.page)
+		data, err := fetchPage(j.page)
 		if err != nil {
-			return s.webReadError(token, err)
+			return err
 		}
 		items := data.Data.Items
 		last := j.previous

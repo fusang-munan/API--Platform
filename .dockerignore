@@ -15,3 +15,6 @@ README.md
 AGENTS.md
 frontend/node_modules
 frontend/dist
+deploy/beichen-session.env
+deploy/beichen-session.local.env
+deploy/.beichen-session-*.tmp

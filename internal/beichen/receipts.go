@@ -84,8 +84,9 @@ type receiptScan struct {
 }
 
 type receiptPage struct {
-	Code *int `json:"code"`
-	Data struct {
+	rawResponse []byte
+	Code        *int `json:"code"`
+	Data        struct {
 		Items    []receiptRow `json:"items"`
 		Total    *int         `json:"total"`
 		Page     int          `json:"page"`
@@ -101,6 +102,8 @@ type receiptRow struct {
 	KeyID          int64           `json:"api_key_id"`
 	RequestID      string          `json:"request_id"`
 	Model          string          `json:"model"`
+	GroupID        *int64          `json:"group_id"`
+	Cost           *json.Number    `json:"cost"`
 	ActualCost     json.RawMessage `json:"actual_cost"`
 	Currency       string          `json:"currency"`
 	BillingType    *int            `json:"billing_type"`
@@ -110,6 +113,39 @@ type receiptRow struct {
 	CacheRead      *int64          `json:"cache_read_tokens"`
 	CacheWrite     *int64          `json:"cache_creation_tokens"`
 	CreatedAt      time.Time       `json:"created_at"`
+}
+
+func (row *receiptRow) UnmarshalJSON(body []byte) error {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || fields == nil {
+		return errReceiptPagination
+	}
+	for _, name := range []string{"input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
+		"cache_write_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "billing_type", "subscription_id", "group_id",
+		"cost", "total_cost", "actual_cost", "input_cost", "output_cost", "cache_read_cost", "cache_creation_cost", "rate_multiplier"} {
+		if raw, ok := fields[name]; ok && websiteMissing(raw) {
+			fields[name] = json.RawMessage("null")
+		}
+	}
+	if creation, write := fields["cache_creation_tokens"], fields["cache_write_tokens"]; !websiteMissing(write) {
+		if !websiteMissing(creation) && string(creation) != string(write) {
+			return errReceiptPagination
+		}
+		fields["cache_creation_tokens"] = write
+	}
+	if raw := fields["actual_cost"]; !websiteMissing(raw) {
+		var number json.Number
+		if json.Unmarshal(raw, &number) != nil || !receiptNumber.MatchString(strings.TrimPrefix(number.String(), "-")) {
+			return errReceiptPagination
+		}
+		fields["actual_cost"] = json.RawMessage(number)
+	}
+	normalized, err := json.Marshal(fields)
+	if err != nil {
+		return errReceiptPagination
+	}
+	type receipt receiptRow
+	return json.Unmarshal(normalized, (*receipt)(row))
 }
 
 // Only website billing fields are archived. Arbitrary response metadata, prompts,
@@ -286,15 +322,17 @@ func (s *Service) reconcileReceiptKey(ctx context.Context, ledger receiptApplier
 			return nil
 		}
 	}
-	token, keyID, revision, err := s.PanelUsageAccess(ctx, credential)
+	binding, err := s.panelUsageAccess(ctx, credential)
 	if err != nil {
 		return err
 	}
-	if token == "" || keyID != scan.keyID || !revision.Equal(scan.revision) || len(scan.targets) == 0 {
+	if binding.auth.bearer == "" || binding.key != scan.keyID || !binding.revision.Equal(scan.revision) || len(scan.targets) == 0 {
 		state.cursor, state.scan = scan.next, nil
 		return nil
 	}
-	complete, err := s.scanReceiptPages(ctx, token, scan)
+	complete, err := readPanelUsage(ctx, s, &binding, func(token string) (bool, error) {
+		return s.scanReceiptPages(ctx, token, scan)
+	})
 	if errors.Is(err, errReceiptPagination) {
 		state.cursor, state.scan = scan.next, nil
 	}
@@ -305,7 +343,7 @@ func (s *Service) reconcileReceiptKey(ctx context.Context, ledger receiptApplier
 	// binding remains active. Configuration changes invalidate the pinned revision.
 	current, currentKey, currentRevision, err := s.PanelUsageAccess(ctx, credential)
 	state.cursor, state.scan = scan.next, nil
-	if err != nil || current == "" || currentKey != keyID || !currentRevision.Equal(revision) {
+	if err != nil || current == "" || currentKey != binding.key || !currentRevision.Equal(binding.revision) {
 		return err
 	}
 	for id, row := range scan.matches {
@@ -430,10 +468,16 @@ func fetchReceiptPage(ctx context.Context, client *http.Client, token string, qu
 	if err != nil {
 		return receiptPage{}, err
 	}
+	if _, err := panelData(body); panelAuthFailed(err) {
+		return receiptPage{}, err
+	}
 	var envelope receiptPage
 	if err := json.Unmarshal(body, &envelope); err != nil || envelope.Code == nil || *envelope.Code != 0 ||
 		envelope.Data.Total == nil || envelope.Data.Items == nil || envelope.Data.Page != page ||
 		envelope.Data.PageSize != receiptPageSize || *envelope.Data.Total < 0 {
+		if _, err := panelData(body); panelAuthFailed(err) {
+			return receiptPage{}, upstreamHTTPStatus(http.StatusUnauthorized)
+		}
 		return receiptPage{}, errReceiptPagination
 	}
 	data, total := envelope.Data, *envelope.Data.Total
@@ -449,6 +493,7 @@ func fetchReceiptPage(ctx context.Context, client *http.Client, token string, qu
 		len(data.Items) != min(receiptPageSize, total-(page-1)*receiptPageSize) {
 		return receiptPage{}, errReceiptPagination
 	}
+	envelope.rawResponse = body
 	return envelope, nil
 }
 

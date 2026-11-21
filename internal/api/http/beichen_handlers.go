@@ -118,6 +118,30 @@ func (s *Server) syncBeichen(c *gin.Context) {
 	respond(c, http.StatusOK, gin.H{"synced": true})
 }
 
+func (s *Server) refreshBeichenKeyUsage(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	provider, ok := pathID(c, "provider_id")
+	var input struct {
+		CredentialID     string  `json:"credential_id"`
+		TargetMultiplier *string `json:"target_multiplier"`
+		ExpectClaude     *bool   `json:"expect_claude"`
+	}
+	if !ok || !bindBeichenJSON(c, &input, false) {
+		return
+	}
+	credential, err := controlplane.UUID(input.CredentialID)
+	if err == nil {
+		err = s.service.Beichen().RefreshKeyUsage(c.Request.Context(), provider, credential, beichen.KeyUsageTarget{
+			Multiplier: input.TargetMultiplier, ExpectClaude: input.ExpectClaude,
+		})
+	}
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, gin.H{"synced": true})
+}
+
 func (s *Server) enableBeichenModel(c *gin.Context) {
 	provider, ok := pathID(c, "provider_id")
 	if !ok {

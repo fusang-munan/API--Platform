@@ -180,7 +180,8 @@ async function refresh(): Promise<boolean> {
   return refreshFlight
 }
 
-async function rawRequest<T>(path: string, init: RequestInit = {}, retry = true): Promise<Envelope<T>> {
+async function rawRequest<T>(path: string, init: RequestInit = {}, retry = true,
+  decode: (response: Response) => Promise<Envelope<T>> = parseEnvelope<T>): Promise<Envelope<T>> {
   const bucket = (init.method ?? 'GET').toUpperCase() === 'GET' ? 'reads' : 'writes'
   networkActivity[bucket] += 1
   try {
@@ -188,14 +189,18 @@ async function rawRequest<T>(path: string, init: RequestInit = {}, retry = true)
     if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
     if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`)
     const response = await fetch(`${base}${path}`, { ...init, headers, credentials: 'include' })
-    if (response.status === 401 && retry && !path.includes('/auth/refresh') && await refresh()) return rawRequest<T>(path, init, false)
-    return parseEnvelope<T>(response)
+    if (response.status === 401 && retry && !path.includes('/auth/refresh') && await refresh()) return rawRequest(path, init, false, decode)
+    return decode(response)
   } finally {
     networkActivity[bucket] -= 1
   }
 }
 
 export async function request<T>(path: string, init: RequestInit = {}): Promise<T> { return (await rawRequest<T>(path, init)).data }
+export async function download(path: string, init: RequestInit): Promise<Blob> {
+  return (await rawRequest<Blob>(path, init, true, async response =>
+    response.ok ? { data: await response.blob() } : parseEnvelope<Blob>(response))).data
+}
 export async function page<T>(path: string): Promise<{ data: T; meta: PageMeta }> { const value = await rawRequest<T>(path); return { data: value.data, meta: value.meta ?? {} } }
 export const get = <T>(path: string) => request<T>(path)
 export const post = <T>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) })
