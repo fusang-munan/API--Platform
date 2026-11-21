@@ -698,6 +698,7 @@ onBeforeUnmount(() => { loadVersion++; closeChannelSwitch() })
               <h3>{{ channel.label }}<template v-if="channel.group_id != null"> · 分组 {{ channel.group_id }}</template></h3>
               <p v-if="channel.state === 'unverified'" class="muted">待核对。请检查官网授权和分组，再同步目录。</p>
               <template v-else>
+                <p v-if="channel.state === 'stale'" class="muted">官网目录待更新，以下为保留的分组清单。</p>
                 <p class="muted">核对时间 {{ beijingTime(channel.checked_at) }}（北京时间）</p>
                 <p v-if="!channel.website_only.length && !channel.key_only.length">网页和 Key 目录一致。</p>
                 <div v-else class="catalog-difference-groups">

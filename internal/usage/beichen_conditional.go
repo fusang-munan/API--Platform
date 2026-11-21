@@ -312,6 +312,7 @@ func (c beichenPriceConditions) ratesFor(total int64) (beichenPanelRates, string
 // already contain cache reads and writes, while Anthropic reports all three
 // separately. OpenAI's cache_miss counter is uncached input, when provided.
 func normalizeBeichenConditionalTokens(m CallMetrics, protocol string) (beichenBillableTokens, string) {
+	m = m.withKnownInputParts(protocol)
 	for _, count := range []*int64{m.PromptTokens, m.CompletionTokens, m.CacheHitTokens, m.CacheMissTokens, m.CacheWriteTokens} {
 		if count != nil && *count < 0 {
 			return beichenBillableTokens{}, "missing_price_or_token_breakdown"
@@ -323,17 +324,7 @@ func normalizeBeichenConditionalTokens(m CallMetrics, protocol string) (beichenB
 	input, output := *m.PromptTokens, *m.CompletionTokens
 	read, write, miss := m.CacheHitTokens, m.CacheWriteTokens, m.CacheMissTokens
 	switch protocol {
-	case "openai_compatible", "openai_responses", "openai_realtime":
-		// An omitted cache count is zero only if the other categories exhaust
-		// the reported prompt. Price zero does not prove count zero.
-		zero := int64(0)
-		if read == nil && miss != nil && write != nil && *miss == input-*write {
-			read = &zero
-		}
-		if write == nil && miss != nil && read != nil && *miss == input-*read {
-			write = &zero
-		}
-	case "anthropic", "google_gemini_v1beta":
+	case "openai_compatible", "openai_responses", "openai_realtime", "anthropic", "google_gemini_v1beta":
 	default:
 		return beichenBillableTokens{}, "unsupported_pricing_protocol"
 	}

@@ -38,29 +38,34 @@ func (s *Service) ModelAliases(ctx context.Context, provider uuid.UUID) ([]Model
 	if err := checkProvider(ctx, tx, provider); err != nil {
 		return nil, err
 	}
+	aliases, err := readModelAliases(ctx, tx, provider)
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		return nil, unavailable("读取北辰模型别名失败", err)
+	}
+	return aliases, nil
+}
+
+func readModelAliases(ctx context.Context, tx *sql.Tx, provider uuid.UUID) ([]ModelAlias, error) {
 	rows, err := tx.QueryContext(ctx, `
 SELECT DISTINCT ON (credential_id, lower(upstream_model)) credential_id, upstream_model, school_model
 FROM upstream_model_aliases WHERE provider_id = $1
 ORDER BY credential_id NULLS FIRST, lower(upstream_model), created_at DESC, id DESC`, provider)
 	if err != nil {
-		return nil, unavailable("读取北辰模型别名失败", err)
+		return nil, err
 	}
 	defer rows.Close()
 	aliases := []ModelAlias{}
 	for rows.Next() {
 		var item ModelAlias
 		if err := rows.Scan(&item.CredentialID, &item.UpstreamModel, &item.SchoolModel); err != nil {
-			return nil, unavailable("读取北辰模型别名失败", err)
+			return nil, err
 		}
 		aliases = append(aliases, item)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, unavailable("读取北辰模型别名失败", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, unavailable("读取北辰模型别名失败", err)
-	}
-	return aliases, nil
+	return aliases, rows.Err()
 }
 
 func (s *Service) PutModelAlias(ctx context.Context, provider, actor uuid.UUID, credential *uuid.UUID, upstream string, school *string) error {

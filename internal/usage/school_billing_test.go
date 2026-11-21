@@ -128,22 +128,22 @@ func testSchoolBilling(t *testing.T, ctx context.Context, db *sql.DB, org, stude
 
 	r, route, bill = reserve(priced, 711)
 	finish(r, route, CallMetrics{})
-	bill.ActualCost = "0.2" // independent token calculation still gives 10.
+	bill.ActualCost = "0.2" // The fixed quote would produce only 10 base credits.
 	apply(bill, true)
 	apply(bill, false)
-	check(r, "10", "receipt_usage_price", "11", "0.2")
+	check(r, "20", "receipt_actual_cost", "22", "0.2")
 	r, route, bill = reserve("no-price", 712)
 	finish(r, route, CallMetrics{})
 	check(r, "", "", "", "")
 	bill.ActualCost = "0.000000000000001"
 	apply(bill, true)
 	check(r, "0.0000000000001", "receipt_actual_cost", "0.00000000000011", "0.000000000000001")
-	if err := store.UpdateStudentQuotaAsTeacher(ctx, teacher, project, student, 22000, "too low"); domain.ErrorCode(err) != domain.CodeValidation {
+	if err := store.UpdateStudentQuotaAsTeacher(ctx, teacher, project, student, 33000, "too low"); domain.ErrorCode(err) != domain.CodeValidation {
 		t.Fatalf("discarded fractional charge: %v", err)
 	}
 	view, err = store.ProjectUsage(ctx, project, time.Now())
 	if err != nil || len(view.Models) != 1 || view.Models[0].BaseSource == nil || *view.Models[0].BaseSource != "mixed" ||
-		view.Models[0].ChargedCredits == nil || *view.Models[0].ChargedCredits != "22.00000000000011" {
+		view.Models[0].ChargedCredits == nil || *view.Models[0].ChargedCredits != "33.00000000000011" {
 		t.Fatalf("report: %+v, %v", view, err)
 	}
 

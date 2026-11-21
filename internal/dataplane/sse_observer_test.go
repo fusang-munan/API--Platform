@@ -6,9 +6,10 @@ import (
 	"testing"
 
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
+	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
-func TestBeichenResponsesTerminalUsageDoesNotInheritEarlierCacheCounts(t *testing.T) {
+func TestBeichenResponsesKeepsEarlierCacheEvidenceWithoutCharging(t *testing.T) {
 	observer := sseObserver{adapter: modelbinding.AdapterOpenaiResponses, beichen: true}
 	observer.observe([]byte(`data: {"type":"response.created","response":{"id":"resp_fixture","usage":{"input_tokens":59,"input_tokens_details":{"cached_tokens":17,"cache_write_tokens":0}}}}
 
@@ -18,9 +19,11 @@ data: {"type":"response.completed","response":{"id":"other","usage":{"input_toke
 
 `))
 	metrics := observer.metrics
+	report, reason := beichenReviewMetrics(observer.adapter, metrics.finished(false), "")
 	if !observer.terminal || observer.incomplete || metrics.UpstreamResponseID != "resp_fixture" ||
-		metrics.CacheHitTokens == nil || *metrics.CacheHitTokens != 0 || metrics.CacheWriteTokens != nil ||
-		metrics.CompletionTokens == nil || *metrics.CompletionTokens != 3 {
+		!tokenIs(metrics.CacheHitTokens, 0) || !tokenIs(metrics.CacheWriteTokens, 0) ||
+		!tokenIs(metrics.CompletionTokens, 3) || report.State != usage.UsagePartial ||
+		report.UsageReason != "terminal_usage_incomplete" || reason != beichenIncompleteUsage {
 		t.Fatalf("unexpected terminal SSE usage: %+v", metrics)
 	}
 }

@@ -100,7 +100,7 @@ func (s *sseObserver) endLine() {
 	case bytes.Equal(field, []byte("event")):
 		s.eventName = ""
 		switch string(value) {
-		case "error", "response.failed", "response.completed", "response.incomplete", "message_stop":
+		case "error", "response.failed", "response.completed", "response.done", "response.incomplete", "message_stop":
 			s.eventName = string(value)
 		}
 	case bytes.Equal(field, []byte("data")) && !s.overflow:
@@ -121,8 +121,8 @@ func (s *sseObserver) endEvent() {
 		return
 	}
 	if s.overflow {
+		s.metrics.UsageReason = "usage_observation_limit"
 		if s.beichen {
-			s.metrics = ResponseMetrics{}
 			s.incomplete = true
 			s.review = beichenUnsupportedPrice
 		}
@@ -149,6 +149,10 @@ func (s *sseObserver) endEvent() {
 	eventType := rawString(payload["type"])
 	eventError := jsonObject(payload["error"])
 	if s.eventName == "error" || s.eventName == "response.failed" || eventType == "error" || eventType == "response.failed" || eventError != nil {
+		if !s.failed && s.adapter == modelbinding.AdapterOpenaiResponses &&
+			(s.eventName == "response.failed" || eventType == "response.failed") {
+			s.metrics.applyPayload(s.adapter, payload)
+		}
 		s.failed = true
 		s.retryable = s.eventName == "error" || eventType == "error" ||
 			retryableSSECode(rawString(eventError["code"])) || retryableSSECode(rawString(eventError["type"]))
@@ -164,19 +168,17 @@ func (s *sseObserver) endEvent() {
 		s.review = beichenPayloadReview(data, s.expectedModel, false)
 		s.modelReported = s.modelReported || beichenModelReported(payload, s.expectedModel)
 	}
-	if s.beichen && (s.adapter == modelbinding.AdapterOpenaiCompatible || s.adapter == modelbinding.AdapterOpenaiResponses) &&
-		(jsonObject(payload["usage"]) != nil || eventType == "response.completed" || s.eventName == "response.completed") {
-		// A complete usage object replaces earlier snapshots. Missing fields in
-		// it cannot inherit values from an earlier, partial usage report.
-		responseID := s.metrics.UpstreamResponseID
-		s.metrics = ResponseMetrics{}
-		s.metrics.UpstreamResponseID = responseID
-	}
-	if s.beichen && (eventType == "response.completed" || s.eventName == "response.completed") {
+	responsesDone := s.adapter == modelbinding.AdapterOpenaiResponses &&
+		(responsesTerminalEvent(eventType) || responsesTerminalEvent(s.eventName))
+	if s.beichen && responsesDone {
 		status := rawString(jsonObject(payload["response"])["status"])
 		s.incomplete = s.incomplete || (status != "" && status != "completed")
 	}
-	s.metrics.applyPayload(s.adapter, payload)
+	if s.beichen && (responsesDone || (s.adapter == modelbinding.AdapterOpenaiCompatible && jsonObject(payload["usage"]) != nil)) {
+		s.metrics.applyUsageSnapshot(s.adapter, payload)
+	} else {
+		s.metrics.applyPayload(s.adapter, payload)
+	}
 	s.noteTerminal(eventType)
 	s.noteTerminal(s.eventName)
 	if !s.billable() {
@@ -205,9 +207,17 @@ func (s *sseObserver) noteTerminal(eventType string) {
 		s.incomplete = true
 	}
 	if (s.adapter == modelbinding.AdapterAnthropic && eventType == "message_stop") ||
-		(s.adapter == modelbinding.AdapterOpenaiResponses && (eventType == "response.completed" || eventType == "response.incomplete")) {
+		(s.adapter == modelbinding.AdapterOpenaiResponses && responsesTerminalEvent(eventType)) {
 		s.terminal = true
 	}
+}
+
+func responsesTerminalEvent(eventType string) bool {
+	switch eventType {
+	case "response.completed", "response.done", "response.incomplete", "response.failed":
+		return true
+	}
+	return false
 }
 
 func retryableSSECode(value string) bool {

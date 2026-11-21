@@ -94,37 +94,65 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('北辰模型管理', () => {
-  it('仅网页模型留在独立清单，重扫只传所选 Key 后读回目录', async () => {
+  it('官网模型计入主表，换 Claude Key 缺目录时显示分组与原因，重扫后恢复', async () => {
+    const model = 'claude-fable-5'
+    const location = {
+      name: 'Claude Fable 5', platform: 'anthropic', channel: 'Claude 渠道',
+      groups: [{ id: 24, name: 'CC1 分组' }], observed_at: '2026-11-21T00:00:00Z', has_price: true, stale: true,
+    }
+    const candidate = { credential_id: 'second', label: 'Claude 接替', school_channel: 'CC1', replacement: true, group_id: 24 }
+    const keyOnly = overview([{ model: 'lab/a', catalog: { source: 'key', catalog_state: 'key_listed', key_count: 1 } }])
     const data: BeichenOverview = {
-      ...overview([{ model: 'lab/a' }, { model: 'only-web' }]),
+      ...keyOnly,
       credentials: [
         { credential_id: 'first', label: '渠道一', status: 'active' },
-        { credential_id: 'second', label: '渠道二', status: 'active' },
-        { credential_id: 'inactive', label: '已停用渠道', status: 'inactive' },
+        { credential_id: 'second', label: 'Claude 接替', status: 'active' },
       ],
-      website_only_status: 'compared',
-      website_only_models: [{ model: 'only-web', channels: [{ credential_id: 'second', label: '渠道二' }] }],
+      website_directory: { state: 'stale', last_success: location.observed_at, last_error: '官网请求失败' },
+      website_only_status: 'stale',
+      model_catalog: [...keyOnly.model_catalog!, { model, source: 'website', catalog_state: 'website_only', key_count: 0,
+        route_count: 0, protocols: [], can_enable: false, website_locations: [location],
+        catalog_keys: [{ ...candidate, state: 'missing' }] }],
     }
-    api.beichenOverview.mockResolvedValueOnce(data).mockResolvedValue({ ...data, website_only_models: [] })
+    const restored = overview([{ model: 'lab/a' }, {
+      model, catalog: { source: 'both', catalog_state: 'key_listed', key_count: 1, protocols: ['anthropic'],
+        website_locations: [location], catalog_keys: [{ ...candidate, state: 'listed', upstream_model: model, match: 'normalized' }] },
+    }])
+    api.beichenOverview.mockResolvedValueOnce(data).mockResolvedValue({
+      ...restored, website_only_status: 'stale', credentials: data.credentials,
+    })
+    api.beichenCapabilities.mockResolvedValue({
+      capabilities: [capability(model, { supported_protocols: [], availability: 'maintenance', binding_state: 'invalid' })],
+    })
     api.rescanBeichenCatalog.mockResolvedValue({ synced: true })
     const wrapper = view()
     await flushPromises()
-    const web = wrapper.get('[aria-label="仅网页可见"]')
-    expect(web.get('li').text()).toContain('only-web · 渠道二')
-    expect(web.get('select').text()).not.toContain('已停用渠道')
-    expect(wrapper.find('[aria-label="启用 only-web"]').exists()).toBe(false)
+    const web = wrapper.get('[aria-label="官网目录"]')
+    expect(web.text()).toContain('保留上次官网目录（待更新）')
+    const claude = wrapper.get('[data-model="' + model + '"]')
+    expect(claude.get('[data-testid="catalog-source"]').text()).toBe('来源 官网')
+    expect(claude.get('[data-testid="key-catalog-gap"]').text()).toContain('官网有、CC1 新 Key 无')
+    expect(claude.text()).toContain('Claude 渠道 · anthropic · CC1 分组 分组 24')
+    expect(claude.text()).toContain('0/2 把 Key 覆盖')
+    expect(claude.text()).toContain('官网有报价，待 Key 确认')
+    expect(claude.get('[data-testid="model-availability"]').text()).toBe('仅官网可见')
+    expect(wrapper.get('.beichen-stat strong').text()).toBe('2')
+    expect(wrapper.find('[aria-label="启用 ' + model + '"]').exists()).toBe(false)
     await button(wrapper, '一键启用').trigger('click')
     const dialog = wrapper.get('[role="dialog"]')
     expect(dialog.text()).toContain('lab/a')
-    expect(dialog.text()).not.toContain('only-web')
+    expect(dialog.text()).not.toContain(model)
     await button(dialog, '取消').trigger('click')
     await web.get('select').setValue('second')
     await web.get('form').trigger('submit')
     await flushPromises()
     expect(api.rescanBeichenCatalog).toHaveBeenCalledExactlyOnceWith('north', 'second')
     expect(api.beichenOverview).toHaveBeenCalledTimes(2)
-    expect(web.text()).toContain('没有仅网页可见的模型')
-    expect(wrapper.find('[aria-label="启用 only-web"]').exists()).toBe(true)
+    expect(claude.get('[data-testid="catalog-source"]').text()).toBe('来源 官网和 Key')
+    expect(claude.text()).toContain('1/2 把 Key 覆盖')
+    expect(claude.text()).toContain('1 种协议')
+    expect(claude.find('[data-testid="key-catalog-gap"]').exists()).toBe(false)
+    expect(wrapper.find('[aria-label="启用 ' + model + '"]').exists()).toBe(true)
   })
 
   it('展示重建的旧线路和新线路，预览变化后需要再次确认', async () => {

@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
 import type { BeichenCapabilities, BeichenCatalogModel, BeichenHealthDimension, BeichenModelCapability, BeichenModelUsage, BeichenOverview, BeichenProbeRun, BeichenUsageRange, BindingAdapter } from '../../api/types'
-import type { BeichenRebindPlan, BeichenRebindRoute } from '../../api/types'
+import type { BeichenCatalogKey, BeichenRebindPlan, BeichenRebindRoute, BeichenWebsiteLocation } from '../../api/types'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { useToast } from '../../composables/useToast'
 import { priceFields, schoolCatalog, type SchoolCatalogRow, type SchoolQuote } from '../../utils/beichenModels'
@@ -57,8 +57,8 @@ const priceRow = ref<SchoolCatalogRow>()
 const conditionsRow = ref<CatalogRow>()
 const usageOpen = ref(false)
 const initialModel = ref('')
-const websiteOnly = computed(() => overview.value?.website_only_models ?? [])
-const websiteOnlyNames = computed(() => new Set(websiteOnly.value.map(row => row.model.toLowerCase())))
+const websiteDirectory = computed(() => overview.value?.website_directory)
+const sourceLabels = { website: '官网', key: 'Key', both: '官网和 Key' } as const
 const protocolLabels: Record<string, string> = {
   openai_compatible: 'OpenAI Chat',
   openai_responses: 'OpenAI Responses',
@@ -217,13 +217,16 @@ const catalog = computed(() => {
     const readyCount = validCount(entry?.ready_count) ?? row.readyCount
     const activation = entry?.activation
     const active = row.status === 'active' || activation === 'active' || Boolean(entry?.binding_issue)
+    const source = entry?.source
+    const websiteOnly = entry?.catalog_state === 'website_only'
+    const listed = entry?.catalog_state ? entry.catalog_state === 'key_listed' : entry?.credential_ids?.length !== 0
     const canDisable = row.canDisable || (activation === 'active' && Boolean(entry?.school_model))
     const capability = summarizeCapabilities(row.model)
     const priceState = capability?.priceState ?? entry?.price_state ?? oldPriceState(row)
-    const priceCovered = capability
+    const priceCovered = !websiteOnly && (capability
       ? priceState === 'confirmed' || priceState === 'manual' || (priceState === 'mixed' && row.priceReady)
       : entry?.price_covered ?? (entry?.price_state == null ? row.priceReady
-        : priceState === 'confirmed' || priceState === 'manual' || (priceState === 'mixed' && row.priceReady))
+        : priceState === 'confirmed' || priceState === 'manual' || (priceState === 'mixed' && row.priceReady)))
     const blockers = entry?.blockers ?? []
     const routeBlocked = entry?.route_count === 0 || blockers.some(blocker => blocker.code === 'no_ready_route')
     const blockerMessages = blockers
@@ -242,9 +245,14 @@ const catalog = computed(() => {
       ...row, active, activation, canDisable, keyCoverage, routeCount, readyCount, priceState, priceCovered, pricing, routeBlocked,
       blockers: [...new Set(blockerMessages)],
       priceBlocker: capability ? capability.priceBlocker : entry?.price_blocker?.message.trim(),
-      listed: !websiteOnlyNames.value.has(model) && entry?.credential_ids?.length !== 0,
-      protocolCount: capability ? capability.protocols.length : entry?.protocols?.length ?? (protocols.size || (routeCount === 0 ? 0 : null)),
-      protocolLabels: capability
+      listed,
+      discovered: Boolean(source) || listed,
+      websiteOnly,
+      source,
+      locations: entry?.website_locations ?? [],
+      catalogKeys: entry?.catalog_keys ?? [],
+      protocolCount: entry?.protocols?.length ?? (capability ? capability.protocols.length : protocols.size || (routeCount === 0 ? 0 : null)),
+      protocolLabels: entry?.catalog_state ? entry.protocols?.map(protocolLabel) ?? [] : capability
         ? capability.protocols.map(protocolLabel)
         : entry?.protocols?.map(protocol => bindingAdapterMeta(protocol).label) ?? [],
       probeState: capability ? (capability.probeState === 'not_applicable' ? undefined : capability.probeState) : entry?.probe_state,
@@ -262,6 +270,7 @@ const catalog = computed(() => {
 })
 type CatalogRow = (typeof catalog.value)[number]
 const listedModels = computed(() => catalog.value.filter(row => row.listed))
+const discoveredModels = computed(() => catalog.value.filter(row => row.discovered))
 const probeRun = computed<ProbeRunWithBudget | undefined>(() => probeOverride.value ?? overview.value?.probe_run as ProbeRunWithBudget | undefined)
 const probeBudget = computed(() => probeRun.value?.budget)
 const probeInProgress = computed(() => probeRun.value?.state === 'queued' || probeRun.value?.state === 'running')
@@ -278,16 +287,17 @@ const probeRunLabel = computed(() => {
   }
 })
 const catalogByModel = computed(() => new Map(catalog.value.map(row => [row.model.toLowerCase(), row])))
+const modelFilter = computed(() => normalizeSignal(props.query ?? ''))
 const searchedRows = computed(() => catalog.value.filter(row =>
-  (row.active || !websiteOnlyNames.value.has(row.model.toLowerCase())) &&
-  row.model.toLowerCase().includes((props.query ?? '').trim().toLowerCase()) &&
+  (!modelFilter.value || [row.model, ...row.locations.map(location => location.name), ...row.catalogKeys.map(key => key.upstream_model ?? '')]
+    .some(name => normalizeSignal(name).includes(modelFilter.value))) &&
   (!props.commonIds || props.commonIds.has(row.model.toLowerCase()))))
 const rows = computed(() => searchedRows.value.filter(row => filter.value === 'all' ||
   filter.value === 'active' && row.active ||
   filter.value === 'pending' && !row.active ||
   filter.value === 'unpriced' && !row.priceCovered ||
   filter.value === 'manual' && (row.mode !== 'follow' || row.priceState === 'manual')))
-const batchRows = computed(() => rows.value.filter(row => !websiteOnlyNames.value.has(row.model.toLowerCase())))
+const batchRows = computed(() => rows.value.filter(row => row.listed || row.active && !row.websiteOnly))
 const monthlyUsage = computed<UsageState>(() => usageStates.value.month ?? {})
 const drawerUsage = computed<UsageState>(() => usageStates.value[range.value] ?? {})
 const usageByModel = computed(() => new Map((monthlyUsage.value.data?.models ?? []).map(row => [row.model.toLowerCase(), row])))
@@ -418,9 +428,10 @@ function publicationLabel(row: CatalogRow) {
 }
 
 const availabilityLabels: Record<string, string> = {
-  available: '可用', maintenance: '维护中', unverified: '待验证', unavailable: '不可用', not_published: '未发布',
+  available: '可用', maintenance: '维护中', unverified: '待验证', unavailable: '不可用', not_published: '未发布', website_only: '仅官网可见',
 }
 function rowAvailability(row: CatalogRow) {
+  if (row.websiteOnly) return 'website_only'
   if (row.hasCapability && row.availability) return row.availability
   if (row.bindingIssue || row.probeState === 'failed') return 'maintenance'
   if (row.routeCount === 0) return 'unavailable'
@@ -432,6 +443,37 @@ function availabilityLabel(row: CatalogRow) {
 function availabilityTone(row: CatalogRow) {
   const state = rowAvailability(row)
   return state === 'available' ? 'active' : state === 'maintenance' || state === 'unavailable' ? 'danger' : 'pending'
+}
+
+function keyCoverageLabel(key: BeichenCatalogKey) {
+  const channel = key.school_channel || key.label
+  const label = channel + (key.replacement ? ' 新 Key' : ' Key')
+  const details = (key.label === channel ? '' : ' · ' + key.label) + (key.group_id == null ? '' : ' · 分组 ' + key.group_id)
+  const matchLabels = { exact: '', normalized: '名称归一后匹配', alias: '按教师别名匹配' } as const
+  switch (key.state) {
+    case 'listed':
+      return label + (key.stale ? ' 上次目录有' : ' 目录有') + ' · ' + key.upstream_model
+        + (key.match && matchLabels[key.match] ? ' · ' + matchLabels[key.match] : '') + details
+    case 'missing': return '官网有、' + label + ' 无' + details + '。请核查分组后重扫。'
+    case 'failed': return label + ' 目录读取失败' + details + '，请重扫。'
+    case 'pending': return label + ' 目录待同步' + details + '。'
+    case 'ambiguous': return label + ' 有多个近似名称，请核查目录和教师别名。'
+  }
+}
+
+function websiteLocationLabel(location: BeichenWebsiteLocation) {
+  const groups = location.groups.map(group => [group.name, group.id != null ? '分组 ' + group.id : ''].filter(Boolean).join(' '))
+  return [location.channel || (location.channel_id != null ? '渠道 ' + location.channel_id : ''),
+    location.platform, groups.length ? groups.join('、') : '分组待核', location.name,
+    location.has_price ? '官网有报价' : '官网无报价',
+    location.stale ? '缓存目录' : ''].filter(Boolean).join(' · ')
+}
+
+function catalogPriceLabel(row: CatalogRow) {
+  if ((row.websiteOnly || row.priceState === 'missing') && row.locations.some(location => location.has_price)) {
+    return '官网有报价，待 Key 确认'
+  }
+  return row.websiteOnly ? '官网未给出报价' : priceStateLabels[row.priceState] ?? '报价待同步'
 }
 
 function canEnableReason(row: CatalogRow) {
@@ -786,9 +828,9 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
       </div>
     </section>
     <div class="beichen-summary model-summary" aria-label="模型概况">
-      <div class="beichen-stat"><span>目录模型</span><strong>{{ overview ? formatTokens(listedModels.length) : '—' }}</strong><small>已从上游发现</small></div>
+      <div class="beichen-stat"><span>目录模型</span><strong>{{ overview ? formatTokens(discoveredModels.length) : '—' }}</strong><small>已从上游发现</small></div>
       <div class="beichen-stat"><span>已启用</span><strong>{{ overview ? formatTokens(catalog.filter(row => row.active).length) : '—' }}</strong><small>学校模型</small></div>
-      <div class="beichen-stat"><span>报价覆盖</span><strong>{{ overview ? listedModels.filter(row => row.priceCovered).length + ' / ' + listedModels.length : '—' }}</strong><small>含可计算的 Token 条件价与手动价</small></div>
+      <div class="beichen-stat"><span>报价覆盖</span><strong>{{ overview ? discoveredModels.filter(row => row.priceCovered).length + ' / ' + discoveredModels.length : '—' }}</strong><small>含可计算的 Token 条件价与手动价</small></div>
       <div class="beichen-stat sync-stat"><span>价格最后同步</span><strong>{{ syncTime(lastSync) }}</strong><small>北京时间</small></div>
     </div>
     <section v-if="keyHealth.length" class="beichen-card key-health" aria-label="Key 健康">
@@ -803,9 +845,9 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
         </dl>
       </details>
     </section>
-    <section v-if="overview?.website_only_status" class="beichen-card website-catalog" aria-label="仅网页可见">
+    <section v-if="overview?.website_only_status" class="beichen-card website-catalog" aria-label="官网目录">
       <div class="beichen-section-head">
-        <h3>仅网页可见</h3>
+        <h3>官网目录</h3>
         <form v-if="rescanKeys.length" class="actions" @submit.prevent="rescanCatalog">
           <label class="sr-only" :for="reasonId + '-rescan-key'">选择要重扫的渠道 Key</label>
           <select :id="reasonId + '-rescan-key'" v-model="rescanKey" :disabled="busy">
@@ -815,14 +857,11 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
           <button type="submit" class="button secondary" :disabled="busy || !rescanKeyAvailable">{{ rescanning ? '重扫中…' : '用指定 Key 重扫' }}</button>
         </form>
       </div>
-      <p v-if="overview.website_only_status === 'unverified'" class="beichen-note">待核对。需要官网分组清单以及每个启用 Key 的目录。</p>
-      <p v-else-if="!websiteOnly.length" class="beichen-note">没有仅网页可见的模型。</p>
-      <details v-else>
-        <summary>{{ websiteOnly.length }} 个模型未出现在任何已启用 Key 的目录里</summary>
-        <ul>
-          <li v-for="row in websiteOnly" :key="row.model"><strong>{{ row.model }}</strong> · {{ row.channels.map(channel => channel.label).join('、') }}</li>
-        </ul>
-      </details>
+      <p v-if="websiteDirectory?.state === 'stale'" class="beichen-note" role="status">
+        {{ websiteDirectory.last_success ? '保留上次官网目录（待更新）' : '官网目录部分待更新' }}<template v-if="websiteDirectory.last_error"> · {{ websiteDirectory.last_error }}</template>
+      </p>
+      <p v-else-if="websiteDirectory?.state === 'unverified'" class="beichen-note">官网完整目录待同步<template v-if="websiteDirectory.last_error"> · {{ websiteDirectory.last_error }}</template></p>
+      <p v-if="websiteDirectory?.last_success" class="beichen-note">最近完整读取 {{ syncTime(websiteDirectory.last_success) }}（北京时间）</p>
     </section>
     <p v-if="rescanError" class="error" role="alert">{{ rescanError }}</p>
     <div class="beichen-toolbar model-toolbar">
@@ -862,23 +901,38 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
                 <span>{{ row.keyCoverage }}/{{ keyCount }} 把 Key 覆盖</span> ·
                 <span :title="row.routeCount + ' 条候选线路'">{{ row.protocolCount == null ? '协议数待同步' : row.protocolCount + ' 种协议' }}</span> ·
                 <span>{{ row.readyCount }} 条已发布</span> ·
-                <span>{{ priceStateLabels[row.priceState] ?? '报价待同步' }}</span> ·
+                <span>{{ catalogPriceLabel(row) }}</span> ·
                 <strong :class="row.bindingIssue ? 'binding-issue' : row.active ? 'published-state' : undefined">{{ publicationLabel(row) }}</strong>
               </span>
+              <small v-if="row.source" class="row-note" data-testid="catalog-source">来源 {{ sourceLabels[row.source] }}</small>
+              <small v-for="key in row.catalogKeys.filter(key => key.state !== 'listed')" :key="key.credential_id"
+                class="row-note" data-testid="key-catalog-gap">{{ keyCoverageLabel(key) }}</small>
+              <small v-if="row.keyCoverage === 0 && !row.catalogKeys.length" class="row-note">
+                {{ row.websiteOnly ? '暂无匹配的渠道 Key，请根据官网分组核对。' : '当前启用 Key 无目录覆盖，请查看 Key 健康和目录同步状态。' }}
+              </small>
+              <details v-if="row.locations.length || row.catalogKeys.some(key => key.state === 'listed')" class="catalog-evidence">
+                <summary>目录来源与分组</summary>
+                <ul>
+                  <li v-for="(location, sourceIndex) in row.locations" :key="sourceIndex">
+                    {{ websiteLocationLabel(location) }} · {{ syncTime(location.observed_at) }}
+                  </li>
+                  <li v-for="key in row.catalogKeys.filter(key => key.state === 'listed')" :key="key.credential_id">{{ keyCoverageLabel(key) }}</li>
+                </ul>
+              </details>
               <div class="model-capability" data-testid="model-capability">
                 <span class="status-pill" :class="availabilityTone(row)" data-testid="model-availability">{{ availabilityLabel(row) }}</span>
-                <span class="chip recommend" data-testid="recommended-protocol">{{ row.recommendedProtocol
+                <span v-if="!row.websiteOnly" class="chip recommend" data-testid="recommended-protocol">{{ row.recommendedProtocol
                   ? '推荐 ' + protocolLabel(row.recommendedProtocol)
                   : row.hasCapability ? '暂无推荐协议' : '推荐协议待同步' }}</span>
                 <span v-if="row.bindingInvalid" class="status-pill danger" data-testid="binding-invalid">绑定失效</span>
-                <span v-if="row.protocolMissing" class="status-pill pending" data-testid="protocol-missing">缺协议</span>
-                <span v-if="row.priceState === 'missing'" class="status-pill pending" data-testid="price-missing">缺价</span>
+                <span v-if="!row.websiteOnly && row.protocolMissing" class="status-pill pending" data-testid="protocol-missing">缺协议</span>
+                <span v-if="!row.websiteOnly && row.priceState === 'missing'" class="status-pill pending" data-testid="price-missing">缺价</span>
               </div>
-              <small v-if="row.availabilityReason" class="row-note" data-testid="availability-reason">{{ row.availabilityReason }}</small>
-              <small v-if="row.actionHint" class="row-note" data-testid="action-hint">下一步：{{ row.actionHint }}</small>
+              <small v-if="!row.websiteOnly && row.availabilityReason" class="row-note" data-testid="availability-reason">{{ row.availabilityReason }}</small>
+              <small v-if="!row.websiteOnly && row.actionHint" class="row-note" data-testid="action-hint">下一步：{{ row.actionHint }}</small>
               <small v-if="row.bindingIssue" class="row-note binding-issue">{{ row.bindingIssue.message }}</small>
               <small v-if="row.protocolLabels.length" class="row-note">{{ row.protocolLabels.join(' · ') }}</small>
-              <div v-if="row.probeState" class="model-probe">
+              <div v-if="!row.websiteOnly && row.probeState" class="model-probe">
                 <span class="status-pill" :class="{ active: row.probeState === 'passed', danger: row.probeState === 'failed', pending: row.probeState === 'unprobed' }">{{ probeLabels[row.probeState] }}</span>
                 <small v-if="row.lastProbeAt">{{ syncTime(row.lastProbeAt) }}（北京时间）</small>
               </div>
@@ -918,13 +972,13 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
             </td>
             <td data-label="操作">
               <div class="model-actions">
-                <button type="button" class="button ghost" :disabled="busy" :aria-label="'定价 ' + row.model" @click="priceRow = row">{{ row.mode !== 'follow' ? '调整价格' : '手动定价' }}</button>
-                <button v-if="!row.active" type="button" class="button secondary" :disabled="busy || Boolean(canEnableReason(row))"
+                <button v-if="row.listed" type="button" class="button ghost" :disabled="busy" :aria-label="'定价 ' + row.model" @click="priceRow = row">{{ row.mode !== 'follow' ? '调整价格' : '手动定价' }}</button>
+                <button v-if="!row.active && !row.websiteOnly" type="button" class="button secondary" :disabled="busy || Boolean(canEnableReason(row))"
                   :aria-describedby="canEnableReason(row) ? reasonId + '-' + index : undefined" :aria-label="'启用 ' + row.model"
                   @click="changeStatus(row, true)">{{ updating === row.model ? '启用中…' : '启用' }}</button>
                 <button v-else-if="row.canDisable" type="button" class="button ghost" :disabled="busy"
                   :aria-label="'禁用 ' + row.model" @click="changeStatus(row, false)">禁用</button>
-                <small v-if="!row.active && canEnableReason(row)" :id="reasonId + '-' + index" class="row-note enable-reason">{{ canEnableReason(row) }}</small>
+                <small v-if="!row.active && !row.websiteOnly && canEnableReason(row)" :id="reasonId + '-' + index" class="row-note enable-reason">{{ canEnableReason(row) }}</small>
               </div>
             </td>
           </tr>
@@ -1048,6 +1102,9 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .model-name { font-size: 13px; }
 .model-state { font-size: 12px; line-height: 1.75; }
 .model-state-summary { display: inline; }
+.catalog-evidence { margin-top: 4px; font-size: 12px; color: var(--ink-soft); }
+.catalog-evidence summary { cursor: pointer; }
+.catalog-evidence ul { margin: 4px 0; padding-inline-start: 18px; overflow-wrap: anywhere; }
 .model-capability { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin-top: 8px; }
 .model-capability .chip { padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #f1f4f9; color: var(--ink-soft); }
 .model-capability .chip.recommend { background: #f3efff; color: #5b3ea8; }

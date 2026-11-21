@@ -682,7 +682,7 @@ func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		return
 	}
-	proxyResponsesWebSockets(client, upstream, selected.callRoute(), g, key.ID, selected.Binding.ModelID, reservation.TurnID)
+	proxyResponsesWebSockets(r.Context(), client, upstream, selected.callRoute(), g, key.ID, selected.Binding.ModelID, reservation)
 }
 
 func (g *Gateway) validWebSocketOrigin(request *http.Request) bool {
@@ -758,10 +758,19 @@ func (g *Gateway) sendLegacyWebSocketCall(ctx context.Context, upstream *websock
 	return nil, nil
 }
 
-func proxyResponsesWebSockets(client, upstream *websocket.Conn, selected usage.CallRoute, gateway *Gateway, keyID, modelID, sessionTurnID uuid.UUID) {
+func proxyResponsesWebSockets(ctx context.Context, client, upstream *websocket.Conn, selected usage.CallRoute, gateway *Gateway, keyID, modelID uuid.UUID, first usage.Reservation) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	errs := make(chan error, 2)
-	activeTurnID := sessionTurnID
+	activeTurnID := first.TurnID
 	var clientWriteMu sync.Mutex
+	var observationMu sync.Mutex
+	observation := legacyResponsesObservation{callID: first.CallID, seen: make(map[string]struct{})}
+	record := func(callID uuid.UUID, metrics usage.CallMetrics) {
+		if callID != uuid.Nil {
+			gateway.completeCallMetrics(ctx, callID, metrics)
+		}
+	}
 	go func() {
 		for {
 			messageType, data, err := client.ReadMessage()
@@ -776,7 +785,7 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, selected usage.C
 				if json.Unmarshal(data, &envelope) == nil && envelope.Type == "response.create" {
 					wsPrompt, wsPromptSource := extractPromptFromJSON(data)
 					wsPrompt, usageCorrelation := turnCorrelation(wsPrompt, extractCallCorrelationFromJSON(data), activeTurnID)
-					reservation, reserveErr := gateway.usage.Reserve(context.Background(), keyID, modelID, uuid.Must(uuid.NewV7()).String(), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, usageCorrelation)
+					reservation, reserveErr := gateway.usage.Reserve(ctx, keyID, modelID, uuid.Must(uuid.NewV7()).String(), string(modelbinding.AdapterOpenaiResponses), "/v1/responses", wsPrompt, wsPromptSource, usageCorrelation)
 					if reserveErr != nil {
 						clientWriteMu.Lock()
 						_ = client.WriteJSON(modelCallErrorEvent(reserveErr))
@@ -789,7 +798,21 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, selected usage.C
 						errs <- err
 						return
 					}
-					rejection, err := gateway.sendLegacyWebSocketCall(context.Background(), upstream, reservation, selected, messageType, data)
+					observationMu.Lock()
+					rejection, err := gateway.sendLegacyWebSocketCall(ctx, upstream, reservation, selected, messageType, data)
+					if rejection == nil && err == nil {
+						if observation.ambiguous || observation.callID != uuid.Nil {
+							// Several possible calls for response.created. Keep
+							// legacy charging and preserve only tied counters.
+							observation.ambiguous = true
+							record(observation.callID, observation.metrics.finished(true))
+							observation.callID = uuid.Nil
+							record(reservation.CallID, usage.CallMetrics{State: usage.UsageMissing, UsageReason: "response_id_unconfirmed"})
+						} else {
+							observation.callID, observation.responseID, observation.metrics = reservation.CallID, "", ResponseMetrics{}
+						}
+					}
+					observationMu.Unlock()
 					if rejection != nil {
 						clientWriteMu.Lock()
 						_ = client.WriteJSON(modelCallErrorEvent(rejection))
@@ -816,9 +839,17 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, selected usage.C
 				errs <- err
 				return
 			}
+			var callID uuid.UUID
+			var metrics usage.CallMetrics
+			if messageType == websocket.TextMessage {
+				observationMu.Lock()
+				callID, metrics = observation.observe(data)
+				observationMu.Unlock()
+			}
 			clientWriteMu.Lock()
 			err = client.WriteMessage(messageType, data)
 			clientWriteMu.Unlock()
+			record(callID, metrics)
 			if err != nil {
 				errs <- err
 				return
@@ -826,6 +857,48 @@ func proxyResponsesWebSockets(client, upstream *websocket.Conn, selected usage.C
 		}
 	}()
 	<-errs
+	cancel()
+	_ = client.Close()
+	_ = upstream.Close()
+	<-errs
+	record(observation.callID, observation.metrics.finished(true))
+}
+
+type legacyResponsesObservation struct {
+	callID     uuid.UUID
+	responseID string
+	metrics    ResponseMetrics
+	ambiguous  bool
+	seen       map[string]struct{}
+}
+
+func (o *legacyResponsesObservation) observe(data []byte) (uuid.UUID, usage.CallMetrics) {
+	if o.callID == uuid.Nil {
+		return uuid.Nil, usage.CallMetrics{}
+	}
+	adapter := modelbinding.AdapterOpenaiResponses
+	payload := jsonObject(data)
+	event, id := rawString(payload["type"]), responsesEventID(payload)
+	if event == "response.created" && o.responseID == "" && id != "" && len(o.seen) < 4096 {
+		if _, duplicate := o.seen[id]; duplicate {
+			return uuid.Nil, usage.CallMetrics{}
+		}
+		o.responseID = id
+		o.seen[id] = struct{}{}
+	}
+	if id == "" || id != o.responseID {
+		return uuid.Nil, usage.CallMetrics{}
+	}
+	if !responsesTerminalEvent(event) {
+		o.metrics.applyPayload(adapter, payload)
+		return uuid.Nil, usage.CallMetrics{}
+	}
+	o.metrics.applyUsageSnapshot(adapter, payload)
+	status := rawString(jsonObject(payload["response"])["status"])
+	interrupted := (event != "response.completed" && event != "response.done") || (status != "" && status != "completed")
+	callID := o.callID
+	o.callID = uuid.Nil
+	return callID, o.metrics.finished(interrupted).ClassifyBeichenUsage(string(adapter))
 }
 
 func proxyRealtimeWebSocket(client, upstream *websocket.Conn, selected usage.CallRoute, gateway *Gateway, keyID, modelID, sessionTurnID uuid.UUID) {

@@ -106,10 +106,9 @@ const reportAttributionSQL = `
 WITH attributed AS (
  SELECT ` + attributedColumnsSQL + `,
    c.project_id, c.project_name, c.user_id, c.user_name, c.api_key_id, c.api_key_name,
-   c.beichen_school_multiplier, c.total_tokens, c.protocol, c.prompt_tokens, c.completion_tokens,
-   c.cache_hit_tokens, c.cache_miss_tokens, c.cache_write_tokens AS raw_cache_write_tokens`
+   c.beichen_school_multiplier, c.total_tokens, c.protocol, c.usage_state, c.prompt_tokens, c.tool_prompt_tokens`
 
-// 缺失量取原始用量可以推知且尚未计入的部分。OpenAI 的输入含缓存，估算时避免重复相加。
+// 已知总量可以大于已归类分项。OpenAI 和 Gemini 的输入含缓存，不重复相加。
 const reportCallsFromSQL = attributedFromSQL + `
    AND ($1::uuid IS NOT NULL OR EXISTS (
      SELECT 1 FROM providers p
@@ -119,27 +118,29 @@ const reportCallsFromSQL = attributedFromSQL + `
 ), report_tokens AS (
  SELECT a.*,
    num_nonnulls(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) AS token_parts,
-   COALESCE(input_tokens, 0)::numeric + COALESCE(output_tokens, 0) +
-     COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0) AS tokens
+   COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) +
+     COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0) AS classified_tokens
  FROM attributed a
+), report_totals AS (
+ SELECT a.*, token_parts = 4 AND usage_state IS NOT DISTINCT FROM 'reported' AND
+     (total_tokens IS NULL OR total_tokens = classified_tokens) AS tokens_complete,
+   GREATEST(classified_tokens, total_tokens,
+     CASE WHEN protocol <> 'anthropic' AND prompt_tokens IS NOT NULL
+       THEN prompt_tokens::numeric + COALESCE(tool_prompt_tokens,0) + COALESCE(output_tokens,0)
+     END) AS tokens
+ FROM report_tokens a
 ), report_calls AS (
  SELECT a.*,
-   CASE WHEN token_parts < 4 THEN GREATEST(tokens, total_tokens,
-     CASE WHEN protocol = 'anthropic' THEN
-       COALESCE(cache_miss_tokens, prompt_tokens, 0)::numeric + COALESCE(cache_hit_tokens, 0) + COALESCE(raw_cache_write_tokens, 0)
-     ELSE GREATEST(prompt_tokens,
-       COALESCE(cache_miss_tokens, 0)::numeric + COALESCE(cache_hit_tokens, 0) + COALESCE(raw_cache_write_tokens, 0))
-     END + COALESCE(completion_tokens, 0)) - tokens
-   ELSE 0 END AS missing_tokens
- FROM report_tokens a
+   tokens - classified_tokens AS missing_tokens
+ FROM report_totals a
 )`
 
 const reportCallsSQL = reportAttributionSQL + reportCallsFromSQL
 
-const tokenCompletenessSQL = `CASE WHEN min(token_parts) = 4 THEN 'complete'
-   WHEN max(token_parts) > 0 THEN 'partial' ELSE 'missing' END`
+const tokenCompletenessSQL = `CASE WHEN bool_and(tokens_complete) THEN 'complete'
+   WHEN bool_or(token_parts > 0 OR total_tokens IS NOT NULL OR prompt_tokens IS NOT NULL) THEN 'partial' ELSE 'missing' END`
 
-const chargedTokensMissingCallsSQL = `count(*) FILTER (WHERE beichen_state = 'charged' AND token_parts < 4)`
+const chargedTokensMissingCallsSQL = `count(*) FILTER (WHERE beichen_state = 'charged' AND NOT tokens_complete)`
 
 const usageTotalsJSONSQL = `jsonb_build_object(
  'credits', trim_scale(COALESCE(sum(beichen_credit_exact) FILTER (WHERE beichen_state = 'charged'), 0))::text,
@@ -153,8 +154,8 @@ const usageTotalsJSONSQL = `jsonb_build_object(
  'students', count(DISTINCT user_id), 'keys', count(DISTINCT api_key_id))`
 
 const modelUsageMetricsJSONSQL = usageTotalsJSONSQL + ` || jsonb_build_object(
- 'cache_hit_rate', sum(cache_read_tokens) FILTER (WHERE token_parts = 4) /
-   NULLIF(sum(input_tokens::numeric + cache_read_tokens) FILTER (WHERE token_parts = 4), 0),
+ 'cache_hit_rate', sum(cache_read_tokens) FILTER (WHERE tokens_complete) /
+   NULLIF(sum(input_tokens + cache_read_tokens) FILTER (WHERE tokens_complete), 0),
  'tokens_missing', COALESCE(sum(missing_tokens), 0),
  'completeness', ` + tokenCompletenessSQL + `)`
 

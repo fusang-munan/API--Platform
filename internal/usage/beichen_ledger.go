@@ -57,8 +57,27 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 		COALESCE(beichen_dispatch_kind,''),beichen_dispatch_at,beichen_dispatch_credential_id,
 		COALESCE(beichen_dispatch_model,''),outcome FROM gateway_calls WHERE id=$1`, callID).
 		Scan(&state, &hold, &multiplier, &kind, &dispatchAt, &credential, &model, &oldOutcome)
-	if err != nil || state == "charged" || state == "released" {
+	if err != nil {
 		return err
+	}
+	if state == "released" {
+		return nil
+	}
+	if state == "charged" {
+		// A recovery sweep may let a receipt settle before the terminal
+		// response arrives. Preserve that observation without changing the debit
+		// or replacing the counters used in an earlier gateway settlement.
+		if !metrics.HasTokenUsage() {
+			return nil
+		}
+		var captureLate bool
+		err := tx.QueryRowContext(ctx, `SELECT usage_state IS DISTINCT FROM 'reported' AND EXISTS(
+			SELECT 1 FROM beichen_call_receipts WHERE call_id=$1 AND applied
+		) FROM gateway_calls WHERE id=$1`, callID).Scan(&captureLate)
+		if err != nil || !captureLate {
+			return err
+		}
+		return writeCallMetrics(ctx, tx, callID, metrics)
 	}
 	if state == "pending_review" {
 		hold = 0
@@ -82,6 +101,11 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 		priceAt = sql.NullTime{Time: route.SentAt, Valid: true}
 		if next == "pending_review" {
 			reason = "missing_terminal_usage"
+			if success && category != "" {
+				reason = category
+			} else if metrics.State == UsagePartial {
+				reason = "incomplete_token_breakdown"
+			}
 		}
 	}
 	if state == "pending_review" && oldOutcome == "succeeded" && outcome != "succeeded" {
@@ -123,7 +147,7 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 	if _, err = tx.ExecContext(ctx, `UPDATE monitored_inputs SET visible=true WHERE call_id=$1`, callID); err != nil {
 		return err
 	}
-	if priceAt.Valid && metrics.State == UsageReported {
+	if priceAt.Valid && success && category == "" && metrics.State == UsageReported {
 		return settleBeichenReport(ctx, tx, callID, metrics)
 	}
 	return refreshLedgerTurn(ctx, tx, callID, "0", false)
@@ -165,7 +189,7 @@ const beichenBaseSourceSQL = `coalesce(c.beichen_base_source,c.pricing_detail->>
 
 func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics) error {
 	var school, upstream, effort sql.NullString
-	var mode, protocol, ttl string
+	var mode, protocol, ttl, missingRate string
 	var terms []byte
 	var quoteVersion sql.NullInt64
 	var quoteMultiplier sql.NullString
@@ -176,7 +200,11 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 		p.mode,p.upstream_version,p.multiplier_version,
 		num_nonnulls(p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)=0,
 		c.protocol,c.reasoning_effort,COALESCE(c.cache_ttl,''),
-		quote.terms,quote.multiplier_version,quote.multiplier::text
+		quote.terms,quote.multiplier_version,quote.multiplier::text,
+		CASE
+		  WHEN COALESCE($4::bigint,0)>0 AND p.upstream_cache_read IS NULL THEN 'missing_cache_read_price'
+		  WHEN COALESCE($6::bigint,0)>0 AND p.upstream_cache_write IS NULL THEN 'missing_cache_write_price'
+		  ELSE 'missing_price_or_token_breakdown' END
 		FROM gateway_calls c
 		CROSS JOIN LATERAL beichen_price_at(c.beichen_dispatch_credential_id,c.beichen_dispatch_model,c.beichen_price_at) p
 		CROSS JOIN LATERAL (SELECT
@@ -191,7 +219,7 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 		FOR UPDATE OF c`, callID, metrics.PromptTokens, metrics.CompletionTokens,
 		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens).Scan(
 		&school, &upstream, &mode, &charge.upstreamVersion, &charge.multiplierVersion, &noFixedSchool,
-		&protocol, &effort, &ttl, &terms, &quoteVersion, &quoteMultiplier)
+		&protocol, &effort, &ttl, &terms, &quoteVersion, &quoteMultiplier, &missingRate)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -211,6 +239,9 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 	anthropicWrite := protocol == "anthropic" && metrics.CacheWriteTokens != nil && *metrics.CacheWriteTokens > 0
 	cacheDuration := beichenCacheTTL(ttl)
 	switch {
+	case metrics.ClassifyBeichenUsage(protocol).State != UsageReported:
+		base = sql.NullString{}
+		reason = "incomplete_token_breakdown"
 	// A complete teacher-set price has one fixed rate for all cache writes.
 	case anthropicWrite && cacheDuration == "" && !manualPriced:
 		base = sql.NullString{}
@@ -240,15 +271,21 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 			WHEN $2::bigint IS NULL THEN 'missing_upstream_price'
 			WHEN $3::bigint IS NULL AND EXISTS (SELECT 1 FROM beichen_price_versions WHERE id=$2 AND basis='base')
 				THEN 'missing_upstream_multiplier'
-			ELSE 'missing_price_or_token_breakdown' END,
+			ELSE $5 END,
 			beichen_upstream_price_version=$2,beichen_multiplier_version=$3 WHERE id=$1`,
-			callID, charge.upstreamVersion, charge.multiplierVersion, reason)
+			callID, charge.upstreamVersion, charge.multiplierVersion, reason, missingRate)
 		if err != nil {
 			return err
 		}
 		return refreshLedgerTurn(ctx, tx, callID, "0", false)
 	}
 	charge.base = base.String
+	if !manualPriced && len(terms) != 0 {
+		charge.detail = recordIgnoredBeichenPanelPrices(terms, charge.detail)
+		if len(charge.detail) != 0 {
+			charge.snapshot = terms
+		}
+	}
 	return bookBeichenCharge(ctx, tx, callID, charge)
 }
 

@@ -48,6 +48,7 @@ CREATE TABLE gateway_calls (
   provider_id uuid, provider_credential_id uuid, binding_id uuid, upstream_model_name text,
   created_at timestamptz, sent_at timestamptz, outcome text, protocol text, usage_state text,
   prompt_tokens int, completion_tokens int, cache_hit_tokens bigint, cache_miss_tokens bigint, cache_write_tokens bigint,
+  reasoning_tokens bigint, tool_prompt_tokens bigint, usage_reason text,
   beichen_state text, beichen_credit_exact numeric, beichen_dispatch_kind text, beichen_dispatch_at timestamptz,
   beichen_dispatch_credential_id uuid, beichen_dispatch_model text, beichen_price_at timestamptz
 )`)

@@ -89,8 +89,8 @@ VALUES ($1,$2,'upstream','base','billing',2000000,10000000,100000,2500000)`, cre
 		hit                                          sql.NullInt64
 		send                                         bool
 	}{
-		{"g3-original-sse", "text/event-stream", outputChunk + "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_g3\",\"status\":\"completed\",\"usage\":{\"input_tokens\":4225,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":4096}}}}\n\n", "pending_review", "", "0", 0, sql.NullInt64{Int64: 4096, Valid: true}, true},
-		{"gm1-original-json", "application/json", `{"id":"` + forgedReceipt + `","status":"completed","usage":{"input_tokens":59,"output_tokens":3}}`, "pending_review", "", "0.014352", 1, sql.NullInt64{}, true},
+		{"g3-original-sse", "text/event-stream", outputChunk + "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_g3\",\"model\":\"" + upstreamModel + "\",\"status\":\"completed\",\"usage\":{\"input_tokens\":4225,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":4096}}}}\n\n", "pending_review", "", "0", 0, sql.NullInt64{Int64: 4096, Valid: true}, true},
+		{"gm1-original-json", "application/json", `{"id":"` + forgedReceipt + `","model":"` + gmModel + `","status":"completed","usage":{"input_tokens":59,"output_tokens":3}}`, "pending_review", "", "0.014352", 1, sql.NullInt64{}, true},
 		{"stream-interrupted", "text/event-stream", outputChunk, "pending_review", "", "0.015488", 2, sql.NullInt64{}, true},
 		{"not-sent", "", "", "released", "", "0.015488", 2, sql.NullInt64{}, false},
 	} {
@@ -261,6 +261,9 @@ FROM gateway_calls WHERE id=$1`, callID, want).Scan(&charged); err != nil || !ch
 	}
 	testBeichenRealtimeConnection(t, ctx, db, gateway, publicModel, gmModel, studentKey, upstreamKey, credential)
 	testBeichenHTTPConditions(t, ctx, db, gateway, binding, credential, publicModel, gmModel, studentKey)
+	t.Run("41-call-token-audit", func(t *testing.T) {
+		testBeichen41CallTokenAudit(t, ctx, db, gateway, provider, credential, binding, teacher, publicModel, gmModel, studentKey)
+	})
 }
 
 func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, gateway *Gateway, binding, credential uuid.UUID, publicModel, upstreamModel, studentKey string) {
@@ -502,7 +505,7 @@ func testBeichenResponsesSocket(t *testing.T, ctx context.Context, db *sql.DB, g
 			}
 			want := "interrupted"
 			if terminal {
-				want = "missing"
+				want = "partial"
 			}
 			var ok bool
 			err = db.QueryRowContext(ctx, `SELECT beichen_state='pending_review' AND protocol='openai_responses'
@@ -579,8 +582,8 @@ func openBeichenGatewayTestSchema(t *testing.T, ctx context.Context) *sql.DB {
 	const required = "test requires the disposable loopback gateway or rollout test database"
 	u, err := url.Parse(dsn)
 	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") ||
-		u.User == nil || u.Path != "/nebula_test" ||
-		!(u.Host == "127.0.0.1:55439" && u.User.Username() == "nebula_qa" || u.Host == "127.0.0.1:55841" && u.User.Username() == "nebula_test") ||
+		u.Hostname() != "127.0.0.1" || u.Port() == "" || u.Path != "/nebula_test" ||
+		u.User == nil || (u.User.Username() != "nebula_qa" && u.User.Username() != "nebula_test") ||
 		u.RawQuery != "sslmode=disable" || u.Fragment != "" {
 		t.Fatal(required)
 	}

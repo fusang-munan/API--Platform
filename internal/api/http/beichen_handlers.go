@@ -62,6 +62,20 @@ func (s *Server) beichenDiagnostics(c *gin.Context) {
 	respond(c, http.StatusOK, view)
 }
 
+func (s *Server) beichenReconciliationCalls(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	providerID, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	view, err := s.service.Beichen().ReconciliationCalls(c.Request.Context(), providerID, c.Query("day"), c.Query("cursor"))
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
+}
+
 func (s *Server) beichenArchivedReceipts(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	providerID, ok := pathID(c, "provider_id")

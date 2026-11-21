@@ -184,7 +184,7 @@ func expectUsageWrite(mock sqlmock.Sqlmock, callID uuid.UUID, responseID string,
 	mock.ExpectQuery(`SELECT turn_id,COALESCE.*FOR UPDATE`).WithArgs(callID).
 		WillReturnRows(sqlmock.NewRows([]string{"turn_id", "prompt", "completion", "total"}).AddRow(nil, 0, 0, 0))
 	mock.ExpectExec(`UPDATE gateway_calls SET upstream_response_id`).WithArgs(callID, responseID, prompt, completion, total,
-		nil, nil, nil, nil, nil, nil, string(state)).WillReturnResult(sqlmock.NewResult(0, 1))
+		nil, nil, nil, nil, nil, nil, string(state), sqlmock.AnyArg(), nil).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 }
 

@@ -317,7 +317,7 @@ func routePriceReadiness(fixed bool, terms json.RawMessage) activationPrice {
 	if fixed {
 		return activationPrice{}
 	}
-	code, message := usage.BeichenTokenQuoteBlocker(terms)
+	code, message := usage.BeichenPanelQuoteBlocker(terms)
 	if code == "" {
 		return activationPrice{conditional: true}
 	}
@@ -364,8 +364,7 @@ func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx, observed
 	return readiness, nil
 }
 
-// Both price_conditions_exact and price_conditions come from model_pricing.
-// Read that original JSON without converting any prices to floating point.
+// Read the original terms without converting any prices to floating point.
 const activationFixedSchoolPriceSQL = `p.school_input IS NOT NULL AND p.school_output IS NOT NULL
   AND (p.mode = 'manual' OR (p.school_cache_read IS NOT NULL AND p.school_cache_write IS NOT NULL))`
 

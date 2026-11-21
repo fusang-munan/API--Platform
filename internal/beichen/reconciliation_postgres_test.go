@@ -148,7 +148,7 @@ func TestReconciliationPostgresStudentAndSchoolChargesAndTokenCompleteness(t *te
 		view.Totals.Local.ChargedTokensMissingCalls != 2 || view.Totals.Upstream.Requests != 6 {
 		t.Fatalf("汇总未区分阶段 2 已扣积分与历史扣分: %+v", view)
 	}
-	wantCompleteness := map[string]string{"zero-tokens": "complete", "partial-local": "partial", "partial-upstream": "partial", "no-tokens": "missing"}
+	wantCompleteness := map[string]string{"zero-tokens": "complete", "partial-local": "partial", "partial-upstream": "partial", "no-tokens": "partial"}
 	for _, row := range view.Models {
 		if row.MatchStatus != "matched" || row.Completeness != wantCompleteness[row.Model] {
 			t.Errorf("模型记录状态和 Token 回报状态错误: %+v", row)
@@ -164,13 +164,13 @@ func TestReconciliationPostgresStudentAndSchoolChargesAndTokenCompleteness(t *te
 		} else if row.SchoolAbsorbedCredits != nil || row.StudentYuan == "0" {
 			t.Errorf("历史记录的学校承担或学生已扣错误: %+v", row)
 		}
-		if row.Model == "no-tokens" && (row.Local.ChargedTokensMissingCalls != 1 || row.Local.Completeness != "missing" ||
-			row.Local.TokensMissing != 10 || row.Upstream.Completeness != "missing") {
-			t.Errorf("已扣款但没有回报 Token 的调用须单独计数: %+v", row)
+		if row.Model == "no-tokens" && (row.Local.ChargedTokensMissingCalls != 1 || row.Local.Completeness != "partial" ||
+			row.Local.Tokens != 10 || row.Local.TokensMissing != 0 || row.Upstream.Completeness != "missing") {
+			t.Errorf("旧记录标记为缺失但仍保留原始分项: %+v", row)
 		}
 	}
 	for _, row := range view.Keys {
-		wantStatus := map[uuid.UUID]string{first: "complete", second: "partial", third: "missing"}[row.CredentialID]
+		wantStatus := map[uuid.UUID]string{first: "complete", second: "partial", third: "partial"}[row.CredentialID]
 		wantSchool := map[uuid.UUID]string{first: "1.000000000000000001", second: "0", third: "<null>"}[row.CredentialID]
 		if row.Completeness != wantStatus || reportDecimal(row.SchoolAbsorbedCredits) != wantSchool {
 			t.Errorf("渠道账本汇总错误: %+v", row)

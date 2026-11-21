@@ -46,6 +46,7 @@ CREATE TABLE gateway_calls(
  provider_id uuid, provider_credential_id uuid, binding_id uuid, upstream_model_name text,
  created_at timestamptz, sent_at timestamptz, outcome text, protocol text, usage_state text,
  prompt_tokens int, completion_tokens int, total_tokens int, cache_hit_tokens bigint, cache_miss_tokens bigint, cache_write_tokens bigint,
+ reasoning_tokens bigint, tool_prompt_tokens bigint, usage_reason text,
  beichen_state text, beichen_credit_exact numeric, beichen_dispatch_kind text, beichen_dispatch_at timestamptz,
  beichen_dispatch_credential_id uuid, beichen_dispatch_model text, beichen_price_at timestamptz,
  project_id uuid, project_name text, user_id uuid, user_name text, api_key_id uuid, api_key_name text,
@@ -139,9 +140,9 @@ func TestModelUsageCompletenessPostgres(t *testing.T) {
 		}
 	}
 	totalRate, mixedRate, zero := 50.0/200, 25.0/95, 0.0
-	check("总计", report.Totals, 267, 76, "partial", &totalRate)
-	if got := report.Totals; got.InputTokens != 159 || got.OutputTokens != 44 ||
-		got.CacheReadTokens != 50 || got.CacheWriteTokens != 14 || got.ChargedTokensMissingCalls != 2 {
+	check("总计", report.Totals, 343, 62, "partial", &totalRate)
+	if got := report.Totals; got.InputTokens != 159 || got.OutputTokens != 48 ||
+		got.CacheReadTokens != 60 || got.CacheWriteTokens != 14 || got.ChargedTokensMissingCalls != 2 {
 		t.Errorf("已回报的分项累计或缺项笔数有误: %+v", got)
 	}
 	models := make(map[string]ModelUsageMetrics)
@@ -150,8 +151,8 @@ func TestModelUsageCompletenessPostgres(t *testing.T) {
 	}
 	check("完整", models["ready"], 12, 0, "complete", &zero)
 	check("账款待核但 Token 已回报", models["mixed"], 240, 0, "complete", &mixedRate)
-	check("上游有总数", models["interrupted"], 0, 73, "missing", nil)
-	check("只有部分分项", models["incomplete"], 15, 3, "partial", nil)
+	check("上游有总数", models["interrupted"], 73, 59, "partial", nil)
+	check("只有部分分项", models["incomplete"], 18, 3, "partial", nil)
 	check("上游未回报", models["unknown"], 0, 0, "missing", nil)
 	if len(report.Students) != 2 {
 		t.Fatalf("应包含两个学生: %+v", report.Students)
@@ -160,7 +161,7 @@ func TestModelUsageCompletenessPostgres(t *testing.T) {
 		if row.UserID == first {
 			check("第一个学生", row.ModelUsageMetrics, 12, 0, "complete", &zero)
 		} else {
-			check("第二个学生", row.ModelUsageMetrics, 255, 76, "partial", &mixedRate)
+			check("第二个学生", row.ModelUsageMetrics, 331, 62, "partial", &mixedRate)
 			for _, detail := range row.Models {
 				check("第二个学生的 "+detail.Model, detail.ModelUsageMetrics, models[detail.Model].Tokens,
 					models[detail.Model].TokensMissing, models[detail.Model].Completeness, models[detail.Model].CacheHitRate)
@@ -169,7 +170,7 @@ func TestModelUsageCompletenessPostgres(t *testing.T) {
 	}
 	for _, row := range report.Keys {
 		if row.APIKeyID == secondKey {
-			check("第二个 Key", row.ModelUsageMetrics, 255, 76, "partial", &mixedRate)
+			check("第二个 Key", row.ModelUsageMetrics, 331, 62, "partial", &mixedRate)
 		}
 	}
 }
@@ -257,7 +258,7 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if usage.Totals.Credits != "40.60000000000000000001" || usage.Totals.Tokens != 395 || usage.Totals.Calls != 6 ||
+	if usage.Totals.Credits != "40.60000000000000000001" || usage.Totals.Tokens != 505 || usage.Totals.Calls != 6 ||
 		usage.Totals.PendingCalls != 1 || usage.Totals.Students != 2 || usage.Totals.Keys != 3 || len(usage.Students) != 3 || len(usage.Keys) != 3 {
 		t.Fatalf("用量总计错误: %+v", usage)
 	}
@@ -277,8 +278,8 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 	}
 	local, upstream := view.Totals.Local, view.Totals.Upstream
 	if local.Tokens != usage.Totals.Tokens || local.Requests != usage.Totals.Calls ||
-		local.InputTokens != 275 || local.OutputTokens != 35 || local.CacheReadTokens != 70 || local.CacheWriteTokens != 15 ||
-		local.TokensMissing != 110 || local.ChargedTokensMissingCalls != 1 || local.Completeness != "partial" ||
+		local.InputTokens != 350 || local.OutputTokens != 45 || local.CacheReadTokens != 90 || local.CacheWriteTokens != 20 ||
+		local.TokensMissing != 0 || local.ChargedTokensMissingCalls != 1 || local.Completeness != "partial" ||
 		upstream.Tokens != 273 || upstream.Requests != 4 ||
 		view.Totals.Money.StudentYuan != "0.4060000000000000000001" || view.Totals.Money.BaseYuan != "0.37" ||
 		reportDecimal(view.Totals.Money.ActualYuan) != "0.38" || view.Totals.Money.MarginAvailable ||
@@ -306,12 +307,12 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 				t.Errorf("两边均有记录的模型归一化错误: %+v", row)
 			}
 			matchedChannels[row.CredentialID] = true
-			checkReportRatio(t, row.LocalShare, wantTokens, 395)
+			checkReportRatio(t, row.LocalShare, wantTokens, 505)
 			checkReportRatio(t, row.UpstreamShare, wantTokens, 273)
 		case "pending", "missing":
 			if row.MatchStatus != "local_only" || row.ActualYuan != nil ||
-				(row.Model == "missing" && (row.Local.Tokens != 0 || row.Local.ChargedTokensMissingCalls != 1 ||
-					row.Local.Completeness != "missing")) {
+				(row.Model == "missing" && (row.Local.Tokens != 110 || row.Local.ChargedTokensMissingCalls != 1 ||
+					row.Local.Completeness != "partial")) {
 				t.Errorf("本地模型状态错误: %+v", row)
 			}
 		case "one-sided":
@@ -336,7 +337,7 @@ func TestReportsPostgresModelsStudentsKeysAndReconciliation(t *testing.T) {
 	}
 	for _, row := range view.Keys {
 		if row.Label == nil || row.MarginAvailable || row.MarginYuan != nil || row.MarginRate != nil ||
-			(row.CredentialID == first && row.Local.Tokens != 330) || (row.CredentialID == second && row.Local.Tokens != 65) {
+			(row.CredentialID == first && row.Local.Tokens != 440) || (row.CredentialID == second && row.Local.Tokens != 65) {
 			t.Errorf("渠道聚合错误: %+v", row)
 		}
 		if row.CredentialID == first && reportDecimal(row.ActualYuan) != "0.37" || row.CredentialID == second && reportDecimal(row.ActualYuan) != "0.01" {

@@ -346,7 +346,7 @@ func (row *capabilityRow) reportPriceGaps(view *BeichenCapabilities) {
 	case row.fixedPrice:
 		row.PriceState = "confirmed"
 	default:
-		code, message := usage.BeichenTokenQuoteBlocker(row.priceTerms)
+		code, message := usage.BeichenPanelQuoteBlocker(row.priceTerms)
 		switch {
 		case code == "":
 			row.PriceState = "conditional"

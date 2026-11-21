@@ -115,7 +115,7 @@ const reconciliationSQL = reportAttributionSQL + `,
    COALESCE(c.actual_credits, c.beichen_credit_exact) AS full_charge_credits
 ` + reportCallsFromSQL + `,
 verified_calls AS (
- SELECT count(*) AS requests, count(*) FILTER (WHERE a.token_parts = 4) AS complete_token_calls
+ SELECT count(*) AS requests, count(*) FILTER (WHERE a.tokens_complete) AS complete_token_calls
  FROM report_calls a
  JOIN beichen_receipt_response_claims claim ON claim.first_call_id = a.call_id
    AND claim.response_id = a.beichen_receipt_response_id AND claim.conflicted_at IS NULL
@@ -124,8 +124,8 @@ verified_calls AS (
  WHERE a.beichen_state = 'charged' AND NOT a.beichen_receipt_conflict
 ), priced_calls AS (
  SELECT a.*, COALESCE(alias.school_model, a.model) AS school_model,
-   CASE WHEN a.token_parts = 4 AND a.beichen_state IS DISTINCT FROM 'pending_review' THEN
-   beichen_weighted_tokens(a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_write_tokens,
+   CASE WHEN a.tokens_complete AND a.beichen_state IS DISTINCT FROM 'pending_review' THEN
+   beichen_weighted_tokens(a.input_tokens::bigint, a.output_tokens::bigint, a.cache_read_tokens, a.cache_write_tokens,
      p.upstream_input, p.upstream_output, p.upstream_cache_read, p.upstream_cache_write)
    END AS estimated_weight
  FROM report_calls a ` + joinModelAliasSQL + `
@@ -159,7 +159,8 @@ verified_calls AS (
  WHERE a.provider_id = $1 AND ($4::text IS NULL OR day >= $4::text::date) AND day < $5::text::date
 ), upstream_summary AS (
  SELECT credential_id, model, grouping(credential_id, model) AS level, count(*) AS row_count,
-   ` + tokenCompletenessSQL + ` AS token_completeness,
+   CASE WHEN min(token_parts) = 4 THEN 'complete'
+        WHEN max(token_parts) > 0 THEN 'partial' ELSE 'missing' END AS token_completeness,
    COALESCE(sum(requests), 0) AS requests,
    COALESCE(sum(input_tokens), 0) AS input_tokens, COALESCE(sum(output_tokens), 0) AS output_tokens,
    COALESCE(sum(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(sum(cache_write_tokens), 0) AS cache_write_tokens,

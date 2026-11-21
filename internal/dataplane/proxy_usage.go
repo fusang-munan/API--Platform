@@ -299,7 +299,7 @@ func (g *Gateway) proxyHTTPBody(w http.ResponseWriter, original *http.Request, r
 		return false
 	}
 	ctx := original.Context()
-	metrics := usage.CallMetrics{State: usage.UsageMissing}
+	metrics := usage.CallMetrics{State: usage.UsageMissing, UsageReason: "upstream_http_error"}
 	category, message := "http", fmt.Sprintf("HTTP %d", response.StatusCode)
 	var resourceBody []byte
 	resourceType, isCreation := createdResourceType(original.Method, original.URL.Path)
@@ -319,7 +319,7 @@ func (g *Gateway) proxyHTTPBody(w http.ResponseWriter, original *http.Request, r
 		}{Reader: io.MultiReader(bytes.NewReader(prefix), body), Closer: body}
 		switch {
 		case err != nil:
-			metrics.State = usage.UsageInterrupted
+			metrics.State, metrics.UsageReason = usage.UsageInterrupted, "response_interrupted"
 		case int64(len(prefix)) <= limit:
 			interrupted := false
 			if north && review == "" {
@@ -336,10 +336,12 @@ func (g *Gateway) proxyHTTPBody(w http.ResponseWriter, original *http.Request, r
 			if isCreation {
 				resourceBody = prefix
 			}
+		default:
+			metrics.UsageReason = "usage_observation_limit"
 		}
 	}
 	if north && success {
-		metrics, review = beichenReviewMetrics(&candidate, adapter, metrics, review)
+		metrics, review = beichenReviewMetrics(adapter, metrics, review)
 		if review != "" {
 			category, message = review, "The response requires billing review."
 		}
@@ -423,7 +425,7 @@ func (g *Gateway) proxySSE(w http.ResponseWriter, original *http.Request, respon
 		if observer.review == "" && !observer.modelReported {
 			observer.review = beichenModelUnconfirmed
 		}
-		metrics, review := beichenReviewMetrics(&candidate, observer.adapter, metrics, observer.review)
+		metrics, review := beichenReviewMetrics(observer.adapter, metrics, observer.review)
 		if interrupted {
 			_ = g.finalizeCall(ctx, reservation, false, "stream", "Upstream stream did not complete.", candidate, metrics)
 		} else {

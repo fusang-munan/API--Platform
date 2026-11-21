@@ -23,7 +23,7 @@ func TestCompleteCallMetricsAppliesOnlyTheChangeInTurnTokens(t *testing.T) {
 		mock.ExpectBegin()
 		mock.ExpectQuery(`SELECT turn_id,COALESCE.*FOR UPDATE`).WithArgs(callID).
 			WillReturnRows(sqlmock.NewRows([]string{"turn_id", "prompt", "completion", "total"}).AddRow(turnID, old[0], old[1], 12))
-		mock.ExpectExec(`UPDATE gateway_calls SET upstream_response_id`).WithArgs(callID, "", int64(0), int64(7), nil, nil, int64(9), nil, nil, nil, nil, "interrupted").
+		mock.ExpectExec(`UPDATE gateway_calls SET upstream_response_id`).WithArgs(callID, "", int64(0), int64(7), nil, nil, int64(9), nil, nil, nil, nil, "interrupted", "", nil).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		if old[0] != 0 {
 			mock.ExpectExec(`UPDATE gateway_call_turns SET`).WithArgs(turnID, int64(-5), int64(3), int64(0)).
@@ -82,7 +82,7 @@ func TestFinalizeBillsTheReservedMultiplierOnce(t *testing.T) {
 		mock.ExpectQuery(`SELECT turn_id,COALESCE.*FOR UPDATE`).WithArgs(reservation.CallID).
 			WillReturnRows(sqlmock.NewRows([]string{"turn_id", "prompt", "completion", "total"}).AddRow(nil, 0, 0, 0))
 		mock.ExpectExec(`UPDATE gateway_calls SET upstream_response_id`).WithArgs(
-			reservation.CallID, "", nil, nil, nil, nil, nil, nil, nil, nil, int64(999999), "reported",
+			reservation.CallID, "", nil, nil, nil, nil, nil, nil, nil, nil, int64(999999), "reported", "", nil,
 		).WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
 		if err := store.Finalize(context.Background(), reservation, true, "succeeded", "", "", route, metrics); err != nil {
