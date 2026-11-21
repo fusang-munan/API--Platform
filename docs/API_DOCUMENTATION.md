@@ -457,6 +457,8 @@ data: {"revision":"01K2..."}
 
 `website_directory` 返回完整官网目录状态、`last_success` 和 `last_error`。`fresh` 表示近期完整采集，`stale` 表示当前使用部分更新或保留的快照，`unverified` 表示等待取得官网目录。`model_catalog` 合并官网与启用 Key 的目录，并保留已发布但失去目录覆盖的模型。`source` 为 `website`、`key` 或 `both`。`catalog_state` 为 `website_only`、`key_listed` 或 `catalog_missing`。`key_count` 按有目录证据的当前 Key 去重。已有 Key 同版本的上次结果在扫描失败后仍可查，`catalog_keys[].stale` 标记该情况。
 
+`website_directory.last_run` 是最近一次后台抓取的摘要，尚无运行记录时为 `null`。摘要包含 `started_at`、`duration_ms`、`platform_count`、`group_count`、`model_count`、`expected_model_count` 和 `failures`。同一平台出现在不同渠道下时分别计数。模型按去掉首尾空白的官网原名去重，保留大小写及版本差异。分组按照分组 ID 去重，没有 ID 时用渠道内的平台和分组名识别。`expected_model_count` 含原响应中所有 `models` 和 `supported_models` 数组中能辨认的型号。当平台资料损坏时，本轮成功归入平台的模型数可能低于它。失败项提供 `path`、`reason` 以及可读取的 `channel_id`、`channel` 和 `platform`。
+
 `website_locations` 带官网原名、渠道、平台、分组、采集时间、缓存状态和报价存在标记。`catalog_keys` 带实际覆盖的 Key 及上游型号，或者给出需要核查的 Key。`state` 可为 `listed`、`missing`、`pending`、`failed` 或 `ambiguous`。已覆盖条目用 `match` 说明原名、名称归一或教师别名，并保留独立的 Key 型号 ID 供教师操作。弱匹配可以识别唯一的日期版本，保留型号数字和具有实际含义的变体。官网已有价格且当前 Key 报价待确认时，教师可同时看到分组和目录证据。
 
 `catalog_differences` 按启用 Key 返回已知分组、核对时间、`website_only` 和 `key_only`。官网分组与当前 Key 目录均可对比时标为 `compared`。比较使用保留的官网数据时标为 `stale`。缺少一方证据时标为 `unverified`。`website_only_models` 汇总当前 Key 均未匹配的官网型号及候选渠道，`website_only_status` 表示该汇总的核对状态。
@@ -467,7 +469,11 @@ data: {"revision":"01K2..."}
 
 维护用的 `beichen/access/{credential_id}` 可读该凭据的同步状态、分组与北辰 Key 数字 ID。学校自动部署通过官网普通账号建立这些关联。旧版专用读取凭据的接口保留兼容。
 
-自动同步和按供应商的手动同步独立刷新完整官网目录，并按 Key 读取模型清单与倍率。定向重扫只读取所选 Key 的 `/v1/models`，结果保存后下一次概览自动重新匹配。学校预配渠道用学校网页会话读取价表。账单提供分组 ID 时使用该 ID，省略时从账号内的 Key 记录核实当前分组，固定配置的渠道同样需要核实。如果已核实分组内的官网名和 Key 名只有明确的拼写差异，且能双向唯一匹配，报价按 Key 的原名保存。手动同步遇到官网目录或采价失败会返回同步未完成。成功保存的结果可在概览查询，价表错误记录在 `datasets`。
+自动同步和按供应商的手动同步独立刷新完整官网目录，并按 Key 读取模型清单与账单倍率。教师模型页的「用指定 Key 重扫」向同步接口提交 `credential_id`，同步该 Key 的账单、目录、报价和近期用量。`/beichen/catalog/rescan` 保留为单独读取 `/v1/models` 的维护接口。学校预配渠道用学校网页会话读取价表。账单提供分组 ID 时使用该 ID，省略时从账号内的 Key 记录核实当前分组，固定配置的渠道同样需要核实。如果已核实分组内的官网名和 Key 名只有明确的拼写差异，且能双向唯一匹配，报价按 Key 的原名保存。手动同步遇到官网目录或采价失败会返回同步未完成。成功保存的结果可在概览查询，价表错误记录在 `datasets`。
+
+`datasets` 的 `billing` 条目包含 `billing_state` 和 `effective_multiplier`。有对应记录时还包含保留小数精度的 `effective_multiplier_text`、`group_id`、`group_rate`、`peak_enabled`、`peak_rate` 和倍率版本的 `observed_at`。`current` 表示最近一次读取已确认，`stale` 保留上次倍率和 `last_success`，`unverified` 表示还没有可用依据。连续失败记录在 `failure_count`，最多记到六次，达到三次时 `alert` 为真。
+
+`catalog_keys[].group_diagnosis` 的 `model_outside_key_group` 表示型号在其他官网分组且当前 Key 的目录未列出，`price_outside_key_group` 表示型号有其他分组报价、当前 Key 分组缺价，`group_rate_mismatch` 表示同一分组的官网与 Key 计费规则不一致。`website_locations[].groups` 返回官网分组倍率和可用的高峰规则。`website_locations[].price_conditions_exact` 以十进制字符串保存可显示的单价数字，供报价对比使用。Key 分组沿用陈旧记录时，`group_stale` 为真。
 
 本轮已在当前分组的有效价表中查找该模型，而价表缺少同名条目时，概览的 `models[].price_status` 返回 `not_listed`。分组待核、价表缺失或过期、已列出的同名条目缺少有效价格，均返回 `pending_confirmation`。
 

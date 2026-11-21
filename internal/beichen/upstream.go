@@ -125,6 +125,15 @@ func parseBilling(body []byte) (billingInfo, error) {
 	if multiplier == nil || multiplier.Cmp(big.NewRat(1000, 1)) > 0 {
 		return billingInfo{}, errors.New("北辰账单响应缺少有效倍率")
 	}
+	if (info.GroupID != nil && *info.GroupID != 0 && billingPanelGroup(info) == 0) ||
+		(info.GroupRate != "" && exactDecimal(info.GroupRate) == nil) ||
+		(info.PeakRate != "" && exactDecimal(info.PeakRate) == nil) {
+		return billingInfo{}, errors.New("北辰账单响应的分组或分组倍率无效")
+	}
+	if len(info.PeakStart) > 16 || len(info.PeakEnd) > 16 ||
+		strings.ContainsRune(info.PeakStart+info.PeakEnd, 0) {
+		return billingInfo{}, errors.New("北辰账单响应的高峰时段无效")
+	}
 	if len(info.Timezone) > 64 || strings.ContainsRune(info.Timezone, 0) {
 		info.Timezone = ""
 	}

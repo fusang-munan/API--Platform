@@ -113,16 +113,59 @@ func catalogWebsiteMatches(keys []discoveryKey, websiteNames catalogNameMatcher,
 		match := matchWebsiteModel(locations[0].Name, key.matcher, websiteNames)
 		if match.name != "" {
 			targets[strings.ToLower(match.name)] = true
-			evidence = append(evidence, key.listed(match.name, match.kind))
+			item := key.listed(match.name, match.kind)
+			if row := key.models[match.name]; row != nil && row.PriceStatus != "confirmed" && row.PriceStatus != "conditional" {
+				item.GroupDiagnosis = key.diagnoseGroup(locations, false)
+			}
+			evidence = append(evidence, item)
 		} else if key.couldCover(locations) || match.kind == "ambiguous" {
 			item := key.CatalogKey
 			if item.State == "missing" && match.kind == "ambiguous" {
 				item.State = "ambiguous"
 			}
+			if item.State == "missing" {
+				item.GroupDiagnosis = key.diagnoseGroup(locations, true)
+			}
 			evidence = append(evidence, item)
 		}
 	}
 	return targets, evidence
+}
+
+func (key discoveryKey) diagnoseGroup(locations []WebsiteLocation, missingModel bool) string {
+	if !key.groupCurrent {
+		return ""
+	}
+	hasOtherGroup, hasCurrentGroup, currentPrice := false, false, false
+	for _, location := range locations {
+		if location.Stale || location.channelStatus != "" && location.channelStatus != "active" {
+			continue
+		}
+		if len(key.platforms) != 0 && !key.platforms[strings.ToLower(location.Platform)] {
+			continue
+		}
+		for _, group := range location.Groups {
+			if group.ID == 0 || group.Status != "" && group.Status != "active" {
+				continue
+			}
+			if group.ID == *key.GroupID {
+				hasCurrentGroup = true
+				currentPrice = currentPrice || location.HasPrice
+			} else {
+				hasOtherGroup = hasOtherGroup || (missingModel || location.HasPrice)
+			}
+		}
+	}
+	if missingModel && hasOtherGroup && !hasCurrentGroup {
+		return "model_outside_key_group"
+	}
+	if !missingModel && hasCurrentGroup && key.priceError != nil && *key.priceError == errPanelRulesConflict.Error() {
+		return "group_rate_mismatch"
+	}
+	if !missingModel && hasOtherGroup && !currentPrice {
+		return "price_outside_key_group"
+	}
+	return ""
 }
 
 func (key discoveryKey) listed(name, kind string) CatalogKey {
@@ -169,6 +212,9 @@ func (key discoveryKey) couldCover(locations []WebsiteLocation) bool {
 			return true
 		}
 		platform := strings.ToLower(location.Platform)
+		if key.platforms[platform] {
+			return true
+		}
 		switch strings.ToLower(channel) {
 		case "cc1":
 			if platform == "anthropic" || platform == "claude" {

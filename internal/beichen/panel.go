@@ -81,6 +81,8 @@ type panelQuote struct {
 var errPanelLoginRequired = errors.New("北辰渠道页要求登录")
 var errPanelEmpty = errors.New("北辰渠道页没有当前 Key 的有效模型报价")
 var errPanelGroupUnverified = errors.New("无法核实北辰 Key 当前所属分组")
+var errPanelGroupNotFound = errors.New("北辰面板找不到当前 Key 分组")
+var errPanelRulesConflict = errors.New("北辰面板与 Key 账单的分组倍率或高峰规则不一致")
 
 func (s *Service) fetchChannelQuote(ctx context.Context, access priceAccess, key string, info billingInfo, entries []catalog.ProviderEntry) panelQuote {
 	group := billingPanelGroup(info)
@@ -451,7 +453,7 @@ func matchPanelPrices(channels []panelChannel, groupID int64, info billingInfo, 
 					return matchedPanelPrices{}, errors.New("北辰面板分组未确认为标准余额组")
 				}
 				if !matchesPanelMultiplier(group, info) {
-					return matchedPanelPrices{}, errors.New("北辰面板与 Key 账单的分组倍率或高峰规则不一致")
+					return matchedPanelPrices{}, errPanelRulesConflict
 				}
 				selectedChannel, groupPlatform = i, group.Platform
 				seenPlatforms[candidate.Platform] = true
@@ -460,8 +462,11 @@ func matchPanelPrices(channels []panelChannel, groupID int64, info billingInfo, 
 			}
 		}
 	}
-	if len(sections) == 0 || modelCount > maxRows {
-		return matchedPanelPrices{}, errors.New("北辰面板找不到映射分组或模型数量超限")
+	if len(sections) == 0 {
+		return matchedPanelPrices{}, errPanelGroupNotFound
+	}
+	if modelCount > maxRows {
+		return matchedPanelPrices{}, errors.New("北辰面板模型数量超限")
 	}
 	keyNames := make([]string, 0, len(entries))
 	for _, model := range entries {
@@ -615,6 +620,9 @@ func conditionalPanelPricing(raw json.RawMessage) bool {
 }
 
 func saveBillingObservation(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, revision time.Time, info billingInfo, billingErr error, group int64, quote panelQuote) error {
+	if group != 0 {
+		info.GroupID = &group
+	}
 	if group == 0 && quote.err == nil {
 		var managed bool
 		err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM beichen_panel_snapshots WHERE credential_id = $1)`, credentialID).Scan(&managed)
@@ -622,10 +630,9 @@ func saveBillingObservation(ctx context.Context, tx *sql.Tx, credentialID uuid.U
 			return err
 		}
 		if !managed {
-			if billingErr != nil {
-				return nil
+			if billingErr == nil {
+				return saveBilling(ctx, tx, credentialID, info)
 			}
-			return saveBilling(ctx, tx, credentialID, info)
 		}
 		quote.err = errors.New("北辰面板分组映射已移除")
 	}
@@ -635,6 +642,9 @@ func saveBillingObservation(ctx context.Context, tx *sql.Tx, credentialID uuid.U
 	}
 	if billingErr != nil {
 		quote.err = billingErr
+		if err := markMultiplierStale(ctx, tx, credentialID, effectiveAt); err != nil {
+			return err
+		}
 	} else if err := saveMultiplier(ctx, tx, credentialID, info, effectiveAt); err != nil {
 		return err
 	}
@@ -643,11 +653,12 @@ func saveBillingObservation(ctx context.Context, tx *sql.Tx, credentialID uuid.U
 	}
 	if quote.err != nil {
 		// A failed read retains the last quote only while this round can still
-		// verify its group and multiplier.
-		if billingErr == nil {
-			if err := invalidateChangedPanelQuote(ctx, tx, credentialID, revision, effectiveAt, group, info.Multiplier.String()); err != nil {
-				return err
-			}
+		// verify its group and the complete multiplier rule.
+		if billingErr != nil || errors.Is(quote.err, errPanelGroupNotFound) || errors.Is(quote.err, errPanelRulesConflict) {
+			group = 0
+		}
+		if err := invalidateChangedPanelQuote(ctx, tx, credentialID, revision, effectiveAt, group, true); err != nil {
+			return err
 		}
 		return recordDatasetError(ctx, tx, credentialID, "prices", quote.err.Error())
 	}
@@ -695,17 +706,19 @@ ON CONFLICT (credential_id, effective_at) DO NOTHING`, credentialID, effectiveAt
 	return err
 }
 
-func invalidateChangedPanelQuote(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, revision, effectiveAt time.Time, group int64, multiplier string) error {
+func invalidateChangedPanelQuote(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, revision, effectiveAt time.Time, group int64, compareVersion bool) error {
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO beichen_panel_snapshots (credential_id, effective_at, credential_revision)
 SELECT $1, $2, $3
 FROM (
   SELECT group_id, expires_at, multiplier_version FROM beichen_panel_snapshots
   WHERE credential_id = $1 ORDER BY effective_at DESC LIMIT 1
-) previous JOIN beichen_multiplier_versions m ON m.id = previous.multiplier_version
+) previous
 WHERE previous.expires_at > $2
-  AND ($4::bigint = 0 OR previous.group_id <> $4 OR m.multiplier <> NULLIF($5::text, '')::numeric)
-ON CONFLICT (credential_id, effective_at) DO NOTHING`, credentialID, effectiveAt, revision, group, multiplier)
+  AND ($4::bigint = 0 OR previous.group_id <> $4 OR ($5::boolean AND previous.multiplier_version <>
+    (SELECT id FROM beichen_multiplier_versions WHERE credential_id = $1 AND effective_at <= $2
+     ORDER BY effective_at DESC, id DESC LIMIT 1)))
+ON CONFLICT (credential_id, effective_at) DO NOTHING`, credentialID, effectiveAt, revision, group, compareVersion)
 	return err
 }
 

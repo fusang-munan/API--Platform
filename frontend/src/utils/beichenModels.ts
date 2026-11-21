@@ -1,4 +1,4 @@
-import type { BeichenCatalogModel, BeichenModel, BeichenOverview, BeichenPriceConditions, BeichenPriceTier } from '../api/types'
+import type { BeichenCatalogModel, BeichenDataset, BeichenModel, BeichenOverview, BeichenPriceConditions, BeichenPriceTier } from '../api/types'
 
 export function isBeichenProvider(baseUrl: string) {
   const address = baseUrl.trim()
@@ -50,7 +50,7 @@ export function schoolCatalog(overview: BeichenOverview, providerId: string): Sc
     if (group) group.push(row)
     else records.set(key, [row])
   }
-  const syncErrors = new Map(overview.datasets?.map(row => [row.kind + ':' + row.credential_id, row.last_error]))
+  const datasets = new Map(overview.datasets?.map(row => [row.kind + ':' + row.credential_id, row]))
   const catalog: BeichenCatalogModel[] = overview.model_catalog ??
     Array.from(records.values(), rows => ({ model: rows[0].model }))
   return catalog.map(entry => {
@@ -73,8 +73,8 @@ export function schoolCatalog(overview: BeichenOverview, providerId: string): Sc
       const upstreamName = (route.upstream_model ?? entry.model).toLowerCase()
       const record = prices.get(route.credential_id + ':' + upstreamName)
       const quote = schoolQuote(record, route.effective_multiplier_text ?? route.effective_multiplier,
-        route.state === 'candidate', syncErrors.get('prices:' + route.credential_id),
-        syncErrors.get('billing:' + route.credential_id))
+        route.state === 'candidate', datasets.get('prices:' + route.credential_id)?.last_error,
+        datasets.get('billing:' + route.credential_id))
       quotes.set(JSON.stringify(quote), quote)
       credentials.set(route.credential_id, {
         credential_id: route.credential_id,
@@ -106,13 +106,19 @@ const priceStatusLabels = {
 }
 
 function schoolQuote(record: BeichenModel | undefined, reported: string | number | null | undefined,
-  candidate: boolean, priceError?: string | null, billingError?: string | null) {
+  candidate: boolean, priceError?: string | null, billing?: BeichenDataset) {
   const status: SchoolQuote['status'] = record?.price_status === 'confirmed' || record?.price_status === 'conditional' ||
     record?.price_status === 'not_listed' ? record.price_status : 'pending'
   const mode: 'follow' | 'manual' = record?.mode === 'manual' ? 'manual' : 'follow'
-  const rate = billingError ? null : nonNegativeDecimal(reported)
-  const multiplier = rate ? formatDecimal(rate) + (candidate ? '× · 待启用' : '×')
-    : billingError || reported == null || reported === '' ? '待同步' : '倍率无效'
+  const billingError = billing?.last_error
+  const stale = billing?.billing_state === 'stale'
+  const billingRate = billing?.effective_multiplier_text ?? billing?.effective_multiplier
+  const observedRate = billing?.billing_state === 'current' ? billingRate : reported
+  const rate = billingError || stale ? null : nonNegativeDecimal(observedRate)
+  const lastRate = stale ? nonNegativeDecimal(billingRate) : null
+  const multiplier = lastRate ? formatDecimal(lastRate) + '× · 已陈旧'
+    : rate ? formatDecimal(rate) + (candidate ? '× · 待启用' : '×')
+      : billingError || observedRate == null || observedRate === '' ? '待同步' : '倍率无效'
   const source = record?.price_conditions_exact ?? record?.price_conditions
   const terms = status !== 'not_listed' && source && typeof source === 'object' && !Array.isArray(source) ? source : null
   const canCalculate = !priceError && (status === 'confirmed' || status === 'conditional') ? rate : null
@@ -121,7 +127,7 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
   // Older confirmed quotes can have effective token rates without a website pricing object.
   const legacy = !terms && canCalculate && status === 'confirmed' ? legacyEffectivePrice(record?.upstream_rates) : null
   const actual = prices?.actual ?? legacy?.actual ?? null
-  const schoolRates = record?.school_rates
+  const schoolRates = stale && mode === 'follow' ? null : record?.school_rates
   const actualRates = schoolRates ? {
     input: scaledNumber(schoolRates.input, 6), output: scaledNumber(schoolRates.output, 6),
     cache_read: scaledNumber(schoolRates.cache_read, 6), cache_write: scaledNumber(schoolRates.cache_write, 6),
@@ -215,7 +221,7 @@ function tokenBoundary(raw: number | string | null | undefined, upper = false) {
   return { label, tokens: invalid ? null : BigInt(label), invalid }
 }
 
-function formatPriceConditions(terms: BeichenPriceConditions, rate: Decimal | null, credits = false) {
+export function formatPriceConditions(terms: BeichenPriceConditions, rate: Decimal | null, credits = false) {
   const standard = priceLines(terms, terms.billing_mode, null, credits)
   const actual = rate ? priceLines(terms, terms.billing_mode, rate, credits) : []
   let precisionUnknown = hasNumericPrice(terms)

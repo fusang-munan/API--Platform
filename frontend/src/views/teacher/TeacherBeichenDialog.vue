@@ -85,7 +85,7 @@ const credentialId = ref('')
 const importKind = ref<BeichenImportKind>('prices')
 const usageExportConfirmed = ref(false)
 const importMultiplier = computed(() => datasetRows.value.find(
-  row => row.kind === 'billing' && !row.last_error && row.credential_id === credentialId.value,
+  row => row.kind === 'billing' && !row.last_error && row.billing_state !== 'stale' && row.credential_id === credentialId.value,
 )?.effective_multiplier)
 const csvInput = ref<HTMLInputElement>()
 const csvHintId = useId()
@@ -311,8 +311,9 @@ async function savePrice() {
                     <th scope="row">{{ credentialLabel(row.credential_id) }}</th>
                     <td>
                       {{ datasetLabels[row.kind] ?? row.kind }}
-                      <strong v-if="row.kind === 'billing'" class="beichen-multiplier">{{ multiplierLabel(row.effective_multiplier) }}</strong>
-                      <small v-if="row.kind === 'billing' && row.last_error && row.effective_multiplier != null">上次记录，本次倍率未知</small>
+                      <strong v-if="row.kind === 'billing'" class="beichen-multiplier">{{ multiplierLabel(row.effective_multiplier_text ?? row.effective_multiplier) }}</strong>
+                      <small v-if="row.kind === 'billing' && row.effective_multiplier != null && (row.billing_state === 'stale' || row.last_error)">倍率已陈旧，保留上次记录</small>
+                      <small v-if="row.alert" role="alert">计费信息连续读取失败 {{ row.failure_count }} 次</small>
                     </td>
                     <td>{{ fullTime(row.last_success) }}</td>
                     <td :class="{ error: row.last_error }">{{ row.last_error || '—' }}</td>

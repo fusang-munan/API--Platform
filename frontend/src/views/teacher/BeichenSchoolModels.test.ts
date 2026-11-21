@@ -10,14 +10,14 @@ const api = vi.hoisted(() => ({
   beichenOverview: vi.fn(), modelUsage: vi.fn(), enableBeichenModelsBatch: vi.fn(), enableBeichenModel: vi.fn(),
   updateModel: vi.fn(), syncBeichen: vi.fn(), setBeichenModelPrice: vi.fn(),
   requestBeichenProbes: vi.fn(), beichenProbes: vi.fn(),
-  previewBeichenRebind: vi.fn(), applyBeichenRebind: vi.fn(), rescanBeichenCatalog: vi.fn(),
+  previewBeichenRebind: vi.fn(), applyBeichenRebind: vi.fn(),
   beichenCapabilities: vi.fn(),
 }))
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }))
 vi.mock('../../api/teacher', () => ({ teacherAPI: api }))
 vi.mock('../../composables/useToast', () => ({ useToast: () => toast }))
 const Dialog = defineComponent({ props: ['open', 'title'], template: '<section v-if="open" role="dialog" :aria-label="title"><h2>{{ title }}</h2><slot /></section>' })
-const stubs = { AppDialog: Dialog, BeichenRecentReceipts: true }
+const stubs = { AppDialog: Dialog, BeichenRecentReceipts: true, RouterLink: true }
 enableAutoUnmount(afterEach)
 type Entry = { model: string; active?: boolean; priced?: boolean; canEnable?: boolean; manual?: boolean; catalog?: Partial<BeichenCatalogModel> }
 function overview(entries: Entry[]): BeichenOverview {
@@ -108,7 +108,14 @@ describe('北辰模型管理', () => {
         { credential_id: 'first', label: '渠道一', status: 'active' },
         { credential_id: 'second', label: 'Claude 接替', status: 'active' },
       ],
-      website_directory: { state: 'stale', last_success: location.observed_at, last_error: '官网请求失败' },
+      website_directory: {
+        state: 'stale', last_success: location.observed_at, last_error: '官网请求失败',
+        last_run: {
+          started_at: '2026-11-21T01:30:00Z', duration_ms: 87, platform_count: 8, group_count: 4,
+          model_count: 17, expected_model_count: 20,
+          failures: [{ channel: 'Claude 渠道', platform: 'anthropic', path: 'data[0].platforms[0]', reason: 'models 不是模型数组' }],
+        },
+      },
       website_only_status: 'stale',
       model_catalog: [...keyOnly.model_catalog!, { model, source: 'website', catalog_state: 'website_only', key_count: 0,
         route_count: 0, protocols: [], can_enable: false, website_locations: [location],
@@ -124,11 +131,14 @@ describe('北辰模型管理', () => {
     api.beichenCapabilities.mockResolvedValue({
       capabilities: [capability(model, { supported_protocols: [], availability: 'maintenance', binding_state: 'invalid' })],
     })
-    api.rescanBeichenCatalog.mockResolvedValue({ synced: true })
+    api.syncBeichen.mockResolvedValue({ synced: true })
     const wrapper = view()
     await flushPromises()
     const web = wrapper.get('[aria-label="官网目录"]')
     expect(web.text()).toContain('保留上次官网目录（待更新）')
+    expect(web.text()).toContain('读到 17 个模型、8 个平台、4 个分组，耗时 87 毫秒')
+    expect(web.text()).toContain('响应中能辨认出 20 个不同型号')
+    expect(web.get('[aria-label="抓取失败项"]').text()).toContain('Claude 渠道 / anthropic · models 不是模型数组')
     const claude = wrapper.get('[data-model="' + model + '"]')
     expect(claude.get('[data-testid="catalog-source"]').text()).toBe('来源 官网')
     expect(claude.get('[data-testid="key-catalog-gap"]').text()).toContain('官网有、CC1 新 Key 无')
@@ -146,13 +156,65 @@ describe('北辰模型管理', () => {
     await web.get('select').setValue('second')
     await web.get('form').trigger('submit')
     await flushPromises()
-    expect(api.rescanBeichenCatalog).toHaveBeenCalledExactlyOnceWith('north', 'second')
+    expect(api.syncBeichen).toHaveBeenCalledExactlyOnceWith('north', 'second')
     expect(api.beichenOverview).toHaveBeenCalledTimes(2)
     expect(claude.get('[data-testid="catalog-source"]').text()).toBe('来源 官网和 Key')
     expect(claude.text()).toContain('1/2 把 Key 覆盖')
     expect(claude.text()).toContain('1 种协议')
     expect(claude.find('[data-testid="key-catalog-gap"]').exists()).toBe(false)
     expect(wrapper.find('[aria-label="启用 ' + model + '"]').exists()).toBe(true)
+  })
+
+  it('重扫立即显示新分组的倍率，并显示报价差异及陈旧告警', async () => {
+    const model = 'claude-sonnet-5'
+    const opus = 'claude-opus-5'
+    const key = 'key-' + model
+    const checked = '2026-11-21T00:35:00Z'
+    const current = overview([{ model, active: true }])
+    current.credentials = [{ credential_id: key, label: 'CC1', status: 'active' }]
+    current.website_only_status = 'compared'
+    const c = { credential_id: key, label: 'CC1', school_channel: 'CC1', group_id: 60 } as const
+    current.model_catalog!.push({
+      model: opus, source: 'website', catalog_state: 'website_only', key_count: 0,
+      catalog_keys: [{ ...c, state: 'missing', group_diagnosis: 'model_outside_key_group' }],
+      website_locations: [{
+        name: opus, platform: 'anthropic', groups: [{ id: 15, rate_multiplier: 0.15 }], has_price: true, observed_at: checked,
+        price_conditions_exact: { billing_mode: 'token', input_price: '0.000004', output_price: '0.000008' },
+      }],
+    })
+    const before = { ...current, model_catalog: current.model_catalog!.slice(0, 1), datasets: [{
+      credential_id: key, kind: 'billing', group_id: 15, effective_multiplier: '0.15', billing_state: 'current' as const,
+    }] }
+    const newBilling = { ...before.datasets[0], group_id: 60, group_rate: '0.6', effective_multiplier: '0.6', last_success: checked }
+    const switched = { ...current, datasets: [newBilling] }
+    const stale = { ...switched, datasets: [{ ...newBilling, billing_state: 'stale' as const,
+      failure_count: 3, alert: true, last_error: '北辰接口返回 HTTP 503' }] }
+    api.beichenOverview.mockResolvedValueOnce(before).mockResolvedValueOnce(switched).mockResolvedValue(stale)
+    api.syncBeichen.mockResolvedValueOnce({ synced: true }).mockRejectedValueOnce(new Error('同步未完成'))
+    const wrapper = view()
+    await flushPromises()
+    const tariff = wrapper.get('[aria-label="北辰 Key 计费倍率"]')
+    expect(tariff.text()).toContain('分组 15 · 生效倍率 0.15×')
+    const directory = wrapper.get('[aria-label="官网目录"]')
+    await directory.get('select').setValue(key)
+    await directory.get('form').trigger('submit')
+    await flushPromises()
+    expect(tariff.text()).toContain('分组 60 · 生效倍率 0.6×')
+    expect(wrapper.get('[data-model="' + model + '"]').text()).toContain('倍率 0.6×')
+    const mismatch = wrapper.get('[data-model="' + opus + '"]')
+    expect(mismatch.text()).toContain('Key 分组不含该模型')
+    const prices = mismatch.get('[data-testid="group-price-comparison"]').text()
+    expect(prices).toContain('官网分组 15 价 · 倍率 0.15×')
+    expect(prices).toContain('Key 分组 60 价 · 倍率 0.6×')
+    expect(prices).toContain('输入 400 积分（4 元）')
+    await button(mismatch, '重扫该 Key').trigger('click')
+    await flushPromises()
+    expect(api.syncBeichen).toHaveBeenNthCalledWith(2, 'north', key)
+    const alert = tariff.get('[role="alert"]').text()
+    expect(alert).toContain('上次生效倍率 0.6×')
+    expect(alert).toContain('倍率已陈旧')
+    expect(alert).toContain('计费信息连续读取失败 3 次')
+    expect(alert).toContain('上次成功 11/21 08:35')
   })
 
   it('展示重建的旧线路和新线路，预览变化后需要再次确认', async () => {

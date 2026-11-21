@@ -110,7 +110,7 @@ SELECT COALESCE(k.model_id::text,w.model,b.model),n.credential_id,COALESCE(c.lab
    SELECT 1 FROM beichen_multiplier_versions m WHERE m.credential_id=c.id AND m.effective_at<=statement_timestamp()
   ) THEN 'missing'
   WHEN billing.last_success<c.updated_at OR billing.last_success<=statement_timestamp()-interval '16 minutes'
-    OR snap.expires_at<=statement_timestamp() THEN 'expired'
+    THEN 'expired'
   ELSE 'current' END
 FROM names n JOIN providers p ON p.id=$1
 LEFT JOIN provider_credentials c ON c.id=n.credential_id AND c.provider_id=p.id

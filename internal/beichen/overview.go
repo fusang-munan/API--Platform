@@ -18,11 +18,20 @@ import (
 )
 
 type Dataset struct {
-	CredentialID        uuid.UUID    `json:"credential_id"`
-	Kind                string       `json:"kind"`
-	LastSuccess         *time.Time   `json:"last_success"`
-	LastError           *string      `json:"last_error"`
-	EffectiveMultiplier *json.Number `json:"effective_multiplier"`
+	CredentialID            uuid.UUID    `json:"credential_id"`
+	Kind                    string       `json:"kind"`
+	LastSuccess             *time.Time   `json:"last_success"`
+	LastError               *string      `json:"last_error"`
+	EffectiveMultiplier     *json.Number `json:"effective_multiplier"`
+	EffectiveMultiplierText string       `json:"effective_multiplier_text,omitempty"`
+	BillingState            string       `json:"billing_state,omitempty"`
+	GroupID                 *int64       `json:"group_id,omitempty"`
+	GroupRate               *string      `json:"group_rate,omitempty"`
+	PeakEnabled             *bool        `json:"peak_enabled,omitempty"`
+	PeakRate                *string      `json:"peak_rate,omitempty"`
+	ObservedAt              *time.Time   `json:"observed_at,omitempty"`
+	FailureCount            int          `json:"failure_count,omitempty"`
+	Alert                   bool         `json:"alert,omitempty"`
 }
 
 type Model struct {
@@ -229,13 +238,23 @@ func (s *Service) Overview(ctx context.Context, providerID uuid.UUID, day string
 
 func readDatasets(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Overview) error {
 	rows, err := tx.QueryContext(ctx, `
-SELECT c.id, kinds.kind, d.last_success, d.last_error, CASE WHEN kinds.kind = 'billing' THEN (
-  SELECT m.multiplier::text FROM beichen_multiplier_versions m WHERE m.credential_id = c.id
-  ORDER BY effective_at DESC, id DESC LIMIT 1
-) END
+SELECT c.id, kinds.kind, d.last_success, d.last_error, trim_scale(m.multiplier)::text,
+  m.group_id, trim_scale(m.group_rate)::text, m.peak_enabled, trim_scale(m.peak_rate)::text, m.observed_at,
+  CASE WHEN kinds.kind <> 'billing' THEN ''
+       WHEN m.id IS NOT NULL AND (m.stale_at IS NOT NULL OR d.last_error IS NOT NULL OR d.last_success < c.updated_at
+         OR d.last_success <= statement_timestamp()-interval '16 minutes') THEN 'stale'
+       WHEN m.id IS NULL OR d.last_success IS NULL THEN 'unverified'
+       ELSE 'current' END,
+  CASE WHEN kinds.kind = 'billing' THEN COALESCE(d.failure_count, 0) ELSE 0 END
 FROM provider_credentials c
 CROSS JOIN (VALUES ('catalog'), ('billing'), ('prices'), ('usage')) AS kinds(kind)
 LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = kinds.kind
+LEFT JOIN LATERAL (
+  SELECT id, multiplier, group_id, group_rate, peak_enabled, peak_rate, observed_at, stale_at
+  FROM beichen_multiplier_versions
+  WHERE kinds.kind = 'billing' AND credential_id = c.id AND effective_at <= statement_timestamp()
+  ORDER BY effective_at DESC, id DESC LIMIT 1
+) m ON true
 WHERE c.provider_id = $1
 ORDER BY c.label, c.id, kinds.kind`, providerID)
 	if err != nil {
@@ -245,16 +264,24 @@ ORDER BY c.label, c.id, kinds.kind`, providerID)
 	for rows.Next() {
 		var item Dataset
 		var multiplier *string
-		if err := rows.Scan(&item.CredentialID, &item.Kind, &item.LastSuccess, &item.LastError, &multiplier); err != nil {
+		if err := rows.Scan(&item.CredentialID, &item.Kind, &item.LastSuccess, &item.LastError, &multiplier,
+			&item.GroupID, &item.GroupRate, &item.PeakEnabled, &item.PeakRate, &item.ObservedAt,
+			&item.BillingState, &item.FailureCount); err != nil {
 			return err
 		}
+		item.Alert = item.FailureCount >= billingAlertFailures
 		if multiplier != nil {
 			value := json.Number(*multiplier)
 			item.EffectiveMultiplier = &value
+			item.EffectiveMultiplierText = *multiplier
 		}
 		if item.LastSuccess != nil {
 			utc := item.LastSuccess.UTC()
 			item.LastSuccess = &utc
+		}
+		if item.ObservedAt != nil {
+			utc := item.ObservedAt.UTC()
+			item.ObservedAt = &utc
 		}
 		view.Datasets = append(view.Datasets, item)
 	}

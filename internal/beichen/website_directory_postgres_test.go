@@ -115,8 +115,12 @@ WHERE d.provider_id=$1 GROUP BY d.platforms`, provider).Scan(&platformCount, &oc
 		t.Fatalf("教师目录缺少 %s", name)
 		return CatalogModel{}
 	}
-	if web := overview(); web.WebsiteDirectory.State != "fresh" || len(web.ModelCatalog) != 20 || len(web.WebsiteOnlyModels) != 20 {
-		t.Fatalf("Key 未扫时官网 20 个型号应可见，得到 %d 个目录模型和 %d 个仅官网模型", len(web.ModelCatalog), len(web.WebsiteOnlyModels))
+	web := overview()
+	fullRun := web.WebsiteDirectory.LastRun
+	if web.WebsiteDirectory.State != "fresh" || len(web.ModelCatalog) != 20 || len(web.WebsiteOnlyModels) != 20 ||
+		fullRun == nil || fullRun.StartedAt.IsZero() || fullRun.PlatformCount != 9 || fullRun.GroupCount != 5 ||
+		fullRun.ModelCount != 20 || fullRun.ExpectedModelCount != 20 || len(fullRun.Failures) != 0 {
+		t.Fatalf("完整抓取后官网目录或最近抓取报告不符: %+v", web.WebsiteDirectory)
 	}
 	secrets := []string{"sk-fixture-gemini", "sk-fixture-gm1", "sk-fixture-g3", "sk-fixture-original-cc1"}
 	for i, key := range keys {
@@ -152,6 +156,19 @@ WHERE d.provider_id=$1 GROUP BY d.platforms`, provider).Scan(&platformCount, &oc
 	if row := findModel(both, "channel-ds"); row.Source != "both" || len(row.WebsiteLocations) != 1 ||
 		row.WebsiteLocations[0].Name != "deepseek-internal-web" || row.CatalogKeys[0].Match != "alias" {
 		t.Fatalf("教师别名未关联目录: %+v", row)
+	}
+	report, err := service.CrawlDirectory(ctx, CrawlOptions{Fixture: fixture, MatchDB: true})
+	if err != nil || report.KeyMatching != "checked" || report.ModelCount != 20 || report.ExpectedModelCount != 20 {
+		t.Fatalf("验收工具未读到当前 Key 和官网目录: %+v, %v", report.CrawlRun, err)
+	}
+	match := crawlTestModel(t, report, "deepseek-internal-web").KeyMatches
+	if !slices.ContainsFunc(match, func(key CatalogKey) bool {
+		return key.CredentialID == keys[1] && key.State == "listed" && key.Match == "alias" && key.UpstreamModel == "channel-ds"
+	}) {
+		t.Fatalf("验收报告没有教师别名匹配结果: %+v", match)
+	}
+	if !overview().WebsiteDirectory.LastRun.StartedAt.Equal(fullRun.StartedAt) || websiteReads != 1 {
+		t.Fatal("离线验收改变了官网抓取记录或发出了网页请求")
 	}
 	if row := findModel(both, "grok-4.1"); row.CatalogState != "website_only" || len(row.WebsiteLocations) != 2 ||
 		row.WebsiteLocations[0].Groups[0].ID != 27 || row.WebsiteLocations[1].Groups[0].ID != 28 || row.CanEnable {
@@ -210,6 +227,7 @@ WHERE d.provider_id=$1 GROUP BY d.platforms`, provider).Scan(&platformCount, &oc
 
 	body = strings.Replace(string(fixture), `"platform": "anthropic",`, `"platform": {"bad": true},`, 1)
 	body = strings.Replace(body, "grok-4.3-fast", "grok-4.4", 1)
+	body = strings.Replace(body, `"input_price": 0, "output_price": 0`, `"input_price": {}, "output_price": 0`, 1)
 	if err := service.syncWebsiteDirectories(ctx, &provider); !errors.Is(err, errWebsiteDirectoryPartial) {
 		t.Fatalf("单平台解析失败应报告部分更新: %v", err)
 	}
@@ -218,9 +236,17 @@ WHERE d.provider_id=$1 GROUP BY d.platforms`, provider).Scan(&platformCount, &oc
 		t.Fatal("部分更新应保留完整成功时间并写入有效平台")
 	}
 	stale := overview()
+	partialRun := stale.WebsiteDirectory.LastRun
 	if stale.WebsiteDirectory.State != "stale" || findModel(stale, "grok-4.4").Source != "website" ||
-		!findModel(stale, "claude-fable-5").WebsiteLocations[0].Stale {
+		!findModel(stale, "claude-fable-5").WebsiteLocations[0].Stale ||
+		!findModel(stale, "grok-4.2").WebsiteLocations[0].HasPrice {
 		t.Fatal("部分失败未保留旧平台或未采纳有效平台")
+	}
+	if partialRun == nil || !partialRun.StartedAt.After(fullRun.StartedAt) ||
+		partialRun.PlatformCount != 8 || partialRun.ModelCount != 17 || partialRun.ExpectedModelCount != 20 ||
+		len(partialRun.Failures) != 2 || partialRun.Failures[0].ChannelID != 100 ||
+		partialRun.Failures[1].Platform != "xai" || !strings.Contains(partialRun.Failures[1].Reason, "pricing") {
+		t.Fatalf("最近抓取记录应仅统计本次响应并列出失败项: %+v", partialRun)
 	}
 	reads := websiteReads
 	if err := service.syncWebsiteDirectories(ctx, nil); err != nil || websiteReads != reads {
@@ -243,11 +269,17 @@ WHERE d.provider_id=$1 GROUP BY d.platforms`, provider).Scan(&platformCount, &oc
 	if saved := readSnapshot(); saved.platforms != partial.platforms || !saved.success.Equal(first.success) {
 		t.Fatal("网络失败清除了上次官网数据")
 	}
+	if failed := overview().WebsiteDirectory.LastRun; failed == nil || failed.ModelCount != 0 ||
+		len(failed.Failures) != 1 || !strings.Contains(failed.Failures[0].Reason, "HTTP 503") {
+		t.Fatalf("网络失败未出现在最近抓取记录: %+v", failed)
+	}
 	websiteStatus, body = http.StatusOK, string(fixture)
 	if err := service.syncWebsiteDirectories(ctx, &provider); err != nil {
 		t.Fatal(err)
 	}
-	if saved := readSnapshot(); saved.failures != 0 || !saved.success.After(first.success) || overview().WebsiteDirectory.State != "fresh" {
+	recovered := overview().WebsiteDirectory
+	if saved := readSnapshot(); saved.failures != 0 || !saved.success.After(first.success) ||
+		recovered.State != "fresh" || recovered.LastRun == nil || recovered.LastRun.ModelCount != 20 || len(recovered.LastRun.Failures) != 0 {
 		t.Fatal("官网恢复后应更新快照时间并清空退避状态")
 	}
 	t.Log("官网 9 个平台范围、21 条记录、20 个不同型号，合并后 22 个原始型号行（14 个仅官网），Claude 覆盖 1/4 → 0/4 → 1/4")

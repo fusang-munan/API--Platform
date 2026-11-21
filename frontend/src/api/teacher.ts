@@ -59,7 +59,8 @@ export const teacherAPI = {
   },
   beichenReconciliation: (id: string, range: BeichenUsageRange) =>
     get<BeichenReconcile>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/reconciliation?${new URLSearchParams({ range })}`),
-  syncBeichen: (id: string) => post<{ synced: boolean }>(`/api/v1/teacher/providers/${id}/beichen/sync`),
+  syncBeichen: (id: string, credentialId?: string) =>
+    post<{ synced: boolean }>(`/api/v1/teacher/providers/${id}/beichen/sync`, credentialId ? { credential_id: credentialId } : undefined),
   beichenAliases: (id: string) =>
     get<BeichenModelAlias[]>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/aliases`),
   putBeichenAlias: (id: string, body: BeichenModelAliasUpdate) =>

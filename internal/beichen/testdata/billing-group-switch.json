@@ -1,0 +1,43 @@
+{
+  "code": 0,
+  "data": [
+    {
+      "id": 115,
+      "name": "CC1 旧组",
+      "platforms": [{
+        "platform": "anthropic",
+        "groups": [{
+          "id": 15,
+          "name": "旧组",
+          "platform": "anthropic",
+          "subscription_type": "standard",
+          "rate_multiplier": 0.15,
+          "peak_rate_enabled": false
+        }],
+        "supported_models": [
+          {"name": "claude-sonnet-5", "pricing": {"billing_mode": "token", "input_price": 0.000001, "output_price": 0.000003, "cache_read_price": 0, "cache_write_price": 0}},
+          {"name": "claude-opus-5", "pricing": {"billing_mode": "token", "input_price": 0.000004, "output_price": 0.000008, "cache_read_price": 0, "cache_write_price": 0}},
+          {"name": "claude-key-listed", "pricing": {"billing_mode": "token", "input_price": 0.000005, "output_price": 0.000008, "cache_read_price": 0, "cache_write_price": 0}}
+        ]
+      }]
+    },
+    {
+      "id": 160,
+      "name": "CC1 新组",
+      "platforms": [{
+        "platform": "anthropic",
+        "groups": [{
+          "id": 60,
+          "name": "新组",
+          "platform": "anthropic",
+          "subscription_type": "standard",
+          "rate_multiplier": 0.6,
+          "peak_rate_enabled": false
+        }],
+        "supported_models": [
+          {"name": "claude-sonnet-5", "pricing": {"billing_mode": "token", "input_price": 0.000002, "output_price": 0.000006, "cache_read_price": 0, "cache_write_price": 0}}
+        ]
+      }]
+    }
+  ]
+}
