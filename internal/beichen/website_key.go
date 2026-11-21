@@ -16,6 +16,8 @@ import (
 
 type websiteKeyCatalog struct {
 	group         directoryGroup
+	keyGroup      *WebsiteGroup
+	keyGroupAt    time.Time
 	entries       []catalog.ProviderEntry
 	prices        map[string]json.RawMessage
 	at            time.Time
@@ -67,7 +69,7 @@ func readWebsiteKey[T any](ctx context.Context, s *Service, access priceAccess, 
 			return zero, err
 		}
 		match, err := identifyChannel(key, access.channel, access.label, keys)
-		if err != nil {
+		if err != nil && !errors.Is(err, errKeyGroupMissing) {
 			return zero, err
 		}
 		return read(token, match)
@@ -92,19 +94,52 @@ func readWebsiteKey[T any](ctx context.Context, s *Service, access priceAccess, 
 }
 
 func (s *Service) fetchWebsiteKeyCatalog(ctx context.Context, token string, key listedKey) (websiteKeyCatalog, error) {
+	group := key.websiteGroup()
+	groupAt := s.now().UTC()
+	observed := websiteKeyCatalog{keyGroup: &group, keyGroupAt: groupAt}
+	if group.ID == 0 {
+		return observed, errKeyGroupMissing
+	}
 	crawl, err := s.fetchWebsiteCrawl(ctx, token)
+	if errors.Is(err, errWebsiteDirectoryEmpty) && crawl.membershipComplete && crawl.GroupCount == 0 {
+		return observed, errors.Join(err, errPanelGroupNotFound)
+	}
+	// A bad price in another group can leave every group identifiable.
+	if err != nil && !(errors.Is(err, errWebsiteDirectoryPartial) && crawl.membershipComplete) {
+		return observed, err
+	}
+	directory, err := selectWebsiteKeyCatalog(crawl.platforms, group.ID)
 	if err != nil {
-		return websiteKeyCatalog{}, err
+		return observed, err
 	}
-	catalog, err := selectWebsiteKeyCatalog(crawl.platforms, key.GroupID)
-	if err != nil {
-		return catalog, err
+	if group.Rate != nil && (directory.group.Rate == nil || !samePanelRate(*group.Rate, *directory.group.Rate)) {
+		return observed, errPanelRulesConflict
 	}
-	if key.Group != nil && key.Group.Rate != "" &&
-		(catalog.group.Rate == nil || !samePanelRate(key.Group.Rate, *catalog.group.Rate)) {
-		return websiteKeyCatalog{}, errPanelRulesConflict
+	if group.Name == "" {
+		group.Name = directory.group.Name
 	}
-	return catalog, nil
+	if group.Rate == nil {
+		group.Rate = directory.group.Rate
+	}
+	directory.keyGroup, directory.keyGroupAt = &group, groupAt
+	return directory, nil
+}
+
+func (key listedKey) websiteGroup() WebsiteGroup {
+	view := websiteKeyView(key)
+	group := WebsiteGroup{ID: key.GroupID, PeakEnabled: view.Peak.Enabled}
+	if view.GroupName != nil {
+		group.Name = *view.GroupName
+	}
+	if view.Rate != nil {
+		rate := json.Number(*view.Rate)
+		group.Rate = &rate
+	}
+	if view.Peak.Rate != nil {
+		rate := json.Number(*view.Peak.Rate)
+		group.PeakRate = &rate
+	}
+	return group
 }
 
 func selectWebsiteKeyCatalog(platforms []directoryPlatform, groupID int64) (websiteKeyCatalog, error) {
@@ -182,7 +217,9 @@ func (directory websiteKeyCatalog) billing() (billingInfo, panelQuote, error) {
 	if directory.keyBilling != nil {
 		info := *directory.keyBilling
 		expires, err := panelExpiry(info, directory.at)
-		return info, panelQuote{groupID: directory.group.ID, expiresAt: expires, err: errPanelEmpty, verifiedKeyModels: true}, err
+		quote := panelQuote{groupID: directory.group.ID, expiresAt: expires, err: errPanelEmpty, verifiedKeyModels: true,
+			terms: map[string]json.RawMessage{}, notListed: crawlModelIDs(directory.entries)}
+		return info, quote, err
 	}
 	group := directory.group
 	info := billingInfo{GroupID: &group.ID, ObservedAt: directory.at, Timezone: group.Timezone,

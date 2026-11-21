@@ -7,11 +7,12 @@ import type { BeichenCapabilities, BeichenCatalogModel, BeichenHealthDimension, 
 import type { BeichenCatalogKey, BeichenRebindPlan, BeichenRebindRoute, BeichenWebsiteLocation } from '../../api/types'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { useToast } from '../../composables/useToast'
-import { formatPriceConditions, priceFields, schoolCatalog, type SchoolCatalogRow, type SchoolQuote } from '../../utils/beichenModels'
+import { emptyPriceDetail, formatPriceConditions, keyGroupIssue, keyGroupRate, missingPriceDetailLabels, schoolCatalog, schoolQuoteDetail, webPriceDetail, type SchoolCatalogRow, type SchoolQuote } from '../../utils/beichenModels'
 import { bindingAdapterMeta } from '../../utils/bindingAdapters'
-import { formatPercent, formatTokens, multiplyDecimal, shiftDecimal } from '../../utils/credits'
+import { formatPercent, formatTokens, shiftDecimal } from '../../utils/credits'
 import { schoolDay, statusLabel } from '../../utils/format'
 import AppDialog from '../../components/AppDialog.vue'
+import BeichenPriceDetail from '../../components/BeichenPriceDetail.vue'
 import BeichenPriceDrawer from '../../components/BeichenPriceDrawer.vue'
 import BeichenModelUsageDrawer from '../../components/BeichenModelUsageDrawer.vue'
 import BeichenRecentReceipts from './BeichenRecentReceipts.vue'
@@ -246,10 +247,19 @@ const catalog = computed(() => {
       .map(blocker => blocker.message?.trim()).filter(Boolean)
     const catalogKeys = entry?.catalog_keys ?? []
     const groupMismatch = catalogKeys.some(key => key.group_diagnosis)
+    const locations = entry?.website_locations ?? []
+    const websitePrices = locations.filter(location => location.price_complete && location.price_conditions_exact)
+    const showWebsitePrices = websitePrices.length > 0 && !row.quotes.some(quote =>
+      (quote.status === 'confirmed' || quote.status === 'conditional') && quote.standard)
+    const hasStudentPrice = row.quotes.some(quote => quote.mode === 'manual' || quote.actual)
+    const quotedKeys = new Set(row.credentials.map(key => key.credential_id))
+    const groupIssues = [...new Set([...keys].filter(id => !quotedKeys.has(id))
+      .map(id => keyGroupIssue(billingByKey.value.get(id))).filter(Boolean))]
     const pricing = (row.quotes.length ? row.quotes : [null]).map(quote => ({
       key: quote?.key ?? 'missing',
+      hasQuote: Boolean(quote),
       status: quote?.status ?? 'pending',
-      statusLabel: groupMismatch && (!quote || quote.status === 'pending' || quote.status === 'not_listed')
+      statusLabel: groupMismatch && !quote?.issue && (!quote || quote.status === 'pending' || quote.status === 'not_listed')
         ? '分组报价需核对' : quote?.statusLabel ?? '单价待同步',
       multiplierLabel: quote?.multiplierLabel ?? (groupMismatch ? '请查看分组倍率' : undefined),
       notes: quote?.notes ?? [],
@@ -264,8 +274,8 @@ const catalog = computed(() => {
       discovered: Boolean(source) || listed,
       websiteOnly,
       source,
-      locations: entry?.website_locations ?? [],
-      catalogKeys,
+      locations, websitePrices, showWebsitePrices, hasStudentPrice,
+      catalogKeys, groupIssues,
       protocolCount: entry?.protocols?.length ?? (capability ? capability.protocols.length : protocols.size || (routeCount === 0 ? 0 : null)),
       protocolLabels: entry?.catalog_state ? entry.protocols?.map(protocolLabel) ?? [] : capability
         ? capability.protocols.map(protocolLabel)
@@ -360,7 +370,8 @@ const lastSync = computed(() => overview.value?.website_sync?.price_last_seen ??
 const loginNeeded = computed(() => overview.value?.web_login_required ?? overview.value?.datasets?.some(row =>
   /重新授权|重新登录|完成登录验证|(?:官网|网站).*(?:授权|会话)(?:已)?(?:失效|过期)/u.test(row.last_error ?? '')))
 const priceErrors = computed(() => [...new Set((overview.value?.datasets ?? [])
-  .filter(row => row.kind === 'prices' && row.last_error)
+  .filter(row => row.kind === 'prices' && row.last_error && !row.official_price_missing &&
+    !keyGroupIssue(billingByKey.value.get(row.credential_id)))
   .map(row => row.last_error as string))])
 const workspaceUrl = computed(() => {
   const raw = overview.value?.maintenance_workspace?.launch_url
@@ -521,6 +532,12 @@ function websiteGroupPrice(location: BeichenWebsiteLocation) {
   return base ? withYuan(base) : ''
 }
 
+function websitePriceHeading(location: BeichenWebsiteLocation) {
+  const groups = location.groups.flatMap(group => group.id == null ? [] : [group.id])
+  const title = location.stale ? '上次官网报价' : '官网报价'
+  return groups.length ? title + ' · 分组 ' + groups.join('、') : title
+}
+
 function catalogPriceLabel(row: CatalogRow) {
   if (!row.priceCovered && row.catalogKeys.some(key => key.group_diagnosis)) return '分组报价需核对'
   if ((row.websiteOnly || row.priceState === 'missing') && row.locations.some(location => location.has_price)) {
@@ -539,9 +556,13 @@ function canEnableReason(row: CatalogRow) {
   }
   if (row.activation === 'ready') return ''
   if (row.routeBlocked) return row.blockers.join('；') || '线路未就绪，请刷新模型或检查渠道配置'
+  if (!row.priceCovered && row.websitePrices.length && row.catalogKeys.some(key => key.group_diagnosis)) {
+    return '当前 Key 报价待核对，请检查分组。'
+  }
   if (row.priceBlocker) return row.priceBlocker
   if (row.blockers.length) return row.blockers.join('；')
   if (row.activation == null && row.canEnable == null) return '启用条件待同步，请先刷新模型'
+  if (!row.priceCovered && row.websitePrices.length) return '当前 Key 报价待核对，请检查分组。'
   if (!row.priceCovered) return row.priceState === 'conditional' ? '条件价待核实，可先手动定价' : '官网未报价，请先手动定价'
   if (row.activation === 'blocked' || !row.canEnable || !row.routeCount) return '线路未就绪，请刷新模型或检查渠道配置'
   return ''
@@ -792,23 +813,34 @@ function withYuan(text: string) {
 
 function displayPrice(quote: SchoolQuote | null, student: boolean) {
   const manual = student && quote?.mode === 'manual'
-  if (quote && hasPriceConditions(quote) && !manual) return { conditional: true, cells: [], details: '' }
-  // schoolCatalog 已把官网元价换成积分，跟随价也已按该线路的倍率计算。
-  const text = (manual ? '' : student ? quote?.actual : quote?.standard) ?? ''
+  if (quote && hasPriceConditions(quote) && !manual) {
+    const terms = quote.conditions
+    const showBase = !student && terms?.billing_mode === 'token' &&
+      (terms.cache_write_1h_price != null || terms.cache_write_12h_price != null) &&
+      !terms.intervals?.length && !Object.keys(terms.reasoning_effort_multipliers ?? {}).length
+    return { conditional: true, showBase, detail: schoolQuoteDetail(quote, student), details: '' }
+  }
+  if (!quote) return { conditional: false, detail: emptyPriceDetail(), details: '' }
+  const text = (manual ? '' : student ? quote.actual : quote.standard) ?? ''
   const [first, ...other] = text.split('\n')
   const tokenLine = first.startsWith(tokenPriceUnit) ? first : ''
-  const useGrid = manual || tokenLine || (!text && (!quote?.standard || quote.standard.startsWith(tokenPriceUnit)))
-  const amounts = tokenLine.split(' · ').slice(1)
-  const legacy = student && quote?.status === 'confirmed' && !quote.standard && !quote.actual
-  const cells = useGrid ? priceFields.map(({ key, label }) => {
-    const raw = manual || legacy ? quote?.actualRates?.[key]
-      : amounts.find(amount => amount.startsWith(label + ' '))?.slice(label.length + 1)
-    const base = shiftDecimal(raw, 0)
-    // 学生实价 = 基础价 × 1.10，与网关记账保持一致；缺值保持「—」。
-    const credits = student && base !== '—' ? multiplyDecimal(base, '1.10') : base
-    return { key, label, credits, yuan: shiftDecimal(credits, -2) }
-  }) : []
-  return { conditional: false, cells, details: withYuan(tokenLine ? other.join('\n') : text) }
+  return {
+    conditional: false,
+    detail: schoolQuoteDetail(quote, student),
+    details: withYuan(tokenLine ? other.join('\n') : text),
+  }
+}
+
+function missingPriceLabel(row: CatalogRow) {
+  const labels = new Set<string>()
+  for (const quote of row.quotes) {
+    for (const label of missingPriceDetailLabels(quote.conditions)) labels.add(label)
+  }
+  const requiredMissing = labels.has('输入') || labels.has('输出') || labels.has('每次请求') || labels.has('每秒') || labels.has('图像单价')
+  if (requiredMissing) return '缺价：' + [...labels].join('、')
+  if (row.priceBlocker) return '缺价：' + row.priceBlocker
+  if (labels.size) return '缺价：' + [...labels].join('、')
+  return '缺价：输入、输出、缓存写入(5m)、缓存写入(1h)、缓存读取'
 }
 
 function modelUsage(model: string) { return usageByModel.value.get(model.toLowerCase()) }
@@ -901,15 +933,14 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
       <h3>Key 分组与倍率</h3>
       <p v-for="billing in billingRows" :key="billing.credential_id" :role="billing.alert ? 'alert' : undefined" class="beichen-note">
         <strong>{{ billing.label }}</strong>
-        <template v-if="billing.group_id != null"> · {{ billing.billing_state === 'stale' ? '上次分组' : '分组' }} {{ billing.group_id }}</template>
-        · {{ billing.billing_state === 'stale' ? '上次生效倍率' : '生效倍率' }} {{ rateLabel(billing.effective_multiplier_text ?? billing.effective_multiplier) }}
-        <template v-if="billing.group_rate != null"> · 分组倍率 {{ rateLabel(billing.group_rate) }}</template>
+        <template v-if="billing.group_id != null"> · {{ billing.billing_state === 'stale' && !billing.group_status ? '上次分组' : '分组' }} {{ billing.group_id }}<template v-if="billing.group_name"> · {{ billing.group_name }}</template></template> · {{ billing.billing_state === 'stale' ? '上次生效倍率' : '生效倍率' }} {{ rateLabel(billing.effective_multiplier_text ?? billing.effective_multiplier) }}
+        <template v-if="billing.group_rate != null"> · 分组倍率 {{ billing.group_status ? keyGroupRate(billing.group_rate) : rateLabel(billing.group_rate) }}</template>
         <template v-if="billing.peak_enabled"> · 高峰系数 {{ rateLabel(billing.peak_rate) }}</template>
         <strong v-if="billing.billing_state === 'stale'"> · 倍率已陈旧，保留上次记录</strong>
         <span v-else-if="billing.billing_state === 'unverified'"> · 计费倍率待核实</span>
         · 上次成功 {{ syncTime(billing.last_success) }}
         <strong v-if="billing.alert"> · 计费信息连续读取失败 {{ billing.failure_count === 6 ? '至少 6' : billing.failure_count }} 次</strong>
-        <span v-if="billing.last_error"> · {{ billing.last_error }}</span>
+        <span v-if="keyGroupIssue(billing) || billing.last_error"> · {{ keyGroupIssue(billing) || billing.last_error }}</span>
       </p>
     </section>
     <BeichenKeyCapabilities v-if="overview?.key_capabilities?.length" :key="providerId"
@@ -1038,8 +1069,9 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
                   : row.hasCapability ? '暂无推荐协议' : '推荐协议待同步' }}</span>
                 <span v-if="row.bindingInvalid" class="status-pill danger" data-testid="binding-invalid">绑定失效</span>
                 <span v-if="!row.websiteOnly && row.protocolMissing" class="status-pill pending" data-testid="protocol-missing">缺协议</span>
-                <span v-if="!row.websiteOnly && row.priceState === 'missing'" class="status-pill pending" data-testid="price-missing">缺价</span>
+                <span v-if="!row.websiteOnly && row.priceState === 'missing' && !row.websitePrices.length" class="status-pill pending" data-testid="price-missing">{{ missingPriceLabel(row) }}</span>
               </div>
+              <small v-for="issue in row.groupIssues" :key="issue" class="row-note">{{ issue }}</small>
               <small v-if="!row.websiteOnly && row.availabilityReason" class="row-note" data-testid="availability-reason">{{ row.availabilityReason }}</small>
               <small v-if="!row.websiteOnly && row.actionHint" class="row-note" data-testid="action-hint">下一步：{{ row.actionHint }}</small>
               <small v-if="row.bindingIssue" class="row-note binding-issue">{{ row.bindingIssue.message }}</small>
@@ -1051,27 +1083,52 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
             </td>
             <td v-for="column in priceColumns" :key="column.id" :data-label="column.label"
               :class="column.id === 'official' ? 'standard-price' : 'actual-price'">
-              <div v-for="(quote, quoteIndex) in row.pricing" :key="quote.key" class="quote-row" :data-price-status="quote.status">
+              <template v-if="column.id === 'official' && row.showWebsitePrices">
+                <div v-for="(location, index) in row.websitePrices" :key="index" class="quote-row">
+                  <BeichenPriceDetail v-if="location.price_conditions_exact?.billing_mode === 'token' &&
+                    !location.price_conditions_exact.intervals?.length"
+                    :title="websitePriceHeading(location)"
+                    :detail="webPriceDetail(location.price_conditions_exact, null, 'website', location.observed_at)" />
+                  <template v-else>
+                    <span>{{ websitePriceHeading(location) }}</span>
+                    <p class="price-line">{{ websiteGroupPrice(location) }}</p>
+                  </template>
+                </div>
+              </template>
+              <p v-if="column.id === 'student' && row.showWebsitePrices && !row.hasStudentPrice" class="price-empty">当前 Key 报价待核对</p>
+              <div v-else v-for="(quote, quoteIndex) in column.id === 'official' && row.showWebsitePrices
+                ? row.pricing.filter(quote => quote.status === 'derived') : row.pricing"
+                :key="quote.key" class="quote-row" :data-price-status="quote.status">
                 <div class="quote-caption">
                   <span v-if="row.pricing.length > 1">报价 {{ quoteIndex + 1 }}</span>
                   <span v-if="column.id === 'official'" class="status-pill" :class="quote.status">{{ quote.statusLabel }}</span>
                   <span v-else>{{ quote.multiplierLabel ?? '倍率待同步' }}</span>
+                  <span v-if="quote.hasQuote" class="status-pill price-source" :data-source="quote[column.id].detail.source">{{ quote[column.id].detail.sourceLabel }}</span>
+                  <small v-if="quote.hasQuote" class="price-observed">observed_at {{ quote[column.id].detail.observedLabel }}</small>
                 </div>
                 <template v-if="quote[column.id].conditional">
                   <button v-if="column.id === 'official'" type="button" class="price-link" @click="conditionsRow = row">查看档位</button>
                   <span v-else class="price-empty">随计价档位变化</span>
                 </template>
-                <dl v-if="quote[column.id].cells.length" class="price-grid">
-                  <div v-for="cell in quote[column.id].cells" :key="cell.key" class="price-cell">
-                    <dt class="price-label">{{ cell.label }}</dt>
-                    <dd class="price-value">
-                      <span class="price-credits">{{ cell.credits }}<small v-if="cell.credits !== '—'"> 积分</small></span>
-                      <span v-if="cell.yuan !== '—'" class="price-sub">{{ cell.yuan }} 元</span>
-                    </dd>
-                  </div>
-                </dl>
+                <template v-if="quote.hasQuote && quote[column.id].detail && (!quote[column.id].conditional || quote[column.id].showBase)">
+                  <p class="billing-mode-line">计费模式：{{ quote[column.id].detail.billingModeLabel }}</p>
+                  <dl v-if="quote[column.id].detail.rows.some(row => !row.notApplicable)" class="price-grid">
+                    <div v-for="cell in quote[column.id].detail.rows" :key="cell.key" class="price-cell" :data-missing="cell.missing">
+                      <dt class="price-label">{{ cell.label }}</dt>
+                      <dd class="price-value">
+                        <template v-if="cell.notApplicable"><span class="price-empty">不适用</span></template>
+                        <template v-else-if="cell.missing"><span class="price-empty price-credits">{{ cell.key === 'cache_write_1h' ? '未列单价' : '缺价' }}</span></template>
+                        <template v-else>
+                          <span class="price-credits">{{ cell.credits }}<small> 积分</small></span>
+                          <span class="price-sub">{{ cell.yuan }} 元</span>
+                          <small v-if="cell.shared" class="price-sub">（同 5m）</small>
+                        </template>
+                      </dd>
+                    </div>
+                  </dl>
+                </template>
                 <p v-if="quote[column.id].details" class="price-line">{{ quote[column.id].details }}</p>
-                <span v-else-if="!quote[column.id].cells.length && !quote[column.id].conditional" class="price-empty">—</span>
+                <span v-else-if="!quote.hasQuote" class="price-empty">缺价</span>
                 <template v-if="column.id === 'official'">
                   <small v-for="note in quote.notes" :key="note" class="row-note">{{ note }}</small>
                 </template>
@@ -1234,6 +1291,10 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .row-note { display: block; color: var(--ink-soft); font-size: 11px; line-height: 1.5; margin-top: 6px; overflow-wrap: anywhere; }
 .enable-reason { color: #835615; }
 .price-line { white-space: pre-line; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; font-size: 12px; line-height: 1.6; margin: 0; }
+.billing-mode-line { margin: 0; color: var(--ink-soft); font-size: 11px; line-height: 1.6; }
+.price-observed { color: var(--ink-soft); font-size: 11px; font-weight: 400; overflow-wrap: anywhere; }
+.price-source { white-space: normal; }
+.price-cell[data-missing="true"] .price-empty { color: #835615; }
 .quote-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
 .quote-row + .quote-row { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
 .quote-caption { display: flex; align-items: center; gap: 6px; min-height: 22px; flex-wrap: wrap; font-size: 11px; font-variant-numeric: tabular-nums; }

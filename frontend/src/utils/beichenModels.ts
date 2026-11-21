@@ -1,4 +1,5 @@
 import type { BeichenCatalogModel, BeichenDataset, BeichenModel, BeichenOverview, BeichenPriceConditions, BeichenPriceTier } from '../api/types'
+import { shiftDecimal } from './credits'
 
 export function isBeichenProvider(baseUrl: string) {
   const address = baseUrl.trim()
@@ -16,9 +17,74 @@ export type SchoolQuote = {
   actualRates: { input: string | null; output: string | null; cache_read: string | null; cache_write: string | null } | null
   status: 'confirmed' | 'conditional' | 'derived' | 'not_listed' | 'pending'
   statusLabel: string
+  issue?: string
   notes: string[]
   mode: 'follow' | 'manual'
   priceReady: boolean
+  conditions?: BeichenPriceConditions | null
+  rateValue?: string | null
+  officialSource?: PriceSource
+  schoolSource?: PriceSource
+  officialObservedAt?: string | null
+  schoolObservedAt?: string | null
+}
+
+export type PriceSource = 'website' | 'derived' | 'manual'
+export type PriceDetailKey = 'input' | 'output' | 'cache_write_5m' | 'cache_write_1h' | 'cache_read'
+export type PriceDetailRow = {
+  key: PriceDetailKey
+  label: string
+  yuan: string | null
+  credits: string | null
+  missing: boolean
+  notApplicable: boolean
+  shared?: boolean
+}
+export type PriceDetailView = {
+  billingModeLabel: string
+  rows: PriceDetailRow[]
+  source: PriceSource
+  sourceLabel: string
+  observedAt: string | null
+  observedLabel: string
+}
+
+export const priceSourceLabels: Record<PriceSource, string> = {
+  website: '官网正式价',
+  derived: '历史流水反推价',
+  manual: '手动价',
+}
+
+export const priceDetailFields = [
+  { key: 'input', label: '输入', priceKey: 'input_price', rateKey: 'input' },
+  { key: 'output', label: '输出', priceKey: 'output_price', rateKey: 'output' },
+  { key: 'cache_write_5m', label: '缓存写入(5m)', priceKey: 'cache_write_price', rateKey: 'cache_write' },
+  { key: 'cache_write_1h', label: '缓存写入(1h)', priceKey: 'cache_write_1h_price', rateKey: 'cache_write' },
+  { key: 'cache_read', label: '缓存读取', priceKey: 'cache_read_price', rateKey: 'cache_read' },
+] as const
+
+const billingModeLabels: Record<string, string> = {
+  token: '按 Token（每 1M Token 计价）',
+  per_request: '按次',
+  video: '按视频秒数',
+  image: '按图像',
+  unknown: '单位未知',
+}
+
+export function billingModeLabel(value?: string | null) {
+  const mode = (value ?? '').trim().toLowerCase()
+  if (!mode) return '按 Token（官网未声明）'
+  return billingModeLabels[mode] ?? '其他（' + value + '）'
+}
+
+export function formatObservedAt(value?: string | null) {
+  if (!value) return null
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return null
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(date)
 }
 export type SchoolCredentialPrice = {
   credential_id: string
@@ -74,7 +140,7 @@ export function schoolCatalog(overview: BeichenOverview, providerId: string): Sc
       const record = prices.get(route.credential_id + ':' + upstreamName)
       const quote = schoolQuote(record, route.effective_multiplier_text ?? route.effective_multiplier,
         route.state === 'candidate', datasets.get('prices:' + route.credential_id)?.last_error,
-        datasets.get('billing:' + route.credential_id))
+        datasets.get('billing:' + route.credential_id), datasets.get('prices:' + route.credential_id))
       quotes.set(JSON.stringify(quote), quote)
       credentials.set(route.credential_id, {
         credential_id: route.credential_id,
@@ -106,21 +172,203 @@ const priceStatusLabels = {
   pending: '单价待同步',
 }
 
+export function keyGroupIssue(billing?: BeichenDataset) {
+  if (billing?.group_status === 'not_found') return 'Key 分组不存在'
+  if (billing?.group_status === 'not_allowed' && billing.group_id != null) return `账号无 group ${billing.group_id} 权限`
+  return ''
+}
+
+export function keyGroupRate(rate: string | undefined) {
+  const value = nonNegativeDecimal(rate)
+  if (!value) return ''
+  const [whole, fraction = ''] = formatDecimal(value).split('.')
+  return whole + '.' + fraction.padEnd(2, '0') + '×'
+}
+
+export type PriceRateValues = Partial<Record<'input' | 'output' | 'cache_read' | 'cache_write', string | number | null>>
+
+function nonTokenPriceLabel(mode: string) {
+  if (mode === 'per_request') return '每次请求'
+  if (mode === 'video') return '每秒'
+  if (mode === 'image') return '图像单价'
+  return '基础单价'
+}
+
+function scaleDecimal(value: string | number | null | undefined, factor: string) {
+  const amount = nonNegativeDecimal(value)
+  const multiplier = nonNegativeDecimal(factor)
+  if (!amount || !multiplier) return null
+  return formatDecimal({ coefficient: amount.coefficient * multiplier.coefficient, scale: amount.scale + multiplier.scale })
+}
+
+/** 固定展示的五项 Token 单价，统一换算成每 1M Token 的元与积分。 */
+export function priceDetailRows(terms: BeichenPriceConditions | null | undefined, rateText?: string | null): PriceDetailRow[] {
+  const mode = terms?.billing_mode?.trim().toLowerCase() ?? ''
+  if (mode && mode !== 'token') {
+    return priceDetailFields.map(field => ({
+      key: field.key, label: field.label, yuan: null, credits: null, missing: false, notApplicable: true,
+    }))
+  }
+  const rate = rateText == null || rateText === '' ? null : nonNegativeDecimal(rateText)
+  return priceDetailFields.map(field => {
+    const raw = terms?.[field.priceKey]
+    const amount = nonNegativeDecimal(raw)
+    if (!amount) return { key: field.key, label: field.label, yuan: null, credits: null, missing: true, notApplicable: false }
+    const coefficient = amount.coefficient * (rate?.coefficient ?? 1n)
+    const scale = amount.scale + (rate?.scale ?? 0)
+    return {
+      key: field.key, label: field.label,
+      yuan: formatDecimal({ coefficient, scale: scale - 6 }),
+      credits: formatDecimal({ coefficient, scale: scale - 8 }),
+      missing: false, notApplicable: false,
+    }
+  })
+}
+
+/** 手动价与旧接口的已生效倍率都以积分/百万 Token 保存。 */
+export function manualPriceDetailRows(rates: PriceRateValues | null | undefined, factor = '1'): PriceDetailRow[] {
+  const multiplier = nonNegativeDecimal(factor)
+  return priceDetailFields.map(field => {
+    const shared = field.key === 'cache_write_1h'
+    const raw = rates?.[field.rateKey] ?? (shared ? rates?.cache_write : null)
+    const amount = nonNegativeDecimal(raw)
+    if (!amount) return { key: field.key, label: field.label, yuan: null, credits: null, missing: true, notApplicable: false, shared }
+    const coefficient = amount.coefficient * (multiplier?.coefficient ?? 1n)
+    const scale = amount.scale + (multiplier?.scale ?? 0)
+    return {
+      key: field.key, label: field.label,
+      credits: formatDecimal({ coefficient, scale }),
+      yuan: formatDecimal({ coefficient, scale: scale + 2 }),
+      missing: false, notApplicable: false, shared,
+    }
+  })
+}
+
+const detailTextLabels: Record<PriceDetailKey, string[]> = {
+  input: ['输入'],
+  output: ['输出'],
+  cache_write_5m: ['缓存写入(5m)', '缓存写入'],
+  cache_write_1h: ['缓存写入(1h)', '缓存写入（1 小时）'],
+  cache_read: ['缓存读取'],
+}
+
+function priceDetailRowsFromText(text: string | null | undefined, factor = '1'): PriceDetailRow[] {
+  const line = (text ?? '').split('\n').find(row => row.startsWith(unitLabels.token))
+  const amounts = line?.split(' · ').slice(1) ?? []
+  return priceDetailFields.map(field => {
+    let amount: string | undefined
+    for (const label of detailTextLabels[field.key]) {
+      const found = amounts.find(row => row.startsWith(label + ' '))
+      if (found) {
+        amount = found.slice(label.length + 1)
+        break
+      }
+    }
+    const credits = scaleDecimal(amount, factor)
+    if (credits == null) return { key: field.key, label: field.label, yuan: null, credits: null, missing: true, notApplicable: false }
+    return { key: field.key, label: field.label, credits, yuan: shiftDecimal(credits, -2), missing: false, notApplicable: false }
+  })
+}
+
+export function missingPriceDetailLabels(terms: BeichenPriceConditions | null | undefined): string[] {
+  if (!terms) return priceDetailFields.map(field => field.label)
+  const mode = terms.billing_mode?.trim().toLowerCase() ?? ''
+  if (mode && mode !== 'token') return terms.per_request_price == null ? [nonTokenPriceLabel(mode)] : []
+  if (Array.isArray(terms.intervals) && terms.intervals.length) return []
+  return priceDetailFields.filter(field => terms[field.priceKey] == null).map(field => field.label)
+}
+
+export function webPriceDetail(terms: BeichenPriceConditions | null | undefined, rateText: string | null | undefined,
+  source: PriceSource, observedAt?: string | null): PriceDetailView {
+  return {
+    billingModeLabel: billingModeLabel(terms?.billing_mode),
+    rows: priceDetailRows(terms, rateText),
+    source,
+    sourceLabel: priceSourceLabels[source],
+    observedAt: observedAt ?? null,
+    observedLabel: formatObservedAt(observedAt) ?? '未记录',
+  }
+}
+
+export function emptyPriceDetail(source: PriceSource = 'website', observedAt?: string | null): PriceDetailView {
+  return {
+    billingModeLabel: '未提供报价',
+    rows: priceDetailFields.map(field => ({
+      key: field.key, label: field.label, yuan: null, credits: null, missing: true, notApplicable: false,
+    })),
+    source,
+    sourceLabel: priceSourceLabels[source],
+    observedAt: observedAt ?? null,
+    observedLabel: formatObservedAt(observedAt) ?? '未记录',
+  }
+}
+
+export function ratesPriceDetail(rates: PriceRateValues | null | undefined, source: PriceSource,
+  observedAt?: string | null, factor = '1'): PriceDetailView {
+  return {
+    billingModeLabel: '按 Token（已应用倍率）',
+    rows: manualPriceDetailRows(rates, factor),
+    source,
+    sourceLabel: priceSourceLabels[source],
+    observedAt: observedAt ?? null,
+    observedLabel: formatObservedAt(observedAt) ?? '未记录',
+  }
+}
+
+export function manualPriceDetail(rates: PriceRateValues | null | undefined, factor = '1', observedAt?: string | null): PriceDetailView {
+  return {
+    ...ratesPriceDetail(rates, 'manual', observedAt, factor),
+    billingModeLabel: '按 Token（手动价）',
+  }
+}
+
+function textPriceDetail(text: string | null | undefined, source: PriceSource, observedAt?: string | null,
+  factor = '1'): PriceDetailView {
+  return {
+    billingModeLabel: '按 Token（报价明细）',
+    rows: priceDetailRowsFromText(text, factor),
+    source,
+    sourceLabel: priceSourceLabels[source],
+    observedAt: observedAt ?? null,
+    observedLabel: formatObservedAt(observedAt) ?? '未记录',
+  }
+}
+
+export function schoolQuoteDetail(quote: SchoolQuote, student: boolean): PriceDetailView {
+  const source = (student ? quote.schoolSource : quote.officialSource) ?? 'website'
+  const observedAt = (student ? quote.schoolObservedAt : quote.officialObservedAt) ?? null
+  if (student && quote.mode === 'manual') return manualPriceDetail(quote.actualRates, '1.10', observedAt)
+  if (quote.conditions) {
+    if (student && quote.rateValue == null) {
+      return quote.actual ? textPriceDetail(quote.actual, source, observedAt, '1.10') : ratesPriceDetail(quote.actualRates, source, observedAt, '1.10')
+    }
+    const rate = student ? scaleDecimal(quote.rateValue ?? '1', '1.10') : null
+    return webPriceDetail(quote.conditions, rate, source, observedAt)
+  }
+  if (student) {
+    return quote.actual ? textPriceDetail(quote.actual, source, observedAt, '1.10')
+      : ratesPriceDetail(quote.actualRates, source, observedAt, '1.10')
+  }
+  return textPriceDetail(quote.standard, source, observedAt)
+}
+
 function schoolQuote(record: BeichenModel | undefined, reported: string | number | null | undefined,
-  candidate: boolean, priceError?: string | null, billing?: BeichenDataset) {
+  candidate: boolean, priceError?: string | null, billing?: BeichenDataset, priceDataset?: BeichenDataset) {
   const status: SchoolQuote['status'] = record?.price_status === 'confirmed' || record?.price_status === 'conditional' ||
     record?.price_status === 'derived' || record?.price_status === 'not_listed' ? record.price_status : 'pending'
   const derived = record?.price_source === 'derived_from_usage' || status === 'derived'
   const mode: 'follow' | 'manual' = record?.mode === 'manual' ? 'manual' : 'follow'
   const billingError = billing?.last_error
+  const groupIssue = keyGroupIssue(billing)
+  const missingOfficial = priceDataset?.official_price_missing
   const stale = billing?.billing_state === 'stale'
   const billingRate = billing?.effective_multiplier_text ?? billing?.effective_multiplier
   const observedRate = billing?.billing_state === 'current' ? billingRate : reported
-  const rate = billingError || stale ? null : nonNegativeDecimal(observedRate)
+  const rate = groupIssue || billingError || stale ? null : nonNegativeDecimal(observedRate)
   const lastRate = stale ? nonNegativeDecimal(billingRate) : null
   const multiplier = lastRate ? formatDecimal(lastRate) + '× · 已陈旧'
     : rate ? formatDecimal(rate) + (candidate ? '× · 待启用' : '×')
-      : billingError || observedRate == null || observedRate === '' ? '待同步' : '倍率无效'
+      : groupIssue || billingError || observedRate == null || observedRate === '' ? '待同步' : '倍率无效'
   const source = record?.price_conditions_exact ?? record?.price_conditions
   const terms = status !== 'not_listed' && source && typeof source === 'object' && !Array.isArray(source) ? source : null
   const canCalculate = !priceError && (status === 'confirmed' || status === 'conditional' || status === 'derived') ? rate : null
@@ -137,10 +385,21 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
   const priceReady = record?.price_covered ?? (mode === 'manual'
     ? Boolean(actualRates?.input != null && actualRates?.output != null)
     : !priceError && Boolean(record?.upstream_rates?.input != null && record?.upstream_rates?.output != null))
-  const statusLabel = derived && status === 'pending' ? '反推价待重新核实' : priceError
+  const issue = groupIssue || (missingOfficial && status === 'pending' ? '官方价表缺失' : '')
+  const statusLabel = issue || (derived && status === 'pending' ? '反推价待重新核实' : priceError
     ? (status === 'pending' ? '价格同步失败' : '上次报价状态 · ' + priceStatusLabels[status])
-    : (status === 'pending' && standard ? '官网单价待核对' : priceStatusLabels[status])
+    : (status === 'pending' && standard ? '官网单价待核对' : priceStatusLabels[status]))
+  const officialSource: PriceSource = derived ? 'derived' : 'website'
+  const schoolSource: PriceSource = mode === 'manual' ? 'manual' : officialSource
+  const websiteObservedAt = priceDataset?.last_success ?? null
+  const officialObservedAt = derived ? record?.price_observed_at ?? websiteObservedAt : websiteObservedAt
+  const schoolObservedAt = mode === 'manual' ? record?.price_observed_at ?? null : officialObservedAt
   const notes: string[] = []
+  if (billing?.group_status && billing.group_id != null) {
+    const groupRate = keyGroupRate(billing.group_rate)
+    notes.push([`Key 分组 ${billing.group_id}`, billing.group_name, groupRate && '分组倍率 ' + groupRate]
+      .filter(Boolean).join(' · '))
+  }
   if (derived) {
     notes.push('输入、输出单价由历史流水反推。缓存单价缺证据时，使用缓存的调用待核账。')
     if (record?.price_observed_at) {
@@ -148,15 +407,17 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
       if (Number.isFinite(at.getTime())) notes.push('反推时间 ' + at.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) + '（北京时间）')
     }
   }
-  if (priceError) notes.push('价格同步错误：' + priceError)
-  if (billingError) notes.push('倍率同步失败：' + billingError)
+  if (priceError && !groupIssue && !missingOfficial) notes.push('价格同步错误：' + priceError)
+  if (billingError && !groupIssue) notes.push('倍率同步失败：' + billingError)
   if (status === 'confirmed' && !standard && !priceError) notes.push('官网标准价待同步')
   if (status === 'conditional' && !standard && !priceError) notes.push('条件明细待同步')
   if (prices?.precisionUnknown) notes.push('官网原始小数精度未知')
   if (legacy?.zeroUncertain) notes.push('后台已有报价小数精度未知，零值待核对')
   if (legacy?.actual) notes.push('实际单价来自后台已有报价')
   return { multiplier, multiplierLabel: mode === 'manual' ? '手动定价' : '倍率 ' + multiplier,
-    standard, actual, actualRates, status, statusLabel, notes, mode, priceReady }
+    standard, actual, actualRates, status, statusLabel, issue: issue || undefined, notes, mode, priceReady,
+    conditions: terms, rateValue: rate ? formatDecimal(rate) : null,
+    officialSource, schoolSource, officialObservedAt, schoolObservedAt }
 }
 
 const tokenPrices = [

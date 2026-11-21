@@ -294,6 +294,9 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 		partialErr = nil
 	}
 	return fetchResult{err: billingErr, partialErr: partialErr, save: func(ctx context.Context, tx *sql.Tx) error {
+		if err := saveBillingGroup(ctx, tx, job.credential, revision, directory, billingErr); err != nil {
+			return err
+		}
 		if catalogErr != nil {
 			if err := recordDatasetError(ctx, tx, job.credential, "catalog", catalogErr.Error()); err != nil {
 				return err

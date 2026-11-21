@@ -474,7 +474,7 @@ data: {"revision":"01K2..."}
 
 `website_directory.last_run.key_model_comparisons` 按学校渠道返回 `/v1/models` 与当前官网分组的对照。`matched` 提供 `key_model`、`channel_model`、匹配方式和 `price_complete`。名称相同优先，其次核对可以双向唯一匹配的写法变体。`only_key` 和 `only_channel` 保留各自的官网或请求原名。`state=unavailable` 表示 Key 目录读取失败，`unverified` 表示分组或渠道证据不足。两种状态都不把未知结果当作已确认差异。整批身份读取失败时摘要提供 `key_model_error`。官网分组的 `account_rate_multiplier` 来自同一网页登录会话的 `GET /api/v1/groups/rates`，`rate_multiplier` 为分组默认值。账户倍率未读到时，`last_run.account_rate_error` 给出状态。
 
-`website_locations` 带官网原名、渠道、平台、分组、采集时间、缓存状态和报价存在标记。`catalog_keys` 带实际覆盖的 Key 及上游型号，或者给出需要核查的 Key。`state` 可为 `listed`、`missing`、`pending`、`failed` 或 `ambiguous`。已覆盖条目用 `match` 说明原名、名称归一或教师别名，并保留独立的 Key 型号 ID 供教师操作。弱匹配可以识别唯一的日期版本，保留型号数字和具有实际含义的变体。官网已有价格且当前 Key 报价待确认时，教师可同时看到分组和目录证据。
+`website_locations` 带官网原名、渠道、平台、分组、采集时间、缓存状态和报价存在标记。`price_complete` 表示该官网报价具备所声明计价方式的必要单价，`has_price` 表示至少找到一个数值单价。`catalog_keys` 带实际覆盖的 Key 及上游型号，或者给出需要核查的 Key。`state` 可为 `listed`、`missing`、`pending`、`failed` 或 `ambiguous`。已覆盖条目用 `match` 说明原名、名称归一或教师别名，并保留独立的 Key 型号 ID 供教师操作。弱匹配可以识别唯一的日期版本，保留型号数字和具有实际含义的变体。当前 Key 的报价待确认时，官网价栏显示已读到的完整报价及其所属分组。
 
 `catalog_differences` 按启用 Key 返回已知分组、核对时间、`website_only` 和 `key_only`。官网分组与当前 Key 目录均可对比时标为 `compared`。比较使用保留的官网数据时标为 `stale`。缺少一方证据时标为 `unverified`。`website_only_models` 汇总当前 Key 均未匹配的官网型号及候选渠道，`website_only_status` 表示该汇总的核对状态。
 
@@ -496,7 +496,9 @@ data: {"revision":"01K2..."}
 
 `catalog_keys[].group_diagnosis` 的 `model_outside_key_group` 表示型号在其他官网分组且当前 Key 的目录未列出，`price_outside_key_group` 表示型号有其他分组报价、当前 Key 分组缺价，`group_rate_mismatch` 表示同一分组的官网与 Key 计费规则不一致。`website_locations[].groups` 返回官网分组倍率和可用的高峰规则。`website_locations[].price_conditions_exact` 以十进制字符串保存可显示的单价数字，供报价对比使用。Key 分组沿用陈旧记录时，`group_stale` 为真。
 
-本轮已在当前分组的有效价表中查找该模型，而价表缺少同名条目时，概览的 `models[].price_status` 返回 `not_listed`。分组待核、价表缺失或过期、已列出的同名条目缺少有效价格，均返回 `pending_confirmation`。
+概览的 `datasets[]` 中，`kind=billing` 可返回从 Key 清单核实的 `group_id`、`group_name`、`group_rate` 和 `group_status`。`assigned` 表示清单确认绑定分组，`not_found` 表示已匹配的 Key 明确未绑定分组，`not_allowed` 表示计费或模型清单接口明确返回 `GROUP_NOT_ALLOWED`。分组状态与 `billing_state` 分别记录归属和生效倍率的核实结果。Key 计费和模型清单已核实的同步可以成功提交，缺少价表另由 `kind=prices` 的 `official_price_missing` 表示。已具备反推单价的模型用 `price_status=derived`、`price_source=derived_from_usage` 和 `price_observed_at` 标明来源与时间。
+
+本轮已在当前分组的有效价表中查找该模型，而价表缺少同名条目时，概览的 `models[].price_status` 返回 `not_listed`。当整组缺少官方价表且部分型号的反推价已生效时，其余已核实的型号也返回 `not_listed`。分组待核、价表缺失或过期、已列出的同名条目缺少有效价格，通常返回 `pending_confirmation`。
 
 概览的 `archived_usage` 以北京时间按日、模型和凭据汇总持续采集的原始流水。`rows`、`unmatched_rows`、`unpriced_rows` 分别表示已采集笔数、未能归属学校扣款的笔数和无法确认余额实扣的笔数。`observed_cost` 汇总已知原始实扣，`matched_cost`、`matched_base_credits`、`matched_charged_credits` 与 `margin_credits` 只比较同一批可匹配且金额齐全的调用。官网更正金额后会更新差额，保留原学生扣分。
 

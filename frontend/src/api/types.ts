@@ -99,7 +99,10 @@ export type BeichenDataset = {
   effective_multiplier_text?: string
   billing_state?: 'current' | 'stale' | 'unverified'
   group_id?: number
+  group_name?: string
   group_rate?: string
+  group_status?: 'assigned' | 'not_found' | 'not_allowed'
+  official_price_missing?: boolean
   peak_enabled?: boolean
   peak_rate?: string
   observed_at?: string
@@ -277,6 +280,7 @@ export type BeichenWebsiteLocation = {
   groups: BeichenWebsiteGroup[]
   observed_at: string
   has_price: boolean
+  price_complete?: boolean
   price_conditions_exact?: BeichenPriceConditions
   stale?: boolean
 }

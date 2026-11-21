@@ -45,16 +45,17 @@ type CrawlModel struct {
 }
 
 type CrawlSource struct {
-	ChannelID     int64           `json:"channel_id,omitempty"`
-	Channel       string          `json:"channel,omitempty"`
-	Platform      string          `json:"platform"`
-	Groups        []WebsiteGroup  `json:"groups"`
-	ObservedAt    time.Time       `json:"observed_at"`
-	PriceComplete bool            `json:"price_complete"`
-	PriceBlocker  string          `json:"price_blocker,omitempty"`
-	Pricing       json.RawMessage `json:"pricing"`
-	MissingFields []string        `json:"missing_price_fields"`
-	IgnoredFields []string        `json:"ignored_fields"`
+	ChannelID                 int64             `json:"channel_id,omitempty"`
+	Channel                   string            `json:"channel,omitempty"`
+	Platform                  string            `json:"platform"`
+	Groups                    []WebsiteGroup    `json:"groups"`
+	ObservedAt                time.Time         `json:"observed_at"`
+	PriceComplete             bool              `json:"price_complete"`
+	PriceBlocker              string            `json:"price_blocker,omitempty"`
+	Pricing                   json.RawMessage   `json:"pricing"`
+	BaseTokenPricesPerMillion map[string]string `json:"base_token_prices_per_million,omitempty"`
+	MissingFields             []string          `json:"missing_price_fields"`
+	IgnoredFields             []string          `json:"ignored_fields"`
 }
 
 // CrawlDirectory uses the scheduled website parser. The optional inventory uses
@@ -124,7 +125,7 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 	var keys []discoveryKey
 	if options.MatchDB && crawl.ModelCount != 0 {
 		var matchErr error
-		keys, matchErr = s.readCrawlKeys(ctx, options.ProviderID)
+		keys, matchErr = s.readCrawlKeys(ctx, options.ProviderID, crawl.platforms)
 		if matchErr != nil {
 			report.KeyMatching, report.KeyMatchError = "failed", matchErr.Error()
 			err = errors.Join(err, matchErr)
@@ -147,11 +148,13 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 				ChannelID: section.ChannelID, Channel: section.Channel, Platform: section.Platform, Groups: groups,
 				ObservedAt: observation.ObservedAt, MissingFields: websiteMissingPriceFields(observation.Pricing),
 				PriceComplete: observation.priceBlocker == "", PriceBlocker: observation.priceBlocker, Pricing: observation.Pricing,
-				IgnoredFields: append([]string{}, usage.BeichenPanelIgnoredFields(observation.Pricing)...),
+				BaseTokenPricesPerMillion: baseTokenPricesPerMillion(observation.Pricing),
+				IgnoredFields:             append([]string{}, usage.BeichenPanelIgnoredFields(observation.Pricing)...),
 			})
 			locations[name] = append(locations[name], WebsiteLocation{
 				Name: name, ChannelID: section.ChannelID, Channel: section.Channel, Platform: section.Platform,
 				Groups: groups, channelStatus: section.ChannelStatus,
+				HasPrice: observation.priceBlocker == "",
 			})
 		}
 	}
@@ -166,7 +169,7 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 	return report, err
 }
 
-func (s *Service) readCrawlKeys(ctx context.Context, provider uuid.UUID) ([]discoveryKey, error) {
+func (s *Service) readCrawlKeys(ctx context.Context, provider uuid.UUID, platforms []directoryPlatform) ([]discoveryKey, error) {
 	if s.db == nil {
 		return nil, errors.New("读取已有 Key 目录需要 DATABASE_URL")
 	}
@@ -190,6 +193,10 @@ func (s *Service) readCrawlKeys(ctx context.Context, provider uuid.UUID) ([]disc
 	}
 	aliases, err := readModelAliases(ctx, tx, provider)
 	if err != nil {
+		return nil, readFailed
+	}
+	var view Overview
+	if err := readDatasets(ctx, tx, provider, &view); err != nil {
 		return nil, readFailed
 	}
 	rows, err := tx.QueryContext(ctx, `
@@ -217,6 +224,7 @@ WHERE m.provider_id=$1 AND m.status='active' AND c.status='active' AND p.status=
 	if err := tx.Commit(); err != nil {
 		return nil, readFailed
 	}
+	indexKeyGroups(view.Datasets, keys, platforms)
 	indexDiscoveryKeys(models, keys, aliases)
 	return keys, nil
 }

@@ -26,7 +26,10 @@ type Dataset struct {
 	EffectiveMultiplierText string       `json:"effective_multiplier_text,omitempty"`
 	BillingState            string       `json:"billing_state,omitempty"`
 	GroupID                 *int64       `json:"group_id,omitempty"`
+	GroupName               *string      `json:"group_name,omitempty"`
 	GroupRate               *string      `json:"group_rate,omitempty"`
+	GroupStatus             string       `json:"group_status,omitempty"`
+	OfficialPriceMissing    bool         `json:"official_price_missing,omitempty"`
 	PeakEnabled             *bool        `json:"peak_enabled,omitempty"`
 	PeakRate                *string      `json:"peak_rate,omitempty"`
 	ObservedAt              *time.Time   `json:"observed_at,omitempty"`
@@ -251,10 +254,14 @@ SELECT c.id, kinds.kind, d.last_success, d.last_error, trim_scale(m.multiplier):
          OR d.last_success <= statement_timestamp()-interval '16 minutes') THEN 'stale'
        WHEN m.id IS NULL OR d.last_success IS NULL THEN 'unverified'
        ELSE 'current' END,
-  CASE WHEN kinds.kind = 'billing' THEN COALESCE(d.failure_count, 0) ELSE 0 END
+  CASE WHEN kinds.kind = 'billing' THEN COALESCE(d.failure_count, 0) ELSE 0 END,
+  d.website_group_observation, c.updated_at, k.group_id, k.group_name, trim_scale(k.rate)::text, inventory.last_seen
 FROM provider_credentials c
 CROSS JOIN (VALUES ('catalog'), ('billing'), ('prices'), ('usage')) AS kinds(kind)
 LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = kinds.kind
+LEFT JOIN beichen_website_keys k ON kinds.kind='billing' AND k.provider_id=c.provider_id AND k.credential_id=c.id
+  AND k.ciphertext_digest=sha256(c.credential_ciphertext)
+LEFT JOIN beichen_website_key_sync inventory ON inventory.provider_id=k.provider_id
 LEFT JOIN LATERAL (
   SELECT id, multiplier, group_id, group_rate, peak_enabled, peak_rate, observed_at, stale_at
   FROM beichen_multiplier_versions
@@ -270,11 +277,21 @@ ORDER BY c.label, c.id, kinds.kind`, providerID)
 	for rows.Next() {
 		var item Dataset
 		var multiplier *string
+		var observedGroup []byte
+		var revision time.Time
+		var inventory WebsiteKey
 		if err := rows.Scan(&item.CredentialID, &item.Kind, &item.LastSuccess, &item.LastError, &multiplier,
 			&item.GroupID, &item.GroupRate, &item.PeakEnabled, &item.PeakRate, &item.ObservedAt,
-			&item.BillingState, &item.FailureCount); err != nil {
+			&item.BillingState, &item.FailureCount, &observedGroup, &revision, &inventory.GroupID, &inventory.GroupName,
+			&inventory.Rate, &inventory.LastSeen); err != nil {
 			return err
 		}
+		if item.Kind == "billing" {
+			if err := item.applyBillingGroup(observedGroup, revision, inventory); err != nil {
+				return err
+			}
+		}
+		item.OfficialPriceMissing = item.Kind == "prices" && item.LastError != nil && *item.LastError == errPanelEmpty.Error()
 		item.Alert = item.FailureCount >= billingAlertFailures
 		if multiplier != nil {
 			value := json.Number(*multiplier)
@@ -522,7 +539,7 @@ func readPreferredRoutes(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, 
 	}
 	syncFailed := make(map[uuid.UUID]bool)
 	for _, d := range view.Datasets {
-		if d.Kind != "usage" && d.LastError != nil {
+		if d.Kind != "usage" && d.LastError != nil && !d.OfficialPriceMissing {
 			syncFailed[d.CredentialID] = true
 		}
 	}

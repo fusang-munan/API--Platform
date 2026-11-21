@@ -29,6 +29,7 @@ type listedKey struct {
 	CreatedAt     *time.Time  `json:"created_at"`
 	fingerprint   *[sha256.Size]byte
 	prefixPreview string
+	groupIDKnown  bool
 }
 
 // The inventory retains a fingerprint and a short prefix for an unmasked Key.
@@ -50,6 +51,7 @@ func (k *listedKey) observeValue(value string) bool {
 
 var errKeyList = errors.New("北辰账号的 Key 列表或分页无法确认")
 var errKeyMatch = errors.New("未能唯一确认本渠道的北辰 Key 和分组")
+var errKeyGroupMissing = errors.New("北辰 Key 分组不存在")
 
 func (s *Service) accountKeys(ctx context.Context, token string) ([]listedKey, error) {
 	return s.readAccountKeys(ctx, token, nil)
@@ -83,7 +85,8 @@ func (s *Service) readAccountKeys(ctx context.Context, token string, modelKeys m
 			Data struct {
 				Items []struct {
 					listedKey
-					Value string `json:"key"`
+					Value   string          `json:"key"`
+					GroupID json.RawMessage `json:"group_id"`
 				} `json:"items"`
 				Total *int `json:"total"`
 				Page  int  `json:"page"`
@@ -110,6 +113,12 @@ func (s *Service) readAccountKeys(ctx context.Context, token string, modelKeys m
 			k := item.listedKey
 			if k.ID <= 0 || k.ID > 9007199254740991 || seen[k.ID] || k.UserID <= 0 || owner != 0 && k.UserID != owner {
 				return nil, errKeyList
+			}
+			if len(item.GroupID) > 0 {
+				if json.Unmarshal(item.GroupID, &k.GroupID) != nil {
+					return nil, errKeyList
+				}
+				k.groupIDKnown = true
 			}
 			if k.Group != nil && k.Group.ID != 0 {
 				if k.GroupID != 0 && k.Group.ID != k.GroupID {
@@ -154,8 +163,14 @@ func identifyChannel(secret, channel, label string, keys []listedKey) (listedKey
 		return listedKey{}, errKeyMatch
 	}
 	key := keys[candidates[0]]
-	if !validWebsiteGroupID(key.GroupID) || key.Status != "" && key.Status != "active" {
+	if key.Status != "" && key.Status != "active" {
 		return listedKey{}, errKeyMatch
+	}
+	if key.GroupID == 0 && key.groupIDKnown {
+		return key, errKeyGroupMissing
+	}
+	if !validWebsiteGroupID(key.GroupID) {
+		return listedKey{}, errPanelGroupUnverified
 	}
 	return key, nil
 }

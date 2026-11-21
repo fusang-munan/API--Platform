@@ -20,7 +20,8 @@ func TestBeichenDerivedPricesPostgres(t *testing.T) {
 	credential := keys[0]
 	const opus, sonnet = "claude-opus-5-5", "claude-sonnet-5-5"
 	const noOfficial = `{"code":0,"data":[{"platforms":[{"platform":"anthropic","groups":[{"id":2}],"supported_models":[
-	{"name":"claude-opus-5-5","pricing":{"billing_mode":"token","input_price":0.9,"output_price":0.9}}]}]}]}`
+	{"name":"claude-opus-5-5","pricing":{"billing_mode":"token","input_price":0.9,"output_price":0.9}}]},
+	{"platform":"openai","groups":[{"id":10}],"supported_models":[{"name":"unrelated","pricing":"invalid"}]}]}]}`
 	const official = `{"code":0,"data":[{"platforms":[{"platform":"anthropic","groups":[{"id":16,
 	"platform":"anthropic","subscription_type":"standard","peak_rate_enabled":false,"rate_multiplier":0.6}],"supported_models":[
 	{"name":"claude-opus-5.5","pricing":{"billing_mode":"token","input_price":0.000008,"output_price":0.000020,"cache_read_price":0,"cache_write_price":0}},
@@ -50,7 +51,8 @@ VALUES($1,'CC1',sha256('derived-price-fixture'::bytea),false)`, credential)
 		case r.URL.String() == panelURL:
 			body = website
 		case r.URL.Host == publicKeyHost && r.URL.Path == "/api/v1/keys":
-			body = websiteKeyListFixture(secret, "CC1", 41, keyGroup)
+			body = strings.Replace(websiteKeyListFixture(secret, "CC1", 41, keyGroup), `"status":"active"`,
+				fmt.Sprintf(`"status":"active","group":{"id":%d,"name":"Claude 分组","rate_multiplier":0.60}`, keyGroup), 1)
 		case r.URL.Host == "api.beichenapi.com" && r.URL.Path == billingPath:
 			body = fmt.Sprintf(`{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token",
 "effective_rate_multiplier":0.6,"group_rate_multiplier":0.6,"peak_rate_enabled":false,"group_id":16,"api_key_id":41,"observed_at":%q}`,
@@ -74,6 +76,12 @@ VALUES($1,'CC1',sha256('derived-price-fixture'::bytea),false)`, credential)
 	view, err := service.Overview(ctx, provider, "")
 	if err != nil || len(view.Models) != 2 {
 		t.Fatalf("overview should have both Key models: %v", err)
+	}
+	group := datasetForCredential(t, view, credential, "billing")
+	if group.GroupID == nil || *group.GroupID != 16 || group.GroupName == nil || *group.GroupName != "Claude 分组" ||
+		group.GroupRate == nil || *group.GroupRate != "0.60" || group.BillingState != "current" ||
+		group.GroupStatus != "assigned" || group.LastError != nil {
+		t.Fatalf("missing verified CC group and rate: %+v", group)
 	}
 	for _, row := range view.Models {
 		if row.PriceStatus != "derived" || row.PriceSource != derivedPriceSource || row.PriceObservedAt == nil ||

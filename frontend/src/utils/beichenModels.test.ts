@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { BeichenOverview } from '../api/types'
-import { schoolCatalog } from './beichenModels'
+import { manualPriceDetailRows, missingPriceDetailLabels, priceDetailRows, schoolCatalog } from './beichenModels'
 
 function overview(model: Record<string, unknown>): BeichenOverview {
   return {
@@ -72,5 +72,29 @@ describe('schoolCatalog credits', () => {
     }), 'provider-1')
     expect(rows[0].quotes[0].priceReady).toBe(false)
     expect(rows[0].priceReady).toBe(false)
+  })
+})
+
+describe('price detail fields', () => {
+  it('把每 Token 的元价换算成每百万 Token 的元与积分', () => {
+    const rows = priceDetailRows({
+      billing_mode: 'token', input_price: '0.000004', output_price: '0.00002',
+      cache_write_price: '0.000005', cache_write_1h_price: '0.000008', cache_read_price: '0.0000002',
+    })
+    expect(rows.map(row => [row.label, row.yuan, row.credits])).toEqual([
+      ['输入', '4', '400'], ['输出', '20', '2000'],
+      ['缓存写入(5m)', '5', '500'], ['缓存写入(1h)', '8', '800'], ['缓存读取', '0.2', '20'],
+    ])
+  })
+
+  it('缺价时逐项列出具体字段', () => {
+    expect(missingPriceDetailLabels(null)).toEqual(['输入', '输出', '缓存写入(5m)', '缓存写入(1h)', '缓存读取'])
+    expect(missingPriceDetailLabels({ billing_mode: 'token', input_price: '0.000004' }))
+      .toEqual(['输出', '缓存写入(5m)', '缓存写入(1h)', '缓存读取'])
+  })
+
+  it('手动价的缓存写入(1h)沿用同一缓存写入价并标注', () => {
+    const rows = manualPriceDetailRows({ input: '0.5', output: '2', cache_read: '0', cache_write: '1' })
+    expect(rows.find(row => row.key === 'cache_write_1h')).toMatchObject({ credits: '1', yuan: '0.01', shared: true })
   })
 })

@@ -27,24 +27,32 @@ go run ./cmd/beichen-report --range all --granularity day --reconcile
 | 账号余额 | GET `/api/v1/auth/me` | `timezone=Asia/Shanghai` | `data.id`、`data.balance`、`data.created_at` | stable | 19:52 | 余额是读取当刻的可用金额，注册日用于 `all` 的日期起点。 |
 | 仪表盘汇总 | GET `/api/v1/usage/dashboard/stats` | `timezone=Asia/Shanghai` | `today_*` 和 `total_*` 的请求、总 Token、输入、输出、缓存读取、缓存创建、标准价和实扣，`total_api_keys`、`active_api_keys` | stable | 19:52 | 网页顶部始终展示今日和累计。传入今天的日期后仍返回这两组统计。 |
 | 仪表盘平台卡片 | 上一接口的 `data.by_platform` | 同上 | `platform`、`today_requests`、`today_tokens`、`today_actual_cost`、对应三个 `total_*` 字段 | experimental | 19:52 | 可复现原网页卡片。网页把累计请求和 Token 放在今日消费旁边。两平台的请求数合计比账号少 6，Token 与金额合计一致。 |
-| 自选范围统计和单 Key 汇总 | GET `/api/v1/usage/stats` | `start_date`、`end_date`、`timezone`，可选 `api_key_id` | `total_requests`、`total_tokens`、`total_input_tokens`、`total_output_tokens`、`total_cache_read_tokens`、`total_cache_creation_tokens`、`total_cost`、`total_actual_cost` | stable | 19:52 | 结束日期含当日。账号与 4 把 Key 均已实抓，三个范围的数量和金额均对上。 |
+| 自选范围统计和单 Key 汇总 | GET `/api/v1/usage/stats` | `start_date`、`end_date`、`timezone`，可选 `api_key_id` | `total_requests`、`total_tokens`、`total_input_tokens`、`total_output_tokens`、`total_cache_read_tokens`、`total_cache_creation_tokens`、`total_cost`、`total_actual_cost` | stable | 19:52 | 结束日期含当日。账号与 4 把 Key 均已实抓，三个范围的数量和金额均对上。传 `api_key_id` 可稳定取单 Key 汇总。 |
 | 模型分布 | GET `/api/v1/usage/dashboard/models` | `start_date`、`end_date`、`timezone`，可选 `api_key_id` | `data.models[]` 的 `model`、`requests`、四类及总 Token、`cost`、`actual_cost` | stable | 19:52 | 账号和 4 把 Key 共用，已核对每把 Key 的模型合计。空范围返回 `models: []`。 |
 | 按天趋势 | GET `/api/v1/usage/dashboard/trend` | `start_date`、`end_date`、`timezone`、`granularity=day` | `data.trend[]` 的 `date`、`requests`、四类及总 Token、`cost`、`actual_cost` | stable | 19:52 | 只有有记录的日期。仅传 `range=today` 实测仍返回默认日期范围。 |
 | 最近使用及逐笔流水 | GET `/api/v1/usage` | `start_date`、`end_date`、`timezone`、`page`、`page_size`、`sort_by`、`sort_order`，可选 `api_key_id` | `data.items[]`、`page`、`page_size`、`pages`、`total`。用量行有 `id`、`user_id`、`api_key_id`、`created_at`、`model`、四类 Token、`total_cost`、`actual_cost`、可选 `group.platform` | stable | 19:52 | 最近使用取 `created_at desc` 的前五条，卡片 Token 为输入加输出。逐笔流水用 `id asc` 和每页 100 条，检查条数、顺序和归属。真实账号本轮 53 条，跨页用脱敏样例验证。 |
 | 近 7 天按流水分组平台 | 上一接口的 `items[].group.platform` | 同逐笔流水 | 请求数、四类 Token 合计、实扣 | experimental | 19:47 | 这组统计解释 Key 分组归属下的近 7 天平台用量。实测 Claude 12、OpenAI 41 条，合计 53。缺分组平台时列入 `unattributed`。 |
-| Key 清单 | GET `/api/v1/keys` | `page`、`page_size=100` | `data.items[]` 的 `id`、`user_id`、`name`、`status`、`group_id`、`group.name`、`group.rate_multiplier` 和分页信息 | stable | 19:52 | 只保存 Key 数字 ID、名称、分组和状态。历史用量按 Key 数字 ID 归属，分组和倍率是清单读取时的状态。 |
+| Key 清单 | GET `/api/v1/keys` | `page`、`page_size=100` | `data.items[]` 的 `id`、`user_id`、`name`、`status`、`group_id`、`group.name`、`group.rate_multiplier` 和分页信息 | stable | 19:52 | `/keys` 稳定。只保存 Key 数字 ID、名称、分组和状态。历史用量按 Key 数字 ID 归属，分组和倍率是清单读取时的状态。 |
 | 单 Key 实际模型目录 | GET `https://api.beichenapi.com/v1/models` | 用对应 Key 的 Bearer 鉴权 | `data[].id` | experimental | 20:11 实抓 | 四把 Key 均走 `api.` 子域。`cc不满血` 返回 2 个型号，国模返回 3 个，gpt 返回 5 个。哈吉米为 HTTP 403 `GROUP_NOT_ALLOWED`，型号数未知。 |
 | 官网 Key 详情 | GET `/api/v1/keys/{id}` | 网页会话，使用清单中的数字 Key ID | `data.group_id`、`data.status`、`data.group`、`data.ip_whitelist`、`data.ip_blacklist` | stable | 20:11、20:14 实抓 | 哈吉米 Key 仍为 `active`，group 5 的 `is_exclusive=true`，Key 的 IP 白名单和黑名单均为 `null`。Group 16 详情确认分组和 0.60×，未提供两款 Claude 的 Token 单价。 |
-| Group 16 的渠道报价 | GET `/api/v1/channels/available?group_id=16` | 网页会话 | 渠道、分组、型号和报价结构 | unsupported | 20:11、20:14 实抓 | HTTP 200。20:14 与无查询参数的响应逐字节相同，均为 35 个型号和 9 个分组，缺 group 16。 |
+| 渠道列表与弹层价格 | GET `/api/v1/channels/available` | 网页会话，可选 `group_id` | `data.platforms[].groups[]`、`data.platforms[].supported_models[].pricing` | experimental（待 R 确认） | 20:11、20:14 实抓 | 可稳定取渠道列表和弹层价格。R 复核前暂按 `experimental` 记录，确认后更新为 `stable`。 |
+| Group 16 的渠道报价 | GET `/api/v1/channels/available?group_id=16` | 网页会话 | 渠道、分组、型号和报价结构 | unsupported | 20:11、20:14 实抓 | HTTP 200。20:14 与无查询参数的响应逐字节相同，均为 35 个型号和 9 个分组，缺 group 16。列表与弹层价格可用不等于该组正式 Token 单价可用。 |
 | Group 16 的分组详情 | GET `/api/v1/groups/16` | 网页会话 | 纯文本 404 | unsupported | 20:11 实抓 | 当前账号无法从此路径取得分组或报价详情。 |
 | 当前账号的分组倍率覆盖 | GET `/api/v1/groups/rates` | 网页会话 | `data` 中由分组 ID 到倍率的映射 | stable | 20:11 实抓 | group 6 为 0.08×，group 10 为 0.20×。 |
 | 单 Key 实时计费规则 | GET `https://api.beichenapi.com/v1/sub2api/billing` | 用对应 Key 的 Bearer 鉴权 | `billing_scope`、分组倍率、账户覆盖、已选倍率、生效倍率、高峰状态 | experimental | 20:11 实抓 | 成功响应为 `billing_scope=token`。CC2 为 0.60×、GM1 为 0.08×、gpt 为 0.20×。CC2 响应未提供 `pricing` 或两款模型的单价。哈吉米返回 `GROUP_NOT_ALLOWED`。 |
 | 用量页的合并图表 | GET `/api/v1/usage/dashboard/snapshot-v2` | 日期、时区、`granularity=day`、`include_trend`、`include_model_stats`、`include_group_stats` | `trend`、`models`、`groups` | experimental | 19:36–19:39 | 分组汇总实测有 5 行，历史分组仍可能出现在流水中。当前报表使用单项接口。 |
 | Key 页的批量消费接口 | POST `/api/v1/usage/dashboard/api-keys-usage` | `api_key_ids` | 前端读取 `stats` | blocked | 19:36 静态核对 | 本次授权限 GET，单 Key 已走 GET 汇总和模型接口。 |
 | Key 每日端点 | GET `/api/v1/user/api-keys/{id}/usage/daily` | `days` | 已定位网页客户端定义 | experimental | 19:36 静态核对 | 本次日、模型、Key 组合使用按页读取的用量流水。每日端点的返回契约待实抓验证。 |
-| 公开用量端点 | GET `https://api.beichenapi.com/v1/usage` | 分别用四把 Key 鉴权，传日期区间、`days=7` 和 `timezone=Asia/Shanghai` | `daily_usage[].cost`、`actual_cost`、`requests`，另有 `model_stats` 和 `unit` | experimental | 20:11 实抓 | 三把 Key 的返回汇总各自和按数字 Key ID 校验过的官网逐笔流水一致。哈吉米返回 HTTP 403 `GROUP_NOT_ALLOWED`。成功响应没有返回数字 Key ID，本轮归属以逐笔核验为准。 |
+| 公开用量端点 | GET `https://api.beichenapi.com/v1/usage` | 分别用四把 Key 鉴权，传日期区间、`days=7` 和 `timezone=Asia/Shanghai` | `daily_usage[].cost`、`actual_cost`、`requests`，另有 `model_stats` 和 `unit` | experimental | 20:11 实抓 | 账号级汇总。三把 Key 的返回汇总各自和按数字 Key ID 校验过的官网逐笔流水一致。哈吉米返回 HTTP 403 `GROUP_NOT_ALLOWED`。成功响应没有返回数字 Key ID，单 Key 归属以逐笔核验或 `/api/v1/usage/stats?api_key_id=` 为准。 |
 | 本地网关账本 | PostgreSQL 只读查询 `gateway_calls`、已核实回执与发件时的价格版本 | 北辰供应商、起止日 | 日期、模型、Key、请求、四类 Token、本地金额和缺项 | stable | 19:52 | 隔离 PostgreSQL 已验证同组匹配、单侧记录、待核账、断档和元转换。 |
 | 实际学校账本与官网覆盖率 | 本地对账命令 | 业务库的本机连接及北辰供应商 | `local_reconciliation` | blocked | 19:52 | 当前环境没有提供实际业务库连接。学校实际覆盖率待验证。 |
+
+### 2026-11-21 补充确认
+
+- `GET /api/v1/channels/available` 可稳定取渠道列表和弹层价格，返回 `data.platforms[].groups[]` 与 `data.platforms[].supported_models[].pricing`。本轮先记为 `experimental（待 R 确认）`，待 R 复核后更新为 `stable`。
+- `GET /api/v1/keys` 稳定。分页、Key 数字 ID、名称、状态、分组和倍率字段沿用当前契约。
+- `GET https://api.beichenapi.com/v1/usage` 是账号级汇总，不返回数字 Key ID；单 Key 归属仍以网页逐笔流水或下一项的单 Key 汇总为准。
+- `GET /api/v1/usage/stats` 传 `api_key_id` 可稳定取得单 Key 汇总，账号级与单 Key 的请求、四类 Token、总 Token、标准价和实扣均已实抓核对。
 
 网页的今日和近 7 天预设都会生成 `start_date`/`end_date`。本命令把 `today` 映射为今日，`7d` 映射为今日及前 6 天，`all` 从账号注册日查到今日。总计结果也与仪表盘累计值核对。网页日期选择器的预设清单中无 `all` 字段。[仪表盘网页分包](https://beichenapi.com/assets/DashboardView-D1joLxp7.js)、[用量请求分包](https://beichenapi.com/assets/usage-DjjR1LYa.js)、[日期选择器分包](https://beichenapi.com/assets/TokenUsageTrend.vue_vue_type_script_setup_true_lang-BClGdzAe.js)
 

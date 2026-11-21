@@ -3,10 +3,11 @@ import { computed, onBeforeUnmount, reactive, ref, shallowRef, useId, watch } fr
 import { teacherAPI } from '../api/teacher'
 import { apiErrorMessage } from '../api/client'
 import type { BeichenModel, BeichenModelPriceUpdate, BeichenOverview } from '../api/types'
-import { priceFields, scaledNumber, type SchoolCatalogRow } from '../utils/beichenModels'
+import { manualPriceDetail, priceFields, ratesPriceDetail, scaledNumber, webPriceDetail, type PriceSource, type SchoolCatalogRow } from '../utils/beichenModels'
 import { multiplyDecimal, shiftDecimal } from '../utils/credits'
 import { schoolDay } from '../utils/format'
 import AppDialog from './AppDialog.vue'
+import BeichenPriceDetail from './BeichenPriceDetail.vue'
 
 const props = defineProps<{ open: boolean; providerId: string; row?: SchoolCatalogRow }>()
 const emit = defineEmits<{ 'update:open': [open: boolean]; saved: [] }>()
@@ -80,11 +81,25 @@ const manualPrices = computed(() => priceFields.map(field => {
   const value = rates[field.key].trim() || (field.key.startsWith('cache_') ? '0' : '')
   return { ...field, value: decimalPattern.test(value) ? shiftDecimal(value, 0) : null }
 }))
+const manualDetail = computed(() => manualPriceDetail({
+  input: manualPrices.value.find(field => field.key === 'input')?.value,
+  output: manualPrices.value.find(field => field.key === 'output')?.value,
+  cache_read: manualPrices.value.find(field => field.key === 'cache_read')?.value,
+  cache_write: manualPrices.value.find(field => field.key === 'cache_write')?.value,
+}))
+const priceDatasets = computed(() => new Map((overview.value?.datasets ?? [])
+  .filter(dataset => dataset.kind === 'prices').map(dataset => [dataset.credential_id, dataset])))
 const followPrices = computed(() => affectedKeys.value.map(key => {
   const record = modelPrices.value.get(key.credential_id)
   const upstream = record?.upstream_rates
+  const conditions = record?.price_conditions_exact ?? record?.price_conditions ?? null
+  const derived = record?.price_source === 'derived_from_usage' || record?.price_status === 'derived'
+  const source: PriceSource = derived ? 'derived' : 'website'
+  const observedAt = derived ? record?.price_observed_at ?? null : priceDatasets.value.get(key.credential_id)?.last_success ?? null
   // 已应用渠道倍率的上游报价以百万分之一元返回，再乘 100 换成积分。
-  return { ...key, derived: record?.price_source === 'derived_from_usage',
+  return { ...key, derived, detail: conditions
+      ? webPriceDetail(conditions, null, source, observedAt)
+      : ratesPriceDetail(upstreamCredits(upstream), source, observedAt),
     prices: priceFields.map(field => ({ ...field, value: scaledNumber(upstream?.[field.key], 4) })) }
 }))
 const hasDerived = computed(() => followPrices.value.some(quote => quote.derived) ||
@@ -93,8 +108,21 @@ const followLabel = computed(() => hasDerived.value ? '自动计价' : '跟随�
 const importableQuote = computed(() => followPrices.value.find(({ prices }) =>
   prices.every(field => field.value == null ? field.key.startsWith('cache_') : decimalPattern.test(field.value))))
 const confirmationPrices = computed(() => mode.value === 'manual'
-  ? [{ credential_id: 'manual', label: '', prices: manualPrices.value }]
+  ? [{ credential_id: 'manual', label: '手动价', prices: manualPrices.value, detail: manualDetail.value }]
   : followPrices.value)
+const missingPriceFields = computed(() => {
+  const labels = new Set<string>()
+  const details = mode.value === 'manual' ? [manualDetail.value] : followPrices.value.map(quote => quote.detail)
+  for (const detail of details) for (const row of detail.rows) if (row.missing) labels.add(row.label)
+  return [...labels]
+})
+
+function upstreamCredits(rates: BeichenModel['upstream_rates']) {
+  return {
+    input: scaledNumber(rates?.input, 4), output: scaledNumber(rates?.output, 4),
+    cache_read: scaledNumber(rates?.cache_read, 4), cache_write: scaledNumber(rates?.cache_write, 4),
+  }
+}
 
 watch([() => props.open, () => props.providerId, () => props.row?.model], () => {
   openVersion++
@@ -210,6 +238,15 @@ async function save() {
       </fieldset>
       <p v-if="hasDerived" class="beichen-note">反推价，待核对。自动计价优先采用同分组的正式官网价。反推价的缓存单价待核实。</p>
 
+      <div v-if="mode === 'follow'" class="price-detail-cards">
+        <BeichenPriceDetail v-for="quote in followPrices" :key="quote.credential_id" :detail="quote.detail"
+          :title="quote.label + ' · ' + (quote.derived ? '反推基础价详情' : '官网基础价详情')" />
+      </div>
+      <BeichenPriceDetail v-else :detail="manualDetail" title="手动价详情" />
+      <p v-if="missingPriceFields.length" class="beichen-note price-missing-summary">
+        缺价字段：{{ missingPriceFields.join('、') }}
+      </p>
+
       <template v-if="mode === 'manual'">
         <div class="beichen-toolbar">
           <strong>基础价 · 积分 / 百万 Token</strong>
@@ -232,6 +269,7 @@ async function save() {
             </p>
           </div>
         </div>
+        <p class="beichen-note">手动价保存输入、输出、缓存读取和 5m 缓存写入；缓存写入(1h)按同一缓存写入价计。</p>
       </template>
       <div v-else class="follow-hint">
         <p class="beichen-note">{{ hasDerived ? '基础价随所选报价和渠道倍率更新。使用了无报价的缓存项时，调用进入待核账。' : '基础价随官网报价和渠道倍率更新。缺少可用报价时，调用可能进入待核账。' }}</p>
@@ -271,15 +309,26 @@ async function save() {
         </ul>
         <p v-else-if="scope === 'credentials'" class="beichen-note">请至少选择一个 Key。</p>
         <p class="beichen-note">每个 Key 对应此模型的一行价格。</p>
+        <p class="beichen-note">跟随官网时，下表为已乘渠道倍率的执行价；手动价为学生实价 ×1.10 前的基础价。</p>
         <table v-if="confirmationPrices.length" class="confirmation-rates">
           <caption>基础单价 / 百万 Token（1 元 = 100 积分）</caption>
           <thead><tr><th scope="col">用量项</th><th scope="col">元</th><th scope="col">积分</th></tr></thead>
           <tbody v-for="quote in confirmationPrices" :key="quote.credential_id">
-            <tr v-if="quote.label" class="confirmation-channel"><th colspan="3" scope="rowgroup">{{ quote.label }}<template v-if="'derived' in quote && quote.derived"> · 反推价，待核对</template></th></tr>
+            <tr v-if="quote.label" class="confirmation-channel">
+              <th colspan="3" scope="rowgroup">
+                {{ quote.label }}
+                <span class="status-pill price-source" :data-source="quote.detail.source">{{ quote.detail.sourceLabel }}</span>
+                <small class="price-observed">observed_at {{ quote.detail.observedLabel }}</small>
+              </th>
+            </tr>
+            <tr class="billing-mode-row">
+              <th scope="row">计费模式</th>
+              <td colspan="2">{{ quote.detail.billingModeLabel }}</td>
+            </tr>
             <tr v-for="field in quote.prices" :key="field.key">
               <th scope="row">{{ field.label }}</th>
-              <td>{{ field.value == null ? (mode === 'follow' ? '待核' : '—') : shiftDecimal(field.value, -2) }}</td>
-              <td>{{ field.value == null ? (mode === 'follow' ? '待核' : '—') : field.value }}</td>
+              <td>{{ field.value == null ? (mode === 'follow' ? '缺价' : '—') : shiftDecimal(field.value, -2) }}</td>
+              <td>{{ field.value == null ? (mode === 'follow' ? '缺价' : '—') : field.value }}</td>
             </tr>
           </tbody>
         </table>
@@ -323,6 +372,11 @@ async function save() {
 .price-input input[aria-invalid="true"] { border-color: #b53b55; }
 .optional, .price-hint { color: var(--ink-soft); font-weight: 400; }
 .price-hint { margin: 7px 0 0; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.price-detail-cards { display: grid; gap: 8px; }
+.price-observed { color: var(--ink-soft); font-weight: 400; font-size: 11px; overflow-wrap: anywhere; }
+.price-source { white-space: normal; }
+.price-missing-summary { color: #835615; }
+.billing-mode-row td { color: var(--ink-soft); }
 .scope-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .price-confirmation { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; }
 .price-confirmation h3, .price-confirmation h4 { font-size: 13px; margin: 0; }
