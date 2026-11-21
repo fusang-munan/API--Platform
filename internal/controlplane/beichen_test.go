@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -47,18 +48,26 @@ func TestBeichenRefreshStoresOnlyActualCatalog(t *testing.T) {
 			req.Header.Get("Authorization") != "Bearer synthetic-key" {
 			t.Fatal("unexpected catalog request")
 		}
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"data":[{"id":"gemini-test"},{"id":"other-family"}]}`))}, nil
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"data":[
+			{"id":"gemini-test","supported_protocols":["google_gemini_v1beta"]},
+			{"id":"other-family","supported_protocols":["openai_responses"]}]}`))}, nil
 	})
+	syncedAt := time.Date(2026, 11, 21, 0, 0, 0, 0, time.UTC)
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT p.base_url FROM provider_credentials").WithArgs(key.ID, provider.ID, key.UpdatedAt).
 		WillReturnRows(sqlmock.NewRows([]string{"base_url"}).AddRow(provider.BaseURL))
-	mock.ExpectExec("UPDATE provider_model_catalog").WillReturnResult(sqlmock.NewResult(0, 0))
-	for _, id := range []string{"gemini-test", "other-family"} {
-		mock.ExpectExec("INSERT INTO provider_model_catalog").WithArgs(sqlmock.AnyArg(), provider.ID, key.ID, id,
-			"", "", "", "", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE provider_model_catalog SET status='inactive',synced_at=$1,updated_at=$1 WHERE credential_id=$2")).
+		WithArgs(syncedAt, key.ID).WillReturnResult(sqlmock.NewResult(0, 1))
+	for _, model := range []struct{ id, protocols string }{
+		{"gemini-test", `["google_gemini_v1beta"]`},
+		{"other-family", `["openai_responses"]`},
+	} {
+		raw := `{"id":"` + model.id + `","supported_protocols":` + model.protocols + "}"
+		mock.ExpectExec("INSERT INTO provider_model_catalog.+supported_protocols").WithArgs(sqlmock.AnyArg(), provider.ID, key.ID, model.id,
+			"", "", "", "", "", raw, syncedAt, model.protocols).WillReturnResult(sqlmock.NewResult(0, 1))
 	}
 	mock.ExpectCommit()
-	s := &Service{sqlDB: db, security: manager, now: time.Now}
+	s := &Service{sqlDB: db, security: manager, now: func() time.Time { return syncedAt }}
 	count, err := s.refreshCredentialCatalog(context.Background(), provider, key)
 	if err != nil || count != 2 || calls != 1 {
 		t.Fatalf("refresh got %d models, %d HTTP requests: %v", count, calls, err)

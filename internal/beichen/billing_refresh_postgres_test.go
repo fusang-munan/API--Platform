@@ -3,7 +3,6 @@ package beichen
 import (
 	"database/sql"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -30,7 +29,7 @@ func TestBeichenBillingGroupRefreshPostgres(t *testing.T) {
 	exec("UPDATE provider_credentials SET status='inactive' WHERE id<>$1", key)
 	exec(`INSERT INTO beichen_provision_channels(credential_id,channel,key_fingerprint,discover_ids)
 VALUES($1,'CC1',sha256('cc1-fixture'::bytea),false)`, key)
-	exec(`INSERT INTO beichen_datasets(credential_id,kind,next_attempt) VALUES($1,'usage',now()+interval '1 hour')`, key)
+	exec(`INSERT INTO beichen_datasets(credential_id,kind,next_attempt) VALUES($1,'key_usage',now()+interval '1 hour')`, key)
 	service := New(db, manager)
 	if err := service.ConfigureWebSessionTokens("billing@example.test", bearer, "fixture-web-refresh", time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
@@ -43,10 +42,9 @@ VALUES($1,'CC1',sha256('cc1-fixture'::bytea),false)`, key)
 		t.Fatal(err)
 	}
 
-	var billingReads atomic.Int32
-	group, rate, peak := 15, "0.15", "1"
-	billingStatus, websiteStatus := http.StatusOK, http.StatusOK
-	oldSample := false
+	var directoryReads atomic.Int32
+	group, peak := 15, "1"
+	websiteStatus := http.StatusOK
 	directory, err := os.ReadFile("testdata/billing-group-switch.json")
 	if err != nil {
 		t.Fatal(err)
@@ -55,36 +53,16 @@ VALUES($1,'CC1',sha256('cc1-fixture'::bytea),false)`, key)
 		reply := func(status int, body string) (*http.Response, error) {
 			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
 		}
-		if req.Method == http.MethodGet {
-			token := req.Header.Get("Authorization")
-			if req.URL.String() == panelURL && token == "Bearer "+bearer {
-				return reply(websiteStatus, string(directory))
-			}
-			if req.URL.Host == "api.beichenapi.com" && token == "Bearer "+secret {
-				switch req.URL.Path {
-				case billingPath:
-					billingReads.Add(1)
-					if req.Header.Get("Cache-Control") != "no-cache" {
-						return nil, errors.New("billing request should revalidate cached responses")
-					}
-					observed := time.Now().UTC()
-					if oldSample {
-						observed = observed.Add(-time.Hour)
-					}
-					return reply(billingStatus, fmt.Sprintf(`{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token",
-"group_id":%d,"group_rate_multiplier":%s,"resolved_rate_multiplier":%s,"effective_rate_multiplier":%s,
-"peak_rate_enabled":false,"peak_rate_multiplier":%s,"observed_at":%q}`,
-						group, rate, rate, rate, peak, observed.Format(time.RFC3339Nano)))
-				case modelsPath:
-					names := `{"id":"claude-sonnet-5","supported_protocols":["anthropic"]},{"id":"claude-key-listed"}`
-					if group == 15 {
-						names += `,{"id":"claude-opus-5"}`
-					}
-					return reply(http.StatusOK, `{"data":[`+names+`]}`)
-				case usagePath:
-					return reply(http.StatusOK, fmt.Sprintf(`{"mode":"unrestricted","date":%q,"timezone":"Asia/Shanghai","model_stats":[]}`,
-						req.URL.Query().Get("start_date")))
-				}
+		if req.Method == http.MethodGet && req.URL.Host == publicKeyHost && req.Header.Get("Authorization") == "Bearer "+bearer {
+			switch req.URL.Path {
+			case "/api/v1/keys":
+				return reply(http.StatusOK, websiteKeyListFixture(secret, "CC1", 41, group))
+			case "/api/v1/channels/available":
+				directoryReads.Add(1)
+				body := strings.ReplaceAll(string(directory), `"peak_rate_enabled": false`, `"peak_rate_enabled": false, "peak_rate_multiplier": `+peak)
+				return reply(websiteStatus, body)
+			case "/api/v1/usage":
+				return reply(http.StatusOK, emptyWebsiteUsageFixture)
 			}
 		}
 		t.Errorf("unexpected fixture request: %s %s", req.Method, req.URL.Path)
@@ -136,6 +114,9 @@ VALUES($1,'CC1',sha256('cc1-fixture'::bytea),false)`, key)
 	}
 	billing(overview(), "current", "0.15", 15)
 	oldVersion := multiplierVersion(1)
+	if directoryReads.Load() != 2 {
+		t.Fatal("automatic sync must refresh both the provider directory and the selected Key's group")
+	}
 
 	org, project, student, studentKey, schoolModel := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	exec("INSERT INTO organizations(id,name,created_at,updated_at) VALUES($1,'Fixture Org',now(),now())", org)
@@ -177,12 +158,12 @@ VALUES(gen_random_uuid(),$1,$2,$3,$4,'anthropic','active',10,now(),now())`, scho
 	}
 	oldCall, oldRoute := dispatch()
 
-	group, rate = 60, "0.6"
+	group = 60
 	if err := service.SyncCredential(ctx, provider, key); err != nil {
 		t.Fatal(err)
 	}
-	if billingReads.Load() != 2 {
-		t.Fatal("automatic and manual sync must each fetch the Key billing information")
+	if directoryReads.Load() != 4 {
+		t.Fatal("manual sync must read the selected group's price and Key capability")
 	}
 	view := overview()
 	current := billing(view, "current", "0.6", 60)
@@ -196,7 +177,7 @@ VALUES(gen_random_uuid(),$1,$2,$3,$4,'anthropic','active',10,now(),now())`, scho
 	for name, reason := range map[string]string{"claude-opus-5": "model_outside_key_group", "claude-key-listed": "price_outside_key_group"} {
 		row := findModel(view, name)
 		if len(row.CatalogKeys) != 1 || row.CatalogKeys[0].GroupID == nil || *row.CatalogKeys[0].GroupID != 60 ||
-			row.CatalogKeys[0].GroupDiagnosis != reason || len(row.WebsiteLocations) != 1 ||
+			row.CatalogKeys[0].GroupDiagnosis != reason || len(row.WebsiteLocations) == 0 ||
 			len(row.WebsiteLocations[0].Groups) != 1 || row.WebsiteLocations[0].Groups[0].ID != 15 ||
 			row.WebsiteLocations[0].Groups[0].Rate == nil || row.WebsiteLocations[0].Groups[0].Rate.String() != "0.15" ||
 			row.WebsiteLocations[0].PriceConditionsExact["input_price"] == nil {
@@ -229,34 +210,25 @@ beichen_multiplier_version,beichen_state FROM gateway_calls WHERE id=$1`, call.C
 		t.Fatal(err)
 	}
 	multiplierVersion(2)
-	peak, websiteStatus = "0.8", http.StatusServiceUnavailable
-	if err := service.SyncCredential(ctx, provider, key); err == nil {
-		t.Fatal("a failed website read should be reported")
+	peak = "0.8"
+	if err := service.SyncCredential(ctx, provider, key); err != nil {
+		t.Fatal(err)
 	}
 	multiplierVersion(3)
 	current = billing(overview(), "current", "0.6", 60)
 	if current.PeakRate == nil || *current.PeakRate != "0.8" {
-		t.Fatal("a peak rule change with the same effective multiplier must be saved even when website pricing fails")
+		t.Fatal("a peak rule change with the same effective multiplier must be saved")
+	}
+	websiteStatus = http.StatusServiceUnavailable
+	for range 3 {
+		if err := service.SyncCredential(ctx, provider, key); err == nil {
+			t.Fatal("failed website billing read should be reported")
+		}
 	}
 	var oldPriceUsable bool
 	if err := db.QueryRowContext(ctx, `SELECT upstream_input IS NOT NULL FROM beichen_price_at($1,$2,statement_timestamp())`, key, model).
 		Scan(&oldPriceUsable); err != nil || oldPriceUsable {
 		t.Fatalf("old quote remained usable after the multiplier rule changed: %v", err)
-	}
-	websiteStatus = http.StatusOK
-	if err := service.SyncCredential(ctx, provider, key); err != nil {
-		t.Fatal(err)
-	}
-	current = billing(overview(), "current", "0.6", 60)
-	oldSample = true
-	if err := service.SyncCredential(ctx, provider, key); err == nil {
-		t.Fatal("an outdated success response should not renew billing freshness")
-	}
-	oldSample, billingStatus = false, http.StatusServiceUnavailable
-	for range 2 {
-		if err := service.SyncCredential(ctx, provider, key); err == nil {
-			t.Fatal("failed billing read should be reported")
-		}
 	}
 	stale := billing(overview(), "stale", "0.6", 60)
 	if !stale.LastSuccess.Equal(*current.LastSuccess) || !stale.ObservedAt.Equal(*current.ObservedAt) ||
@@ -272,7 +244,7 @@ beichen_multiplier_version,beichen_state FROM gateway_calls WHERE id=$1`, call.C
 		Scan(&state, &debit); err != nil || state != "pending_review" || debit.Valid {
 		t.Fatalf("stale price used for a new call: %s %+v (%v)", state, debit, err)
 	}
-	billingStatus = http.StatusOK
+	websiteStatus = http.StatusOK
 	if err := service.SyncCredential(ctx, provider, key); err != nil {
 		t.Fatal(err)
 	}

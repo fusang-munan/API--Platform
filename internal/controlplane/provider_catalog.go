@@ -421,6 +421,21 @@ func (s *Service) fetchAndStoreCredentialCatalogEntries(
 	syncedAt time.Time,
 	syncer *catalog.ProviderCatalogSyncer,
 ) (int, []catalog.ProviderEntry, error) {
+	isBeichen := catalog.IsBeichenBaseURL(providerRow.BaseURL)
+	if isBeichen && s.beichen != nil {
+		if err := s.beichen.RescanWebsiteCatalog(ctx, providerRow.ID, credentialRow.ID); err != nil {
+			return 0, nil, err
+		}
+		count, err := s.db.ProviderModelCatalog.Query().Where(
+			providermodelcatalog.ProviderIDEQ(providerRow.ID),
+			providermodelcatalog.CredentialIDEQ(credentialRow.ID),
+			providermodelcatalog.StatusEQ(providermodelcatalog.StatusActive),
+		).Count(ctx)
+		if err != nil {
+			return 0, nil, domain.WrapError(domain.CodeDependencyUnavailable, "读取已确认的北辰分组目录失败", err)
+		}
+		return count, nil, nil
+	}
 	plain, decryptErr := s.security.DecryptCredential(credentialRow.CredentialCiphertext)
 	if decryptErr != nil {
 		return 0, nil, domain.NewError(domain.CodeValidation, "provider credential is unavailable")
@@ -436,7 +451,7 @@ func (s *Service) fetchAndStoreCredentialCatalogEntries(
 	}
 	entries = catalog.FilterProviderEntriesByCredential(credentialRow.Label, credentialRow.GroupHint, providerRow.BaseURL, entries)
 	var revision *time.Time
-	if catalog.IsBeichenBaseURL(providerRow.BaseURL) {
+	if isBeichen {
 		revision = &credentialRow.UpdatedAt
 	}
 	count, upsertErr := syncer.UpsertCredentialEntries(ctx, providerRow.ID, credentialRow.ID, entries, syncedAt, revision)

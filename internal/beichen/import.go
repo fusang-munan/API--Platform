@@ -125,8 +125,12 @@ func (s *Service) saveImportedUsage(ctx context.Context, tx *sql.Tx, providerID,
 		var confirmed bool
 		err = tx.QueryRowContext(ctx, `
 SELECT EXISTS (
-  SELECT 1 FROM beichen_usage_days
-  WHERE provider_id = $1 AND credential_id = $2 AND day = $3::text::date
+  SELECT 1 FROM beichen_key_usage_days d JOIN provider_credentials c ON c.id=d.credential_id
+  JOIN beichen_key_observations o ON o.credential_id=d.credential_id AND o.key_digest=d.key_digest
+    AND o.website_key_id=d.website_key_id
+  WHERE c.provider_id = $1 AND d.credential_id = $2 AND d.day = $3::text::date
+    AND d.key_digest=sha256(c.credential_ciphertext)
+    AND d.fetched_at >= (d.day+1)::timestamp AT TIME ZONE 'Asia/Shanghai'
 )`, providerID, credentialID, day).Scan(&confirmed)
 		if err != nil {
 			return err
@@ -243,7 +247,7 @@ SET requests = EXCLUDED.requests, input_tokens = EXCLUDED.input_tokens, output_t
   updated_at = clock_timestamp()
 WHERE EXCLUDED.source = 'csv'
    OR EXCLUDED.source = beichen_daily_usage.source
-   OR (EXCLUDED.source = 'usage' AND beichen_daily_usage.source = 'export')
+   OR (EXCLUDED.source = 'export' AND beichen_daily_usage.source = 'usage')
 `, providerID, credentialID, row.date, row.model, row.requests, row.input, row.output, row.cacheRead, row.cacheWrite, row.billed, source, actor)
 	return err
 }

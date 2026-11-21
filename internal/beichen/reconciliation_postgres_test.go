@@ -3,7 +3,6 @@ package beichen
 import (
 	"context"
 	"database/sql"
-	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -11,21 +10,67 @@ import (
 	"github.com/google/uuid"
 )
 
+const reportImportActor = "00000000-0000-4000-8000-000000000099"
+
 func reconciliationTestTransaction(t *testing.T) (context.Context, *sql.Tx) {
 	t.Helper()
 	ctx, tx := reportTestTransaction(t)
 	execTestSQL(t, ctx, tx, `
 ALTER TABLE providers ADD COLUMN status text;
-ALTER TABLE provider_credentials ADD COLUMN status text, ADD COLUMN updated_at timestamptz;
+ALTER TABLE provider_credentials ADD COLUMN status text, ADD COLUMN updated_at timestamptz, ADD COLUMN credential_ciphertext bytea;
 ALTER TABLE gateway_calls ADD COLUMN id uuid PRIMARY KEY DEFAULT gen_random_uuid();`)
-	for _, name := range []string{"0034_beichen_panel_access.sql", "0035_beichen_receipts.sql", "0044_beichen_conditional_billing.sql", "0046_beichen_billing_checks_and_aliases.sql"} {
-		migration, err := os.ReadFile("../infrastructure/db/migrations/" + name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		execTestSQL(t, ctx, tx, string(migration))
-	}
+	applyBeichenTestMigrations(t, ctx, tx, "0031_beichen_usage_export.sql", "0033_beichen_panel_prices.sql",
+		"0034_beichen_panel_access.sql", "0035_beichen_receipts.sql", "0041_beichen_upstream_usage.sql",
+		"0044_beichen_conditional_billing.sql", "0046_beichen_billing_checks_and_aliases.sql",
+		"0050_beichen_crawl_runs.sql", "0052_beichen_key_usage.sql", "0054_beichen_key_website_evidence.sql")
+	execTestSQL(t, ctx, tx, "INSERT INTO users(id) VALUES($1)", reportImportActor)
 	return ctx, tx
+}
+
+func TestReconciliationUsesVerifiedArchiveWithoutRecentSnapshot(t *testing.T) {
+	ctx, tx := reconciliationTestTransaction(t)
+	provider, credential := uuid.New(), uuid.New()
+	execTestSQL(t, ctx, tx, "INSERT INTO providers VALUES($1,$2,'active')", provider, origin)
+	execTestSQL(t, ctx, tx, `
+INSERT INTO provider_credentials(id,provider_id,label,created_at,status,updated_at)
+VALUES($1,$2,'已换下的 Key','2026-11-07 00:00+08','inactive','2026-11-10 00:00+08')`, credential, provider)
+	execTestSQL(t, ctx, tx, `
+INSERT INTO beichen_usage_checkpoints(credential_id,revision,upstream_key_id,upstream_user_id,caught_up,last_success)
+VALUES($1,'2026-11-07 00:00+08',41,13,true,'2026-11-09 00:00+08')`, credential)
+	execTestSQL(t, ctx, tx, `
+INSERT INTO beichen_upstream_usage_rows(upstream_user_id,row_id,upstream_key_id,provider_id,credential_id,channel,model,
+ occurred_at,actual_cost,currency,billing_type,cost_details,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens)
+VALUES (13,1,41,$1,$2,'CC1','archived','2026-11-08 23:59:59+08',0.25,'CNY',0,'{}',9,1,0,0),
+       (13,2,41,$1,$2,'CC1','after-cutoff','2026-11-09 00:00:01+08',9,'CNY',0,'{}',9,1,0,0),
+       (13,3,99,$1,$2,'CC1','different-key','2026-11-08 12:00+08',9,'CNY',0,'{}',9,1,0,0),
+       (45,4,41,$1,$2,'CC1','different-account','2026-11-08 12:00+08',9,'CNY',0,'{}',9,1,0,0)`, provider, credential)
+	now := time.Date(2026, 11, 21, 0, 0, 0, 0, beijing)
+	period, _ := reportPeriod("all", now)
+	report, err := readReconciliation(ctx, tx, provider, period, now)
+	if err != nil || len(report.Models) != 1 || report.Models[0].Model != "archived" ||
+		report.Totals.Upstream.Requests != 1 || report.Totals.Upstream.Tokens != 10 ||
+		reportDecimal(report.Totals.Money.ActualYuan) != "0.25" || report.Coverage.SyncedDays != 1 {
+		t.Fatalf("closed archived day was omitted or counted with unverified rows: %+v, %v", report, err)
+	}
+	checkUsageSource(t, report.Totals.Upstream.Source, "website_receipts")
+
+	start, _ := dayStart("2026-11-08")
+	var overview Overview
+	if err := readComparison(ctx, tx, provider, start, now, &overview); err != nil || len(overview.Comparison) != 1 {
+		t.Fatalf("daily report missed the verified archive: %+v, %v", overview.Comparison, err)
+	}
+	checkCount(t, overview.Comparison[0].BilledUpstreamMicros, 250000)
+	checkUsageSource(t, overview.Comparison[0].UpstreamUsageSource, "usage")
+
+	execTestSQL(t, ctx, tx, `
+INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,billed_upstream_micros,source,actor_id)
+VALUES($1,$2,'2026-11-08','corrected',1,300000,'csv',$3)`, provider, credential, reportImportActor)
+	report, err = readReconciliation(ctx, tx, provider, period, now)
+	if err != nil || len(report.Models) != 1 || report.Models[0].Model != "corrected" ||
+		reportDecimal(report.Totals.Money.ActualYuan) != "0.3" || report.Coverage.SyncedDays != 1 {
+		t.Fatalf("manual correction did not replace the archive or retain complete-day evidence: %+v, %v", report, err)
+	}
+	checkUsageSource(t, report.Totals.Upstream.Source, "csv")
 }
 
 func TestCatalogQualityAliasAggregationPostgres(t *testing.T) {
@@ -48,9 +93,9 @@ func TestCatalogQualityAliasAggregationPostgres(t *testing.T) {
 	execTestSQL(t, ctx, tx, `INSERT INTO beichen_price_versions (credential_id,model,track,basis,source,effective_at,input_rate,output_rate,cache_read_rate,cache_write_rate)
 VALUES ($1,'historical','upstream','effective','billing','2026-01-01',1000000,2000000,0,0),
 ($1,'Current','upstream','effective','billing','2026-01-01',1000000,2000000,0,0)`, first)
-	execTestSQL(t, ctx, tx, `INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros,source)
-VALUES($1,$2,'2026-11-20','historical',2,20,2,0,0,30,'usage'),($1,$2,'2026-11-20','current',1,20,2,0,0,NULL,'usage'),
-($1,$3,'2026-11-20','historical',1,10,1,0,0,10,'usage'),($1,$3,'2026-11-20','untouched',1,10,1,0,0,0,'usage')`, provider, first, second)
+	execTestSQL(t, ctx, tx, `INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros,source,actor_id)
+VALUES($1,$2,'2026-11-20','historical',2,20,2,0,0,30,'csv',$4),($1,$2,'2026-11-20','current',1,20,2,0,0,NULL,'csv',$4),
+($1,$3,'2026-11-20','historical',1,10,1,0,0,10,'csv',$4),($1,$3,'2026-11-20','untouched',1,10,1,0,0,0,'csv',$4)`, provider, first, second, reportImportActor)
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, beijing)
 	period, _ := reportPeriod("day", now)
 	baseline, err := readReconciliation(ctx, tx, provider, period, now)
@@ -88,7 +133,7 @@ VALUES ($1,$2,'HISTORICAL','school-specific',$3),($1,$2,'current','school-specif
 	}
 	daily := Overview{}
 	start, _ := dayStart("2026-11-20")
-	if err := readComparison(ctx, tx, provider, start, &daily); err != nil {
+	if err := readComparison(ctx, tx, provider, start, now, &daily); err != nil {
 		t.Fatal(err)
 	}
 	if len(daily.Comparison) != 3 {
@@ -128,12 +173,12 @@ func TestReconciliationPostgresStudentAndSchoolChargesAndTokenCompleteness(t *te
 	insertReportCall(t, ctx, tx, call)
 	call.model, call.credential, call.usage = "no-tokens", third, "missing"
 	insertReportCall(t, ctx, tx, call)
-	execTestSQL(t, ctx, tx, `INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros,source)
- VALUES($1,$2,'2026-11-20','zero-tokens',1,0,0,0,0,10,'usage'),
- ($1,$3,'2026-11-20','zero-tokens',1,0,0,0,0,20,'usage'),
- ($1,$3,'2026-11-20','partial-local',2,10,0,0,0,0,'usage'),
- ($1,$3,'2026-11-20','partial-upstream',1,0,0,NULL,0,0,'usage'),
- ($1,$4,'2026-11-20','no-tokens',1,NULL,NULL,NULL,NULL,0,'usage')`, provider, first, second, third)
+	execTestSQL(t, ctx, tx, `INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros,source,actor_id)
+ VALUES($1,$2,'2026-11-20','zero-tokens',1,0,0,0,0,10,'csv',$5),
+ ($1,$3,'2026-11-20','zero-tokens',1,0,0,0,0,20,'csv',$5),
+ ($1,$3,'2026-11-20','partial-local',2,10,0,0,0,0,'csv',$5),
+ ($1,$3,'2026-11-20','partial-upstream',1,0,0,NULL,0,0,'csv',$5),
+ ($1,$4,'2026-11-20','no-tokens',1,NULL,NULL,NULL,NULL,0,'csv',$5)`, provider, first, second, third, reportImportActor)
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, beijing)
 	period, _ := reportPeriod("day", now)
 	view, err := readReconciliation(ctx, tx, provider, period, now)

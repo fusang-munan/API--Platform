@@ -396,12 +396,21 @@ data: {"revision":"01K2..."}
 | 北辰调用对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/reconciliation/calls?day=YYYY-MM-DD&cursor=…` | 按北京时间分页查看本地调用、缺失字段及已验证回执 |
 | 北辰逐笔对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/receipts?day=YYYY-MM-DD&cursor=…` | 教师按北京时间分页查看学校已归档的北辰流水及关联的校内扣分 |
 | 北辰手动同步 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/sync` | 执行一次有时限的同步，页面按数据类别显示各自结果 |
+| 北辰 Key 网页核对 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/key-usage` | 读取已确认的官网分组和该 Key 的网页流水，可同时记录页面的目标倍率 |
 | 北辰手动探活 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/probes` | 接受空请求体或 `{}`，排队后返回 202 |
 | 北辰最近探活 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/probes` | 查询任务进度和最多 100 个最近的 Key、模型、协议结果 |
 | 启用北辰已发现模型 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/models/enable` | 教师提交 `model`，如已有校内别名可另传 `school_model`。学校复核当前目录和路由后，使模型可供学生申请或调用。 |
 | 批量启用北辰模型 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/models/enable-batch` | 教师提交当前筛选出的 1 至 200 个模型，分别返回启用或跳过结果 |
 | 按模型统一定价 | PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/models/price` | 为同一模型的全部目录渠道设置教师价或恢复官网价 |
 | 北辰采价授权 | GET / PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/access/{credential_id}` | 读取配置状态，设置、轮换或停用该凭据的面板读取授权 |
+| 北辰网页登录状态 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/account` | 查看保存在该供应商下的网页账号及最近抓取摘要 |
+| 北辰官网 Key 清单 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/keys` | 读取上次保存的官网 Key 清单和同步状态 |
+| 刷新北辰官网 Key | POST | `/api/v1/teacher/providers/{provider_id}/beichen/keys/refresh` | 用已配置的网页会话更新同一清单，返回更新结果 |
+| 保存北辰网页登录 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/account/login` | 提交账号密码或网页 Token |
+| 验证北辰网页会话 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/account/verify` | 在线检查会话状态，必要时续期密码模式的会话 |
+| 生成旧版北辰本机授权 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/account/export` | 供既有脚本使用，提交 `{"confirm":true}` 后返回 `beichen-session.env` |
+| 清除北辰网页登录 | DELETE | `/api/v1/teacher/providers/{provider_id}/beichen/account` | 清除已保存凭证并尝试退出上游会话 |
+| 抓取北辰官网目录 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/crawl` | 手动更新官网目录，返回本轮抓取摘要 |
 | 北辰校内试算价 | PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/price` | 指定模型手动设价或恢复跟随 |
 | 北辰报价或账单导入 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/import` | 按凭据导入受支持的 CSV |
 | Key 终审 | GET | `/api/v1/teacher/api-key-reviews` | 只列出 `pending_teacher` 摘要 |
@@ -469,7 +478,13 @@ data: {"revision":"01K2..."}
 
 维护用的 `beichen/access/{credential_id}` 可读该凭据的同步状态、分组与北辰 Key 数字 ID。学校自动部署通过官网普通账号建立这些关联。旧版专用读取凭据的接口保留兼容。
 
-自动同步和按供应商的手动同步独立刷新完整官网目录，并按 Key 读取模型清单与账单倍率。教师模型页的「用指定 Key 重扫」向同步接口提交 `credential_id`，同步该 Key 的账单、目录、报价和近期用量。`/beichen/catalog/rescan` 保留为单独读取 `/v1/models` 的维护接口。学校预配渠道用学校网页会话读取价表。账单提供分组 ID 时使用该 ID，省略时从账号内的 Key 记录核实当前分组，固定配置的渠道同样需要核实。如果已核实分组内的官网名和 Key 名只有明确的拼写差异，且能双向唯一匹配，报价按 Key 的原名保存。手动同步遇到官网目录或采价失败会返回同步未完成。成功保存的结果可在概览查询，价表错误记录在 `datasets`。
+北辰网页登录接口使用教师身份和标准响应封装。提交凭证使用可信 HTTPS 入口，JSON 请求体为 `{"mode":"password","email":"…","password":"…"}` 或 `{"mode":"token","token":"…"}`。账号状态返回 `configured`、`mode`、`email`、`status`、`expires_at`、`last_verified_at`、`last_error`、`failure_count` 和 `crawl`。密码及访问、续期凭证只用于上游请求。状态为 `active`、`expired`、`error` 或 `none`。没有可用数据的时间和错误字段为 `null`。
+
+登录和验证如已写入业务失败状态，仍返回该账号状态对象，中文原因在 `last_error` 中。Token 模式提交后可用「验证」检查当前访问权限。`crawl` 包含 `last_run_at`、`platforms`、`models`、`failures`。后面三项为计数，尚未抓取时均为 `null`。有失败项时，`failure_details` 包含渠道、平台、字段位置和失败原因。手动抓取返回本轮摘要。参数错误返回 `400`，供应商不存在返回 `404`，已有抓取正在运行时返回 `409`，上游或数据库不可用时返回带中文原因的错误。
+
+本机窗口的 HTTP 服务仅监听 `127.0.0.1` 的随机端口。浏览器通过同源 WebSocket 完成登录、刷新、测试抓取和关闭，连接和后续操作各使用一次性随机校验值。已部署的旧版脚本可继续向 `POST /api/v1/beichen/local-session/{provider_id}` 提交学校本机授权以读取短期北辰访问 Token。只有有效授权、启用的供应商和仍在职的授权教师才能使用该接口。再次生成授权或替换、清除网页登录配置会撤销旧授权。
+
+自动同步和按供应商的手动同步独立刷新完整官网目录，从登录后的 Key 清单核实分组，再读取该分组的模型、报价和倍率规则。教师模型页的「用指定 Key 重扫」向同步接口提交 `credential_id`，同步该 Key 的账单、目录、报价和近期用量。`/beichen/catalog/rescan` 为单独读取 `/v1/models` 的维护接口，只刷新该 Key 的模型清单。学校预配渠道优先使用学校网页会话，网站提前拒绝会话时自动续期后重试一次。手动同步遇到官网目录或采价失败会返回同步未完成。成功保存的结果可在概览查询，价表错误记录在 `datasets`。教师换 Key 进度中的 `sync.usage` 对应单 Key 网页用量同步。
 
 `datasets` 的 `billing` 条目包含 `billing_state` 和 `effective_multiplier`。有对应记录时还包含保留小数精度的 `effective_multiplier_text`、`group_id`、`group_rate`、`peak_enabled`、`peak_rate` 和倍率版本的 `observed_at`。`current` 表示最近一次读取已确认，`stale` 保留上次倍率和 `last_success`，`unverified` 表示还没有可用依据。连续失败记录在 `failure_count`，最多记到六次，达到三次时 `alert` 为真。
 
@@ -486,6 +501,14 @@ data: {"revision":"01K2..."}
 逐笔对账的 `day` 默认为北京时间当天。第一页省略 `cursor`，后续传入上页的 `data.next_cursor`，保持同一供应商和日期。每页最多 50 行，以流水发生时间倒序排列。最后一页的游标为 `null`。游标错用到其他账日或供应商、游标内容错误及日期格式错误均返回 400。每行含 `occurred_at`、`model`、`matched`、`student_name`、`base_credits`、`school_multiplier`、`charged_credits`、`actual_cost` 和 `difference_credits`。金额和积分用十进制字符串表示。缺少依据的字段返回 `null`，确认零金额返回 `"0"`。差额等于学校已扣积分减去北辰原始实扣乘 100。此查询只读取学校的账本。
 
 按凭据的旧价格请求包含 `credential_id`、`model`、`mode`。设置 `manual` 时同时提供 `rates`，其中 `input`、`output` 必填，`cache_read`、`cache_write` 可空，四项均以百万分之一校内积分/百万 Token 表示。恢复 `follow` 时省略 `rates`。教师页按模型统一定价使用下面的新接口，其请求直接使用积分十进制字符串，不能混用单位。新调用的教师基础价参与正式扣费，再应用请求发出时保存的学校系数；已入账调用保持原金额。
+
+#### 北辰官网 Key 清单
+
+清单和刷新接口要求教师登录。GET 只读取学校数据库。POST 使用已配置的网页会话读取北辰 `GET /api/v1/keys?page=1&page_size=100` 并检查分页完整性。密钥页仅给出分组 ID 或分组明细不全时，由 `GET /api/v1/channels/available` 按同一个 ID 补全。
+
+`data.status` 为 `unsynced`、`current`、`stale`、`session_expired` 或 `unavailable`。成功时 `last_seen` 更新为读取时间。北辰返回 401 或会话已知过期时返回 `session_expired`，保留最近成功的清单及时间。已保存的清单超过 30 分钟未更新时显示 `stale`。并发刷新返回 `invalid_transition`。
+
+`data.keys` 的每一项包含北辰 `id`、`name`、脱敏后的 `key_prefix`、`group_id`、`group_name`、分组倍率 `rate`、`status`、`enabled`、`created_at`、`last_seen`、匹配的学校 `credential_id` 和 `match_status`。倍率用十进制字符串传输，未知字段为 `null`。匹配状态为 `matched`、`unmatched` 或 `ambiguous`。
 
 ### 7.1 北辰批量启用与按模型定价
 
@@ -544,24 +567,32 @@ data: {"revision":"01K2..."}
 | 对账字段 | 内容 |
 | --- | --- |
 | `totals.local` | `requests`、`credits`、`pending_calls`、`tokens` 及四项 Token 拆分、可空 `estimated_micros`（本地按调用时有效上游价加权估算的微元） |
-| `totals.upstream` | `requests`、`tokens` 及四项 Token 拆分、可空 `billed_micros`；`source` 是按字母排序去重后的日账来源，多个来源以逗号连接，无日账时为空 |
+| `totals.upstream` | `requests`、`tokens` 及四项 Token 拆分。`actual_cost` 是精确实扣字符串，`unit` 为已知的上游原单位，`billed_micros` 兼容旧日账。`source` 是按字母排序去重的来源，多个来源以逗号连接。`mixed_units` 为真时按 `amounts_by_unit` 分别返回各单位金额。`stale` 标示所用金额含陈旧观测。 |
 | `totals.money` | `student_yuan`、`base_yuan` 为十进制字符串；`actual_yuan`、`margin_yuan`、`margin_rate` 为十进制字符串或 `null` |
 | `models[]` | `model`、`local`、`upstream`、上述五个金额字段、`local_share` / `upstream_share`，按模型名排序 |
 | `keys[]` | 按供应商凭据聚合的 `credential_id`、`label`、`local`、`upstream`、金额、占比；不是学生的学校 API Key，已删除渠道的标签可空，历史账单仍保留 |
 | `models[].match_status` / `keys[].match_status` | `matched`、`local_only`、`upstream_only`，表示该分组两侧是否有记录，不表示逐笔账单已全部核对成功 |
-| `coverage` | `days_expected`、`days_present`（按“渠道 × 账日”计数）、去重 `missing_days` 日期数组、`pending_calls`、`unpriced_calls`、`multiplier_mixed`，以及逐渠道 `credentials[]` 覆盖明细 |
+| `coverage` | `days_expected`、`days_present`（按“渠道 × 账日”计数）、去重 `missing_days` 日期数组和逐渠道 `credentials[]`。`key_usage_days`、`key_usage_model_days`、`stale_key_usage_days` 分别记录使用网页 Key 账日数、附有已核对模型实付的账日数、沿用陈旧快照的账日数。另含 `pending_calls`、`unpriced_calls` 和 `multiplier_mixed`。 |
 
-本地侧与学校用量使用同一归属和 Token 口径。上游侧来自 `beichen_daily_usage`，以北京时间 `day` 筛选后独立聚合，再按模型 FULL JOIN；只在一侧存在的模型不会被丢弃。同名模型跨渠道先各自汇总，避免重复累计扣分。上游没有记录，或任一日账的 `billed_upstream_micros` 缺失时，该聚合组的 `billed_micros`、`actual_yuan`、`margin_yuan`、`margin_rate` 全部为 JSON `null`，总计、模型和渠道均遵循此规则，不能把部分成本当完整实扣；明确为零的实扣仍返回 `"0"`。Token 只汇总已知分项，还须结合覆盖状态与单侧记录判断差额。`estimated_micros` 无完整报价或用量时为 `null`，不伪造估算。
+本地侧与学校用量使用同一归属和 Token 口径。每个渠道账日依次选用人工导入、确认完整的长期归档流水和官网单 Key 快照，归档标记 `website_receipts`，近期快照标记 `key_usage`。历史归档可独立确认账日，核对范围包括已停用渠道。账日是否完整取决于官网核对结果。日和模型实付均汇总网页流水的 `actual_cost`。明确回报的零提供 `"0"`，缺失金额或混合单位的总金额为 `null`。按模型和按渠道分别合并两侧，保留仅一侧存在的记录。`estimated_micros` 需要完整报价和用量。
 
-金额按 **100 积分 = 1 元** 换算：`student_yuan = 已扣积分 × 0.01`；`base_yuan` 使用保存的基础积分，缺少时用已扣积分除以该笔学校系数（历史缺失系数按 1）；`actual_yuan = 已确认完整的北辰 billed_upstream_micros 总和 × 0.000001`；`margin_yuan = student_yuan - actual_yuan`；`margin_rate = margin_yuan / student_yuan`。实扣已知且学生已扣为零时比率为 `"0"`，实扣未知时比率为 `null`。`local_share` / `upstream_share` 分别是模型或渠道 Token 占对应侧总 Token 的 0 至 1 十进制字符串，总 Token 为零时为 `"0"`。
+学校金额按 **100 积分 = 1 元** 换算。`student_yuan` 取已扣积分乘 0.01，`base_yuan` 取保存的基础积分或按该笔学校系数反推后的折算值。`actual_yuan` 适用于同为 CNY 的上游金额或沿用旧日账口径的数据。金额差额需要完整日账、同一金额单位及未陈旧的实扣。USD 等原单位通过 `unit` 返回，`actual_yuan`、`margin_yuan`、`margin_rate` 为空。`local_share` / `upstream_share` 分别是模型或渠道 Token 占对应侧总 Token 的 0 至 1 十进制字符串，总 Token 为零时为 `"0"`。
 
 覆盖范围从每条当前供应商凭据的北京时间创建日与所选区间起点较晚者开始，截止到区间结束或北京时间今天（包含今天）较早者；尚未开始的未来账日不算缺失。`beichen_usage_days` 中明确确认的空账日也算已同步。`missing_days` 按日期排序且去重，`credentials[]` 给出各渠道的 `credential_id`、`label`、`expected_days`、`synced_days`、`missing_days`，可定位同一天缺哪条渠道。`unpriced_calls` 是已扣款但未保存基础积分的调用数，`multiplier_mixed` 表示范围内出现过不同学校系数。尚未整日确认的今天可能显示缺失，日账覆盖不等同于分钟级流水扫描进度。
+
+#### Key 网页核对
+
+`POST .../beichen/key-usage` 使用教师身份，要求启用的 `credential_id`。可提交 `{"credential_id":"渠道 UUID","target_multiplier":"0.6","expect_claude":true}`。两个目标字段均可省略，空倍率字符串可清除目标倍率。成功返回 `{"synced":true}`。并发核对同一 Key 时返回状态冲突。网页读取失败返回 503，本次已验证的分组或已读完的账日仍可保存。
+
+北辰网页请求使用会话 Token。先用 `GET /api/v1/keys` 确认 `id`、`user_id` 和 `group_id`，再用 `GET /api/v1/channels/available` 读取该组型号、价格和 `rate_multiplier`。用量使用 `GET /api/v1/usage`，传 `api_key_id`、同一天的 `start_date` 和 `end_date`、`timezone=Asia/Shanghai`、分页参数和 ID 升序。每笔必须匹配账号、Key 和日期。`total_cost` 可作为网页原价字段，实付取 `actual_cost`。教师概览的 `key_capabilities[]` 包含 `website_key_id` 和 `website_group`，后者附分组 ID、名称和倍率。空字段为 `null`。
+
+`GET .../beichen?day=YYYY-MM-DD` 响应的 `key_capabilities[]` 按渠道提供 `models`、`has_claude`、`balance`、`unit` 和模型、用量各自的状态、时间与错误。`daily_usage` 为所选北京时间日期的数据。`model_stats` 给出模型分项，模型日期未确认时 `model_stats_day` 为空。`observed_multiplier` 等于 `actual_cost/cost`，原价缺失或为零时留空。`multiplier_diff` 表示相对 `stored_multiplier` 的偏差严格超过 5%。金额和倍率以十进制字符串返回。`group_check` 为 `old_group`、`mismatch`、`target_observed` 或 `pending`。
 
 导入请求包含 `credential_id`、`kind`、`csv`。报价表头为 `model,input,output,cache_read,cache_write`，价格为每百万 Token 的百万分之一北辰余额单位。用 `prices` 导入已应用倍率的最终报价，用 `prices_base` 导入需乘北辰倍率的已确认基础报价。日用量 `usage` 表头为 `date,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billed_upstream_micros`，日期为北京时间，缓存和实际扣款留空表示缺失。
 
 `usage_export` 接受北辰用量页的逐笔导出原始表头，并要求 `full_day_confirmed: true`。先在北辰选择一把 Key 和一个已结束的完整北京时间账日，取消模型、请求类别等可能使记录不完整的筛选，再导出。每行 `Time` 须含时区，换算出的北京时间日期须一致。每行 `API Key Name` 须与所选供应商凭据标签匹配。行数和文件大小仍受 CSV 限制。服务按模型汇总 Token 和以裸十进制表示的美元实付 `Billed Cost`，再统一换算成微美元。某字段在任一记录中缺失时，该模型日汇总的字段保持为空。记录内的 IP 和请求细节不入库。
 
-明细导入只用于补账。文件内容可以验证日期，覆盖整个账日仍需导入者核对筛选范围。有自动确认日账时拒绝导入同日的逐笔文件。补账可替换同日、同模型的旧补账，已有手工汇总优先。后续成功同步的整日账单会清理该日的补账。概览的 `upstream_usage_source` 为 `usage`（自动日账）、`csv`（手工汇总）、`export`（逐笔导入补账）或 `null`（来源缺失）。
+明细导入只用于补账。文件内容可以验证日期，覆盖整个账日仍需导入者核对筛选范围。所选 Key 已在账日结束后取得官网快照时，拒绝再导入同日的逐笔文件。补账可替换同日、同模型的旧补账，已有手工汇总优先。成功同步官网日账后保留原有导入记录。概览的 `upstream_usage_source` 沿用 `usage`（官网 Key 快照或已确认归档）、`csv`（手工汇总）、`export`（逐笔导入补账）或 `null`（来源缺失）。
 
 模型创建/修改使用核心模型字段。将模型改为 `active` 前必须至少存在一个 ACTIVE binding，且对应 provider 为 ACTIVE。更新请求中的 `credit_multiplier` 只有在已有倍率且值确实改变时才要求 `multiplier_change_reason` 并写倍率审计；原值为 NULL 的首次设置默认倍率不要求原因。Binding 请求形状：
 

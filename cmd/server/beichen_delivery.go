@@ -19,6 +19,9 @@ type beichenSettings struct {
 }
 
 func initializeBeichenDelivery(ctx context.Context, service *controlplane.Service) *schoolseal.Recipient {
+	if err := service.Beichen().ConfigureImportedPanelSession(); err != nil {
+		slog.Error("北辰本机配置不可用", "error", err)
+	}
 	settings, err := loadBeichenSettings()
 	if err != nil {
 		slog.Error("北辰部署配置尚不可用", "error", err)

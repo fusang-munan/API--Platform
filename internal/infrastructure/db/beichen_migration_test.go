@@ -29,6 +29,51 @@ VALUES ($1, 'legacy-call', now(), $1, $1, $1, $1, $1,
 	verifyBeichenMigrationUpgrade(t, ctx, conn, callID)
 }
 
+func TestBeichenMigrationFrom0051PreservesPriceAndUsage(t *testing.T) {
+	ctx, conn := openMigrationTestDB(t)
+	applyMigrationTestBaseline(t, ctx, conn, "0052")
+
+	provider, credential := uuid.New(), uuid.New()
+	seed := func(query string, args ...any) {
+		t.Helper()
+		if _, err := conn.ExecContext(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(`INSERT INTO providers(id,name,base_url,created_at,updated_at)
+VALUES($1,'Upgrade fixture','https://api.beichenapi.com',now(),now())`, provider)
+	seed(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
+VALUES($1,$2,'fixture Key','fixture'::bytea,now(),'2026-11-11 00:00+08')`, credential, provider)
+	seed(`
+WITH multiplier AS (
+ INSERT INTO beichen_multiplier_versions(credential_id,multiplier,effective_at)
+ VALUES($1,0.3,'2026-11-12 00:00+08') RETURNING id,effective_at
+)
+INSERT INTO beichen_panel_snapshots(credential_id,effective_at,credential_revision,group_id,expires_at,multiplier_version)
+SELECT $1,effective_at,'2026-11-11 00:00+08',301,'2026-11-13 00:00+08',id FROM multiplier`, credential)
+	seed(`
+INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,effective_at)
+VALUES($1,'fixture-model','upstream','base','panel',1000,2000,'2026-11-12 00:00+08')`, credential)
+	seed(`
+INSERT INTO beichen_daily_usage(provider_id,credential_id,day,model,requests,billed_upstream_micros,source)
+VALUES($1,$2,'2026-11-12','public-history',1,42,'usage')`, provider, credential)
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := Migrate(ctx, conn); err != nil {
+			t.Fatalf("apply 0052–0055, attempt %d: %v", attempt, err)
+		}
+	}
+	var migrations int
+	var group, micros int64
+	if err := conn.QueryRowContext(ctx, `
+SELECT (SELECT count(*) FROM schema_migrations WHERE split_part(version,'_',1) BETWEEN '0052' AND '0055'),
+       (SELECT group_id FROM beichen_price_versions WHERE credential_id=$1 AND model='fixture-model'),
+       (SELECT billed_upstream_micros FROM beichen_daily_usage WHERE credential_id=$1 AND model='public-history')`,
+		credential).Scan(&migrations, &group, &micros); err != nil || migrations != 4 || group != 301 || micros != 42 {
+		t.Fatalf("migration records, pricing group or historical usage changed: %d, %d, %d (%v)", migrations, group, micros, err)
+	}
+}
+
 func openMigrationTestDB(t *testing.T) (context.Context, *sql.DB) {
 	t.Helper()
 	dsn := os.Getenv("NEBULA_TEST_POSTGRES")
@@ -118,6 +163,11 @@ FROM gateway_calls WHERE id=$1`, callID).Scan(&credits, &cacheHits, &credential)
 	}
 
 	providerID, credentialID := uuid.New(), uuid.New()
+	actor := uuid.New()
+	if _, err := conn.ExecContext(ctx, `INSERT INTO users(id,name,email,password_hash,role,created_at,updated_at)
+VALUES($1,'Migration teacher','migration@example.test','fixture','teacher',now(),now())`, actor); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := conn.ExecContext(ctx, `
 INSERT INTO providers(id, name, base_url, created_at, updated_at)
 VALUES($1, 'North test', 'https://api.beichenapi.com', now(), now())`, providerID); err != nil {
@@ -143,8 +193,9 @@ WHERE id=$1`, callID, providerID, credentialID, uuid.New()); err != nil {
 	}
 	if _, err := conn.ExecContext(ctx, `
 INSERT INTO beichen_daily_usage(provider_id, credential_id, day, model, requests, input_tokens,
-   output_tokens, cache_read_tokens, billed_upstream_micros, source)
-VALUES($1, $2, '2026-11-18', 'model', 1, 10000, 1000, 2000, 24000, 'usage')`, providerID, credentialID); err != nil {
+   output_tokens, cache_read_tokens, billed_upstream_micros, source, actor_id)
+VALUES($1, $2, '2026-11-18', 'model', 1, 10000, 1000, 2000, 24000, 'csv', $3),
+      ($1, $2, '2026-11-18', 'old-public-model', 9, 90, 0, 0, 90000, 'usage', NULL)`, providerID, credentialID, actor); err != nil {
 		t.Fatal(err)
 	}
 

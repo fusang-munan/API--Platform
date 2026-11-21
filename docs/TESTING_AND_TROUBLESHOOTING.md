@@ -10,7 +10,7 @@
 
 ## 学校网页能打开，维护用 HTTPS 握手失败
 
-教师在模型页确认已发现的模型、当前倍率与启用权限，在项目中给学生分配额度、查看开销。维护者可从学校已核实的 HTTPS 入口读取收件公钥，随下一次 GitHub 自动部署交付加密配置。北辰网页同步需要维护者先运行 `scripts/capture-beichen-session.ps1`，亲自完成一次登录；程序只交付加密后的访问令牌和续期令牌。若工具提示账号响应没有邮箱，核对登录页已进入个人面板后重试，不要手工把令牌粘贴到聊天。
+教师在模型页确认已发现的模型、当前倍率与启用权限，在项目中给学生分配额度、查看开销。维护者可从学校已核实的 HTTPS 入口读取收件公钥，随下一次 GitHub 自动部署交付加密的渠道 Key。学校的北辰网页会话在可信 HTTPS 教师页保存，点「测试抓取」即可核对服务器读取结果。
 
 0.13.0 的学校 HTTPS 应能匿名读取 `/teacher/providers`、`/student/api-keys`、网页引用的 JS/CSS 和 `/.well-known/nebula-release.txt`。使用已独立核实的学校 PEM 证书执行 `curl --cacert school.pem https://106.55.103.208:25555/teacher/providers` 应返回官方控制台 HTML。同样请求 `/api/v1/teacher/providers` 时，匿名应返回 401。页面返回 502 而 API 能访问时，检查前后端均已更新，且学校前端容器的静态服务正在 8082 监听。浏览器报告未知签发机构时，需解决该设备对学校证书的信任，再录入密码或密钥。
 
@@ -222,6 +222,27 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 用 `go test ./cmd/beichen-crawl ./internal/beichen -run 'Test(BeichenCrawl|CrawlCommand|BeichenWebsiteDirectoryPostgres)' -count=1 -v` 复查退出码、完整计数、单平台损坏、空价与零价、教师别名和抓取记录入库。看到 `complete=false` 时，用 `failures[].path` 和 `reason` 定位错误。网页不可读时教师页上次抓取可显示 0，先前已保存的目录仍可用于查看。需要核对 Key 时加 `--match-db` 并设置 `DATABASE_URL`，`key_matching=not_checked` 表示本轮没有执行这项核对。`key_matching=failed` 时查看 `key_match_error`。
 
+#### 北辰网页登录、续期或抓取失败
+
+本机窗口和爬虫可运行 `go test ./internal/beichen ./cmd/beichen-session ./cmd/beichen-crawl -run 'Test(LocalLogin|LoginWindow|CrawlCommand)' -count=1 -v`。本地假服务覆盖密码成功与拒绝、验证码、过期自动续期、并发 401、加密与文件权限、窗口关闭、以及抓取失败项。学校数据库路径可在隔离 PostgreSQL 运行 `go test ./internal/beichen ./internal/api/http -run TestBeichenPanelAccount -count=1 -v`。教师登录面板用 `npm test -- BeichenLoginPanel` 核对登录后的保存提示和测试抓取摘要。
+
+| 现象 | 检查与处理 |
+|---|---|
+| 页面提示网页 Token 已过期 | 在北辰官网重新登录，更新已保存的网页 Token 后点「验证」 |
+| 密码模式提示需要人工验证或登录被拒 | 核对账号，在浏览器完成北辰要求的验证。有可用网页 Token 时可切换到 Token 模式 |
+| 登录状态显示读写或加解密失败 | 在目标数据库运行显式迁移，核对进程使用同一数据库和凭据加密密钥 |
+| 平台或模型数为 0 | 查看最近抓取时间、失败计数和最后一次验证状态，核对网页账号对北辰渠道的权限 |
+| 本机登录窗口未打开 | 检查 Windows 默认浏览器，再运行 `go run ./cmd/beichen-session login --window` |
+| 本机会话文件读写失败 | 在 PowerShell 运行 `icacls "$env:LOCALAPPDATA\Nebula\beichen-session.json"` 和 `icacls "$env:LOCALAPPDATA\Nebula\beichen-session.key"`，核对当前账号是唯一的授权主体。会话文件损坏时可重新登录覆盖 |
+| 本机提示重新登录 | 打开本机登录窗口，重新登录后点「测试抓取」。北辰未发续期凭证时，Token 到期需再次登录 |
+| 窗口显示部分抓取失败 | 按失败项中的平台、字段位置和原因核对北辰渠道页。窗口仍会显示本轮可读的平台及去重模型数 |
+
+#### 核对北辰官网 Key 清单
+
+设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run TestBeichenWebsiteKeysPostgres -count=1 -v`，前端运行 `npm test -- BeichenWebsiteKeys`。构造样例覆盖「cc不满血」从旧倍率 0.15 更新到 `[CC2]ClaudeCode高智` 的 0.6、哈吉米 0.3、国模 GM1、分组信息缺失、已停用 Key、重复抓取、旧采价任务作废和 HTTP 401。测试服务器仅接收已登录网页所需的 GET 请求。
+
+进入「供应商管理 → 北辰官网 Key 清单」，点「刷新官网 Key」并核对最近成功读取时间。出现「匹配不唯一」时复核官网的 Key 前缀和学校渠道的对应关系。出现「待核实」时查看北辰密钥页的分组及渠道目录的倍率字段。会话过期时在「北辰网页登录」恢复授权，再刷新清单。
+
 #### 改分组后仍显示旧倍率或缺报价
 
 旧模型页的定向重扫只读模型清单，旧概览的分组取自上次采价或预配映射。新版在「用指定 Key 重扫」后读取当前 Key 账单。查看「Key 分组与倍率」中的生效倍率、分组与上次成功时间。若显示「倍率已陈旧」，查看该行的账单错误并重扫。第三次连续失败会同时写入服务告警。待核的跟随价调用可由通过校验的北辰回执补记。
@@ -229,6 +250,12 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 行内出现「分组报价需核对」时，对照「官网分组 X 价」与「Key 分组 Y 价」及各自倍率。显示「Key 分组不含该模型」时，可在北辰为该 Key 选对应分组，或从供应商管理换用对应 Key，再重扫该 Key。
 
 设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run TestBeichenBillingGroupRefreshPostgres -count=1 -v`。构造数据覆盖 0.15 到 0.6 的切换、同平台不同分组单价、迟到的旧调用、仅高峰规则变更、官网读取失败、过期账单响应和连续失败告警。教师页运行 `npm test -- BeichenSchoolModels` 核对倍率与分组差异。
+
+#### 核对一把 Key 的实际用量和分组
+
+进入「模型管理 → 北辰 → Key 实际能力」，按渠道名找到对应 Key。输入目标倍率，若新分组应提供 Claude，则勾选相应选项，再点「核对这个 Key」。官网分组名和倍率来自登录后的 Key 清单与可用渠道。切组当日的账单实付比值可包含切换前用量。用量显示陈旧时，查看具体账日的抓取错误。官网拒绝授权时先在「北辰网页登录」验证会话。若返回的流水属于另一把 Key 或分页缺失，保留上次核实数据，检查网页的 Key ID 和日期筛选后重试。
+
+使用隔离的本机 PostgreSQL，运行 `go test ./internal/beichen -run 'TestWebsiteCC2GroupCatalog|TestBeichenWebsiteCC2KeyUsagePostgres|TestWebsiteUsageMoneyAndEmptyFields' -count=1 -v`。构造数据覆盖四把 Key、0.3× 与 0.6× 两个 Claude 分组、GM1、同名模型跨组异价、USD 实付、显式零、缺失和可选图像及视频字段。测试还核对两份原始 JSON、账号级 0.16× 旧数据隔离、错误 Key 流水拒绝与陈旧标记。CC2 fixture 的型号和单价用于验收，需要使用获准的真实网页会话确认官网清单与价格。前端运行 `npm test -- BeichenKeyCapabilities BeichenSchoolModels BeichenReconcile` 核对页面。
 
 #### 探活与目录差异
 
@@ -242,6 +269,15 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 纯文本模型探活通过后仍显示「官网报价格式无效」或「非 Token 计价」时，先看 `price_blocker.message` 的字段名。旧解析会拒绝空字符串，并把非 Token 字段的零值当作有费用。运行 `go test ./internal/beichen -run 'TestPanelMixedPriceFixture|TestPanelMixedPricesActivationAndSettlementPostgres' -count=1 -v`，用构造的面板 JSON 和隔离的本机数据库复查。测试覆盖 gpt-6.1-sol 的固定价、gpt-6.2-sol 的两个 Token 档位、缺价档的提示与待核账、两种启用入口及扣分明细中被忽略的字段。
 
 后端使用隔离的本机 PostgreSQL。新建的测试库需在 `public` 安装 `citext`、`pg_trgm` 和 `pgcrypto`。全量测试的网关用例可使用下列本机端口。
+
+验证 0.23.0 的迁移和北辰回归时，在同一测试库运行下列命令。迁移测试从 0051 升级并重复执行，检查分组报价回填和旧账保留。对账测试核实历史归档、人工更正、无记录的零用量日和缺账金额。报价测试用模拟网页触发 401，检查各渠道共享一次续期。渠道切换测试确认网页用量同步后会生成线路迁移预览。
+
+```powershell
+go test ./internal/infrastructure/db -run TestBeichenMigrationFrom0051PreservesPriceAndUsage -count=1
+go test ./internal/beichen -run 'TestReconciliationUsesVerifiedArchiveWithoutRecentSnapshot|TestBeichenBillingDiagnosticsPostgres|TestScheduledWebsitePricesPostgres|TestCredentialSwitchLifecyclePostgres' -count=1
+```
+
+若历史账日显示缺账，在测试库核对归档检查点的账号、Key ID 和 `last_success`。完整归档要求读到该北京时间账日结束后，且分页已读完。若旧数据来自公开账号级用量，仍可查询历史行，教师对账从已核对的官网流水或人工导入读取。
 
 ```powershell
 $env:NEBULA_TEST_POSTGRES = 'postgres://nebula_test@127.0.0.1:55841/nebula_test?sslmode=disable'

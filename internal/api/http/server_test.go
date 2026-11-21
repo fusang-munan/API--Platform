@@ -17,6 +17,7 @@ func TestRegistersControlPlaneAndGatewayRoutes(t *testing.T) {
 	deleteRoutes := map[string]bool{
 		"/api/v1/teacher/providers/:provider_id":                            true,
 		"/api/v1/teacher/providers/:provider_id/credentials/:credential_id": true,
+		"/api/v1/teacher/providers/:provider_id/beichen/account":            true,
 		"/api/v1/teacher/projects/:project_id/mentors/:mentor_id":           true,
 	}
 	for _, route := range server.engine.Routes() {
@@ -106,8 +107,11 @@ func TestRegistersControlPlaneAndGatewayRoutes(t *testing.T) {
 		"POST /api/v1/teacher/providers/:provider_id/reset-catalog",
 		"GET /api/v1/teacher/providers/:provider_id/beichen",
 		"GET /api/v1/teacher/providers/:provider_id/beichen/reconciliation",
+		"POST /api/v1/teacher/providers/:provider_id/beichen/key-usage",
 		"GET /api/v1/teacher/providers/:provider_id/beichen/reconciliation/calls",
 		"GET /api/v1/teacher/providers/:provider_id/beichen/receipts",
+		"GET /api/v1/teacher/providers/:provider_id/beichen/keys",
+		"POST /api/v1/teacher/providers/:provider_id/beichen/keys/refresh",
 		"POST /api/v1/teacher/providers/:provider_id/beichen/sync",
 		"POST /api/v1/teacher/providers/:provider_id/beichen/probes",
 		"GET /api/v1/teacher/providers/:provider_id/beichen/probes",
@@ -164,7 +168,10 @@ func TestBeichenTeacherRoutesRequireLogin(t *testing.T) {
 		{http.MethodGet, base + "/reconciliation/calls"},
 		{http.MethodGet, base + "/diagnostics"},
 		{http.MethodGet, base + "/receipts"},
+		{http.MethodGet, base + "/keys"},
+		{http.MethodPost, base + "/keys/refresh"},
 		{http.MethodPost, base + "/sync"},
+		{http.MethodPost, base + "/key-usage"},
 		{http.MethodPost, base + "/probes"},
 		{http.MethodGet, base + "/probes"},
 		{http.MethodPost, base + "/models/enable"},

@@ -1,0 +1,50 @@
+:root {
+  font: 16px/1.5 system-ui, "Microsoft YaHei UI", sans-serif;
+  color: #1e2b37;
+  background: #eef4f5;
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+body { margin: 0; padding: clamp(16px, 6vw, 64px) 16px; }
+main {
+  max-width: 630px;
+  margin: 0 auto;
+  padding: clamp(20px, 6vw, 40px);
+  background: #fff;
+  border: 1px solid #d4e0e4;
+  border-radius: 16px;
+}
+
+h1, h2, p { margin: 0; }
+h1 { font-size: 1.65rem; line-height: 1.2; }
+h2 { font-size: 1.05rem; margin-bottom: .5rem; }
+header p { color: #455867; margin-top: .45rem; }
+form, section, footer, #notice, #error { margin-top: 1.2rem; }
+section { border: 1px solid #d4e0e4; background: #f8fbfb; border-radius: 10px; padding: 1rem; }
+#notice { color: #0c624d; }
+#error { color: #942d32; overflow-wrap: anywhere; }
+
+dl { margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: .8rem; }
+dt, .help, #renewal { font-size: .9rem; color: #455867; }
+dd { margin: .25rem 0 0; overflow-wrap: anywhere; }
+#renewal { margin: .65rem 0; }
+ul { margin: .55rem 0 0; padding-inline-start: 1.3rem; overflow-wrap: anywhere; }
+
+fieldset { min-width: 0; padding: 0; margin: 0; border: 0; }
+legend { font-weight: 650; margin-bottom: .5rem; }
+.inputs { display: grid; gap: .4rem; margin: .9rem 0 1rem; }
+.inputs > label:not(.remember) { margin-top: .3rem; }
+.inputs > input { width: 100%; padding: .55rem .7rem; border: 1px solid #899ba6; border-radius: 6px; font: inherit; }
+.actions { display: flex; flex-wrap: wrap; gap: .55rem; }
+.modes { gap: 1rem; }
+.remember { margin-top: .5rem; }
+button { font: inherit; padding: .48rem .85rem; cursor: pointer; border: 1px solid #899ba6; border-radius: 7px; color: inherit; background: #fff; }
+button:hover:enabled { background: #e7eff1; }
+.primary { color: #fff; background: #08665c; border-color: #08665c; }
+.primary:hover:enabled { background: #075348; }
+button:disabled { opacity: .6; cursor: default; }
+:focus-visible { outline: 2px solid #175eaf; outline-offset: 3px; }
+footer { border-top: 1px solid #d4e0e4; padding-top: 1rem; text-align: right; }

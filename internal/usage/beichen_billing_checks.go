@@ -41,10 +41,17 @@ WITH days AS (
   SELECT provider_id, credential_id, model, (sent_at AT TIME ZONE 'Asia/Shanghai')::date AS day,
     CASE WHEN count(local_credits) = count(*) THEN sum(local_credits) END AS credits
   FROM calls JOIN providers_to_check p ON p.id=calls.provider_id GROUP BY 1,2,3,4
-), daily AS (
-  SELECT u.provider_id, u.credential_id, u.model::text, u.day, u.billed_upstream_micros * 0.0001::numeric AS credits
-  FROM beichen_daily_usage u JOIN providers_to_check p ON p.id=u.provider_id CROSS JOIN days
-  WHERE u.day >= days.first_day AND u.day < days.end_day
+), usage_scope AS (
+  SELECT p.id AS provider_id,days.first_day,days.end_day,days.end_day AS today,$2::timestamptz AS as_of
+  FROM providers_to_check p CROSS JOIN days
+)` + BeichenDailyEvidenceSQL + `,
+daily AS (
+  SELECT provider_id,credential_id,model,day,
+    CASE WHEN count(actual_cost)=count(*) AND bool_and(unit IS NULL OR unit='CNY') AND NOT bool_or(stale)
+         THEN sum(actual_cost)*100 END AS credits
+  FROM model_usage_rows GROUP BY provider_id,credential_id,model,day
+), confirmed_empty AS (
+  SELECT provider_id,credential_id,day FROM key_usage_days WHERE requests=0 AND NOT stale
 ), archived AS (
   SELECT DISTINCT u.provider_id, u.credential_id, u.model, (u.occurred_at AT TIME ZONE 'Asia/Shanghai')::date AS day
   FROM beichen_upstream_usage_rows u JOIN providers_to_check p ON p.id=u.provider_id
@@ -59,14 +66,11 @@ WITH days AS (
 ), compared AS (
   SELECT d.*,
     CASE WHEN l.credential_id IS NULL THEN 0 ELSE l.credits END AS local_credits,
-    CASE WHEN u.credential_id IS NOT NULL THEN u.credits
-         WHEN synced.credential_id IS NOT NULL AND a.credential_id IS NULL THEN 0 END AS upstream_credits
+    CASE WHEN u.credential_id IS NULL AND e.credential_id IS NOT NULL THEN 0 ELSE u.credits END AS upstream_credits
   FROM dimensions d
   LEFT JOIN local l USING (provider_id,credential_id,model,day)
   LEFT JOIN daily u USING (provider_id,credential_id,model,day)
-  LEFT JOIN archived a USING (provider_id,credential_id,model,day)
-  LEFT JOIN beichen_usage_days synced ON synced.provider_id=d.provider_id
-    AND synced.credential_id=d.credential_id AND synced.day=d.day
+  LEFT JOIN confirmed_empty e USING (provider_id,credential_id,day)
 )
 INSERT INTO billing_checks AS b (provider_id,credential_id,model,day,local_credits,upstream_credits,diff_credits,status)
 SELECT provider_id,credential_id,model,day,local_credits,upstream_credits,local_credits-upstream_credits,

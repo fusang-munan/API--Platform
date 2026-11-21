@@ -46,12 +46,12 @@ func TestPanelAccessPostgresIsolationAndRotation(t *testing.T) {
 	exec(`
 CREATE TABLE users (id uuid PRIMARY KEY);
 CREATE TABLE providers (id uuid PRIMARY KEY, base_url text NOT NULL, status text NOT NULL DEFAULT 'active');
-CREATE TABLE provider_credentials (id uuid PRIMARY KEY, provider_id uuid NOT NULL REFERENCES providers(id),
+CREATE TABLE provider_credentials (id uuid PRIMARY KEY, provider_id uuid NOT NULL REFERENCES providers(id), credential_ciphertext bytea,
   label text NOT NULL DEFAULT 'test channel', updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   status text NOT NULL DEFAULT 'active');
-CREATE TABLE beichen_provision_channels (credential_id uuid PRIMARY KEY, channel text, discover_ids boolean);
+CREATE TABLE beichen_provision_channels (credential_id uuid PRIMARY KEY, channel text, discover_ids boolean, upstream_user_id bigint);
 CREATE TABLE gateway_calls (provider_id uuid, provider_credential_id uuid, upstream_model_name text, sent_at timestamptz)`)
-	for _, name := range []string{"0030_beichen.sql", "0033_beichen_panel_prices.sql", "0034_beichen_panel_access.sql"} {
+	for _, name := range []string{"0030_beichen.sql", "0033_beichen_panel_prices.sql", "0034_beichen_panel_access.sql", "0053_beichen_panel_accounts.sql"} {
 		data, err := os.ReadFile("../infrastructure/db/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -109,7 +109,7 @@ CREATE TABLE gateway_calls (provider_id uuid, provider_credential_id uuid, upstr
 		t.Fatal("panel token was not stored as ciphertext")
 	}
 	exec("INSERT INTO beichen_panel_access (credential_id,group_id,token_ciphertext,updated_by,updated_at) VALUES ($1,11,$2,$3,clock_timestamp())", b, ciphertext, actor)
-	if access, err := s.loadPriceAccess(ctx, b); err == nil || access.legacyToken != "" || access.groupID != 0 {
+	if access, err := s.loadPriceAccess(ctx, b); err != nil || s.checkLegacyPriceAccount(access) == nil || access.legacyToken != "" {
 		t.Fatal("transplanted ciphertext was accepted or fell back")
 	}
 	status, err := s.PanelStatus(ctx, provider, a)

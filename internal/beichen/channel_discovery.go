@@ -14,19 +14,21 @@ import (
 	"github.com/google/uuid"
 )
 
+const accountKeysURL = "https://beichenapi.com/api/v1/keys"
+
 type listedKey struct {
-	ID      int64 `json:"id"`
-	UserID  int64 `json:"user_id"`
-	GroupID int64 `json:"group_id"`
-	Group   *struct {
-		ID int64 `json:"id"`
-	} `json:"group"`
-	Name        string `json:"name"`
-	Status      string `json:"status"`
-	Masked      string `json:"masked_key"`
-	Prefix      string `json:"key_prefix"`
-	Suffix      string `json:"key_suffix"`
-	fingerprint *[sha256.Size]byte
+	ID            int64       `json:"id"`
+	UserID        int64       `json:"user_id"`
+	GroupID       int64       `json:"group_id"`
+	Group         *panelGroup `json:"group"`
+	Name          string      `json:"name"`
+	Status        string      `json:"status"`
+	Masked        string      `json:"masked_key"`
+	Prefix        string      `json:"key_prefix"`
+	Suffix        string      `json:"key_suffix"`
+	CreatedAt     *time.Time  `json:"created_at"`
+	fingerprint   *[sha256.Size]byte
+	prefixPreview string
 }
 
 // Some versions of the account endpoint return the owner's key in place of
@@ -44,6 +46,11 @@ func (k *listedKey) UnmarshalJSON(body []byte) error {
 		!strings.ContainsAny(value, "*•…. \r\n\t") {
 		fingerprint := sha256.Sum256([]byte(value))
 		k.fingerprint = &fingerprint
+		if len(value) >= 18 {
+			k.prefixPreview = value[:10]
+		}
+	} else if k.Masked == "" && strings.ContainsAny(item.Value, "*•….") {
+		k.Masked = item.Value
 	}
 	return nil
 }
@@ -60,13 +67,14 @@ func (s *Service) accountKeys(ctx context.Context, token string) ([]listedKey, e
 	total := -1
 	var owner int64
 	for page := 1; ; page++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://beichenapi.com/api/v1/keys?page_size=100&page="+strconv.Itoa(page), nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, accountKeysURL+"?page_size=100&page="+strconv.Itoa(page), nil)
 		if err != nil {
 			return nil, errKeyList
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("X-User-UI-Request", "1")
 		body, err := s.readResponse(req)
 		if err != nil {
 			return nil, s.webReadError(token, err)
@@ -82,6 +90,9 @@ func (s *Service) accountKeys(ctx context.Context, token string) ([]listedKey, e
 			} `json:"data"`
 		}
 		if json.Unmarshal(body, &reply) != nil || reply.Code == nil || *reply.Code != 0 {
+			if _, err := panelData(body); panelAuthFailed(err) {
+				return nil, s.webReadError(token, upstreamHTTPStatus(http.StatusUnauthorized))
+			}
 			return nil, errKeyList
 		}
 		d := reply.Data
@@ -97,8 +108,11 @@ func (s *Service) accountKeys(ctx context.Context, token string) ([]listedKey, e
 			if k.ID <= 0 || k.ID > 9007199254740991 || seen[k.ID] || k.UserID <= 0 || owner != 0 && k.UserID != owner {
 				return nil, errKeyList
 			}
-			if k.Group != nil && k.Group.ID != k.GroupID {
-				return nil, errKeyList
+			if k.Group != nil && k.Group.ID != 0 {
+				if k.GroupID != 0 && k.Group.ID != k.GroupID {
+					return nil, errKeyList
+				}
+				k.GroupID = k.Group.ID
 			}
 			seen[k.ID], owner = true, k.UserID
 			keys = append(keys, k)
@@ -109,18 +123,35 @@ func (s *Service) accountKeys(ctx context.Context, token string) ([]listedKey, e
 	}
 }
 
-// The inference credential is provided by the school and sent only to its own
-// fixed-origin billing endpoint. No inference request or search by raw key is made.
-func (s *Service) identifyChannel(ctx context.Context, secret, channel, label string, keys []listedKey) (listedKey, error) {
-	body, err := s.fetch(ctx, secret, billingPath, nil)
-	if err != nil {
-		return listedKey{}, err
+var beichenKeyAliases = map[string]string{"GM1": "国模", "Gemini": "哈吉米", "CC1": "cc不满血", "G3": "gpt"}
+
+func (k listedKey) fragments() (prefix, suffix string, valid bool) {
+	prefix, suffix = k.Prefix, k.Suffix
+	if k.Masked == "" {
+		return prefix, suffix, true
 	}
-	var info billingInfo
-	if json.Unmarshal(body, &info) != nil || info.Object != "sub2api.key_billing" || info.Scope != "token" || info.SchemaVersion != 1 {
+	split := strings.IndexAny(k.Masked, "*•….")
+	if split < 0 {
+		return "", "", false
+	}
+	left := k.Masked[:split]
+	right := strings.TrimLeft(k.Masked[split:], "*•….")
+	if strings.ContainsAny(right, "*•….") || prefix != "" && prefix != left || suffix != "" && suffix != right {
+		return "", "", false
+	}
+	return left, right, left != "" || right != ""
+}
+
+func identifyChannel(secret, channel, label string, keys []listedKey) (listedKey, error) {
+	candidates := websiteKeyCandidates(keys, secret, channel, label)
+	if len(candidates) != 1 {
 		return listedKey{}, errKeyMatch
 	}
-	return info.matchWebsiteKey(keys, secret, channel, label)
+	key := keys[candidates[0]]
+	if !validWebsiteGroupID(key.GroupID) || key.Status != "" && key.Status != "active" {
+		return listedKey{}, errKeyMatch
+	}
+	return key, nil
 }
 
 func (info billingInfo) matchWebsiteKey(keys []listedKey, secret, channel, label string) (listedKey, error) {
@@ -146,15 +177,14 @@ func matchAccountKey(keys []listedKey, secret, channel, label string, group, id 
 			groupCount++
 		}
 	}
-	aliases := map[string]string{"GM1": "国模", "Gemini": "哈吉米", "CC1": "cc不满血", "G3": "gpt"}
 	for _, k := range keys {
 		if id != 0 && k.ID != id || group != 0 && k.GroupID != group || k.GroupID <= 0 || k.GroupID > 9007199254740991 {
 			continue
 		}
 		name := strings.TrimSpace(k.Name)
-		labelMatch := strings.EqualFold(name, channel) || strings.EqualFold(name, strings.TrimSpace(label)) || strings.EqualFold(name, aliases[channel])
+		labelMatch := strings.EqualFold(name, channel) || strings.EqualFold(name, strings.TrimSpace(label)) || strings.EqualFold(name, beichenKeyAliases[channel])
 		wrongChannel := false
-		for other, alias := range aliases {
+		for other, alias := range beichenKeyAliases {
 			if channel != "" && other != channel && (strings.EqualFold(name, other) || strings.EqualFold(name, alias)) {
 				wrongChannel = true
 			}
@@ -162,15 +192,8 @@ func matchAccountKey(keys []listedKey, secret, channel, label string, group, id 
 		if wrongChannel {
 			continue
 		}
-		prefix, suffix := k.Prefix, k.Suffix
-		if k.Masked != "" {
-			parts := strings.FieldsFunc(k.Masked, func(r rune) bool { return r == '*' || r == '•' || r == '…' || r == '.' })
-			if len(parts) != 2 || parts[0] == k.Masked || (prefix != "" && prefix != parts[0]) || (suffix != "" && suffix != parts[1]) {
-				continue
-			}
-			prefix, suffix = parts[0], parts[1]
-		}
-		if prefix != "" && !strings.HasPrefix(secret, prefix) || suffix != "" && !strings.HasSuffix(secret, suffix) {
+		prefix, suffix, valid := k.fragments()
+		if !valid || prefix != "" && !strings.HasPrefix(secret, prefix) || suffix != "" && !strings.HasSuffix(secret, suffix) {
 			continue
 		}
 		maskMatch := len(strings.TrimPrefix(prefix, "sk-"))+len(suffix) >= 8 && (len(prefix) < len(secret) && len(suffix) < len(secret))
@@ -207,17 +230,17 @@ func (s *Service) discoverChannels(ctx context.Context) error {
 }
 
 func (s *Service) discoverChannelKeys(ctx context.Context, selected *uuid.UUID) error {
-	if !s.WebSessionConfigured() {
-		return nil
-	}
 	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.provider_id,j.channel,c.label,c.credential_ciphertext,c.updated_at
 FROM beichen_provision_channels j JOIN provider_credentials c ON c.id=j.credential_id
 JOIN providers p ON p.id=c.provider_id JOIN beichen_panel_access a ON a.credential_id=c.id
+LEFT JOIN beichen_panel_accounts session ON session.provider_id=p.id
 WHERE j.discover_ids AND a.updated_by=$1 AND c.status='active' AND p.status='active' AND `+beichenProvider+`
  AND ($2::uuid IS NULL OR c.id=$2)
+ AND COALESCE(session.status<>'none',$3)
  AND (a.group_id IS NULL OR a.updated_at<>c.updated_at OR j.checked_at IS NULL OR j.checked_at < clock_timestamp()-interval '15 minutes'
       OR ($2 IS NOT NULL AND j.discovery_error IS NOT NULL))
-ORDER BY j.checked_at NULLS FIRST,c.id LIMIT 4`, ProvisionActorID, selected)
+ORDER BY j.checked_at NULLS FIRST,c.id LIMIT 4`, ProvisionActorID, selected,
+		s.WebSessionConfigured() || s.panelFallback != "" || s.sharedPanel != nil)
 	if err != nil {
 		return err
 	}
@@ -235,25 +258,32 @@ ORDER BY j.checked_at NULLS FIRST,c.id LIMIT 4`, ProvisionActorID, selected)
 	if err != nil || len(jobs) == 0 {
 		return err
 	}
-	token, lookupErr := s.webPanelToken(ctx)
-	var keys []listedKey
-	if lookupErr == nil {
-		keys, lookupErr = s.accountKeys(ctx, token)
-	}
 	type match struct {
-		key listedKey
-		err error
+		key     listedKey
+		err     error
+		managed bool
 	}
 	matches := make([]match, len(jobs))
+	type lookup struct {
+		keys    []listedKey
+		err     error
+		managed bool
+	}
+	lookups := make(map[uuid.UUID]lookup)
 	claims := make(map[int64]int)
 	for i, j := range jobs {
 		m := &matches[i]
-		m.err = lookupErr
+		result, found := lookups[j.provider]
+		if !found {
+			result.keys, result.managed, result.err = s.lookupPanelKeys(ctx, j.provider)
+			lookups[j.provider] = result
+		}
+		m.err, m.managed = result.err, result.managed
 		if m.err == nil {
 			var secret string
 			secret, m.err = s.crypto.DecryptCredential(j.encrypted)
 			if m.err == nil {
-				m.key, m.err = s.identifyChannel(ctx, secret, j.channel, j.label, keys)
+				m.key, m.err = identifyChannel(secret, j.channel, j.label, result.keys)
 				if m.err == nil {
 					claims[m.key.ID]++
 				}
@@ -266,7 +296,7 @@ ORDER BY j.checked_at NULLS FIRST,c.id LIMIT 4`, ProvisionActorID, selected)
 		if claims[m.key.ID] > 1 {
 			m.err = errKeyMatch
 		}
-		if applyErr := s.applyDiscovery(ctx, j, m.key, m.err); applyErr != nil {
+		if applyErr := s.applyDiscovery(ctx, j, m.key, m.err, m.managed); applyErr != nil {
 			failed = applyErr
 		} else if m.err != nil {
 			failed = m.err
@@ -275,7 +305,26 @@ ORDER BY j.checked_at NULLS FIRST,c.id LIMIT 4`, ProvisionActorID, selected)
 	return failed
 }
 
-func (s *Service) applyDiscovery(ctx context.Context, j discoveryJob, k listedKey, lookupErr error) error {
+func (s *Service) lookupPanelKeys(ctx context.Context, provider uuid.UUID) ([]listedKey, bool, error) {
+	auth, managed, err := s.managedPanelAuthorization(ctx, provider, "")
+	if err != nil {
+		return nil, managed, err
+	}
+	if managed {
+		keys, err := readWithPanelAuthorization(ctx, s, provider, auth, true, func(token string) ([]listedKey, error) {
+			return s.accountKeys(ctx, token)
+		})
+		return keys, true, err
+	}
+	token, err := s.webPanelToken(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	keys, err := s.accountKeys(ctx, token)
+	return keys, false, err
+}
+
+func (s *Service) applyDiscovery(ctx context.Context, j discoveryJob, k listedKey, lookupErr error, managed bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -332,6 +381,10 @@ WHERE a.credential_id=$1 AND a.updated_by=$2 AND c.updated_at=$3 AND c.status='a
 		access, err := s.DeploymentPanelAccess(k.GroupID, k.ID, "")
 		if err != nil {
 			return err
+		}
+		if managed {
+			access = PanelAccessInput{Enabled: true, GroupID: k.GroupID, UpstreamKeyID: &k.ID,
+				webAccount: accountDigest("beichen-provider:" + j.provider.String())}
 		}
 		same := false
 		if group.Int64 == k.GroupID && id.Int64 == k.ID && current.Equal(j.revision) && (!owner.Valid || owner.Int64 == k.UserID) {

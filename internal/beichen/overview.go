@@ -94,6 +94,7 @@ type Overview struct {
 	WebsiteDirectory   WebsiteDirectoryStatus `json:"website_directory"`
 	ArchivedUsage      []ArchivedUsage        `json:"archived_usage"`
 	Credentials        []CredentialSummary    `json:"credentials"`
+	KeyCapabilities    []KeyCapability        `json:"key_capabilities"`
 	Datasets           []Dataset              `json:"datasets"`
 	Models             []Model                `json:"models"`
 	ModelCatalog       []CatalogModel         `json:"model_catalog"`
@@ -210,6 +211,9 @@ func (s *Service) Overview(ctx context.Context, providerID uuid.UUID, day string
 		err = readCredentials(ctx, tx, providerID, &view)
 	}
 	if err == nil {
+		err = readKeyCapabilities(ctx, tx, providerID, day, s.now(), &view)
+	}
+	if err == nil {
 		err = readPreferredRoutes(ctx, tx, providerID, &view)
 	}
 	if err == nil {
@@ -219,7 +223,7 @@ func (s *Service) Overview(ctx context.Context, providerID uuid.UUID, day string
 		view.ProbeRun, err = readProbeRun(ctx, tx, providerID)
 	}
 	if err == nil {
-		err = readComparison(ctx, tx, providerID, start, &view)
+		err = readComparison(ctx, tx, providerID, start, s.now(), &view)
 	}
 	if err == nil {
 		view.ArchivedUsage, err = readArchivedUsage(ctx, tx, providerID, start)
@@ -430,14 +434,15 @@ CROSS JOIN LATERAL (
   SELECT max(d.last_success) FILTER (WHERE d.kind = 'catalog') AS catalog_at,
     max(d.last_success) FILTER (WHERE d.kind = 'prices') AS prices_at,
     max(d.last_success) FILTER (WHERE d.kind = 'billing') AS billing_at,
-    max(d.last_success) FILTER (WHERE d.kind = 'usage') AS usage_at,
+    max(d.last_success) FILTER (WHERE d.kind = 'key_usage') AS usage_at,
     (array_agg(d.last_error ORDER BY GREATEST(d.last_success,
-      CASE WHEN d.kind = 'usage' THEN d.next_attempt - interval '24 hours'
+      CASE WHEN d.kind = 'key_usage' AND d.last_error IS NOT NULL THEN
+             d.next_attempt - make_interval(mins => 1 << greatest(d.failure_count - 1, 0))
            WHEN b.last_error IS NOT NULL THEN
              b.next_attempt - make_interval(mins => 1 << greatest(b.failure_count - 1, 0))
            ELSE b.last_success END) DESC NULLS LAST, d.kind)
       FILTER (WHERE d.last_error IS NOT NULL))[1] AS last_error
-  FROM beichen_datasets d WHERE d.credential_id = c.id
+  FROM beichen_datasets d WHERE d.credential_id = c.id AND d.kind <> 'usage'
 ) s
 WHERE c.provider_id = $1
 ORDER BY c.label, c.id`, providerID)
@@ -634,8 +639,10 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 	return item, nil
 }
 
-func readComparison(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, start time.Time, view *Overview) error {
-	rows, err := tx.QueryContext(ctx, comparisonSQL, providerID, start, start.AddDate(0, 0, 1), start.Format(dayLayout))
+func readComparison(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, start, now time.Time, view *Overview) error {
+	end := start.AddDate(0, 0, 1)
+	rows, err := tx.QueryContext(ctx, comparisonSQL, providerID, start, end,
+		start.Format(dayLayout), end.Format(dayLayout), now.In(beijing).Format(dayLayout), now.UTC())
 	if err != nil {
 		return err
 	}
@@ -721,10 +728,14 @@ WITH attributed AS (
     count(*) FILTER (WHERE trial_weight IS NULL) AS unpriced_calls
   FROM priced_calls
   GROUP BY credential_id, school_model
-), upstream_rows AS (
-  SELECT a.*, COALESCE(alias.school_model, a.model) AS school_model
-  FROM beichen_daily_usage a ` + joinModelAliasSQL + `
-  WHERE a.provider_id = $1 AND a.day = $4::text::date
+), usage_scope AS (
+  SELECT $1::uuid AS provider_id,$4::text::date AS first_day,$5::text::date AS end_day,
+    $6::text::date AS today,$7::timestamptz AS as_of
+)` + usage.BeichenDailyEvidenceSQL + `,
+upstream_rows AS (
+  SELECT a.*, COALESCE(alias.school_model, a.model) AS school_model,
+    CASE WHEN a.source IN ('key_usage','website_receipts') THEN 'usage' ELSE a.source END AS comparison_source
+  FROM model_usage_rows a ` + joinModelAliasSQL + `
 ), upstream AS (
   SELECT credential_id, school_model AS model,
     CASE WHEN count(requests) = count(*) THEN sum(requests) END AS requests,
@@ -732,11 +743,14 @@ WITH attributed AS (
     CASE WHEN count(output_tokens) = count(*) THEN sum(output_tokens) END AS output_tokens,
     CASE WHEN count(cache_read_tokens) = count(*) THEN sum(cache_read_tokens) END AS cache_read_tokens,
     CASE WHEN count(cache_write_tokens) = count(*) THEN sum(cache_write_tokens) END AS cache_write_tokens,
-    CASE WHEN count(billed_upstream_micros) = count(*) THEN sum(billed_upstream_micros) END AS billed_upstream_micros,
-    string_agg(DISTINCT source, ',' ORDER BY source) AS source
+    CASE WHEN count(actual_cost) = count(*) AND NOT bool_or(stale) AND bool_and(unit IS NULL OR unit='CNY')
+         THEN sum(actual_cost) * 1000000 END AS billed_upstream_micros,
+    string_agg(DISTINCT comparison_source, ',' ORDER BY comparison_source) AS source
   FROM upstream_rows GROUP BY credential_id, school_model
 ), confirmed_empty AS (
-  SELECT credential_id FROM beichen_usage_days WHERE provider_id = $1 AND day = $4::text::date AND empty
+  SELECT d.credential_id FROM scoped_days d
+  WHERE d.requests=0 AND NOT d.stale
+    AND NOT EXISTS (SELECT 1 FROM website_days w WHERE w.credential_id=d.credential_id AND w.day=d.day)
 )
 SELECT COALESCE(l.credential_id, u.credential_id), COALESCE(l.model, u.model), l.requests,
   CASE WHEN u.requests <= 9223372036854775807 THEN u.requests::bigint WHEN u.credential_id IS NULL AND e.credential_id IS NOT NULL THEN 0::bigint END,
@@ -749,7 +763,7 @@ SELECT COALESCE(l.credential_id, u.credential_id), COALESCE(l.model, u.model), l
   CASE WHEN l.cache_write_tokens <= 9223372036854775807 THEN l.cache_write_tokens::bigint END,
   CASE WHEN u.cache_write_tokens <= 9223372036854775807 THEN u.cache_write_tokens::bigint END,
   CASE WHEN l.estimated_micros <= 9223372036854775807 THEN l.estimated_micros::bigint END,
-  CASE WHEN u.billed_upstream_micros <= 9223372036854775807 THEN u.billed_upstream_micros::bigint END,
+  CASE WHEN u.billed_upstream_micros BETWEEN -9223372036854775808 AND 9223372036854775807 THEN u.billed_upstream_micros::bigint END,
   CASE WHEN l.trial_credit_milli <= 9223372036854775807 THEN l.trial_credit_milli::bigint END, l.unpriced_calls,
   COALESCE(u.source, CASE WHEN e.credential_id IS NOT NULL THEN 'usage' END), l.trial_credits,
   l.charged_credits, l.pending_review_calls

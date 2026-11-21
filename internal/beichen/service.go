@@ -45,13 +45,17 @@ type CredentialRef struct {
 }
 
 type Service struct {
-	db          *sql.DB
-	crypto      *security.Manager
-	client      *http.Client
-	now         func() time.Time
-	panelToken  string
-	panelGroups map[uuid.UUID]int64
-	webAccount  *webSession
+	db             *sql.DB
+	crypto         *security.Manager
+	client         *http.Client
+	now            func() time.Time
+	panelToken     string
+	panelFallback  string
+	panelGroups    map[uuid.UUID]int64
+	webAccount     *webSession
+	localLogin     *LocalLoginStore
+	sharedPanel    *LocalPanelConfig
+	sharedPanelErr error
 }
 
 func New(db *sql.DB, crypto *security.Manager) *Service {

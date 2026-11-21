@@ -3,6 +3,7 @@ package beichen
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"maps"
 	"slices"
@@ -35,13 +36,14 @@ type CrawlModel struct {
 }
 
 type CrawlSource struct {
-	ChannelID     int64          `json:"channel_id,omitempty"`
-	Channel       string         `json:"channel,omitempty"`
-	Platform      string         `json:"platform"`
-	Groups        []WebsiteGroup `json:"groups"`
-	PriceComplete bool           `json:"price_complete"`
-	PriceBlocker  string         `json:"price_blocker,omitempty"`
-	IgnoredFields []string       `json:"ignored_fields"`
+	ChannelID     int64           `json:"channel_id,omitempty"`
+	Channel       string          `json:"channel,omitempty"`
+	Platform      string          `json:"platform"`
+	Groups        []WebsiteGroup  `json:"groups"`
+	PriceComplete bool            `json:"price_complete"`
+	PriceBlocker  string          `json:"price_blocker,omitempty"`
+	Pricing       json.RawMessage `json:"pricing"`
+	IgnoredFields []string        `json:"ignored_fields"`
 }
 
 // CrawlDirectory uses the scheduled website parser and can compare its result
@@ -56,7 +58,13 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 		crawl, err = decodeWebsiteDirectory(options.Fixture, start.UTC())
 		crawl.StartedAt, crawl.DurationMS = start.UTC(), time.Since(start).Milliseconds()
 	} else {
-		crawl, err = s.crawlWebsiteDirectory(ctx, options.PanelToken)
+		provider := options.ProviderID
+		if provider == uuid.Nil && s.db != nil && s.crypto != nil {
+			provider, err = s.ResolvePanelProvider(ctx, uuid.Nil)
+		}
+		if err == nil {
+			crawl, err = s.crawlWebsiteDirectory(ctx, provider, options.PanelToken)
+		}
 	}
 	report := CrawlReport{
 		CrawlRun: crawl.CrawlRun, Source: source, Complete: err == nil,
@@ -77,8 +85,8 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 	models := map[string]*CrawlModel{}
 	locations := map[string][]WebsiteLocation{}
 	for _, section := range crawl.platforms {
-		groups := websiteGroups(section.Groups)
 		for _, observation := range section.Models {
+			groups := websiteGroups(directoryModelGroups(section, observation))
 			name := observation.Name
 			if models[name] == nil {
 				models[name] = &CrawlModel{Name: name, KeyMatches: []CatalogKey{}}
@@ -86,7 +94,7 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 			row := models[name]
 			row.Sources = append(row.Sources, CrawlSource{
 				ChannelID: section.ChannelID, Channel: section.Channel, Platform: section.Platform, Groups: groups,
-				PriceComplete: observation.priceBlocker == "", PriceBlocker: observation.priceBlocker,
+				PriceComplete: observation.priceBlocker == "", PriceBlocker: observation.priceBlocker, Pricing: observation.Pricing,
 				IgnoredFields: append([]string{}, usage.BeichenPanelIgnoredFields(observation.Pricing)...),
 			})
 			locations[name] = append(locations[name], WebsiteLocation{
@@ -161,8 +169,10 @@ WHERE m.provider_id=$1 AND m.status='active' AND c.status='active' AND p.status=
 	return keys, nil
 }
 
-func findCrawlProvider(ctx context.Context, tx *sql.Tx) (uuid.UUID, error) {
-	rows, err := tx.QueryContext(ctx, "SELECT p.id FROM providers p WHERE p.status='active' AND "+beichenProvider+" LIMIT 2")
+func findCrawlProvider(ctx context.Context, db interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) (uuid.UUID, error) {
+	rows, err := db.QueryContext(ctx, "SELECT p.id FROM providers p WHERE p.status='active' AND "+beichenProvider+" LIMIT 2")
 	if err != nil {
 		return uuid.Nil, errors.New("查询北辰供应商失败，请检查数据库连接")
 	}

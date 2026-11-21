@@ -15,6 +15,7 @@ import AppDialog from '../../components/AppDialog.vue'
 import BeichenPriceDrawer from '../../components/BeichenPriceDrawer.vue'
 import BeichenModelUsageDrawer from '../../components/BeichenModelUsageDrawer.vue'
 import BeichenRecentReceipts from './BeichenRecentReceipts.vue'
+import BeichenKeyCapabilities from './BeichenKeyCapabilities.vue'
 
 const props = defineProps<{ providerId: string; query?: string; commonIds?: Set<string>; providerMaintenance?: boolean }>()
 const emit = defineEmits<{ 'catalog-synced': [] }>()
@@ -501,11 +502,18 @@ function groupPriceComparison(key: BeichenCatalogKey, locations: BeichenWebsiteL
 }
 
 function websiteLocationLabel(location: BeichenWebsiteLocation) {
-  const groups = location.groups.map(group => [group.name, group.id != null ? '分组 ' + group.id : ''].filter(Boolean).join(' '))
+  const groups = location.groups.map(group => [group.name, group.id != null ? '分组 ' + group.id : '',
+    rateLabel(group.rate_multiplier)].filter(Boolean).join(' '))
   return [location.channel || (location.channel_id != null ? '渠道 ' + location.channel_id : ''),
     location.platform, groups.length ? groups.join('、') : '分组待核', location.name,
     location.has_price ? '官网有报价' : '官网无报价',
     location.stale ? '缓存目录' : ''].filter(Boolean).join(' · ')
+}
+
+function websiteGroupPrice(location: BeichenWebsiteLocation) {
+  if (!location.has_price || !location.price_conditions_exact) return ''
+  const base = formatPriceConditions(location.price_conditions_exact, null, true).standard
+  return base ? withYuan(base) : ''
 }
 
 function catalogPriceLabel(row: CatalogRow) {
@@ -899,6 +907,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
         <span v-if="billing.last_error"> · {{ billing.last_error }}</span>
       </p>
     </section>
+    <BeichenKeyCapabilities v-if="overview?.key_capabilities?.length" :key="providerId"
+      :provider-id="providerId" :capabilities="overview.key_capabilities" :disabled="busy" @refresh="refreshOverview" />
     <section v-if="overview?.website_only_status" class="beichen-card website-catalog" aria-label="官网目录">
       <div class="beichen-section-head">
         <h3>官网目录</h3>
@@ -988,6 +998,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
                 <ul>
                   <li v-for="(location, sourceIndex) in row.locations" :key="sourceIndex">
                     {{ websiteLocationLabel(location) }} · {{ syncTime(location.observed_at) }}
+                    <div v-for="line in websiteGroupPrice(location).split('\n').filter(Boolean)" :key="line" class="row-note">{{ line }}</div>
                   </li>
                   <li v-for="key in row.catalogKeys.filter(key => key.state === 'listed')" :key="key.credential_id">{{ keyCoverageLabel(key) }}</li>
                 </ul>

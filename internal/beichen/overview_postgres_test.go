@@ -263,7 +263,8 @@ VALUES($1,'Mixed','upstream','effective','billing',0,2000000,0,0,NULL),
 	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success,last_error,failure_count,next_attempt)
 VALUES($1,'catalog',$3,NULL,0,'-infinity'),
  ($1,'billing',$3+interval '1 minute','账单同步失败',2,$3+interval '7 minutes'),
- ($1,'usage',$3+interval '2 minutes','较早的用量同步失败',1,$3+interval '24 hours 4 minutes'),
+ ($1,'key_usage',$3+interval '2 minutes','较早的用量同步失败',1,$3+interval '5 minutes'),
+ ($1,'usage',$3+interval '3 hours','旧公开账单读取失败',1,$3+interval '1 day'),
  ($1,'prices',$3+interval '3 minutes',NULL,0,'-infinity'),
  ($2,'catalog',NULL,'目录同步失败',0,'-infinity')`, first, second, base)
 

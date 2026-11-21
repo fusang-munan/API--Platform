@@ -33,7 +33,7 @@ func saveCatalogFixture(t *testing.T, ctx context.Context, db *sql.DB, provider,
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	if err := saveKeyCatalog(ctx, tx, syncJob{provider, credential, "catalog"}, entries, time.Now().UTC()); err != nil {
+	if err := saveKeyCatalog(ctx, tx, syncJob{provider: provider, credential: credential, kind: "catalog"}, entries, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if website != nil {

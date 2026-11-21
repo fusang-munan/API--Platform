@@ -1,0 +1,15 @@
+{
+  "code": 0,
+  "data": {
+    "items": [
+      {"id": 41, "user_id": 7, "name": "cc 0.3 fixture", "key": "sk-fixture-cc03", "group_id": 301, "status": "active"},
+      {"id": 42, "user_id": 7, "name": "cc不满血", "key": "sk-fixture-cc2", "group_id": 602, "status": "active"},
+      {"id": 43, "user_id": 7, "name": "国模", "key": "sk-fixture-gm1", "group_id": 160, "status": "active"},
+      {"id": 44, "user_id": 7, "name": "国模备用", "key": "sk-fixture-gm1-alt", "group_id": 160, "status": "active"}
+    ],
+    "page": 1,
+    "page_size": 100,
+    "pages": 1,
+    "total": 4
+  }
+}

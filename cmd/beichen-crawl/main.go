@@ -14,6 +14,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/beichen"
+	"github.com/starprince1234/Nebula-api/internal/config"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db"
 )
 
@@ -49,7 +51,27 @@ func run(args []string, stdout, stderr io.Writer) int {
 	token := strings.TrimSpace(os.Getenv("BEICHEN_PANEL_TOKEN"))
 	email := strings.TrimSpace(os.Getenv("BEICHEN_WEB_EMAIL"))
 	password := os.Getenv("BEICHEN_WEB_PASSWORD")
-	hasCredentials := token != "" || (email != "" && password != "")
+	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	var savedSession *beichen.LocalLoginStore
+	if *fixturePath == "" {
+		if store, err := beichen.OpenLocalLoginStore(); err == nil {
+			exists, err := store.Exists()
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				return 1
+			}
+			if exists {
+				savedSession = store
+			}
+		}
+	}
+	hasDatabaseSession := *fixturePath == "" && savedSession == nil && dsn != ""
+	localConfig := strings.TrimSpace(os.Getenv("BEICHEN_SESSION_LOCAL_FILE"))
+	if localConfig == "" {
+		localConfig = "deploy/beichen-session.local.env"
+	}
+	_, localConfigErr := os.Stat(localConfig)
+	hasCredentials := savedSession != nil || hasDatabaseSession || !errors.Is(localConfigErr, os.ErrNotExist) || token != "" || (email != "" && password != "")
 	if !hasCredentials {
 		fmt.Fprintln(stderr, "未提供真实凭据，仅 fixture")
 	}
@@ -61,13 +83,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	} else if !hasCredentials {
-		fmt.Fprintln(stderr, "请提供 --fixture 路径，或设置 BEICHEN_PANEL_TOKEN 或完整的 BEICHEN_WEB_EMAIL 与 BEICHEN_WEB_PASSWORD")
+		fmt.Fprintln(stderr, "请先运行 go run ./cmd/beichen-session login --window 登录，或用 --fixture 读取本地样例")
 		return 2
 	}
 
 	var database *sql.DB
-	if dsn := strings.TrimSpace(os.Getenv("DATABASE_URL")); options.MatchDB && dsn != "" {
-		// sql.Open defers connecting until the read-only matching transaction.
+	if (options.MatchDB || hasDatabaseSession) && dsn != "" {
 		var err error
 		database, err = sql.Open(db.DriverName, dsn)
 		if err != nil {
@@ -76,10 +97,29 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		defer database.Close()
 	}
-	service := beichen.New(database, nil)
-	if options.Fixture == nil {
+	var manager *crypto.Manager
+	if hasDatabaseSession {
+		cfg, err := config.LoadProviderCatalogWorker()
+		if err != nil {
+			fmt.Fprintln(stderr, "读取已保存的北辰会话需要 DATABASE_URL 和有效的 PROVIDER_CREDENTIAL_ENCRYPTION_KEY")
+			return 2
+		}
+		manager, err = crypto.NewManager(nil, nil, nil, cfg.ProviderEncryptionKey, 0)
+		if err != nil {
+			fmt.Fprintln(stderr, "初始化北辰会话加密服务失败")
+			return 1
+		}
+	}
+	service := beichen.New(database, manager)
+	if savedSession != nil {
+		service.UseLocalLogin(savedSession)
+	} else if options.Fixture == nil {
+		if err := service.ConfigureImportedPanelSession(); err != nil && !hasDatabaseSession {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
 		options.PanelToken = token
-		if token == "" {
+		if token == "" && email != "" && password != "" {
 			if err := service.ConfigureWebSession(email, password); err != nil {
 				fmt.Fprintln(stderr, err)
 				return 2

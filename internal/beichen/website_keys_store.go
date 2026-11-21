@@ -1,0 +1,315 @@
+package beichen
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"errors"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/domain"
+)
+
+func (s *Service) WebsiteKeys(ctx context.Context, provider uuid.UUID) (WebsiteKeyInventory, error) {
+	view := WebsiteKeyInventory{Status: "unsynced", Keys: []WebsiteKey{}}
+	if s.db == nil {
+		return view, unavailable("北辰 Key 清单未配置", nil)
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
+	if err != nil {
+		return view, err
+	}
+	defer tx.Rollback()
+	if err := checkProvider(ctx, tx, provider); err != nil {
+		return view, err
+	}
+	err = tx.QueryRowContext(ctx, `
+SELECT status,last_seen FROM beichen_website_key_sync WHERE provider_id=$1`, provider).Scan(&view.Status, &view.LastSeen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return view, nil
+	}
+	if err != nil {
+		return view, err
+	}
+	if view.Status == "current" && view.LastSeen != nil && s.now().Sub(*view.LastSeen) > 2*websiteDirectoryInterval {
+		view.Status = "stale"
+	}
+	rows, err := tx.QueryContext(ctx, `
+SELECT k.upstream_key_id,k.name,k.key_prefix,k.group_id,k.group_name,trim_scale(k.rate)::text,
+       k.status,k.enabled,k.created_at,c.id,
+       CASE WHEN c.id IS NULL AND k.match_status='matched' THEN 'unmatched' ELSE k.match_status END
+FROM beichen_website_keys k
+LEFT JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
+ AND c.status='active' AND k.ciphertext_digest=sha256(c.credential_ciphertext)
+WHERE k.provider_id=$1 ORDER BY k.upstream_key_id`, provider)
+	if err != nil {
+		return view, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		key := WebsiteKey{LastSeen: view.LastSeen}
+		if err := rows.Scan(&key.ID, &key.Name, &key.KeyPrefix, &key.GroupID, &key.GroupName, &key.Rate, &key.Status,
+			&key.Enabled, &key.CreatedAt, &key.CredentialID, &key.MatchStatus); err != nil {
+			return view, err
+		}
+		view.Keys = append(view.Keys, key)
+	}
+	return view, rows.Err()
+}
+
+func (s *Service) RefreshWebsiteKeys(ctx context.Context, provider uuid.UUID) (WebsiteKeyInventory, error) {
+	if s.db == nil || s.crypto == nil {
+		return WebsiteKeyInventory{}, unavailable("北辰 Key 清单同步未配置", nil)
+	}
+	if err := checkProvider(ctx, s.db, provider); err != nil {
+		return WebsiteKeyInventory{}, err
+	}
+	if err := s.refreshWebsiteKeys(ctx, provider, true); err != nil {
+		return WebsiteKeyInventory{}, err
+	}
+	return s.WebsiteKeys(ctx, provider)
+}
+
+func (s *Service) syncWebsiteKeyInventories(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT p.id FROM providers p
+LEFT JOIN beichen_panel_accounts a ON a.provider_id=p.id
+LEFT JOIN beichen_website_key_sync r ON r.provider_id=p.id
+WHERE `+beichenProvider+` AND p.status='active' AND COALESCE(a.status<>'none',$1)
+  AND COALESCE(r.next_attempt,'-infinity'::timestamptz)<=clock_timestamp()
+ORDER BY p.id`, s.WebSessionConfigured() || s.panelToken != "" || s.panelFallback != "" || s.sharedPanel != nil)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var providers []uuid.UUID
+	for rows.Next() {
+		var provider uuid.UUID
+		if err := rows.Scan(&provider); err != nil {
+			return err
+		}
+		providers = append(providers, provider)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var failed error
+	for _, provider := range providers {
+		failed = errors.Join(failed, s.refreshWebsiteKeys(ctx, provider, false))
+	}
+	return failed
+}
+
+func (s *Service) refreshWebsiteKeys(ctx context.Context, provider uuid.UUID, manual bool) error {
+	lease := uuid.New()
+	var oldStatus string
+	err := s.db.QueryRowContext(ctx, `
+INSERT INTO beichen_website_key_sync(provider_id,lease_id,lease_until)
+VALUES ($1,$2,clock_timestamp()+$3::int*interval '1 second')
+ON CONFLICT(provider_id) DO UPDATE SET lease_id=EXCLUDED.lease_id,lease_until=EXCLUDED.lease_until
+WHERE (beichen_website_key_sync.lease_until IS NULL OR beichen_website_key_sync.lease_until<=clock_timestamp())
+  AND ($4 OR beichen_website_key_sync.next_attempt<=clock_timestamp())
+RETURNING status`, provider, lease, leaseSeconds, manual).Scan(&oldStatus)
+	if errors.Is(err, sql.ErrNoRows) {
+		if manual {
+			return domain.NewError(domain.CodeInvalidTransition, "北辰 Key 清单正在同步，请稍后刷新")
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	readCtx, cancel := context.WithTimeout(ctx, jobTimeout)
+	observation, readErr := s.readWebsiteKeys(readCtx, provider)
+	cancel()
+	if readErr != nil {
+		status := "unavailable"
+		if panelAuthFailed(readErr) || errors.Is(readErr, errEnvironmentPanelToken) ||
+			errors.Is(readErr, errPanelTokenExpired) || errors.Is(readErr, errWebSignIn) {
+			status = "session_expired"
+		}
+		saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+		return finishWebsiteKeyInventory(saveCtx, s.db, provider, lease, status, nil)
+	}
+	return s.applyWebsiteKeys(ctx, provider, lease, observation, s.now().UTC(), oldStatus != "current")
+}
+
+type websiteKeyWriter interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func finishWebsiteKeyInventory(ctx context.Context, db websiteKeyWriter, provider, lease uuid.UUID, status string, observedAt *time.Time) error {
+	result, err := db.ExecContext(ctx, `
+UPDATE beichen_website_key_sync SET status=$3,last_seen=COALESCE($4,last_seen),
+ next_attempt=clock_timestamp()+$5::int*interval '1 minute',lease_id=NULL,lease_until=NULL
+WHERE provider_id=$1 AND lease_id=$2 AND lease_until>clock_timestamp()`,
+		provider, lease, status, observedAt, int(websiteDirectoryInterval/time.Minute))
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err == nil && count == 0 {
+		return errors.New("北辰 Key 清单同步时限已过")
+	}
+	return err
+}
+
+type websiteCredentialMatch struct {
+	id         uuid.UUID
+	ciphertext []byte
+	revision   time.Time
+	candidates []int
+}
+
+func (s *Service) applyWebsiteKeys(ctx context.Context, provider, lease uuid.UUID, observation websiteKeyObservation, observedAt time.Time, recovered bool) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var active uuid.UUID
+	err = tx.QueryRowContext(ctx, `SELECT p.id FROM providers p WHERE p.id=$1 AND p.status='active' AND `+
+		beichenProvider+` FOR SHARE`, provider).Scan(&active)
+	if errors.Is(err, sql.ErrNoRows) {
+		return invalid("北辰供应商须处于启用状态才可更新 Key 清单")
+	}
+	if err != nil {
+		return err
+	}
+	if observation.tokenVersion != nil {
+		var current []byte
+		err := tx.QueryRowContext(ctx, `
+SELECT token_ciphertext FROM beichen_panel_accounts
+WHERE provider_id=$1 AND status='active' FOR SHARE`, provider).Scan(&current)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if !bytes.Equal(current, observation.tokenVersion) {
+			if err := finishWebsiteKeyInventory(ctx, tx, provider, lease, "unavailable", nil); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}
+	}
+	listed := observation.keys
+	credentials, claims, err := s.findWebsiteCredentialMatches(ctx, tx, provider, listed)
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, "DELETE FROM beichen_website_keys WHERE provider_id=$1", provider); err != nil {
+		return err
+	}
+	matched := make(map[int]websiteCredentialMatch)
+	for _, credential := range credentials {
+		var current WebsiteKey
+		if len(credential.candidates) == 1 {
+			i := credential.candidates[0]
+			if claims[i] == 1 {
+				matched[i] = credential
+				current = websiteKeyView(listed[i])
+			}
+		}
+		if err := saveWebsiteKeyVersion(ctx, tx, credential, current, observedAt, recovered); err != nil {
+			return err
+		}
+	}
+	for i, listedKey := range listed {
+		key := websiteKeyView(listedKey)
+		var ciphertextDigest []byte
+		if credential, ok := matched[i]; ok {
+			key.CredentialID, key.MatchStatus = &credential.id, "matched"
+			digest := sha256.Sum256(credential.ciphertext)
+			ciphertextDigest = digest[:]
+		} else if claims[i] != 0 {
+			key.MatchStatus = "ambiguous"
+		}
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO beichen_website_keys
+ (provider_id,upstream_key_id,name,key_prefix,group_id,group_name,rate,status,enabled,created_at,credential_id,ciphertext_digest,match_status)
+VALUES ($1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12,$13)`, provider, key.ID, key.Name, key.KeyPrefix,
+			key.GroupID, key.GroupName, key.Rate, key.Status, key.Enabled, key.CreatedAt, key.CredentialID, ciphertextDigest, key.MatchStatus)
+		if err != nil {
+			return err
+		}
+	}
+	if err := finishWebsiteKeyInventory(ctx, tx, provider, lease, "current", &observedAt); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Service) findWebsiteCredentialMatches(ctx context.Context, tx *sql.Tx, provider uuid.UUID, keys []listedKey) ([]websiteCredentialMatch, []int, error) {
+	rows, err := tx.QueryContext(ctx, `
+SELECT c.id,c.credential_ciphertext,c.updated_at,c.label::text,COALESCE(p.channel,c.label::text)
+FROM provider_credentials c LEFT JOIN beichen_provision_channels p ON p.credential_id=c.id
+WHERE c.provider_id=$1 AND c.status='active' ORDER BY c.id FOR NO KEY UPDATE OF c`, provider)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var credentials []websiteCredentialMatch
+	claims := make([]int, len(keys))
+	for rows.Next() {
+		var credential websiteCredentialMatch
+		var label, channel string
+		if err := rows.Scan(&credential.id, &credential.ciphertext, &credential.revision, &label, &channel); err != nil {
+			return nil, nil, err
+		}
+		secret, err := s.crypto.DecryptCredential(credential.ciphertext)
+		if err == nil {
+			credential.candidates = websiteKeyCandidates(keys, secret, channel, label)
+			for _, i := range credential.candidates {
+				claims[i]++
+			}
+		}
+		credentials = append(credentials, credential)
+	}
+	return credentials, claims, rows.Err()
+}
+
+func saveWebsiteKeyVersion(ctx context.Context, tx *sql.Tx, credential websiteCredentialMatch, key WebsiteKey, observedAt time.Time, recovered bool) error {
+	effectiveAt, err := priceTimestamp(ctx, tx)
+	if err != nil {
+		return err
+	}
+	changed := false
+	if key.GroupID != nil && key.Rate != nil {
+		// This is the group's base multiplier. It has no verified per-user
+		// override or peak rule, so it cannot be used alone to settle a call.
+		result, err := tx.ExecContext(ctx, `
+INSERT INTO beichen_multiplier_versions(credential_id,effective_at,multiplier,group_id,group_rate,observed_at,stale_at)
+SELECT $1,$2,$3::text::numeric,$4,$3::text::numeric,$5,$2
+WHERE NOT EXISTS (
+  SELECT 1 FROM (SELECT group_id,group_rate FROM beichen_multiplier_versions WHERE credential_id=$1
+                ORDER BY effective_at DESC,id DESC LIMIT 1) previous
+  WHERE previous.group_id=$4 AND previous.group_rate=$3::text::numeric
+)`, credential.id, effectiveAt, key.Rate, key.GroupID, observedAt)
+		if err != nil {
+			return err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		changed = count != 0
+	}
+	unknown := key.GroupID == nil || key.Rate == nil || key.Enabled == nil || !*key.Enabled
+	if unknown {
+		if err := markMultiplierStale(ctx, tx, credential.id, effectiveAt); err != nil {
+			return err
+		}
+	}
+	if changed || unknown {
+		if err := invalidateChangedPanelQuote(ctx, tx, credential.id, credential.revision, effectiveAt, 0, false); err != nil {
+			return err
+		}
+	}
+	if changed || unknown || recovered {
+		return schedulePanelRefresh(ctx, tx, credential.id)
+	}
+	return nil
+}

@@ -89,6 +89,12 @@ func (s *Service) fetchChannelQuote(ctx context.Context, access priceAccess, key
 	if access.disabled {
 		return panelQuote{groupID: group, err: errors.New("北辰面板采价已停用")}
 	}
+	if quote, handled := s.managedChannelQuote(ctx, access, key, group, info, entries); handled {
+		return quote
+	}
+	if err := s.checkLegacyPriceAccount(access); err != nil {
+		return panelQuote{groupID: group, err: err}
+	}
 	webConfigured := s.WebSessionConfigured()
 	// The school's channels use the saved account every round. Legacy bindings
 	// outside that provisioning path can still use their own read authorization.
@@ -232,6 +238,7 @@ func (s *Service) fetchPanelBody(ctx context.Context, token string) ([]byte, err
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-User-UI-Request", "1")
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Cache-Control", "no-cache")
@@ -313,6 +320,7 @@ func panelExpiry(info billingInfo, now time.Time) (time.Time, error) {
 
 type panelGroup struct {
 	ID               int64       `json:"id"`
+	Name             string      `json:"name"`
 	Platform         string      `json:"platform"`
 	SubscriptionType string      `json:"subscription_type"`
 	Status           string      `json:"status"`
@@ -685,9 +693,9 @@ ORDER BY m.effective_at DESC, m.id DESC LIMIT 1`, credentialID, effectiveAt, rev
 	}
 	for _, row := range quote.rows {
 		_, err := tx.ExecContext(ctx, `
-INSERT INTO beichen_price_versions (credential_id, model, track, basis, source, input_rate, output_rate, cache_read_rate, cache_write_rate, effective_at)
-VALUES ($1, $2, 'upstream', 'base', 'panel', $3, $4, $5, $6, $7)`,
-			credentialID, row.Model, row.Rates.Input, row.Rates.Output, row.Rates.CacheRead, row.Rates.CacheWrite, effectiveAt)
+INSERT INTO beichen_price_versions (credential_id, model, track, basis, source, input_rate, output_rate, cache_read_rate, cache_write_rate, effective_at, group_id)
+VALUES ($1, $2, 'upstream', 'base', 'panel', $3, $4, $5, $6, $7, $8)`,
+			credentialID, row.Model, row.Rates.Input, row.Rates.Output, row.Rates.CacheRead, row.Rates.CacheWrite, effectiveAt, group)
 		if err != nil {
 			return err
 		}

@@ -95,13 +95,12 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 				t.Fatal(err)
 			}
 		}
-		exec(`INSERT INTO beichen_datasets (credential_id,kind,next_attempt) VALUES ($1,'usage',now()+interval '1 hour')`, ids[i])
+		exec(`INSERT INTO beichen_datasets (credential_id,kind,next_attempt) VALUES ($1,'key_usage',now()+interval '1 hour')`, ids[i])
 		keys = append(keys, map[string]any{"id": 40 + i, "user_id": 13, "key": secrets[i], "name": name, "group_id": currentGroups[i]})
 	}
 
 	useAmount := func(n int) json.Number { return json.Number(fmt.Sprintf("0.%02d", n)) }
-	var catalogReads, billingReads [len(names)]atomic.Int32
-	var websiteReads, refreshes atomic.Int32
+	var websiteReads, keyListReads, refreshes atomic.Int32
 	round := 1
 	websiteBody := func() any {
 		channels := make([]any, 0, len(names))
@@ -135,13 +134,13 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 				sections = append(sections, map[string]any{"platform": "minimax", "groups": []any{group},
 					"supported_models": []any{model("mixed-model", "minimax", 6)}})
 			}
-			channels = append(channels, map[string]any{"platforms": sections})
+			channels = append(channels, map[string]any{"id": 100 + i, "name": names[i], "status": "active", "platforms": sections})
 			if i == 3 {
 				// The obsolete fixed group remains visible and uses the same
 				// multiplier but has a different price for the same model.
 				staleGroup := map[string]any{"id": 23, "platform": platform, "subscription_type": "standard",
 					"rate_multiplier": useAmount(multipliers[i]), "peak_rate_enabled": false}
-				channels = append(channels, map[string]any{"platforms": []any{map[string]any{
+				channels = append(channels, map[string]any{"id": 200, "name": "旧 CC1 分组", "platforms": []any{map[string]any{
 					"platform": platform, "groups": []any{staleGroup},
 					"supported_models": []any{model("shared", platform, 9)},
 				}}})
@@ -181,40 +180,13 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 				websiteReads.Add(1)
 				return response(200, websiteBody())
 			case "/api/v1/keys":
+				keyListReads.Add(1)
 				items := keys
 				if round == 5 {
 					items = items[:len(items)-1]
 				}
 				return response(200, map[string]any{"code": 0, "data": map[string]any{
 					"items": items, "page": 1, "pages": 1, "page_size": 100, "total": len(items)}})
-			}
-		}
-		for i, key := range secrets {
-			if r.URL.Host != "api.beichenapi.com" || token != key {
-				continue
-			}
-			switch r.URL.Path {
-			case billingPath:
-				billingReads[i].Add(1)
-				billing := map[string]any{"object": "sub2api.key_billing", "schema_version": 1, "billing_scope": "token",
-					"effective_rate_multiplier": useAmount(multipliers[i]), "group_rate_multiplier": useAmount(multipliers[i]),
-					"resolved_rate_multiplier": useAmount(multipliers[i]), "peak_rate_enabled": false, "observed_at": time.Now().UTC()}
-				if i == 0 || i == 2 {
-					billing["group_id"] = currentGroups[i]
-				}
-				return response(200, billing)
-			case modelsPath:
-				catalogReads[i].Add(1)
-				data := []map[string]any{{"id": "shared"}}
-				if i == 0 {
-					data = append(data, map[string]any{"id": "tiered"}, map[string]any{"id": "listed-without-price"})
-					if round >= 2 {
-						data = append(data, map[string]any{"id": "new-model"})
-					}
-				} else if i == 1 {
-					data = append(data, map[string]any{"id": "mixed-model"})
-				}
-				return response(200, map[string]any{"object": "list", "data": data})
 			}
 		}
 		t.Errorf("unexpected outbound request to %s%s", r.URL.Host, r.URL.Path)
@@ -232,26 +204,31 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 			if row.Model != model || row.CredentialID != credential {
 				continue
 			}
-			if row.PriceStatus != expectedStatus || (input != "" && (row.UpstreamRates == nil || row.UpstreamRates.Input == nil || *row.UpstreamRates.Input != input)) ||
+			if expectedStatus == "" || row.PriceStatus != expectedStatus || (input != "" && (row.UpstreamRates == nil || row.UpstreamRates.Input == nil || *row.UpstreamRates.Input != input)) ||
 				(input == "" && row.UpstreamRates != nil) {
-				t.Fatalf("round %d: %s did not have expected status and rate", round, model)
+				t.Fatalf("round %d: %s status is %s, want %s and input %s", round, model, row.PriceStatus, expectedStatus, input)
 			}
 			return
 		}
-		t.Fatalf("round %d: %s missing from overview", round, model)
+		if expectedStatus != "" {
+			t.Fatalf("round %d: %s missing from overview", round, model)
+		}
 	}
 	for ; round <= 3; round++ {
 		exec("UPDATE beichen_datasets SET next_attempt=clock_timestamp() WHERE kind='billing'")
 		if err := service.syncJobs(ctx, nil); err != nil {
-			t.Fatal(err)
+			view, readErr := service.Overview(ctx, provider, "")
+			for _, dataset := range view.Datasets {
+				if dataset.LastError != nil {
+					t.Logf("round %d, fixture Key %s, %s: %s", round, dataset.CredentialID, dataset.Kind, *dataset.LastError)
+				}
+			}
+			t.Fatalf("round %d: %v (overview: %v)", round, err, readErr)
 		}
-		if websiteReads.Load() != int32(round*len(names)) {
-			t.Fatalf("round %d did not read four authenticated price tables", round)
+		if websiteReads.Load() != int32(round*len(names)) || keyListReads.Load() != websiteReads.Load() {
+			t.Fatalf("round %d did not confirm four Key identities and their price tables", round)
 		}
 		for i, id := range ids {
-			if catalogReads[i].Load() != int32(round) || billingReads[i].Load() != int32(round) {
-				t.Fatalf("round %d did not reread directory and multiplier for %s", round, names[i])
-			}
 			var group int64
 			var base int
 			var observedRevision bool
@@ -277,7 +254,7 @@ ORDER BY s.effective_at DESC LIMIT 1`, id).Scan(&group, &base, &observedRevision
 		current("mixed-model", ids[1], "confirmed", "480000")
 		current("listed-without-price", ids[0], "pending_confirmation", "")
 		if round == 2 {
-			current("new-model", ids[0], "not_listed", "")
+			current("new-model", ids[0], "", "")
 		} else if round == 3 {
 			current("new-model", ids[0], "confirmed", "2100000")
 		}
@@ -296,13 +273,14 @@ ORDER BY s.effective_at DESC LIMIT 1`, id).Scan(&group, &base, &observedRevision
 	if err := service.syncJobs(ctx, nil); err == nil {
 		t.Fatal("empty authenticated response reported success")
 	}
-	current("new-model", ids[0], "confirmed", "2100000")
+	pricedChannels = 0
+	current("new-model", ids[0], "pending_confirmation", "")
 	var failed, snapshotCount int
 	var latestSuccess time.Time
 	err = db.QueryRowContext(ctx, `SELECT
   (SELECT count(*) FROM beichen_datasets WHERE kind='prices' AND last_success IS NOT NULL AND last_error=$1),
   (SELECT count(*) FROM beichen_panel_snapshots WHERE expires_at IS NOT NULL),
-  (SELECT max(last_success) FROM beichen_datasets WHERE kind='prices')`, errPanelEmpty.Error()).Scan(&failed, &snapshotCount, &latestSuccess)
+   (SELECT max(last_success) FROM beichen_datasets WHERE kind='prices')`, errWebsiteDirectoryEmpty.Error()).Scan(&failed, &snapshotCount, &latestSuccess)
 	if err != nil || failed != 4 || snapshotCount != 12 || !latestSuccess.Equal(priorSuccess) {
 		t.Fatalf("empty read lost history or advanced last success: errors %d snapshots %d (%v)", failed, snapshotCount, err)
 	}
@@ -314,7 +292,7 @@ ORDER BY s.effective_at DESC LIMIT 1`, id).Scan(&group, &base, &observedRevision
 	}
 	current("shared", ids[3], "pending_confirmation", "")
 	var reason string
-	if err := db.QueryRowContext(ctx, `SELECT last_error FROM beichen_datasets WHERE kind='prices' AND credential_id=$1`, ids[3]).Scan(&reason); err != nil || reason != errPanelGroupUnverified.Error() {
+	if err := db.QueryRowContext(ctx, `SELECT last_error FROM beichen_datasets WHERE kind='prices' AND credential_id=$1`, ids[3]).Scan(&reason); err != nil || reason != errKeyMatch.Error() {
 		t.Fatalf("missing group verification failure: %v", err)
 	}
 	t.Log("three four-channel rounds, deferred model price, and fixed-group rejection verified")

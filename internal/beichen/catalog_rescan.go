@@ -11,6 +11,17 @@ import (
 )
 
 func (s *Service) RescanCatalog(ctx context.Context, provider, credential uuid.UUID) error {
+	return s.rescanCatalog(ctx, provider, credential, false)
+}
+
+func (s *Service) RescanWebsiteCatalog(ctx context.Context, provider, credential uuid.UUID) error {
+	return s.rescanCatalog(ctx, provider, credential, true)
+}
+
+func (s *Service) rescanCatalog(ctx context.Context, provider, credential uuid.UUID, website bool) error {
+	if s == nil {
+		return unavailable("北辰同步未配置", nil)
+	}
 	if provider == uuid.Nil || credential == uuid.Nil {
 		return invalid("需要有效的供应商和渠道 ID")
 	}
@@ -19,8 +30,22 @@ func (s *Service) RescanCatalog(ctx context.Context, provider, credential uuid.U
 	}
 	ctx, cancel := context.WithTimeout(ctx, jobTimeout+5*time.Second)
 	defer cancel()
+	if err := checkActiveSyncCredential(ctx, s.db, provider, credential); err != nil {
+		return err
+	}
+	busy, err := s.runJob(ctx, syncJob{provider: provider, credential: credential, kind: "catalog", websiteCatalog: website}, true)
+	if err != nil {
+		return unavailable("所选渠道目录重扫未完成，请查看渠道状态后重试", err)
+	}
+	if busy {
+		return domain.NewError(domain.CodeInvalidTransition, "所选渠道正在同步，请稍后重扫")
+	}
+	return nil
+}
+
+func checkActiveSyncCredential(ctx context.Context, db rowQueryer, provider, credential uuid.UUID) error {
 	var found uuid.UUID
-	err := s.db.QueryRowContext(ctx, `
+	err := db.QueryRowContext(ctx, `
 SELECT c.id FROM provider_credentials c JOIN providers p ON p.id=c.provider_id
 WHERE p.id=$1 AND c.id=$2 AND p.status='active' AND c.status='active' AND `+beichenProvider,
 		provider, credential).Scan(&found)
@@ -29,13 +54,6 @@ WHERE p.id=$1 AND c.id=$2 AND p.status='active' AND c.status='active' AND `+beic
 	}
 	if err != nil {
 		return unavailable("读取北辰渠道失败", err)
-	}
-	busy, err := s.runJob(ctx, syncJob{provider: provider, credential: credential, kind: "catalog"}, true)
-	if err != nil {
-		return unavailable("所选渠道目录重扫未完成，请查看渠道状态后重试", err)
-	}
-	if busy {
-		return domain.NewError(domain.CodeInvalidTransition, "所选渠道正在同步，请稍后重扫")
 	}
 	return nil
 }

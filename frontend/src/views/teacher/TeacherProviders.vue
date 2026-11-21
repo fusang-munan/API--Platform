@@ -10,6 +10,8 @@ import { useLoadState } from '../../composables/useLoadState'
 import { useToast } from '../../composables/useToast'
 import BeichenSchoolModels from './BeichenSchoolModels.vue'
 import BeichenReconcile from './BeichenReconcile.vue'
+import BeichenLoginPanel from './BeichenLoginPanel.vue'
+import BeichenWebsiteKeys from './BeichenWebsiteKeys.vue'
 import { isBeichenProvider } from '../../utils/beichenModels'
 import { bindingAdapterMeta } from '../../utils/bindingAdapters'
 import { schoolDay } from '../../utils/format'
@@ -683,6 +685,7 @@ onBeforeUnmount(() => { loadVersion++; closeChannelSwitch() })
               <button v-if="isBeichenProvider(p.base_url)" class="button secondary" @click="schoolProvider = p">查看模型</button>
               <button v-if="isBeichenProvider(p.base_url)" type="button" class="button secondary" @click="openChannelSwitch(p)">渠道切换向导</button>
               <button v-if="isBeichenProvider(p.base_url)" type="button" class="button secondary" @click="openAliases(p)">模型别名</button>
+              <BeichenLoginPanel v-if="isBeichenProvider(p.base_url)" :provider="p" />
               <template v-else>
                 <button class="button secondary" :disabled="resetting === p.id" @click="resetCatalog(p)">{{ resetting === p.id ? '重置中…' : '配置重置' }}</button>
                 <button class="button ghost" @click="open(p)">编辑</button>
@@ -691,6 +694,7 @@ onBeforeUnmount(() => { loadVersion++; closeChannelSwitch() })
               </template>
             </div>
           </div>
+          <BeichenWebsiteKeys v-if="isBeichenProvider(p.base_url)" :provider="p" />
           <details v-if="isBeichenProvider(p.base_url) && anomalies[p.id]?.differences" class="catalog-differences">
             <summary>目录差异</summary>
             <p v-if="!anomalies[p.id].differences?.length" class="muted">当前没有启用的渠道 Key。</p>

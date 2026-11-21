@@ -41,11 +41,12 @@ func TestBeichenPostgresDailyComparison(t *testing.T) {
 	schema := pgx.Identifier{"beichen_test_" + uuid.NewString()}.Sanitize()
 	execTestSQL(t, ctx, tx, "CREATE SCHEMA "+schema+"; SET LOCAL search_path TO "+schema)
 	execTestSQL(t, ctx, tx, `
-CREATE TABLE providers (id uuid PRIMARY KEY, base_url text NOT NULL);
+CREATE TABLE providers (id uuid PRIMARY KEY, base_url text NOT NULL, status text);
 CREATE TABLE provider_credentials (id uuid PRIMARY KEY, provider_id uuid, label text NOT NULL DEFAULT '',
-  updated_at timestamptz NOT NULL DEFAULT now(), credential_ciphertext bytea);
+  updated_at timestamptz NOT NULL DEFAULT now(), credential_ciphertext bytea, status text);
 CREATE TABLE users (id uuid PRIMARY KEY);
 CREATE TABLE gateway_calls (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   provider_id uuid, provider_credential_id uuid, binding_id uuid, upstream_model_name text,
   created_at timestamptz, sent_at timestamptz, outcome text, protocol text, usage_state text,
   prompt_tokens int, completion_tokens int, cache_hit_tokens bigint, cache_miss_tokens bigint, cache_write_tokens bigint,
@@ -53,19 +54,11 @@ CREATE TABLE gateway_calls (
   beichen_state text, beichen_credit_exact numeric, beichen_dispatch_kind text, beichen_dispatch_at timestamptz,
   beichen_dispatch_credential_id uuid, beichen_dispatch_model text, beichen_price_at timestamptz
 )`)
-	for _, name := range []string{"0030_beichen.sql", "0033_beichen_panel_prices.sql",
-		"0042_beichen_price_credential_identity.sql", "0051_beichen_billing_observations.sql"} {
-		migration, err := os.ReadFile("../infrastructure/db/migrations/" + name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		execTestSQL(t, ctx, tx, string(migration))
-	}
-	aliases, err := os.ReadFile("../infrastructure/db/migrations/0046_beichen_billing_checks_and_aliases.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	execTestSQL(t, ctx, tx, string(aliases))
+	applyBeichenTestMigrations(t, ctx, tx, "0030_beichen.sql", "0033_beichen_panel_prices.sql",
+		"0034_beichen_panel_access.sql", "0035_beichen_receipts.sql", "0041_beichen_upstream_usage.sql",
+		"0042_beichen_price_credential_identity.sql", "0046_beichen_billing_checks_and_aliases.sql",
+		"0050_beichen_crawl_runs.sql", "0051_beichen_billing_observations.sql",
+		"0052_beichen_key_usage.sql", "0054_beichen_key_website_evidence.sql")
 
 	job := syncJob{provider: uuid.New(), credential: uuid.New()}
 	actor := uuid.New()
@@ -121,10 +114,10 @@ VALUES
 	}
 	start, _ := dayStart(day)
 	var view, prior Overview
-	if err := readComparison(ctx, tx, job.provider, start, &view); err != nil {
+	if err := readComparison(ctx, tx, job.provider, start, start.AddDate(0, 0, 1), &view); err != nil {
 		t.Fatal(err)
 	}
-	if err := readComparison(ctx, tx, job.provider, start.AddDate(0, 0, -1), &prior); err != nil || len(prior.Comparison) != 0 {
+	if err := readComparison(ctx, tx, job.provider, start.AddDate(0, 0, -1), start, &prior); err != nil || len(prior.Comparison) != 0 {
 		t.Fatalf("call or snapshot assigned to the wrong Beijing day: %+v, %v", prior.Comparison, err)
 	}
 	if len(view.Comparison) != 5 {
@@ -140,10 +133,8 @@ VALUES
 				t.Fatalf("unexpected legacy trial or charge: %+v", row)
 			}
 			checkCount(t, row.TrialUnpricedCalls, 0)
-			checkCount(t, row.UpstreamRequests, 0)
-			checkUsageSource(t, row.UpstreamUsageSource, "usage")
-			if row.BilledUpstreamMicros != nil {
-				t.Fatal("empty API snapshot fabricated an actual cost")
+			if row.UpstreamRequests != nil || row.UpstreamUsageSource != nil || row.BilledUpstreamMicros != nil {
+				t.Fatal("old public snapshot was used as proof of a Key's empty day")
 			}
 		case "explicit":
 			checkCount(t, row.LocalRequests, 2)
@@ -283,7 +274,7 @@ func testUsageExportPostgres(t *testing.T, ctx context.Context, tx *sql.Tx, prov
 			t.Fatal(err)
 		}
 		var view Overview
-		if err := readComparison(ctx, tx, provider, start, &view); err != nil {
+		if err := readComparison(ctx, tx, provider, start, service.now(), &view); err != nil {
 			t.Fatal(err)
 		}
 		result := make(map[string]Comparison)
@@ -297,7 +288,7 @@ func testUsageExportPostgres(t *testing.T, ctx context.Context, tx *sql.Tx, prov
 	day := rows[0].date
 	otherModel := rows[1].model
 	legacyRequests := int64(4)
-	if err := saveUsage(ctx, tx, provider, credential, usageRow{date: day, model: otherModel, requests: &legacyRequests}, "usage", nil); err != nil {
+	if err := saveUsage(ctx, tx, provider, credential, usageRow{date: day, model: "public-only", requests: &legacyRequests}, "usage", nil); err != nil {
 		t.Fatal(err)
 	}
 	for range 2 {
@@ -315,8 +306,11 @@ func testUsageExportPostgres(t *testing.T, ctx context.Context, tx *sql.Tx, prov
 	if imported.UpstreamOutputTokens != nil || imported.UpstreamCacheWriteTokens != nil {
 		t.Fatal("re-import changed the null fields")
 	}
-	checkCount(t, byModel[otherModel].UpstreamRequests, legacyRequests)
-	checkUsageSource(t, byModel[otherModel].UpstreamUsageSource, "usage")
+	checkCount(t, byModel[otherModel].UpstreamRequests, 1)
+	checkUsageSource(t, byModel[otherModel].UpstreamUsageSource, "export")
+	if _, ok := byModel["public-only"]; ok {
+		t.Fatal("旧账号级数据混入 Key 对账")
+	}
 
 	manualRequests := int64(9)
 	manual := usageRow{date: day, model: otherModel, requests: &manualRequests}
@@ -333,15 +327,8 @@ func testUsageExportPostgres(t *testing.T, ctx context.Context, tx *sql.Tx, prov
 	checkUsageSource(t, byModel[otherModel].UpstreamUsageSource, "csv")
 	checkUsageSource(t, byModel[stale.model].UpstreamUsageSource, "export")
 
-	job := syncJob{provider: provider, credential: credential}
-	automaticRequests := int64(7)
-	automatic := []usageRow{
-		{date: day, model: rows[0].model, requests: &automaticRequests},
-		{date: day, model: otherModel, requests: &automaticRequests},
-	}
-	if err := replaceUsageDay(ctx, tx, job, day, automatic); err != nil {
-		t.Fatal(err)
-	}
+	seedVerifiedKeyDay(t, ctx, tx, credential, 41, day, service.now(), "CNY",
+		`{"requests":7,"actual_cost":0.000002}`, `[{"model":"example-a","requests":7,"actual_cost":0.000002}]`)
 	execTestSQL(t, ctx, tx, `
 INSERT INTO gateway_calls (provider_id, provider_credential_id, binding_id, upstream_model_name, sent_at, outcome)
 VALUES ($1,$2,$3,'local-only','2026-11-18 08:00:00+08','succeeded')
@@ -351,13 +338,11 @@ VALUES ($1,$2,$3,'local-only','2026-11-18 08:00:00+08','succeeded')
 		t.Fatalf("partial export could replace a confirmed day: %v", err)
 	}
 	byModel = readDay(day)
-	checkCount(t, byModel[rows[0].model].UpstreamRequests, automaticRequests)
-	checkUsageSource(t, byModel[rows[0].model].UpstreamUsageSource, "usage")
+	checkCount(t, byModel[rows[0].model].UpstreamRequests, 2)
+	checkUsageSource(t, byModel[rows[0].model].UpstreamUsageSource, "export")
 	checkCount(t, byModel[otherModel].UpstreamRequests, manualRequests)
 	checkUsageSource(t, byModel[otherModel].UpstreamUsageSource, "csv")
-	if _, ok := byModel[stale.model]; ok {
-		t.Fatal("automatic snapshot did not remove an export-only model")
-	}
+	checkUsageSource(t, byModel[stale.model].UpstreamUsageSource, "export")
 	localOnly := byModel["local-only"]
 	checkCount(t, localOnly.LocalRequests, 1)
 	if localOnly.UpstreamUsageSource != nil {
@@ -370,19 +355,15 @@ VALUES ($1,$2,$3,'local-only','2026-11-18 08:00:00+08','succeeded')
 	if err := service.saveImportedUsage(ctx, tx, provider, credential, actor, "", []usageRow{zeroDayManual}); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.saveImportedUsage(ctx, tx, provider, credential, actor, label, []usageRow{zeroExport}); err != nil {
-		t.Fatal(err)
-	}
-	if err := replaceUsageDay(ctx, tx, job, zeroExport.date, nil); err != nil {
-		t.Fatal(err)
-	}
+	seedVerifiedKeyDay(t, ctx, tx, credential, 41, zeroExport.date, service.now(), "unknown",
+		`{"requests":0,"actual_cost":0}`, `[]`)
 	err = service.saveImportedUsage(ctx, tx, provider, credential, actor, label, []usageRow{zeroExport})
 	if domain.ErrorCode(err) != domain.CodeValidation || !strings.Contains(err.Error(), "自动确认") {
 		t.Fatalf("export could replace a confirmed zero day: %v", err)
 	}
 	byModel = readDay(zeroExport.date)
 	if len(byModel) != 1 {
-		t.Fatal("confirmed zero day did not clear the older export and preserve manual usage")
+		t.Fatal("已确认的零用量账日应只保留原有手工导入")
 	}
 	checkCount(t, byModel[zeroDayManual.model].UpstreamRequests, manualRequests)
 	checkUsageSource(t, byModel[zeroDayManual.model].UpstreamUsageSource, "csv")
@@ -398,7 +379,36 @@ func checkUsageSource(t *testing.T, got *string, want string) {
 	}
 }
 
-func execTestSQL(t *testing.T, ctx context.Context, tx *sql.Tx, query string, args ...any) {
+type testSQLExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func applyBeichenTestMigrations(t *testing.T, ctx context.Context, tx *sql.Tx, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		migration, err := os.ReadFile("../infrastructure/db/migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		execTestSQL(t, ctx, tx, string(migration))
+	}
+}
+
+func seedVerifiedKeyDay(t *testing.T, ctx context.Context, db testSQLExecutor, credential uuid.UUID,
+	keyID int64, day string, fetchedAt time.Time, unit, daily, models string) {
+	t.Helper()
+	execTestSQL(t, ctx, db, "UPDATE provider_credentials SET credential_ciphertext=id::text::bytea WHERE id=$1 AND credential_ciphertext IS NULL", credential)
+	execTestSQL(t, ctx, db, `
+INSERT INTO beichen_key_observations(credential_id,key_digest,website_key_id)
+SELECT id,sha256(credential_ciphertext),$2 FROM provider_credentials WHERE id=$1
+ON CONFLICT(credential_id,key_digest) DO UPDATE SET website_key_id=excluded.website_key_id`, credential, keyID)
+	execTestSQL(t, ctx, db, `
+INSERT INTO beichen_key_usage_days(credential_id,key_digest,website_key_id,day,fetched_at,unit,daily_usage,model_stats,raw_website_pages)
+SELECT id,sha256(credential_ciphertext),$2,$3::text::date,$4,$5,$6::jsonb,$7::jsonb,'fixture'::bytea
+FROM provider_credentials WHERE id=$1`, credential, keyID, day, fetchedAt, unit, daily, models)
+}
+
+func execTestSQL(t *testing.T, ctx context.Context, tx testSQLExecutor, query string, args ...any) {
 	t.Helper()
 	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 		t.Fatal(err)

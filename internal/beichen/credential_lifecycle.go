@@ -158,7 +158,7 @@ WHERE credential_id=$1 AND status='active'`, credential)
 func QueueCredentialSyncTx(ctx context.Context, tx *sql.Tx, credential uuid.UUID) error {
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO beichen_datasets(credential_id,kind)
-SELECT $1::uuid,kind FROM (VALUES ('billing'),('usage')) AS jobs(kind)
+SELECT $1::uuid,kind FROM (VALUES ('billing'),('key_usage')) AS jobs(kind)
 ON CONFLICT(credential_id,kind) DO UPDATE SET next_attempt='-infinity',last_error=NULL,failure_count=0`, credential)
 	return err
 }

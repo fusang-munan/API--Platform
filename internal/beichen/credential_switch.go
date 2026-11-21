@@ -143,7 +143,7 @@ SELECT c.id,c.label::text,c.status,c.updated_at,p.status='active' AND c.status='
     WHEN EXISTS (SELECT 1 FROM beichen_receipt_active_bindings a WHERE a.credential_id=c.id) THEN 'ready'
     WHEN j.discovery_error IS NOT NULL THEN 'failed'
     ELSE 'pending' END,
-  jsonb_object_agg(job.kind, CASE
+  jsonb_object_agg(CASE WHEN job.kind='key_usage' THEN 'usage' ELSE job.kind END, CASE
     WHEN p.status<>'active' OR c.status<>'active' THEN 'inactive'
     WHEN d.lease_until > statement_timestamp() AND (d.last_success IS NULL OR d.last_success < c.updated_at OR d.last_error IS NOT NULL) THEN 'syncing'
     WHEN d.last_error IS NOT NULL THEN 'failed'
@@ -151,7 +151,7 @@ SELECT c.id,c.label::text,c.status,c.updated_at,p.status='active' AND c.status='
     ELSE 'pending' END)
 FROM provider_credentials c JOIN providers p ON p.id=c.provider_id
 LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
-CROSS JOIN (VALUES ('catalog'),('prices'),('billing'),('usage')) job(kind)
+CROSS JOIN (VALUES ('catalog'),('prices'),('billing'),('key_usage')) job(kind)
 LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind=job.kind
 WHERE c.provider_id=$1
 GROUP BY c.id,p.status,j.credential_id,j.channel,j.discovery_error ORDER BY c.label,c.id`, provider)
