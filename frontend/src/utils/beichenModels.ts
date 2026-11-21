@@ -14,7 +14,7 @@ export type SchoolQuote = {
   standard: string | null
   actual: string | null
   actualRates: { input: string | null; output: string | null; cache_read: string | null; cache_write: string | null } | null
-  status: 'confirmed' | 'conditional' | 'not_listed' | 'pending'
+  status: 'confirmed' | 'conditional' | 'derived' | 'not_listed' | 'pending'
   statusLabel: string
   notes: string[]
   mode: 'follow' | 'manual'
@@ -101,6 +101,7 @@ export function schoolCatalog(overview: BeichenOverview, providerId: string): Sc
 const priceStatusLabels = {
   confirmed: '报价已确认',
   conditional: '按条件计价',
+  derived: '反推价，待核对',
   not_listed: '官网未提供同名报价',
   pending: '单价待同步',
 }
@@ -108,7 +109,8 @@ const priceStatusLabels = {
 function schoolQuote(record: BeichenModel | undefined, reported: string | number | null | undefined,
   candidate: boolean, priceError?: string | null, billing?: BeichenDataset) {
   const status: SchoolQuote['status'] = record?.price_status === 'confirmed' || record?.price_status === 'conditional' ||
-    record?.price_status === 'not_listed' ? record.price_status : 'pending'
+    record?.price_status === 'derived' || record?.price_status === 'not_listed' ? record.price_status : 'pending'
+  const derived = record?.price_source === 'derived_from_usage' || status === 'derived'
   const mode: 'follow' | 'manual' = record?.mode === 'manual' ? 'manual' : 'follow'
   const billingError = billing?.last_error
   const stale = billing?.billing_state === 'stale'
@@ -121,7 +123,7 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
       : billingError || observedRate == null || observedRate === '' ? '待同步' : '倍率无效'
   const source = record?.price_conditions_exact ?? record?.price_conditions
   const terms = status !== 'not_listed' && source && typeof source === 'object' && !Array.isArray(source) ? source : null
-  const canCalculate = !priceError && (status === 'confirmed' || status === 'conditional') ? rate : null
+  const canCalculate = !priceError && (status === 'confirmed' || status === 'conditional' || status === 'derived') ? rate : null
   const prices = terms ? formatPriceConditions(terms, canCalculate, true) : null
   const standard = prices?.standard ?? null
   // Older confirmed quotes can have effective token rates without a website pricing object.
@@ -135,10 +137,17 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
   const priceReady = record?.price_covered ?? (mode === 'manual'
     ? Boolean(actualRates?.input != null && actualRates?.output != null)
     : !priceError && Boolean(record?.upstream_rates?.input != null && record?.upstream_rates?.output != null))
-  const statusLabel = priceError
+  const statusLabel = derived && status === 'pending' ? '反推价待重新核实' : priceError
     ? (status === 'pending' ? '价格同步失败' : '上次报价状态 · ' + priceStatusLabels[status])
     : (status === 'pending' && standard ? '官网单价待核对' : priceStatusLabels[status])
   const notes: string[] = []
+  if (derived) {
+    notes.push('输入、输出单价由历史流水反推。缓存单价缺证据时，使用缓存的调用待核账。')
+    if (record?.price_observed_at) {
+      const at = new Date(record.price_observed_at)
+      if (Number.isFinite(at.getTime())) notes.push('反推时间 ' + at.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) + '（北京时间）')
+    }
+  }
   if (priceError) notes.push('价格同步错误：' + priceError)
   if (billingError) notes.push('倍率同步失败：' + billingError)
   if (status === 'confirmed' && !standard && !priceError) notes.push('官网标准价待同步')
@@ -155,6 +164,7 @@ const tokenPrices = [
   ['cache_write_1h_price', '缓存写入（1 小时）'], ['cache_write_12h_price', '缓存写入（12 小时）'],
 ] as const
 const imagePrices = [['image_input_price', '图像输入'], ['image_output_price', '图像输出']] as const
+const videoPrices = [['video_input_price', '视频输入'], ['video_output_price', '视频输出']] as const
 const effortLabels = new Map([
   ['minimal', '极低'], ['low', '低'], ['medium', '中'], ['high', '高'], ['xhigh', '极高'], ['max', '最高'],
 ])
@@ -166,19 +176,19 @@ const unitLabels = {
 }
 
 type PriceUnit = keyof typeof unitLabels
-type PriceField = readonly [(typeof tokenPrices | typeof imagePrices)[number][0] | 'per_request_price', string]
+type PriceField = readonly [(typeof tokenPrices | typeof imagePrices | typeof videoPrices)[number][0] | 'per_request_price', string]
 type PriceGroup = readonly [PriceUnit, readonly PriceField[]]
 
 function priceGroups(mode: BeichenPriceTier['billing_mode']): PriceGroup[] {
   switch (mode) {
     case 'token': return [['token', [...tokenPrices, ...imagePrices]]]
     case 'per_request': return [['request', [['per_request_price', '每次请求']]]]
-    case 'video': return [['second', [['per_request_price', '每秒']]]]
+    case 'video': return [['second', [['per_request_price', '每秒']]], ['unknown', videoPrices]]
     case 'image': return [
-      ['request', [imagePrices[1]]],
-      ['unknown', [imagePrices[0], ['per_request_price', '基础价格']]],
+      ['request', [imagePrices[1], ['per_request_price', '按次基础价']]],
+      ['unknown', [imagePrices[0]]],
     ]
-    default: return [['unknown', [...tokenPrices, ...imagePrices, ['per_request_price', '基础价格']]]]
+    default: return [['unknown', [...tokenPrices, ...imagePrices, ...videoPrices, ['per_request_price', '基础价格']]]]
   }
 }
 

@@ -41,6 +41,8 @@ type Model struct {
 	SchoolStatus         string          `json:"school_status"`
 	RouteReady           bool            `json:"route_ready"`
 	PriceStatus          string          `json:"price_status"`
+	PriceSource          string          `json:"price_source,omitempty"`
+	PriceObservedAt      *time.Time      `json:"price_observed_at,omitempty"`
 	PriceConditions      json.RawMessage `json:"price_conditions"`
 	PriceConditionsExact map[string]any  `json:"price_conditions_exact,omitempty"`
 	UpstreamRates        *DisplayRates   `json:"upstream_rates"`
@@ -297,9 +299,16 @@ func readModels(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Ove
 SELECT m.credential_id, m.model_id::text, p.mode,
   COALESCE(route.school_status, named.status, 'not_configured'),
   owner.status = 'active' AND c.status = 'active' AND COALESCE(route.binding_ready, false),
-  CASE WHEN snap.expires_at > statement_timestamp()
+  CASE WHEN version.source='derived_from_usage' AND p.upstream_input IS NOT NULL THEN
+       jsonb_strip_nulls(jsonb_build_object('billing_mode','token',
+        'input_price',trim_scale(version.input_rate * 0.000000000001::numeric),
+        'output_price',trim_scale(version.output_rate * 0.000000000001::numeric),
+        'cache_read_price',trim_scale(version.cache_read_rate * 0.000000000001::numeric),
+        'cache_write_price',trim_scale(version.cache_write_rate * 0.000000000001::numeric)))
+       WHEN snap.expires_at > statement_timestamp()
          AND COALESCE(snap.credential_ciphertext_sha256 = sha256(c.credential_ciphertext), snap.credential_revision = c.updated_at)
        THEN snap.model_pricing -> (m.model_id::text) END,
+  COALESCE(version.source,''),version.observed_at,
   trim_scale(p.upstream_input)::text, trim_scale(p.upstream_output)::text,
   trim_scale(p.upstream_cache_read)::text, trim_scale(p.upstream_cache_write)::text,
   trim_scale(p.school_input * f.factor)::text, trim_scale(p.school_output * f.factor)::text,
@@ -335,6 +344,7 @@ LEFT JOIN LATERAL (
     AND (cardinality(m.supported_protocols) = 0 OR r.protocol = ANY(m.supported_protocols))
 ) probe ON true
 CROSS JOIN LATERAL beichen_price_at(m.credential_id, m.model_id::text, statement_timestamp()) p
+LEFT JOIN beichen_price_versions version ON version.id=p.upstream_version
 CROSS JOIN LATERAL (SELECT CASE WHEN p.mode = 'follow' THEN 100 ELSE 1 END AS factor) f
 WHERE m.provider_id = $1 AND m.status = 'active'
 ORDER BY m.credential_id, m.model_id`, providerID)
@@ -348,7 +358,7 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 		var terms, rawEntry, protocols []byte
 		var passed, fixedPrice bool
 		err := rows.Scan(&model.CredentialID, &model.Model, &model.Mode,
-			&model.SchoolStatus, &model.RouteReady, &terms,
+			&model.SchoolStatus, &model.RouteReady, &terms, &model.PriceSource, &model.PriceObservedAt,
 			&upstream.Input, &upstream.Output, &upstream.CacheRead, &upstream.CacheWrite,
 			&school.Input, &school.Output, &school.CacheRead, &school.CacheWrite, &model.available, &model.currentKey, &rawEntry, &protocols,
 			&model.lastProbeAt, &passed, &model.credentialRejected, &fixedPrice)
@@ -386,6 +396,9 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 		model.priceReadiness = routePriceReadiness(fixedPrice, terms)
 		if upstream.Input != nil && upstream.Output != nil {
 			model.PriceStatus = "confirmed"
+			if model.PriceSource == derivedPriceSource {
+				model.PriceStatus = "derived"
+			}
 			model.UpstreamRates = &upstream
 		} else if model.priceReadiness.conditional || fixedPrice && conditionalPanelPricing(terms) {
 			model.PriceStatus = "conditional"
@@ -405,6 +418,8 @@ func (m *Model) catalogPriceState() string {
 		return "manual"
 	case m != nil && m.PriceStatus == "confirmed":
 		return "confirmed"
+	case m != nil && m.PriceStatus == "derived":
+		return "derived"
 	case m != nil && m.PriceStatus == "conditional":
 		return "conditional"
 	default:

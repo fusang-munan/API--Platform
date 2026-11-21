@@ -81,10 +81,15 @@ const manualPrices = computed(() => priceFields.map(field => {
   return { ...field, value: decimalPattern.test(value) ? shiftDecimal(value, 0) : null }
 }))
 const followPrices = computed(() => affectedKeys.value.map(key => {
-  const upstream = modelPrices.value.get(key.credential_id)?.upstream_rates
+  const record = modelPrices.value.get(key.credential_id)
+  const upstream = record?.upstream_rates
   // 已应用渠道倍率的上游报价以百万分之一元返回，再乘 100 换成积分。
-  return { ...key, prices: priceFields.map(field => ({ ...field, value: scaledNumber(upstream?.[field.key], 4) })) }
+  return { ...key, derived: record?.price_source === 'derived_from_usage',
+    prices: priceFields.map(field => ({ ...field, value: scaledNumber(upstream?.[field.key], 4) })) }
 }))
+const hasDerived = computed(() => followPrices.value.some(quote => quote.derived) ||
+  (props.row?.quotes.some(quote => quote.status === 'derived') ?? false))
+const followLabel = computed(() => hasDerived.value ? '自动计价' : '跟随官网')
 const importableQuote = computed(() => followPrices.value.find(({ prices }) =>
   prices.every(field => field.value == null ? field.key.startsWith('cache_') : decimalPattern.test(field.value))))
 const confirmationPrices = computed(() => mode.value === 'manual'
@@ -125,7 +130,7 @@ async function loadOverview() {
     selectedIds.value = selectedIds.value.filter(id => selectableIds.has(id))
     if (firstLoad) {
       const state = catalogEntry.value?.price_state
-      if (state && state !== 'confirmed') mode.value = 'manual'
+      if (state && state !== 'confirmed' && state !== 'derived') mode.value = 'manual'
       const current = Array.from(modelPrices.value.values()).filter(record => record.school_rates)
       const source = (current.find(record => record.mode === 'manual') ?? current[0])?.school_rates
       if (source) {
@@ -200,16 +205,17 @@ async function save() {
     <form class="price-drawer beichen-stack" :aria-busy="saving" novalidate @submit.prevent="save">
       <fieldset class="price-mode" :disabled="editingDisabled">
         <legend>计价方式</legend>
-        <label><input v-model="mode" type="radio" value="follow" :name="fieldId + '-mode'">跟随官网</label>
+        <label><input v-model="mode" type="radio" value="follow" :name="fieldId + '-mode'">{{ followLabel }}</label>
         <label><input v-model="mode" type="radio" value="manual" :name="fieldId + '-mode'">手动定价</label>
       </fieldset>
+      <p v-if="hasDerived" class="beichen-note">反推价，待核对。自动计价优先采用同分组的正式官网价。反推价的缓存单价待核实。</p>
 
       <template v-if="mode === 'manual'">
         <div class="beichen-toolbar">
           <strong>基础价 · 积分 / 百万 Token</strong>
           <button type="button" class="button ghost" :disabled="editingDisabled || !importableQuote"
             :title="importableQuote ? `带入 ${importableQuote.label} 的渠道基础价` : '暂无可带入的官网基础价，请手动填写'"
-            @click="importOfficial">从官网价带入</button>
+            @click="importOfficial">{{ importableQuote?.derived ? '从反推价带入' : '从官网价带入' }}</button>
         </div>
         <div class="price-inputs">
           <div v-for="field in manualPrices" :key="field.key" class="price-input">
@@ -228,7 +234,7 @@ async function save() {
         </div>
       </template>
       <div v-else class="follow-hint">
-        <p class="beichen-note">基础价随官网报价和渠道倍率更新。缺少可用报价时，调用可能进入待核账。</p>
+        <p class="beichen-note">{{ hasDerived ? '基础价随所选报价和渠道倍率更新。使用了无报价的缓存项时，调用进入待核账。' : '基础价随官网报价和渠道倍率更新。缺少可用报价时，调用可能进入待核账。' }}</p>
       </div>
 
       <fieldset class="price-mode" :disabled="editingDisabled || !modelKeys.length">
@@ -257,7 +263,7 @@ async function save() {
         <dl class="confirmation-summary">
           <div><dt>影响 Key 数</dt><dd>{{ scope === 'all' && incompleteScope ? '待确认' : affectedKeys.length }}</dd></div>
           <div><dt>影响行数</dt><dd>{{ scope === 'all' && incompleteScope ? '待确认' : affectedKeys.length }}</dd></div>
-          <div><dt>计价方式</dt><dd>{{ mode === 'follow' ? '跟随官网' : '手动价' }}</dd></div>
+          <div><dt>计价方式</dt><dd>{{ mode === 'follow' ? followLabel : '手动价' }}</dd></div>
         </dl>
         <h4>本次将影响的全部 Key</h4>
         <ul v-if="affectedKeys.length" class="affected-keys" aria-label="本次将影响的全部 Key">
@@ -269,7 +275,7 @@ async function save() {
           <caption>基础单价 / 百万 Token（1 元 = 100 积分）</caption>
           <thead><tr><th scope="col">用量项</th><th scope="col">元</th><th scope="col">积分</th></tr></thead>
           <tbody v-for="quote in confirmationPrices" :key="quote.credential_id">
-            <tr v-if="quote.label" class="confirmation-channel"><th colspan="3" scope="rowgroup">{{ quote.label }}</th></tr>
+            <tr v-if="quote.label" class="confirmation-channel"><th colspan="3" scope="rowgroup">{{ quote.label }}<template v-if="'derived' in quote && quote.derived"> · 反推价，待核对</template></th></tr>
             <tr v-for="field in quote.prices" :key="field.key">
               <th scope="row">{{ field.label }}</th>
               <td>{{ field.value == null ? (mode === 'follow' ? '待核' : '—') : shiftDecimal(field.value, -2) }}</td>
@@ -298,7 +304,7 @@ async function save() {
         <button v-if="outcome" type="button" class="button primary" @click="close(false)">完成</button>
         <template v-else>
           <button type="button" class="button ghost" :disabled="saving" @click="close(false)">取消</button>
-          <button type="submit" class="button primary" :disabled="!canSave">{{ saving ? '保存中…' : mode === 'follow' ? '保存并跟随官网' : '保存手动价' }}</button>
+          <button type="submit" class="button primary" :disabled="!canSave">{{ saving ? '保存中…' : mode === 'follow' ? '保存并' + followLabel : '保存手动价' }}</button>
         </template>
       </div>
     </form>

@@ -462,11 +462,17 @@ data: {"revision":"01K2..."}
 
 线路就绪且报价阻止启用时，`model_catalog[].price_blocker` 返回 `{code, message}`，其中 `message` 说明涉及的字段及适用的档位号。常见代码包括 `missing_price`、`billing_mode_non_token`、`price_conditions_invalid`、`tier_missing_input`、`tier_missing_output`、`tier_range_invalid` 和 `effort_multiplier_invalid`。线路未就绪时，查看 `blockers` 中的 `no_ready_route`。
 
-概览的 `models[].price_conditions` 保留官网报价原值。可按 Token 解析的报价在 `price_conditions_exact` 中显示实际使用的报价字段，数值以字符串返回以保留小数精度。空或省略的计费模式默认按 Token 处理，明确以 Token 为主时会忽略附带的按次、图像和视频单价。
+使用官网报价时，概览的 `models[].price_conditions` 保留官网原值。可按 Token 解析的报价在 `price_conditions_exact` 中显示实际使用的报价字段，数值以字符串返回以保留小数精度。空或省略的计费模式默认按 Token 处理，明确以 Token 为主时会忽略附带的按次、图像和视频单价。
+
+选中历史流水反推报价时，`models[].price_status` 为 `derived`、`price_source` 为 `derived_from_usage`，`price_observed_at` 为反推时间。`price_conditions` 和 `price_conditions_exact` 给出这份基础单价，缓存价缺证据时省略对应字段。`upstream_rates` 已应用当前 Key 的已核实倍率。能力目录的 `price_state` 同样标记 `derived`。原有模型定价接口可为该模型设置教师价或恢复自动选择。
+
+带上下文倍率的官网报价保留 `intervals` 中的四项倍率和档位标签。`price_conditions_exact` 将倍率应用到基础单价，并使用下限包含、上限不包含的边界。未命中该类档位时使用基础价。`website_directory.price_unit` 为「元（北辰余额单位）」。官网报价按 1:1 读取，界面上的 `$` 不触发货币换算。
 
 `website_directory` 返回完整官网目录状态、`last_success` 和 `last_error`。`fresh` 表示近期完整采集，`stale` 表示当前使用部分更新或保留的快照，`unverified` 表示等待取得官网目录。`model_catalog` 合并官网与启用 Key 的目录，并保留已发布但失去目录覆盖的模型。`source` 为 `website`、`key` 或 `both`。`catalog_state` 为 `website_only`、`key_listed` 或 `catalog_missing`。`key_count` 按有目录证据的当前 Key 去重。已有 Key 同版本的上次结果在扫描失败后仍可查，`catalog_keys[].stale` 标记该情况。
 
 `website_directory.last_run` 是最近一次后台抓取的摘要，尚无运行记录时为 `null`。摘要包含 `started_at`、`duration_ms`、`platform_count`、`group_count`、`model_count`、`expected_model_count` 和 `failures`。同一平台出现在不同渠道下时分别计数。模型按去掉首尾空白的官网原名去重，保留大小写及版本差异。分组按照分组 ID 去重，没有 ID 时用渠道内的平台和分组名识别。`expected_model_count` 含原响应中所有 `models` 和 `supported_models` 数组中能辨认的型号。当平台资料损坏时，本轮成功归入平台的模型数可能低于它。失败项提供 `path`、`reason` 以及可读取的 `channel_id`、`channel` 和 `platform`。
+
+`website_directory.last_run.key_model_comparisons` 按学校渠道返回 `/v1/models` 与当前官网分组的对照。`matched` 提供 `key_model`、`channel_model`、匹配方式和 `price_complete`。名称相同优先，其次核对可以双向唯一匹配的写法变体。`only_key` 和 `only_channel` 保留各自的官网或请求原名。`state=unavailable` 表示 Key 目录读取失败，`unverified` 表示分组或渠道证据不足。两种状态都不把未知结果当作已确认差异。整批身份读取失败时摘要提供 `key_model_error`。官网分组的 `account_rate_multiplier` 来自同一网页登录会话的 `GET /api/v1/groups/rates`，`rate_multiplier` 为分组默认值。账户倍率未读到时，`last_run.account_rate_error` 给出状态。
 
 `website_locations` 带官网原名、渠道、平台、分组、采集时间、缓存状态和报价存在标记。`catalog_keys` 带实际覆盖的 Key 及上游型号，或者给出需要核查的 Key。`state` 可为 `listed`、`missing`、`pending`、`failed` 或 `ambiguous`。已覆盖条目用 `match` 说明原名、名称归一或教师别名，并保留独立的 Key 型号 ID 供教师操作。弱匹配可以识别唯一的日期版本，保留型号数字和具有实际含义的变体。官网已有价格且当前 Key 报价待确认时，教师可同时看到分组和目录证据。
 
@@ -508,7 +514,22 @@ data: {"revision":"01K2..."}
 
 `data.status` 为 `unsynced`、`current`、`stale`、`session_expired` 或 `unavailable`。成功时 `last_seen` 更新为读取时间。北辰返回 401 或会话已知过期时返回 `session_expired`，保留最近成功的清单及时间。已保存的清单超过 30 分钟未更新时显示 `stale`。并发刷新返回 `invalid_transition`。
 
-`data.keys` 的每一项包含北辰 `id`、`name`、脱敏后的 `key_prefix`、`group_id`、`group_name`、分组倍率 `rate`、`status`、`enabled`、`created_at`、`last_seen`、匹配的学校 `credential_id` 和 `match_status`。倍率用十进制字符串传输，未知字段为 `null`。匹配状态为 `matched`、`unmatched` 或 `ambiguous`。
+`data.keys` 的每一项包含北辰 `id`、`name`、脱敏后的 `key_prefix`、`group_id`、`group_name`、分组倍率 `rate`、`status`、`enabled`、`created_at`、`last_seen`、匹配的学校 `credential_id` 和 `match_status`。`peak` 包含 `enabled`、`rate`、`start` 和 `end`，取官网 Key 页的 `group.peak_rate_enabled`、`group.peak_rate_multiplier`、`group.peak_start` 和 `group.peak_end`。倍率用十进制字符串传输，未知字段为 `null`。匹配状态为 `matched`、`unmatched` 或 `ambiguous`。
+
+`observed_at` 是当前分组、倍率和高峰规则版本首次读到的时间。`changed_at` 是当前版本与上一版本发生变化时的抓取时间，首次建立基线或尚未采集版本时为 `null`。`last_seen` 随每次成功读取推进，便于判断数据是否新鲜。两次抓取之间发生的变化以实际读到的时间登记。
+
+`beichen-crawl --keys` 的 `keys[].models` 来自 `channels/available` 的同一分组，`actual_models` 和 `actual_model_count` 来自使用当前 Key 发出的 `GET /v1/models`。`matched` 同时保留 Key 型号原名和渠道型号原名，名称完全一致或写法可以双向唯一匹配时成立。`only_key` 和 `only_group` 分别列出只在实际清单或只在官网分组出现的型号。一侧资料无法核实时，差异字段为 `null`。
+
+`model_check=checked` 表示读取到非空清单，`empty` 表示上游明确返回空清单。`unverified` 表示官网未提供可请求的完整 Key，`unavailable` 表示模型读取失败，两者的实际型号数和清单均为 `null`。此时命令保留其余 Key 的结果并返回非零退出码。用于查看型号的完整 Key 只在本次请求期间留在内存。
+
+##### 接口稳定性清单
+
+| 接口 | 稳定性 | 用途 |
+| --- | --- | --- |
+| 北辰 `GET /api/v1/keys` | `experimental` | 上游网页接口，分页和分组字段按当前实测兼容 |
+| 北辰 `GET https://api.beichenapi.com/v1/models` | `experimental` | 用该把 Key 授权读取型号清单，显式空列表与授权失败分别处理 |
+| `GET /api/v1/teacher/providers/{provider_id}/beichen/keys` | `stable` | 教师读取当前清单、倍率、高峰规则及最后变化时间 |
+| `POST /api/v1/teacher/providers/{provider_id}/beichen/keys/refresh` | `stable` | 手动触发与定时抓取共用的同步流程 |
 
 ### 7.1 北辰批量启用与按模型定价
 

@@ -114,7 +114,7 @@ func catalogWebsiteMatches(keys []discoveryKey, websiteNames catalogNameMatcher,
 		if match.name != "" {
 			targets[strings.ToLower(match.name)] = true
 			item := key.listed(match.name, match.kind)
-			if row := key.models[match.name]; row != nil && row.PriceStatus != "confirmed" && row.PriceStatus != "conditional" {
+			if row := key.models[match.name]; row != nil && row.PriceStatus != "confirmed" && row.PriceStatus != "conditional" && row.PriceStatus != "derived" {
 				item.GroupDiagnosis = key.diagnoseGroup(locations, false)
 			}
 			evidence = append(evidence, item)

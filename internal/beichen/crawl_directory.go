@@ -16,13 +16,16 @@ import (
 )
 
 type CrawlRun struct {
-	StartedAt          time.Time      `json:"started_at"`
-	DurationMS         int64          `json:"duration_ms"`
-	PlatformCount      int            `json:"platform_count"`
-	GroupCount         int            `json:"group_count"`
-	ModelCount         int            `json:"model_count"`
-	ExpectedModelCount int            `json:"expected_model_count"`
-	Failures           []CrawlFailure `json:"failures"`
+	StartedAt           time.Time                 `json:"started_at"`
+	DurationMS          int64                     `json:"duration_ms"`
+	PlatformCount       int                       `json:"platform_count"`
+	GroupCount          int                       `json:"group_count"`
+	ModelCount          int                       `json:"model_count"`
+	ExpectedModelCount  int                       `json:"expected_model_count"`
+	Failures            []CrawlFailure            `json:"failures"`
+	KeyModelComparisons []CrawlKeyModelComparison `json:"key_model_comparisons,omitempty"`
+	KeyModelError       string                    `json:"key_model_error,omitempty"`
+	AccountRateError    string                    `json:"account_rate_error,omitempty"`
 }
 
 type CrawlFailure struct {
@@ -45,8 +48,10 @@ func (run CrawlRun) panelSummary() PanelCrawlSummary {
 
 type directoryCrawl struct {
 	CrawlRun
-	platforms   []directoryPlatform
-	rawResponse []byte
+	platforms            []directoryPlatform
+	rawResponse          []byte
+	membershipComplete   bool
+	accountRatesVerified bool
 }
 
 func (crawl *directoryCrawl) addFailure(path string, section directoryPlatform, reason string) {
@@ -77,7 +82,7 @@ func decodeWebsiteDirectory(body []byte, observedAt time.Time) (directoryCrawl, 
 		return failedDirectoryCrawl(errors.New("北辰官网响应的 data 不是渠道数组"))
 	}
 
-	crawl := directoryCrawl{CrawlRun: CrawlRun{Failures: []CrawlFailure{}}, rawResponse: rawResponse}
+	crawl := directoryCrawl{CrawlRun: CrawlRun{Failures: []CrawlFailure{}}, rawResponse: rawResponse, membershipComplete: true}
 	sourceNames := map[string]struct{}{}
 	for i, raw := range channels {
 		var channel struct {
@@ -93,6 +98,7 @@ func decodeWebsiteDirectory(body []byte, observedAt time.Time) (directoryCrawl, 
 		channelPath := fmt.Sprintf("data[%d]", i)
 		if err != nil || channel.Platforms == nil {
 			crawl.addFailure(channelPath, section, "渠道资料无效或缺少 platforms 数组")
+			crawl.membershipComplete = false
 		}
 		for j, rawPlatform := range channel.Platforms {
 			path := fmt.Sprintf("%s.platforms[%d]", channelPath, j)
@@ -100,12 +106,13 @@ func decodeWebsiteDirectory(body []byte, observedAt time.Time) (directoryCrawl, 
 			for _, name := range sourceModels {
 				sourceNames[name] = struct{}{}
 			}
-			if len(problems) != 0 {
-				crawl.addFailure(path, platform, strings.Join(problems, "，"))
+			if len(problems.messages) != 0 {
+				crawl.addFailure(path, platform, strings.Join(problems.messages, "，"))
 			}
+			crawl.membershipComplete = crawl.membershipComplete && !problems.membershipIncomplete
 			if readable {
 				platform.Scope = directoryScope(platform, i)
-				platform.Incomplete = len(problems) != 0
+				platform.Incomplete = len(problems.messages) != 0
 				crawl.platforms = append(crawl.platforms, platform)
 			}
 		}
@@ -118,8 +125,11 @@ func decodeWebsiteDirectory(body []byte, observedAt time.Time) (directoryCrawl, 
 		}
 		return crawl, errWebsiteDirectoryEmpty
 	}
-	if crawl.ExpectedModelCount != crawl.ModelCount && len(crawl.Failures) == 0 {
-		crawl.addFailure("response", directoryPlatform{}, "报告模型数与响应中去重后的模型数不一致")
+	if crawl.ExpectedModelCount != crawl.ModelCount {
+		crawl.membershipComplete = false
+		if len(crawl.Failures) == 0 {
+			crawl.addFailure("response", directoryPlatform{}, "报告模型数与响应中去重后的模型数不一致")
+		}
 	}
 	if len(crawl.Failures) != 0 {
 		return crawl, errWebsiteDirectoryPartial
@@ -132,27 +142,38 @@ type websiteModelLists struct {
 	Models    json.RawMessage `json:"models"`
 }
 
-func decodeDirectoryPlatform(raw json.RawMessage, section directoryPlatform) (directoryPlatform, []string, []string, bool) {
+type directoryProblems struct {
+	messages             []string
+	membershipIncomplete bool
+}
+
+func (p *directoryProblems) add(message string) {
+	p.messages = append(p.messages, message)
+	p.membershipIncomplete = true
+}
+
+func decodeDirectoryPlatform(raw json.RawMessage, section directoryPlatform) (directoryPlatform, []string, directoryProblems, bool) {
 	var input struct {
 		websiteModelLists
 		Platform string          `json:"platform"`
 		Groups   json.RawMessage `json:"groups"`
 	}
 	err := json.Unmarshal(raw, &input)
-	var problems, sourceNames []string
+	var problems directoryProblems
+	var sourceNames []string
 	platform := strings.TrimSpace(input.Platform)
 	hasPlatform := err == nil && validModel(platform)
 	if hasPlatform {
 		section.Platform = platform
 	} else {
-		problems = append(problems, "platform 名称缺失或格式无效")
+		problems.add("platform 名称缺失或格式无效")
 	}
 	section.Groups = []directoryGroup{}
 	section.Models = []directoryModel{}
 	hasModels := readDirectoryModels(&section, input.websiteModelLists, 0, "", &sourceNames, &problems)
 	var groups []json.RawMessage
 	if len(input.Groups) != 0 && json.Unmarshal(input.Groups, &groups) != nil {
-		problems = append(problems, "groups 不是分组数组")
+		problems.add("groups 不是分组数组")
 	}
 	for i, item := range groups {
 		var group struct {
@@ -161,9 +182,10 @@ func decodeDirectoryPlatform(raw json.RawMessage, section directoryPlatform) (di
 		}
 		if json.Unmarshal(item, &group) != nil || group.ID < 0 || group.ID > 9007199254740991 ||
 			(group.ID == 0 && strings.TrimSpace(group.Name) == "") {
-			problems = append(problems, fmt.Sprintf("groups[%d] 分组资料无效", i))
+			problems.add(fmt.Sprintf("groups[%d] 分组资料无效", i))
 			continue
 		}
+		group.AccountRate = nil
 		if group.ID > 0 {
 			group.OwnModels = readDirectoryModels(&section, group.websiteModelLists, group.ID,
 				fmt.Sprintf("groups[%d].", i), &sourceNames, &problems)
@@ -175,17 +197,17 @@ func decodeDirectoryPlatform(raw json.RawMessage, section directoryPlatform) (di
 		if model.GroupID == 0 || namesGroup(section.Groups, model.GroupID) {
 			return false
 		}
-		problems = append(problems, "模型的 group_id 未在本平台的 groups 中登记")
+		problems.add("模型的 group_id 未在本平台的 groups 中登记")
 		return true
 	})
 	if !hasModels {
-		problems = append(problems, "没有可读取的 models 或 supported_models 数组")
+		problems.add("没有可读取的 models 或 supported_models 数组")
 	}
 	return section, sourceNames, problems, hasPlatform && hasModels
 }
 
 func readDirectoryModels(section *directoryPlatform, input websiteModelLists, groupID int64, prefix string,
-	sourceNames, problems *[]string) bool {
+	sourceNames *[]string, problems *directoryProblems) bool {
 	hasModelList := false
 	for _, list := range []struct {
 		name string
@@ -196,7 +218,7 @@ func readDirectoryModels(section *directoryPlatform, input websiteModelLists, gr
 		}
 		var rows []json.RawMessage
 		if json.Unmarshal(list.raw, &rows) != nil {
-			*problems = append(*problems, prefix+list.name+" 不是模型数组")
+			problems.add(prefix + list.name + " 不是模型数组")
 			continue
 		}
 		hasModelList = true
@@ -206,7 +228,7 @@ func readDirectoryModels(section *directoryPlatform, input websiteModelLists, gr
 				*sourceNames = append(*sourceNames, model.Name)
 			}
 			if groupID != 0 && model.GroupID != 0 && model.GroupID != groupID {
-				*problems = append(*problems, fmt.Sprintf("%s%s[%d] 的 group_id 与所属分组冲突", prefix, list.name, i))
+				problems.add(fmt.Sprintf("%s%s[%d] 的 group_id 与所属分组冲突", prefix, list.name, i))
 				continue
 			}
 			if groupID != 0 {
@@ -216,7 +238,9 @@ func readDirectoryModels(section *directoryPlatform, input websiteModelLists, gr
 				section.Models = append(section.Models, model)
 			}
 			if problem != "" {
-				*problems = append(*problems, fmt.Sprintf("%s%s[%d] %s", prefix, list.name, i, problem))
+				problems.add(fmt.Sprintf("%s%s[%d] %s", prefix, list.name, i, problem))
+			} else if model.priceBlocker == crawlPriceInvalid {
+				problems.messages = append(problems.messages, fmt.Sprintf("%s%s[%d] pricing 报价格式无效", prefix, list.name, i))
 			}
 		}
 	}
@@ -267,12 +291,9 @@ func decodeDirectoryModel(raw json.RawMessage, at time.Time) (directoryModel, st
 			pricing = nil
 		}
 	}
-	blocker, _ := usage.BeichenTokenQuoteBlocker(pricing)
+	blocker := usage.BeichenDirectoryQuoteBlocker(pricing)
 	model := directoryModel{Name: name, Platform: input.Platform, GroupID: groupID, Protocols: input.Protocols,
 		Pricing: pricing, ObservedAt: at, priceBlocker: blocker}
-	if blocker == crawlPriceInvalid {
-		return model, "pricing 报价格式无效"
-	}
 	if err != nil {
 		return model, "模型资料格式无效"
 	}

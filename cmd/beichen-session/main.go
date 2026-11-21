@@ -22,7 +22,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db"
 )
 
-const cliUsage = "用法：beichen-session login --window，或 status|check [--provider 供应商UUID]。学校管理模式支持 login|export --actor 教师UUID 和 import <配置文件>"
+const cliUsage = "用法：beichen-session login --window，或 status|check [--provider 供应商UUID]，或 adopt <原生登录导出的会话JSON>。学校管理模式支持 login|export --actor 教师UUID 和 import <配置文件>"
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -36,6 +36,9 @@ func run(args []string, input *os.File, stdout, stderr io.Writer) int {
 	command := args[0]
 	if command == "import" {
 		return importConfig(args[1:], stdout, stderr)
+	}
+	if command == "adopt" {
+		return adoptSession(args[1:], stdout, stderr)
 	}
 	switch command {
 	case "login", "status", "export", "check":
@@ -353,4 +356,38 @@ func writeSessionEnv(path, contents string) error {
 		return errors.New("替换北辰会话导出文件失败，请检查文件权限和占用情况")
 	}
 	return nil
+}
+
+func adoptSession(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, "用法：beichen-session adopt <原生登录导出的会话JSON>")
+		return 2
+	}
+	raw, err := os.ReadFile(args[0])
+	if err != nil {
+		fmt.Fprintln(stderr, "无法读取会话文件")
+		return 1
+	}
+	var input struct {
+		Email   string `json:"web_email"`
+		Access  string `json:"web_access_token"`
+		Refresh string `json:"web_refresh_token"`
+		Expires string `json:"web_expires_at"`
+	}
+	if json.Unmarshal(raw, &input) != nil || strings.TrimSpace(input.Access) == "" {
+		fmt.Fprintln(stderr, "会话文件格式无效")
+		return 1
+	}
+	var expires *time.Time
+	if input.Expires != "" {
+		if parsed, parseErr := time.Parse(time.RFC3339, input.Expires); parseErr == nil {
+			expires = &parsed
+		}
+	}
+	if err := beichen.SaveLocalLogin(context.Background(), input.Email, input.Access, input.Refresh, expires); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "会话已加密保存，本机爬虫可直接使用")
+	return 0
 }

@@ -21,6 +21,7 @@ var (
 
 type WebsiteDirectoryStatus struct {
 	State       string     `json:"state"`
+	PriceUnit   string     `json:"price_unit"`
 	LastSuccess *time.Time `json:"last_success"`
 	LastError   *string    `json:"last_error"`
 	LastRun     *CrawlRun  `json:"last_run"`
@@ -31,6 +32,7 @@ type WebsiteGroup struct {
 	Name        string       `json:"name,omitempty"`
 	Status      string       `json:"status,omitempty"`
 	Rate        *json.Number `json:"rate_multiplier,omitempty"`
+	AccountRate *json.Number `json:"account_rate_multiplier,omitempty"`
 	PeakRate    *json.Number `json:"peak_rate_multiplier,omitempty"`
 	PeakEnabled *bool        `json:"peak_rate_enabled,omitempty"`
 }
@@ -175,7 +177,16 @@ RETURNING platforms`, provider, lease, leaseSeconds, manual).Scan(&previous)
 	}
 	fetch, cancel := context.WithTimeout(ctx, jobTimeout)
 	crawl, observedErr := s.crawlWebsiteDirectory(fetch, provider, "")
+	if crawl.membershipComplete {
+		crawl.KeyModelComparisons, crawl.KeyModelError = s.crawlKeyModels(fetch, provider, &crawl, "")
+		crawl.DurationMS = time.Since(crawl.StartedAt).Milliseconds()
+	}
 	cancel()
+	// Capture fresh records before restoring older data in a partial merge.
+	prices, err := json.Marshal(websitePriceObservations(crawl))
+	if err != nil {
+		return PanelCrawlSummary{}, errPanelAccountDB
+	}
 	platforms := crawl.platforms
 	if errors.Is(observedErr, errWebsiteDirectoryPartial) {
 		var old []directoryPlatform
@@ -209,6 +220,13 @@ RETURNING platforms`, provider, lease, leaseSeconds, manual).Scan(&previous)
 	if err != nil {
 		return PanelCrawlSummary{}, errPanelAccountDB
 	}
+	comparisons := []byte("[]")
+	if crawl.KeyModelComparisons != nil {
+		comparisons, err = json.Marshal(crawl.KeyModelComparisons)
+		if err != nil {
+			return PanelCrawlSummary{}, errPanelAccountDB
+		}
+	}
 	var saved uuid.UUID
 	err = s.db.QueryRowContext(ctx, `
 WITH saved AS (
@@ -221,17 +239,34 @@ WITH saved AS (
     lease_id=NULL,lease_until=NULL
   WHERE provider_id=$1 AND lease_id=$2 AND lease_until>clock_timestamp()
   RETURNING provider_id
+), price_history AS (
+  INSERT INTO beichen_group_price_observations (provider_id, group_id, model, observed_at, group_rules, pricing)
+  SELECT saved.provider_id, quote.group_id, quote.model, quote.observed_at, quote.group_rules, quote.pricing
+  FROM saved CROSS JOIN jsonb_to_recordset($14::jsonb)
+    AS quote(group_id bigint, model text, observed_at timestamptz, group_rules jsonb, pricing jsonb, account_rates_verified boolean)
+  LEFT JOIN LATERAL (
+    SELECT observed_at, group_rules, pricing FROM beichen_group_price_observations
+    WHERE provider_id=saved.provider_id AND group_id=quote.group_id AND model=quote.model AND source='website'
+    ORDER BY observed_at DESC LIMIT 1
+  ) previous ON true
+  WHERE (quote.account_rates_verified OR previous.group_rules->'account_rate_multiplier' IS NULL)
+    AND (previous.observed_at IS NULL OR (previous.observed_at < quote.observed_at
+      AND (previous.group_rules, previous.pricing) IS DISTINCT FROM (quote.group_rules, quote.pricing)))
+  ON CONFLICT DO NOTHING
 )
-INSERT INTO beichen_crawl_runs (provider_id, started_at, duration_ms, platform_count, group_count, model_count, expected_model_count, failures, raw_website_response)
-SELECT provider_id,$6,$7,$8,$9,$10,$11,$12::jsonb,$13 FROM saved
+INSERT INTO beichen_crawl_runs (provider_id, started_at, duration_ms, platform_count, group_count, model_count, expected_model_count,
+  failures, raw_website_response, key_model_comparisons, key_model_error, account_rate_error)
+SELECT provider_id,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$15::jsonb,NULLIF($16,''),NULLIF($17,'') FROM saved
 ON CONFLICT (provider_id) DO UPDATE SET
   started_at=EXCLUDED.started_at, duration_ms=EXCLUDED.duration_ms, platform_count=EXCLUDED.platform_count,
   group_count=EXCLUDED.group_count, model_count=EXCLUDED.model_count,
   expected_model_count=EXCLUDED.expected_model_count, failures=EXCLUDED.failures,
-  raw_website_response=COALESCE(EXCLUDED.raw_website_response,beichen_crawl_runs.raw_website_response)
+  raw_website_response=COALESCE(EXCLUDED.raw_website_response,beichen_crawl_runs.raw_website_response),
+  key_model_comparisons=EXCLUDED.key_model_comparisons, key_model_error=EXCLUDED.key_model_error,
+  account_rate_error=EXCLUDED.account_rate_error
 RETURNING provider_id`, provider, lease, snapshot, message, int(websiteDirectoryInterval/time.Minute),
 		crawl.StartedAt, crawl.DurationMS, crawl.PlatformCount, crawl.GroupCount, crawl.ModelCount,
-		crawl.ExpectedModelCount, string(failures), crawl.rawResponse).Scan(&saved)
+		crawl.ExpectedModelCount, string(failures), crawl.rawResponse, string(prices), string(comparisons), crawl.KeyModelError, crawl.AccountRateError).Scan(&saved)
 	if err != nil {
 		return PanelCrawlSummary{}, errPanelAccountDB
 	}
@@ -239,7 +274,7 @@ RETURNING provider_id`, provider, lease, snapshot, message, int(websiteDirectory
 }
 
 func readWebsiteDirectory(ctx context.Context, tx *sql.Tx, provider uuid.UUID) (WebsiteDirectoryStatus, []directoryPlatform, error) {
-	status := WebsiteDirectoryStatus{State: "unverified"}
+	status := WebsiteDirectoryStatus{State: "unverified", PriceUnit: websitePriceUnit}
 	var raw, lastRun []byte
 	var stale bool
 	err := tx.QueryRowContext(ctx, `

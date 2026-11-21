@@ -124,7 +124,9 @@ export type BeichenModel = {
   mode: BeichenPriceUpdate['mode']
   school_status?: BeichenSchoolStatus | null
   route_ready?: boolean | null
-  price_status?: 'confirmed' | 'conditional' | 'not_listed' | 'pending' | 'pending_confirmation' | null
+  price_status?: 'confirmed' | 'conditional' | 'derived' | 'not_listed' | 'pending' | 'pending_confirmation' | null
+  price_source?: string
+  price_observed_at?: string | null
   price_conditions?: BeichenPriceConditions | null
   price_conditions_exact?: BeichenPriceConditions | null
   upstream_rates?: BeichenDisplayRates | null
@@ -161,12 +163,24 @@ export type BeichenCrawlRun = {
   model_count: number
   expected_model_count: number
   failures: Array<{ channel_id?: number; channel?: string; platform?: string; path: string; reason: string }>
+  key_model_comparisons?: Array<{
+    channel: string
+    group_id: number | null
+    state: 'checked' | 'unverified' | 'unavailable'
+    error?: string
+    matched: Array<{ key_model: string; channel_model: string; match: 'exact' | 'normalized'; price_complete: boolean }>
+    only_key: string[]
+    only_channel: string[]
+  }>
+  key_model_error?: string
+  account_rate_error?: string
 }
 export type BeichenOverview = {
   web_login_required?: boolean | null
   website_sync?: BeichenWebsiteSync | null
   website_directory?: {
     state: 'fresh' | 'stale' | 'unverified'
+    price_unit?: string
     last_success: string | null
     last_error: string | null
     last_run?: BeichenCrawlRun | null
@@ -251,6 +265,7 @@ export type BeichenWebsiteGroup = {
   name?: string
   status?: string
   rate_multiplier?: number | string
+  account_rate_multiplier?: number | string
   peak_rate_multiplier?: number | string
   peak_rate_enabled?: boolean
 }
@@ -536,7 +551,7 @@ export type BeichenCatalogModel = {
   website_locations?: BeichenWebsiteLocation[]
   route_count?: number | null
   ready_count?: number | null
-  price_state?: 'confirmed' | 'conditional' | 'manual' | 'missing' | 'mixed' | null
+  price_state?: 'confirmed' | 'conditional' | 'derived' | 'manual' | 'missing' | 'mixed' | null
   price_covered?: boolean
   price_blocker?: { code: string; message: string } | null
   blockers?: Array<{ code: string; message: string }> | null

@@ -31,34 +31,33 @@ type listedKey struct {
 	prefixPreview string
 }
 
-// Some versions of the account endpoint return the owner's key in place of
-// masked metadata. Reduce it to an in-memory fingerprint during decoding.
-func (k *listedKey) UnmarshalJSON(body []byte) error {
-	type fields listedKey
-	item := struct {
-		*fields
-		Value string `json:"key"`
-	}{fields: (*fields)(k)}
-	if err := json.Unmarshal(body, &item); err != nil {
-		return err
-	}
-	if value := item.Value; strings.HasPrefix(value, "sk-") && len(value) <= 4096 &&
-		!strings.ContainsAny(value, "*•…. \r\n\t") {
+// The inventory retains a fingerprint and a short prefix for an unmasked Key.
+func (k *listedKey) observeValue(value string) bool {
+	if strings.HasPrefix(value, "sk-") && len(value) > len("sk-") && len(value) <= 4096 &&
+		!strings.ContainsAny(value, "*.") && strings.IndexFunc(value, func(r rune) bool { return r <= ' ' || r >= 127 }) < 0 {
 		fingerprint := sha256.Sum256([]byte(value))
 		k.fingerprint = &fingerprint
 		if len(value) >= 18 {
 			k.prefixPreview = value[:10]
 		}
-	} else if k.Masked == "" && strings.ContainsAny(item.Value, "*•….") {
-		k.Masked = item.Value
+		return true
 	}
-	return nil
+	if k.Masked == "" && strings.ContainsAny(value, "*•….") {
+		k.Masked = value
+	}
+	return false
 }
 
 var errKeyList = errors.New("北辰账号的 Key 列表或分页无法确认")
 var errKeyMatch = errors.New("未能唯一确认本渠道的北辰 Key 和分组")
 
 func (s *Service) accountKeys(ctx context.Context, token string) ([]listedKey, error) {
+	return s.readAccountKeys(ctx, token, nil)
+}
+
+// Only an explicit catalog crawl supplies modelKeys. These credentials are
+// used in memory for the corresponding Key's request to /v1/models.
+func (s *Service) readAccountKeys(ctx context.Context, token string, modelKeys map[int64]string) ([]listedKey, error) {
 	if !validPanelBearer(token) {
 		return nil, errKeyList
 	}
@@ -82,11 +81,14 @@ func (s *Service) accountKeys(ctx context.Context, token string) ([]listedKey, e
 		var reply struct {
 			Code *int `json:"code"`
 			Data struct {
-				Items []listedKey `json:"items"`
-				Total *int        `json:"total"`
-				Page  int         `json:"page"`
-				Size  int         `json:"page_size"`
-				Pages int         `json:"pages"`
+				Items []struct {
+					listedKey
+					Value string `json:"key"`
+				} `json:"items"`
+				Total *int `json:"total"`
+				Page  int  `json:"page"`
+				Size  int  `json:"page_size"`
+				Pages int  `json:"pages"`
 			} `json:"data"`
 		}
 		if json.Unmarshal(body, &reply) != nil || reply.Code == nil || *reply.Code != 0 {
@@ -104,7 +106,8 @@ func (s *Service) accountKeys(ctx context.Context, token string) ([]listedKey, e
 		if d.Pages != (total+99)/100 && !(total == 0 && d.Pages == 1) {
 			return nil, errKeyList
 		}
-		for _, k := range d.Items {
+		for _, item := range d.Items {
+			k := item.listedKey
 			if k.ID <= 0 || k.ID > 9007199254740991 || seen[k.ID] || k.UserID <= 0 || owner != 0 && k.UserID != owner {
 				return nil, errKeyList
 			}
@@ -113,6 +116,9 @@ func (s *Service) accountKeys(ctx context.Context, token string) ([]listedKey, e
 					return nil, errKeyList
 				}
 				k.GroupID = k.Group.ID
+			}
+			if k.observeValue(item.Value) && modelKeys != nil {
+				modelKeys[k.ID] = item.Value
 			}
 			seen[k.ID], owner = true, k.UserID
 			keys = append(keys, k)

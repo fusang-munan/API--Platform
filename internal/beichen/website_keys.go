@@ -13,18 +13,28 @@ import (
 )
 
 type WebsiteKey struct {
-	ID           int64      `json:"id"`
-	Name         string     `json:"name"`
-	KeyPrefix    *string    `json:"key_prefix"`
-	GroupID      *int64     `json:"group_id"`
-	GroupName    *string    `json:"group_name"`
-	Rate         *string    `json:"rate"`
-	Status       string     `json:"status"`
-	Enabled      *bool      `json:"enabled"`
-	CreatedAt    *time.Time `json:"created_at"`
-	LastSeen     *time.Time `json:"last_seen"`
-	CredentialID *uuid.UUID `json:"credential_id"`
-	MatchStatus  string     `json:"match_status"`
+	ID           int64          `json:"id"`
+	Name         string         `json:"name"`
+	KeyPrefix    *string        `json:"key_prefix"`
+	GroupID      *int64         `json:"group_id"`
+	GroupName    *string        `json:"group_name"`
+	Rate         *string        `json:"rate"`
+	Peak         WebsiteKeyPeak `json:"peak"`
+	ObservedAt   *time.Time     `json:"observed_at"`
+	ChangedAt    *time.Time     `json:"changed_at"`
+	Status       string         `json:"status"`
+	Enabled      *bool          `json:"enabled"`
+	CreatedAt    *time.Time     `json:"created_at"`
+	LastSeen     *time.Time     `json:"last_seen"`
+	CredentialID *uuid.UUID     `json:"credential_id"`
+	MatchStatus  string         `json:"match_status"`
+}
+
+type WebsiteKeyPeak struct {
+	Enabled *bool   `json:"enabled"`
+	Rate    *string `json:"rate"`
+	Start   *string `json:"start"`
+	End     *string `json:"end"`
 }
 
 type WebsiteKeyInventory struct {
@@ -39,22 +49,27 @@ type websiteKeyObservation struct {
 }
 
 func (s *Service) readWebsiteKeys(ctx context.Context, provider uuid.UUID) (websiteKeyObservation, error) {
-	authorization, managed, err := s.managedPanelAuthorization(ctx, provider, s.panelToken)
+	return readWithWebsiteKeySession(ctx, s, provider, s.panelToken, func(session panelAuthorization) (websiteKeyObservation, error) {
+		keys, err := s.fetchWebsiteKeys(ctx, session.bearer)
+		return websiteKeyObservation{keys: keys, tokenVersion: session.tokenVersion}, err
+	})
+}
+
+func readWithWebsiteKeySession[T any](ctx context.Context, s *Service, provider uuid.UUID, fallback string,
+	read func(panelAuthorization) (T, error)) (T, error) {
+	var zero T
+	authorization, managed, err := s.managedPanelAuthorization(ctx, provider, fallback)
 	if err != nil {
-		return websiteKeyObservation{}, err
+		return zero, err
 	}
 	if managed {
-		return readWithPanelSession(ctx, s, provider, authorization, true, func(session panelAuthorization) (websiteKeyObservation, error) {
-			keys, err := s.fetchWebsiteKeys(ctx, session.bearer)
-			return websiteKeyObservation{keys: keys, tokenVersion: session.tokenVersion}, err
-		})
+		return readWithPanelSession(ctx, s, provider, authorization, true, read)
 	}
 	if !s.WebSessionConfigured() {
-		return websiteKeyObservation{}, errPanelAccountMissing
+		return zero, errPanelAccountMissing
 	}
-	return readWithCapturedWebSession(ctx, s, func(bearer string) (websiteKeyObservation, error) {
-		keys, err := s.fetchWebsiteKeys(ctx, bearer)
-		return websiteKeyObservation{keys: keys}, err
+	return readWithCapturedWebSession(ctx, s, func(bearer string) (T, error) {
+		return read(panelAuthorization{bearer: bearer})
 	})
 }
 
@@ -63,13 +78,7 @@ func (s *Service) fetchWebsiteKeys(ctx context.Context, bearer string) ([]listed
 	if err != nil {
 		return nil, err
 	}
-	missing := make(map[int64]bool)
-	for _, key := range keys {
-		if validWebsiteGroupID(key.GroupID) && (key.Group == nil ||
-			websiteKeyText(key.Group.Name) == nil || websiteGroupRate(key.Group.Rate) == nil) {
-			missing[key.GroupID] = true
-		}
-	}
+	missing := websiteKeysMissingGroups(keys)
 	if len(missing) == 0 {
 		return keys, nil
 	}
@@ -77,12 +86,30 @@ func (s *Service) fetchWebsiteKeys(ctx context.Context, bearer string) ([]listed
 	if err != nil {
 		return nil, s.webReadError(bearer, err)
 	}
+	if err := supplementWebsiteKeyGroups(keys, missing, body); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+func websiteKeysMissingGroups(keys []listedKey) map[int64]bool {
+	missing := make(map[int64]bool)
+	for _, key := range keys {
+		if validWebsiteGroupID(key.GroupID) && (key.Group == nil ||
+			websiteKeyText(key.Group.Name) == nil || websiteGroupRate(key.Group.Rate) == nil) {
+			missing[key.GroupID] = true
+		}
+	}
+	return missing
+}
+
+func supplementWebsiteKeyGroups(keys []listedKey, missing map[int64]bool, body []byte) error {
 	channels, err := decodePanelChannels(body)
 	if errors.Is(err, errPanelEmpty) {
-		return keys, nil
+		return nil
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
 	groups := make(map[int64]panelGroup)
 	conflicts := make(map[int64]bool)
@@ -115,17 +142,17 @@ func (s *Service) fetchWebsiteKeys(ctx context.Context, bearer string) ([]listed
 		if !found || conflicts[key.GroupID] {
 			continue
 		}
-		if key.Group != nil {
-			if name := websiteKeyText(key.Group.Name); name != nil {
-				group.Name = *name
-			}
-			if websiteGroupRate(key.Group.Rate) != nil {
-				group.Rate = key.Group.Rate
-			}
+		if key.Group == nil {
+			key.Group = &panelGroup{ID: key.GroupID}
 		}
-		key.Group = &group
+		if websiteKeyText(key.Group.Name) == nil {
+			key.Group.Name = group.Name
+		}
+		if websiteGroupRate(key.Group.Rate) == nil {
+			key.Group.Rate = group.Rate
+		}
 	}
-	return keys, nil
+	return nil
 }
 
 func validWebsiteGroupID(id int64) bool {
@@ -149,6 +176,21 @@ func websiteGroupRate(number json.Number) *string {
 	return &value
 }
 
+func websiteKeyPeakTime(value string) *string {
+	value = strings.TrimSpace(value)
+	for _, layout := range []string{"15:04", "15:04:05"} {
+		if at, err := time.Parse(layout, value); err == nil {
+			if at.Second() != 0 {
+				value = at.Format("15:04:05")
+			} else {
+				value = at.Format("15:04")
+			}
+			return &value
+		}
+	}
+	return nil
+}
+
 func websiteKeyView(key listedKey) WebsiteKey {
 	view := WebsiteKey{ID: key.ID, Status: "unknown", MatchStatus: "unmatched", CreatedAt: key.CreatedAt}
 	if name := websiteKeyText(key.Name); name != nil {
@@ -160,7 +202,7 @@ func websiteKeyView(key listedKey) WebsiteKey {
 	}
 	if valid && len(prefix) >= 4 {
 		prefix = prefix[:min(10, len(prefix))]
-		if strings.IndexFunc(prefix, func(c rune) bool {
+		if (key.fingerprint == nil || sha256.Sum256([]byte(prefix)) != *key.fingerprint) && strings.IndexFunc(prefix, func(c rune) bool {
 			return !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_')
 		}) == -1 {
 			view.KeyPrefix = &prefix
@@ -170,6 +212,10 @@ func websiteKeyView(key listedKey) WebsiteKey {
 		view.GroupID = &key.GroupID
 		if key.Group != nil {
 			view.GroupName, view.Rate = websiteKeyText(key.Group.Name), websiteGroupRate(key.Group.Rate)
+			view.Peak = WebsiteKeyPeak{
+				Enabled: key.Group.PeakEnabled, Rate: websiteGroupRate(key.Group.PeakRate),
+				Start: websiteKeyPeakTime(key.Group.PeakStart), End: websiteKeyPeakTime(key.Group.PeakEnd),
+			}
 		}
 	}
 	switch key.Status {

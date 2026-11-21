@@ -218,7 +218,15 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 配置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run 'TestBeichenWebsiteDirectoryPostgres|TestBeichenDirectoryNameMatching|TestBeichenPanelPricesMatchEquivalentKeySpelling' -count=1 -v`。测试仅用构造数据和假上游，覆盖多平台完整入库、空列表、空价格、名称变体和教师别名、仅官网型号、换 Key 后重新匹配、部分更新、失败保留和退避。运行 `npm test -- BeichenSchoolModels TeacherProviders` 检查教师页显示和指定 Key 重扫。
 
-从仓库根目录运行 `go run ./cmd/beichen-crawl --fixture ./internal/beichen/testdata/website-directory.json`。构造样本应读到 9 个平台、20 个去重型号和 5 个分组。可给 `--fixture` 传入完整的官网响应对象或其中的渠道数组。JSON 输出中的 `complete` 为 `true` 时，`model_count` 和 `expected_model_count` 一致，且 `failures` 为空。每个型号的 `sources` 保留各平台和分组，`price_complete` 表示该来源的 Token 报价具备当前规则所需的字段。明示零单价按数字处理，缺失、空白和 `null` 会保留型号。附带费用被忽略时，`ignored_fields` 给出字段名。
+从仓库根目录运行 `go run ./cmd/beichen-crawl --fixture ./internal/beichen/testdata/website-directory.json`。构造样本应读到 9 个平台、20 个去重型号和 5 个分组。可给 `--fixture` 传入完整的官网响应对象或其中的渠道数组。JSON 输出中的 `complete` 为 `true` 时，`model_count` 和 `expected_model_count` 一致，且 `failures` 为空。每个型号的 `sources` 保留各平台和分组。`price_complete` 表示报价包含所声明计价方式所需的价格字段，固定图像按次报价也可完整。明示零单价按数字处理，空白、`null` 和未列出的字段在 `missing_price_fields` 中逐项显示。附带费用被忽略时，`ignored_fields` 给出字段名。
+
+遇到 OpenAI 长上下文报价显示格式无效时，用 `go run ./cmd/beichen-crawl --fixture ./internal/beichen/testdata/website-pricing-2026-11-21.json` 离线复查。旧解析会拒绝 `tier_label` 及输入、输出、缓存读写的四个档位倍率。运行 `go test ./internal/usage ./internal/beichen -run 'Test(BeichenMultiplierTier|BeichenDirectoryFixedNonTokenQuote|BeichenCrawlRealPriceFixture|BeichenCrawlPriceHistoryAndKeyModelsPostgres)' -count=1 -v`，验证 35 个型号、499,999 和 500,000 的计价边界、分组不同价、重复抓取及价格或规则变更。PostgreSQL 用例使用 `NEBULA_TEST_POSTGRES` 指定的隔离测试库。
+
+浏览器价格弹层从 `channels/available` 的 `supported_models[].pricing` 读取，悬停和切换型号不会请求另一份价表。价格结构中的缓存 1h/12h、图片、视频单价、分档和推理强度倍率按发布值保留。遇到 Key 只列出少数型号时，查看「Key 实际型号核对」中的分组 ID 和错误。只有该 Key 的 `GET /v1/models` 返回成功且匹配其当前分组时，才计入匹配。HTTP 403 或分组待核实时，确认支持目录读取的 Key 与目标分组已经匹配，再刷新官网目录。
+
+网页通过 `GET /api/v1/groups/rates` 在分组默认倍率之外显示当前账号的倍率。核对分组报价时同时比较两项。该请求失败时，目录会提示账户倍率待核实，历史保留上次已核实的版本。回归用例分别改变默认倍率、价格和个人倍率，并验证失败前后不会产生虚假的历史版本。
+
+Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反推价，待核对」及观察时间。若报价缺失，先核对 `0058` 是否已应用、Key 是否仍属于 group 16，以及实际型号清单和当前倍率是否核实成功。用隔离的 PostgreSQL 运行 `go test ./internal/beichen -run '^TestBeichenDerivedPricesPostgres$' -count=1 -v`，回归两款 Claude 的自动结算、缓存缺价待核账、手动修正，以及官网固定价和分档价生效后的版本切换。
 
 用 `go test ./cmd/beichen-crawl ./internal/beichen -run 'Test(BeichenCrawl|CrawlCommand|BeichenWebsiteDirectoryPostgres)' -count=1 -v` 复查退出码、完整计数、单平台损坏、空价与零价、教师别名和抓取记录入库。看到 `complete=false` 时，用 `failures[].path` 和 `reason` 定位错误。网页不可读时教师页上次抓取可显示 0，先前已保存的目录仍可用于查看。需要核对 Key 时加 `--match-db` 并设置 `DATABASE_URL`，`key_matching=not_checked` 表示本轮没有执行这项核对。`key_matching=failed` 时查看 `key_match_error`。
 
@@ -242,6 +250,12 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run TestBeichenWebsiteKeysPostgres -count=1 -v`，前端运行 `npm test -- BeichenWebsiteKeys`。构造样例覆盖「cc不满血」从旧倍率 0.15 更新到 `[CC2]ClaudeCode高智` 的 0.6、哈吉米 0.3、国模 GM1、分组信息缺失、已停用 Key、重复抓取、旧采价任务作废和 HTTP 401。测试服务器仅接收已登录网页所需的 GET 请求。
 
 进入「供应商管理 → 北辰官网 Key 清单」，点「刷新官网 Key」并核对最近成功读取时间。出现「匹配不唯一」时复核官网的 Key 前缀和学校渠道的对应关系。出现「待核实」时查看北辰密钥页的分组及渠道目录的倍率字段。会话过期时在「北辰网页登录」恢复授权，再刷新清单。
+
+运行 `go run ./cmd/beichen-crawl --keys`，核对 `keys[].group_id`、`group`、`rate`、`peak` 与北辰密钥页，同时查看 `group_check` 和同组 `models`。`missing_group` 表示目录未列出分组，`no_models` 表示目录列出分组但没有型号，两者显示「该分组未分配模型」。目录的分组或型号无法完整解析时，空列表显示 `unverified`。只有报价无法解析时，仍可判断模型归属，并保留报价失败及原有非零退出码。
+
+同一次 `--keys` 输出还包含 `actual_models`、`actual_model_count` 与对照字段 `matched`、`only_key`、`only_group`。先看 `model_check`，只有 `empty` 确认这把 Key 的接口返回 0 个型号。`unverified` 时检查官网是否只返回遮盖后的 Key，`unavailable` 时查看 `model_message` 中的 HTTP 状态或格式错误。官网分组缺失时仍会请求该把 Key 的模型清单。学校凭据已配置时，可以用 `--compare-models` 查看学校渠道的独立对照结果。
+
+用 `go test ./cmd/beichen-crawl ./internal/beichen -run 'Test(CrawlCommand|BeichenCrawlWebsiteKey)' -count=1 -v` 验证分页、脱敏、同组去重、部分解析及显式保存。配置隔离的 `NEBULA_TEST_POSTGRES` 后，该命令也覆盖定时到期刷新、基础倍率和高峰倍率分别变更、重复读数去重，以及分页失败保留上次数据。`changed_at` 为空时，检查教师清单的 `observed_at` 是否已有首个版本。`last_seen` 长时间未更新时，检查同步状态、北辰网页登录授权和数据库迁移 `0056`。
 
 #### 改分组后仍显示旧倍率或缺报价
 
@@ -304,6 +318,14 @@ go test ./...
 - 对账差额异常大：先看北辰实扣是否为未知、当天账单是否已同步、模型是否只有本地或只有北辰记录。缺失实扣时页面显示“—”，不会把未知当作零；差额仅供参考。
 - 学生额度保存返回 `PROJECT_QUOTA_ALLOCATION_EXCEEDED`：该学生增加后的总额超过项目月额度。先减少其他成员额度或提高项目额度，不能靠前端绕过。
 - 手动价出现 100 倍偏差：检查是否把“积分/百万 Token”又乘了一次 1,000,000。HTTP 新接口接收十进制积分字符串，服务端统一缩放；不要在浏览器里预先缩放。
+
+### 北辰仪表盘与本地账本报表
+
+执行 `go test ./cmd/beichen-report ./internal/beichen -run TestDashboard -count=1 -v`，验证日期与粒度、Key 过滤、翻页、空数据、401、金额差额和报告保存。设置 `NEBULA_TEST_POSTGRES` 为隔离的本机测试库，可同时验证按北京时间日期、模型和 Key 的对账，以及无回执、待核账和一侧缺记录。全量检查执行 `go build ./...` 和 `go test ./...`。
+
+- 网页提示会话过期时，先用本机登录窗口更新会话，再运行 `go run ./cmd/beichen-report --range 7d`。
+- 平台卡片的请求差额在 `platforms.account_minus_platforms`，四把 Key 的差额在 `key_reconciliation.account_minus_sum`。实际金额和 Token 的差额另有字段。
+- `--reconcile` 用 `DATABASE_URL` 连接本机数据库。如果北辰供应商无法唯一确认，加 `--provider <供应商UUID>`。对账行里的 `null` 表示证据缺项，具体查看 `missing_reasons`。[对账字段说明](reports/beichen-crawl-stability.md)
 
 ### 北辰 Token 缺项与逐笔差额
 

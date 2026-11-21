@@ -15,10 +15,12 @@ import (
 )
 
 type websiteKeyCatalog struct {
-	group   directoryGroup
-	entries []catalog.ProviderEntry
-	prices  map[string]json.RawMessage
-	at      time.Time
+	group         directoryGroup
+	entries       []catalog.ProviderEntry
+	prices        map[string]json.RawMessage
+	at            time.Time
+	keyBilling    *billingInfo
+	websiteModels []string
 }
 
 func (s *Service) readCredentialWebsiteCatalog(ctx context.Context, credential uuid.UUID, key string) (websiteKeyCatalog, error) {
@@ -32,7 +34,16 @@ func (s *Service) readCredentialWebsiteCatalog(ctx context.Context, credential u
 }
 
 func (directory websiteKeyCatalog) catalogQuote() panelQuote {
-	quote := panelQuote{groupID: directory.group.ID, websiteModels: make([]string, 0, len(directory.entries))}
+	quote := panelQuote{groupID: directory.group.ID}
+	if directory.keyBilling != nil {
+		quote.websiteModels = []string{}
+		return quote
+	}
+	if directory.websiteModels != nil {
+		quote.websiteModels = directory.websiteModels
+		return quote
+	}
+	quote.websiteModels = make([]string, 0, len(directory.entries))
 	for _, model := range directory.entries {
 		quote.websiteModels = append(quote.websiteModels, model.ID)
 	}
@@ -168,10 +179,15 @@ func sameWebsiteGroup(left, right directoryGroup) bool {
 }
 
 func (directory websiteKeyCatalog) billing() (billingInfo, panelQuote, error) {
+	if directory.keyBilling != nil {
+		info := *directory.keyBilling
+		expires, err := panelExpiry(info, directory.at)
+		return info, panelQuote{groupID: directory.group.ID, expiresAt: expires, err: errPanelEmpty, verifiedKeyModels: true}, err
+	}
 	group := directory.group
 	info := billingInfo{GroupID: &group.ID, ObservedAt: directory.at, Timezone: group.Timezone,
 		PeakEnabled: group.PeakEnabled, PeakStart: group.PeakStart, PeakEnd: group.PeakEnd}
-	quote := panelQuote{groupID: group.ID}
+	quote := panelQuote{groupID: group.ID, verifiedKeyModels: directory.websiteModels != nil}
 	if group.Subscription != "standard" || group.Rate == nil || group.PeakEnabled == nil {
 		return info, quote, errors.New("北辰网页分组缺少可确认的余额计费规则")
 	}

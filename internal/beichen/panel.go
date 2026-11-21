@@ -76,6 +76,7 @@ type panelQuote struct {
 	expiresAt         time.Time
 	err               error
 	verificationError error
+	verifiedKeyModels bool
 }
 
 var errPanelLoginRequired = errors.New("北辰渠道页要求登录")
@@ -656,13 +657,24 @@ func saveBillingObservation(ctx context.Context, tx *sql.Tx, credentialID uuid.U
 	} else if err := saveMultiplier(ctx, tx, credentialID, info, effectiveAt); err != nil {
 		return err
 	}
+	var derived []derivedPriceRow
+	if billingErr == nil && group > 0 && (quote.err == nil || errors.Is(quote.err, errPanelEmpty)) {
+		derived, err = readDerivedPrices(ctx, tx, credentialID, group, effectiveAt, quote.terms)
+		if err != nil {
+			return err
+		}
+		if len(derived) > 0 && errors.Is(quote.err, errPanelEmpty) {
+			quote.err = nil
+		}
+	}
 	if quote.err == nil && (effectiveAt.Before(info.ObservedAt) || !quote.expiresAt.After(effectiveAt)) {
 		quote.err = errors.New("北辰报价已过期或同步期间跨越高峰边界")
 	}
 	if quote.err != nil {
 		// A failed read retains the last quote only while this round can still
 		// verify its group and the complete multiplier rule.
-		if billingErr != nil || errors.Is(quote.err, errPanelGroupNotFound) || errors.Is(quote.err, errPanelRulesConflict) {
+		if billingErr != nil || errors.Is(quote.err, errPanelGroupNotFound) || errors.Is(quote.err, errPanelRulesConflict) ||
+			(quote.verifiedKeyModels && errors.Is(quote.err, errPanelEmpty)) {
 			group = 0
 		}
 		if err := invalidateChangedPanelQuote(ctx, tx, credentialID, revision, effectiveAt, group, true); err != nil {
@@ -697,6 +709,15 @@ INSERT INTO beichen_price_versions (credential_id, model, track, basis, source, 
 VALUES ($1, $2, 'upstream', 'base', 'panel', $3, $4, $5, $6, $7, $8)`,
 			credentialID, row.Model, row.Rates.Input, row.Rates.Output, row.Rates.CacheRead, row.Rates.CacheWrite, effectiveAt, group)
 		if err != nil {
+			return err
+		}
+	}
+	for _, row := range derived {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO beichen_price_versions (credential_id, model, track, basis, source, input_rate, output_rate,
+  cache_read_rate, cache_write_rate, effective_at, group_id, observed_at)
+VALUES ($1,$2,'upstream','base','derived_from_usage',$3,$4,$5,$6,$7,$8,$9)`,
+			credentialID, row.Model, row.Input, row.Output, row.CacheRead, row.CacheWrite, effectiveAt, group, row.observedAt); err != nil {
 			return err
 		}
 	}

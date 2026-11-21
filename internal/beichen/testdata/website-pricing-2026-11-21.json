@@ -1,0 +1,848 @@
+{
+  "code": 0,
+  "data": [
+    {
+      "name": "渠道 1",
+      "platforms": [
+        {
+          "groups": [
+            {
+              "id": 2,
+              "name": "分组 2",
+              "peak_end": "",
+              "peak_rate_enabled": false,
+              "peak_rate_multiplier": 1,
+              "peak_start": "",
+              "platform": "anthropic",
+              "rate_multiplier": 0.15,
+              "subscription_type": "standard"
+            }
+          ],
+          "platform": "anthropic",
+          "supported_models": [
+            {
+              "name": "claude-fable-5",
+              "platform": "anthropic",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 0.000001,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0.0000125,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.00001,
+                "intervals": [],
+                "output_price": 0.00005,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "claude-fable-5-1",
+              "platform": "anthropic",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 0.000001,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0.0000125,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.00001,
+                "intervals": [],
+                "output_price": 0.00005,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "claude-fable-5.1",
+              "platform": "anthropic",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 0.000001,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0.0000125,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.00001,
+                "intervals": [],
+                "output_price": 0.00005,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "claude-opus-4-6",
+              "platform": "anthropic",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 5e-7,
+                "cache_write_1h_price": 0.00001,
+                "cache_write_price": 0.00000625,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000005,
+                "intervals": [],
+                "output_price": 0.000025,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "claude-opus-4-7",
+              "platform": "anthropic",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 5e-7,
+                "cache_write_1h_price": 0.00001,
+                "cache_write_price": 0.00000625,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000005,
+                "intervals": [],
+                "output_price": 0.000025,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "claude-opus-4-8",
+              "platform": "anthropic",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 5e-7,
+                "cache_write_1h_price": 0.00001,
+                "cache_write_price": 0.00000625,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000005,
+                "intervals": [],
+                "output_price": 0.000025,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "claude-opus-5",
+              "platform": "anthropic",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 5e-7,
+                "cache_write_1h_price": 0.00001,
+                "cache_write_price": 0.00000625,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000005,
+                "intervals": [],
+                "output_price": 0.000025,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "claude-opus-5-5",
+              "platform": "anthropic",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 2e-7,
+                "cache_write_1h_price": 0.000008,
+                "cache_write_price": 0.000005,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000004,
+                "intervals": [],
+                "output_price": 0.00002,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "claude-opus-5.5",
+              "platform": "anthropic",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 2e-7,
+                "cache_write_1h_price": 0.000008,
+                "cache_write_price": 0.000005,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000004,
+                "intervals": [],
+                "output_price": 0.00002,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "claude-sonnet-4-6",
+              "platform": "anthropic",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 3e-7,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0.00000375,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000003,
+                "intervals": [],
+                "output_price": 0.000015,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "claude-sonnet-5",
+              "platform": "anthropic",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 2e-7,
+                "cache_write_1h_price": 0.000004,
+                "cache_write_price": 0.0000025,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000002,
+                "intervals": [],
+                "output_price": 0.00001,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "claude-sonnet-5.5",
+              "platform": "anthropic",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 1e-7,
+                "cache_write_1h_price": 0.000004,
+                "cache_write_price": 0.0000025,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000002,
+                "intervals": [],
+                "output_price": 0.00001,
+                "per_request_price": null
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "渠道 2",
+      "platforms": [
+        {
+          "groups": [
+            {
+              "id": 6,
+              "name": "分组 6",
+              "peak_end": "",
+              "peak_rate_enabled": false,
+              "peak_rate_multiplier": 1,
+              "peak_start": "",
+              "platform": "openai",
+              "rate_multiplier": 0.1,
+              "subscription_type": "standard"
+            }
+          ],
+          "platform": "openai",
+          "supported_models": [
+            {
+              "name": "deepseek-v4-pro",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 3e-7,
+                "cache_write_1h_price": null,
+                "cache_write_price": null,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000009,
+                "intervals": [],
+                "output_price": 0.000027,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "deepseek-v4.1-flash",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 4e-8,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0,
+                "image_input_price": 0,
+                "image_output_price": 0,
+                "input_price": 0.000002,
+                "intervals": [],
+                "output_price": 0.000008,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "minimax-m3.1-flash",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 1e-8,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0,
+                "image_input_price": 0,
+                "image_output_price": 0,
+                "input_price": 0.000001,
+                "intervals": [],
+                "output_price": 0.000004,
+                "per_request_price": null
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "渠道 3",
+      "platforms": [
+        {
+          "groups": [
+            {
+              "id": 15,
+              "name": "分组 15",
+              "peak_end": "",
+              "peak_rate_enabled": false,
+              "peak_rate_multiplier": 1,
+              "peak_start": "",
+              "platform": "openai",
+              "rate_multiplier": 0.16,
+              "subscription_type": "standard"
+            },
+            {
+              "id": 14,
+              "name": "分组 14",
+              "peak_end": "",
+              "peak_rate_enabled": false,
+              "peak_rate_multiplier": 1,
+              "peak_start": "",
+              "platform": "openai",
+              "rate_multiplier": 0.15,
+              "subscription_type": "standard"
+            }
+          ],
+          "platform": "openai",
+          "supported_models": [
+            {
+              "name": "deepseek-v4-pro",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 3e-7,
+                "cache_write_1h_price": 0,
+                "cache_write_price": 0,
+                "image_input_price": 0,
+                "image_output_price": 0,
+                "input_price": 0.000009,
+                "intervals": [],
+                "output_price": 0.000027,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "deepseek-v4.1-flash",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 4e-8,
+                "cache_write_1h_price": 0,
+                "cache_write_price": 0,
+                "image_input_price": 0,
+                "image_output_price": 0,
+                "input_price": 0.000002,
+                "intervals": [],
+                "output_price": 0.000008,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "glm-5.3",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 0.000002,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000008,
+                "intervals": [],
+                "output_price": 0.000028,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "glm-5.3-flash",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 2.3e-7,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 8e-7,
+                "intervals": [],
+                "output_price": 0.0000028,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "kimi-k3",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 0.000002,
+                "cache_write_1h_price": 0.00004,
+                "cache_write_price": 0.00002,
+                "image_input_price": 0,
+                "image_output_price": 0,
+                "input_price": 0.00002,
+                "intervals": [],
+                "output_price": 0.0001,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "kimi-k3.1-pro",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 0.0000013,
+                "cache_write_1h_price": 0.000026,
+                "cache_write_price": 0.000013,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000013,
+                "intervals": [],
+                "output_price": 0.000068,
+                "per_request_price": null
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "渠道 4",
+      "platforms": [
+        {
+          "groups": [
+            {
+              "id": 4,
+              "name": "分组 4",
+              "peak_end": "",
+              "peak_rate_enabled": false,
+              "peak_rate_multiplier": 1,
+              "peak_start": "",
+              "platform": "grok",
+              "rate_multiplier": 0.24,
+              "subscription_type": "standard"
+            }
+          ],
+          "platform": "grok",
+          "supported_models": [
+            {
+              "name": "grok-4.3",
+              "platform": "grok",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 2e-7,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000002,
+                "intervals": [],
+                "output_price": 0.00001,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "grok-4.5",
+              "platform": "grok",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 2e-7,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000002,
+                "intervals": [],
+                "output_price": 0.00001,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "grok-4.6",
+              "platform": "grok",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 2e-7,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000002,
+                "intervals": [],
+                "output_price": 0.00001,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "grok-4.7",
+              "platform": "grok",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 2e-7,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000002,
+                "intervals": [],
+                "output_price": 0.00001,
+                "per_request_price": null
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "渠道 5",
+      "platforms": [
+        {
+          "groups": [
+            {
+              "id": 11,
+              "name": "分组 11",
+              "peak_end": "",
+              "peak_rate_enabled": false,
+              "peak_rate_multiplier": 1,
+              "peak_start": "",
+              "platform": "openai",
+              "rate_multiplier": 0.16,
+              "subscription_type": "standard"
+            },
+            {
+              "id": 8,
+              "name": "分组 8",
+              "peak_end": "",
+              "peak_rate_enabled": false,
+              "peak_rate_multiplier": 1,
+              "peak_start": "",
+              "platform": "openai",
+              "rate_multiplier": 0.16,
+              "subscription_type": "standard"
+            },
+            {
+              "id": 10,
+              "name": "分组 10",
+              "peak_end": "",
+              "peak_rate_enabled": false,
+              "peak_rate_multiplier": 1,
+              "peak_start": "",
+              "platform": "openai",
+              "rate_multiplier": 0.18,
+              "subscription_type": "standard"
+            }
+          ],
+          "platform": "openai",
+          "supported_models": [
+            {
+              "name": "GTA6",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 0.000911,
+                "cache_write_1h_price": 0.000119,
+                "cache_write_price": null,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000268,
+                "intervals": [],
+                "output_price": 0.000368,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "gpt-6-astra",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 0.000001,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0.0000125,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.00001,
+                "intervals": [
+                  {
+                    "cache_read_multiplier": 2,
+                    "cache_read_price": null,
+                    "cache_write_1h_price": null,
+                    "cache_write_multiplier": 2,
+                    "cache_write_price": null,
+                    "input_multiplier": 2,
+                    "input_price": null,
+                    "max_tokens": null,
+                    "min_tokens": 499999,
+                    "output_multiplier": 2,
+                    "output_price": null,
+                    "per_request_price": null,
+                    "tier_label": "\u003e=500000:whole-request-x2"
+                  }
+                ],
+                "output_price": 0.00005,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "gpt-6-luna",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 2e-7,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0.0000025,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000002,
+                "intervals": [
+                  {
+                    "cache_read_multiplier": 2,
+                    "cache_read_price": null,
+                    "cache_write_1h_price": null,
+                    "cache_write_multiplier": 2,
+                    "cache_write_price": null,
+                    "input_multiplier": 2,
+                    "input_price": null,
+                    "max_tokens": null,
+                    "min_tokens": 499999,
+                    "output_multiplier": 2,
+                    "output_price": null,
+                    "per_request_price": null,
+                    "tier_label": "\u003e=500000:whole-request-x2"
+                  }
+                ],
+                "output_price": 0.00001,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "gpt-6-sol",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 2e-7,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0.0000025,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000002,
+                "intervals": [
+                  {
+                    "cache_read_multiplier": 2,
+                    "cache_read_price": null,
+                    "cache_write_1h_price": null,
+                    "cache_write_multiplier": 2,
+                    "cache_write_price": null,
+                    "input_multiplier": 2,
+                    "input_price": null,
+                    "max_tokens": null,
+                    "min_tokens": 499999,
+                    "output_multiplier": 2,
+                    "output_price": null,
+                    "per_request_price": null,
+                    "tier_label": "\u003e=500000:whole-request-x2"
+                  }
+                ],
+                "output_price": 0.00001,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "gpt-6.1-sol",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 1e-7,
+                "cache_write_1h_price": null,
+                "cache_write_price": 0.0000025,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": 0.000002,
+                "intervals": [
+                  {
+                    "cache_read_multiplier": 2,
+                    "cache_read_price": null,
+                    "cache_write_1h_price": null,
+                    "cache_write_multiplier": 2,
+                    "cache_write_price": null,
+                    "input_multiplier": 2,
+                    "input_price": null,
+                    "max_tokens": null,
+                    "min_tokens": 499999,
+                    "output_multiplier": 2,
+                    "output_price": null,
+                    "per_request_price": null,
+                    "tier_label": "\u003e=500000:whole-request-x2"
+                  }
+                ],
+                "output_price": 0.00001,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "gpt-6.1-terra",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 5e-8,
+                "cache_write_1h_price": 0.00000125,
+                "cache_write_price": 0.00000125,
+                "image_input_price": 0,
+                "image_output_price": 0,
+                "input_price": 0.000001,
+                "intervals": [
+                  {
+                    "cache_read_multiplier": 2,
+                    "cache_read_price": null,
+                    "cache_write_1h_price": null,
+                    "cache_write_multiplier": 2,
+                    "cache_write_price": null,
+                    "input_multiplier": 2,
+                    "input_price": null,
+                    "max_tokens": null,
+                    "min_tokens": 499999,
+                    "output_multiplier": 2,
+                    "output_price": null,
+                    "per_request_price": null,
+                    "tier_label": "\u003e=500000:whole-request-x2"
+                  }
+                ],
+                "output_price": 0.000005,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "gpt-6.2-astra",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 4e-7,
+                "cache_write_1h_price": 0.00001,
+                "cache_write_price": 0.00001,
+                "image_input_price": 0,
+                "image_output_price": 0,
+                "input_price": 0.000008,
+                "intervals": [],
+                "output_price": 0.00004,
+                "per_request_price": null
+              }
+            },
+            {
+              "name": "gpt-6.2-sol",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "token",
+                "cache_read_price": 1e-7,
+                "cache_write_1h_price": 0.0000025,
+                "cache_write_price": 0.0000025,
+                "image_input_price": 0,
+                "image_output_price": 0,
+                "input_price": 0.000002,
+                "intervals": [],
+                "output_price": 0.00001,
+                "per_request_price": null
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "渠道 6",
+      "platforms": [
+        {
+          "groups": [
+            {
+              "id": 12,
+              "name": "分组 12",
+              "peak_end": "",
+              "peak_rate_enabled": false,
+              "peak_rate_multiplier": 1,
+              "peak_start": "",
+              "platform": "openai",
+              "rate_multiplier": 1,
+              "subscription_type": "standard"
+            }
+          ],
+          "platform": "openai",
+          "supported_models": [
+            {
+              "name": "gpt-image-2",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "image",
+                "cache_read_price": null,
+                "cache_write_1h_price": null,
+                "cache_write_price": null,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": null,
+                "intervals": [],
+                "output_price": null,
+                "per_request_price": 0.04
+              }
+            },
+            {
+              "name": "gpt-image-2.5",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "image",
+                "cache_read_price": null,
+                "cache_write_1h_price": null,
+                "cache_write_price": null,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": null,
+                "intervals": [],
+                "output_price": null,
+                "per_request_price": 0.04
+              }
+            },
+            {
+              "name": "gpt-image-2.5-flare",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "image",
+                "cache_read_price": null,
+                "cache_write_1h_price": null,
+                "cache_write_price": null,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": null,
+                "intervals": [],
+                "output_price": null,
+                "per_request_price": 0.04
+              }
+            },
+            {
+              "name": "gpt-image-2.5-sunburst",
+              "platform": "openai",
+              "pricing": {
+                "billing_mode": "image",
+                "cache_read_price": null,
+                "cache_write_1h_price": null,
+                "cache_write_price": null,
+                "image_input_price": null,
+                "image_output_price": null,
+                "input_price": null,
+                "intervals": [],
+                "output_price": null,
+                "per_request_price": 0.04
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

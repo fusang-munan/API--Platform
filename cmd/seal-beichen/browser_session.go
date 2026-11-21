@@ -53,7 +53,7 @@ func (captured *capturedBrowserSession) close() {
 	}
 }
 
-func runSession(origin, certPath, out, loginURL, edgePath string, timeout time.Duration) error {
+func runSession(origin, certPath, out, localOut, loginURL, edgePath string, timeout time.Duration) error {
 	cert, err := os.ReadFile(certPath)
 	if err != nil {
 		return errors.New("无法读取已确认的学校证书文件")
@@ -77,6 +77,16 @@ func runSession(origin, certPath, out, loginURL, edgePath string, timeout time.D
 	if err := writeSealed(out, append(sealed, '\n')); err != nil {
 		captured.show("写入密文失败", false)
 		return err
+	}
+	if localOut != "" {
+		plain, marshalErr := json.MarshalIndent(captured.session, "", "  ")
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if err := os.WriteFile(localOut, plain, 0600); err != nil {
+			captured.show("写入本机会话失败", false)
+			return err
+		}
 	}
 	captured.show("登录会话已加密", true)
 	time.Sleep(2 * time.Second)
@@ -184,9 +194,9 @@ func launchCaptureBrowser(edgePath string) (*captureBrowser, error) {
 	if edgePath == "" {
 		return nil, errors.New("找不到 Microsoft Edge；请用 -edge 指定 msedge.exe")
 	}
-	profileDir, err := os.MkdirTemp("", "beichen-web-login-")
-	if err != nil {
-		return nil, errors.New("创建本机临时登录目录失败")
+	profileDir := filepath.Join(os.Getenv("LOCALAPPDATA"), "Nebula", "beichen-login-profile")
+	if err := os.MkdirAll(profileDir, 0700); err != nil {
+		return nil, errors.New("创建本机登录目录失败")
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

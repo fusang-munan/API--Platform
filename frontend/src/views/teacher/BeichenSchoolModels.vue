@@ -46,9 +46,12 @@ const probeError = ref('')
 const error = ref('')
 const toast = useToast()
 const reasonId = useId()
-const priceColumns = [{ id: 'official', label: '官网价' }, { id: 'student', label: '学生实价' }] as const
+const priceColumns = computed(() => [
+  { id: 'official', label: rows.value.some(row => row.pricing.some(quote => quote.status === 'derived')) ? '基础报价' : '官网价' },
+  { id: 'student', label: '学生实价' },
+] as const)
 const priceStateLabels: Record<PriceState, string> = {
-  confirmed: '报价已确认', conditional: '按条件计价', manual: '手动价', missing: '缺少报价', mixed: '混合报价',
+  confirmed: '报价已确认', conditional: '按条件计价', derived: '反推价，待核对', manual: '手动价', missing: '缺少报价', mixed: '混合报价',
 }
 const tokenPriceUnit = '每百万 Token 的积分'
 const convertibleUnits = new Set([tokenPriceUnit, '积分/次', '积分/秒'])
@@ -108,7 +111,7 @@ function capabilityFamilyRank(model: string, protocol: string) {
   return index >= 0 ? 3 - index : 0
 }
 function capabilityPriceState(value?: string): PriceState | undefined {
-  return value === 'confirmed' || value === 'conditional' || value === 'manual' || value === 'missing' || value === 'mixed' ? value : undefined
+  return value === 'confirmed' || value === 'conditional' || value === 'derived' || value === 'manual' || value === 'missing' || value === 'mixed' ? value : undefined
 }
 function uniqueProtocols(values: Array<string | null | undefined>) {
   return [...new Set(values.filter((value): value is string => Boolean(value)))].sort()
@@ -425,6 +428,7 @@ function validCount(value?: number | null) {
 function oldPriceState(row: SchoolCatalogRow): PriceState {
   const states = new Set<PriceState>(row.quotes.map(quote => {
     if (quote.mode === 'manual') return 'manual'
+    if (quote.status === 'derived') return 'derived'
     if (hasPriceConditions(quote)) return 'conditional'
     return quote.status === 'confirmed' || quote.priceReady ? 'confirmed' : 'missing'
   }))
@@ -492,6 +496,7 @@ function groupPriceComparison(key: BeichenCatalogKey, locations: BeichenWebsiteL
       .filter(group => group.id != null && (!group.status || group.status === 'active') &&
         (rulesDiffer ? group.id === key.group_id : group.id !== key.group_id))
       .map(group => `官网分组 ${group.id} 价 · 倍率 ${rateLabel(group.rate_multiplier)}` +
+        (group.account_rate_multiplier != null ? ' · 账户倍率 ' + rateLabel(group.account_rate_multiplier) : '') +
         (group.peak_rate_enabled ? ' · 高峰系数 ' + rateLabel(group.peak_rate_multiplier) : '') +
         (price ? '\n' + withYuan(price) : ' · 单价明细未确认'))
   })
@@ -503,7 +508,7 @@ function groupPriceComparison(key: BeichenCatalogKey, locations: BeichenWebsiteL
 
 function websiteLocationLabel(location: BeichenWebsiteLocation) {
   const groups = location.groups.map(group => [group.name, group.id != null ? '分组 ' + group.id : '',
-    rateLabel(group.rate_multiplier)].filter(Boolean).join(' '))
+    rateLabel(group.rate_multiplier), group.account_rate_multiplier != null ? '账户 ' + rateLabel(group.account_rate_multiplier) : ''].filter(Boolean).join(' '))
   return [location.channel || (location.channel_id != null ? '渠道 ' + location.channel_id : ''),
     location.platform, groups.length ? groups.join('、') : '分组待核', location.name,
     location.has_price ? '官网有报价' : '官网无报价',
@@ -937,6 +942,29 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
             <small v-if="!failure.platform && failure.path.startsWith('data[')">（{{ failure.path }}）</small>
           </li>
         </ul>
+        <p v-if="lastCrawl.key_model_error" class="beichen-note" role="status">{{ lastCrawl.key_model_error }}</p>
+        <p v-if="lastCrawl.account_rate_error" class="beichen-note" role="status">{{ lastCrawl.account_rate_error }}</p>
+        <details v-if="lastCrawl.key_model_comparisons?.length" class="beichen-note">
+          <summary>Key 实际型号核对</summary>
+          <div v-for="comparison in lastCrawl.key_model_comparisons" :key="comparison.channel">
+            <p>
+              <strong>{{ comparison.channel }}</strong>
+              <template v-if="comparison.group_id != null"> · 分组 {{ comparison.group_id }}</template>
+              <template v-if="comparison.state === 'checked'">
+                · 匹配 {{ comparison.matched.length }} · 仅 Key {{ comparison.only_key.length }} · 仅官网 {{ comparison.only_channel.length }}
+              </template>
+              <template v-else> · {{ comparison.error ?? '目录待核实' }}</template>
+            </p>
+            <ul v-if="comparison.state === 'checked'">
+              <li v-for="match in comparison.matched" :key="match.key_model">
+                {{ match.key_model }}<template v-if="match.key_model !== match.channel_model"> → {{ match.channel_model }}</template>
+                <template v-if="!match.price_complete">（报价待核对）</template>
+              </li>
+              <li v-if="comparison.only_key.length">仅 Key · {{ comparison.only_key.join('、') }}</li>
+              <li v-if="comparison.only_channel.length">仅官网 · {{ comparison.only_channel.join('、') }}</li>
+            </ul>
+          </div>
+        </details>
       </template>
     </section>
     <p v-if="rescanError" class="error" role="alert">{{ rescanError }}</p>
@@ -957,7 +985,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
     </p>
     <p v-if="probeError" class="error" role="alert">{{ probeError }}</p>
     <div class="model-filters" role="group" aria-label="模型状态筛选"><button v-for="item in filters" :key="item.id" type="button" :aria-pressed="filter === item.id" @click="filter = item.id">{{ item.label }}</button><small>当前筛选 {{ rows.length }} 个模型</small></div>
-    <p class="beichen-note">Token 单价按每百万 Token 计，1 元 = 100 积分。跟随官网时，学生实价按该线路的倍率计算。</p>
+    <p class="beichen-note">官网报价单位为{{ websiteDirectory?.price_unit ?? '元（北辰余额单位）' }}。Token 单价按每百万 Token 计，1 元 = 100 积分。跟随官网时，学生实价按该线路的倍率计算。</p>
     <p v-if="error && !batchSelection" class="error" role="alert">{{ error }}</p>
     <p v-if="providerMaintenance && loginNeeded" role="status">北辰官网需要学校后台重新授权。</p>
     <p v-if="priceErrors.length" class="error" role="alert">价格同步失败：{{ priceErrors.join('；') }}</p>
@@ -967,7 +995,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
         <caption class="sr-only">北辰模型覆盖、价格与本月用量</caption>
         <colgroup><col class="model-col"><col class="state-col"><col class="price-col"><col class="price-col"><col class="usage-col"><col class="action-col"></colgroup>
         <thead>
-          <tr><th scope="col">模型</th><th scope="col">状态与覆盖</th><th scope="col">官网价</th><th scope="col">学生实价</th><th scope="col">本月用量</th><th scope="col">操作</th></tr>
+          <tr><th scope="col">模型</th><th scope="col">状态与覆盖</th><th v-for="column in priceColumns" :key="column.id" scope="col">{{ column.label }}</th><th scope="col">本月用量</th><th scope="col">操作</th></tr>
         </thead>
         <tbody>
           <tr v-for="(row, index) in rows" :key="row.model" :data-model="row.model" :class="{ 'binding-issue-row': row.bindingIssue }">
@@ -1152,7 +1180,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
       <section v-for="quote in conditionsRow?.quotes ?? []" :key="quote.key" class="condition-quote">
         <h3>{{ quote.multiplierLabel }}</h3>
         <dl class="condition-prices">
-          <div><dt>官网价</dt><dd class="price-detail">{{ quote.standard ? withYuan(quote.standard) : '尚未取得官网明细' }}</dd></div>
+          <div><dt>{{ quote.status === 'derived' ? '反推基础价' : '官网价' }}</dt><dd class="price-detail">{{ quote.standard ? withYuan(quote.standard) : '尚未取得报价明细' }}</dd></div>
           <div><dt>学生实价</dt><dd class="price-detail">{{ quote.mode === 'manual' ? '请查看列表中的手动价' : quote.actual ? withYuan(quote.actual) : '尚无可用单价' }}</dd></div>
         </dl>
         <p v-for="note in quote.notes" :key="note" class="beichen-note">{{ note }}</p>

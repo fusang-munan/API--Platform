@@ -365,7 +365,8 @@ func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx, observed
 
 // Read the original terms without converting any prices to floating point.
 const activationFixedSchoolPriceSQL = `p.school_input IS NOT NULL AND p.school_output IS NOT NULL
-  AND (p.mode = 'manual' OR (p.school_cache_read IS NOT NULL AND p.school_cache_write IS NOT NULL))`
+  AND (p.mode = 'manual' OR COALESCE(version.source = 'derived_from_usage', false)
+       OR (p.school_cache_read IS NOT NULL AND p.school_cache_write IS NOT NULL))`
 
 const activationPriceSQL = `
 SELECT ` + activationFixedSchoolPriceSQL + `,
@@ -374,6 +375,7 @@ SELECT ` + activationFixedSchoolPriceSQL + `,
        THEN snap.model_pricing -> ($2::text) END
 FROM provider_credentials c
 CROSS JOIN LATERAL beichen_price_at(c.id,$2,statement_timestamp()) p
+LEFT JOIN beichen_price_versions version ON version.id=p.upstream_version
 LEFT JOIN LATERAL (
   SELECT expires_at,credential_ciphertext_sha256,credential_revision,model_pricing
   FROM beichen_panel_snapshots

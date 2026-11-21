@@ -35,9 +35,21 @@ func TestCrawlCommandFindsSavedLocalSessionByDefault(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"version":-1}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	var stdout, stderr bytes.Buffer
-	if code := run(nil, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "本机北辰会话解密失败") {
-		t.Fatalf("default local session was not used: exit %d, stderr %q", code, stderr.String())
+	for _, args := range [][]string{nil, {"--keys"}} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "本机北辰会话解密失败") {
+			t.Fatalf("default local session was not used: exit %d, stderr %q", code, stderr.String())
+		}
+	}
+}
+
+func TestCrawlCommandKeepsFixtureOffline(t *testing.T) {
+	for _, flag := range []string{"--keys", "--save-keys", "--compare-models"} {
+		var stdout, stderr bytes.Buffer
+		if code := run([]string{"--fixture", "channels.json", flag}, &stdout, &stderr); code != 2 ||
+			!strings.Contains(stderr.String(), "离线") || stdout.Len() != 0 {
+			t.Fatalf("expected offline option error for %s: exit %d", flag, code)
+		}
 	}
 }
 

@@ -26,6 +26,8 @@ Nebula 是实验室正在使用的 AI API 平台，镜像版本由仓库根目�
 
 后台约每 15 分钟读取北辰登录网页的 Key 清单和可用渠道。自动同步、手动同步和指定 Key 重扫先核实 Key 的网页身份，再以 `group_id` 读取分组模型及报价。分组规则足够核对时，报价、倍率和分组写入同一轮版本。官网报价须和当前 Key 的分组、计费规则及模型对应，调用按派发时有效的报价和倍率结算。网页读取失败时，教师页保留上次倍率并标记陈旧，后续跟随价待回执核账。新流水约每分钟检查一次。
 
+分组 16 的两款 Claude 可用已核实的历史流水补齐输入和输出报价。老师会看到「反推价，待核对」，也可为指定 Key 保存手动价。自动计价优先使用同组正式官网价，缺价时使用当前 Key 已核实倍率和反推基础价。请求有缓存用量但反推样本缺少缓存价时进入待核账。此路径需要应用迁移 `0058`。
+
 官网快照保存各渠道、平台、分组、型号和原始计价条件。部分平台读失败时更新可读平台并保留其余数据，整页失败时保留已有快照，页面标记待更新并按退避间隔重试。教师页保存及续期得到的会话加密写入学校数据库，后端重启后会继续读取。
 
 「模型管理 → 北辰」把官网和各 Key 目录一起计入「已从上游发现」。每行展示来源、启用 Key 覆盖数、官网分组和实际 Key 型号。匹配依序使用原名、格式归一化、教师别名。官网型号在其他分组有报价时，页面并列展示官网分组和当前 Key 分组的单价情况及倍率。当前 Key 分组缺型号时，可切换上游分组或换 Key 后直接重扫。目录中保留可直接操作的不同 Key 型号 ID。
@@ -57,6 +59,7 @@ Nebula 是实验室正在使用的 AI API 平台，镜像版本由仓库根目�
 
 ```powershell
 go run ./cmd/beichen-crawl --fixture ./internal/beichen/testdata/website-directory.json
+go run ./cmd/beichen-crawl --fixture ./internal/beichen/testdata/website-pricing-2026-11-21.json
 ```
 
 教师可在供应商页保存北辰账号密码或网页 Token。密码模式可自动续期，也可在北辰拒绝续期后重新登录。网页 Token 模式适合已在北辰浏览器完成验证的会话，到期要手动更新。
@@ -72,6 +75,7 @@ go run ./cmd/beichen-session login --window
 go run ./cmd/beichen-session status
 go run ./cmd/beichen-session check
 go run ./cmd/beichen-crawl
+go run ./cmd/beichen-crawl --keys
 ```
 
 Windows 会话保存在 `%LOCALAPPDATA%\Nebula\beichen-session.json`，同目录的 `beichen-session.key` 用于 AES-256-GCM 加密。两个文件只授权给当前 Windows 账号。其他系统在用户配置目录下使用 `Nebula` 和 `0600` 文件权限。「记住账号密码」默认关闭。爬虫优先读取这份会话，到期或渠道页拒绝访问时会尝试续期。北辰未下发续期凭证且密码未保存时，到期后需重新登录。本机测试抓取只读取渠道页和必要的登录接口。
@@ -80,7 +84,17 @@ Windows 会话保存在 `%LOCALAPPDATA%\Nebula\beichen-session.json`，同目录
 
 需要比对学校现有 Key 时，运行 `go run ./cmd/beichen-crawl --match-db`。学校有多个启用的北辰供应商时，用 `--provider <供应商UUID>` 选定一个。该选项也可与 `--fixture` 一起使用。比对读取已保存的 Key 目录和教师别名。官网读取时，工具可更新已保存的会话状态。
 
-标准输出是 JSON，列出每个型号的来源分组、Token 报价状态、忽略的报价字段和已保存的 Key 匹配结果。部分解析失败仍会输出可用结果和失败项，并以非零状态退出。后台每次抓取的本轮计数、耗时和失败项显示在教师「模型管理 → 北辰 → 官网目录」。
+`--keys` 用同一个网页登录会话读取渠道目录和 Key 清单，再用官网提供的各把 Key 请求 `GET https://api.beichenapi.com/v1/models`。每把 Key 显示名称、最多 10 字符的前缀、分组、倍率、高峰规则、官网状态及同组型号，同时列出实际模型数和完整型号，以及 `matched`、`only_key`、`only_group` 三类对照。只有实际接口返回空清单才显示实际型号数为 0。官网仅返回遮盖前缀或模型列表读取失败时，实际型号数为空。此选项无需数据库。`--fixture` 保持离线使用。
+
+需要同步清单到已配置的 PostgreSQL 时使用 `go run ./cmd/beichen-crawl --save-keys`，由 `DATABASE_URL` 和 `PROVIDER_CREDENTIAL_ENCRYPTION_KEY` 选择数据库并匹配学校渠道。存在多个启用的北辰供应商时加 `--provider <供应商UUID>`。学校后台也会约每 15 分钟继续读取官网清单。每把 Key 的分组、倍率或高峰规则变化时记录新版本。`--save-keys` 和教师清单接口都会显示版本首次观察时间 `observed_at` 和最近变化时间 `changed_at`，首次建立基线时最近变化时间为空。
+
+标准输出是 JSON，列出每个型号的来源分组、报价、采集时间、缺项和已忽略字段。报价单位为元（北辰余额单位），按原金额保存。脱敏的 2026-11-21 样本包含 35 个不同型号及 9 个分组。部分解析失败仍会输出可用结果和失败项，并以非零状态退出。
+
+后台按约 15 分钟刷新官网目录和分组报价。已核对归属的学校渠道会用各自凭据读取 `GET /v1/models`，按分组对照官网型号，同时记录网页账号可见的个人倍率。教师在「模型管理 → 北辰 → 官网目录 → Key 实际型号核对」查看匹配、仅 Key、仅官网三类及读取失败原因。要立即输出同样的对照，运行 `go run ./cmd/beichen-crawl --compare-models`，使用已配置的数据库、凭据加密密钥和网页授权。重复读取同样的价格和倍率不会增加历史版本。
+
+### 导出北辰仪表盘和 Key 用量
+
+`go run ./cmd/beichen-report --range 7d --granularity day` 读取本机加密会话，输出并保存仪表盘、平台、模型、趋势、最近使用和各把 Key 的用量及核对结果。范围可选 `today`、`7d`、`all`。加 `--reconcile` 后，通过 `DATABASE_URL` 只读比较本机网关账本与本轮网页数据，金额按元记账。[接口、用法和实抓记录](docs/reports/beichen-crawl-stability.md)
 
 ## 技术栈
 

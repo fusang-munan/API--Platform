@@ -27,6 +27,18 @@ type LocalLoginStore struct {
 	dir string
 }
 
+// SaveLocalLogin 把一次原生网页登录得到的会话加密写入本机存储，
+// 供窗口与爬虫共用；密码不经此入口保存。
+func SaveLocalLogin(ctx context.Context, account, access, refresh string, expires *time.Time) error {
+	store, err := OpenLocalLoginStore()
+	if err != nil {
+		return err
+	}
+	return store.withLock(ctx, func() error {
+		return store.save(localPanelLogin{Account: account, Email: account, Access: access, Refresh: refresh, ExpiresAt: expires})
+	})
+}
+
 func OpenLocalLoginStore() (*LocalLoginStore, error) {
 	base, err := os.UserConfigDir()
 	if runtime.GOOS == "windows" {

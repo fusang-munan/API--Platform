@@ -99,7 +99,9 @@ SELECT COALESCE(k.model_id::text,w.model,b.model),n.credential_id,COALESCE(c.lab
  ),
  COALESCE(b.protocols,'[]'::jsonb),probes.observations,
  price.mode,price.school_input IS NOT NULL AND price.school_output IS NOT NULL
-  AND (price.mode='manual' OR (price.school_cache_read IS NOT NULL AND price.school_cache_write IS NOT NULL)),
+  AND (price.mode='manual' OR COALESCE(version.source='derived_from_usage',false)
+    OR (price.school_cache_read IS NOT NULL AND price.school_cache_write IS NOT NULL)),
+ COALESCE(version.source='derived_from_usage',false),
  CASE WHEN snap.expires_at>statement_timestamp()
         AND COALESCE(snap.credential_ciphertext_sha256=sha256(c.credential_ciphertext),snap.credential_revision=c.updated_at)
       THEN snap.model_pricing->k.model_id::text END,
@@ -124,6 +126,7 @@ LEFT JOIN LATERAL (
  WHERE credential_id=c.id AND effective_at<=statement_timestamp() ORDER BY effective_at DESC LIMIT 1
 ) snap ON true
 CROSS JOIN LATERAL beichen_price_at(c.id,k.model_id::text,statement_timestamp()) price
+LEFT JOIN beichen_price_versions version ON version.id=price.upstream_version
 CROSS JOIN LATERAL (
  SELECT COALESCE(jsonb_object_agg(r.protocol,` + probeEvidenceSQL + `),'{}'::jsonb) AS observations
  FROM upstream_probes r
@@ -135,7 +138,7 @@ ORDER BY n.name_key,c.label,c.id`
 type capabilityRow struct {
 	ModelCapability
 	keyEnabled, keyListed, websiteListed, catalogCurrent, activeSchool bool
-	fixedPrice, priceExpired                                           bool
+	fixedPrice, derivedPrice, priceExpired                             bool
 	priceMode                                                          string
 	priceTerms                                                         []byte
 	entryRaw, declaredJSON, publishedJSON, probesJSON                  []byte
@@ -179,7 +182,7 @@ func readCapabilityRows(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, v
 		if err := rows.Scan(&row.Model, &row.CredentialID, &row.CredentialLabel,
 			&row.keyEnabled, &row.keyListed, &row.websiteListed, &row.catalogCurrent,
 			&row.entryRaw, &row.declaredJSON, &row.activeSchool, &row.publishedJSON, &row.probesJSON,
-			&row.priceMode, &row.fixedPrice, &row.priceTerms, &row.priceExpired, &row.MultiplierState); err != nil {
+			&row.priceMode, &row.fixedPrice, &row.derivedPrice, &row.priceTerms, &row.priceExpired, &row.MultiplierState); err != nil {
 			return err
 		}
 		if err := row.evaluate(view); err != nil {
@@ -343,6 +346,8 @@ func (row *capabilityRow) reportPriceGaps(view *BeichenCapabilities) {
 	switch {
 	case row.fixedPrice && row.priceMode == "manual":
 		row.PriceState = "manual"
+	case row.fixedPrice && row.derivedPrice:
+		row.PriceState = "derived"
 	case row.fixedPrice:
 		row.PriceState = "confirmed"
 	default:

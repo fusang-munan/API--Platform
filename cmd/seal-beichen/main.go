@@ -30,6 +30,7 @@ func main() {
 	out := flag.String("out", "", "Git 发布中要保存的密文文件；默认按模式选择")
 	check := flag.Bool("check", false, "仅确认学校收件公钥就绪")
 	sessionMode := flag.Bool("session", false, "打开北辰登录页并捕获网页面板会话")
+	localOut := flag.String("local-out", "", "同时写入本机明文会话 JSON（仅本机测试用）")
 	login := flag.String("login", "https://beichenapi.com/login", "北辰网页登录地址")
 	edge := flag.String("edge", "", "Microsoft Edge 可执行文件；留空自动查找")
 	timeout := flag.Duration("timeout", 10*time.Minute, "等待本人完成北辰登录的最长时间")
@@ -45,7 +46,7 @@ func main() {
 	if *check {
 		err = run(schoolOrigin, *cert, *out, true, os.Stdin)
 	} else if *sessionMode {
-		err = runSession(schoolOrigin, *cert, *out, *login, *edge, *timeout)
+		err = runSession(schoolOrigin, *cert, *out, *localOut, *login, *edge, *timeout)
 	} else {
 		err = run(schoolOrigin, *cert, *out, *check, os.Stdin)
 	}

@@ -280,14 +280,20 @@ func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credenti
 }
 
 func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision time.Time, key string) fetchResult {
-	directory, catalogErr := s.readCredentialWebsiteCatalog(ctx, job.credential, key)
+	directory, catalogErr := s.readBillingCatalog(ctx, job, key)
 	var info billingInfo
 	var quote panelQuote
 	billingErr := catalogErr
 	if catalogErr == nil {
 		info, quote, billingErr = directory.billing()
 	}
-	return fetchResult{err: billingErr, partialErr: quote.err, save: func(ctx context.Context, tx *sql.Tx) error {
+	partialErr := quote.err
+	if directory.keyBilling != nil && billingErr == nil {
+		// A successful Key read establishes the billing rule. The official
+		// website quote remains unavailable and is reported separately.
+		partialErr = nil
+	}
+	return fetchResult{err: billingErr, partialErr: partialErr, save: func(ctx context.Context, tx *sql.Tx) error {
 		if catalogErr != nil {
 			if err := recordDatasetError(ctx, tx, job.credential, "catalog", catalogErr.Error()); err != nil {
 				return err
