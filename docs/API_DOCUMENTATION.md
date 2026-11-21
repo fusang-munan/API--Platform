@@ -496,7 +496,7 @@ data: {"revision":"01K2..."}
 
 `catalog_keys[].group_diagnosis` 的 `model_outside_key_group` 表示型号在其他官网分组且当前 Key 的目录未列出，`price_outside_key_group` 表示型号有其他分组报价、当前 Key 分组缺价，`group_rate_mismatch` 表示同一分组的官网与 Key 计费规则不一致。`website_locations[].groups` 返回官网分组倍率和可用的高峰规则。`website_locations[].price_conditions_exact` 以十进制字符串保存可显示的单价数字，供报价对比使用。Key 分组沿用陈旧记录时，`group_stale` 为真。
 
-概览的 `datasets[]` 中，`kind=billing` 可返回从 Key 清单核实的 `group_id`、`group_name`、`group_rate` 和 `group_status`。`assigned` 表示清单确认绑定分组，`not_found` 表示已匹配的 Key 明确未绑定分组，`not_allowed` 表示计费或模型清单接口明确返回 `GROUP_NOT_ALLOWED`。分组状态与 `billing_state` 分别记录归属和生效倍率的核实结果。Key 计费和模型清单已核实的同步可以成功提交，缺少价表另由 `kind=prices` 的 `official_price_missing` 表示。已具备反推单价的模型用 `price_status=derived`、`price_source=derived_from_usage` 和 `price_observed_at` 标明来源与时间。
+概览的 `datasets[]` 中，`kind=billing` 可返回从 Key 清单核实的 `group_id`、`group_name`、`group_rate` 和 `group_status`。`pending` 表示归属待同步，`assigned` 表示清单确认绑定分组，`not_found` 表示已匹配的 Key 明确未绑定分组，`not_allowed` 表示计费或模型清单接口明确返回 `GROUP_NOT_ALLOWED`。`not_allowed` 保留清单确认的分组。分组状态与 `billing_state` 分别记录归属和生效倍率的核实结果。Key 计费和模型清单已核实的同步可以成功提交，缺少价表另由 `kind=prices` 的 `official_price_missing` 表示。已具备反推单价的模型用 `price_status=derived`、`price_source=derived_from_usage` 和 `price_observed_at` 标明来源与时间。
 
 本轮已在当前分组的有效价表中查找该模型，而价表缺少同名条目时，概览的 `models[].price_status` 返回 `not_listed`。当整组缺少官方价表且部分型号的反推价已生效时，其余已核实的型号也返回 `not_listed`。分组待核、价表缺失或过期、已列出的同名条目缺少有效价格，通常返回 `pending_confirmation`。
 
@@ -607,7 +607,7 @@ data: {"revision":"01K2..."}
 
 `POST .../beichen/key-usage` 使用教师身份，要求启用的 `credential_id`。可提交 `{"credential_id":"渠道 UUID","target_multiplier":"0.6","expect_claude":true}`。两个目标字段均可省略，空倍率字符串可清除目标倍率。成功返回 `{"synced":true}`。并发核对同一 Key 时返回状态冲突。网页读取失败返回 503，本次已验证的分组或已读完的账日仍可保存。
 
-北辰网页请求使用会话 Token。先用 `GET /api/v1/keys` 确认 `id`、`user_id` 和 `group_id`，再用 `GET /api/v1/channels/available` 读取该组型号、价格和 `rate_multiplier`。用量使用 `GET /api/v1/usage`，传 `api_key_id`、同一天的 `start_date` 和 `end_date`、`timezone=Asia/Shanghai`、分页参数和 ID 升序。每笔必须匹配账号、Key 和日期。`total_cost` 可作为网页原价字段，实付取 `actual_cost`。教师概览的 `key_capabilities[]` 包含 `website_key_id` 和 `website_group`，后者附分组 ID、名称和倍率。空字段为 `null`。
+北辰网页请求使用会话 Token。先用 `GET /api/v1/keys` 确认 `id`、`user_id` 和 `group_id`，再用 `GET /api/v1/channels/available` 读取该组型号、价格和 `rate_multiplier`。用量使用 `GET /api/v1/usage`，传 `api_key_id`、同一天的 `start_date` 和 `end_date`、`timezone=Asia/Shanghai`、分页参数和 ID 升序。每笔必须匹配账号、Key 和日期。`total_cost` 可作为网页原价字段，实付取 `actual_cost`。教师概览的 `key_capabilities[]` 包含 `website_key_id`、`website_group` 和 `group_status`。分组状态与计费同步共用。`website_group` 返回核实的 ID、名称和倍率，缺少分组资料时为 `null`。
 
 `GET .../beichen?day=YYYY-MM-DD` 响应的 `key_capabilities[]` 按渠道提供 `models`、`has_claude`、`balance`、`unit` 和模型、用量各自的状态、时间与错误。`daily_usage` 为所选北京时间日期的数据。`model_stats` 给出模型分项，模型日期未确认时 `model_stats_day` 为空。`observed_multiplier` 等于 `actual_cost/cost`，原价缺失或为零时留空。`multiplier_diff` 表示相对 `stored_multiplier` 的偏差严格超过 5%。金额和倍率以十进制字符串返回。`group_check` 为 `old_group`、`mismatch`、`target_observed` 或 `pending`。
 

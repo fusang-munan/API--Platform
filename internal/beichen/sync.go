@@ -280,6 +280,7 @@ func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credenti
 }
 
 func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision time.Time, key string) fetchResult {
+	startedAt := s.now().UTC()
 	directory, catalogErr := s.readBillingCatalog(ctx, job, key)
 	var info billingInfo
 	var quote panelQuote
@@ -294,7 +295,7 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 		partialErr = nil
 	}
 	return fetchResult{err: billingErr, partialErr: partialErr, save: func(ctx context.Context, tx *sql.Tx) error {
-		if err := saveBillingGroup(ctx, tx, job.credential, revision, directory, billingErr); err != nil {
+		if err := saveBillingGroup(ctx, tx, job.credential, revision, startedAt, directory, billingErr); err != nil {
 			return err
 		}
 		if catalogErr != nil {

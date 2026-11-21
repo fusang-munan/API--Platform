@@ -181,10 +181,10 @@ VALUES($1,$2,$3::date,'glm-5.3',2,160000,'usage')`, provider, cc2, day)
 	if err := service.RefreshKeyUsage(ctx, provider, cc2, input); err != nil {
 		t.Fatal(err)
 	}
-	_, result := read()
+	view, result := read()
 	if result.WebsiteKeyID == nil || *result.WebsiteKeyID != 42 || result.WebsiteGroup == nil ||
 		result.WebsiteGroup.ID != 602 || *result.WebsiteGroup.Rate != "0.6" ||
-		result.Balance != nil || result.HasClaude == nil || !*result.HasClaude ||
+		result.GroupStatus != "assigned" || result.Balance != nil || result.HasClaude == nil || !*result.HasClaude ||
 		!slices.Equal(result.Models, []string{"claude-opus-4-6", "claude-sonnet-4-6"}) ||
 		result.GroupCheck != "target_observed" || result.DailyUsage == nil ||
 		*result.DailyUsage.Cost != "0.11" || *result.DailyUsage.ActualCost != "0.066" ||
@@ -193,6 +193,10 @@ VALUES($1,$2,$3::date,'glm-5.3',2,160000,'usage')`, provider, cc2, day)
 		*result.ModelStats[0].CacheRead != 2000 || *result.ModelStats[0].CacheWrite != 120 ||
 		*result.ModelStats[1].Input != 0 || result.ModelStats[1].CacheWrite != nil {
 		t.Fatalf("invalid CC2 evidence: %+v", result)
+	}
+	billing := datasetForCredential(t, view, cc2, "billing")
+	if billing.GroupStatus != "assigned" || billing.GroupID == nil || *billing.GroupID != 602 {
+		t.Fatalf("a Key check did not initialize its shared group observation: %+v", billing)
 	}
 	if report := reconcile(); report.Totals.Upstream.ActualCost == nil || *report.Totals.Upstream.ActualCost != "0.066" ||
 		report.Totals.Upstream.Unit == nil || *report.Totals.Upstream.Unit != "USD" || len(report.Models) != 2 {

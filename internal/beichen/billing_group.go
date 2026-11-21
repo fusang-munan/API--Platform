@@ -17,31 +17,33 @@ type billingGroupObservation struct {
 	Revision    time.Time `json:"credential_revision"`
 }
 
-func saveBillingGroup(ctx context.Context, tx *sql.Tx, credential uuid.UUID, revision time.Time, directory websiteKeyCatalog, err error) error {
-	if directory.keyGroup == nil {
-		if errors.Is(err, errKeyMatch) || errors.Is(err, errPanelGroupUnverified) {
-			_, err := tx.ExecContext(ctx, `UPDATE beichen_datasets SET website_group_observation=NULL
-WHERE credential_id=$1 AND kind='billing'`, credential)
-			return err
+func saveBillingGroup(ctx context.Context, tx *sql.Tx, credential uuid.UUID, revision, startedAt time.Time, directory websiteKeyCatalog, readErr error) error {
+	observation := billingGroupObservation{GroupStatus: "pending", CheckedAt: startedAt, Revision: revision}
+	switch {
+	case directory.keyGroup != nil:
+		observation.WebsiteGroup, observation.CheckedAt = *directory.keyGroup, directory.keyGroupAt
+		switch {
+		case directory.keyGroup.ID == 0:
+			observation.GroupStatus = "not_found"
+		case errors.Is(readErr, errKeyGroupNotAllowed):
+			observation.GroupStatus = "not_allowed"
+		default:
+			observation.GroupStatus = "assigned"
 		}
+	case !errors.Is(readErr, errKeyMatch) && !errors.Is(readErr, errPanelGroupUnverified):
 		return nil
 	}
-	status := "assigned"
-	switch {
-	case directory.keyGroup.ID == 0:
-		status = "not_found"
-	case errors.Is(err, errKeyGroupNotAllowed):
-		status = "not_allowed"
-	}
-	observation, err := json.Marshal(billingGroupObservation{
-		WebsiteGroup: *directory.keyGroup, GroupStatus: status, CheckedAt: directory.keyGroupAt, Revision: revision,
-	})
+	raw, err := json.Marshal(observation)
 	if err != nil {
 		return err
 	}
+	// Billing and Key usage may finish in a different order from the Key list reads.
 	_, err = tx.ExecContext(ctx, `
-UPDATE beichen_datasets SET website_group_observation=$2::jsonb
-WHERE credential_id=$1 AND kind='billing'`, credential, string(observation))
+INSERT INTO beichen_datasets AS prior (credential_id,kind,website_group_observation)
+VALUES ($1,'billing',$2::jsonb)
+ON CONFLICT (credential_id,kind) DO UPDATE SET website_group_observation=excluded.website_group_observation
+WHERE (prior.website_group_observation->>'credential_revision')::timestamptz IS DISTINCT FROM $4::timestamptz
+   OR (prior.website_group_observation->>'checked_at')::timestamptz <= $3`, credential, string(raw), observation.CheckedAt, revision)
 	return err
 }
 
@@ -83,4 +85,21 @@ func (item *Dataset) setBillingGroup(key WebsiteKey, status string) {
 		item.GroupName = key.GroupName
 	}
 	item.GroupID, item.GroupStatus = key.GroupID, status
+}
+
+func (item Dataset) groupReadError(message *string) *string {
+	// Errors from the old channel lookup can survive an upgrade in several datasets.
+	if message == nil || *message != "北辰面板找不到当前 Key 分组" {
+		return message
+	}
+	display := "分组待同步"
+	switch item.GroupStatus {
+	case "not_found":
+		display = errKeyGroupMissing.Error()
+	case "not_allowed":
+		if item.GroupID != nil {
+			display = deniedKeyGroup(*item.GroupID).Error()
+		}
+	}
+	return &display
 }

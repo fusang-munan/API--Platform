@@ -230,9 +230,11 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反推价，待核对」及观察时间。若报价缺失，先核对 `0058` 是否已应用、Key 是否仍属于 group 16，以及实际型号清单和当前倍率是否核实成功。用隔离的 PostgreSQL 运行 `go test ./internal/beichen -run '^TestBeichenDerivedPricesPostgres$' -count=1 -v`，回归两款 Claude 的自动结算、缓存缺价待核账、手动修正，以及官网固定价和分档价生效后的版本切换。
 
-若 Key 清单有 group 5 而渠道目录未列出该组，核对计费或型号清单的错误码。明确返回 `GROUP_NOT_ALLOWED` 时，模型行应显示「账号无 group 5 权限」，并保留分组名和倍率。Key 清单匹配成功但未绑定分组时显示「Key 分组不存在」。计费倍率已核实、官方价表缺失且没有适用流水证据的模型显示「官方价表缺失」。显示旧文案时先核对 `0059`，再查看同步后的分组状态和报价来源。
+若 Key 清单有 group 5 而渠道目录未列出该组，核对计费或型号清单的错误码。明确返回 `GROUP_NOT_ALLOWED` 时，模型行和 Key 卡片应显示「账号无 group 5 权限」，并保留分组名和倍率。Key 清单匹配成功但未绑定分组时显示「Key 分组不存在」，缺少归属证据时显示「分组待同步」。计费倍率已核实、官方价表缺失且没有适用流水证据的模型显示「官方价表缺失」。
 
-在隔离测试库运行 `go test ./internal/beichen -run 'TestBeichen(GroupDenialError|BillingGroupDenialPostgres|DerivedPricesPostgres)$' -count=1 -v`。在 `frontend` 下运行 `npm run test -- src/views/teacher/BeichenSchoolModels.test.ts` 验证同样的模型行文案。两处测试使用预设响应。
+0.23.1 的 `0059` 只添加字段，历史的「北辰面板找不到当前 Key 分组」仍可能留在 Key 核对和价格同步错误中。即使 `datasets[]` 已有 `not_allowed`，旧卡片也会直接读取独立保存的错误。排查时通过教师概览 GET 对照相同 `credential_id` 的 `datasets[]` 中 `kind=billing` 的 `group_status` 与 `key_capabilities[]` 的分组。概览响应带 `Cache-Control: private, no-store`，且数据库缺少 `0059` 的字段时概览读取会失败。字段已存在但没有本轮观测时，等待同步或核对该 Key 后可见新的分组状态。
+
+在隔离测试库运行 `go test ./internal/beichen -run 'TestBeichen(GroupDenialError|BillingGroupDenialPostgres|WebsiteCC2KeyUsagePostgres|DerivedPricesPostgres)$' -count=1 -v`。在 `frontend` 下运行 `npm run test -- BeichenKeyCapabilities BeichenSchoolModels`，覆盖旧错误、三个异常状态、G3 的倍率和模型、CC2 的倍率核对。测试使用预设响应。
 
 用 `go test ./cmd/beichen-crawl ./internal/beichen -run 'Test(BeichenCrawl|CrawlCommand|BeichenWebsiteDirectoryPostgres)' -count=1 -v` 复查退出码、完整计数、单平台损坏、空价与零价、教师别名和抓取记录入库。看到 `complete=false` 时，用 `failures[].path` 和 `reason` 定位错误。网页不可读时教师页上次抓取可显示 0，先前已保存的目录仍可用于查看。需要核对 Key 时加 `--match-db` 并设置 `DATABASE_URL`，`key_matching=not_checked` 表示本轮没有执行这项核对。`key_matching=failed` 时查看 `key_match_error`。
 
@@ -273,7 +275,7 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 #### 核对一把 Key 的实际用量和分组
 
-进入「模型管理 → 北辰 → Key 实际能力」，按渠道名找到对应 Key。输入目标倍率，若新分组应提供 Claude，则勾选相应选项，再点「核对这个 Key」。官网分组名和倍率来自登录后的 Key 清单与可用渠道。切组当日的账单实付比值可包含切换前用量。用量显示陈旧时，查看具体账日的抓取错误。官网拒绝授权时先在「北辰网页登录」验证会话。若返回的流水属于另一把 Key 或分页缺失，保留上次核实数据，检查网页的 Key ID 和日期筛选后重试。
+进入「模型管理 → 北辰 → Key 实际能力」，按渠道名找到对应 Key，点击「核对这个 Key」。可在弹层填写目标分组倍率，再点「开始核对」。官网分组名和倍率来自登录后的 Key 清单与可用渠道。切组当日的账单实付比值可包含切换前用量。用量显示陈旧时，查看具体账日的抓取错误。官网拒绝授权时先在「北辰网页登录」验证会话。若返回的流水属于另一把 Key 或分页缺失，保留上次核实数据，检查网页的 Key ID 和日期筛选后重试。
 
 使用隔离的本机 PostgreSQL，运行 `go test ./internal/beichen -run 'TestWebsiteCC2GroupCatalog|TestBeichenWebsiteCC2KeyUsagePostgres|TestWebsiteUsageMoneyAndEmptyFields' -count=1 -v`。构造数据覆盖四把 Key、0.3× 与 0.6× 两个 Claude 分组、GM1、同名模型跨组异价、USD 实付、显式零、缺失和可选图像及视频字段。测试还核对两份原始 JSON、账号级 0.16× 旧数据隔离、错误 Key 流水拒绝与陈旧标记。CC2 fixture 的型号和单价用于验收，需要使用获准的真实网页会话确认官网清单与价格。前端运行 `npm test -- BeichenKeyCapabilities BeichenSchoolModels BeichenReconcile` 核对页面。
 

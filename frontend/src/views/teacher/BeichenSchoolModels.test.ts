@@ -142,6 +142,14 @@ describe('北辰模型管理', () => {
     const claudeRow = assertOfficial(claude, {
       输入: '3 元', 输出: '15 元', '缓存写入(5m)': '3.75 元', '缓存写入(1h)': '未列单价', 缓存读取: '0.3 元',
     })
+    const claudePrices = claudeRow.get('.standard-price')
+    const priceAmounts = (label: string) => claudePrices.findAll('dl > div')
+      .find(node => node.get('dt').text() === label)!
+      .findAll('.price-yuan, .price-credits, .price-unit').map(node => node.text())
+    expect(priceAmounts('输入')).toEqual(['3 元', '300 积分', '/ 1M Token'])
+    expect(priceAmounts('输出')).toEqual(['15 元', '1500 积分', '/ 1M Token'])
+    expect(priceAmounts('缓存写入(5m)')).toEqual(['3.75 元', '375 积分', '/ 1M Token'])
+    expect(priceAmounts('缓存读取')).toEqual(['0.3 元', '30 积分', '/ 1M Token'])
     expect(claudeRow.get('.standard-price').text()).toContain('分组 2')
     expect(claudeRow.get('.actual-price').text()).toContain('当前 Key 报价待核对')
     expect(button(claudeRow, '启用').element.disabled).toBe(true)
@@ -745,20 +753,21 @@ describe('北辰模型管理', () => {
     await flushPromises()
     expect(wrapper.findAll('.model-table thead th').map(cell => cell.text())).toEqual(['模型', '状态与覆盖', '官网价', '学生实价', '本月用量', '操作'])
     const amounts = (selector: string) => wrapper.findAll(selector + ' .price-value').map(cell => [
-      cell.get('.price-credits').text(), cell.element.querySelector('.price-sub')?.textContent ?? null,
+      cell.get('.price-yuan').text(), cell.get('.price-credits').text(),
+      cell.find('.price-gap').exists() ? cell.get('.price-gap').text() : null,
     ])
     expect(amounts('.standard-price')).toEqual([
-      ['123.4567890123 积分', '1.234567890123 元'], ['200 积分', '2 元'],
-      ['缺价', null], ['未列单价', null], ['0 积分', '0 元'],
+      ['1.234567890123 元', '123.4567890123 积分', null], ['2 元', '200 积分', null],
+      ['—', '—', '缺价：缓存写入(5m)'], ['—', '—', '未列单价：缓存写入(1h)'], ['0 元', '0 积分', null],
     ])
     expect(amounts('.actual-price')).toEqual([
-      ['16.97530848919125 积分', '0.1697530848919125 元'], ['27.5 积分', '0.275 元'],
-      ['缺价', null], ['未列单价', null], ['0 积分', '0 元'],
+      ['0.1697530848919125 元', '16.97530848919125 积分', null], ['0.275 元', '27.5 积分', null],
+      ['—', '—', '缺价：缓存写入(5m)'], ['—', '—', '未列单价：缓存写入(1h)'], ['0 元', '0 积分', null],
     ])
     expect(wrapper.get('.standard-price .billing-mode-line').text()).toBe('计费模式：按 Token（每 1M Token 计价）')
     expect(wrapper.get('.standard-price .price-source').text()).toBe('官网正式价')
     expect(wrapper.get('.actual-price .quote-caption').text()).toContain('0.125×')
-    expect(componentSource).toContain('@container (max-width: 54rem)')
+    expect(componentSource).toContain('@container (max-width: 60rem)')
     expect(componentSource).not.toContain('overflow-x: auto')
   })
 
@@ -775,7 +784,7 @@ describe('北辰模型管理', () => {
     await flushPromises()
     expect(wrapper.get('.standard-price .price-line').element.textContent).toBe(official)
     expect(wrapper.get('.actual-price .price-line').element.textContent).toBe(student)
-    expect(wrapper.find('.price-grid').exists()).toBe(false)
+    expect(wrapper.find('.price-table').exists()).toBe(false)
   })
 
   it('把历史流水报价标为待核对并保留手动修正入口', async () => {

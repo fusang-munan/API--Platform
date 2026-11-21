@@ -51,7 +51,7 @@ func (k *listedKey) observeValue(value string) bool {
 
 var errKeyList = errors.New("北辰账号的 Key 列表或分页无法确认")
 var errKeyMatch = errors.New("未能唯一确认本渠道的北辰 Key 和分组")
-var errKeyGroupMissing = errors.New("北辰 Key 分组不存在")
+var errKeyGroupMissing = errors.New("Key 分组不存在")
 
 func (s *Service) accountKeys(ctx context.Context, token string) ([]listedKey, error) {
 	return s.readAccountKeys(ctx, token, nil)
