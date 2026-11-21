@@ -252,11 +252,12 @@ data: {"revision":"01K2..."}
 | POST | `/api/v1/student/api-keys` | 提交 Key 申请 |
 | GET | `/api/v1/student/api-keys` | 列出自己的申请和 Key |
 | GET | `/api/v1/student/api-keys/{api_key_id}` | 查看自己的审核详情与进度 |
+| POST | `/api/v1/student/api-keys/{api_key_id}/models` | 为自己的生效 Key 添加已开放的模型 |
 | POST | `/api/v1/student/api-keys/{api_key_id}/claim` | 一次性领取已批准 Key |
 
 组织和项目列表不要求学生已是成员。项目没有导师或已停用时仍返回并由界面禁选；无导师项目提交返回 `409 PROJECT_HAS_NO_MENTOR`，停用项目提交返回资源不存在。
 
-模型广场集合为：全局 `is_common=true AND status=active` 模型，与当前学生 `approved/active` Key 关联模型的去重并集。后者即使后来停用仍返回真实状态，便于解释 Key 可用性。
+模型广场将预置模型与学生个人模型库去重展示。新模型须已启用、已有正数倍率且有可用线路，才出现在广场及目录搜索结果。目录搜索选中的非预置模型可通过 `POST /api/v1/student/models` 加入个人模型库。
 
 提交申请：
 
@@ -265,14 +266,13 @@ data: {"revision":"01K2..."}
   "name": "research-key",
   "organization_id": "uuid",
   "project_id": "uuid",
-  "models": [{"model_id":"gpt-4.1-mini"},{"model_id":"new-lab-model","display_name":"Lab Model"}]
+  "models": [{"model_id":"gpt-4.1-mini"},{"model_id":"configured-lab-model"}]
 }
 ```
 
-- `models` 为 1 至 100 个大小写不敏感去重后的模型引用。`display_name` 选填；新模型省略时默认等于 `model_id`，已有模型始终复用平台权威信息。
+- `models` 接受 1 至 100 个模型引用，按公开模型 ID 去重。选用教师已开放且当前学生可见的模型，平台模型配置决定显示名称及调用线路。
 - 服务端校验项目确实属于 `organization_id`，但只持久化 `project_id`，避免组织归属冗余。
-- 新 `model_id` 大小写不敏感幂等创建为 `pending_configuration`。
-- 创建申请、候选模型和 `api_key_models` 必须在一个事务完成。
+- 创建申请与 `api_key_models` 在同一个事务完成。
 - 同一学生进行中或生效 Key 名称大小写不敏感唯一；`rejected/revoked` 后可复用。
 
 创建成功返回 `201 Created`：
@@ -311,6 +311,20 @@ data: {"revision":"01K2..."}
 ```
 
 重复领取返回 `409 KEY_ALREADY_CLAIMED`，不会再次返回明文。老师批准事务会幂等创建学生的组织和项目成员关系；Key 撤销不移除这些关系。
+
+### 5.1 给生效 Key 添加模型
+
+`POST /api/v1/student/api-keys/{api_key_id}/models` 接受 `{"model_ids":["gpt-4.1-mini"]}`。数组每次提交 1 至 100 个公开模型 ID。只有本人持有的 `active` Key 可操作，所属组织、项目和学生的项目访问资格须有效。每个新模型须为预置模型或已加入该学生的模型库，由教师启用，已有报价，并具备至少一条网关当前可用的线路。
+
+成功返回 HTTP 200，`data.model_ids` 是当前 Key 的完整授权列表，`data.added_model_ids` 是本次新增的模型 ID 数组。已授权模型重复提交时不产生新记录，数组可以为空。整批新增授权和审计一并提交。事务提交后，原 Key 的下一次 `GET /v1/models` 和相应协议的调用直接读取新授权。
+
+| HTTP 状态 | 错误码 | 含义 |
+| --- | --- | --- |
+| 400 | `VALIDATION_ERROR` | Key ID 或请求体无效 |
+| 403 | `FORBIDDEN` | 当前账号没有学生接口权限 |
+| 404 | `RESOURCE_NOT_FOUND` | Key 不存在或不属于本人，或模型不在本人广场 |
+| 409 | `INVALID_STATE_TRANSITION` | Key 尚未生效或项目访问资格已失效 |
+| 409 | `MODEL_NOT_READY` | 模型未启用、缺报价或暂无可用线路。响应给出具体原因和相关模型 ID |
 
 ## 6. 导师接口
 
@@ -436,6 +450,8 @@ data: {"revision":"01K2..."}
 
 `model_catalog[].protocols` 使用网关绑定的协议枚举。`probe_state` 为 `unprobed`、`passed` 或 `failed`。同一模型任一当前 Key 和协议的最近结果通过即为 `passed`。`last_probe_at` 是所有有效最近结果里的最新时间。发布可达线路数仍由 `ready_count` 表示。学校已启用但 `ready_count=0` 时返回 `binding_issue`，整个模型从当前目录消失时仍保留这个异常条目。`price_covered` 表示至少一条启用 Key 有可计算报价，发布时仍逐条检查实际会使用的线路。
 
+线路就绪且报价阻止启用时，`model_catalog[].price_blocker` 返回 `{code, message}`，其中 `message` 为中文说明。常见代码包括 `missing_price`、`billing_mode_non_token`、`tier_missing_input`、`tier_missing_output`、`tier_range_invalid` 和 `effort_multiplier_invalid`。线路未就绪时，查看 `blockers` 中的 `no_ready_route`。
+
 `catalog_differences` 按启用 Key 返回分组、核对时间、`website_only` 和 `key_only`。完整网页目录与 Key 目录都已核实才标为 `compared`，其余标为 `unverified`。模型匹配忽略大小写，列表保留各自来源的原始拼写。
 
 探活 POST 返回任务对象，GET 返回 `{run, results}`。概览中的 `probe_run` 使用相同任务对象。任务对象含 `state`（`idle`、`queued`、`running`、`completed` 或 `failed`）、`started_at`、`finished_at` 和 `error_code`。同一供应商在排队或执行时收到重复 POST 会合并。没有启用且已同步目录的 Key 时 POST 返回 400，供应商不存在或并非北辰时返回 404。未登录返回 401，角色不符返回 403。两个接口均返回 `Cache-Control: private, no-store`。
@@ -467,11 +483,11 @@ data: {"revision":"01K2..."}
 ```json
 {
   "enabled": [{"model": "model-a", "model_id": "uuid"}],
-  "skipped": [{"model": "model-b", "reason": "no_price", "message": "官网未报价或按条件计价，请先手动定价"}]
+  "skipped": [{"model": "model-b", "reason": "no_price", "message": "第 2 档缺少输出 Token 单价"}]
 }
 ```
 
-`reason` 包括 `not_found`、`already_active`、`route_not_ready`、`no_price`、`enable_failed`。各模型独立提交，单项失败不会撤销已成功的其他模型；重复请求返回已启用的跳过结果。按条件计价且没有教师手动价的模型也会跳过。
+`reason` 包括 `not_found`、`already_active`、`route_not_ready`、`no_price`、`enable_failed`。各模型独立提交，单项失败不会撤销已成功的其他模型；重复请求返回已启用的跳过结果。可计算的纯 Token 条件价可用于启用，空或省略的 `billing_mode` 默认按 Token 处理。单个启用的错误提示和批量结果的 `message` 使用与概览相同的报价说明。
 
 `PATCH .../beichen/models/price` 请求示例：
 
@@ -562,7 +578,7 @@ data: {"revision":"01K2..."}
 
 老师模型列表的集合是所有 `models`，即平台用户曾申请模型的大小写不敏感去重并集加老师主动添加的模型；不返回申请次数或申请用户身份。
 
-学生在申请 Key 阶段只填写 `model_id` 和可选 `display_name`。服务端在提交事务内按 `model_id` 查询：已有模型直接复用平台权威配置；不存在时以 `pending_configuration` 创建。并发创建同一 ID 时首个成功记录为权威，后续申请复用该记录。模型申请审批通过并完成配置后，自动出现在学生模型广场。
+学生首次申请 Key 时从自己的模型广场选取已开放的模型。领到生效 Key 后，可以在同一广场添加教师后来启用的模型。
 
 ### 7.3 Key 终审可见范围
 
@@ -626,7 +642,7 @@ data: {"revision":"01K2..."}
 - Realtime 使用 `Authorization` Header；浏览器无法设置 Header 时可使用标准 `Sec-WebSocket-Protocol` 承载凭据，不接受查询参数中的 API Key。
 - Responses WebSocket 使用同一个 `/v1/responses`，在首个 `response.create` frame 中提取公开 model 并改写为上游 model；`OpenAI-Beta`、Codex metadata Header、`previous_response_id`、`prompt_cache_key`、加密 reasoning/compaction item 和未知字段均透明保留。
 - Key 必须为 `active`，所请求 `model` 必须位于 `api_key_models` 白名单，模型、binding 和 provider 均须为 `active`。
-- `/v1/models` 返回当前 Key 关联的全部白名单模型，不以状态或路由就绪过滤；真正调用时仍要求模型、匹配 adapter 的 binding 和 provider 均为 active。
+- `/v1/models` 直接读取当前 Key 的完整授权列表，返回 `Cache-Control: no-store`。列表包含已授权的 Claude 模型。调用所用协议须有对应的可用线路；Codex 专用目录通过 `/v1/codex/model_catalog` 获取。
 
 网关按模型倍率执行月度 credit 额度检查与调用记录；目录查询、视频状态查询和内容下载不计费。
 

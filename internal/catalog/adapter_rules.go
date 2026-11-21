@@ -21,7 +21,7 @@ type AdapterRule struct {
 var adapterRules = []AdapterRule{
 	{Adapter: modelbinding.AdapterCohereRerankV2, Priority: 100, AnyTokens: []string{"rerank"}},
 	{Adapter: modelbinding.AdapterOpenaiEmbeddings, Priority: 90, AnyTokens: []string{"embed"}},
-	{Adapter: modelbinding.AdapterGoogleGeminiV1beta, Priority: 85, AnyTokens: []string{"gemini", "v1beta"}},
+	{Adapter: modelbinding.AdapterGoogleGeminiV1beta, Priority: 85, AnyTokens: []string{"gemini", "v1beta", "generatecontent"}},
 	{Adapter: modelbinding.AdapterAnthropic, Priority: 80, AnyTokens: []string{"anthropic", "claude"}, NoneTokens: []string{"openai"}},
 	{Adapter: modelbinding.AdapterAnthropic, Priority: 79, AllTokens: []string{"message"}, NoneTokens: []string{"openai", "embed", "image"}},
 	{Adapter: modelbinding.AdapterOpenaiResponses, Priority: 70, AnyTokens: []string{"response"}, NoneTokens: []string{"embed"}},
@@ -54,8 +54,8 @@ func ResolveAdapter(signal string) (modelbinding.Adapter, bool) {
 
 func ResolveAdapterFromRequestPath(path string) modelbinding.Adapter {
 	path = strings.TrimSpace(path)
-	if path == "" {
-		return modelbinding.AdapterOpenaiCompatible
+	if strings.HasPrefix(path, "/v1beta/models/") {
+		return modelbinding.AdapterGoogleGeminiV1beta
 	}
 	if adapter, ok := ResolveAdapter(path); ok {
 		return adapter
@@ -87,12 +87,15 @@ func AdaptersFromUpstream(entry ProviderEntry) []modelbinding.Adapter {
 	return DefaultAdaptersForModel(entry.ID)
 }
 
-// RegisteredProtocols uses explicit protocol names when supplied, then the
-// same endpoint signals and model defaults used to prepare bindings.
+// RegisteredProtocols preserves an explicit list without inferring companion
+// protocols. Legacy catalog rows with no declaration still use model defaults.
 func RegisteredProtocols(entry ProviderEntry) []string {
 	values := entry.SupportedProtocols
 	if len(values) == 0 {
 		values = extractStringSlice(entry.Raw, "supported_protocols")
+	}
+	if len(values) == 0 {
+		values = explicitEndpointSignals(entry)
 	}
 	protocols := make([]string, 0, len(values))
 	for _, value := range values {
@@ -108,12 +111,22 @@ func RegisteredProtocols(entry ProviderEntry) []string {
 			protocols = append(protocols, string(adapter))
 		}
 	}
-	if len(protocols) == 0 {
+	if len(values) == 0 && !hasDeclaredProtocolList(entry.Raw) {
 		for _, adapter := range AdaptersFromUpstream(entry) {
 			protocols = append(protocols, string(adapter))
 		}
 	}
 	return protocols
+}
+
+func hasDeclaredProtocolList(raw map[string]any) bool {
+	for _, key := range []string{"supported_protocols", "supported_endpoint_types", "endpoints", "endpoint_types"} {
+		switch raw[key].(type) {
+		case []any, []string:
+			return true
+		}
+	}
+	return false
 }
 
 func explicitEndpointSignals(entry ProviderEntry) []string {

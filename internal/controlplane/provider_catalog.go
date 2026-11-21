@@ -2,11 +2,13 @@ package controlplane
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/beichen"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
@@ -25,10 +27,11 @@ type ProviderCatalogSyncView struct {
 }
 
 type ProviderCredentialInput struct {
-	Label      string
-	GroupHint  *string
-	Credential *string
-	Status     *string
+	Label                string
+	GroupHint            *string
+	Credential           *string
+	Status               *string
+	ReplacesCredentialID *uuid.UUID
 }
 
 type ProviderCredentialView struct {
@@ -111,6 +114,23 @@ func (s *Service) CreateProviderCredential(ctx context.Context, providerID uuid.
 	if err != nil {
 		return ProviderCredentialView{}, err
 	}
+	if catalog.IsBeichenBaseURL(row.BaseURL) {
+		edit := beichen.CredentialEdit{
+			Label: &label, GroupHint: input.GroupHint, Status: &status, Ciphertext: ciphertext,
+			Replaces: input.ReplacesCredentialID,
+		}
+		if edit.Replaces != nil {
+			if *edit.Replaces == uuid.Nil {
+				return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "请选择有效的原渠道")
+			}
+			fingerprint := sha256.Sum256([]byte(*input.Credential))
+			edit.Fingerprint = fingerprint[:]
+		}
+		return s.saveBeichenCredential(ctx, providerID, uuid.Nil, edit)
+	}
+	if input.ReplacesCredentialID != nil {
+		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "选择原渠道仅适用于北辰")
+	}
 	builder := s.db.ProviderCredential.Create().
 		SetProviderID(row.ID).
 		SetLabel(label).
@@ -148,6 +168,27 @@ func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, cred
 	if err != nil {
 		return ProviderCredentialView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query provider credential", err)
 	}
+	if row.Edges.Provider != nil && catalog.IsBeichenBaseURL(row.Edges.Provider.BaseURL) {
+		if input.Credential != nil {
+			return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "更换北辰 Key 请在渠道切换向导添加新 Key，以保留原凭据的账单记录")
+		}
+		edit := beichen.CredentialEdit{GroupHint: input.GroupHint}
+		if input.Label != "" {
+			label, err := ValidateName(input.Label, 128)
+			if err != nil {
+				return ProviderCredentialView{}, err
+			}
+			edit.Label = &label
+		}
+		if input.Status != nil {
+			status, err := resourceStatus(input.Status, "")
+			if err != nil {
+				return ProviderCredentialView{}, err
+			}
+			edit.Status = &status
+		}
+		return s.saveBeichenCredential(ctx, providerID, credentialID, edit)
+	}
 	builder := row.Update()
 	if input.Label != "" {
 		label, labelErr := ValidateName(input.Label, 128)
@@ -165,11 +206,6 @@ func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, cred
 		}
 	}
 	if input.Credential != nil {
-		if row.Edges.Provider != nil {
-			if catalog.IsBeichenBaseURL(row.Edges.Provider.BaseURL) {
-				return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "换北辰 Key 时请新增凭据并重新选择模型绑定，以保留原凭据的账单记录")
-			}
-		}
 		ciphertext, encErr := s.security.EncryptCredential(*input.Credential)
 		if encErr != nil {
 			return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, encErr.Error())
@@ -199,16 +235,26 @@ func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, cred
 		if err := catalog.DeactivateCredentialCatalog(ctx, s.db, credentialID); err != nil {
 			return ProviderCredentialView{}, domain.WrapError(domain.CodeDependencyUnavailable, "deactivate provider catalog", err)
 		}
-		if row.Edges.Provider != nil && catalog.IsBeichenBaseURL(row.Edges.Provider.BaseURL) {
-			// Preserve the teacher's binding intent when a key is retired.
-			// A later explicit enable can attach a newly discovered owner.
-			return providerCredentialView(updated), nil
-		}
 		if err := catalog.ReconcileProviderBindingRoutes(ctx, s.db, providerID); err != nil {
 			return ProviderCredentialView{}, domain.WrapError(domain.CodeDependencyUnavailable, "reconcile provider routes", err)
 		}
 	}
 	return providerCredentialView(updated), nil
+}
+
+func (s *Service) saveBeichenCredential(ctx context.Context, providerID, credentialID uuid.UUID, edit beichen.CredentialEdit) (ProviderCredentialView, error) {
+	if edit.GroupHint != nil {
+		hint := strings.TrimSpace(*edit.GroupHint)
+		if len([]rune(hint)) > 128 {
+			return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "渠道分组提示最多 128 个字符")
+		}
+		edit.GroupHint = &hint
+	}
+	row, err := s.beichen.SaveCredential(ctx, providerID, credentialID, edit)
+	if err != nil {
+		return ProviderCredentialView{}, err
+	}
+	return providerCredentialView(row), nil
 }
 
 func (s *Service) DeleteProviderCredential(ctx context.Context, providerID, credentialID uuid.UUID) error {

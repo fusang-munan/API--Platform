@@ -1,4 +1,4 @@
-import type { ApiKey, ApiKeyStatus, BindingAdapter, Model, RequestedModel } from '../api/types'
+import type { ApiKey, ApiKeyStatus, BindingAdapter, Model } from '../api/types'
 import { bindingAdapterMeta } from './bindingAdapters'
 import {
   codexReasoningLevelsForModel,
@@ -158,25 +158,6 @@ export function keyIncludesModel(key: Pick<ApiKey, 'models'>, modelID: string) {
 
 export function keyCanWithdraw(key: Pick<ApiKey, 'status'>) {
   return key.status === 'pending_mentor' || key.status === 'pending_teacher'
-}
-
-export function keyReapplyQuota(
-  key: Pick<ApiKey, 'monthly_credits' | 'mentor_monthly_credits' | 'requested_monthly_credits'>,
-) {
-  return (key.monthly_credits || key.mentor_monthly_credits || key.requested_monthly_credits || '0.000').trim()
-}
-
-export function buildKeyReapplyModels(key: Pick<ApiKey, 'models'>, addModelID: string): RequestedModel[] {
-  const seen = new Set<string>()
-  const result: RequestedModel[] = []
-  for (const model of [...key.models, { model_id: addModelID, display_name: '' }]) {
-    const modelID = model.model_id.trim()
-    const normalized = modelID.toLowerCase()
-    if (!modelID || seen.has(normalized)) continue
-    seen.add(normalized)
-    result.push({ model_id: modelID, ...(model.display_name && model.display_name !== modelID ? { display_name: model.display_name } : {}) })
-  }
-  return result
 }
 
 export type KeyHarnessSupport = {

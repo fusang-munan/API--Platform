@@ -12,30 +12,25 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/domain"
 )
 
-func TestActivationTokenPriceReady(t *testing.T) {
+func TestRoutePriceReadiness(t *testing.T) {
 	for _, tc := range []struct {
-		name, quote string
-		want        bool
+		name, quote, code string
+		fixed             bool
 	}{
-		{name: "exact decimal strings", quote: `{"billing_mode":"token","input_price":"0","output_price":"0.000000000000000000000000000001","cache_write_1h_price":"0.1"}`, want: true},
-		{name: "legacy JSON numbers", quote: `{"billing_mode":"token","input_price":0,"output_price":1e-8}`, want: true},
-		{name: "missing mode", quote: `{"input_price":0,"output_price":1}`},
-		{name: "missing output", quote: `{"billing_mode":"token","input_price":0,"output_price":null}`},
-		{name: "malformed price", quote: `{"billing_mode":"token","input_price":0,"output_price":"n/a"}`},
-		{name: "negative price", quote: `{"billing_mode":"token","input_price":0,"output_price":-1}`},
-		{name: "no output in one tier", quote: `{"billing_mode":"token","input_price":0,"output_price":1,"intervals":[
-			{"min_tokens":0,"max_tokens":100,"input_price":0,"output_price":1},
-			{"min_tokens":100,"input_price":2}]}`},
-		{name: "per request", quote: `{"billing_mode":"per_request","input_price":0,"output_price":1,"per_request_price":2}`},
-		{name: "video", quote: `{"billing_mode":"video","input_price":0,"output_price":1}`},
-		{name: "image", quote: `{"billing_mode":"image","input_price":0,"output_price":1}`},
-		{name: "image price mixed with token prices", quote: `{"billing_mode":"token","input_price":0,"output_price":1,"image_output_price":0}`},
-		{name: "video price in tier", quote: `{"billing_mode":"token","intervals":[
-			{"min_tokens":0,"input_price":0,"output_price":1,"video_output_price":2}]}`},
+		{name: "tiered default mode", quote: `{"intervals":[{"min_tokens":0,"input_price":0,"output_price":1}]}`},
+		{name: "incomplete tier", quote: `{"intervals":[{"min_tokens":0,"input_price":0}]}`, code: "tier_missing_output"},
+		{name: "unsupported mode", quote: `{"billing_mode":"per_request","per_request_price":1}`, code: "billing_mode_non_token"},
+		{name: "fixed manual price", fixed: true, quote: `{"billing_mode":"per_request","per_request_price":1}`},
+		{name: "no quote", code: "missing_price"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := activationTokenPriceReady(json.RawMessage(tc.quote)); got != tc.want {
-				t.Fatalf("价格检查结果为 %t，预期 %t", got, tc.want)
+			price := routePriceReadiness(tc.fixed, json.RawMessage(tc.quote))
+			if tc.code == "" {
+				if !price.ready() || price.conditional == tc.fixed {
+					t.Fatalf("expected usable price: %+v", price)
+				}
+			} else if price.ready() || price.blocker.Code != tc.code || price.blocker.Message == "" {
+				t.Fatalf("expected blocker %q, got %+v", tc.code, price.blocker)
 			}
 		})
 	}

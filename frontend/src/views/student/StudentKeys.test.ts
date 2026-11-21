@@ -151,3 +151,98 @@ describe('key visibility', () => {
     wrapper.unmount()
   })
 })
+
+describe('key availability explained in plain language', () => {
+  const model = {
+    model_id: 'claude-sonnet-4-5',
+    display_name: 'Claude Sonnet 4.5',
+    description: null,
+    category: 'text',
+    capabilities: [],
+    input_modalities: ['text'],
+    output_modalities: ['text'],
+    context_window: 200000,
+    max_input_tokens: null,
+    max_output_tokens: null,
+    is_common: false,
+    status: 'active',
+    route_ready: true,
+    credit_multiplier: '1.10',
+    provider_name: '北辰',
+    supported_protocols: ['anthropic', 'openai_compatible'],
+    recommended_protocol: 'openai_compatible',
+  }
+  const key = (overrides: Record<string, unknown>) => ({
+    id: 'key-health',
+    name: '健康检查 Key',
+    status: 'active',
+    route_ready: true,
+    progress: { current: 'active', completed_steps: ['submitted', 'mentor_review', 'teacher_review', 'claimed'] },
+    organization: { id: 'org', name: 'Org', status: 'active' },
+    project: { id: 'project', organization_id: 'org', name: 'Project', status: 'active', has_mentor: true, monthly_credit_quota: '200.000' },
+    models: [model],
+    key_prefix: 'neb_sk_health',
+    requested_monthly_credits: '200.000',
+    created_at: '2026-11-20T00:00:00Z',
+    updated_at: '2026-11-20T00:00:00Z',
+    ...overrides,
+  })
+  const mountWithKey = async (value: Record<string, unknown>) => {
+    const { studentAPI } = await import('../../api/student')
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([value] as never)
+    const wrapper = mount(StudentKeys, {
+      global: {
+        stubs: {
+          LoadingRegion: { template: '<div><slot/></div>' },
+          AppDialog: { props: ['open', 'title'], template: '<section v-if="open"><slot/></section>' },
+          StatusProgress: true,
+          StatusBadge: true,
+          EmptyState: true,
+        },
+      },
+    })
+    await flushPromises()
+    return wrapper
+  }
+
+  it('explains credential, catalog, pricing and probe and lists what protocols the key supports', async () => {
+    const wrapper = await mountWithKey(key({}))
+
+    const guide = wrapper.get('[data-testid="key-health-guide"]').text()
+    expect(guide).toContain('凭据')
+    expect(guide).toContain('目录')
+    expect(guide).toContain('报价')
+    expect(guide).toContain('探活')
+    expect(guide).toContain('不是实时探测')
+
+    const credential = wrapper.get('[data-health="credential"]').text()
+    expect(credential).toContain('已签发')
+    expect(wrapper.get('[data-health="catalog"]').text()).toContain('已登记 1 个模型')
+    const authorized = wrapper.get('[data-testid="authorized-models"]').text()
+    expect(authorized).toContain(model.model_id)
+    expect(wrapper.get('[data-testid="key-model-protocol"]').text()).toContain('支持协议：OpenAI Chat、Anthropic Messages')
+    expect(wrapper.get('[data-testid="key-model-protocol"]').text()).toContain('推荐协议：OpenAI Chat')
+    expect(wrapper.get('[data-health="pricing"]').text()).toContain('已配置 1 个模型')
+    expect(wrapper.get('[data-health="probe"]').text()).toContain('线路已打通')
+
+    const protocols = wrapper.get('[data-testid="key-protocols"]').text()
+    expect(protocols).toContain('Anthropic Messages')
+    expect(protocols).toContain('OpenAI Chat')
+    expect(wrapper.text()).toContain('网关不做协议转换')
+    wrapper.unmount()
+  })
+
+  it('shows what is wrong and what to ask the teacher when the key is not usable', async () => {
+    const brokenModel = { ...model, status: 'inactive', route_ready: false, credit_multiplier: null }
+    const wrapper = await mountWithKey(key({ models: [brokenModel], route_ready: false, key_prefix: null }))
+
+    expect(wrapper.get('[data-health="credential"]').text()).toContain('已生效，待生成')
+    expect(wrapper.get('[data-health="catalog"]').text()).toContain('模型全部停用')
+    expect(wrapper.get('[data-health="pricing"]').text()).toContain('缺少 1 个模型的报价')
+    expect(wrapper.get('[data-health="probe"]').text()).toContain('线路不可用')
+    expect(wrapper.get('[data-health="credential"]').text()).toContain('找老师')
+    expect(wrapper.get('[data-health="pricing"]').text()).toContain('找老师')
+    expect(wrapper.get('[data-health="probe"]').text()).toContain('找老师')
+    wrapper.unmount()
+  })
+})

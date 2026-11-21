@@ -81,6 +81,43 @@ func (s *Service) Sync(ctx context.Context, providerID uuid.UUID) error {
 	return s.syncJobs(ctx, &providerID)
 }
 
+// SyncCredential pulls this Key's catalog, pricing, multiplier and recent
+// usage using the same leases as the scheduled jobs.
+func (s *Service) SyncCredential(ctx context.Context, providerID, credentialID uuid.UUID) error {
+	if providerID == uuid.Nil || credentialID == uuid.Nil {
+		return invalid("需要有效的供应商和渠道 ID")
+	}
+	if s.db == nil || s.crypto == nil {
+		return unavailable("北辰同步未配置", nil)
+	}
+	ctx, cancel := context.WithTimeout(ctx, sweepTimeout)
+	defer cancel()
+	var found uuid.UUID
+	err := s.db.QueryRowContext(ctx, `
+SELECT c.id FROM provider_credentials c JOIN providers p ON p.id=c.provider_id
+WHERE p.id=$1 AND c.id=$2 AND p.status='active' AND c.status='active' AND `+beichenProvider,
+		providerID, credentialID).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.NewError(domain.CodeNotFound, "找不到该北辰供应商下已启用的渠道 Key")
+	}
+	if err != nil {
+		return unavailable("读取北辰渠道失败", err)
+	}
+	discovery, finish := context.WithTimeout(ctx, receiptKeyTimeout)
+	discoveryErr := s.discoverChannelKeys(discovery, &credentialID)
+	finish()
+	if err := s.executeSyncJobs(ctx, []syncJob{
+		{provider: providerID, credential: credentialID, kind: "billing"},
+		{provider: providerID, credential: credentialID, kind: "usage"},
+	}, true); err != nil {
+		return err
+	}
+	if discoveryErr != nil {
+		return unavailable("渠道已同步，但北辰官网的 Key 身份待确认", discoveryErr)
+	}
+	return nil
+}
+
 func (s *Service) syncJobs(ctx context.Context, providerID *uuid.UUID) error {
 	jobs, err := s.listJobs(ctx, providerID)
 	if err != nil {
@@ -89,6 +126,10 @@ func (s *Service) syncJobs(ctx context.Context, providerID *uuid.UUID) error {
 	if providerID != nil && len(jobs) == 0 {
 		return invalid("北辰供应商和凭据须为已启用状态")
 	}
+	return s.executeSyncJobs(ctx, jobs, providerID != nil)
+}
+
+func (s *Service) executeSyncJobs(ctx context.Context, jobs []syncJob, manual bool) error {
 	failed, busy := 0, 0
 	for len(jobs) > 0 {
 		if ctx.Err() != nil {
@@ -102,7 +143,7 @@ func (s *Service) syncJobs(ctx context.Context, providerID *uuid.UUID) error {
 		results := make(chan outcome, len(batch))
 		for _, job := range batch {
 			go func() {
-				running, err := s.runJob(ctx, job, providerID != nil)
+				running, err := s.runJob(ctx, job, manual)
 				results <- outcome{running, err}
 			}()
 		}
@@ -119,7 +160,7 @@ func (s *Service) syncJobs(ctx context.Context, providerID *uuid.UUID) error {
 	if failed > 0 {
 		return unavailable(fmt.Sprintf("有 %d 项北辰同步未完成，请查看数据状态", failed), nil)
 	}
-	if providerID != nil && busy > 0 {
+	if manual && busy > 0 {
 		return domain.NewError(domain.CodeInvalidTransition, "已有北辰同步任务运行中")
 	}
 	return nil
@@ -387,19 +428,15 @@ func (s *Service) finishJob(ctx context.Context, job syncJob, lease uuid.UUID, c
 		return err
 	}
 	defer tx.Rollback()
-	if result.save != nil {
-		var current time.Time
-		err := tx.QueryRowContext(ctx, `
+	var current time.Time
+	err = tx.QueryRowContext(ctx, `
 SELECT c.updated_at FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
 WHERE p.id = $1 AND c.id = $2 AND c.status = 'active' AND p.status = 'active' AND `+beichenProvider+`
 FOR SHARE OF p FOR NO KEY UPDATE OF c`, job.provider, job.credential).Scan(&current)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if err != nil || !credential.updatedAt.Equal(current) {
-			result = fetchResult{err: errors.New("同步期间北辰凭据或供应商已变化")}
-		}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
 	}
+	obsolete := err != nil || !credential.updatedAt.Equal(current)
 	var ownsLease bool
 	err = tx.QueryRowContext(ctx, `
 SELECT lease_id = $3 AND lease_until > clock_timestamp() FROM beichen_datasets
@@ -410,6 +447,14 @@ WHERE credential_id = $1 AND kind = $2 AND lease_id IS NOT NULL FOR UPDATE`,
 	}
 	if !ownsLease {
 		return errors.New("北辰同步任务租约已失效")
+	}
+	if obsolete {
+		_, err := tx.ExecContext(ctx, `UPDATE beichen_datasets SET lease_id=NULL, lease_until=NULL
+WHERE credential_id=$1 AND kind=$2`, job.credential, job.leaseKind())
+		if err == nil {
+			err = tx.Commit()
+		}
+		return errors.Join(err, errors.New("同步期间北辰凭据或供应商已变化"))
 	}
 	if result.save != nil {
 		if err := result.save(ctx, tx); err != nil {

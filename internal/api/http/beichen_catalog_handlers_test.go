@@ -22,6 +22,9 @@ func catalogHandlerRouter(s *Server, actor uuid.UUID) *gin.Engine {
 	group.PUT("/aliases", s.beichenModelAliases)
 	group.POST("/rebind", s.rebindBeichenModels)
 	group.POST("/catalog/rescan", s.rescanBeichenCatalog)
+	group.GET("/channel-switch", s.beichenChannelSwitch)
+	group.POST("/channel-switch", s.confirmBeichenChannelSwitch)
+	group.POST("/sync", s.syncBeichen)
 	return router
 }
 
@@ -42,6 +45,12 @@ func TestBeichenCatalogMaintenanceRejectsInvalidRequests(t *testing.T) {
 		{"POST", "/rebind?preview=other", ``},
 		{"POST", "/rebind?preview=true&preview=false", ``},
 		{"POST", "/rebind?preview=false", `{"preview":true}`},
+		{"GET", "/channel-switch?from_credential_id=wrong", ``},
+		{"GET", "/channel-switch?to_credential_id=a&to_credential_id=b", ``},
+		{"POST", "/channel-switch", `{"from_credential_id":"wrong"}`},
+		{"POST", "/channel-switch", `{}`},
+		{"POST", "/channel-switch", `{"retire":true}`},
+		{"POST", "/sync", `{"credential_id":"wrong"}`},
 	} {
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, httptest.NewRequest(tc.method, prefix+tc.path, strings.NewReader(tc.body)))
@@ -56,6 +65,18 @@ func TestBeichenCatalogMaintenanceRejectsInvalidRequests(t *testing.T) {
 	router.ServeHTTP(w, preflight)
 	if w.Code != http.StatusNoContent || !strings.Contains(w.Header().Get("Access-Control-Allow-Methods"), "PUT") {
 		t.Fatal("浏览器跨域预检应允许 PUT")
+	}
+}
+
+func TestBeichenChannelSwitchRequiresTeacherRouteAuthentication(t *testing.T) {
+	router := NewServer(nil, nil, nil, nil, HealthDependencies{}, Config{}).Handler()
+	path := "/api/v1/teacher/providers/" + uuid.NewString() + "/beichen/channel-switch"
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(method, path, nil))
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s: 匿名渠道操作状态为 %d", method, w.Code)
+		}
 	}
 }
 

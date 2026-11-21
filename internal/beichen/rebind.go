@@ -133,6 +133,170 @@ SELECT p.status='active' AND NOT EXISTS (
 	return view, nil
 }
 
+// ConfirmCredentialSwitch only moves bindings from the selected original Key
+// to the selected replacement. Uncovered routes stay on their original Key.
+func (s *Service) ConfirmCredentialSwitch(ctx context.Context, provider, actor uuid.UUID, scope CredentialSwitch, token string) (SwitchPreview, error) {
+	if provider == uuid.Nil || actor == uuid.Nil || scope.From == uuid.Nil || scope.To == uuid.Nil || scope.From == scope.To {
+		return SwitchPreview{}, invalid("请选择两个不同的北辰渠道")
+	}
+	if _, err := hex.DecodeString(token); len(token) != sha256.Size*2 || err != nil {
+		return SwitchPreview{}, invalid("请先预览渠道切换，再确认重绑")
+	}
+	if s.db == nil {
+		return SwitchPreview{}, unavailable("北辰渠道切换未配置", nil)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SwitchPreview{}, unavailable("开启北辰渠道切换失败", err)
+	}
+	defer tx.Rollback()
+	if err := lockAliasProvider(ctx, tx, provider); err != nil {
+		return SwitchPreview{}, err
+	}
+	keys, _, err := readSwitchCredentials(ctx, tx, provider)
+	if err != nil {
+		return SwitchPreview{}, unavailable("读取北辰渠道失败", err)
+	}
+	from, to, err := selectSwitchCredentials(keys, scope)
+	if err != nil {
+		return SwitchPreview{}, err
+	}
+	if !switchCatalogReady(to) {
+		return SwitchPreview{}, domain.NewError(domain.CodeInvalidTransition, "接替渠道的目录或同步状态已变化，请重新同步并预览")
+	}
+	plan, err := readCredentialRebind(ctx, tx, provider, *from, *to, true)
+	if err != nil {
+		return SwitchPreview{}, unavailable("重新核对北辰渠道切换失败", err)
+	}
+	if token != plan.PreviewToken || len(plan.Changes) == 0 {
+		return SwitchPreview{}, domain.NewError(domain.CodeInvalidTransition, "渠道、报价、协议或绑定已变化，请重新预览")
+	}
+	if err := applyRebind(ctx, tx, provider, plan.Changes); err != nil {
+		return SwitchPreview{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SwitchPreview{}, unavailable("完成北辰渠道切换失败", err)
+	}
+	plan.Preview = false
+	slog.InfoContext(ctx, "北辰渠道切换", "event", "beichen_credential_switched", "actor_user_id", actor, "provider_id", provider,
+		"from_credential_id", scope.From, "to_credential_id", scope.To, "preview_token", token, "change_count", len(plan.Changes))
+	return plan, nil
+}
+
+func readCredentialRebind(ctx context.Context, tx *sql.Tx, provider uuid.UUID, from, to SwitchCredential, lock bool) (SwitchPreview, error) {
+	bindings, _, err := readRebindBindings(ctx, tx, provider, lock)
+	if err != nil {
+		return SwitchPreview{}, err
+	}
+	entries, err := readRebindCatalog(ctx, tx, provider)
+	if err != nil {
+		return SwitchPreview{}, err
+	}
+	var observed Overview
+	if err := readModels(ctx, tx, provider, &observed); err != nil {
+		return SwitchPreview{}, err
+	}
+	priced := map[string]bool{}
+	for _, row := range observed.Models {
+		if row.CredentialID == to.CredentialID {
+			priced[row.Model] = row.PriceCovered
+		}
+	}
+	byUpstream, bySchool := map[string][]rebindCatalogEntry{}, map[uuid.UUID][]rebindCatalogEntry{}
+	for _, entry := range entries {
+		if *entry.route.CredentialID != to.CredentialID {
+			continue
+		}
+		if !entry.explicit {
+			name := strings.ToLower(entry.route.UpstreamModel)
+			byUpstream[name] = append(byUpstream[name], entry)
+		}
+		if entry.school.id != uuid.Nil {
+			bySchool[entry.school.id] = append(bySchool[entry.school.id], entry)
+		}
+	}
+	plan := SwitchPreview{
+		RebindPlan: RebindPlan{Preview: true, Changes: []RebindChange{}},
+		Blockers:   []SwitchBlocker{},
+	}
+	for _, b := range bindings {
+		if b.Before.Status != "active" || !sameRouteKey(b.Before.CredentialID, &from.CredentialID) {
+			continue
+		}
+		entries := append(slices.Clone(bySchool[b.ModelID]), byUpstream[strings.ToLower(strings.TrimSpace(b.Before.UpstreamModel))]...)
+		next, blocked := replacementRoute(b, entries, priced)
+		if blocked != nil {
+			plan.Blockers = append(plan.Blockers, *blocked)
+			continue
+		}
+		if (from.Identity == "") != (to.Identity == "") {
+			plan.Blockers = append(plan.Blockers, SwitchBlocker{b.SchoolModel, b.Adapter, "channel_mismatch",
+				"原渠道和接替渠道的学校计费身份不同。请选择原 Key 后添加接替 Key。"})
+			continue
+		}
+		if to.Identity != "" && to.Identity != "ready" {
+			plan.Blockers = append(plan.Blockers, SwitchBlocker{b.SchoolModel, b.Adapter, "unverified_identity",
+				"接替 Key 的官网账单归属待核对。请核对学校北辰账号中的 Key，再点一键同步。"})
+			continue
+		}
+		b.Action, b.After = "update", next
+		plan.Changes = append(plan.Changes, b)
+	}
+	slices.SortFunc(plan.Changes, compareRebindChanges)
+	slices.SortFunc(plan.Blockers, func(a, b SwitchBlocker) int {
+		if order := strings.Compare(a.SchoolModel, b.SchoolModel); order != 0 {
+			return order
+		}
+		return strings.Compare(a.Adapter, b.Adapter)
+	})
+	// Include both Key revisions and the blocked routes so an old confirmation
+	// cannot apply after the teacher's choices or the observed results change.
+	raw, err := json.Marshal(plan)
+	if err != nil {
+		return SwitchPreview{}, err
+	}
+	versions := fmt.Sprintf("%s/%s/%s/%s/%s:", provider, from.CredentialID, from.revision.UTC(), to.CredentialID, to.revision.UTC())
+	plan.PreviewToken = fmt.Sprintf("%x", sha256.Sum256(append([]byte(versions), raw...)))
+	return plan, nil
+}
+
+func replacementRoute(binding RebindChange, entries []rebindCatalogEntry, priced map[string]bool) (RebindRoute, *SwitchBlocker) {
+	blocked := SwitchBlocker{SchoolModel: binding.SchoolModel, Adapter: binding.Adapter}
+	blocked.Code, blocked.Message = "missing_model", "接替渠道的目录缺少此模型。请重新同步目录或核对模型别名。"
+	if len(entries) > 0 {
+		blocked.Code, blocked.Message = "missing_protocol", "接替渠道未登记这条线路使用的协议。请探活并核对上游支持的协议。"
+	}
+	var picked RebindRoute
+	best := -1
+	for _, entry := range entries {
+		if !slices.Contains(entry.protocols, binding.Adapter) {
+			continue
+		}
+		route := entry.route
+		if !priced[route.UpstreamModel] {
+			blocked.Code, blocked.Message = "missing_price", "接替渠道缺少可计算报价。请重新同步报价，或在北辰模型页设置校内价。"
+			continue
+		}
+		rank := 0
+		if entry.explicit {
+			rank += 2
+		}
+		if strings.EqualFold(route.UpstreamModel, strings.TrimSpace(binding.Before.UpstreamModel)) {
+			rank++
+		}
+		if rank > best {
+			picked, best = route, rank
+		}
+	}
+	if best < 0 {
+		return RebindRoute{}, &blocked
+	}
+	picked.Priority = binding.Before.Priority
+	return picked, nil
+}
+
 func readRebindBindings(ctx context.Context, tx *sql.Tx, provider uuid.UUID, lock bool) (map[rebindSlot]RebindChange, map[rebindSlot]int, error) {
 	query := `
 SELECT b.id, b.model_id, m.model_id::text, b.adapter, b.credential_id, c.label::text,
@@ -291,16 +455,18 @@ func planRebind(bindings map[rebindSlot]RebindChange, entries []rebindCatalogEnt
 			changes = append(changes, change)
 		}
 	}
-	slices.SortFunc(changes, func(a, b RebindChange) int {
-		if order := strings.Compare(strings.ToLower(a.SchoolModel), strings.ToLower(b.SchoolModel)); order != 0 {
-			return order
-		}
-		if order := strings.Compare(a.SchoolModel, b.SchoolModel); order != 0 {
-			return order
-		}
-		return strings.Compare(a.Adapter, b.Adapter)
-	})
+	slices.SortFunc(changes, compareRebindChanges)
 	return changes
+}
+
+func compareRebindChanges(a, b RebindChange) int {
+	if order := strings.Compare(strings.ToLower(a.SchoolModel), strings.ToLower(b.SchoolModel)); order != 0 {
+		return order
+	}
+	if order := strings.Compare(a.SchoolModel, b.SchoolModel); order != 0 {
+		return order
+	}
+	return strings.Compare(a.Adapter, b.Adapter)
 }
 
 func sameRouteKey(a, b *uuid.UUID) bool {

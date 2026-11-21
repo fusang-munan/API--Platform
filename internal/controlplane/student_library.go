@@ -15,9 +15,17 @@ import (
 )
 
 func modelEnabledForStudents(row *ent.Model) bool {
-	return row.Status == entmodel.StatusActive &&
-		row.CreditMultiplierMilli != nil &&
-		*row.CreditMultiplierMilli > 0
+	return studentModelPublicationIssue(row) == ""
+}
+
+func studentModelPublicationIssue(row *ent.Model) string {
+	if row.Status != entmodel.StatusActive {
+		return "model is not enabled for students"
+	}
+	if row.CreditMultiplierMilli == nil || *row.CreditMultiplierMilli <= 0 {
+		return "model is missing a student price"
+	}
+	return ""
 }
 
 func modelViewEnabledForStudents(item ModelView) bool {
@@ -322,19 +330,17 @@ func (s *Service) AddStudentModel(ctx context.Context, studentID uuid.UUID, publ
 	if err != nil {
 		return ModelView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query model", err)
 	}
-	hasProvider, err := s.hasActiveProvider(ctx)
+	if issue := studentModelPublicationIssue(row); issue != "" {
+		return ModelView{}, domain.NewError(domain.CodeValidation, issue)
+	}
+	view, err := s.enrichStudentModelView(ctx, modelView(row), row.ID)
 	if err != nil {
-		return ModelView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query active providers", err)
+		return ModelView{}, err
 	}
-	if !hasProvider {
-		return ModelView{}, domain.NewError(domain.CodeValidation, "no active provider configured")
+	if !view.RouteReady {
+		return ModelView{}, domain.NewError(domain.CodeValidation, "model has no usable route")
 	}
-	exists, err := s.db.StudentModelLibrary.Query().
-		Where(
-			studentmodellibrary.UserIDEQ(studentID),
-			studentmodellibrary.ModelIDEQ(row.ID),
-		).
-		Exist(ctx)
+	exists, err := studentHasModelInLibrary(ctx, s.db, studentID, row.ID)
 	if err != nil {
 		return ModelView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query student model library", err)
 	}
@@ -345,17 +351,6 @@ func (s *Service) AddStudentModel(ctx context.Context, studentID uuid.UUID, publ
 			Save(ctx); err != nil && !ent.IsConstraintError(err) {
 			return ModelView{}, domain.WrapError(domain.CodeDependencyUnavailable, "add student model", err)
 		}
-	}
-	if !modelEnabledForStudents(row) {
-		return ModelView{}, domain.NewError(domain.CodeValidation, "model is not available")
-	}
-	view := modelView(row)
-	view, err = s.enrichStudentModelView(ctx, view, row.ID)
-	if err != nil {
-		return ModelView{}, err
-	}
-	if !modelViewEnabledForStudents(view) {
-		return ModelView{}, domain.NewError(domain.CodeValidation, "model is not available")
 	}
 	return view, nil
 }
@@ -387,8 +382,8 @@ func (s *Service) RemoveStudentModel(ctx context.Context, studentID uuid.UUID, p
 	return nil
 }
 
-func (s *Service) studentHasModelInLibrary(ctx context.Context, studentID, platformModelID uuid.UUID) (bool, error) {
-	return s.db.StudentModelLibrary.Query().
+func studentHasModelInLibrary(ctx context.Context, client *ent.Client, studentID, platformModelID uuid.UUID) (bool, error) {
+	return client.StudentModelLibrary.Query().
 		Where(
 			studentmodellibrary.UserIDEQ(studentID),
 			studentmodellibrary.ModelIDEQ(platformModelID),
@@ -410,5 +405,5 @@ func (s *Service) studentCanSelectModel(ctx context.Context, studentID uuid.UUID
 	if row.IsCommon {
 		return true, nil
 	}
-	return s.studentHasModelInLibrary(ctx, studentID, row.ID)
+	return studentHasModelInLibrary(ctx, s.db, studentID, row.ID)
 }

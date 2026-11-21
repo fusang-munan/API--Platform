@@ -177,6 +177,8 @@ function priceGroups(mode: BeichenPriceTier['billing_mode']): PriceGroup[] {
 }
 
 function priceLines(tier: BeichenPriceTier, mode: BeichenPriceTier['billing_mode'], rate: Decimal | null = null, credits = false) {
+  if (!mode && tier.per_request_price == null && tier.image_input_price == null && tier.image_output_price == null &&
+    tier.video_input_price == null && tier.video_output_price == null) mode = 'token'
   const lines: string[] = []
   for (const [unit, fields] of priceGroups(mode)) {
     if (rate && unit === 'unknown') continue

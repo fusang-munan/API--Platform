@@ -321,16 +321,18 @@ func (s *Server) createProviderCredential(c *gin.Context) {
 		return
 	}
 	var input struct {
-		Label      string  `json:"label" binding:"required"`
-		GroupHint  *string `json:"group_hint"`
-		Credential string  `json:"credential" binding:"required"`
-		Status     *string `json:"status"`
+		Label                string     `json:"label" binding:"required"`
+		GroupHint            *string    `json:"group_hint"`
+		Credential           string     `json:"credential" binding:"required"`
+		Status               *string    `json:"status"`
+		ReplacesCredentialID *uuid.UUID `json:"replaces_credential_id"`
 	}
 	if !bindJSON(c, &input) {
 		return
 	}
 	view, err := s.service.CreateProviderCredential(c.Request.Context(), providerID, controlplane.ProviderCredentialInput{
-		Label: input.Label, GroupHint: input.GroupHint, Credential: &input.Credential, Status: input.Status,
+		Label: input.Label, GroupHint: input.GroupHint, Credential: &input.Credential,
+		Status: input.Status, ReplacesCredentialID: input.ReplacesCredentialID,
 	})
 	if err != nil {
 		writeError(c, err)

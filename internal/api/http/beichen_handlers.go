@@ -26,6 +26,7 @@ func (s *Server) beichenOverview(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
+	view.UseActiveCredentialHealth()
 	respond(c, http.StatusOK, s.config.SchoolWorkspace.overview(view, identity(c), c.Request))
 }
 
@@ -76,11 +77,27 @@ func (s *Server) beichenArchivedReceipts(c *gin.Context) {
 }
 
 func (s *Server) syncBeichen(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
 	providerID, ok := pathID(c, "provider_id")
-	if !ok || !bindBeichenJSON(c, &struct{}{}, true) {
+	var input struct {
+		CredentialID *string `json:"credential_id"`
+	}
+	if !ok || !bindBeichenJSON(c, &input, true) {
 		return
 	}
-	if err := s.service.Beichen().Sync(c.Request.Context(), providerID); err != nil {
+	ctx := c.Request.Context()
+	var err error
+	if input.CredentialID == nil {
+		err = s.service.Beichen().Sync(ctx, providerID)
+	} else {
+		id, parseErr := controlplane.UUID(*input.CredentialID)
+		if parseErr != nil {
+			writeError(c, parseErr)
+			return
+		}
+		err = s.service.Beichen().SyncCredential(ctx, providerID, id)
+	}
+	if err != nil {
 		writeError(c, err)
 		return
 	}

@@ -167,6 +167,25 @@ func (s *Server) studentAPIKey(c *gin.Context) {
 	respond(c, http.StatusOK, view)
 }
 
+func (s *Server) addStudentAPIKeyModels(c *gin.Context) {
+	keyID, ok := pathID(c, "api_key_id")
+	if !ok {
+		return
+	}
+	var input struct {
+		ModelIDs []string `json:"model_ids"`
+	}
+	if !bindJSON(c, &input) {
+		return
+	}
+	view, err := s.service.AddStudentAPIKeyModels(c.Request.Context(), identity(c).UserID, keyID, input.ModelIDs)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
+}
+
 func (s *Server) claimAPIKey(c *gin.Context) {
 	keyID, ok := pathID(c, "api_key_id")
 	if !ok {

@@ -262,8 +262,7 @@ func (s *Service) provisionChannel(ctx context.Context, tx *sql.Tx, provider uui
 			current.id, c.archivedLabel(current.id)); err != nil {
 			return false, errors.New("旧凭据归档失败，请检查标签冲突")
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE provider_model_catalog SET status='inactive',updated_at=clock_timestamp()
-WHERE credential_id=$1 AND status='active'`, current.id); err != nil {
+		if err := beichen.RetireCredentialCatalogTx(ctx, tx, current.id); err != nil {
 			return false, errors.New("旧凭据目录停用失败")
 		}
 	}
@@ -280,7 +279,13 @@ VALUES ($1,$2,$3,$4,'active',clock_timestamp(),clock_timestamp())`, id, provider
 	if err != nil {
 		return false, errors.New("新增北辰凭据失败")
 	}
-	return false, s.bindProvisionPanel(ctx, tx, provisionCredential{id: id}, c)
+	if err := s.bindProvisionPanel(ctx, tx, provisionCredential{id: id}, c); err != nil {
+		return false, err
+	}
+	if err := beichen.QueueCredentialSyncTx(ctx, tx, id); err != nil {
+		return false, errors.New("安排新北辰凭据同步失败")
+	}
+	return false, nil
 }
 
 func (c provisionChannel) archivedLabel(id uuid.UUID) string {

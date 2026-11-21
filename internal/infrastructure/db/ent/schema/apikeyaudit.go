@@ -22,6 +22,7 @@ func (APIKeyAudit) Annotations() []entschema.Annotation {
 				action NOT IN ('mentor_rejected', 'teacher_rejected', 'mentor_revoked')
 				OR (comment IS NOT NULL AND btrim(comment) <> '')
 			`,
+			"api_key_audit_model_required": `action <> 'student_model_added' OR (comment IS NOT NULL AND btrim(comment) <> '')`,
 		},
 	}}
 }
@@ -35,7 +36,7 @@ func (APIKeyAudit) Fields() []ent.Field {
 		field.UUID("api_key_id", uuid.UUID{}).Immutable(),
 		field.UUID("actor_user_id", uuid.UUID{}).Immutable(),
 		field.Enum("action").
-			Values("mentor_approved", "mentor_rejected", "teacher_approved", "teacher_rejected", "mentor_revoked", "mentor_deactivated", "mentor_activated", "student_withdrawn").
+			Values("mentor_approved", "mentor_rejected", "teacher_approved", "teacher_rejected", "mentor_revoked", "mentor_deactivated", "mentor_activated", "student_withdrawn", "student_model_added").
 			Immutable(),
 		field.String("comment").Optional().Nillable().MaxLen(1000).Immutable(),
 	}

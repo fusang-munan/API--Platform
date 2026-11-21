@@ -3,6 +3,7 @@ package usage
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"math/big"
@@ -34,8 +35,9 @@ func (r beichenPanelRates) hasTimedCacheWrite() bool {
 	return r.CacheWrite1h != nil || r.CacheWrite12h != nil
 }
 
-func (r beichenPanelRates) hasNonTokenPrice() bool {
-	return r.ImageInput != nil || r.ImageOutput != nil || r.VideoInput != nil || r.VideoOutput != nil || r.PerRequest != nil
+func (r beichenPanelRates) usesTokenBilling() bool {
+	return (r.BillingMode == "" || r.BillingMode == "token") &&
+		r.ImageInput == nil && r.ImageOutput == nil && r.VideoInput == nil && r.VideoOutput == nil && r.PerRequest == nil
 }
 
 type beichenPanelTier struct {
@@ -63,57 +65,101 @@ func decodeBeichenConditions(raw json.RawMessage) *beichenPriceConditions {
 // BeichenTokenQuoteUsable checks a quote's structure before publication.
 // Settlement still needs the actual token counts and any effort or TTL.
 func BeichenTokenQuoteUsable(raw json.RawMessage) bool {
+	code, _ := BeichenTokenQuoteBlocker(raw)
+	return code == ""
+}
+
+// BeichenTokenQuoteBlocker returns the first obstacle to enabling a quote,
+// or two empty strings when the quote can be enabled.
+func BeichenTokenQuoteBlocker(raw json.RawMessage) (code, message string) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "missing_price", "北辰线路缺少可用报价，请同步官网价或设置手动价"
+	}
 	quote := decodeBeichenConditions(raw)
-	if quote == nil || quote.BillingMode != "token" || quote.hasNonTokenPrice() {
-		return false
+	if quote == nil {
+		return "price_conditions_invalid", "官网报价格式无效或含有暂不支持的计价字段"
+	}
+	const nonTokenCode = "billing_mode_non_token"
+	const nonTokenMessage = "包含按次、图像或视频等非 Token 计价"
+	if !quote.usesTokenBilling() {
+		return nonTokenCode, "官网报价" + nonTokenMessage
 	}
 	for _, rate := range quote.EffortMultiplier {
 		if beichenPriceDecimal(rate) == nil {
-			return false
+			return "effort_multiplier_invalid", "官网推理强度倍率无效，应为非负数"
 		}
 	}
 	if len(quote.Intervals) == 0 {
-		return quote.usableTokenRates()
+		code, message := quote.tokenRateBlocker()
+		if code == "" {
+			return "", ""
+		}
+		return code, "官网报价" + message
 	}
 
-	type tokenRange struct{ min, max int64 }
 	ranges := make([]tokenRange, 0, len(quote.Intervals))
-	for _, tier := range quote.Intervals {
-		if !tier.usableTokenRates() || tier.Min == nil {
-			return false
+	for i, tier := range quote.Intervals {
+		if !tier.usesTokenBilling() {
+			return nonTokenCode, fmt.Sprintf("第 %d 档%s", i+1, nonTokenMessage)
 		}
-		minimum, err := tier.Min.Int64()
-		if err != nil || minimum < 0 {
-			return false
+		if code, message := tier.tokenRateBlocker(); code != "" {
+			return "tier_" + code, fmt.Sprintf("第 %d 档%s", i+1, message)
 		}
-		bounds := tokenRange{min: minimum, max: -1}
-		if tier.Max != nil {
-			bounds.max, err = tier.Max.Int64()
-			if err != nil || bounds.max <= minimum {
-				return false
-			}
+		bounds, ok := tier.tokenRange()
+		if !ok {
+			return "tier_range_invalid", fmt.Sprintf("第 %d 档的 Token 范围无效，下限须为非负整数，有限上限须为大于下限的整数", i+1)
 		}
 		ranges = append(ranges, bounds)
 	}
 	sort.Slice(ranges, func(i, j int) bool { return ranges[i].min < ranges[j].min })
 	for i := 1; i < len(ranges); i++ {
 		if ranges[i-1].max < 0 || ranges[i-1].max > ranges[i].min {
-			return false
+			return "tier_range_invalid", "官网报价的 Token 档位范围重叠"
 		}
 	}
-	return true
+	return "", ""
 }
 
-func (r beichenPanelRates) usableTokenRates() bool {
-	if (r.BillingMode != "" && r.BillingMode != "token") || r.hasNonTokenPrice() || r.Input == nil || r.Output == nil {
-		return false
+func (r beichenPanelRates) tokenRateBlocker() (code, message string) {
+	switch {
+	case r.Input == nil:
+		return "missing_input", "缺少输入 Token 单价"
+	case r.Output == nil:
+		return "missing_output", "缺少输出 Token 单价"
 	}
-	for _, price := range []*json.Number{r.Input, r.Output, r.CacheRead, r.CacheWrite, r.CacheWrite1h, r.CacheWrite12h} {
-		if price != nil && beichenPriceDecimal(price) == nil {
-			return false
+	for _, field := range []struct {
+		label string
+		price *json.Number
+	}{
+		{"输入", r.Input}, {"输出", r.Output}, {"缓存读取", r.CacheRead},
+		{"缓存写入", r.CacheWrite}, {"1 小时缓存写入", r.CacheWrite1h}, {"12 小时缓存写入", r.CacheWrite12h},
+	} {
+		if field.price != nil && beichenPriceDecimal(field.price) == nil {
+			return "price_invalid", "的" + field.label + "单价无效，应为非负数"
 		}
 	}
-	return true
+	return "", ""
+}
+
+type tokenRange struct{ min, max int64 }
+
+func (tier beichenPanelTier) tokenRange() (tokenRange, bool) {
+	if tier.Min == nil {
+		return tokenRange{}, false
+	}
+	minimum, err := tier.Min.Int64()
+	if err != nil || minimum < 0 {
+		return tokenRange{}, false
+	}
+	bounds := tokenRange{min: minimum, max: -1}
+	if tier.Max != nil {
+		bounds.max, err = tier.Max.Int64()
+		if err != nil || bounds.max <= minimum {
+			return tokenRange{}, false
+		}
+	}
+	return bounds, true
 }
 
 func isBeichenConditional(raw json.RawMessage) bool {
@@ -121,8 +167,8 @@ func isBeichenConditional(raw json.RawMessage) bool {
 		return false
 	}
 	terms := decodeBeichenConditions(raw)
-	return terms == nil || terms.BillingMode != "token" || len(terms.Intervals) != 0 ||
-		len(terms.EffortMultiplier) != 0 || terms.hasTimedCacheWrite() || terms.hasNonTokenPrice()
+	return terms == nil || !terms.usesTokenBilling() || len(terms.Intervals) != 0 ||
+		len(terms.EffortMultiplier) != 0 || terms.hasTimedCacheWrite()
 }
 
 type beichenConditionalPrice struct {
@@ -147,7 +193,7 @@ func evaluateBeichenConditional(raw json.RawMessage, metrics CallMetrics, effort
 	if terms == nil {
 		return beichenConditionalPrice{}, "invalid_price_conditions"
 	}
-	if terms.BillingMode != "token" || terms.hasNonTokenPrice() {
+	if !terms.usesTokenBilling() {
 		return beichenConditionalPrice{}, "unsupported_billing_mode"
 	}
 	tokens, reason := normalizeBeichenConditionalTokens(metrics, protocol)
@@ -158,7 +204,7 @@ func evaluateBeichenConditional(raw json.RawMessage, metrics CallMetrics, effort
 	if reason != "" {
 		return beichenConditionalPrice{}, reason
 	}
-	if (rates.BillingMode != "" && rates.BillingMode != "token") || rates.hasNonTokenPrice() {
+	if !rates.usesTokenBilling() {
 		return beichenConditionalPrice{}, "unsupported_billing_mode"
 	}
 
@@ -238,29 +284,22 @@ func (c beichenPriceConditions) ratesFor(total int64) (beichenPanelRates, string
 	label := ""
 	for _, interval := range c.Intervals {
 		timedCache = timedCache || interval.hasTimedCacheWrite()
-		if interval.Min == nil {
-			return beichenPanelRates{}, "", false, "invalid_price_tier"
-		}
-		min, err := interval.Min.Int64()
-		if err != nil || min < 0 {
+		bounds, ok := interval.tokenRange()
+		if !ok {
 			return beichenPanelRates{}, "", false, "invalid_price_tier"
 		}
 		maxLabel := ""
-		if interval.Max != nil {
-			max, err := interval.Max.Int64()
-			if err != nil || max <= min {
-				return beichenPanelRates{}, "", false, "invalid_price_tier"
-			}
-			if total >= max {
+		if bounds.max >= 0 {
+			if total >= bounds.max {
 				continue
 			}
-			maxLabel = strconv.FormatInt(max, 10)
+			maxLabel = strconv.FormatInt(bounds.max, 10)
 		}
-		if total >= min {
+		if total >= bounds.min {
 			if label != "" {
 				return beichenPanelRates{}, "", false, "ambiguous_price_tier"
 			}
-			rates, label = interval.beichenPanelRates, "["+strconv.FormatInt(min, 10)+","+maxLabel+")"
+			rates, label = interval.beichenPanelRates, "["+strconv.FormatInt(bounds.min, 10)+","+maxLabel+")"
 		}
 	}
 	if label == "" {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -126,7 +127,7 @@ CREATE TRIGGER reject_action_fixture BEFORE INSERT ON models FOR EACH ROW EXECUT
 			t.Fatalf("跳过原因错误: %+v", result.Skipped)
 		}
 	}
-	if result.Skipped[3].Message != "北辰线路缺少可自动结算的报价，请先手动定价" {
+	if result.Skipped[3].Message != "北辰线路缺少可用报价，请同步官网价或设置手动价" {
 		t.Fatal("缺价提示错误")
 	}
 	replay, err := service.EnableModelsBatch(ctx, provider, actor, []string{"flat", "manual-only", "fresh"})
@@ -153,19 +154,22 @@ CREATE TRIGGER reject_action_fixture BEFORE INSERT ON models FOR EACH ROW EXECUT
 func TestSingleAndBatchEnableUseSamePricesPostgres(t *testing.T) {
 	ctx, db, provider, actor, keys := newActionsPostgres(t)
 	service := New(db, nil)
+	const missingOutput = `{"input_price":0,"output_price":1,"intervals":[{"min_tokens":0,"input_price":1}]}`
 	for _, tc := range []struct {
-		name       string
-		conditions string
-		cacheRate  *int64
-		enable     bool
+		name, conditions, code, messagePart string
+		cacheRate                           *int64
+		enable, noRoute                     bool
 	}{
 		{name: "fixed", cacheRate: new(int64), enable: true},
-		{name: "fixed-without-cache-prices"},
+		{name: "fixed-without-cache-prices", code: "missing_price", messagePart: "缺少可用报价"},
 		{name: "tiered", enable: true, conditions: `{"billing_mode":"token","intervals":[
 			{"min_tokens":0,"max_tokens":100,"input_price":0,"output_price":0.000002},
 			{"min_tokens":"100","max_tokens":null,"input_price":"0.000003","output_price":"0.000004"}]}`},
-		{name: "per-request", conditions: `{"billing_mode":"per_request","per_request_price":1}`},
-		{name: "missing-output", conditions: `{"billing_mode":"token","intervals":[{"min_tokens":0,"input_price":1}]}`},
+		{name: "default-mode", enable: true, conditions: `{"intervals":[{"min_tokens":0,"input_price":0,"output_price":1}]}`},
+		{name: "per-request", conditions: `{"billing_mode":"per_request","per_request_price":1}`,
+			code: "billing_mode_non_token", messagePart: "非 Token 计价"},
+		{name: "missing-output", conditions: missingOutput, code: "tier_missing_output", messagePart: "第 1 档缺少输出"},
+		{name: "no-route", conditions: missingOutput, noRoute: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			exec := func(q string, args ...any) {
@@ -176,6 +180,10 @@ func TestSingleAndBatchEnableUseSamePricesPostgres(t *testing.T) {
 			}
 			single, batch := tc.name+"-single", tc.name+"-batch"
 			key := keys[0]
+			if tc.noRoute {
+				key = keys[3]
+				exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", key)
+			}
 			exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at)
 VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now()),
       (gen_random_uuid(),$1,$2,$4,now(),now(),now(),now())`, provider, key, single, batch)
@@ -200,6 +208,7 @@ FROM provider_credentials c CROSS JOIN rate WHERE c.id=$1`, key, single, batch, 
 				t.Fatal(err)
 			}
 			previewed := 0
+			var priceMessage string
 			for _, model := range view.ModelCatalog {
 				if model.Model != single && model.Model != batch {
 					continue
@@ -207,6 +216,21 @@ FROM provider_credentials c CROSS JOIN rate WHERE c.id=$1`, key, single, batch, 
 				previewed++
 				if model.PriceCovered != tc.enable || (model.Activation == "ready") != tc.enable || model.ProbeState != "unprobed" {
 					t.Fatalf("coverage and activation preview disagree: %+v", model)
+				}
+				if tc.code == "" {
+					if model.PriceBlocker != nil {
+						t.Fatalf("unexpected price blocker: %+v", model.PriceBlocker)
+					}
+				} else {
+					if model.PriceBlocker == nil || model.PriceBlocker.Code != tc.code || !strings.Contains(model.PriceBlocker.Message, tc.messagePart) {
+						t.Fatalf("expected price blocker %q with %q, got %+v", tc.code, tc.messagePart, model.PriceBlocker)
+					}
+					priceMessage = model.PriceBlocker.Message
+				}
+				if tc.noRoute && (model.CanEnable || model.PriceState != "conditional" || !slices.ContainsFunc(model.Blockers, func(blocker CatalogBlocker) bool {
+					return blocker.Code == "no_ready_route"
+				})) {
+					t.Fatalf("expected a route blocker ahead of conditional pricing: %+v", model)
 				}
 			}
 			if previewed != 2 {
@@ -243,10 +267,16 @@ FROM provider_credentials c CROSS JOIN rate WHERE c.id=$1`, key, single, batch, 
 				}
 				t.Fatal("a published model must stay visible after it leaves all catalogues")
 			}
-			if id != uuid.Nil || domain.ErrorCode(singleErr) != domain.CodeValidation || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
-				result.Skipped[0].Reason != "no_price" || result.Skipped[0].Message != singleErr.Error() ||
-				!strings.Contains(result.Skipped[0].Message, "请先手动定价") {
-				t.Fatalf("两种入口都应按相同原因拒绝: single=%s %v batch=%+v", id, singleErr, result)
+			if id != uuid.Nil || domain.ErrorCode(singleErr) != domain.CodeValidation || len(result.Enabled) != 0 || len(result.Skipped) != 1 {
+				t.Fatalf("两种入口都应拒绝: single=%s %v batch=%+v", id, singleErr, result)
+			}
+			skipped := result.Skipped[0]
+			if tc.noRoute {
+				if skipped.Reason != "route_not_ready" || !strings.Contains(singleErr.Error(), "路线") {
+					t.Fatalf("两种入口都应提示线路原因: single=%v batch=%+v", singleErr, skipped)
+				}
+			} else if skipped.Reason != "no_price" || skipped.Message != priceMessage || singleErr.Error() != priceMessage {
+				t.Fatalf("两种入口都应显示和概览一致的价格原因: overview=%q single=%v batch=%+v", priceMessage, singleErr, skipped)
 			}
 			var created int
 			if err := db.QueryRowContext(ctx, `SELECT count(*) FROM models WHERE model_id IN ($1,$2)`, single, batch).Scan(&created); err != nil || created != 0 {
