@@ -239,7 +239,7 @@ Matrix 候选目录以 `model_id citext UNIQUE` 保存合并后的描述、owner
 
 索引：唯一索引 `(api_key_id, model_id)`；普通索引 `model_id`。该规范化关联替代旧 JSON 模型白名单。
 
-学生扩充授权时，事务先锁定本人 Key 行并校验其生效状态，再核对新模型的开放状态、广场归属与线路。对同一 Key 的并发添加依次处理，已有授权直接复用。批次内所有新关联及对应审计一起提交，失败时整批回滚。网关按请求直接读取这些关联。
+Key 申请和审批可在没有任何授权关联时完成。学生扩充授权时，事务锁定本人 Key 行，校验 Key 和项目访问状态、模型报价及发布线路。待验证线路可授权，维护中的模型暂停新增。学生移除授权时同样锁定本人 Key。每批新增或删除的关联和审计一起提交，同一 Key 的并发写入依次处理。个人模型库用于收藏。网关按请求直接读取授权关系。
 
 ### 4.12 `api_key_audits`
 
@@ -249,14 +249,14 @@ Matrix 候选目录以 `model_id citext UNIQUE` 保存合并后的描述、owner
 | `api_key_id` | uuid | 否 | - | FK -> `api_keys.id` |
 | `actor_user_id` | uuid | 否 | - | FK -> `users.id`，执行该操作的用户 |
 | `action` | enum | 否 | - | Key 审核或授权动作，不可变 |
-| `comment` | varchar(1000) | 是 | NULL | 审核通过时可选，指定的驳回或撤销操作需提供原因。学生新增授权时记录公开模型 ID |
+| `comment` | varchar(1000) | 是 | NULL | 审核通过时可选，指定的驳回或撤销操作需提供原因。增删模型授权时记录公开模型 ID |
 | `created_at` | timestamptz | 否 | 当前时间 | 动作发生时间，不可变 |
 
 索引：普通索引 `(api_key_id, created_at)`、`(actor_user_id, created_at)`。
 
 审计记录只允许插入，不允许更新或删除。数据库 `CHECK` 保证 `mentor_rejected/teacher_rejected/mentor_revoked` 的 `comment` 非空；角色与状态迁移由事务服务校验。
 
-迁移 `0047_student_key_model_audit.sql` 增加 `student_model_added` 动作。每条新授权写一条审计，记录学生用户 ID、时间和模型 ID，重复提交已有授权时复用原记录。
+迁移 `0047_student_key_model_audit.sql` 增加 `student_model_added`。迁移 `0060_student_key_model_removal.sql` 扩展约束以允许 `student_model_removed`，保留历史审计和模型授权。两种动作均要求 `comment` 包含公开模型 ID。每个实际变更写一条记录，重复提交没有变更时也没有新增审计。
 
 ## 5. 关系图
 
@@ -284,16 +284,13 @@ erDiagram
 ### 6.1 API Key 状态机
 
 ```text
-pending_mentor --导师通过--> pending_teacher --老师通过--> approved --学生领取--> active
+pending_mentor --负责导师批准--> approved --学生领取--> active
 pending_mentor --导师驳回--> rejected
-pending_teacher --老师驳回--> rejected
-active --负责导师撤销--> revoked
+active --负责导师停用--> inactive --负责导师恢复--> active
 ```
 
-- 学生只能从属于目标项目组织的 `active` 导师中获得初审；具体实现允许项目任一负责导师抢占首个有效初审。
-- 初审必须以条件更新保证只有一次 `pending_mentor -> pending_teacher/rejected` 成功，随后追加一条审计记录。
-- 老师终审前，申请关联的所有模型必须为 `active`，且每个模型至少有一个 `active` binding，其 provider 也必须为 `active`。
-- 老师通过时，在同一数据库事务中：锁定申请、校验状态与模型、幂等创建学生组织成员关系、幂等创建学生项目成员关系、追加审计、更新为 `approved`。
+- 项目的负责导师只能对 `pending_mentor` 申请做出一次有效决定。通过与驳回均以条件更新保证单次状态变化，并写审核记录。
+- 批准事务校验组织、项目、申请状态及月额度，建立学生组织和项目成员关系，写审核审计并更新为 `approved`。允许零模型申请通过。
 - 学生成员关系在 Key 被撤销后仍保留。
 - 学生领取时，在同一事务中以条件更新保证只领取一次：生成高熵 secret，计算配置 pepper 下的 HMAC/hash，写入 `key_hash/key_prefix/claimed_at`，状态改为 `active`。事务提交后只在本次响应返回明文。
 - 撤销使用条件更新保证只有 `active -> revoked` 成功，同时写入 `revoked_at` 和不可变审计。
@@ -306,7 +303,7 @@ active --负责导师撤销--> revoked
 
 ### 6.3 一致性边界
 
-以下规则不由单个外键表达，必须由应用事务和授权层强制：用户角色与成员表类型匹配、项目组织归属、审核人角色、导师是否负责目标项目、合法状态迁移、模型终审条件、Key 领取的一次性返回。
+应用事务和授权层负责校验用户角色、成员类型、项目归属、导师负责范围、Key 状态迁移和领取条件。
 
 模型路由一致性检查不改变 Schema，也不执行迁移。将模型设为 ACTIVE、停用 provider 或停用 binding 时，应用在同一事务中锁定受影响模型和路由记录；任何 ACTIVE 模型必须始终保留至少一个 ACTIVE binding 且对应 provider 为 ACTIVE。已有不一致数据不会自动修复，由老师在模型管理中手动配置或停用模型。
 
@@ -407,7 +404,7 @@ Key 账单读取失败时在最近版本写一次 `stale_at`，并结束仍有�
 
 同步在核实当前 Key 分组、实际型号与倍率后，将对应证据写入 `beichen_price_versions`。行的 `source` 和 `observed_at` 保留反推来源及时间，`effective_at` 为这次同步开始生效的时刻。反推费率依附同批分组与倍率快照，新调用优先使用同组官网价，已派发调用仍按当时的版本结算。用反推价结算的调用在 `gateway_calls.beichen_base_source` 标记 `derived_from_usage` 并引用原报价版本。缓存缺价与回执补记沿用现有待核账规则。
 
-老师终审必须在同一事务内锁定项目、待审 Key、相关模型与当月项目 bucket；更新 `project_month_credit_buckets.allocated_milli` 时，条件必须同时包含 `project_id` 和当前上海月份。任何 SQL 绑定、约束或提交错误都必须回滚 Key 状态、项目分配、Key bucket、成员关系和审核记录，不允许部分成功。
+导师批准申请时，同一事务锁定项目、所属组织、待审 Key 与当月项目 bucket。更新 `project_month_credit_buckets.allocated_milli` 时，条件包含 `project_id` 和当前上海月份。任一步骤失败时，Key 状态、额度、成员关系和审核记录一起回滚。
 
 迁移 0035 为北辰 HTTP 请求固定发件时的北辰 Key 数字编号与授权版本。网关收到北辰的 `X-Client-Request-ID` 后记录其 UUID。`beichen_receipt_response_claims` 记录编号的占用和冲突。`beichen_call_receipts` 保存精确匹配的上游流水行号、请求编号、模型、北辰实付金额、普通输入、输出和缓存读写，独立保留网关原始回包。补记、更新月桶和保存流水在一个事务内完成；流水号、请求编号和本地调用分别唯一。一个实际余额单位乘 100，流水金额已含北辰倍率。
 

@@ -7,7 +7,7 @@ export type ApplicationStatus = 'pending' | 'approved' | 'rejected' | 'cancelled
 export type ModelCategory = 'text' | 'image' | 'audio' | 'video' | 'multimodal' | 'embedding' | 'rerank'
 export type ModelCapability = 'reasoning'|'vision'|'tool_calling'|'structured_output'|'web_search'|'coding'|'embeddings'|'rerank'|'realtime'|'image_generation'|'video_generation'|'speech_to_text'|'text_to_speech'
 export type BindingAdapter = 'openai_compatible' | 'openai_responses' | 'openai_embeddings' | 'openai_images' | 'openai_audio' | 'openai_video' | 'openai_realtime' | 'openai_moderations' | 'anthropic' | 'cohere_rerank_v2' | 'google_gemini_v1beta'
-export type AuditAction = 'mentor_approved' | 'mentor_rejected' | 'teacher_approved' | 'teacher_rejected' | 'mentor_deactivated' | 'mentor_activated' | 'student_withdrawn'
+export type AuditAction = 'mentor_approved' | 'mentor_rejected' | 'teacher_approved' | 'teacher_rejected' | 'mentor_deactivated' | 'mentor_activated' | 'student_withdrawn' | 'student_model_added' | 'student_model_removed'
 export type ProgressStep = 'submitted' | 'mentor_review' | 'teacher_review' | 'claimed'
 export type ProgressCurrent = 'mentor_review' | 'teacher_review' | 'claim' | 'active' | 'rejected' | 'rejected_teacher' | 'inactive' | 'withdrawn'
 
@@ -22,9 +22,11 @@ export type Project = { id: string; organization_id: string; name: string; descr
 export type ModelProtocolInfo = {
   /** 网关实际发布的接入协议；与 /v1/models 的 protocols 一致。 */
   protocols?: string[]
+  supported_protocols?: string[]
   available_protocols?: string[]
   recommended_protocol?: string | null
   probe_state?: 'passed' | 'unprobed' | 'failed' | 'not_applicable' | string
+  last_probe_at?: string | null
   availability?: 'available' | 'maintenance' | 'unverified' | 'unavailable' | 'not_published' | string
   availability_reason?: string
 }
@@ -76,8 +78,7 @@ export type BindingRouteProbeEndpoint = 'chat_completions' | 'responses' | 'mess
 export type BindingRouteProbeStep = { endpoint: BindingRouteProbeEndpoint; path: string; adapter: BindingAdapter; http_status: number; ok: boolean; duration_ms: number; error?: string }
 export type BindingCreate = { provider_id: string; upstream_model_name: string; adapter: BindingAdapter; priority: number; status: ResourceStatus; probed_adapters?: BindingAdapter[] }
 export type BindingUpdate = { upstream_model_name?: string; adapter?: BindingAdapter; priority?: number; status?: ResourceStatus }
-export type RequestedModel = { model_id: string; display_name?: string }
-export type SubmitApiKey = { name: string; organization_id: string; project_id: string; models: RequestedModel[]; requested_monthly_credits: string }
+export type SubmitApiKey = { name: string; organization_id: string; project_id: string; requested_monthly_credits: string }
 export type ModelCatalogCandidate = { model_id:string;display_name?:string|null;description?:string|null;owned_by?:string|null;upstream_object?:string|null;upstream_created_at?:string|null;credential_id?:string;credential_label?:string;provider_name?:string;credit_multiplier?:string|null;raw_entry:Record<string, unknown> } & ModelProtocolInfo
 export type ModelCatalogPage = { items:ModelCatalogCandidate[];page:number;page_size:number;total:number }
 export type ProviderCatalogSyncView = { provider_id: string; provider_name: string; synced: number; synced_at: string }

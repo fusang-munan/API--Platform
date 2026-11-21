@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 
@@ -102,14 +103,11 @@ func (s *Server) removeStudentModel(c *gin.Context) {
 
 func (s *Server) submitAPIKey(c *gin.Context) {
 	var input struct {
-		Name           string `json:"name" binding:"required"`
-		OrganizationID string `json:"organization_id" binding:"required"`
-		ProjectID      string `json:"project_id" binding:"required"`
-		Models         []struct {
-			ModelID     string `json:"model_id" binding:"required"`
-			DisplayName string `json:"display_name"`
-		} `json:"models" binding:"required"`
-		RequestedMonthlyCredits string `json:"requested_monthly_credits" binding:"required"`
+		Name                    string          `json:"name" binding:"required"`
+		OrganizationID          string          `json:"organization_id" binding:"required"`
+		ProjectID               string          `json:"project_id" binding:"required"`
+		RequestedMonthlyCredits string          `json:"requested_monthly_credits" binding:"required"`
+		Models                  json.RawMessage `json:"models"` // Accepted for older clients and ignored.
 	}
 	if !bindJSON(c, &input) {
 		return
@@ -129,13 +127,8 @@ func (s *Server) submitAPIKey(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	requested := make([]controlplane.RequestedModelInput, 0, len(input.Models))
-	for _, item := range input.Models {
-		requested = append(requested, controlplane.RequestedModelInput{ModelID: item.ModelID, DisplayName: item.DisplayName})
-	}
 	view, err := s.service.SubmitAPIKey(c.Request.Context(), identity(c).UserID, controlplane.SubmitAPIKeyInput{
 		Name: input.Name, OrganizationID: organizationID, ProjectID: projectID,
-		Models:                  requested,
 		RequestedMonthlyCredits: requestedCredits,
 	})
 	if err != nil {
@@ -179,6 +172,25 @@ func (s *Server) addStudentAPIKeyModels(c *gin.Context) {
 		return
 	}
 	view, err := s.service.AddStudentAPIKeyModels(c.Request.Context(), identity(c).UserID, keyID, input.ModelIDs)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
+}
+
+func (s *Server) removeStudentAPIKeyModels(c *gin.Context) {
+	keyID, ok := pathID(c, "api_key_id")
+	if !ok {
+		return
+	}
+	var input struct {
+		ModelIDs []string `json:"model_ids"`
+	}
+	if !bindJSON(c, &input) {
+		return
+	}
+	view, err := s.service.RemoveStudentAPIKeyModels(c.Request.Context(), identity(c).UserID, keyID, input.ModelIDs)
 	if err != nil {
 		writeError(c, err)
 		return

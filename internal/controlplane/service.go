@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/beichen"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/cache"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
@@ -139,15 +140,26 @@ func (s *Service) keyView(ctx context.Context, query *ent.APIKeyQuery) (APIKeyVi
 	if err != nil {
 		return APIKeyView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query API key", err)
 	}
-	return makeAPIKeyView(key), nil
+	modelIDs := make([]uuid.UUID, 0, len(key.Edges.Models))
+	for _, link := range key.Edges.Models {
+		if link.Edges.Model != nil {
+			modelIDs = append(modelIDs, link.ModelID)
+		}
+	}
+	protocols, err := catalog.LoadPublishedProtocols(ctx, s.db, modelIDs, s.security)
+	if err != nil {
+		return APIKeyView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query API key model availability", err)
+	}
+	return makeAPIKeyView(key, protocols), nil
 }
 
-func makeAPIKeyView(key *ent.APIKey) APIKeyView {
+func makeAPIKeyView(key *ent.APIKey, protocols map[uuid.UUID][]catalog.ProtocolCapability) APIKeyView {
 	view := APIKeyView{
 		ID: key.ID.String(), Name: key.Name, Status: string(key.Status),
 		KeyPrefix: key.KeyPrefix, ClaimedAt: key.ClaimedAt,
 		CreatedAt: key.CreatedAt, UpdatedAt: key.UpdatedAt,
 		RequestedMonthlyCredits: domain.FormatCredits(key.RequestedMonthlyCreditQuotaMilli),
+		Models:                  make([]ModelView, 0, len(key.Edges.Models)),
 	}
 	if key.MentorMonthlyCreditQuotaMilli != nil {
 		value := domain.FormatCredits(*key.MentorMonthlyCreditQuotaMilli)
@@ -167,8 +179,11 @@ func makeAPIKeyView(key *ent.APIKey) APIKeyView {
 		}
 	}
 	for _, link := range key.Edges.Models {
-		if link.Edges.Model != nil {
-			view.Models = append(view.Models, modelView(link.Edges.Model))
+		if row := link.Edges.Model; row != nil {
+			item := modelView(row)
+			item.setAvailability(catalog.SummarizeModelAvailability(row.ModelID, row.Status, protocols[row.ID]))
+			view.RouteReady = view.RouteReady || item.RouteReady
+			view.Models = append(view.Models, item)
 		}
 	}
 	for _, audit := range key.Edges.Audits {
@@ -212,6 +227,9 @@ func progressForStatus(status string, audits []AuditView) ProgressView {
 }
 
 func (s *Service) publishKeyStatus(ctx context.Context, ownerID uuid.UUID, keyID uuid.UUID, status string, updatedAt time.Time) {
+	if s.cache == nil {
+		return
+	}
 	_ = s.cache.PublishUserEvent(ctx, ownerID.String(), "api_key.status_changed", map[string]any{
 		"api_key_id": keyID.String(),
 		"status":     status,

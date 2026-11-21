@@ -359,6 +359,7 @@ onMounted(() => { void loadRecent(true) })
         <div>
           <h2>按模型用量</h2>
           <p class="muted">积分按学校记账；Token 与缓存命中率来自上游回报。</p>
+          <p class="muted">需要别的模型？<RouterLink :to="{ name: 'student-models' }" data-testid="usage-model-plaza-link">到模型广场把模型加入当前 Key</RouterLink>。</p>
         </div>
         <div class="range-switch" role="group" aria-label="用量范围">
           <button v-for="item in ranges" :key="item.id" type="button"

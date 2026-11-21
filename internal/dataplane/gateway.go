@@ -241,56 +241,60 @@ func ensureAnthropicVersion(header http.Header) {
 	}
 }
 
-func (g *Gateway) serveModels(w http.ResponseWriter, r *http.Request, key *ent.APIKey) {
-	w.Header().Set("Cache-Control", "no-store")
+type listedKeyModel struct {
+	row          *ent.Model
+	availability catalog.ModelAvailability
+}
+
+func (g *Gateway) listKeyModels(r *http.Request, keyID uuid.UUID) ([]listedKeyModel, error) {
+	ctx := r.Context()
 	rows, err := g.db.Model.Query().Where(
-		entmodel.HasAPIKeyModelsWith(apikeymodel.APIKeyIDEQ(key.ID)),
-	).Order(ent.Asc(entmodel.FieldModelID)).All(r.Context())
+		entmodel.HasAPIKeyModelsWith(apikeymodel.APIKeyIDEQ(keyID)),
+	).Order(ent.Asc(entmodel.FieldModelID)).All(ctx)
 	if err != nil {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "server_error", "dependency_unavailable", "Model catalog is unavailable.", "")
-		return
+		return nil, err
 	}
 	ids := make([]uuid.UUID, 0, len(rows))
 	for _, row := range rows {
 		ids = append(ids, row.ID)
 	}
-	protocols, err := catalog.LoadPublishedProtocols(r.Context(), g.db, ids, g.credentialUsable)
+	protocols, err := catalog.LoadPublishedProtocols(ctx, g.db, ids, g.security)
+	if err != nil {
+		return nil, err
+	}
+	includeUnavailable := r.URL.Query().Get("include_unavailable") == "1"
+	models := make([]listedKeyModel, 0, len(rows))
+	for _, row := range rows {
+		availability := catalog.SummarizeModelAvailability(row.ModelID, row.Status, protocols[row.ID])
+		if includeUnavailable || availability.Availability != catalog.AvailabilityMaintenance {
+			models = append(models, listedKeyModel{row: row, availability: availability})
+		}
+	}
+	return models, nil
+}
+
+func (g *Gateway) serveModels(w http.ResponseWriter, r *http.Request, key *ent.APIKey) {
+	w.Header().Set("Cache-Control", "no-store")
+	models, err := g.listKeyModels(r, key.ID)
 	if err != nil {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "server_error", "dependency_unavailable", "Model catalog is unavailable.", "")
 		return
 	}
-	data := make([]map[string]any, 0, len(rows))
-	for _, row := range rows {
-		summary := catalog.SummarizeProtocols(row.ModelID, protocols[row.ID])
-		state, reason := modelProtocolAvailability(row, summary)
-		data = append(data, map[string]any{
-			"id": row.ModelID, "object": "model", "created": row.CreatedAt.Unix(), "owned_by": "nebula",
-			"protocols": summary.Protocols, "available_protocols": summary.AvailableProtocols,
-			"recommended_protocol": summary.RecommendedProtocol, "probe_state": summary.ProbeState,
-			"availability": state, "availability_reason": reason,
+	type item struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Created int64  `json:"created"`
+		OwnedBy string `json:"owned_by"`
+		catalog.ModelAvailability
+	}
+	data := make([]item, 0, len(models))
+	for _, model := range models {
+		data = append(data, item{
+			ID: model.row.ModelID, Object: "model", Created: model.row.CreatedAt.Unix(), OwnedBy: "nebula",
+			ModelAvailability: model.availability,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
-}
-
-func (g *Gateway) credentialUsable(ciphertext []byte) bool {
-	clear, err := g.security.DecryptCredential(ciphertext)
-	return err == nil && strings.TrimSpace(clear) != ""
-}
-
-func modelProtocolAvailability(model *ent.Model, summary catalog.ProtocolSummary) (state, reason string) {
-	switch {
-	case model.Status != entmodel.StatusActive:
-		return "maintenance", "维护中。校内模型已停用或还未发布，请联系老师。"
-	case summary.ProbeState == "failed":
-		return "maintenance", "维护中。所有已配置线路最近一次探活均失败，请联系老师检查渠道 Key 后重新探活。"
-	case len(summary.Protocols) == 0:
-		return "maintenance", "维护中。当前没有可接入的线路，请联系老师核对渠道 Key 和模型绑定。"
-	case len(summary.AvailableProtocols) == 0:
-		return "unverified", "已有绑定线路，当前还没有通过探活的协议。"
-	default:
-		return "available", ""
-	}
 }
 
 func (g *Gateway) modelProtocolRejection(ctx context.Context, keyID uuid.UUID, modelID string, requested modelbinding.Adapter) (int, map[string]any) {
@@ -304,14 +308,14 @@ func (g *Gateway) modelProtocolRejection(ctx context.Context, keyID uuid.UUID, m
 	}
 	var options map[uuid.UUID][]catalog.ProtocolCapability
 	if err == nil {
-		options, err = catalog.LoadPublishedProtocols(ctx, g.db, []uuid.UUID{model.ID}, g.credentialUsable)
+		options, err = catalog.LoadPublishedProtocols(ctx, g.db, []uuid.UUID{model.ID}, g.security)
 	}
 	if err != nil {
 		fields["type"], fields["code"], fields["message"] = "server_error", "dependency_unavailable", "暂时无法读取模型线路，请稍后重试。"
 		return http.StatusServiceUnavailable, fields
 	}
 
-	summary := catalog.SummarizeProtocols(model.ModelID, options[model.ID])
+	summary := catalog.SummarizeModelAvailability(model.ModelID, model.Status, options[model.ID])
 	paths := make(map[string]string, len(summary.Protocols))
 	names := make([]string, 0, len(summary.Protocols))
 	for _, protocol := range summary.Protocols {
@@ -324,8 +328,8 @@ func (g *Gateway) modelProtocolRejection(ctx context.Context, keyID uuid.UUID, m
 	fields["recommended_protocol"] = summary.RecommendedProtocol
 	fields["requested_protocol"], fields["protocol_paths"] = requested, paths
 
-	state, reason := modelProtocolAvailability(model, summary)
-	if state == "maintenance" || summary.RecommendedProtocol == nil || *summary.RecommendedProtocol == string(requested) {
+	if summary.Availability == catalog.AvailabilityMaintenance || summary.RecommendedProtocol == nil || *summary.RecommendedProtocol == string(requested) {
+		reason := summary.AvailabilityReason
 		if reason == "" {
 			reason = "该协议的线路暂不可用，请稍后重试或联系老师检查绑定。"
 		}
@@ -374,19 +378,16 @@ func (g *Gateway) writeModelProtocolRejection(w http.ResponseWriter, r *http.Req
 }
 
 func (g *Gateway) serveCodexModelCatalog(w http.ResponseWriter, r *http.Request, key *ent.APIKey) {
-	rows, err := g.db.Model.Query().Where(
-		entmodel.HasAPIKeyModelsWith(apikeymodel.APIKeyIDEQ(key.ID)),
-	).Order(ent.Asc(entmodel.FieldModelID)).All(r.Context())
+	w.Header().Set("Cache-Control", "no-store")
+	models, err := g.listKeyModels(r, key.ID)
 	if err != nil {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "server_error", "dependency_unavailable", "Model catalog is unavailable.", "")
 		return
 	}
-	modelIDs := make([]string, 0, len(rows))
-	displayNames := make(map[string]string, len(rows))
-	for _, row := range rows {
-		if !catalog.IsOpenAIModelsListable(row.ModelID) {
-			continue
-		}
+	modelIDs := make([]string, 0, len(models))
+	displayNames := make(map[string]string, len(models))
+	for _, model := range models {
+		row := model.row
 		modelIDs = append(modelIDs, row.ModelID)
 		if name := strings.TrimSpace(row.DisplayName); name != "" {
 			displayNames[row.ModelID] = name
@@ -1806,9 +1807,9 @@ func firstString(payload map[string]any, keys ...string) string {
 
 const (
 	gatewayMessageInvalidAPIKey   = "API Key 无效或已停用。请打开 Nebula 控制台「申请密钥」页确认 Key 状态，重新领取或重新生成 Key 后，再更新客户端配置。"
-	gatewayMessageForbidden       = "当前 Key 无权执行此操作。请确认使用的是本人状态为 active 的 Key；如果模型不在 Key 白名单内，请到模型广场重新申领 Key。"
+	gatewayMessageForbidden       = "当前 Key 无权执行此操作。请确认使用的是本人已生效的 Key，并在 Nebula 控制台「模型广场」核对该模型的授权。"
 	gatewayMessageNotFound        = "请求的接口或资源不存在。请检查客户端 Base URL 不要重复带 /v1，并确认该模型仍在模型广场中。"
-	gatewayMessageModelNotAllowed = "当前 Key 未包含该模型。请打开 Nebula 控制台「模型广场」，在该模型卡片点「需重新申领 Key」，撤回后按原审批额度重新申请。"
+	gatewayMessageModelNotAllowed = "当前 Key 未包含该模型。请打开 Nebula 控制台「模型广场」，把该模型添加到当前 Key，然后用同一把 Key 重试。"
 )
 
 func gatewayErrorMessage(status int, code, fallback string) string {

@@ -13,9 +13,8 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeyaudit"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeymodel"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeymonthcreditbucket"
-	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/organization"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/mentorprofile"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/organization"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/project"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/projectmember"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/user"
@@ -25,8 +24,8 @@ type SubmitAPIKeyInput struct {
 	Name                    string
 	OrganizationID          uuid.UUID
 	ProjectID               uuid.UUID
-	Models                  []RequestedModelInput
 	RequestedMonthlyCredits int64
+	Models                  []RequestedModelInput // Accepted for older callers and ignored.
 }
 
 type RequestedModelInput struct {
@@ -105,18 +104,7 @@ func (s *Service) StudentModels(ctx context.Context, studentID uuid.UUID) (Stude
 }
 
 func (s *Service) SubmitAPIKey(ctx context.Context, studentID uuid.UUID, input SubmitAPIKeyInput) (APIKeyView, error) {
-	hasProvider, err := s.hasActiveProvider(ctx)
-	if err != nil {
-		return APIKeyView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query active providers", err)
-	}
-	if !hasProvider {
-		return APIKeyView{}, domain.NewError(domain.CodeValidation, "no active provider configured")
-	}
 	name, err := ValidateName(input.Name, 128)
-	if err != nil {
-		return APIKeyView{}, err
-	}
-	requestedModels, err := normalizeRequestedModels(input.Models)
 	if err != nil {
 		return APIKeyView{}, err
 	}
@@ -168,35 +156,6 @@ func (s *Service) SubmitAPIKey(ctx context.Context, studentID uuid.UUID, input S
 		return APIKeyView{}, domain.NewError(domain.CodeValidation, "requested monthly credits exceed project quota")
 	}
 
-	modelRows := make([]*ent.Model, 0, len(requestedModels))
-	for _, requested := range requestedModels {
-		modelID := requested.ModelID
-		row, queryErr := tx.Model.Query().Where(entmodel.ModelIDEQ(modelID)).Only(ctx)
-		if ent.IsNotFound(queryErr) {
-			return APIKeyView{}, domain.NewError(domain.CodeNotFound, "requested model is not in platform catalog")
-		}
-		if queryErr != nil {
-			return APIKeyView{}, domain.WrapError(domain.CodeDependencyUnavailable, "resolve requested model", queryErr)
-		}
-		if row.Status != entmodel.StatusActive {
-			return APIKeyView{}, domain.NewError(domain.CodeValidation, "requested model is not active")
-		}
-		routable, routeErr := s.modelHasActiveRoute(ctx, row.ID)
-		if routeErr != nil {
-			return APIKeyView{}, routeErr
-		}
-		if !routable {
-			return APIKeyView{}, domain.NewError(domain.CodeValidation, "requested model is not routable")
-		}
-		canSelect, selectErr := s.studentCanSelectModel(ctx, studentID, row)
-		if selectErr != nil {
-			return APIKeyView{}, domain.WrapError(domain.CodeDependencyUnavailable, "verify student model selection", selectErr)
-		}
-		if !canSelect {
-			return APIKeyView{}, domain.NewError(domain.CodeValidation, "requested model is not available in your model plaza")
-		}
-		modelRows = append(modelRows, row)
-	}
 	key, err := tx.APIKey.Create().
 		SetOwnerUserID(studentID).
 		SetProjectID(targetProject.ID).
@@ -213,14 +172,6 @@ func (s *Service) SubmitAPIKey(ctx context.Context, studentID uuid.UUID, input S
 	if err != nil {
 		return APIKeyView{}, domain.WrapError(domain.CodeDependencyUnavailable, "create API key application", err)
 	}
-	for _, row := range modelRows {
-		if _, err := tx.APIKeyModel.Create().
-			SetAPIKeyID(key.ID).
-			SetModelID(row.ID).
-			Save(ctx); err != nil {
-			return APIKeyView{}, domain.WrapError(domain.CodeDependencyUnavailable, "create API key model link", err)
-		}
-	}
 	if err := tx.Commit(); err != nil {
 		return APIKeyView{}, domain.WrapError(domain.CodeDependencyUnavailable, "commit API key transaction", err)
 	}
@@ -232,38 +183,6 @@ func (s *Service) SubmitAPIKey(ctx context.Context, studentID uuid.UUID, input S
 		s.publishKeyStatus(ctx, studentID, key.ID, domain.KeyPendingMentor, key.UpdatedAt)
 	}
 	return view, err
-}
-
-func normalizeRequestedModels(requested []RequestedModelInput) ([]RequestedModelInput, error) {
-	if len(requested) < 1 || len(requested) > 100 {
-		return nil, domain.NewError(domain.CodeValidation, "models must contain 1 to 100 items")
-	}
-	result := make([]RequestedModelInput, 0, len(requested))
-	seen := map[string]struct{}{}
-	for _, item := range requested {
-		modelID, err := normalizeSingleModelID(item.ModelID)
-		if err != nil {
-			return nil, err
-		}
-		key := strings.ToLower(modelID)
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		displayName := strings.TrimSpace(item.DisplayName)
-		if displayName == "" {
-			displayName = modelID
-		} else {
-			displayName, err = ValidateName(displayName, 256)
-			if err != nil {
-				return nil, err
-			}
-		}
-		item.ModelID = modelID
-		item.DisplayName = displayName
-		result = append(result, item)
-	}
-	return result, nil
 }
 
 func (s *Service) StudentAPIKeys(ctx context.Context, studentID uuid.UUID) ([]APIKeyView, error) {

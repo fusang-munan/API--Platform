@@ -311,41 +311,17 @@ func (s *Store) ApproveKey(ctx context.Context, actorID, keyID uuid.UUID, quota 
 		return uuid.Nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var projectQuota int64
-	if err = tx.QueryRowContext(ctx, `SELECT monthly_credit_quota_milli FROM projects WHERE id=$1 FOR UPDATE`, projectID).Scan(&projectQuota); err != nil {
-		return uuid.Nil, err
-	}
-	var ownerID, organizationID uuid.UUID
-	if err = tx.QueryRowContext(ctx, `SELECT k.owner_user_id,p.organization_id FROM api_keys k JOIN projects p ON p.id=k.project_id WHERE k.id=$1 AND k.project_id=$2 AND k.status='pending_mentor' FOR UPDATE OF k`, keyID, projectID).Scan(&ownerID, &organizationID); errors.Is(err, sql.ErrNoRows) {
-		return uuid.Nil, domain.NewError(domain.CodeInvalidTransition, "API key is no longer pending mentor review")
+	var organizationID uuid.UUID
+	if err = tx.QueryRowContext(ctx, `SELECT p.organization_id FROM projects p JOIN organizations o ON o.id=p.organization_id WHERE p.id=$1 AND p.status='active' AND o.status='active' FOR UPDATE OF p FOR SHARE OF o`, projectID).Scan(&organizationID); errors.Is(err, sql.ErrNoRows) {
+		return uuid.Nil, domain.NewError(domain.CodeInvalidTransition, "API key project access is inactive")
 	} else if err != nil {
 		return uuid.Nil, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT m.model_id,m.status,m.credit_multiplier_milli,EXISTS(SELECT 1 FROM model_bindings b JOIN providers p ON p.id=b.provider_id WHERE b.model_id=m.id AND b.status='active' AND p.status='active') FROM api_key_models km JOIN models m ON m.id=km.model_id WHERE km.api_key_id=$1 ORDER BY m.id FOR UPDATE OF m`, keyID)
-	if err != nil {
+	var ownerID uuid.UUID
+	if err = tx.QueryRowContext(ctx, `SELECT owner_user_id FROM api_keys WHERE id=$1 AND project_id=$2 AND status='pending_mentor' FOR UPDATE`, keyID, projectID).Scan(&ownerID); errors.Is(err, sql.ErrNoRows) {
+		return uuid.Nil, domain.NewError(domain.CodeInvalidTransition, "API key is no longer pending mentor review")
+	} else if err != nil {
 		return uuid.Nil, err
-	}
-	notReady, count := []string{}, 0
-	for rows.Next() {
-		var modelID, status string
-		var multiplier sql.NullInt64
-		var routed bool
-		if err = rows.Scan(&modelID, &status, &multiplier, &routed); err != nil {
-			rows.Close()
-			return uuid.Nil, err
-		}
-		count++
-		if status != "active" || !multiplier.Valid || !routed {
-			notReady = append(notReady, modelID)
-		}
-	}
-	if err = rows.Close(); err != nil {
-		return uuid.Nil, err
-	}
-	if count == 0 || len(notReady) > 0 {
-		appErr := domain.NewError(domain.CodeModelNotReady, "one or more models are not ready")
-		appErr.Details = map[string]any{"model_ids": notReady}
-		return uuid.Nil, appErr
 	}
 	month, now := Month(time.Now()), time.Now().UTC()
 	if err = insertProjectMonthBucketTx(ctx, tx, projectID, month, now); err != nil {

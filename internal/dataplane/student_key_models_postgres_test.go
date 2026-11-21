@@ -3,9 +3,11 @@ package dataplane_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	httpapi "github.com/starprince1234/Nebula-api/internal/api/http"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/controlplane"
 	"github.com/starprince1234/Nebula-api/internal/dataplane"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
@@ -95,16 +98,20 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 		VALUES($1,'Fake upstream','https://fixture-upstream.test',now(),now())`, providerID)
 	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
 		VALUES($1,$2,'Fake key',$3,now(),now())`, credential, providerID, ciphertext)
+	addBinding := func(id, providerID, credential uuid.UUID, adapter, upstream string) {
+		t.Helper()
+		exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at)
+			VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now())`, providerID, credential, upstream)
+		exec(`INSERT INTO model_bindings(id,model_id,provider_id,upstream_model_name,adapter,credential_id,created_at,updated_at)
+			VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,now(),now())`, id, providerID, upstream, adapter, credential)
+	}
 	addModel := func(publicID, status, adapter, upstream string, common bool) uuid.UUID {
 		t.Helper()
 		id := uuid.New()
 		exec(`INSERT INTO models(id,model_id,display_name,status,is_common,credit_multiplier_milli,created_at,updated_at)
 			VALUES($1,$2::text,$2::text,$3,$4,1000,now(),now())`, id, publicID, status, common)
 		if adapter != "" {
-			exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at)
-				VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now())`, providerID, credential, upstream)
-			exec(`INSERT INTO model_bindings(id,model_id,provider_id,upstream_model_name,adapter,credential_id,created_at,updated_at)
-				VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,now(),now())`, id, providerID, upstream, adapter, credential)
+			addBinding(id, providerID, credential, adapter, upstream)
 		}
 		return id
 	}
@@ -115,8 +122,53 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 	addModel("fixture-no-route", "active", "", "", true)
 	addModel("fixture-stale", "active", "openai_responses", "fixture-stale-upstream", true)
 	exec(`UPDATE provider_model_catalog SET status='inactive' WHERE model_id='fixture-stale-upstream'`)
-	exec(`INSERT INTO api_key_models(id,api_key_id,model_id,created_at)
-		VALUES(gen_random_uuid(),$1,$2,now())`, keyID, oldID)
+	linkModel := func(id uuid.UUID) {
+		t.Helper()
+		exec(`INSERT INTO api_key_models(id,api_key_id,model_id,created_at)
+			VALUES(gen_random_uuid(),$1,$2,now())`, keyID, id)
+	}
+	linkModel(oldID)
+	var beichenProvider uuid.UUID
+	if err := db.QueryRowContext(ctx, `SELECT id FROM providers WHERE base_url='https://api.beichenapi.com'`).Scan(&beichenProvider); err != nil {
+		t.Fatal(err)
+	}
+	beichenCredential := uuid.New()
+	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
+		VALUES($1,$2,'Stored probe fixture',$3,now(),now())`, beichenCredential, beichenProvider, ciphertext)
+	seedProbe := func(id uuid.UUID, modelID string, status int, errorCode string) {
+		t.Helper()
+		addBinding(id, beichenProvider, beichenCredential, "openai_responses", modelID)
+		exec(`INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,error_code,duration_ms,checked_at)
+			VALUES($1,$2,$3,'openai_responses',$4,NULLIF($5,''),1,clock_timestamp())`, beichenProvider, beichenCredential, modelID, status, errorCode)
+	}
+	const failedModel = "gpt-fixture-failed"
+	seedProbe(addModel(failedModel, "active", "", "", true), failedModel, 503, "http_error")
+	legacyIDs := []string{existingModel}
+	var verifiedIDs []string
+	for i := 1; i <= 8; i++ {
+		modelID := fmt.Sprintf("gpt-fixture-old-%d", i)
+		id := addModel(modelID, "active", "", "", true)
+		linkModel(id)
+		legacyIDs = append(legacyIDs, modelID)
+		if i <= 2 {
+			seedProbe(id, modelID, 200, "")
+			verifiedIDs = append(verifiedIDs, modelID)
+		}
+	}
+	// The most recent probe can fail while an earlier successful probe still
+	// verifies a different protocol for the same model.
+	exec(`INSERT INTO model_bindings(id,model_id,provider_id,upstream_model_name,adapter,credential_id,created_at,updated_at)
+		SELECT gen_random_uuid(),m.id,$1,m.model_id::text,'openai_compatible',$2,now(),now()
+		FROM models m WHERE m.model_id=$3`, beichenProvider, beichenCredential, verifiedIDs[0])
+	var latestProbe time.Time
+	if err := db.QueryRowContext(ctx, `INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,error_code,duration_ms,checked_at)
+		SELECT provider_id,credential_id,model,'openai_compatible',503,'http_error',1,checked_at+interval '1 second'
+		FROM upstream_probes WHERE credential_id=$1 AND model=$2 AND protocol='openai_responses'
+		RETURNING checked_at`, beichenCredential, verifiedIDs[0]).Scan(&latestProbe); err != nil {
+		t.Fatal(err)
+	}
+	exec(`INSERT INTO api_key_audits (id,api_key_id,actor_user_id,action,comment,created_at)
+		VALUES(gen_random_uuid(),$1,$2,'student_model_added',$3,now())`, keyID, student, existingModel)
 
 	token := func(userID uuid.UUID, role string) string {
 		t.Helper()
@@ -152,28 +204,84 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 		}
 		return envelope.Data
 	}
-	modelList := func() []string {
+	type gatewayModel struct {
+		ID string `json:"id"`
+		catalog.ModelAvailability
+	}
+	readGateway := func(query string) []gatewayModel {
 		t.Helper()
-		rec := serve("GET", "/v1/models", studentKey, "")
-		var response struct{ Data []struct{ ID string } }
+		rec := serve("GET", "/v1/models"+query, studentKey, "")
+		var response struct{ Data []gatewayModel }
 		if err := json.Unmarshal([]byte(requireStatus(rec, 200)), &response); err != nil {
 			t.Fatal(err)
 		}
 		if rec.Header().Get("Cache-Control") != "no-store" {
 			t.Fatal("model list is cacheable")
 		}
-		ids := make([]string, 0, len(response.Data))
-		for _, item := range response.Data {
+		return response.Data
+	}
+	modelList := func() []string {
+		t.Helper()
+		models := readGateway("")
+		ids := make([]string, 0, len(models))
+		for _, item := range models {
 			ids = append(ids, item.ID)
 		}
 		return ids
 	}
-	endpoint := "/api/v1/student/api-keys/" + keyID.String() + "/models"
+	readCodex := func(query string) []string {
+		t.Helper()
+		rec := serve("GET", "/v1/codex/model_catalog"+query, studentKey, "")
+		var response struct{ Models []struct{ Slug string } }
+		if err := json.Unmarshal([]byte(requireStatus(rec, 200)), &response); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Header().Get("Cache-Control") != "no-store" {
+			t.Fatal("Codex catalog is cacheable")
+		}
+		ids := make([]string, 0, len(response.Models))
+		for _, item := range response.Models {
+			ids = append(ids, item.Slug)
+		}
+		return ids
+	}
+	keyPath := "/api/v1/student/api-keys/" + keyID.String()
+	endpoint := keyPath + "/models"
+	removeEndpoint := endpoint + "/remove"
 	newBody := `{"model_ids":["gpt-fixture-new","gpt-fixture-new"]}`
 	responsesBody := `{"model":"gpt-fixture-new","input":"offline fixture"}`
-	if got := modelList(); !slices.Equal(got, []string{existingModel}) {
+	if got := modelList(); !slices.Equal(got, verifiedIDs) {
 		t.Fatalf("pre-grant models: %v", got)
 	}
+	if got := readCodex(""); !slices.Equal(got, verifiedIDs) {
+		t.Fatalf("pre-grant Codex models: %v", got)
+	}
+	if got := readCodex("?include_unavailable=1"); !slices.Equal(got, legacyIDs) {
+		t.Fatalf("Codex catalog omitted old authorizations: %v", got)
+	}
+	var keyDetail struct{ Data controlplane.APIKeyView }
+	body := requireStatus(serve("GET", keyPath, studentToken, ""), 200)
+	if err := json.Unmarshal([]byte(body), &keyDetail); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics := readGateway("?include_unavailable=1")
+	if len(diagnostics) != 9 || len(keyDetail.Data.Models) != 9 {
+		t.Fatalf("legacy links missing in diagnostics or key detail: %d, %d", len(diagnostics), len(keyDetail.Data.Models))
+	}
+	detailByID := make(map[string]*catalog.ModelAvailability)
+	for _, model := range keyDetail.Data.Models {
+		detailByID[model.ModelID] = model.ModelAvailability
+	}
+	for _, model := range diagnostics {
+		want := catalog.AvailabilityMaintenance
+		if slices.Contains(verifiedIDs, model.ID) {
+			want = catalog.AvailabilityAvailable
+		}
+		if model.Availability != want || !reflect.DeepEqual(detailByID[model.ID], &model.ModelAvailability) {
+			t.Fatalf("%s availability mismatch: gateway=%+v detail=%+v", model.ID, model.ModelAvailability, detailByID[model.ID])
+		}
+	}
+	requireStatus(serve("GET", "/v1/models?include_unavailable=1", "invalid-fixture-key", ""), 401)
 	requireStatus(serve("POST", "/v1/responses", studentKey, responsesBody), 400)
 	requireStatus(serve("POST", endpoint, token(otherStudent, "student"), newBody), 404)
 	requireStatus(serve("POST", endpoint, token(teacher, "teacher"), newBody), 403)
@@ -185,17 +293,18 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 		body, reason string
 		status       int
 	}{
-		{`{"model_ids":["gpt-fixture-new","fixture-disabled"]}`, "model is not enabled for students", 409},
-		{`{"model_ids":["fixture-no-route"]}`, "model has no usable route", 409},
-		{`{"model_ids":["fixture-stale"]}`, "model has no usable route", 409},
-		{`{"model_ids":["claude-fixture-new"]}`, "model is not available in your model plaza", 404},
+		{`{"model_ids":["gpt-fixture-new","fixture-disabled"]}`, "停用或还未发布", 409},
+		{`{"model_ids":["fixture-no-route"]}`, "没有可接入的线路", 409},
+		{`{"model_ids":["fixture-stale"]}`, "没有可接入的线路", 409},
+		{`{"model_ids":["gpt-fixture-failed"]}`, "探活均失败", 409},
+		{`{"model_ids":["fixture-nonexistent"]}`, "model not found in platform catalog", 404},
 	} {
 		body := requireStatus(serve("POST", endpoint, studentToken, refusal.body), refusal.status)
 		if !strings.Contains(body, refusal.reason) {
 			t.Fatalf("missing rejection reason %q: %s", refusal.reason, body)
 		}
 	}
-	if got := modelList(); !slices.Equal(got, []string{existingModel}) || sends != 0 {
+	if got := modelList(); !slices.Equal(got, verifiedIDs) || sends != 0 {
 		t.Fatalf("rejected requests changed the whitelist or used the upstream: models=%v calls=%d", got, sends)
 	}
 	refusal := requireStatus(serve("POST", "/api/v1/student/models", studentToken, `{"model_id":"fixture-disabled"}`), 400)
@@ -214,45 +323,144 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 	}
 	close(start)
 	var added []string
+	var warnings []controlplane.StudentAPIKeyModelWarning
+	wantGranted := append(slices.Clone(legacyIDs), newModel)
+	slices.Sort(wantGranted)
 	for range 2 {
 		got := readGrant(<-replies)
-		if !slices.Equal(got.ModelIDs, []string{existingModel, newModel}) {
+		if !slices.Equal(got.ModelIDs, wantGranted) {
 			t.Fatalf("grant returned a stale model list: %v", got.ModelIDs)
 		}
 		added = append(added, got.AddedModelIDs...)
+		warnings = append(warnings, got.Warnings...)
 	}
 	if !slices.Equal(added, []string{newModel}) {
 		t.Fatalf("duplicate concurrent grants: %v", added)
 	}
+	if len(warnings) != 1 || warnings[0].ModelID != newModel || warnings[0].Code != "MODEL_UNVERIFIED" || warnings[0].Message == "" {
+		t.Fatalf("missing unverified warning: %+v", warnings)
+	}
 	if got := readGrant(serve("POST", endpoint, studentToken, newBody)); got.AddedModelIDs == nil || len(got.AddedModelIDs) != 0 {
 		t.Fatalf("repeat grant did not return an empty addition list: %+v", got)
 	}
-	if got := modelList(); !slices.Equal(got, []string{existingModel, newModel}) {
+	wantVisible := append([]string{newModel}, verifiedIDs...)
+	if got := modelList(); !slices.Equal(got, wantVisible) {
 		t.Fatalf("model list did not change immediately: %v", got)
 	}
+	if got := readCodex(""); !slices.Equal(got, wantVisible) {
+		t.Fatalf("Codex catalog did not include the unverified addition: %v", got)
+	}
+	assertProbeTimes := func(models []json.RawMessage) {
+		t.Helper()
+		probeTimes := make(map[string]json.RawMessage)
+		for _, raw := range models {
+			var model struct {
+				ID          string          `json:"model_id"`
+				LastProbeAt json.RawMessage `json:"last_probe_at"`
+			}
+			if err := json.Unmarshal(raw, &model); err != nil {
+				t.Fatal(err)
+			}
+			probeTimes[model.ID] = model.LastProbeAt
+		}
+		var checkedAt time.Time
+		if err := json.Unmarshal(probeTimes[verifiedIDs[0]], &checkedAt); err != nil || !checkedAt.Equal(latestProbe) {
+			t.Fatalf("last_probe_at should show the newer failed probe: got %v (%v), want %v", checkedAt, err, latestProbe)
+		}
+		if got := string(probeTimes[newModel]); got != "null" {
+			t.Fatalf("model without probe should have last_probe_at=null, got %q", got)
+		}
+	}
+	var keys struct {
+		Data []struct {
+			ID     string
+			Models []json.RawMessage
+		}
+	}
+	if err := json.Unmarshal([]byte(requireStatus(serve("GET", "/api/v1/student/api-keys", studentToken, ""), 200)), &keys); err != nil {
+		t.Fatal(err)
+	}
+	var keyModels []json.RawMessage
+	for _, key := range keys.Data {
+		if key.ID == keyID.String() {
+			keyModels = key.Models
+		}
+	}
+	assertProbeTimes(keyModels)
+	var plaza struct {
+		Data struct {
+			CommonModels []json.RawMessage `json:"common_models"`
+		}
+	}
+	if err := json.Unmarshal([]byte(requireStatus(serve("GET", "/api/v1/student/models", studentToken, ""), 200)), &plaza); err != nil {
+		t.Fatal(err)
+	}
+	assertProbeTimes(plaza.Data.CommonModels)
 	requireStatus(serve("POST", "/v1/responses", studentKey, responsesBody), 200)
 
-	requireStatus(serve("POST", "/api/v1/student/models", studentToken, `{"model_id":"claude-fixture-new"}`), 201)
-	readGrant(serve("POST", endpoint, studentToken, `{"model_ids":["claude-fixture-new"]}`))
-	wantList := []string{libraryModel, existingModel, newModel}
+	if got := readGrant(serve("POST", endpoint, studentToken, `{"model_ids":["claude-fixture-new"]}`)); !slices.Equal(got.AddedModelIDs, []string{libraryModel}) {
+		t.Fatalf("model outside the personal library could not be granted: %+v", got)
+	}
+	wantList := append([]string{libraryModel}, wantVisible...)
 	if got := modelList(); !slices.Equal(got, wantList) {
 		t.Fatalf("gateway list omitted a granted model: %v", got)
 	}
 	requireStatus(serve("POST", "/v1/messages", studentKey, `{"model":"claude-fixture-new","max_tokens":8,"messages":[{"role":"user","content":"offline fixture"}]}`), 200)
+	removeBody := `{"model_ids":["gpt-fixture-existing","gpt-fixture-new"]}`
+	requireStatus(serve("POST", removeEndpoint, token(otherStudent, "student"), removeBody), 404)
+	requireStatus(serve("POST", removeEndpoint, token(teacher, "teacher"), removeBody), 403)
+	requireStatus(serve("POST", removeEndpoint, studentToken, `{"model_ids":["gpt-fixture-existing"," "]}`), 400)
+	exec(`ALTER TABLE api_key_audits ADD CONSTRAINT fixture_fail_removal_audit
+		CHECK (action <> 'student_model_removed' OR comment <> 'gpt-fixture-new')`)
+	requireStatus(serve("POST", removeEndpoint, studentToken, removeBody), 503)
+	if got := readGateway("?include_unavailable=1"); len(got) != 11 || !slices.Equal(modelList(), wantList) {
+		t.Fatalf("audit failure partially removed authorizations: %v", got)
+	}
+	exec(`ALTER TABLE api_key_audits DROP CONSTRAINT fixture_fail_removal_audit`)
+	remove := func(body string) controlplane.StudentAPIKeyModelRemovalView {
+		t.Helper()
+		rec := serve("POST", removeEndpoint, studentToken, body)
+		var envelope struct {
+			Data controlplane.StudentAPIKeyModelRemovalView
+		}
+		if err := json.Unmarshal([]byte(requireStatus(rec, 200)), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		return envelope.Data
+	}
+	if got := remove(`{"model_ids":["GPT-fixture-existing"]}`); !slices.Equal(got.RemovedModelIDs, []string{existingModel}) || len(got.ModelIDs) != 10 {
+		t.Fatalf("legacy maintenance grant was not removed: %+v", got)
+	}
+	if got := remove(newBody); !slices.Equal(got.RemovedModelIDs, []string{newModel}) || len(got.ModelIDs) != 9 {
+		t.Fatalf("active grant was not removed: %+v", got)
+	}
+	if got := remove(removeBody); got.RemovedModelIDs == nil || len(got.RemovedModelIDs) != 0 || len(got.ModelIDs) != 9 {
+		t.Fatalf("removal retry was not idempotent: %+v", got)
+	}
+	if got := modelList(); !slices.Equal(got, append([]string{libraryModel}, verifiedIDs...)) {
+		t.Fatalf("removed grant still in gateway catalog: %v", got)
+	}
+	if got := readCodex("?include_unavailable=1"); !slices.Equal(got, legacyIDs[1:]) {
+		t.Fatalf("removed grant still in Codex diagnostics: %v", got)
+	}
+	if body := requireStatus(serve("POST", "/v1/responses", studentKey, responsesBody), 400); !strings.Contains(body, "model_not_allowed") {
+		t.Fatalf("removed model call did not fail authorization: %s", body)
+	}
 	if sends != 2 {
 		t.Fatalf("expected two calls to the in-memory upstream, got %d", sends)
 	}
 	keysBody := requireStatus(serve("GET", "/api/v1/student/api-keys", studentToken, ""), 200)
-	if !strings.Contains(keysBody, newModel) || !strings.Contains(keysBody, libraryModel) || strings.Contains(keysBody, studentKey) {
+	if !strings.Contains(keysBody, libraryModel) || strings.Contains(keysBody, studentKey) {
 		t.Fatal("student key list did not refresh models safely")
 	}
-	var auditCount, matchingAudits int
-	if err := db.QueryRowContext(ctx, `SELECT count(*), count(DISTINCT comment) FILTER (
-		WHERE actor_user_id=$2 AND action='student_model_added' AND comment IN ($3,$4) AND created_at IS NOT NULL
-	) FROM api_key_audits WHERE api_key_id=$1`, keyID, student, newModel, libraryModel).Scan(&auditCount, &matchingAudits); err != nil {
+	var auditCount, addedAudits, removedAudits int
+	if err := db.QueryRowContext(ctx, `SELECT count(*),
+		count(DISTINCT comment) FILTER (WHERE actor_user_id=$2 AND action='student_model_added' AND comment IN ($3,$4,$5) AND created_at IS NOT NULL),
+		count(DISTINCT comment) FILTER (WHERE actor_user_id=$2 AND action='student_model_removed' AND comment IN ($3,$4) AND created_at IS NOT NULL)
+		FROM api_key_audits WHERE api_key_id=$1`, keyID, student, existingModel, newModel, libraryModel).Scan(&auditCount, &addedAudits, &removedAudits); err != nil {
 		t.Fatal(err)
 	}
-	if auditCount != 2 || matchingAudits != 2 {
-		t.Fatalf("expected exactly two matching per-model audits, got %d of %d", matchingAudits, auditCount)
+	if auditCount != 5 || addedAudits != 3 || removedAudits != 2 {
+		t.Fatalf("incorrect per-model audits: total=%d added=%d removed=%d", auditCount, addedAudits, removedAudits)
 	}
 }

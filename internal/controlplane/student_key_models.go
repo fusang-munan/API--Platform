@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"sort"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
@@ -12,28 +13,32 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeyaudit"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeymodel"
 	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/organization"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/project"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/projectmember"
 )
 
 type StudentAPIKeyModelsView struct {
-	ModelIDs      []string `json:"model_ids"`
-	AddedModelIDs []string `json:"added_model_ids"`
+	ModelIDs      []string                    `json:"model_ids"`
+	AddedModelIDs []string                    `json:"added_model_ids"`
+	Warnings      []StudentAPIKeyModelWarning `json:"warnings"`
+}
+
+type StudentAPIKeyModelWarning struct {
+	ModelID string `json:"model_id"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type StudentAPIKeyModelRemovalView struct {
+	ModelIDs        []string `json:"model_ids"`
+	RemovedModelIDs []string `json:"removed_model_ids"`
 }
 
 func (s *Service) AddStudentAPIKeyModels(ctx context.Context, studentID, keyID uuid.UUID, modelIDs []string) (StudentAPIKeyModelsView, error) {
-	if len(modelIDs) < 1 || len(modelIDs) > 100 {
-		return StudentAPIKeyModelsView{}, domain.NewError(domain.CodeValidation, "model_ids must contain 1 to 100 items")
-	}
-	requested := make([]string, 0, len(modelIDs))
-	for _, value := range modelIDs {
-		modelID, err := normalizeSingleModelID(value)
-		if err != nil {
-			return StudentAPIKeyModelsView{}, err
-		}
-		requested = append(requested, modelID)
+	requested, err := normalizeStudentKeyModelIDs(modelIDs)
+	if err != nil {
+		return StudentAPIKeyModelsView{}, err
 	}
 
 	tx, err := s.db.Tx(ctx)
@@ -42,13 +47,9 @@ func (s *Service) AddStudentAPIKeyModels(ctx context.Context, studentID, keyID u
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Serialize grants for this key and wait for any concurrent Key status change.
-	key, err := tx.APIKey.Query().Where(apikey.IDEQ(keyID), apikey.OwnerUserIDEQ(studentID)).ForUpdate().Only(ctx)
-	if ent.IsNotFound(err) {
-		return StudentAPIKeyModelsView{}, domain.NewError(domain.CodeNotFound, "API key not found")
-	}
+	key, err := lockStudentAPIKey(ctx, tx, studentID, keyID)
 	if err != nil {
-		return StudentAPIKeyModelsView{}, domain.WrapError(domain.CodeDependencyUnavailable, "lock API key", err)
+		return StudentAPIKeyModelsView{}, err
 	}
 	if key.Status != apikey.StatusActive {
 		return StudentAPIKeyModelsView{}, domain.NewError(domain.CodeInvalidTransition, "API key must be active to add models")
@@ -66,13 +67,14 @@ func (s *Service) AddStudentAPIKeyModels(ctx context.Context, studentID, keyID u
 		return StudentAPIKeyModelsView{}, domain.NewError(domain.CodeInvalidTransition, "API key project access is inactive")
 	}
 
-	links, err := tx.APIKeyModel.Query().Where(apikeymodel.APIKeyIDEQ(keyID)).WithModel().All(ctx)
+	links, err := studentAPIKeyModelLinks(ctx, tx, keyID)
 	if err != nil {
-		return StudentAPIKeyModelsView{}, domain.WrapError(domain.CodeDependencyUnavailable, "list authorized API key models", err)
+		return StudentAPIKeyModelsView{}, err
 	}
 	view := StudentAPIKeyModelsView{
 		ModelIDs:      make([]string, 0, len(links)+len(requested)),
 		AddedModelIDs: []string{},
+		Warnings:      []StudentAPIKeyModelWarning{},
 	}
 	authorized := make(map[uuid.UUID]bool, len(links)+len(requested))
 	for _, link := range links {
@@ -82,7 +84,7 @@ func (s *Service) AddStudentAPIKeyModels(ctx context.Context, studentID, keyID u
 	for _, modelID := range requested {
 		row, err := tx.Model.Query().Where(entmodel.ModelIDEQ(modelID)).ForShare().Only(ctx)
 		if ent.IsNotFound(err) {
-			return StudentAPIKeyModelsView{}, studentKeyModelError(domain.CodeNotFound, "model is not available in your model plaza", modelID)
+			return StudentAPIKeyModelsView{}, studentKeyModelError(domain.CodeNotFound, "model not found in platform catalog", modelID)
 		}
 		if err != nil {
 			return StudentAPIKeyModelsView{}, domain.WrapError(domain.CodeDependencyUnavailable, "resolve key model", err)
@@ -90,8 +92,21 @@ func (s *Service) AddStudentAPIKeyModels(ctx context.Context, studentID, keyID u
 		if authorized[row.ID] {
 			continue
 		}
-		if err := s.validateStudentKeyModel(ctx, tx, studentID, row); err != nil {
-			return StudentAPIKeyModelsView{}, err
+		protocols, err := catalog.LoadPublishedProtocols(ctx, tx.Client(), []uuid.UUID{row.ID}, s.security)
+		if err != nil {
+			return StudentAPIKeyModelsView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query model availability", err)
+		}
+		availability := catalog.SummarizeModelAvailability(row.ModelID, row.Status, protocols[row.ID])
+		if availability.Availability == catalog.AvailabilityMaintenance {
+			return StudentAPIKeyModelsView{}, studentKeyModelError(domain.CodeModelNotReady, availability.AvailabilityReason, row.ModelID)
+		}
+		if issue := studentModelPublicationIssue(row); issue != "" {
+			return StudentAPIKeyModelsView{}, studentKeyModelError(domain.CodeModelNotReady, issue, row.ModelID)
+		}
+		if availability.Availability == catalog.AvailabilityUnverified {
+			view.Warnings = append(view.Warnings, StudentAPIKeyModelWarning{
+				ModelID: row.ModelID, Code: "MODEL_UNVERIFIED", Message: availability.AvailabilityReason,
+			})
 		}
 		if err := tx.APIKeyModel.Create().SetAPIKeyID(keyID).SetModelID(row.ID).Exec(ctx); err != nil {
 			return StudentAPIKeyModelsView{}, domain.WrapError(domain.CodeDependencyUnavailable, "authorize API key model", err)
@@ -111,40 +126,88 @@ func (s *Service) AddStudentAPIKeyModels(ctx context.Context, studentID, keyID u
 	return view, nil
 }
 
-func (s *Service) validateStudentKeyModel(ctx context.Context, tx *ent.Tx, studentID uuid.UUID, row *ent.Model) error {
-	if issue := studentModelPublicationIssue(row); issue != "" {
-		return studentKeyModelError(domain.CodeModelNotReady, issue, row.ModelID)
-	}
-	if !row.IsCommon {
-		inLibrary, err := studentHasModelInLibrary(ctx, tx.Client(), studentID, row.ID)
-		if err != nil {
-			return domain.WrapError(domain.CodeDependencyUnavailable, "verify student model library", err)
-		}
-		if !inLibrary {
-			return studentKeyModelError(domain.CodeNotFound, "model is not available in your model plaza", row.ModelID)
-		}
-	}
-	bindings, err := tx.ModelBinding.Query().Where(
-		modelbinding.ModelIDEQ(row.ID), modelbinding.StatusEQ(modelbinding.StatusActive),
-	).All(ctx)
+func (s *Service) RemoveStudentAPIKeyModels(ctx context.Context, studentID, keyID uuid.UUID, modelIDs []string) (StudentAPIKeyModelRemovalView, error) {
+	requested, err := normalizeStudentKeyModelIDs(modelIDs)
 	if err != nil {
-		return domain.WrapError(domain.CodeDependencyUnavailable, "query model routes", err)
+		return StudentAPIKeyModelRemovalView{}, err
 	}
-	ready := false
-	for _, binding := range bindings {
-		credential, _, err := catalog.ResolveBindingCredential(ctx, tx.Client(), s.security, binding)
+	remove := make(map[string]bool, len(requested))
+	for _, modelID := range requested {
+		remove[strings.ToLower(modelID)] = true
+	}
+
+	tx, err := s.db.Tx(ctx)
+	if err != nil {
+		return StudentAPIKeyModelRemovalView{}, domain.WrapError(domain.CodeDependencyUnavailable, "start key model removal", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := lockStudentAPIKey(ctx, tx, studentID, keyID); err != nil {
+		return StudentAPIKeyModelRemovalView{}, err
+	}
+	links, err := studentAPIKeyModelLinks(ctx, tx, keyID)
+	if err != nil {
+		return StudentAPIKeyModelRemovalView{}, err
+	}
+	view := StudentAPIKeyModelRemovalView{
+		ModelIDs:        make([]string, 0, len(links)),
+		RemovedModelIDs: []string{},
+	}
+	for _, link := range links {
+		modelID := link.Edges.Model.ModelID
+		if !remove[strings.ToLower(modelID)] {
+			view.ModelIDs = append(view.ModelIDs, modelID)
+			continue
+		}
+		if err := tx.APIKeyModel.DeleteOneID(link.ID).Exec(ctx); err != nil {
+			return StudentAPIKeyModelRemovalView{}, domain.WrapError(domain.CodeDependencyUnavailable, "remove API key model authorization", err)
+		}
+		if err := tx.APIKeyAudit.Create().SetAPIKeyID(keyID).SetActorUserID(studentID).
+			SetAction(apikeyaudit.ActionStudentModelRemoved).SetComment(modelID).Exec(ctx); err != nil {
+			return StudentAPIKeyModelRemovalView{}, domain.WrapError(domain.CodeDependencyUnavailable, "audit API key model removal", err)
+		}
+		view.RemovedModelIDs = append(view.RemovedModelIDs, modelID)
+	}
+	sort.Strings(view.ModelIDs)
+	sort.Strings(view.RemovedModelIDs)
+	if err := tx.Commit(); err != nil {
+		return StudentAPIKeyModelRemovalView{}, domain.WrapError(domain.CodeDependencyUnavailable, "commit key model removal", err)
+	}
+	return view, nil
+}
+
+func normalizeStudentKeyModelIDs(modelIDs []string) ([]string, error) {
+	if len(modelIDs) < 1 || len(modelIDs) > 100 {
+		return nil, domain.NewError(domain.CodeValidation, "model_ids must contain 1 to 100 items")
+	}
+	requested := make([]string, 0, len(modelIDs))
+	for _, value := range modelIDs {
+		modelID, err := normalizeSingleModelID(value)
 		if err != nil {
-			return domain.WrapError(domain.CodeDependencyUnavailable, "check model route", err)
+			return nil, err
 		}
-		if credential != "" {
-			ready = true
-			break
-		}
+		requested = append(requested, modelID)
 	}
-	if !ready {
-		return studentKeyModelError(domain.CodeModelNotReady, "model has no usable route for this API key", row.ModelID)
+	return requested, nil
+}
+
+func lockStudentAPIKey(ctx context.Context, tx *ent.Tx, studentID, keyID uuid.UUID) (*ent.APIKey, error) {
+	// Serialize model changes and coordinate with changes to the key's status.
+	key, err := tx.APIKey.Query().Where(apikey.IDEQ(keyID), apikey.OwnerUserIDEQ(studentID)).ForUpdate().Only(ctx)
+	if ent.IsNotFound(err) {
+		return nil, domain.NewError(domain.CodeNotFound, "API key not found")
 	}
-	return nil
+	if err != nil {
+		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "lock API key", err)
+	}
+	return key, nil
+}
+
+func studentAPIKeyModelLinks(ctx context.Context, tx *ent.Tx, keyID uuid.UUID) ([]*ent.APIKeyModel, error) {
+	links, err := tx.APIKeyModel.Query().Where(apikeymodel.APIKeyIDEQ(keyID)).WithModel().All(ctx)
+	if err != nil {
+		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list authorized API key models", err)
+	}
+	return links, nil
 }
 
 func studentKeyModelError(code, message, modelID string) error {

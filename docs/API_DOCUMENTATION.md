@@ -2,7 +2,7 @@
 
 ## 1. 文档范围与状态
 
-额度设置以千分之一积分为单位。从 `0.10.0` 开始，北辰用量和调用金额返回精确十进制字符串，可能超过三位小数。待核账调用的状态值为 `pending_review`，计入已扣金额的部分为零。usage/call/input DTO 使用 snake_case。学生申请、导师 approve、老师 approve 的 `requested_monthly_credits` / `monthly_credits` 均为必填字段。
+额度设置以千分之一积分为单位。从 `0.10.0` 开始，北辰用量和调用金额返回精确十进制字符串，可能超过三位小数。待核账调用的状态值为 `pending_review`，计入已扣金额的部分为零。usage/call/input DTO 使用 snake_case。学生申请必填 `requested_monthly_credits`。审批可沿用已有成员额度，首次分配额度时需提供正数 `monthly_credits`。
 
 导师项目用量响应同时返回顶层 `free_models` 项目汇总和 `members[].free_models` 成员明细；两者的每个模型均包含 `id`、`name`、固定 `credits: "0.000"` 与 `calls`。同一模型的项目 `calls` 必须等于全部成员对应 `calls` 之和。
 
@@ -253,11 +253,12 @@ data: {"revision":"01K2..."}
 | GET | `/api/v1/student/api-keys` | 列出自己的申请和 Key |
 | GET | `/api/v1/student/api-keys/{api_key_id}` | 查看自己的审核详情与进度 |
 | POST | `/api/v1/student/api-keys/{api_key_id}/models` | 为自己的生效 Key 添加已开放的模型 |
+| POST | `/api/v1/student/api-keys/{api_key_id}/models/remove` | 移除自己 Key 上的模型授权 |
 | POST | `/api/v1/student/api-keys/{api_key_id}/claim` | 一次性领取已批准 Key |
 
-组织和项目列表不要求学生已是成员。项目没有导师或已停用时仍返回并由界面禁选；无导师项目提交返回 `409 PROJECT_HAS_NO_MENTOR`，停用项目提交返回资源不存在。
+组织和项目列表可供学生浏览。项目列表返回真实状态和 `has_mentor`。提交申请时组织和项目须为 ACTIVE，项目须属于该组织。
 
-模型广场将预置模型与学生个人模型库去重展示。新模型须已启用、已有正数倍率且有可用线路，才出现在广场及目录搜索结果。目录搜索选中的非预置模型可通过 `POST /api/v1/student/models` 加入个人模型库。
+模型广场将预置模型与学生个人模型库去重展示。广场及目录搜索展示启用、有正数倍率且已配置线路的模型。目录搜索选中的非预置模型可通过 `POST /api/v1/student/models` 收藏。
 
 提交申请：
 
@@ -266,13 +267,12 @@ data: {"revision":"01K2..."}
   "name": "research-key",
   "organization_id": "uuid",
   "project_id": "uuid",
-  "models": [{"model_id":"gpt-4.1-mini"},{"model_id":"configured-lab-model"}]
+  "requested_monthly_credits": "20.00"
 }
 ```
 
-- `models` 接受 1 至 100 个模型引用，按公开模型 ID 去重。选用教师已开放且当前学生可见的模型，平台模型配置决定显示名称及调用线路。
-- 服务端校验项目确实属于 `organization_id`，但只持久化 `project_id`，避免组织归属冗余。
-- 创建申请与 `api_key_models` 在同一个事务完成。
+- 旧客户端可继续发送 `models`，服务端忽略该字段。新申请的模型授权为空。
+- 服务端校验组织归属并存储 `project_id`。
 - 同一学生进行中或生效 Key 名称大小写不敏感唯一；`rejected/revoked` 后可复用。
 
 创建成功返回 `201 Created`：
@@ -286,7 +286,7 @@ data: {"revision":"01K2..."}
     "progress": {"current":"mentor_review","completed_steps":["submitted"]},
     "organization": {"id":"uuid","name":"AI Lab"},
     "project": {"id":"uuid","name":"Research Assistant"},
-    "models": [{"model_id":"gpt-4.1-mini","status":"active"}],
+    "models": [],
     "key_prefix": null,
     "claimed_at": null,
     "created_at": "2026-08-18T09:30:00Z"
@@ -310,21 +310,25 @@ data: {"revision":"01K2..."}
 }
 ```
 
-重复领取返回 `409 KEY_ALREADY_CLAIMED`，不会再次返回明文。老师批准事务会幂等创建学生的组织和项目成员关系；Key 撤销不移除这些关系。
+重复领取返回 `409 KEY_ALREADY_CLAIMED`。负责导师批准时自动建立学生的组织和项目成员关系。Key 停用后仍保有成员关系。
 
-### 5.1 给生效 Key 添加模型
+### 5.1 查看和修改 Key 的模型授权
 
-`POST /api/v1/student/api-keys/{api_key_id}/models` 接受 `{"model_ids":["gpt-4.1-mini"]}`。数组每次提交 1 至 100 个公开模型 ID。只有本人持有的 `active` Key 可操作，所属组织、项目和学生的项目访问资格须有效。每个新模型须为预置模型或已加入该学生的模型库，由教师启用，已有报价，并具备至少一条网关当前可用的线路。
+Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场条目都返回 `protocols`、`available_protocols`、`recommended_protocol`、`probe_state`、`availability`、`availability_reason` 和 `last_probe_at`。`protocols` 是已配置且凭据有效的协议，`available_protocols` 是最近探活通过的协议。`availability` 为 `available`、`unverified` 或 `maintenance`，与网关的判断一致。`last_probe_at` 是当前线路最近一次探活的 UTC 时间，含失败结果，缺少有效探活记录时为 `null`。学生目录搜索在 `raw_entry` 中返回这些状态字段。
 
-成功返回 HTTP 200，`data.model_ids` 是当前 Key 的完整授权列表，`data.added_model_ids` 是本次新增的模型 ID 数组。已授权模型重复提交时不产生新记录，数组可以为空。整批新增授权和审计一并提交。事务提交后，原 Key 的下一次 `GET /v1/models` 和相应协议的调用直接读取新授权。
+`POST /api/v1/student/api-keys/{api_key_id}/models` 接受 `{"model_ids":["gpt-4.1-mini"]}`，每批 1 至 100 个公开模型 ID。添加要求本人的 `active` Key、有效的项目访问权限及模型报价。已有线路且待验证的模型可新增授权；维护中的模型返回 `MODEL_NOT_READY`。收藏与授权各自独立。
+
+添加返回 HTTP 200。 `data.model_ids` 是当前完整授权列表，`data.added_model_ids` 是实际新增的模型。每个新加入的待验证模型在 `data.warnings` 中有一项 `{"model_id":"gpt-4.1-mini","code":"MODEL_UNVERIFIED","message":"已有绑定线路，当前还没有通过探活的协议。"}`。
+
+`POST /api/v1/student/api-keys/{api_key_id}/models/remove` 接受同样的请求体。学生可移除自己 Key 的有效或历史授权，包括维护中的模型。HTTP 200 返回完整的 `data.model_ids` 和本次实际移除的 `data.removed_model_ids`。重复添加和重复移除返回空的变更数组。整批关联与审计写入同时提交或回滚，原 Key 的下一次网关请求立即读取更新后的授权。
 
 | HTTP 状态 | 错误码 | 含义 |
 | --- | --- | --- |
 | 400 | `VALIDATION_ERROR` | Key ID 或请求体无效 |
 | 403 | `FORBIDDEN` | 当前账号没有学生接口权限 |
-| 404 | `RESOURCE_NOT_FOUND` | Key 不存在或不属于本人，或模型不在本人广场 |
-| 409 | `INVALID_STATE_TRANSITION` | Key 尚未生效或项目访问资格已失效 |
-| 409 | `MODEL_NOT_READY` | 模型未启用、缺报价或暂无可用线路。响应给出具体原因和相关模型 ID |
+| 404 | `RESOURCE_NOT_FOUND` | Key 不存在或不属于本人，或待添加模型不在平台目录 |
+| 409 | `INVALID_STATE_TRANSITION` | 添加模型时 Key 尚未生效或项目访问资格已失效 |
+| 409 | `MODEL_NOT_READY` | 新增授权的模型处于维护中或缺少报价，响应提供原因和模型 ID |
 
 ## 6. 导师接口
 
@@ -338,8 +342,8 @@ data: {"revision":"01K2..."}
 | GET | `/api/v1/mentor/project-applications` | 查看自己的项目申请历史 |
 | GET | `/api/v1/mentor/api-key-reviews` | 列出负责项目中待初审申请 |
 | GET | `/api/v1/mentor/api-key-reviews/{api_key_id}` | 查看待初审申请详情 |
-| POST | `/api/v1/mentor/api-key-reviews/{api_key_id}/approve` | 初审通过 |
-| POST | `/api/v1/mentor/api-key-reviews/{api_key_id}/reject` | 初审驳回 |
+| POST | `/api/v1/mentor/api-key-reviews/{api_key_id}/approve` | 批准申请并分配项目额度 |
+| POST | `/api/v1/mentor/api-key-reviews/{api_key_id}/reject` | 驳回申请 |
 | GET | `/api/v1/mentor/projects/{project_id}/api-keys` | 列出负责项目的 ACTIVE Key |
 | POST | `/api/v1/mentor/api-keys/{api_key_id}/revoke` | 撤销负责项目的 ACTIVE Key |
 
@@ -351,9 +355,9 @@ data: {"revision":"01K2..."}
 
 只能申请导师所属组织中的 ACTIVE 项目；同项目已有负责关系或 pending 申请时返回 `409 INVALID_STATE_TRANSITION`。
 
-初审列表和详情展示申请学生的 `id/name/email`、组织、项目、申请模型及创建时间，不返回 Key hash。任一负责导师可对 `pending_mentor` 申请执行首次有效决策；并发后续请求返回 `409 INVALID_STATE_TRANSITION`。
+审核列表和详情展示申请学生的 `id/name/email`、组织、项目、额度及创建时间。任一负责导师可处理 `pending_mentor` 申请。并发后续请求返回 `409 INVALID_STATE_TRANSITION`。
 
-通过请求可省略 body，或传 `{"comment":"optional"}`。驳回和撤销必须传非空 `{"comment":"reason"}`。撤销不会移除学生组织或项目成员关系。
+通过请求接受 `{"monthly_credits":"20.00","comment":"optional"}`。允许批准零模型申请，事务校验项目和额度，写入成员关系、额度和审核记录，再切换状态为 `approved`。依赖失败时返回 `503 DEPENDENCY_UNAVAILABLE`，详情含 `{"operation":"api_key_approval","state_changed":false}`。驳回和撤销须提供原因。
 
 ## 7. 老师接口
 
@@ -413,10 +417,6 @@ data: {"revision":"01K2..."}
 | 抓取北辰官网目录 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/crawl` | 手动更新官网目录，返回本轮抓取摘要 |
 | 北辰校内试算价 | PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/price` | 指定模型手动设价或恢复跟随 |
 | 北辰报价或账单导入 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/import` | 按凭据导入受支持的 CSV |
-| Key 终审 | GET | `/api/v1/teacher/api-key-reviews` | 只列出 `pending_teacher` 摘要 |
-| Key 终审 | GET | `/api/v1/teacher/api-key-reviews/{api_key_id}` | 待终审摘要详情 |
-| Key 终审 | POST | `/api/v1/teacher/api-key-reviews/{api_key_id}/approve` | 终审通过并自动加入成员关系 |
-| Key 终审 | POST | `/api/v1/teacher/api-key-reviews/{api_key_id}/reject` | 终审驳回，原因必填 |
 
 首期不提供任何 DELETE 接口。资源通过 `status=inactive/disabled` 停用。
 
@@ -649,15 +649,7 @@ data: {"revision":"01K2..."}
 
 同一模型需要支持多个协议时，应分别创建对应 adapter 的 Binding；网关不会在协议之间自动转换请求或响应。
 
-老师模型列表的集合是所有 `models`，即平台用户曾申请模型的大小写不敏感去重并集加老师主动添加的模型；不返回申请次数或申请用户身份。
-
-学生首次申请 Key 时从自己的模型广场选取已开放的模型。领到生效 Key 后，可以在同一广场添加教师后来启用的模型。
-
-### 7.3 Key 终审可见范围
-
-老师只能读取 `pending_teacher` 申请。摘要包含申请学生的 `name/email`、组织、项目、模型状态和导师审核记录；不包含项目成员列表、历史 ACTIVE Key 或 Key hash。
-
-终审通过请求可省略 body，或传 `{"comment":"optional"}`。通过前必须再次校验全部模型及 ACTIVE binding；不满足时返回 `409 MODEL_NOT_READY` 和未就绪 `model_ids`。通过事务幂等创建学生的组织与项目成员关系，追加审核记录，并转为 `approved`。事务依赖失败返回 `503 DEPENDENCY_UNAVAILABLE`，`details` 固定包含 `{"operation":"api_key_approval","state_changed":false}`，表示本次终审已完整回滚；前端必须同时展示 `request_id` 供管理员定位日志。
+老师负责配置平台模型和绑定。学生领取 Key 后可以给原 Key 添加已开放的模型。
 
 ## 8. 网关 API
 
@@ -668,6 +660,7 @@ data: {"revision":"01K2..."}
 | 协议 | 方法 | 路由 | 请求形态 |
 | --- | --- | --- | --- |
 | OpenAI | GET | `/v1/models` | JSON |
+| Codex | GET | `/v1/codex/model_catalog` | Codex 模型目录 JSON |
 | OpenAI | POST | `/v1/chat/completions` | JSON，支持 `stream=true` SSE |
 | OpenAI | POST | `/v1/completions` | JSON，支持 `stream=true` SSE |
 | OpenAI | POST/WS | `/v1/responses` | JSON SSE 或 Responses WebSocket；Codex CLI `response.create` 原样透传并改写 model |
@@ -715,7 +708,7 @@ data: {"revision":"01K2..."}
 - Realtime 使用 `Authorization` Header；浏览器无法设置 Header 时可使用标准 `Sec-WebSocket-Protocol` 承载凭据，不接受查询参数中的 API Key。
 - Responses WebSocket 使用同一个 `/v1/responses`，在首个 `response.create` frame 中提取公开 model 并改写为上游 model；`OpenAI-Beta`、Codex metadata Header、`previous_response_id`、`prompt_cache_key`、加密 reasoning/compaction item 和未知字段均透明保留。
 - Key 必须为 `active`，所请求 `model` 必须位于 `api_key_models` 白名单，模型、binding 和 provider 均须为 `active`。
-- `/v1/models` 直接读取当前 Key 的完整授权列表，返回 `Cache-Control: no-store`。列表包含已授权的 Claude 模型。调用所用协议须有对应的可用线路；Codex 专用目录通过 `/v1/codex/model_catalog` 获取。
+- `/v1/models` 和 `/v1/codex/model_catalog` 请求时读取当前 Key 授权，并返回 `Cache-Control: no-store`。默认保留 `available` 和 `unverified`，加 `?include_unavailable=1` 可查询已授权的 `maintenance` 模型。`/v1/models` 包含已授权的 Claude 模型并返回完整协议与状态字段。Codex 目录沿用其客户端格式和模型族筛选。
 
 网关按模型倍率执行月度 credit 额度检查与调用记录；目录查询、视频状态查询和内容下载不计费。
 

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	entsql "entgo.io/ent/dialect/sql"
 	"github.com/google/uuid"
+	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
 	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
@@ -36,9 +38,9 @@ const publishedProtocolRouteSQL = `(
  ORDER BY c.id LIMIT 1
 ) AS route_evidence`
 
-// LoadPublishedProtocols reads evidence only for the already authorized school
-// model IDs. The optional validator only sees encrypted credentials.
-func LoadPublishedProtocols(ctx context.Context, client *ent.Client, modelIDs []uuid.UUID, credentialUsable func([]byte) bool) (map[uuid.UUID][]ProtocolCapability, error) {
+// LoadPublishedProtocols reads stored evidence for the supplied school model IDs.
+// Only routes with credentials that the gateway can decrypt are included.
+func LoadPublishedProtocols(ctx context.Context, client *ent.Client, modelIDs []uuid.UUID, manager *security.Manager) (map[uuid.UUID][]ProtocolCapability, error) {
 	result := make(map[uuid.UUID][]ProtocolCapability)
 	if len(modelIDs) == 0 {
 		return result, nil
@@ -76,7 +78,8 @@ func LoadPublishedProtocols(ctx context.Context, client *ent.Client, modelIDs []
 		}
 		valid, checked := usable[route.CredentialID]
 		if !checked {
-			valid = len(route.Ciphertext) > 0 && (credentialUsable == nil || credentialUsable(route.Ciphertext))
+			clear, err := manager.DecryptCredential(route.Ciphertext)
+			valid = err == nil && strings.TrimSpace(clear) != ""
 			usable[route.CredentialID] = valid
 		}
 		if valid {

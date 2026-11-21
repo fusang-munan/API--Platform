@@ -41,7 +41,14 @@ const baseUsage = {
 
 function mountUsage(payload: StudentUsagePayload) {
   vi.mocked(studentAPI.usage).mockResolvedValue(payload)
-  return mount(StudentUsage, { global: { stubs: { CreditDonut: true } } })
+  return mount(StudentUsage, {
+    global: {
+      stubs: {
+        CreditDonut: true,
+        RouterLink: { props: ['to'], template: '<a :href="to.name" data-testid="usage-model-plaza-link"><slot/></a>' },
+      },
+    },
+  })
 }
 
 function stat(wrapper: ReturnType<typeof mountUsage>, name: string) {
@@ -74,6 +81,17 @@ describe('StudentUsage', () => {
     expect(rows[0].text()).toContain('1,234')
     expect(rows[0].text()).toContain('25%')
     expect(rows[1].findAll('td').map(cell => cell.text())).toEqual(['0', '—', '—'])
+    wrapper.unmount()
+  })
+
+  it('points students to the model plaza to add models to the current key', async () => {
+    const wrapper = mountUsage(baseUsage)
+    await flushPromises()
+
+    const link = wrapper.get('[data-testid="usage-model-plaza-link"]')
+    expect(link.attributes('href')).toBe('student-models')
+    expect(link.text()).toBe('到模型广场把模型加入当前 Key')
+    expect(wrapper.text()).not.toContain('重新申领')
     wrapper.unmount()
   })
 
