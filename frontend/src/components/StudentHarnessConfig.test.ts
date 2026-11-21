@@ -26,6 +26,9 @@ describe('StudentHarnessConfig', () => {
       },
     })
     expect(wrapper.text()).toContain('没有满足协议')
+    expect(wrapper.text()).toContain('请到模型广场把需要的模型加入当前 Key')
+    expect(wrapper.text()).toContain('这里只显示当前 Key 已加入的模型')
+    expect(wrapper.text()).not.toContain('重新申领')
     expect(wrapper.text()).not.toContain('一键配置 Codex')
     expect(wrapper.text()).not.toContain('一键配置 Claude Code')
     wrapper.unmount()

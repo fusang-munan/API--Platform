@@ -11,7 +11,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/projectmember"
 )
 
-// FinalizeKeyApproval validates routing, allocates quota, and moves a key from
+// FinalizeKeyApproval allocates project quota and moves a key from
 // pending_mentor to approved. Only responsible project mentors may call this.
 func (s *Service) FinalizeKeyApproval(ctx context.Context, mentorID, keyID uuid.UUID, quota int64, comment string) (uuid.UUID, error) {
 	if quota < 0 || quota > domain.MaxCreditMilli {

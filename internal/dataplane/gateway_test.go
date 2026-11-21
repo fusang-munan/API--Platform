@@ -180,7 +180,7 @@ func TestGatewayErrorMessagesGiveChineseNextStep(t *testing.T) {
 		want   string
 	}{
 		{http.StatusUnauthorized, "invalid_api_key", "申请密钥"},
-		{http.StatusForbidden, "forbidden", "重新申领 Key"},
+		{http.StatusForbidden, "forbidden", "核对该模型的授权"},
 		{http.StatusNotFound, "resource_not_found", "/v1"},
 		{http.StatusBadRequest, "model_not_allowed", "模型广场"},
 	}

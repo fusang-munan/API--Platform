@@ -75,9 +75,9 @@ npm run build
 ### 限额、调用日志与输入监控
 
 - 学生 `/student/usage`、导师项目用量、老师项目花费必须通过真实 HTTP JSON envelope 验证 snake_case 字段，禁止只构造前端对象。Go usage DTO 缺少 `json` tag 时，接口会返回 `ID/Quota/Models`，前端按 `id/quota/models` 读取后表现为空白或 `undefined.map`。
-- 模型广场必须展示 `credit_multiplier`；老师模型配置在已有倍率被改为不同值时必须要求 `multiplier_change_reason`，首次从 NULL 设置默认倍率不要求原因且不写倍率变更审计。Key 申请、导师初审、老师终审分别验证三阶段额度字段。
+- 模型广场展示 `credit_multiplier`。老师修改已有倍率时要求 `multiplier_change_reason`，首次设置默认倍率时可省略原因。Key 申请验证申请额度，导师批准验证项目分配额度。
 - 老师模型向导只通过顶部节点导航：填写模型 ID 和名称后第二节点解锁，第一步不显示“下一步”。进入第二步必须立即显示一次“一键填充”询问；选择否后保留描述、类别、文本模态、128K/128K/4K 容量和 1.00x 倍率默认值。选择是时模型 ID 与上游模型名默认来自第一步；Probe 必须自动请求 `/v1/models`，将真实 description、tags、model type、endpoint types 和按优先级推断的容量写回第二步，成功后关闭子弹窗且不渲染响应 body。Binding 加号和编辑按钮必须打开 Portal 居中弹窗。
-- 老师终审成功路径必须验证项目月 bucket 更新同时绑定 `project_id` 与当前上海月份；SQL 占位符与实参数量不一致时，pgx 会在事务内拒绝执行并完整回滚。前端遇到终审依赖错误时必须关闭确认弹窗，明确说明额度和申请状态未变更，并展示响应 `request_id` 供管理员排查。
+- 导师批准的测试验证项目月 bucket 更新同时绑定 `project_id` 与当前上海月份。SQL 参数数量不一致时 pgx 拒绝执行并回滚。接口返回的 `request_id` 可用于定位该事务的错误。
 - 调用日志无数据时先区分真实空集和渲染失败：检查 `/mentor/call-logs` 的 `items`，再通过 fake upstream 发一笔测试调用，确认 `gateway_calls`、`monthly_usage_cube` 和适用协议的 `monitored_inputs` 同时更新。
 - 生产 Playwright E2E 仅使用专用测试身份与测试 Key；凭据不得写入源码、报告或截图。额度/倍率写操作只针对专用测试资源，并保留永久审计。
 - 导师项目详情的视觉验收必须检查：两张环图都有可见颜色图例；额度分配按成员的全部 Key 额度之和分段；成员明细采用横向卡片，每成员一张，左侧为成员身份，中间纵向排列多个 Key 的额度轨道/已用填充/右侧百分比，右侧显示该成员的 0x 免费模型请求次数表并保留 Key 状态；逐模型验证所有成员 `free_models.calls` 之和等于项目顶层 `free_models.calls`；窄屏应依次降为两列和单列。老师项目花费必须是按项目分行的表格，行内提供 mini-donut，展开后显示按模型拆分且带可见图例的大图。学生个人用量的每个 Key 环图也必须有可见模型/剩余额度图例。
@@ -172,20 +172,20 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 1. 学生和导师分别完成验证码注册，老师由 bootstrap 或邀请激活。
 2. 老师创建组织和项目，并将导师加入组织。
 3. 导师申请项目，老师批准。
-4. 学生选择组织、项目和至少一个模型申请 Key。
-5. 导师初审后，状态从 `pending_mentor` 变为 `pending_teacher`。
-6. 老师确保所有模型和 binding ACTIVE 后终审，状态变为 `approved`。
+4. 学生填写组织、项目、Key 名称和申请额度，提交零模型申请。
+5. 负责该项目的导师批准后，状态从 `pending_mentor` 变为 `approved`。
+6. 核对该项目的当月额度分配和审批审计。
 7. 确认学生已自动加入组织和项目。
 8. 学生首次领取，取得一次性明文并转为 `active`；重复领取必须失败。
-9. 使用 Key 调用 `GET /v1/models` 和一个允许模型；调用白名单外模型必须失败。
+9. 使用 Key 调用 `GET /v1/models` 确认目录为空。添加模型后用假上游验证原 Key 可调用；移除后验证原 Key 无法再调用该模型。
 10. 导师撤销 Key，后续网关调用必须失败，但学生成员关系保留。
 
 ### 2.7 控制台人工验收
 
 1. 分别用学生、导师、老师账号登录，确认默认落点、侧栏权限、手机导航抽屉和退出登录；导师从“审核密钥”点击“项目管理”后必须保留完整工作台并显示项目列表或明确空状态。
 2. 学生选择组织后确认停用/无导师项目可见但禁选；切换组织确认会清空后续草稿。
-3. 没有生效 Key 时，从模型广场点击「申请密钥」，在首次申请中选择广场模型。
-4. 导师在最早优先队列完成通过和带原因驳回；老师检查逐模型路由后终审。
+3. 没有生效 Key 时，从模型广场进入申请，填写组织、项目、Key 名称和额度。
+4. 负责导师批准零模型申请，并验证带原因的驳回。
 5. 学生观察 SSE 状态变化：只有已有 Key 的状态真正变化时自动打开该 Key 详情；首次进入、普通刷新、SSE 重连和新提交不会自动弹窗。领取时验证未复制关闭二次确认、复制失败手动选择及关闭后 secret 清空。
 6. 用生效 Key 在模型广场点击「添加到我的 Key」，核对该模型显示「已同步」，并出现在「申请密钥」页的「已授权模型」列表。选择不同项目的 Key 时，核对授权列表与所选 Key 对应。
 6. 老师验证导师候选搜索分页、组织/项目启停、凭据独立替换、模型 nullable 数值和 Binding 编辑。
@@ -194,12 +194,13 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 ## 3. 常见问题矩阵
 
-### 学生 Key 新增模型授权
+### 学生 Key 模型授权
 
-设置 `NEBULA_TEST_POSTGRES` 为隔离的本机测试库，运行 `go test ./internal/dataplane -run TestStudentKeyModelAuthorizationPostgres -count=1`。该测试使用假上游，覆盖原 Key 即时列出与调用新增模型、重复及并发添加、审计、整批回滚和越权拒绝。前端运行 `npm test -- StudentModels StudentKeys`，覆盖无生效 Key 时的申请入口、同步、失败原因和重试。
+设置 `NEBULA_TEST_POSTGRES` 为隔离的本机测试库，运行 `go test ./internal/dataplane ./internal/infrastructure/db -run 'TestStudentKey(ApplicationWithoutModels|ModelAuthorization|ModelRemovalMigration)Postgres' -count=1`。测试覆盖零模型申请、批准和领取，九条旧授权中两条进入默认目录，待验证告警、原 Key 即时生效、越权拒绝、审计失败回滚及迁移保留历史。Key 列表和模型广场都验证最近探活时间，包括探活失败和 `null`。调用使用假上游。
 
-- 提示没有可用线路时，核对模型状态、报价，以及至少一条线路的供应商、凭据和目录条目是否有效。
-- 已加入广场但 Key 同步失败时，按错误原因处理后对同一 Key 重试。若客户端仍显示旧列表，用同一把 Key 重读 `GET /v1/models` 核对服务端授权。
+- 模型显示维护中时，核对模型状态、供应商、凭据、目录条目和最近探活结果。
+- 用同一把 Key 分别请求 `GET /v1/models` 和 `GET /v1/models?include_unavailable=1`。前者是客户端默认目录，后者可核对维护中的授权。
+- 并行运行全量 PostgreSQL 用例时，如果出现 `citext` 类型不存在或 `pg_extension_name_index` 冲突，先在隔离测试库的 `public` schema 执行 `CREATE EXTENSION IF NOT EXISTS citext WITH SCHEMA public`，并以相同方式启用 `pg_trgm` 和 `pgcrypto`。再运行 `go test ./...`。
 
 ### 北辰接入验收
 
@@ -396,7 +397,7 @@ ORDER BY j.channel;
 | SSE 已连接但状态不更新 | Redis stream 不可用、事件过期或客户端只监听未刷新 REST | 恢复 Redis并重新拉取权威 REST 状态 | 查看 heartbeat、Last-Event-ID 和用户 stream；事件不是权威数据 |
 | 学生看得到项目但提交失败 | 项目没有 ACTIVE 负责导师 | 导师申请该项目并由老师批准 | 查看项目 `has_mentor` 与 ACTIVE project member |
 | 申请提示 Key 名称冲突 | 同一学生已有同名进行中/生效 Key，citext 不区分大小写 | 更换名称，或等待原申请进入 rejected/revoked | 查询自己的 Key 列表，核对状态和大小写 |
-| 自定义模型提交后无法终审 | 新模型处于 `pending_configuration` | 老师补全模型、至少一个 ACTIVE binding 和 ACTIVE provider | 终审返回的 `model_ids` 是未就绪集合 |
+| 添加模型返回 `MODEL_NOT_READY` | 模型暂停发布、缺报价、没有有效线路或线路探活均失败 | 根据响应原因检查模型配置、绑定和探活结果 | 通过 `details.model_id` 定位模型 |
 | 首次保存模型默认倍率返回 `multiplier change reason is required` | 后端把 NULL -> 默认倍率误判为倍率变更 | 首次设置倍率不要求原因；只有已有倍率改为不同值时填写变更原因 | 用默认基础配置直接保存，应返回 200 并进入 Binding 节点 |
 | 老师新增模型搜不到 Matrix 候选 | `model-catalog` 未启动、`MATRIX_APIKEY` 缺失或最近同步失败 | 检查生产 worker 状态和日志；失败保留上次快照，不清表、不把目录暴露给学生 | `docker compose -p nebula-api -f compose.production.yaml ps model-catalog`；日志不得包含 API Key |
 | 一键配置拒绝测试地址 | 手写 Base URL 解析到 localhost、私网、链路本地或云元数据地址 | 使用公网 HTTP/HTTPS 上游，或先注册经审核的供应商 | 不得关闭连接阶段 DNS/IP 校验或允许重定向绕过 |
@@ -407,11 +408,11 @@ ORDER BY j.channel;
 | 学生“选择模型广场模型”点击右上角关闭后立即重开 | 搜索框用 `focus` 自动开窗，Dialog 关闭后恢复焦点触发同一事件 | 仅在用户点击搜索框时打开；焦点恢复不得改变 Dialog 状态 | `npm run test -- src/views/student/StudentKeys.test.ts`；Playwright 点击叉号并等待 300ms，页面应无 Dialog |
 | 导师看不到待审 Key | 导师不是目标项目的 ACTIVE 负责成员，或已被其他导师处理 | 完成项目申请，或刷新状态 | 查项目成员关系和 Key 当前状态；首个有效初审胜出 |
 | 导师/老师重复审批得到 409 | 条件更新阻止并发重复状态迁移 | 刷新详情，不要重复提交 | 检查审计时间线和当前状态，不要直接改数据库 |
-| 老师终审返回 `503 DEPENDENCY_UNAVAILABLE`，页面提示终审未完成 | 终审事务的数据库操作失败；曾出现项目月 bucket 更新 SQL 使用 `$1..$4` 但只传 3 个参数，pgx 报 `mismatched param and argument count` | 保持终审事务向 bucket 更新完整传入额度、时间、项目 ID 和月份；失败时事务必须回滚，修复后重新终审 | 从响应复制 `request_id`，在 backend 日志中按该 ID 定位真实错误；运行 `go test ./internal/usage -run TestApproveKeyBindsProjectBucketMonth` 和 `cd frontend; npm run test -- src/api/client.test.ts` |
+| 导师审批返回 `503 DEPENDENCY_UNAVAILABLE` | 审批事务的数据库操作失败，项目月 bucket 更新必须绑定额度、时间、项目 ID 和月份 | 查看响应的 `request_id` 对应日志，处理事务错误并重试 | 运行 `go test ./internal/usage -run TestApproveKeyBindsProjectBucketMonth` |
 | 老师驳回申请返回原因缺失 | 驳回请求没有填写非空审核意见；通过请求的审核意见可以省略 | 在驳回弹窗填写具体原因；通过时可以留空意见 | 期望错误码为 `REJECTION_REASON_REQUIRED`；通过请求空 body 应返回 `204` |
 | 老师审批导师项目申请提示导师关系异常 | 审批时发现导师未加入项目所属组织，或导师已经是项目成员；空 body 则可能是请求体解析错误 | `MENTOR_NOT_IN_ORGANIZATION`：在“组织管理”重新分配导师；`MENTOR_ALREADY_PROJECT_MEMBER`：无需重复审批并刷新列表 | 查看响应 `error.code`；核对 `organization_members`、`project_members` 和申请状态 |
 | 老师看不到 ACTIVE Key | 这是首期权限边界，不是数据丢失 | 由负责导师查看和撤销 | 老师接口只暴露 `pending_teacher` 摘要 |
-| 终审后学生未加入组织/项目 | 终审事务回滚或数据库约束失败 | 修复根因后重新执行合法终审；禁止手工只改 Key 状态 | 同时检查 Key、两张 member 表和 audit；四者必须原子一致 |
+| 批准申请后学生成员关系缺失 | 审批事务回滚或数据库约束失败 | 核对请求结果和事务错误，修复后重新批准 | 同时检查 Key、组织成员、项目成员和审计记录 |
 | 领取接口没有再次返回完整 Key | 明文只在首次领取返回一次 | 创建新申请，不支持找回 | 只能使用 prefix 定位；任何人都不应从数据库恢复明文 |
 | 领取时报 `KEY_ALREADY_CLAIMED` | Key 已是 ACTIVE 或并发请求已有一个成功 | 使用首次响应中的明文 | 检查 `claimed_at` 和 prefix，不要要求后台重显 |
 | 网关返回 invalid API key | Key 不存在、HMAC pepper 变化、状态非 ACTIVE | 使用正确 Key；恢复原 pepper 或重新申请 | 只记录 prefix；检查部署间 `API_KEY_HASH_PEPPER` 是否一致 |

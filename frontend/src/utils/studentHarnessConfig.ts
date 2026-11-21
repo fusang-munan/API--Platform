@@ -21,7 +21,7 @@ export const STUDENT_GATEWAY_ERROR_GUIDANCE = [
   {
     key: '403',
     title: '403 · Key 无权调用',
-    action: '确认使用的是本人 active Key；模型不在 Key 白名单时，到模型广场点「需重新申领 Key」。',
+    action: '确认使用的是本人 active Key；模型不在当前 Key 时，到模型广场把该模型加入当前 Key。',
   },
   {
     key: '404',
@@ -31,7 +31,7 @@ export const STUDENT_GATEWAY_ERROR_GUIDANCE = [
   {
     key: 'model_not_allowed',
     title: 'model_not_allowed · 当前 Key 未包含该模型',
-    action: '在模型广场该模型卡片点「需重新申领 Key」，撤回后按原审批额度重新申请。',
+    action: '到模型广场把该模型加入当前 Key，然后重新发起请求。',
   },
 ] as const
 

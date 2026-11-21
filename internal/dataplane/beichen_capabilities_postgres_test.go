@@ -153,9 +153,9 @@ func TestBeichenCapabilitiesAndGatewayPostgres(t *testing.T) {
 		Availability       string `json:"availability"`
 		AvailabilityReason string `json:"availability_reason"`
 	}
-	modelsList := func() map[string]modelItem {
+	modelsList := func(query string) map[string]modelItem {
 		t.Helper()
-		res := serve("GET", "/v1/models", studentKey, "", 200)
+		res := serve("GET", "/v1/models"+query, studentKey, "", 200)
 		var envelope struct{ Data []modelItem }
 		if err := json.Unmarshal(res.Body.Bytes(), &envelope); err != nil {
 			t.Fatal(err)
@@ -187,7 +187,7 @@ func TestBeichenCapabilitiesAndGatewayPostgres(t *testing.T) {
 		serve("GET", path, jwt(student, "student"), "", 403)
 		serve("GET", pathPrefix+"invalid/beichen/capabilities", teacherToken, "", 400)
 		serve("GET", pathPrefix+uuid.NewString()+"/beichen/capabilities", teacherToken, "", 404)
-		last := modelsList()
+		last := modelsList("")
 		if len(last) != 4 {
 			t.Fatalf("want only the four whitelisted models, got %v", last)
 		}
@@ -237,7 +237,7 @@ func TestBeichenCapabilitiesAndGatewayPostgres(t *testing.T) {
 		}
 		probe("anthropic", 403, "http_error")
 		probe("openai_compatible", 200, "")
-		row, model := readLine(claude.model), modelsList()[claude.model]
+		row, model := readLine(claude.model), modelsList("")[claude.model]
 		if row.RecommendedProtocol == nil || *row.RecommendedProtocol != "openai_compatible" ||
 			model.RecommendedProtocol == nil || *model.RecommendedProtocol != "openai_compatible" ||
 			!slices.Equal(row.AvailableProtocols, []string{"openai_compatible"}) || !slices.Equal(model.AvailableProtocols, row.AvailableProtocols) {
@@ -248,7 +248,10 @@ func TestBeichenCapabilitiesAndGatewayPostgres(t *testing.T) {
 			t.Fatalf("mismatch did not recommend passing Chat: %+v", mismatch)
 		}
 		probe("openai_compatible", 503, "http_error")
-		row, model = readLine(claude.model), modelsList()[claude.model]
+		if _, listed := modelsList("")[claude.model]; listed {
+			t.Fatal("maintenance model appeared in the default list")
+		}
+		row, model = readLine(claude.model), modelsList("?include_unavailable=1")[claude.model]
 		if row.Availability != "maintenance" || row.ProbeState != "failed" || row.RecommendedProtocol != nil ||
 			model.Availability != "maintenance" || model.RecommendedProtocol != nil || !strings.Contains(model.AvailabilityReason, "探活均失败") {
 			t.Fatalf("failed route disappeared or remained recommended: %+v %+v", row, model)
@@ -258,14 +261,14 @@ func TestBeichenCapabilitiesAndGatewayPostgres(t *testing.T) {
 			t.Fatalf("missing gateway maintenance reason: %+v", maintenance)
 		}
 		exec("UPDATE provider_credentials SET updated_at=clock_timestamp()+interval '1 millisecond' WHERE id=$1", claude.id)
-		row, model = readLine(claude.model), modelsList()[claude.model]
+		row, model = readLine(claude.model), modelsList("?include_unavailable=1")[claude.model]
 		if row.CatalogState != "catalog_unverified" || row.RecommendedProtocol != nil ||
 			model.RecommendedProtocol != nil || model.ProbeState != "not_applicable" {
 			t.Fatalf("rotated Key kept previous catalog or probe evidence: %+v %+v", row, model)
 		}
 		exec(`UPDATE provider_model_catalog k SET last_seen_at=c.updated_at
  FROM provider_credentials c WHERE k.credential_id=c.id AND c.id=$1`, claude.id)
-		row, model = readLine(claude.model), modelsList()[claude.model]
+		row, model = readLine(claude.model), modelsList("")[claude.model]
 		if row.ProbeState != "unprobed" || model.ProbeState != "unprobed" {
 			t.Fatalf("fresh catalog inherited a previous Key's probes: %+v %+v", row, model)
 		}

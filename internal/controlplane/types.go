@@ -1,11 +1,14 @@
 package controlplane
 
 import (
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 )
 
 type UserView struct {
@@ -52,6 +55,7 @@ type StudentModelPlazaView struct {
 }
 
 type ModelView struct {
+	*catalog.ModelAvailability
 	ModelID            string         `json:"model_id"`
 	DisplayName        string         `json:"display_name"`
 	Description        *string        `json:"description"`
@@ -75,6 +79,14 @@ type ModelView struct {
 	ResponsesReady     bool           `json:"responses_ready"`
 	CredentialID       string         `json:"credential_id,omitempty"`
 	CredentialLabel    string         `json:"credential_label,omitempty"`
+}
+
+func (view *ModelView) setAvailability(availability catalog.ModelAvailability) {
+	view.ModelAvailability = &availability
+	view.SupportedProtocols = availability.Protocols
+	view.RouteReady = len(availability.Protocols) > 0
+	view.AnthropicReady = slices.Contains(availability.Protocols, string(modelbinding.AdapterAnthropic))
+	view.ResponsesReady = slices.Contains(availability.Protocols, string(modelbinding.AdapterOpenaiResponses))
 }
 
 type MentorCandidateView struct {

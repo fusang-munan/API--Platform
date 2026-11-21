@@ -75,7 +75,7 @@ var (
 	APIKeyAuditsColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeUUID},
 		{Name: "created_at", Type: field.TypeTime},
-		{Name: "action", Type: field.TypeEnum, Enums: []string{"mentor_approved", "mentor_rejected", "teacher_approved", "teacher_rejected", "mentor_revoked", "mentor_deactivated", "mentor_activated", "student_withdrawn", "student_model_added"}},
+		{Name: "action", Type: field.TypeEnum, Enums: []string{"mentor_approved", "mentor_rejected", "teacher_approved", "teacher_rejected", "mentor_revoked", "mentor_deactivated", "mentor_activated", "student_withdrawn", "student_model_added", "student_model_removed"}},
 		{Name: "comment", Type: field.TypeString, Nullable: true, Size: 1000},
 		{Name: "api_key_id", Type: field.TypeUUID},
 		{Name: "actor_user_id", Type: field.TypeUUID},
@@ -1017,7 +1017,7 @@ func init() {
 		Table: "api_key_audits",
 	}
 	APIKeyAuditsTable.Annotation.Checks = map[string]string{
-		"api_key_audit_model_required":  "action <> 'student_model_added' OR (comment IS NOT NULL AND btrim(comment) <> '')",
+		"api_key_audit_model_required":  "action NOT IN ('student_model_added', 'student_model_removed') OR (comment IS NOT NULL AND btrim(comment) <> '')",
 		"api_key_audit_reason_required": "\n\t\t\t\taction NOT IN ('mentor_rejected', 'teacher_rejected', 'mentor_revoked')\n\t\t\t\tOR (comment IS NOT NULL AND btrim(comment) <> '')\n\t\t\t",
 	}
 	APIKeyModelsTable.ForeignKeys[0].RefTable = APIKeysTable

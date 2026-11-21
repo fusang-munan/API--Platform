@@ -139,7 +139,7 @@ async function copyText(value: string, message: string) {
     </a>
 
     <p v-if="!support.codex && !support.claude" class="student-harness-empty muted">
-      当前 Key 没有满足协议的 Codex 或 Claude Code 模型。请到模型广场查看是否标有「需重新申领 Key」，撤回后按原审批额度重新申请。
+      当前 Key 没有满足协议的 Codex 或 Claude Code 模型。请到模型广场把需要的模型加入当前 Key，加入后再回到这里配置。
     </p>
 
     <div class="student-harness-gateway">
@@ -269,7 +269,7 @@ async function copyText(value: string, message: string) {
 
     <section class="student-harness-help">
       <p class="student-harness-hint muted">
-        模型广场里标有「需重新申领 Key」的模型不在当前 Key 中。请先在模型广场撤回，并按原审批额度重新申请 Key；新 Key 生效后重新打开此面板。
+        这里只显示当前 Key 已加入的模型。需要别的模型时，到模型广场把模型加入当前 Key，再重新打开此面板。
       </p>
       <details>
         <summary>客户端报错时怎么处理</summary>

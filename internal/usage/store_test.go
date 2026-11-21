@@ -189,15 +189,12 @@ func TestApproveKeyBindsProjectBucketMonth(t *testing.T) {
 		WithArgs(keyID).
 		WillReturnRows(sqlmock.NewRows([]string{"project_id"}).AddRow(projectID))
 	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT monthly_credit_quota_milli FROM projects WHERE id=$1 FOR UPDATE`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT p.organization_id FROM projects p JOIN organizations o ON o.id=p.organization_id WHERE p.id=$1 AND p.status='active' AND o.status='active' FOR UPDATE OF p FOR SHARE OF o`)).
 		WithArgs(projectID).
-		WillReturnRows(sqlmock.NewRows([]string{"monthly_credit_quota_milli"}).AddRow(int64(20_000_000)))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT k.owner_user_id,p.organization_id FROM api_keys k JOIN projects p ON p.id=k.project_id WHERE k.id=$1 AND k.project_id=$2 AND k.status='pending_mentor' FOR UPDATE OF k`)).
+		WillReturnRows(sqlmock.NewRows([]string{"organization_id"}).AddRow(organizationID))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT owner_user_id FROM api_keys WHERE id=$1 AND project_id=$2 AND status='pending_mentor' FOR UPDATE`)).
 		WithArgs(keyID, projectID).
-		WillReturnRows(sqlmock.NewRows([]string{"owner_user_id", "organization_id"}).AddRow(ownerID, organizationID))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT m.model_id,m.status,m.credit_multiplier_milli,EXISTS(SELECT 1 FROM model_bindings b JOIN providers p ON p.id=b.provider_id WHERE b.model_id=m.id AND b.status='active' AND p.status='active') FROM api_key_models km JOIN models m ON m.id=km.model_id WHERE km.api_key_id=$1 ORDER BY m.id FOR UPDATE OF m`)).
-		WithArgs(keyID).
-		WillReturnRows(sqlmock.NewRows([]string{"model_id", "status", "credit_multiplier_milli", "routed"}).AddRow("gpt-5.6-sol", "active", int64(1000), true))
+		WillReturnRows(sqlmock.NewRows([]string{"owner_user_id"}).AddRow(ownerID))
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO project_month_credit_buckets`)).
 		WithArgs(projectID, month, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
