@@ -82,7 +82,7 @@ type panelQuote struct {
 var errPanelLoginRequired = errors.New("北辰渠道页要求登录")
 var errPanelEmpty = errors.New("北辰渠道页没有当前 Key 的有效模型报价")
 var errPanelGroupUnverified = errors.New("无法核实北辰 Key 当前所属分组")
-var errPanelGroupNotFound = errors.New("北辰面板找不到当前 Key 分组")
+var errPanelGroupNotFound = errors.New("北辰可用渠道未列出当前 Key 分组")
 var errPanelRulesConflict = errors.New("北辰面板与 Key 账单的分组倍率或高峰规则不一致")
 
 func (s *Service) fetchChannelQuote(ctx context.Context, access priceAccess, key string, info billingInfo, entries []catalog.ProviderEntry) panelQuote {

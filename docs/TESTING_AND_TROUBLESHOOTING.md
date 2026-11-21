@@ -226,7 +226,13 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 网页通过 `GET /api/v1/groups/rates` 在分组默认倍率之外显示当前账号的倍率。核对分组报价时同时比较两项。该请求失败时，目录会提示账户倍率待核实，历史保留上次已核实的版本。回归用例分别改变默认倍率、价格和个人倍率，并验证失败前后不会产生虚假的历史版本。
 
+若北辰有价而教师页显示缺价，运行 `go run ./cmd/beichen-crawl --fixture ./internal/beichen/testdata/website-price-details.json`。以 `sources[].price_complete` 确认官网报价，在 `base_token_prices_per_million` 查每百万 Token 的原价。`cache_write_price` 是 5 分钟缓存写入价，`cache_write_1h_price` 是 1 小时缓存写入价，`cache_read_price` 是缓存读取价。Claude 的 1 小时价为 `null`，对应未列单价。官网分组与 Key 分组不同时，到当前模型的「目录来源与分组」核对两个分组号。运行 `go test ./internal/beichen -run TestBeichenWebsitePriceDetails -count=1 -v` 与 `npm test -- BeichenSchoolModels` 验收原价、同组匹配和教师页展示。
+
 Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反推价，待核对」及观察时间。若报价缺失，先核对 `0058` 是否已应用、Key 是否仍属于 group 16，以及实际型号清单和当前倍率是否核实成功。用隔离的 PostgreSQL 运行 `go test ./internal/beichen -run '^TestBeichenDerivedPricesPostgres$' -count=1 -v`，回归两款 Claude 的自动结算、缓存缺价待核账、手动修正，以及官网固定价和分档价生效后的版本切换。
+
+若 Key 清单有 group 5 而渠道目录未列出该组，核对计费或型号清单的错误码。明确返回 `GROUP_NOT_ALLOWED` 时，模型行应显示「账号无 group 5 权限」，并保留分组名和倍率。Key 清单匹配成功但未绑定分组时显示「Key 分组不存在」。计费倍率已核实、官方价表缺失且没有适用流水证据的模型显示「官方价表缺失」。显示旧文案时先核对 `0059`，再查看同步后的分组状态和报价来源。
+
+在隔离测试库运行 `go test ./internal/beichen -run 'TestBeichen(GroupDenialError|BillingGroupDenialPostgres|DerivedPricesPostgres)$' -count=1 -v`。在 `frontend` 下运行 `npm run test -- src/views/teacher/BeichenSchoolModels.test.ts` 验证同样的模型行文案。两处测试使用预设响应。
 
 用 `go test ./cmd/beichen-crawl ./internal/beichen -run 'Test(BeichenCrawl|CrawlCommand|BeichenWebsiteDirectoryPostgres)' -count=1 -v` 复查退出码、完整计数、单平台损坏、空价与零价、教师别名和抓取记录入库。看到 `complete=false` 时，用 `failures[].path` 和 `reason` 定位错误。网页不可读时教师页上次抓取可显示 0，先前已保存的目录仍可用于查看。需要核对 Key 时加 `--match-db` 并设置 `DATABASE_URL`，`key_matching=not_checked` 表示本轮没有执行这项核对。`key_matching=failed` 时查看 `key_match_error`。
 

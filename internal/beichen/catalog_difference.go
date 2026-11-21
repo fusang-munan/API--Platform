@@ -37,6 +37,7 @@ type WebsiteLocation struct {
 	Groups               []WebsiteGroup `json:"groups"`
 	ObservedAt           time.Time      `json:"observed_at"`
 	HasPrice             bool           `json:"has_price"`
+	PriceComplete        bool           `json:"price_complete"`
 	PriceConditionsExact map[string]any `json:"price_conditions_exact,omitempty"`
 	Stale                bool           `json:"stale,omitempty"`
 	channelStatus        string
@@ -159,7 +160,8 @@ func readCatalogDifferences(ctx context.Context, tx *sql.Tx, provider uuid.UUID,
 				Name: model.Name, ChannelID: section.ChannelID, Channel: section.Channel, Platform: section.Platform,
 				Groups:     websiteGroups(directoryModelGroups(section, model)),
 				ObservedAt: model.ObservedAt, HasPrice: hasPanelPrice(model.Pricing),
-				Stale: stale, channelStatus: section.ChannelStatus,
+				PriceComplete: usage.BeichenDirectoryQuoteBlocker(model.Pricing) == "",
+				Stale:         stale, channelStatus: section.ChannelStatus,
 			}
 			if location.HasPrice {
 				decoder := json.NewDecoder(bytes.NewReader(usage.BeichenPanelDisplayTerms(model.Pricing)))
@@ -225,10 +227,10 @@ func indexKeyGroups(datasets []Dataset, keys []discoveryKey, platforms []directo
 		case "billing":
 			// The saved panel mapping is display evidence for legacy rows. A
 			// successful live observation supersedes it even if the group is unknown.
-			if dataset.ObservedAt != nil || dataset.GroupID != nil {
+			if dataset.ObservedAt != nil || dataset.GroupID != nil || dataset.GroupStatus != "" {
 				key.GroupID = dataset.GroupID
 			}
-			key.GroupStale = dataset.BillingState == "stale"
+			key.GroupStale = dataset.GroupStatus == "" && dataset.BillingState == "stale"
 			key.groupCurrent = dataset.BillingState == "current" && dataset.GroupID != nil
 			if !key.groupCurrent {
 				continue

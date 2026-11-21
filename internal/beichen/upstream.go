@@ -25,6 +25,7 @@ const (
 )
 
 var decimal = regexp.MustCompile(`^(0|[1-9][0-9]{0,18})(\.[0-9]{1,24})?([eE][+-]?[0-9]{1,2})?$`)
+var errKeyGroupNotAllowed = errors.New("账号无分组权限")
 
 func newClient() *http.Client {
 	dialer := &net.Dialer{Timeout: 4 * time.Second, KeepAlive: 30 * time.Second}
@@ -82,6 +83,10 @@ func readBeichenResponse(client *http.Client, req *http.Request) ([]byte, error)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusForbidden && req.URL.Host == "api.beichenapi.com" &&
+			keyGroupNotAllowed(response.Body) {
+			return nil, errKeyGroupNotAllowed
+		}
 		return nil, upstreamHTTPStatus(response.StatusCode)
 	}
 	if response.ContentLength > maxResponseBytes {
@@ -95,6 +100,34 @@ func readBeichenResponse(client *http.Client, req *http.Request) ([]byte, error)
 		return nil, errors.New("北辰接口响应超过 2 MiB")
 	}
 	return body, nil
+}
+
+func keyGroupNotAllowed(reader io.Reader) bool {
+	const maxErrorBytes = 4096
+	body, err := io.ReadAll(io.LimitReader(reader, maxErrorBytes+1))
+	if err != nil || len(body) > maxErrorBytes {
+		return false
+	}
+	type errorCode struct {
+		Code   string `json:"code"`
+		Type   string `json:"type"`
+		Reason string `json:"reason"`
+	}
+	var reply struct {
+		errorCode
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(body, &reply) != nil {
+		return false
+	}
+	for _, code := range []string{reply.Code, reply.Type, reply.Reason} {
+		if code == "GROUP_NOT_ALLOWED" {
+			return true
+		}
+	}
+	var nested errorCode
+	return json.Unmarshal(reply.Error, &nested) == nil &&
+		(nested.Code == "GROUP_NOT_ALLOWED" || nested.Type == "GROUP_NOT_ALLOWED" || nested.Reason == "GROUP_NOT_ALLOWED")
 }
 
 type billingInfo struct {

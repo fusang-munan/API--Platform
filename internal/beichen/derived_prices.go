@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,7 +29,19 @@ func (s *Service) readBillingCatalog(ctx context.Context, job syncJob, key strin
 
 func (s *Service) fetchBillingCatalog(ctx context.Context, provider uuid.UUID, token, key string, identity listedKey) (websiteKeyCatalog, error) {
 	directory, websiteErr := s.fetchWebsiteKeyCatalog(ctx, token, identity)
-	if websiteErr != nil && !errors.Is(websiteErr, errPanelGroupNotFound) {
+	if errors.Is(websiteErr, errPanelGroupNotFound) {
+		fallback, err := s.fetchKeyBillingCatalog(ctx, key, identity)
+		if err != nil && errors.Is(websiteErr, errWebsiteDirectoryEmpty) && !errors.Is(err, errKeyGroupNotAllowed) {
+			return directory, errWebsiteDirectoryEmpty
+		}
+		fallback.keyGroup, fallback.keyGroupAt = directory.keyGroup, directory.keyGroupAt
+		if err == nil && fallback.keyGroup.Rate == nil {
+			fallback.keyGroup.Rate = fallback.group.Rate
+		}
+		// The verified Key has a group even when the price directory omits it.
+		return fallback, err
+	}
+	if websiteErr != nil {
 		return directory, websiteErr
 	}
 	var hasEvidence bool
@@ -36,17 +49,14 @@ func (s *Service) fetchBillingCatalog(ctx context.Context, provider uuid.UUID, t
 SELECT 1 FROM beichen_group_price_observations
 WHERE provider_id=$1 AND group_id=$2 AND source='derived_from_usage' AND observed_at<=statement_timestamp()
 )`, provider, identity.GroupID).Scan(&hasEvidence); err != nil {
-		return websiteKeyCatalog{}, errPanelAccountDB
+		return directory, errPanelAccountDB
 	}
 	if !hasEvidence {
-		return directory, websiteErr
-	}
-	if websiteErr != nil {
-		return s.fetchDerivedBillingCatalog(ctx, key, identity)
+		return directory, nil
 	}
 	actual, err := s.fetchKeyCatalog(ctx, key)
 	if err != nil {
-		return websiteKeyCatalog{}, errors.New("北辰 Key 的实际型号清单无法读取")
+		return directory, keyMetadataError(err, identity.GroupID, "北辰 Key 的实际型号清单无法读取")
 	}
 	return directory.withActualModels(actual), nil
 }
@@ -62,10 +72,10 @@ func (directory websiteKeyCatalog) withActualModels(actual []catalog.ProviderEnt
 	return directory
 }
 
-func (s *Service) fetchDerivedBillingCatalog(ctx context.Context, key string, identity listedKey) (websiteKeyCatalog, error) {
+func (s *Service) fetchKeyBillingCatalog(ctx context.Context, key string, identity listedKey) (websiteKeyCatalog, error) {
 	body, err := s.fetch(ctx, key, billingPath, nil)
 	if err != nil {
-		return websiteKeyCatalog{}, errors.New("北辰 Key 的当前计费倍率无法读取")
+		return websiteKeyCatalog{}, keyMetadataError(err, identity.GroupID, "北辰 Key 的当前计费倍率无法读取")
 	}
 	info, err := parseBilling(body)
 	if err != nil {
@@ -85,6 +95,9 @@ func (s *Service) fetchDerivedBillingCatalog(ctx context.Context, key string, id
 			(group.PeakEnabled != nil && info.PeakEnabled != nil && *group.PeakEnabled != *info.PeakEnabled) {
 			return websiteKeyCatalog{}, errPanelRulesConflict
 		}
+		if info.GroupRate == "" && websiteGroupRate(group.Rate) != nil {
+			info.GroupRate = group.Rate
+		}
 	}
 	// A separately published Key price table needs its own official-price
 	// verification. Do not select an estimate over those declared terms.
@@ -93,7 +106,7 @@ func (s *Service) fetchDerivedBillingCatalog(ctx context.Context, key string, id
 	}
 	entries, err := s.fetchKeyCatalog(ctx, key)
 	if err != nil {
-		return websiteKeyCatalog{}, errors.New("北辰 Key 的实际型号清单无法读取")
+		return websiteKeyCatalog{}, keyMetadataError(err, identity.GroupID, "北辰 Key 的实际型号清单无法读取")
 	}
 	info.GroupID = &identity.GroupID
 	at := s.now().UTC()
@@ -123,6 +136,18 @@ func (s *Service) fetchDerivedBillingCatalog(ctx context.Context, key string, id
 		group.PeakRate = &info.PeakRate
 	}
 	return websiteKeyCatalog{group: group, entries: entries, at: at, keyBilling: &info}, nil
+}
+
+type deniedKeyGroup int64
+
+func (group deniedKeyGroup) Error() string { return fmt.Sprintf("账号无 group %d 权限", group) }
+func (group deniedKeyGroup) Unwrap() error { return errKeyGroupNotAllowed }
+
+func keyMetadataError(err error, groupID int64, message string) error {
+	if errors.Is(err, errKeyGroupNotAllowed) {
+		return deniedKeyGroup(groupID)
+	}
+	return errors.New(message)
 }
 
 type derivedPriceRow struct {

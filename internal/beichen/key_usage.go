@@ -66,7 +66,7 @@ func (s *Service) fetchWebsiteKeyUsage(ctx context.Context, job syncJob, credent
 		check, err = readWebsiteKey(ctx, s, access, key, func(bearer string, identity listedKey) (websiteKeyCheck, error) {
 			check := websiteKeyCheck{key: identity}
 			check.catalog, check.catalogErr = s.fetchBillingCatalog(ctx, job.provider, bearer, key, identity)
-			if panelAuthFailed(check.catalogErr) {
+			if panelAuthFailed(check.catalogErr) || errors.Is(check.catalogErr, errKeyGroupMissing) {
 				return check, check.catalogErr
 			}
 			// Also refresh the most recent completed day for reconciliation.
@@ -90,7 +90,8 @@ func (s *Service) fetchWebsiteKeyUsage(ctx context.Context, job syncJob, credent
 	if check.key.ID == 0 {
 		check.catalogErr, check.usageErr = err, err
 	}
-	if panelAuthFailed(check.catalogErr) && len(check.days) == 0 && check.usageErr == nil {
+	if (panelAuthFailed(check.catalogErr) || errors.Is(check.catalogErr, errKeyGroupMissing)) &&
+		len(check.days) == 0 && check.usageErr == nil {
 		check.usageErr = check.catalogErr
 	}
 	return fetchResult{err: err, save: func(ctx context.Context, tx *sql.Tx) error {
@@ -117,6 +118,27 @@ WHERE credential_id=$1 AND key_digest=$2 AND website_key_id IS DISTINCT FROM $3`
 			return err
 		}
 	}
+	if check.catalog.keyGroup != nil {
+		var group []byte
+		if check.catalog.keyGroup.ID != 0 {
+			metadata := check.catalog.group.WebsiteGroup
+			if metadata.ID == 0 {
+				metadata = *check.catalog.keyGroup
+			}
+			metadata.Name, metadata.Rate = check.catalog.keyGroup.Name, check.catalog.keyGroup.Rate
+			var err error
+			group, err = json.Marshal(metadata)
+			if err != nil {
+				return err
+			}
+		}
+		_, err := tx.ExecContext(ctx, `
+UPDATE beichen_key_observations SET website_group=$3::jsonb
+WHERE credential_id=$1 AND key_digest=$2`, id, digest[:], group)
+		if err != nil {
+			return err
+		}
+	}
 	if check.catalogErr == nil && check.catalog.group.ID > 0 {
 		models := make([]string, 0, len(check.catalog.entries))
 		for _, model := range check.catalog.entries {
@@ -126,13 +148,9 @@ WHERE credential_id=$1 AND key_digest=$2 AND website_key_id IS DISTINCT FROM $3`
 		if err != nil {
 			return err
 		}
-		group, err := json.Marshal(check.catalog.group.WebsiteGroup)
-		if err != nil {
-			return err
-		}
 		_, err = tx.ExecContext(ctx, `
-UPDATE beichen_key_observations SET models=$3::jsonb,models_fetched_at=$4,website_group=$5::jsonb,models_error=NULL
-WHERE credential_id=$1 AND key_digest=$2`, id, digest[:], string(list), check.catalog.at, string(group))
+UPDATE beichen_key_observations SET models=$3::jsonb,models_fetched_at=$4,models_error=NULL
+WHERE credential_id=$1 AND key_digest=$2`, id, digest[:], string(list), check.catalog.at)
 		if err != nil {
 			return err
 		}

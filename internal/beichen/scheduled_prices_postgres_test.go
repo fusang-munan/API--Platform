@@ -166,6 +166,9 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 			t.Errorf("unexpected method for metadata endpoint %s", r.URL.Path)
 			return nil, fmt.Errorf("unexpected metadata request")
 		}
+		if round == 4 && r.URL.Host == "api.beichenapi.com" && r.URL.Path == billingPath {
+			return response(http.StatusServiceUnavailable, nil)
+		}
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if r.URL.Host == "beichenapi.com" {
 			if round == 2 && token == "initial-access" {

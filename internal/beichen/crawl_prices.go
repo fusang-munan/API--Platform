@@ -2,7 +2,10 @@ package beichen
 
 import (
 	"encoding/json"
+	"math/big"
 	"time"
+
+	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
 const websitePriceUnit = "元（北辰余额单位）"
@@ -56,4 +59,28 @@ func websiteMissingPriceFields(raw json.RawMessage) []string {
 		}
 	}
 	return missing
+}
+
+func baseTokenPricesPerMillion(raw json.RawMessage) map[string]string {
+	if !usage.BeichenTokenQuoteUsable(raw) {
+		return nil
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return nil
+	}
+	prices := make(map[string]string)
+	million := big.NewRat(1_000_000, 1)
+	for _, field := range []string{
+		"input_price", "output_price", "cache_write_price", "cache_write_1h_price", "cache_write_12h_price", "cache_read_price",
+	} {
+		var value json.Number
+		if json.Unmarshal(fields[field], &value) != nil {
+			continue
+		}
+		if price := exactDecimal(value); price != nil {
+			prices[field] = websiteDecimalText(price.Mul(price, million))
+		}
+	}
+	return prices
 }

@@ -75,7 +75,9 @@ function summary(wrapper: Drawer) {
   return wrapper.findAll('.confirmation-summary dd').map(cell => cell.text())
 }
 function priceRows(wrapper: Drawer, group = 0) {
-  return wrapper.findAll('tbody')[group].findAll('tr:has(td)').map(row => row.findAll('th, td').map(cell => cell.text()))
+  return wrapper.findAll('tbody')[group].findAll('tr:has(td)')
+    .filter(row => !row.classes('billing-mode-row'))
+    .map(row => row.findAll('th, td').map(cell => cell.text()))
 }
 
 beforeEach(() => {
@@ -110,6 +112,30 @@ describe('北辰模型定价范围', () => {
     }))
   })
 
+  it('固定展示计费模式与五项单价，并标注来源和 observed_at', async () => {
+    const data = overview()
+    data.models[0].price_status = 'derived'
+    data.models[0].price_source = 'derived_from_usage'
+    data.models[0].price_observed_at = '2026-11-21T12:14:00Z'
+    data.models[0].price_conditions_exact = {
+      billing_mode: 'token', input_price: '0.000004', output_price: '0.00002',
+      cache_write_price: '0.000005', cache_write_1h_price: '0.000008', cache_read_price: '0.0000002',
+    }
+    api.beichenOverview.mockResolvedValue(data)
+    const wrapper = await view()
+    const detail = wrapper.get('[data-testid="price-detail"]')
+    const text = detail.text()
+    expect(text).toContain('计费模式')
+    expect(text).toContain('按 Token')
+    for (const label of ['输入', '输出', '缓存写入(5m)', '缓存写入(1h)', '缓存读取']) expect(text).toContain(label)
+    expect(text).toContain('历史流水反推价')
+    expect(text).toContain('observed_at 2026/11/21 20:14')
+    expect(text).toContain('4 元')
+    expect(text).toContain('20 元')
+    expect(text).toContain('8 元')
+    expect(text).toContain('0.2 元')
+  })
+
   it('默认确认全部渠道，按模型和 Key 计算影响行数，保存后显示核对一致的 Key 数', async () => {
     const wrapper = await view()
     expect(wrapper.get<HTMLInputElement>('input[value="all"]').element.checked).toBe(true)
@@ -120,11 +146,11 @@ describe('北辰模型定价范围', () => {
     expect(summary(wrapper)).toEqual(['4', '4', '跟随官网'])
     expect(priceRows(wrapper)).toEqual([
       ['输入', '0.005', '0.5'], ['输出', '1.25000001', '125.000001'],
-      ['缓存读取', '0', '0'], ['缓存写入', '待核', '待核'],
+      ['缓存读取', '0', '0'], ['缓存写入', '缺价', '缺价'],
     ])
     expect(priceRows(wrapper, 1)).toEqual([
-      ['输入', '待核', '待核'], ['输出', '待核', '待核'],
-      ['缓存读取', '待核', '待核'], ['缓存写入', '待核', '待核'],
+      ['输入', '缺价', '缺价'], ['输出', '缺价', '缺价'],
+      ['缓存读取', '缺价', '缺价'], ['缓存写入', '缺价', '缺价'],
     ])
     await wrapper.get('form').trigger('submit')
     await flushPromises()
