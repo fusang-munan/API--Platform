@@ -103,6 +103,9 @@ func (s *Service) saveWebsiteKeyCheck(ctx context.Context, tx *sql.Tx, job syncJ
 	check websiteKeyCheck, at time.Time, today string) error {
 	digest := sha256.Sum256(credential.ciphertext)
 	id := job.credential
+	if err := saveBillingGroup(ctx, tx, id, credential.updatedAt, at, check.catalog, check.catalogErr); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, initKeyObservationSQL, id, digest[:], job.target.Multiplier, job.target.ExpectClaude); err != nil {
 		return err
 	}
@@ -133,7 +136,9 @@ WHERE credential_id=$1 AND key_digest=$2 AND website_key_id IS DISTINCT FROM $3`
 			}
 		}
 		_, err := tx.ExecContext(ctx, `
-UPDATE beichen_key_observations SET website_group=$3::jsonb
+UPDATE beichen_key_observations SET website_group=$3::jsonb,
+ models=CASE WHEN website_group->>'id'=$3::jsonb->>'id' THEN models END,
+ models_fetched_at=CASE WHEN website_group->>'id'=$3::jsonb->>'id' THEN models_fetched_at END
 WHERE credential_id=$1 AND key_digest=$2`, id, digest[:], group)
 		if err != nil {
 			return err

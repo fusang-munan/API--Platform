@@ -308,7 +308,25 @@ ORDER BY c.label, c.id, kinds.kind`, providerID)
 		}
 		view.Datasets = append(view.Datasets, item)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	billing := view.billingByCredential()
+	for i := range view.Datasets {
+		item := &view.Datasets[i]
+		item.LastError = billing[item.CredentialID].groupReadError(item.LastError)
+	}
+	return nil
+}
+
+func (view *Overview) billingByCredential() map[uuid.UUID]Dataset {
+	billing := make(map[uuid.UUID]Dataset)
+	for _, dataset := range view.Datasets {
+		if dataset.Kind == "billing" {
+			billing[dataset.CredentialID] = dataset
+		}
+	}
+	return billing
 }
 
 func readModels(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Overview) error {
@@ -446,6 +464,7 @@ func (m *Model) catalogPriceState() string {
 
 func readCredentials(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Overview) error {
 	counts := credentialModelCounts(view.Models)
+	billing := view.billingByCredential()
 	datasetErrors := make(map[uuid.UUID]map[string]*string)
 	for _, data := range view.Datasets {
 		if datasetErrors[data.CredentialID] == nil {
@@ -492,6 +511,7 @@ ORDER BY c.label, c.id`, providerID)
 			&enabled, &configured, &revision); err != nil {
 			return err
 		}
+		item.LastError = billing[item.CredentialID].groupReadError(item.LastError)
 		for _, timestamp := range times {
 			if *timestamp != nil {
 				utc := (*timestamp).UTC()

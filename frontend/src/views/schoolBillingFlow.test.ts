@@ -172,7 +172,8 @@ function visiblePrices(row: Pick<DOMWrapper<Element>, 'find'>) {
   return [{ id: 'standard-price', title: '官网标准价' }, { id: 'actual-price', title: '学生实际价（含 1.10）' }].map(column => ({
     title: column.title,
     values: row.find('td.' + column.id).findAll('.price-cell')
-      .map(cell => [cell.get('.price-label').text(), cell.get('.price-credits').text()]),
+      .map(cell => [cell.get('.price-label').text(),
+        cell.find('.price-gap').exists() ? cell.get('.price-gap').text() : cell.get('.price-credits').text()]),
   }))
 }
 
@@ -203,8 +204,8 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   expect(table.text()).toContain('北辰官网需要学校后台重新授权')
   const confirmed = shared.get('[data-price-status="confirmed"]')
   expect(visiblePrices(shared)).toEqual([
-    { title: '官网标准价', values: [['输入', '10 积分'], ['输出', '20 积分'], ['缓存写入(5m)', '缺价'], ['缓存写入(1h)', '未列单价'], ['缓存读取', '0 积分']] },
-    { title: '学生实际价（含 1.10）', values: [['输入', '23.375000000000000000000011 积分'], ['输出', '46.750000000000000000000022 积分'], ['缓存写入(5m)', '缺价'], ['缓存写入(1h)', '未列单价'], ['缓存读取', '0 积分']] },
+    { title: '官网标准价', values: [['输入', '10 积分'], ['输出', '20 积分'], ['缓存写入(5m)', '缺价：缓存写入(5m)'], ['缓存写入(1h)', '未列单价：缓存写入(1h)'], ['缓存读取', '0 积分']] },
+    { title: '学生实际价（含 1.10）', values: [['输入', '23.375000000000000000000011 积分'], ['输出', '46.750000000000000000000022 积分'], ['缓存写入(5m)', '缺价：缓存写入(5m)'], ['缓存写入(1h)', '未列单价：缓存写入(1h)'], ['缓存读取', '0 积分']] },
   ])
   expect(confirmed.text()).toContain('报价已确认')
   const conditional = shared.get('[data-price-status="conditional"]')
@@ -337,16 +338,16 @@ it('教师页自动发现目录里的新模型，并随后台报价更新待同�
   const confirmed = await update(discoveredOverview({ price_status: 'confirmed', price_conditions_exact: price }))
   expect(confirmed.text()).toContain('0.125× · 待启用')
   expect(visiblePrices(confirmed)).toEqual([
-    { title: '官网标准价', values: [['输入', '800 积分'], ['输出', '1600 积分'], ['缓存写入(5m)', '缺价'], ['缓存写入(1h)', '未列单价'], ['缓存读取', '缺价']] },
-    { title: '学生实际价（含 1.10）', values: [['输入', '110 积分'], ['输出', '220 积分'], ['缓存写入(5m)', '缺价'], ['缓存写入(1h)', '未列单价'], ['缓存读取', '缺价']] },
+    { title: '官网标准价', values: [['输入', '800 积分'], ['输出', '1600 积分'], ['缓存写入(5m)', '缺价：缓存写入(5m)'], ['缓存写入(1h)', '未列单价：缓存写入(1h)'], ['缓存读取', '缺价：缓存读取']] },
+    { title: '学生实际价（含 1.10）', values: [['输入', '110 积分'], ['输出', '220 积分'], ['缓存写入(5m)', '缺价：缓存写入(5m)'], ['缓存写入(1h)', '未列单价：缓存写入(1h)'], ['缓存读取', '缺价：缓存读取']] },
   ])
   const changed = await update(discoveredOverview({
     price_status: 'confirmed', price_conditions_exact: { ...price, input_price: '0.000012' },
   }, '0.25'))
   expect(changed.text()).toContain('0.25× · 待启用')
   expect(visiblePrices(changed)).toEqual([
-    { title: '官网标准价', values: [['输入', '1200 积分'], ['输出', '1600 积分'], ['缓存写入(5m)', '缺价'], ['缓存写入(1h)', '未列单价'], ['缓存读取', '缺价']] },
-    { title: '学生实际价（含 1.10）', values: [['输入', '330 积分'], ['输出', '440 积分'], ['缓存写入(5m)', '缺价'], ['缓存写入(1h)', '未列单价'], ['缓存读取', '缺价']] },
+    { title: '官网标准价', values: [['输入', '1200 积分'], ['输出', '1600 积分'], ['缓存写入(5m)', '缺价：缓存写入(5m)'], ['缓存写入(1h)', '未列单价：缓存写入(1h)'], ['缓存读取', '缺价：缓存读取']] },
+    { title: '学生实际价（含 1.10）', values: [['输入', '330 积分'], ['输出', '440 积分'], ['缓存写入(5m)', '缺价：缓存写入(5m)'], ['缓存写入(1h)', '未列单价：缓存写入(1h)'], ['缓存读取', '缺价：缓存读取']] },
   ])
   expect(request.mock.calls.slice(before).map(([url, init]) => [init?.method ?? 'GET', url.split('?')[0]])).toEqual(
     Array.from({ length: 4 }, () => [
@@ -374,7 +375,7 @@ it.each([
   const row = widget.get('[aria-label="北辰模型目录"] tbody tr')
   expect(row.get('.standard-price .price-line').text()).toContain(standard.split('\n')[0])
   expect(row.get('.actual-price .price-line').text()).toContain(actual.split('\n')[0])
-  expect(row.find('.price-grid').exists()).toBe(false)
+  expect(row.find('.price-table').exists()).toBe(false)
   expect(row.text()).not.toContain('按条件计价')
 })
 

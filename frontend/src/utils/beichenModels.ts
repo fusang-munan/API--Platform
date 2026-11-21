@@ -172,7 +172,8 @@ const priceStatusLabels = {
   pending: '单价待同步',
 }
 
-export function keyGroupIssue(billing?: BeichenDataset) {
+export function keyGroupIssue(billing?: Pick<BeichenDataset, 'group_status' | 'group_id'>) {
+  if (billing?.group_status === 'pending') return '分组待同步'
   if (billing?.group_status === 'not_found') return 'Key 分组不存在'
   if (billing?.group_status === 'not_allowed' && billing.group_id != null) return `账号无 group ${billing.group_id} 权限`
   return ''

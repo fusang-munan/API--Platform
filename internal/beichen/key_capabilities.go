@@ -18,6 +18,7 @@ type KeyCapability struct {
 	CredentialRef
 	WebsiteKeyID     *int64           `json:"website_key_id"`
 	WebsiteGroup     *WebsiteGroup    `json:"website_group"`
+	GroupStatus      string           `json:"group_status"`
 	Models           []string         `json:"models"`
 	HasClaude        *bool            `json:"has_claude"`
 	ModelsState      string           `json:"models_state"`
@@ -62,12 +63,7 @@ func readKeyCapabilities(ctx context.Context, tx *sql.Tx, provider uuid.UUID, da
 		return err
 	}
 	defer rows.Close()
-	stored := map[uuid.UUID]string{}
-	for _, dataset := range view.Datasets {
-		if dataset.Kind == "billing" && dataset.EffectiveMultiplierText != "" {
-			stored[dataset.CredentialID] = dataset.EffectiveMultiplierText
-		}
-	}
+	billing := view.billingByCredential()
 	view.KeyCapabilities = []KeyCapability{}
 	for rows.Next() {
 		var key KeyCapability
@@ -82,9 +78,21 @@ func readKeyCapabilities(ctx context.Context, tx *sql.Tx, provider uuid.UUID, da
 				return err
 			}
 		}
+		billingData := billing[key.CredentialID]
+		if billingData.GroupStatus != "" && (billingData.GroupID == nil ||
+			key.WebsiteGroup == nil || *billingData.GroupID != key.WebsiteGroup.ID) {
+			// A model list from another group cannot describe the current group.
+			modelList, key.ModelsFetchedAt = nil, nil
+			if key.WebsiteGroup != nil {
+				key.ModelsError = nil
+			}
+		}
+		key.applyGroup(billingData)
+		key.ModelsError = billingData.groupReadError(key.ModelsError)
+		key.UsageError = billingData.groupReadError(key.UsageError)
 		key.ModelsState = keyDataState(key.ModelsFetchedAt, key.ModelsError, now)
 		key.UsageState = keyDataState(key.UsageFetchedAt, key.UsageError, now)
-		if value, ok := stored[key.CredentialID]; ok {
+		if value := billingData.EffectiveMultiplierText; value != "" {
 			key.StoredMultiplier = &value
 		}
 		savedRate := rateFromText(key.StoredMultiplier)
@@ -121,12 +129,37 @@ func readKeyCapabilities(ctx context.Context, tx *sql.Tx, provider uuid.UUID, da
 			}
 		}
 		key.GroupCheck = "pending"
-		if key.ModelsState == "fresh" && key.WebsiteGroup != nil {
+		if key.GroupStatus == "assigned" && key.ModelsState == "fresh" && key.WebsiteGroup != nil {
 			key.GroupCheck = assessGroup(key, exactWebsiteGroupRate(key.WebsiteGroup), savedRate)
 		}
 		view.KeyCapabilities = append(view.KeyCapabilities, key)
 	}
 	return rows.Err()
+}
+
+func (key *KeyCapability) applyGroup(billing Dataset) {
+	key.GroupStatus = billing.GroupStatus
+	if key.GroupStatus == "" {
+		key.GroupStatus = "pending"
+		if key.WebsiteGroup != nil {
+			key.GroupStatus = "assigned"
+		}
+		return
+	}
+	if billing.GroupID == nil {
+		key.WebsiteGroup = nil
+		return
+	}
+	if key.WebsiteGroup == nil || key.WebsiteGroup.ID != *billing.GroupID {
+		key.WebsiteGroup = &WebsiteGroup{ID: *billing.GroupID}
+	}
+	if billing.GroupName != nil {
+		key.WebsiteGroup.Name = *billing.GroupName
+	}
+	if billing.GroupRate != nil {
+		rate := json.Number(*billing.GroupRate)
+		key.WebsiteGroup.Rate = &rate
+	}
 }
 
 func keyDataState(at *time.Time, lastError *string, now time.Time) string {

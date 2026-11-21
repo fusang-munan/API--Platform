@@ -90,6 +90,7 @@ export type BeichenImport = { credential_id: string; csv: string } & (
   { kind: 'usage_export'; full_day_confirmed: true }
   | { kind: Exclude<BeichenImportKind, 'usage_export'>; full_day_confirmed?: never }
 )
+export type BeichenGroupStatus = 'pending' | 'assigned' | 'not_found' | 'not_allowed'
 export type BeichenDataset = {
   credential_id: string
   kind: string
@@ -101,7 +102,7 @@ export type BeichenDataset = {
   group_id?: number
   group_name?: string
   group_rate?: string
-  group_status?: 'assigned' | 'not_found' | 'not_allowed'
+  group_status?: BeichenGroupStatus
   official_price_missing?: boolean
   peak_enabled?: boolean
   peak_rate?: string
@@ -222,13 +223,12 @@ export type BeichenKeyUsageMetric = {
   observed_multiplier: string | null
   multiplier_diff: boolean
 }
-// 数据口径：后端当前提供的是 /v1/usage 账号级参考。
-// 分组数据接口（M）就绪后，再补充分组事实字段并替换页面上的账号级标记。
 export type BeichenKeyCapability = {
   credential_id: string
   label: string
   website_key_id?: number | null
   website_group?: BeichenWebsiteGroup | null
+  group_status?: BeichenGroupStatus
   models: string[]
   has_claude: boolean | null
   models_state: 'fresh' | 'stale' | 'failed' | 'pending'

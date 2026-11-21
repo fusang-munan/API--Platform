@@ -51,6 +51,12 @@ func TestBeichenBillingGroupDenialPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	execCatalogTestSQL(t, ctx, db, `UPDATE provider_credentials SET credential_ciphertext=$2 WHERE id=$1`, key, ciphertext)
+	const legacyError = "北辰面板找不到当前 Key 分组"
+	execCatalogTestSQL(t, ctx, db, `
+INSERT INTO beichen_key_observations (credential_id,key_digest,website_key_id,models_error,usage_error)
+VALUES ($1,sha256($2::bytea),41,$3,$3)`, key, ciphertext, legacyError)
+	execCatalogTestSQL(t, ctx, db, `
+INSERT INTO beichen_datasets (credential_id,kind,last_error) VALUES ($1,'prices',$2)`, key, legacyError)
 	service := New(db, manager)
 	service.ConfigurePanelFallback("fixture-session")
 	const knownPrice = `{"name":"gemini-3.7-flash","pricing":{"billing_mode":"token","input_price":0.000004,"output_price":0.00002}}`
@@ -81,66 +87,132 @@ func TestBeichenBillingGroupDenialPostgres(t *testing.T) {
 		case "https://api.beichenapi.com" + modelsPath:
 			body = `{"data":[{"id":"gemini-3.7-flash"}]}`
 		default:
-			return nil, errors.New("unexpected fixture endpoint")
+			if r.URL.Host != "beichenapi.com" || r.URL.Path != "/api/v1/usage" || r.URL.Query().Get("api_key_id") != "41" {
+				return nil, errors.New("unexpected fixture endpoint")
+			}
+			body = `{"code":0,"data":{"items":[],"total":0,"page":1,"page_size":100,"pages":0}}`
 		}
 		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
 	})
-	refresh := func() (Overview, error) {
+	overview := func() Overview {
 		t.Helper()
-		_, syncErr := service.runJob(ctx, syncJob{provider: provider, credential: key, kind: "billing"}, true)
 		view, err := service.Overview(ctx, provider, "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		return view, syncErr
+		return view
 	}
-	view, err := refresh()
+	refresh := func(kind string) (Overview, error) {
+		t.Helper()
+		_, syncErr := service.runJob(ctx, syncJob{provider: provider, credential: key, kind: kind}, true)
+		return overview(), syncErr
+	}
+	capability := func(view Overview) KeyCapability {
+		t.Helper()
+		for _, item := range view.KeyCapabilities {
+			if item.CredentialID == key {
+				return item
+			}
+		}
+		t.Fatal("missing Gemini Key capability")
+		return KeyCapability{}
+	}
+	view := overview()
+	card := capability(view)
+	if card.GroupStatus != "pending" || card.WebsiteGroup != nil || card.ModelsError == nil || *card.ModelsError != "分组待同步" {
+		t.Fatalf("old errors must not be evidence that the Key is unassigned: %+v", card)
+	}
+	prices := datasetForCredential(t, view, key, "prices")
+	if prices.LastError == nil || *prices.LastError != "分组待同步" {
+		t.Fatalf("old price error was not normalized: %+v", prices)
+	}
+	view, err = refresh("billing")
 	if err != nil || len(view.Models) != 1 || view.Models[0].Model != model || view.Models[0].PriceStatus != "confirmed" {
 		t.Fatalf("expected the model to start with a confirmed price: %v", err)
 	}
 	website = websiteGroupFixture(6, "0.3", knownPrice)
-	view, err = refresh()
+	view, err = refresh("billing")
 	if !errors.Is(err, errKeyGroupNotAllowed) || billingReads != 1 {
 		t.Fatalf("missing group in the price directory must check the Key permission: %v", err)
 	}
 	billing := datasetForCredential(t, view, key, "billing")
-	prices := datasetForCredential(t, view, key, "prices")
+	prices = datasetForCredential(t, view, key, "prices")
 	if billing.GroupStatus != "not_allowed" || billing.GroupID == nil || *billing.GroupID != 5 ||
 		billing.GroupName == nil || *billing.GroupName != "[Gemini]国外豆包" || billing.GroupRate == nil || *billing.GroupRate != "0.30" ||
 		billing.BillingState != "stale" || prices.LastError == nil || *prices.LastError != "账号无 group 5 权限" || prices.OfficialPriceMissing ||
 		len(view.Models) != 1 || view.Models[0].UpstreamRates != nil {
 		t.Fatalf("denial did not preserve the Key identity and expire its quote: billing=%+v prices=%+v", billing, prices)
 	}
+	card = capability(view)
+	if card.GroupStatus != "not_allowed" || card.WebsiteGroup == nil || card.WebsiteGroup.ID != 5 ||
+		card.WebsiteGroup.Name != "[Gemini]国外豆包" || card.WebsiteGroup.Rate == nil || *card.WebsiteGroup.Rate != "0.30" ||
+		card.ModelsError == nil || *card.ModelsError != "账号无 group 5 权限" {
+		t.Fatalf("the card did not use billing evidence instead of its old Key usage error: %+v", card)
+	}
 
 	group = `"group_id":null`
-	view, err = refresh()
+	view, err = refresh("billing")
 	billing = datasetForCredential(t, view, key, "billing")
+	card = capability(view)
 	if !errors.Is(err, errKeyGroupMissing) || billingReads != 1 || billing.GroupStatus != "not_found" ||
-		billing.GroupID != nil || billing.GroupName != nil || billing.GroupRate != nil {
-		t.Fatalf("an unassigned Key must be distinguished from an inaccessible group: %+v, %v", billing, err)
+		billing.GroupID != nil || billing.GroupName != nil || billing.GroupRate != nil ||
+		card.GroupStatus != "not_found" || card.WebsiteGroup != nil {
+		t.Fatalf("an unassigned Key must be distinguished from an inaccessible group: billing=%+v card=%+v err=%v", billing, card, err)
 	}
 
 	group = `"description":"response omitted its group field"`
-	view, err = refresh()
+	view, err = refresh("billing")
 	billing = datasetForCredential(t, view, key, "billing")
-	if !errors.Is(err, errPanelGroupUnverified) || billingReads != 1 || billing.GroupStatus != "" {
+	if !errors.Is(err, errPanelGroupUnverified) || billingReads != 1 || billing.GroupStatus != "pending" || capability(view).GroupStatus != "pending" {
 		t.Fatalf("an omitted group field must not indicate a missing group: %+v, %v", billing, err)
 	}
 
 	listedSecret = "sk-unrelated-fixture"
-	view, err = refresh()
+	view, err = refresh("billing")
 	billing = datasetForCredential(t, view, key, "billing")
-	if !errors.Is(err, errKeyMatch) || billingReads != 1 || billing.GroupStatus != "" {
+	if !errors.Is(err, errKeyMatch) || billingReads != 1 || billing.GroupStatus != "pending" {
 		t.Fatalf("credential mismatch must be distinguished from an unassigned Key: %+v, %v", billing, err)
+	}
+
+	listedSecret, group = secret, `"group_id":5,"group":{"id":5,"name":"[Gemini]国外豆包","rate_multiplier":0.30}`
+	view, err = refresh("key_usage")
+	billing, card = datasetForCredential(t, view, key, "billing"), capability(view)
+	if !errors.Is(err, errKeyGroupNotAllowed) || billingReads != 2 || billing.GroupStatus != "not_allowed" ||
+		card.GroupStatus != "not_allowed" || card.WebsiteGroup == nil || card.WebsiteGroup.ID != 5 {
+		t.Fatalf("a Key-only check must publish the same denial: billing=%+v card=%+v err=%v", billing, card, err)
+	}
+
+	// A slower billing job may finish after the Key check using an older list.
+	var revision time.Time
+	if err := db.QueryRowContext(ctx, "SELECT updated_at FROM provider_credentials WHERE id=$1", key).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	older := time.Now().UTC().Add(-time.Minute)
+	staleRead := websiteKeyCatalog{keyGroup: &WebsiteGroup{ID: 17}, keyGroupAt: older}
+	if err := saveBillingGroup(ctx, tx, key, revision, older, staleRead, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if card := capability(overview()); card.GroupStatus != "not_allowed" || card.WebsiteGroup == nil || card.WebsiteGroup.ID != 5 {
+		t.Fatalf("an older group observation replaced the denial: %+v", card)
 	}
 
 	listedSecret, group, allowed = secret, `"group_id":17,"group":{"id":17,"rate_multiplier":0.50}`, true
 	website = `{"code":0,"data":[]}`
-	view, err = refresh()
+	view, err = refresh("billing")
 	billing, prices = datasetForCredential(t, view, key, "billing"), datasetForCredential(t, view, key, "prices")
-	if err != nil || billingReads != 2 || billing.GroupStatus != "assigned" || billing.GroupID == nil ||
+	card = capability(view)
+	if err != nil || billingReads != 3 || billing.GroupStatus != "assigned" || billing.GroupID == nil ||
 		*billing.GroupID != 17 || billing.BillingState != "current" || billing.LastError != nil || !prices.OfficialPriceMissing ||
-		len(view.Models) != 1 || view.Models[0].UpstreamRates != nil {
+		len(view.Models) != 1 || view.Models[0].UpstreamRates != nil ||
+		card.GroupStatus != "assigned" || card.WebsiteGroup == nil || card.WebsiteGroup.ID != 17 || card.ModelsError != nil {
 		t.Fatalf("missing official prices must not fail the verified multiplier: billing=%+v prices=%+v err=%v", billing, prices, err)
 	}
 }

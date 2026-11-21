@@ -940,7 +940,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
         <span v-else-if="billing.billing_state === 'unverified'"> · 计费倍率待核实</span>
         · 上次成功 {{ syncTime(billing.last_success) }}
         <strong v-if="billing.alert"> · 计费信息连续读取失败 {{ billing.failure_count === 6 ? '至少 6' : billing.failure_count }} 次</strong>
-        <span v-if="keyGroupIssue(billing) || billing.last_error"> · {{ keyGroupIssue(billing) || billing.last_error }}</span>
+        <span v-if="keyGroupIssue(billing) || billing.last_error || billing.group_id == null"> · {{ keyGroupIssue(billing) || billing.last_error || '分组待同步' }}</span>
       </p>
     </section>
     <BeichenKeyCapabilities v-if="overview?.key_capabilities?.length" :key="providerId"
@@ -1112,17 +1112,29 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
                 </template>
                 <template v-if="quote.hasQuote && quote[column.id].detail && (!quote[column.id].conditional || quote[column.id].showBase)">
                   <p class="billing-mode-line">计费模式：{{ quote[column.id].detail.billingModeLabel }}</p>
-                  <dl v-if="quote[column.id].detail.rows.some(row => !row.notApplicable)" class="price-grid">
-                    <div v-for="cell in quote[column.id].detail.rows" :key="cell.key" class="price-cell" :data-missing="cell.missing">
+                  <dl v-if="quote[column.id].detail.rows.some(row => !row.notApplicable)" class="price-table">
+                    <div v-for="cell in quote[column.id].detail.rows" :key="cell.key" class="price-row price-cell"
+                      :data-key="cell.key" :data-missing="cell.missing">
                       <dt class="price-label">{{ cell.label }}</dt>
                       <dd class="price-value">
-                        <template v-if="cell.notApplicable"><span class="price-empty">不适用</span></template>
-                        <template v-else-if="cell.missing"><span class="price-empty price-credits">{{ cell.key === 'cache_write_1h' ? '未列单价' : '缺价' }}</span></template>
-                        <template v-else>
-                          <span class="price-credits">{{ cell.credits }}<small> 积分</small></span>
-                          <span class="price-sub">{{ cell.yuan }} 元</span>
-                          <small v-if="cell.shared" class="price-sub">（同 5m）</small>
-                        </template>
+                        <span class="price-amount">
+                          <template v-if="cell.notApplicable">
+                            <span class="price-figure price-empty">—</span>
+                            <small class="price-gap price-not-applicable">不适用：{{ cell.label }}</small>
+                          </template>
+                          <template v-else-if="cell.missing">
+                            <span class="price-figure price-yuan">—</span>
+                            <span class="price-figure price-credits">—</span>
+                            <span class="price-unit">/ 1M Token</span>
+                            <small class="price-gap">{{ cell.key === 'cache_write_1h' ? '未列单价' : '缺价' }}：{{ cell.label }}</small>
+                          </template>
+                          <template v-else>
+                            <span class="price-figure price-yuan">{{ cell.yuan }}<small class="price-unit-mark"> 元</small></span>
+                            <span class="price-figure price-credits">{{ cell.credits }}<small class="price-unit-mark"> 积分</small></span>
+                            <span class="price-unit">/ 1M Token</span>
+                            <small v-if="cell.shared" class="price-shared">与缓存写入(5m)同价</small>
+                          </template>
+                        </span>
                       </dd>
                     </div>
                   </dl>
@@ -1265,7 +1277,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .model-toolbar { justify-content: flex-end; }
 .model-list { container-type: inline-size; }
 .model-table { table-layout: fixed; }
-.model-col { width: 16%; } .state-col { width: 20%; } .price-col { width: 20%; } .usage-col { width: 11%; } .action-col { width: 13%; }
+.model-col { width: 15%; } .state-col { width: 16%; } .price-col { width: 25%; } .usage-col { width: 8%; } .action-col { width: 11%; }
 .model-table thead th { white-space: normal; }
 .model-table th, .model-table td { min-width: 0; overflow-wrap: anywhere; }
 .model-name { font-size: 13px; }
@@ -1294,16 +1306,11 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .billing-mode-line { margin: 0; color: var(--ink-soft); font-size: 11px; line-height: 1.6; }
 .price-observed { color: var(--ink-soft); font-size: 11px; font-weight: 400; overflow-wrap: anywhere; }
 .price-source { white-space: normal; }
-.price-cell[data-missing="true"] .price-empty { color: #835615; }
 .quote-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
 .quote-row + .quote-row { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
 .quote-caption { display: flex; align-items: center; gap: 6px; min-height: 22px; flex-wrap: wrap; font-size: 11px; font-variant-numeric: tabular-nums; }
 .quote-caption .status-pill { white-space: normal; }
-.price-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; margin: 0; }
-.price-cell { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); align-items: baseline; gap: 2px 8px; min-height: 32px; }
-.price-cell > .price-value { margin: 0; font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; }
-.price-value small { font-size: 10px; font-weight: 500; }
-.price-sub { font-size: 10px; font-weight: 400; overflow-wrap: anywhere; }
+.price-cell { min-width: 0; }
 .price-link, .usage-link { padding: 0; border: 0; background: transparent; text-align: left; color: var(--primary-strong); font-weight: 700; font-size: 12px; overflow-wrap: anywhere; }
 .price-link:hover, .usage-link:hover { text-decoration: underline; text-underline-offset: 3px; }
 .model-filters { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
@@ -1339,7 +1346,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .condition-prices dt { font-weight: 700; font-size: 13px; margin-bottom: 8px; }
 .price-detail { white-space: pre-line; overflow-wrap: anywhere; color: var(--ink-soft); font-variant-numeric: tabular-nums; font-size: 13px; margin: 0; line-height: 1.7; }
 button:focus-visible, summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
-@container (max-width: 54rem) {
+@container (max-width: 60rem) {
   .model-table { display: block; }
   .model-table colgroup, .model-table thead { display: none; }
   .model-table tbody { display: grid; gap: 16px; }
@@ -1347,8 +1354,6 @@ button:focus-visible, summary:focus-visible { outline: 2px solid var(--primary);
   .model-table th, .model-table td { display: block; width: auto; padding: 0 14px; border: 0; }
   .model-name, .model-state { grid-column: 1 / -1; }
   .model-table td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 6px; font-size: 11px; color: var(--ink-soft); }
-  .price-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .price-cell { grid-template-columns: minmax(0, 1fr); }
   .model-actions .row-note { margin-top: 0; }
 }
 @container (max-width: 29rem) {

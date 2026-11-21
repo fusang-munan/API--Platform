@@ -391,9 +391,9 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 Key 账单读取失败时在最近版本写一次 `stale_at`，并结束仍有效的官网报价快照。倍率值、采样时间与上次成功时间保留。计价使用派发时刻查版本，在该时刻已经陈旧的倍率无法用于跟随价。确认 Key 分组后，跟随价使用该分组的有效报价。成功恢复时重新开立版本，即使数值相同。原有版本的用量仍按此前的派发时刻查询。
 
-迁移 `0059_beichen_billing_group_observation.sql` 在 `beichen_datasets` 的 `billing` 行增加 `website_group_observation`。同步在当前凭据版本与租约仍有效时保存 Key 清单确认的分组、分组状态、校验时刻和凭据版本。报价和有效倍率获取失败时也能保留分组元数据。概览可采用同凭据的更新清单分组资料，原权限拒绝只随同一组保留。计费仍读取正式倍率版本及其报价快照。
+迁移 `0059_beichen_billing_group_observation.sql` 在 `beichen_datasets` 的 `billing` 行增加 `website_group_observation`。计费同步与单 Key 核对在当前凭据版本与各自租约仍有效时共用该字段，按核对时间保存最新的分组状态。Key 清单确认分组后，即使报价和有效倍率获取失败也可保留分组元数据。身份或分组归属无法确认时可记录 `pending`。概览可采用同凭据的更新清单分组资料，原权限拒绝只随同一组保留。计费仍读取正式倍率版本及其报价快照。
 
-迁移 `0052_beichen_key_usage.sql` 添加 `key_usage` 同步任务。迁移 `0054_beichen_key_website_evidence.sql` 增加 `website_key_id` 和 `website_group`。`beichen_key_observations` 以渠道凭据 ID 和密文摘要识别同一把 Key，保存官网身份、分组模型、目标倍率、是否预期含 Claude、抓取时间及最近错误。有效租约和凭据版本一致时才能提交。失败保留上次成功内容并标记陈旧。迁移前的公开账号观测保留历史行，教师查询只采用有官网身份的 Key 数据。
+迁移 `0052_beichen_key_usage.sql` 添加 `key_usage` 同步任务。迁移 `0054_beichen_key_website_evidence.sql` 增加 `website_key_id` 和 `website_group`。`beichen_key_observations` 以渠道凭据 ID 和密文摘要识别同一把 Key，保存官网身份、分组模型、目标倍率、是否预期含 Claude、抓取时间及最近错误。有效租约和凭据版本一致时才能提交。同组读取失败会保留上次成功内容并标记陈旧。确认切组后，上一组型号退出当前分组展示。迁移前的公开账号观测保留历史行，教师查询只采用有官网身份的 Key 数据。
 
 `beichen_key_usage_days` 按 Key 和北京时间日期保存 `daily_usage`、`model_stats`、`unit` 和抓取时间。只有完整读完该 Key 该日的分页并核对每笔归属，才写入带 `website_key_id` 的新快照。`raw_website_pages` 加密保存完整响应字节，包括未知字段和可选的图像、视频字段。原价和实付以精确十进制相加，缺失值为 `null`，明确的零保持为零。
 

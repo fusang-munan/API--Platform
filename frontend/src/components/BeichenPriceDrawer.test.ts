@@ -134,6 +134,11 @@ describe('北辰模型定价范围', () => {
     expect(text).toContain('20 元')
     expect(text).toContain('8 元')
     expect(text).toContain('0.2 元')
+    const amounts = (key: string) => detail.get('[data-key="' + key + '"]')
+      .findAll('.price-yuan, .price-credits, .price-unit').map(node => node.text())
+    expect(amounts('input')).toEqual(['4 元', '400 积分', '/ 1M Token'])
+    expect(amounts('output')).toEqual(['20 元', '2000 积分', '/ 1M Token'])
+    expect(amounts('cache_write_1h')).toEqual(['8 元', '800 积分', '/ 1M Token'])
   })
 
   it('默认确认全部渠道，按模型和 Key 计算影响行数，保存后显示核对一致的 Key 数', async () => {
