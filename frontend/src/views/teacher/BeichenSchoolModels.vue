@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, useId, watch } from 'vue'
+import { RouterLink } from 'vue-router'
 import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
 import type { BeichenCapabilities, BeichenCatalogModel, BeichenHealthDimension, BeichenModelCapability, BeichenModelUsage, BeichenOverview, BeichenProbeRun, BeichenUsageRange, BindingAdapter } from '../../api/types'
 import type { BeichenCatalogKey, BeichenRebindPlan, BeichenRebindRoute, BeichenWebsiteLocation } from '../../api/types'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { useToast } from '../../composables/useToast'
-import { priceFields, schoolCatalog, type SchoolCatalogRow, type SchoolQuote } from '../../utils/beichenModels'
+import { formatPriceConditions, priceFields, schoolCatalog, type SchoolCatalogRow, type SchoolQuote } from '../../utils/beichenModels'
 import { bindingAdapterMeta } from '../../utils/bindingAdapters'
 import { formatPercent, formatTokens, multiplyDecimal, shiftDecimal } from '../../utils/credits'
 import { schoolDay, statusLabel } from '../../utils/format'
@@ -58,6 +59,7 @@ const conditionsRow = ref<CatalogRow>()
 const usageOpen = ref(false)
 const initialModel = ref('')
 const websiteDirectory = computed(() => overview.value?.website_directory)
+const lastCrawl = computed(() => websiteDirectory.value?.last_run)
 const sourceLabels = { website: '官网', key: 'Key', both: '官网和 Key' } as const
 const protocolLabels: Record<string, string> = {
   openai_compatible: 'OpenAI Chat',
@@ -192,6 +194,12 @@ function summarizeCapabilities(model: string): CapabilitySummary | undefined {
 }
 const rescanKeys = computed(() => (overview.value?.credentials ?? []).filter(key => key.status === 'active'))
 const rescanKeyAvailable = computed(() => rescanKeys.value.some(key => key.credential_id === rescanKey.value))
+const billingByKey = computed(() => new Map((overview.value?.datasets ?? [])
+  .filter(dataset => dataset.kind === 'billing').map(dataset => [dataset.credential_id, dataset])))
+const billingRows = computed(() => rescanKeys.value.flatMap(key => {
+  const billing = billingByKey.value.get(key.credential_id)
+  return billing?.billing_state ? [{ ...billing, label: key.label }] : []
+}))
 const rebindModelCount = computed(() => new Set(rebindPlan.value?.changes.map(row => row.model_id)).size)
 const catalog = computed(() => {
   const data = overview.value
@@ -232,11 +240,14 @@ const catalog = computed(() => {
     const blockerMessages = blockers
       .filter(blocker => !routeBlocked || (blocker.code !== 'missing_price' && blocker.code !== 'conditional_price'))
       .map(blocker => blocker.message?.trim()).filter(Boolean)
+    const catalogKeys = entry?.catalog_keys ?? []
+    const groupMismatch = catalogKeys.some(key => key.group_diagnosis)
     const pricing = (row.quotes.length ? row.quotes : [null]).map(quote => ({
       key: quote?.key ?? 'missing',
       status: quote?.status ?? 'pending',
-      statusLabel: quote?.statusLabel ?? '单价待同步',
-      multiplierLabel: quote?.multiplierLabel,
+      statusLabel: groupMismatch && (!quote || quote.status === 'pending' || quote.status === 'not_listed')
+        ? '分组报价需核对' : quote?.statusLabel ?? '单价待同步',
+      multiplierLabel: quote?.multiplierLabel ?? (groupMismatch ? '请查看分组倍率' : undefined),
       notes: quote?.notes ?? [],
       official: displayPrice(quote, false),
       student: displayPrice(quote, true),
@@ -250,7 +261,7 @@ const catalog = computed(() => {
       websiteOnly,
       source,
       locations: entry?.website_locations ?? [],
-      catalogKeys: entry?.catalog_keys ?? [],
+      catalogKeys,
       protocolCount: entry?.protocols?.length ?? (capability ? capability.protocols.length : protocols.size || (routeCount === 0 ? 0 : null)),
       protocolLabels: entry?.catalog_state ? entry.protocols?.map(protocolLabel) ?? [] : capability
         ? capability.protocols.map(protocolLabel)
@@ -448,17 +459,45 @@ function availabilityTone(row: CatalogRow) {
 function keyCoverageLabel(key: BeichenCatalogKey) {
   const channel = key.school_channel || key.label
   const label = channel + (key.replacement ? ' 新 Key' : ' Key')
-  const details = (key.label === channel ? '' : ' · ' + key.label) + (key.group_id == null ? '' : ' · 分组 ' + key.group_id)
+  const group = key.group_id == null ? '' : (key.group_stale ? ' · 上次分组 ' : ' · 分组 ') + key.group_id
+  const details = (key.label === channel ? '' : ' · ' + key.label) + group
   const matchLabels = { exact: '', normalized: '名称归一后匹配', alias: '按教师别名匹配' } as const
   switch (key.state) {
     case 'listed':
       return label + (key.stale ? ' 上次目录有' : ' 目录有') + ' · ' + key.upstream_model
         + (key.match && matchLabels[key.match] ? ' · ' + matchLabels[key.match] : '') + details
-    case 'missing': return '官网有、' + label + ' 无' + details + '。请核查分组后重扫。'
+    case 'missing': return key.group_diagnosis === 'model_outside_key_group'
+      ? label + details + '。Key 分组不含该模型。'
+      : '官网有、' + label + ' 无' + details + '。请核查分组后重扫。'
     case 'failed': return label + ' 目录读取失败' + details + '，请重扫。'
     case 'pending': return label + ' 目录待同步' + details + '。'
     case 'ambiguous': return label + ' 有多个近似名称，请核查目录和教师别名。'
   }
+}
+
+function rateLabel(value?: string | number | null) {
+  const rate = shiftDecimal(value, 0)
+  return rate === '—' ? '未知' : rate + '×'
+}
+
+function groupPriceComparison(key: BeichenCatalogKey, locations: BeichenWebsiteLocation[]) {
+  const billing = billingByKey.value.get(key.credential_id)
+  const rulesDiffer = key.group_diagnosis === 'group_rate_mismatch'
+  const website = locations.flatMap(location => {
+    if (location.stale || !location.has_price) return []
+    const price = location.price_conditions_exact
+      ? formatPriceConditions(location.price_conditions_exact, null, true).standard : null
+    return location.groups
+      .filter(group => group.id != null && (!group.status || group.status === 'active') &&
+        (rulesDiffer ? group.id === key.group_id : group.id !== key.group_id))
+      .map(group => `官网分组 ${group.id} 价 · 倍率 ${rateLabel(group.rate_multiplier)}` +
+        (group.peak_rate_enabled ? ' · 高峰系数 ' + rateLabel(group.peak_rate_multiplier) : '') +
+        (price ? '\n' + withYuan(price) : ' · 单价明细未确认'))
+  })
+  const own = `Key 分组 ${key.group_id} 价 · 倍率 ${rateLabel(billing?.group_rate ?? billing?.effective_multiplier_text ?? billing?.effective_multiplier)}` +
+    (billing?.peak_enabled ? ' · 高峰系数 ' + rateLabel(billing.peak_rate) : '') +
+    (rulesDiffer ? ' · 分组计费规则待核对' : ' · 当前分组未列可匹配报价')
+  return [...new Set(website), own]
 }
 
 function websiteLocationLabel(location: BeichenWebsiteLocation) {
@@ -470,6 +509,7 @@ function websiteLocationLabel(location: BeichenWebsiteLocation) {
 }
 
 function catalogPriceLabel(row: CatalogRow) {
+  if (!row.priceCovered && row.catalogKeys.some(key => key.group_diagnosis)) return '分组报价需核对'
   if ((row.websiteOnly || row.priceState === 'missing') && row.locations.some(location => location.has_price)) {
     return '官网有报价，待 Key 确认'
   }
@@ -524,16 +564,15 @@ async function syncPrices() {
   }
 }
 
-async function rescanCatalog() {
-  const credentialId = rescanKey.value
-  if (busy.value || !rescanKeyAvailable.value) return
+async function rescanCatalog(credentialId = rescanKey.value) {
+  if (busy.value || !rescanKeys.value.some(key => key.credential_id === credentialId)) return
   const providerId = props.providerId
   const current = () => !disposed && props.providerId === providerId
   rescanning.value = true
   rescanError.value = ''
   try {
-    await teacherAPI.rescanBeichenCatalog(providerId, credentialId)
-    if (current()) toast.success('所选渠道目录已重扫')
+    await teacherAPI.syncBeichen(providerId, credentialId)
+    if (current()) toast.success('所选渠道分组、倍率和目录已同步')
   } catch (e) {
     if (current()) rescanError.value = apiErrorMessage(e, '所选渠道重扫失败，请稍后重试')
   } finally {
@@ -845,10 +884,25 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
         </dl>
       </details>
     </section>
+    <section v-if="billingRows.length" class="beichen-card" aria-label="北辰 Key 计费倍率">
+      <h3>Key 分组与倍率</h3>
+      <p v-for="billing in billingRows" :key="billing.credential_id" :role="billing.alert ? 'alert' : undefined" class="beichen-note">
+        <strong>{{ billing.label }}</strong>
+        <template v-if="billing.group_id != null"> · {{ billing.billing_state === 'stale' ? '上次分组' : '分组' }} {{ billing.group_id }}</template>
+        · {{ billing.billing_state === 'stale' ? '上次生效倍率' : '生效倍率' }} {{ rateLabel(billing.effective_multiplier_text ?? billing.effective_multiplier) }}
+        <template v-if="billing.group_rate != null"> · 分组倍率 {{ rateLabel(billing.group_rate) }}</template>
+        <template v-if="billing.peak_enabled"> · 高峰系数 {{ rateLabel(billing.peak_rate) }}</template>
+        <strong v-if="billing.billing_state === 'stale'"> · 倍率已陈旧，保留上次记录</strong>
+        <span v-else-if="billing.billing_state === 'unverified'"> · 计费倍率待核实</span>
+        · 上次成功 {{ syncTime(billing.last_success) }}
+        <strong v-if="billing.alert"> · 计费信息连续读取失败 {{ billing.failure_count === 6 ? '至少 6' : billing.failure_count }} 次</strong>
+        <span v-if="billing.last_error"> · {{ billing.last_error }}</span>
+      </p>
+    </section>
     <section v-if="overview?.website_only_status" class="beichen-card website-catalog" aria-label="官网目录">
       <div class="beichen-section-head">
         <h3>官网目录</h3>
-        <form v-if="rescanKeys.length" class="actions" @submit.prevent="rescanCatalog">
+        <form v-if="rescanKeys.length" class="actions" @submit.prevent="rescanCatalog()">
           <label class="sr-only" :for="reasonId + '-rescan-key'">选择要重扫的渠道 Key</label>
           <select :id="reasonId + '-rescan-key'" v-model="rescanKey" :disabled="busy">
             <option value="">选择渠道 Key</option>
@@ -862,6 +916,18 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
       </p>
       <p v-else-if="websiteDirectory?.state === 'unverified'" class="beichen-note">官网完整目录待同步<template v-if="websiteDirectory.last_error"> · {{ websiteDirectory.last_error }}</template></p>
       <p v-if="websiteDirectory?.last_success" class="beichen-note">最近完整读取 {{ syncTime(websiteDirectory.last_success) }}（北京时间）</p>
+      <template v-if="lastCrawl">
+        <p class="beichen-note">
+          上次抓取 {{ syncTime(lastCrawl.started_at) }}（北京时间），读到 {{ lastCrawl.model_count }} 个模型、{{ lastCrawl.platform_count }} 个平台、{{ lastCrawl.group_count }} 个分组，耗时 {{ lastCrawl.duration_ms }} 毫秒
+          <template v-if="lastCrawl.model_count !== lastCrawl.expected_model_count">。响应中能辨认出 {{ lastCrawl.expected_model_count }} 个不同型号。</template>
+        </p>
+        <ul v-if="lastCrawl.failures.length" class="beichen-note" aria-label="抓取失败项">
+          <li v-for="failure in lastCrawl.failures" :key="failure.path">
+            {{ [failure.channel || (failure.channel_id ? `渠道 ${failure.channel_id}` : ''), failure.platform].filter(Boolean).join(' / ') || '官网响应' }} · {{ failure.reason }}
+            <small v-if="!failure.platform && failure.path.startsWith('data[')">（{{ failure.path }}）</small>
+          </li>
+        </ul>
+      </template>
     </section>
     <p v-if="rescanError" class="error" role="alert">{{ rescanError }}</p>
     <div class="beichen-toolbar model-toolbar">
@@ -907,6 +973,13 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
               <small v-if="row.source" class="row-note" data-testid="catalog-source">来源 {{ sourceLabels[row.source] }}</small>
               <small v-for="key in row.catalogKeys.filter(key => key.state !== 'listed')" :key="key.credential_id"
                 class="row-note" data-testid="key-catalog-gap">{{ keyCoverageLabel(key) }}</small>
+              <div v-for="key in row.catalogKeys.filter(key => key.group_diagnosis)" :key="'group-' + key.credential_id"
+                class="row-note" data-testid="group-price-comparison">
+                <div v-for="line in groupPriceComparison(key, row.locations)" :key="line" class="price-detail">{{ line }}</div>
+                <p v-if="key.group_diagnosis === 'model_outside_key_group'">请在北辰切换到含该型号的分组，或在
+                  <RouterLink :to="{ name: 'teacher-providers' }">供应商管理</RouterLink>换用对应分组的 Key。</p>
+                <button type="button" class="button ghost" :disabled="busy" @click="rescanCatalog(key.credential_id)">重扫该 Key</button>
+              </div>
               <small v-if="row.keyCoverage === 0 && !row.catalogKeys.length" class="row-note">
                 {{ row.websiteOnly ? '暂无匹配的渠道 Key，请根据官网分组核对。' : '当前启用 Key 无目录覆盖，请查看 Key 健康和目录同步状态。' }}
               </small>

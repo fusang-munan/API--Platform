@@ -218,6 +218,18 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 配置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run 'TestBeichenWebsiteDirectoryPostgres|TestBeichenDirectoryNameMatching|TestBeichenPanelPricesMatchEquivalentKeySpelling' -count=1 -v`。测试仅用构造数据和假上游，覆盖多平台完整入库、空列表、空价格、名称变体和教师别名、仅官网型号、换 Key 后重新匹配、部分更新、失败保留和退避。运行 `npm test -- BeichenSchoolModels TeacherProviders` 检查教师页显示和指定 Key 重扫。
 
+从仓库根目录运行 `go run ./cmd/beichen-crawl --fixture ./internal/beichen/testdata/website-directory.json`。构造样本应读到 9 个平台、20 个去重型号和 5 个分组。可给 `--fixture` 传入完整的官网响应对象或其中的渠道数组。JSON 输出中的 `complete` 为 `true` 时，`model_count` 和 `expected_model_count` 一致，且 `failures` 为空。每个型号的 `sources` 保留各平台和分组，`price_complete` 表示该来源的 Token 报价具备当前规则所需的字段。明示零单价按数字处理，缺失、空白和 `null` 会保留型号。附带费用被忽略时，`ignored_fields` 给出字段名。
+
+用 `go test ./cmd/beichen-crawl ./internal/beichen -run 'Test(BeichenCrawl|CrawlCommand|BeichenWebsiteDirectoryPostgres)' -count=1 -v` 复查退出码、完整计数、单平台损坏、空价与零价、教师别名和抓取记录入库。看到 `complete=false` 时，用 `failures[].path` 和 `reason` 定位错误。网页不可读时教师页上次抓取可显示 0，先前已保存的目录仍可用于查看。需要核对 Key 时加 `--match-db` 并设置 `DATABASE_URL`，`key_matching=not_checked` 表示本轮没有执行这项核对。`key_matching=failed` 时查看 `key_match_error`。
+
+#### 改分组后仍显示旧倍率或缺报价
+
+旧模型页的定向重扫只读模型清单，旧概览的分组取自上次采价或预配映射。新版在「用指定 Key 重扫」后读取当前 Key 账单。查看「Key 分组与倍率」中的生效倍率、分组与上次成功时间。若显示「倍率已陈旧」，查看该行的账单错误并重扫。第三次连续失败会同时写入服务告警。待核的跟随价调用可由通过校验的北辰回执补记。
+
+行内出现「分组报价需核对」时，对照「官网分组 X 价」与「Key 分组 Y 价」及各自倍率。显示「Key 分组不含该模型」时，可在北辰为该 Key 选对应分组，或从供应商管理换用对应 Key，再重扫该 Key。
+
+设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run TestBeichenBillingGroupRefreshPostgres -count=1 -v`。构造数据覆盖 0.15 到 0.6 的切换、同平台不同分组单价、迟到的旧调用、仅高峰规则变更、官网读取失败、过期账单响应和连续失败告警。教师页运行 `npm test -- BeichenSchoolModels` 核对倍率与分组差异。
+
 #### 探活与目录差异
 
 设置 `NEBULA_TEST_POSTGRES` 为隔离的本机 `nebula_test` 后运行 `go test ./internal/beichen -run 'TestBeichenProbeAndCatalogPostgres|TestSingleAndBatchEnableUseSamePricesPostgres' -count=1`。探活测试使用模拟 HTTP 响应，核对协议请求的输出限制、重复排队、每小时触发、结果脱敏和 Key 轮换后的隔离。前端运行 `npm test -- BeichenSchoolModels TeacherProviders` 验证健康项、探活状态和目录差异。

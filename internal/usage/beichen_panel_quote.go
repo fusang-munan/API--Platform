@@ -244,6 +244,15 @@ func BeichenPanelDisplayTerms(raw json.RawMessage) json.RawMessage {
 	return quote.terms
 }
 
+// BeichenPanelIgnoredFields lists the price fields left out by normalization.
+func BeichenPanelIgnoredFields(raw json.RawMessage) []string {
+	quote, err := normalizeBeichenPanelQuote(raw)
+	if err != nil {
+		return nil
+	}
+	return quote.ignoredFields
+}
+
 // BeichenFlatTokenPrices projects the four fixed prices in upstream units
 // per token. Quotes with other rate conditions use the conditional ledger.
 func BeichenFlatTokenPrices(raw json.RawMessage) (input, output, cacheRead, cacheWrite *json.Number) {

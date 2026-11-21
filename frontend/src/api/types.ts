@@ -96,6 +96,15 @@ export type BeichenDataset = {
   last_success?: string | null
   last_error?: string | null
   effective_multiplier: number | string | null
+  effective_multiplier_text?: string
+  billing_state?: 'current' | 'stale' | 'unverified'
+  group_id?: number
+  group_rate?: string
+  peak_enabled?: boolean
+  peak_rate?: string
+  observed_at?: string
+  failure_count?: number
+  alert?: boolean
 }
 type BeichenDisplayRates = Partial<Record<keyof BeichenRates, number | string | null>>
 type BeichenPanelPrice = 'input_price' | 'output_price' | 'cache_read_price' | 'cache_write_price' |
@@ -144,6 +153,15 @@ export type BeichenComparison = {
   pending_review_calls?: number | null
   trial_unpriced_calls: number | null
 }
+export type BeichenCrawlRun = {
+  started_at: string
+  duration_ms: number
+  platform_count: number
+  group_count: number
+  model_count: number
+  expected_model_count: number
+  failures: Array<{ channel_id?: number; channel?: string; platform?: string; path: string; reason: string }>
+}
 export type BeichenOverview = {
   web_login_required?: boolean | null
   website_sync?: BeichenWebsiteSync | null
@@ -151,6 +169,7 @@ export type BeichenOverview = {
     state: 'fresh' | 'stale' | 'unverified'
     last_success: string | null
     last_error: string | null
+    last_run?: BeichenCrawlRun | null
   }
   maintenance_workspace?: { launch_url?: string | null } | null
   model_catalog?: BeichenCatalogModel[] | null
@@ -188,9 +207,11 @@ export type BeichenWebsiteLocation = {
   channel_id?: number
   channel?: string
   platform?: string
-  groups: Array<{ id?: number; name?: string; status?: string }>
+  groups: Array<{ id?: number; name?: string; status?: string; rate_multiplier?: number | string
+    peak_rate_multiplier?: number | string; peak_rate_enabled?: boolean }>
   observed_at: string
   has_price: boolean
+  price_conditions_exact?: BeichenPriceConditions
   stale?: boolean
 }
 export type BeichenCatalogKey = {
@@ -199,6 +220,8 @@ export type BeichenCatalogKey = {
   school_channel?: string
   replacement?: boolean
   group_id: number | null
+  group_stale?: boolean
+  group_diagnosis?: 'model_outside_key_group' | 'price_outside_key_group' | 'group_rate_mismatch'
   state: 'listed' | 'missing' | 'pending' | 'failed' | 'ambiguous'
   upstream_model?: string
   match?: 'exact' | 'normalized' | 'alias'

@@ -42,7 +42,8 @@ func TestBeichenPostgresDailyComparison(t *testing.T) {
 	execTestSQL(t, ctx, tx, "CREATE SCHEMA "+schema+"; SET LOCAL search_path TO "+schema)
 	execTestSQL(t, ctx, tx, `
 CREATE TABLE providers (id uuid PRIMARY KEY, base_url text NOT NULL);
-CREATE TABLE provider_credentials (id uuid PRIMARY KEY, provider_id uuid, label text NOT NULL DEFAULT '');
+CREATE TABLE provider_credentials (id uuid PRIMARY KEY, provider_id uuid, label text NOT NULL DEFAULT '',
+  updated_at timestamptz NOT NULL DEFAULT now(), credential_ciphertext bytea);
 CREATE TABLE users (id uuid PRIMARY KEY);
 CREATE TABLE gateway_calls (
   provider_id uuid, provider_credential_id uuid, binding_id uuid, upstream_model_name text,
@@ -52,11 +53,14 @@ CREATE TABLE gateway_calls (
   beichen_state text, beichen_credit_exact numeric, beichen_dispatch_kind text, beichen_dispatch_at timestamptz,
   beichen_dispatch_credential_id uuid, beichen_dispatch_model text, beichen_price_at timestamptz
 )`)
-	migration, err := os.ReadFile("../infrastructure/db/migrations/0030_beichen.sql")
-	if err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"0030_beichen.sql", "0033_beichen_panel_prices.sql",
+		"0042_beichen_price_credential_identity.sql", "0051_beichen_billing_observations.sql"} {
+		migration, err := os.ReadFile("../infrastructure/db/migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		execTestSQL(t, ctx, tx, string(migration))
 	}
-	execTestSQL(t, ctx, tx, string(migration))
 	aliases, err := os.ReadFile("../infrastructure/db/migrations/0046_beichen_billing_checks_and_aliases.sql")
 	if err != nil {
 		t.Fatal(err)
@@ -190,6 +194,21 @@ SELECT count(DISTINCT effective_at) FROM (
 ) versions`, newCredential).Scan(&effectiveTimes)
 	if err != nil || effectiveTimes != 1 {
 		t.Fatalf("billing batch has %d effective timestamps: %v", effectiveTimes, err)
+	}
+	group := int64(60)
+	info.GroupID = &group
+	at, err := priceTimestamp(ctx, tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveMultiplier(ctx, tx, newCredential, info, at); err != nil {
+		t.Fatal(err)
+	}
+	var noGroupQuote bool
+	if err := tx.QueryRowContext(ctx, `SELECT upstream_input IS NULL AND
+  (SELECT upstream_input=1.25 FROM beichen_price_at($1, 'example-a', $2::timestamptz-interval '1 microsecond'))
+FROM beichen_price_at($1, 'example-a', $2)`, newCredential, at).Scan(&noGroupQuote); err != nil || !noGroupQuote {
+		t.Fatalf("legacy price from before the verified group was carried into the new group: %v", err)
 	}
 
 	yesterday := usageRow{date: "2026-11-17", model: "gemini-3.1-flash-lite", requests: &two}

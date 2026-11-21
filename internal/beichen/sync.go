@@ -15,10 +15,11 @@ import (
 )
 
 const (
-	sweepInterval = time.Minute
-	sweepTimeout  = time.Minute
-	jobTimeout    = 25 * time.Second
-	leaseSeconds  = 90
+	sweepInterval        = time.Minute
+	sweepTimeout         = time.Minute
+	jobTimeout           = 25 * time.Second
+	leaseSeconds         = 90
+	billingAlertFailures = 3
 )
 
 type syncJob struct {
@@ -229,6 +230,11 @@ WHERE c.id = $1 AND p.id = $2 AND p.status = 'active' AND c.status = 'active' AN
 	key, err := s.crypto.DecryptCredential(credential.ciphertext)
 	if err != nil {
 		result := fetchResult{err: errors.New("北辰凭据解密失败")}
+		if job.kind == "billing" {
+			result.save = func(ctx context.Context, tx *sql.Tx) error {
+				return saveBillingObservation(ctx, tx, job.credential, credential.updatedAt, billingInfo{}, result.err, 0, panelQuote{})
+			}
+		}
 		return false, s.finishJob(ctx, job, lease, credential, result, manual)
 	}
 	deadline, cancel := context.WithTimeout(ctx, jobTimeout)
@@ -264,6 +270,15 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 	if billingErr == nil {
 		info, billingErr = parseBilling(body)
 	}
+	if billingErr == nil {
+		switch {
+		case info.ObservedAt.IsZero() && billingPanelGroup(info) == 0 && !s.WebSessionConfigured():
+			// The legacy multiplier-only response does not carry a sample time.
+			info.ObservedAt = s.now().UTC()
+		case info.ObservedAt.Before(requestedAt.Add(-2*time.Second)) || info.ObservedAt.After(s.now()):
+			billingErr = errors.New("北辰 Key 账单采样时间无效或早于本轮同步")
+		}
+	}
 	entries, catalogErr := s.fetchKeyCatalog(ctx, key)
 	catalogAt := s.now().UTC()
 	access, accessErr := s.loadPriceAccess(ctx, job.credential)
@@ -276,8 +291,6 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 		quote.err = catalogErr
 	case accessErr != nil:
 		quote.err = accessErr
-	case (group != 0 || s.WebSessionConfigured()) && info.ObservedAt.Before(requestedAt.Add(-2*time.Second)):
-		quote.err = errors.New("北辰 Key 账单报价早于本轮采样")
 	default:
 		quote = s.fetchChannelQuote(ctx, access, key, info, entries)
 	}
@@ -408,16 +421,42 @@ func saveBilling(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, info b
 }
 
 func saveMultiplier(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, info billingInfo, effectiveAt time.Time) error {
+	var observedAt *time.Time
+	if !info.ObservedAt.IsZero() {
+		observedAt = &info.ObservedAt
+	}
 	_, err := tx.ExecContext(ctx, `
-INSERT INTO beichen_multiplier_versions (credential_id, multiplier, timezone, effective_at)
-SELECT $1::uuid, $2::text::numeric, NULLIF($3::text, ''), $4::timestamptz
+WITH observation AS (
+  SELECT $1::uuid AS credential_id, $2::text::numeric AS multiplier, NULLIF($3::text, '') AS timezone,
+    $4::timestamptz AS effective_at, NULLIF($5::bigint, 0) AS group_id,
+    NULLIF($6::text, '')::numeric AS group_rate, $7::boolean AS peak_enabled,
+    NULLIF($8::text, '')::numeric AS peak_rate, NULLIF($9::text, '') AS peak_start,
+    NULLIF($10::text, '') AS peak_end, $11::timestamptz AS observed_at
+)
+INSERT INTO beichen_multiplier_versions
+  (credential_id, multiplier, timezone, effective_at, group_id, group_rate, peak_enabled, peak_rate, peak_start, peak_end, observed_at)
+SELECT observation.* FROM observation
 WHERE NOT EXISTS (
   SELECT 1 FROM (
-    SELECT multiplier, timezone FROM beichen_multiplier_versions WHERE credential_id = $1
+    SELECT * FROM beichen_multiplier_versions WHERE credential_id = $1
     ORDER BY effective_at DESC, id DESC LIMIT 1
   ) previous
-  WHERE previous.multiplier = $2::text::numeric AND previous.timezone IS NOT DISTINCT FROM NULLIF($3::text, '')
-)`, credentialID, info.Multiplier.String(), info.Timezone, effectiveAt)
+  WHERE previous.stale_at IS NULL AND
+    ROW(previous.multiplier, previous.timezone, previous.group_id, previous.group_rate, previous.peak_enabled,
+        previous.peak_rate, previous.peak_start, previous.peak_end)
+    IS NOT DISTINCT FROM
+    ROW(observation.multiplier, observation.timezone, observation.group_id, observation.group_rate, observation.peak_enabled,
+        observation.peak_rate, observation.peak_start, observation.peak_end)
+)`, credentialID, info.Multiplier.String(), info.Timezone, effectiveAt, billingPanelGroup(info),
+		info.GroupRate.String(), info.PeakEnabled, info.PeakRate.String(), info.PeakStart, info.PeakEnd, observedAt)
+	return err
+}
+
+func markMultiplierStale(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, effectiveAt time.Time) error {
+	_, err := tx.ExecContext(ctx, `
+UPDATE beichen_multiplier_versions SET stale_at = $2
+WHERE id = (SELECT id FROM beichen_multiplier_versions WHERE credential_id = $1 AND effective_at <= $2
+  ORDER BY effective_at DESC, id DESC LIMIT 1) AND stale_at IS NULL`, credentialID, effectiveAt)
 	return err
 }
 
@@ -482,7 +521,8 @@ WHERE credential_id=$1 AND kind='billing'`, job.credential)
 		value := result.err.Error()
 		message = &value
 	}
-	_, err = tx.ExecContext(ctx, `
+	var failures int
+	err = tx.QueryRowContext(ctx, `
 UPDATE beichen_datasets SET
   last_success = CASE WHEN $3 THEN clock_timestamp() ELSE last_success END,
   last_error = $4, failure_count = CASE WHEN $6 THEN failure_count WHEN $4::text IS NULL THEN 0 ELSE LEAST(failure_count + 1, 6) END,
@@ -497,13 +537,17 @@ UPDATE beichen_datasets SET
     WHEN $4 IS NULL OR kind = 'usage' THEN clock_timestamp() + $5::int * interval '1 minute'
     ELSE clock_timestamp() + power(2, LEAST(failure_count, 6)) * interval '1 minute' END,
   lease_id = NULL, lease_until = NULL
-WHERE credential_id = $1 AND kind = $2`, job.credential, job.kind,
-		(result.save != nil && job.kind != "billing") || result.err == nil, message, refreshMinutes(job.kind), manual && job.kind == "usage")
+WHERE credential_id = $1 AND kind = $2
+RETURNING failure_count`, job.credential, job.kind,
+		(result.save != nil && job.kind != "billing") || result.err == nil, message, refreshMinutes(job.kind), manual && job.kind == "usage").Scan(&failures)
 	if err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	if job.kind == "billing" && failures == billingAlertFailures {
+		slog.Warn("北辰渠道倍率连续读取失败", "provider_id", job.provider, "credential_id", job.credential, "failures", failures)
 	}
 	return errors.Join(result.err, result.partialErr)
 }

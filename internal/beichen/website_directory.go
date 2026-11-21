@@ -5,10 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,30 +22,32 @@ type WebsiteDirectoryStatus struct {
 	State       string     `json:"state"`
 	LastSuccess *time.Time `json:"last_success"`
 	LastError   *string    `json:"last_error"`
+	LastRun     *CrawlRun  `json:"last_run"`
 }
 
 type WebsiteGroup struct {
-	ID     int64  `json:"id,omitempty"`
-	Name   string `json:"name,omitempty"`
-	Status string `json:"status,omitempty"`
+	ID          int64        `json:"id,omitempty"`
+	Name        string       `json:"name,omitempty"`
+	Status      string       `json:"status,omitempty"`
+	Rate        *json.Number `json:"rate_multiplier,omitempty"`
+	PeakRate    *json.Number `json:"peak_rate_multiplier,omitempty"`
+	PeakEnabled *bool        `json:"peak_rate_enabled,omitempty"`
 }
 
 type directoryGroup struct {
 	WebsiteGroup
-	Platform     string       `json:"platform,omitempty"`
-	Subscription string       `json:"subscription_type,omitempty"`
-	Rate         *json.Number `json:"rate_multiplier,omitempty"`
-	PeakEnabled  *bool        `json:"peak_rate_enabled,omitempty"`
-	PeakStart    string       `json:"peak_start,omitempty"`
-	PeakEnd      string       `json:"peak_end,omitempty"`
-	PeakRate     *json.Number `json:"peak_rate_multiplier,omitempty"`
+	Platform     string `json:"platform,omitempty"`
+	Subscription string `json:"subscription_type,omitempty"`
+	PeakStart    string `json:"peak_start,omitempty"`
+	PeakEnd      string `json:"peak_end,omitempty"`
 }
 
 type directoryModel struct {
-	Name       string          `json:"name"`
-	Platform   string          `json:"platform,omitempty"`
-	Pricing    json.RawMessage `json:"pricing"`
-	ObservedAt time.Time       `json:"observed_at"`
+	Name         string          `json:"name"`
+	Platform     string          `json:"platform,omitempty"`
+	Pricing      json.RawMessage `json:"pricing"`
+	ObservedAt   time.Time       `json:"observed_at"`
+	priceBlocker string
 }
 
 type directoryPlatform struct {
@@ -61,124 +60,6 @@ type directoryPlatform struct {
 	Groups        []directoryGroup `json:"groups"`
 	Models        []directoryModel `json:"models"`
 	Incomplete    bool             `json:"incomplete,omitempty"`
-}
-
-func decodeWebsiteDirectory(body []byte, observedAt time.Time) ([]directoryPlatform, error) {
-	data, err := panelData(body)
-	if err != nil {
-		return nil, err
-	}
-	var channels []json.RawMessage
-	if json.Unmarshal(data, &channels) != nil || len(channels) == 0 {
-		return nil, errWebsiteDirectoryEmpty
-	}
-	var platforms []directoryPlatform
-	partial, modelCount := false, 0
-	for i, raw := range channels {
-		var channel struct {
-			ID        int64             `json:"id"`
-			Name      string            `json:"name"`
-			Status    string            `json:"status"`
-			Platforms []json.RawMessage `json:"platforms"`
-		}
-		if json.Unmarshal(raw, &channel) != nil || channel.Platforms == nil {
-			partial = true
-			continue
-		}
-		for _, rawPlatform := range channel.Platforms {
-			section, ok := decodeDirectoryPlatform(rawPlatform, observedAt)
-			if !ok {
-				partial = true
-				continue
-			}
-			channelName := strings.TrimSpace(channel.Name)
-			section.ChannelID, section.Channel, section.ChannelStatus = channel.ID, channelName, channel.Status
-			section.Scope = directoryScope(section, i)
-			platforms = append(platforms, section)
-			modelCount += len(section.Models)
-			partial = partial || section.Incomplete
-		}
-	}
-	if modelCount == 0 {
-		return nil, errWebsiteDirectoryEmpty
-	}
-	if partial {
-		return platforms, errWebsiteDirectoryPartial
-	}
-	return platforms, nil
-}
-
-func decodeDirectoryPlatform(raw json.RawMessage, observedAt time.Time) (directoryPlatform, bool) {
-	var input struct {
-		Platform  string            `json:"platform"`
-		Groups    json.RawMessage   `json:"groups"`
-		Supported []json.RawMessage `json:"supported_models"`
-		Models    []json.RawMessage `json:"models"`
-	}
-	if json.Unmarshal(raw, &input) != nil || !validModel(strings.TrimSpace(input.Platform)) {
-		return directoryPlatform{}, false
-	}
-	rows := input.Supported
-	if rows == nil {
-		rows = input.Models
-	}
-	if rows == nil {
-		return directoryPlatform{}, false
-	}
-	section := directoryPlatform{Platform: strings.TrimSpace(input.Platform), ObservedAt: observedAt,
-		Groups: []directoryGroup{}, Models: []directoryModel{}}
-	var groups []json.RawMessage
-	if len(input.Groups) != 0 && json.Unmarshal(input.Groups, &groups) != nil {
-		section.Incomplete = true
-	}
-	for _, item := range groups {
-		var group directoryGroup
-		if json.Unmarshal(item, &group) != nil || group.ID < 0 || group.ID > 9007199254740991 ||
-			(group.ID == 0 && strings.TrimSpace(group.Name) == "") {
-			section.Incomplete = true
-			continue
-		}
-		section.Groups = append(section.Groups, group)
-	}
-	for _, item := range rows {
-		var model struct {
-			directoryModel
-			ID string `json:"id"`
-		}
-		err := json.Unmarshal(item, &model)
-		name := strings.TrimSpace(model.Name)
-		if name == "" {
-			name = strings.TrimSpace(model.ID)
-		}
-		if err != nil || !validModel(name) {
-			section.Incomplete = true
-			continue
-		}
-		model.Name, model.ObservedAt = name, observedAt
-		section.Models = append(section.Models, model.directoryModel)
-	}
-	return section, true
-}
-
-func directoryScope(section directoryPlatform, index int) string {
-	platform := strings.ToLower(section.Platform)
-	if section.ChannelID > 0 {
-		return fmt.Sprintf("%d/%s", section.ChannelID, platform)
-	}
-	if section.Channel != "" {
-		return fmt.Sprintf("%q/%s", strings.ToLower(section.Channel), platform)
-	}
-	groups := make([]int64, 0, len(section.Groups))
-	for _, group := range section.Groups {
-		if group.ID > 0 {
-			groups = append(groups, group.ID)
-		}
-	}
-	if len(groups) != 0 {
-		slices.Sort(groups)
-		return fmt.Sprintf("%v/%s", groups, platform)
-	}
-	return fmt.Sprintf("channel-%d/%s", index, platform)
 }
 
 // On partial reads, replace complete scopes and preserve observations that were
@@ -205,6 +86,13 @@ func mergeWebsiteDirectory(previous, current []directoryPlatform) []directoryPla
 				section.Groups = append(section.Groups, group)
 			}
 		}
+		oldModels := make(map[string]bool, len(old.Models))
+		for _, model := range old.Models {
+			oldModels[model.Name] = true
+		}
+		section.Models = slices.DeleteFunc(section.Models, func(model directoryModel) bool {
+			return model.priceBlocker == crawlPriceInvalid && oldModels[model.Name]
+		})
 		models := make(map[string]bool, len(section.Models))
 		for _, model := range section.Models {
 			models[model.Name] = true
@@ -273,14 +161,17 @@ RETURNING platforms`, provider, lease, leaseSeconds, manual).Scan(&previous)
 		return err
 	}
 	fetch, cancel := context.WithTimeout(ctx, jobTimeout)
-	platforms, observedErr := s.fetchWebsiteDirectory(fetch)
+	crawl, observedErr := s.crawlWebsiteDirectory(fetch, "")
 	cancel()
+	platforms := crawl.platforms
 	if errors.Is(observedErr, errWebsiteDirectoryPartial) {
 		var old []directoryPlatform
 		if err := json.Unmarshal(previous, &old); err != nil {
 			return err
 		}
 		platforms = mergeWebsiteDirectory(old, platforms)
+	} else if observedErr != nil {
+		platforms = nil
 	}
 
 	var snapshot, message *string
@@ -294,68 +185,63 @@ RETURNING platforms`, provider, lease, leaseSeconds, manual).Scan(&previous)
 			snapshot = &body
 		} else {
 			observedErr = errors.New("北辰官网目录超过存储上限")
+			crawl.addFailure("snapshot", directoryPlatform{}, observedErr.Error())
 		}
 	}
 	if observedErr != nil {
 		safeMessage := observedErr.Error()
 		message = &safeMessage
 	}
+	failures, err := json.Marshal(crawl.Failures)
+	if err != nil {
+		return err
+	}
 	var saved uuid.UUID
 	err = s.db.QueryRowContext(ctx, `
-UPDATE beichen_website_directories SET platforms=COALESCE($3::jsonb,platforms),
-  last_success=CASE WHEN $4::text IS NULL THEN clock_timestamp() ELSE last_success END,
-  last_error=$4,
-  failure_count=CASE WHEN $4 IS NULL THEN 0 ELSE LEAST(failure_count+1,6) END,
-  next_attempt=clock_timestamp()+CASE WHEN $4 IS NULL THEN $5::int*interval '1 minute'
-    ELSE power(2,LEAST(failure_count,5))*interval '1 minute' END,
-  lease_id=NULL,lease_until=NULL
-WHERE provider_id=$1 AND lease_id=$2 AND lease_until>clock_timestamp()
-RETURNING provider_id`, provider, lease, snapshot, message, int(websiteDirectoryInterval/time.Minute)).Scan(&saved)
+WITH saved AS (
+  UPDATE beichen_website_directories SET platforms=COALESCE($3::jsonb,platforms),
+    last_success=CASE WHEN $4::text IS NULL THEN clock_timestamp() ELSE last_success END,
+    last_error=$4,
+    failure_count=CASE WHEN $4 IS NULL THEN 0 ELSE LEAST(failure_count+1,6) END,
+    next_attempt=clock_timestamp()+CASE WHEN $4 IS NULL THEN $5::int*interval '1 minute'
+      ELSE power(2,LEAST(failure_count,5))*interval '1 minute' END,
+    lease_id=NULL,lease_until=NULL
+  WHERE provider_id=$1 AND lease_id=$2 AND lease_until>clock_timestamp()
+  RETURNING provider_id
+)
+INSERT INTO beichen_crawl_runs (provider_id, started_at, duration_ms, platform_count, group_count, model_count, expected_model_count, failures)
+SELECT provider_id,$6,$7,$8,$9,$10,$11,$12::jsonb FROM saved
+ON CONFLICT (provider_id) DO UPDATE SET
+  started_at=EXCLUDED.started_at, duration_ms=EXCLUDED.duration_ms, platform_count=EXCLUDED.platform_count,
+  group_count=EXCLUDED.group_count, model_count=EXCLUDED.model_count,
+  expected_model_count=EXCLUDED.expected_model_count, failures=EXCLUDED.failures
+RETURNING provider_id`, provider, lease, snapshot, message, int(websiteDirectoryInterval/time.Minute),
+		crawl.StartedAt, crawl.DurationMS, crawl.PlatformCount, crawl.GroupCount, crawl.ModelCount,
+		crawl.ExpectedModelCount, string(failures)).Scan(&saved)
 	return errors.Join(observedErr, err)
-}
-
-func (s *Service) fetchWebsiteDirectory(ctx context.Context) ([]directoryPlatform, error) {
-	token, err := s.webPanelToken(ctx)
-	if err != nil {
-		return nil, errors.New("北辰官网目录会话不可用")
-	}
-	read := func(bearer string) ([]directoryPlatform, error) {
-		body, err := s.fetchPanelBody(ctx, bearer)
-		if err != nil {
-			return nil, err
-		}
-		return decodeWebsiteDirectory(body, s.now().UTC())
-	}
-	platforms, err := read(token)
-	if !panelAuthFailed(err) {
-		return platforms, err
-	}
-	s.webReadError(token, upstreamHTTPStatus(http.StatusUnauthorized))
-	token, err = s.webPanelToken(ctx)
-	if err != nil {
-		return nil, errors.New("北辰官网目录会话续期失败")
-	}
-	platforms, err = read(token)
-	if panelAuthFailed(err) {
-		s.webReadError(token, upstreamHTTPStatus(http.StatusUnauthorized))
-	}
-	return platforms, err
 }
 
 func readWebsiteDirectory(ctx context.Context, tx *sql.Tx, provider uuid.UUID) (WebsiteDirectoryStatus, []directoryPlatform, error) {
 	status := WebsiteDirectoryStatus{State: "unverified"}
-	var raw []byte
+	var raw, lastRun []byte
 	var stale bool
 	err := tx.QueryRowContext(ctx, `
-SELECT platforms,last_success,last_error,last_error IS NOT NULL OR
-  COALESCE(last_success < statement_timestamp()-$2::int*interval '1 minute',false)
-FROM beichen_website_directories WHERE provider_id=$1`, provider, int(2*websiteDirectoryInterval/time.Minute)).
-		Scan(&raw, &status.LastSuccess, &status.LastError, &stale)
+SELECT d.platforms,d.last_success,d.last_error,d.last_error IS NOT NULL OR
+  COALESCE(d.last_success < statement_timestamp()-$2::int*interval '1 minute',false),
+  to_jsonb(r)-'provider_id'
+FROM beichen_website_directories d LEFT JOIN beichen_crawl_runs r USING (provider_id)
+WHERE d.provider_id=$1`, provider, int(2*websiteDirectoryInterval/time.Minute)).
+		Scan(&raw, &status.LastSuccess, &status.LastError, &stale, &lastRun)
 	if errors.Is(err, sql.ErrNoRows) {
 		return status, nil, nil
 	}
 	if err != nil {
 		return status, nil, err
+	}
+	if len(lastRun) != 0 {
+		if err := json.Unmarshal(lastRun, &status.LastRun); err != nil {
+			return status, nil, err
+		}
 	}
 	if status.LastSuccess != nil {
 		at := status.LastSuccess.UTC()

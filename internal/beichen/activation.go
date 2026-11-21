@@ -54,15 +54,14 @@ SELECT k.model_id::text,k.raw_entry,p.name::text,c.id,c.label::text,
  p.status='active' AND c.status='active',
  CASE WHEN d.last_error IS NULL AND d.last_success>=c.updated_at
    AND d.last_success>statement_timestamp()-interval '16 minutes'
-   AND (snap.expires_at IS NULL OR snap.expires_at>statement_timestamp())
+   AND mv.stale_at IS NULL
  THEN mv.multiplier::text END, to_json(k.supported_protocols)
 FROM provider_model_catalog k JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
 JOIN providers p ON p.id=c.provider_id
 LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='billing'
-LEFT JOIN LATERAL (SELECT multiplier FROM beichen_multiplier_versions WHERE credential_id=c.id
+LEFT JOIN LATERAL (SELECT multiplier,stale_at FROM beichen_multiplier_versions WHERE credential_id=c.id
+ AND effective_at<=statement_timestamp()
  ORDER BY effective_at DESC,id DESC LIMIT 1) mv ON true
-LEFT JOIN LATERAL (SELECT expires_at FROM beichen_panel_snapshots WHERE credential_id=c.id
- ORDER BY effective_at DESC LIMIT 1) snap ON true
 WHERE p.id=$1 AND ` + beichenProvider + ` AND k.status='active' AND ($2::text='' OR k.model_id=$2::citext)
 ORDER BY lower(k.model_id::text),c.id`
 	if source != "" {

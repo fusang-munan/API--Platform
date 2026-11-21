@@ -254,7 +254,7 @@ SET group_id=excluded.group_id, token_ciphertext=excluded.token_ciphertext,
 		}
 	}
 	if input.Enabled {
-		if err := invalidateChangedPanelQuote(ctx, tx, credential, version, version, input.GroupID, ""); err != nil {
+		if err := invalidateChangedPanelQuote(ctx, tx, credential, version, version, input.GroupID, false); err != nil {
 			return err
 		}
 	}

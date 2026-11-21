@@ -1,6 +1,7 @@
 package beichen
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
 type CatalogDifference struct {
@@ -28,26 +30,29 @@ type WebsiteOnlyModel struct {
 }
 
 type WebsiteLocation struct {
-	Name          string         `json:"name"`
-	ChannelID     int64          `json:"channel_id,omitempty"`
-	Channel       string         `json:"channel,omitempty"`
-	Platform      string         `json:"platform,omitempty"`
-	Groups        []WebsiteGroup `json:"groups"`
-	ObservedAt    time.Time      `json:"observed_at"`
-	HasPrice      bool           `json:"has_price"`
-	Stale         bool           `json:"stale,omitempty"`
-	channelStatus string
+	Name                 string         `json:"name"`
+	ChannelID            int64          `json:"channel_id,omitempty"`
+	Channel              string         `json:"channel,omitempty"`
+	Platform             string         `json:"platform,omitempty"`
+	Groups               []WebsiteGroup `json:"groups"`
+	ObservedAt           time.Time      `json:"observed_at"`
+	HasPrice             bool           `json:"has_price"`
+	PriceConditionsExact map[string]any `json:"price_conditions_exact,omitempty"`
+	Stale                bool           `json:"stale,omitempty"`
+	channelStatus        string
 }
 
 type CatalogKey struct {
 	CredentialRef
-	SchoolChannel string `json:"school_channel,omitempty"`
-	Replacement   bool   `json:"replacement,omitempty"`
-	GroupID       *int64 `json:"group_id"`
-	State         string `json:"state"`
-	UpstreamModel string `json:"upstream_model,omitempty"`
-	Match         string `json:"match,omitempty"`
-	Stale         bool   `json:"stale,omitempty"`
+	SchoolChannel  string `json:"school_channel,omitempty"`
+	Replacement    bool   `json:"replacement,omitempty"`
+	GroupID        *int64 `json:"group_id"`
+	GroupStale     bool   `json:"group_stale,omitempty"`
+	GroupDiagnosis string `json:"group_diagnosis,omitempty"`
+	State          string `json:"state"`
+	UpstreamModel  string `json:"upstream_model,omitempty"`
+	Match          string `json:"match,omitempty"`
+	Stale          bool   `json:"stale,omitempty"`
 }
 
 const keyCatalogCurrentSQL = `(d.last_error IS NULL AND COALESCE(d.last_success >= c.updated_at, false))`
@@ -71,11 +76,15 @@ ON CONFLICT (credential_id) DO UPDATE SET credential_revision = EXCLUDED.credent
 
 type discoveryKey struct {
 	CatalogKey
-	hint        string
-	legacyAt    *time.Time
-	legacyNames []string
-	models      map[string]*Model
-	matcher     catalogNameMatcher
+	hint         string
+	legacyAt     *time.Time
+	legacyGroup  *int64
+	legacyNames  []string
+	models       map[string]*Model
+	matcher      catalogNameMatcher
+	groupCurrent bool
+	platforms    map[string]bool
+	priceError   *string
 }
 
 func readDiscoveryKeys(ctx context.Context, tx *sql.Tx, provider uuid.UUID) ([]discoveryKey, error) {
@@ -83,7 +92,7 @@ func readDiscoveryKeys(ctx context.Context, tx *sql.Tx, provider uuid.UUID) ([]d
 SELECT c.id, c.label::text, COALESCE(school.channel,''), COALESCE(c.group_hint,''),
   EXISTS (SELECT 1 FROM beichen_provision_channels prev JOIN provider_credentials old ON old.id=prev.credential_id
     WHERE prev.channel=school.channel AND old.provider_id=c.provider_id AND old.created_at<c.created_at),
-  COALESCE(w.group_id,a.group_id), w.checked_at, to_json(w.models),
+  COALESCE(w.group_id,a.group_id), w.group_id, w.checked_at, to_json(w.models),
   `+keyCatalogCurrentSQL+`, d.last_error IS NOT NULL
 FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
 LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = 'catalog'
@@ -102,7 +111,7 @@ ORDER BY c.label, c.id`, provider)
 		var website []byte
 		var scanned, failed bool
 		if err := rows.Scan(&key.CredentialID, &key.Label, &key.SchoolChannel, &key.hint, &key.Replacement,
-			&key.GroupID, &key.legacyAt, &website, &scanned, &failed); err != nil {
+			&key.GroupID, &key.legacyGroup, &key.legacyAt, &website, &scanned, &failed); err != nil {
 			return nil, err
 		}
 		switch {
@@ -139,21 +148,28 @@ func readCatalogDifferences(ctx context.Context, tx *sql.Tx, provider uuid.UUID,
 		return err
 	}
 	view.WebsiteDirectory = status
+	indexKeyGroups(view.Datasets, keys, platforms)
 	indexDiscoveryKeys(view.Models, keys, aliases)
 	web := map[string][]WebsiteLocation{}
 	stale := status.State == "stale"
 	for _, section := range platforms {
-		groups := make([]WebsiteGroup, 0, len(section.Groups))
-		for _, group := range section.Groups {
-			groups = append(groups, group.WebsiteGroup)
-		}
+		groups := websiteGroups(section.Groups)
 		for _, model := range section.Models {
 			name := strings.ToLower(model.Name)
-			web[name] = append(web[name], WebsiteLocation{
+			location := WebsiteLocation{
 				Name: model.Name, ChannelID: section.ChannelID, Channel: section.Channel, Platform: section.Platform,
 				Groups: groups, ObservedAt: model.ObservedAt, HasPrice: hasPanelPrice(model.Pricing),
 				Stale: stale, channelStatus: section.ChannelStatus,
-			})
+			}
+			if location.HasPrice {
+				decoder := json.NewDecoder(bytes.NewReader(usage.BeichenPanelDisplayTerms(model.Pricing)))
+				decoder.UseNumber()
+				if err := decoder.Decode(&location.PriceConditionsExact); err != nil {
+					return err
+				}
+				stringifyPriceNumbers(location.PriceConditionsExact)
+			}
+			web[name] = append(web[name], location)
 		}
 	}
 	view.CatalogDifferences = make([]CatalogDifference, 0, len(keys))
@@ -161,7 +177,7 @@ func readCatalogDifferences(ctx context.Context, tx *sql.Tx, provider uuid.UUID,
 	allKeysScanned, anyWebsite := true, len(platforms) != 0
 	for _, key := range keys {
 		names, checked := websiteGroupCatalog(platforms, key.GroupID)
-		if len(platforms) == 0 && key.legacyAt != nil {
+		if len(platforms) == 0 && key.legacyAt != nil && key.GroupID != nil && *key.legacyGroup == *key.GroupID {
 			anyWebsite = true
 			names, checked = key.legacyNames, key.legacyAt
 			for _, name := range names {
@@ -177,7 +193,7 @@ func readCatalogDifferences(ctx context.Context, tx *sql.Tx, provider uuid.UUID,
 		allKeysScanned = allKeysScanned && scanned
 		if scanned && names != nil {
 			diff.State = "compared"
-			if stale {
+			if stale || key.GroupStale {
 				diff.State = "stale"
 			}
 			diff.WebsiteOnly, diff.KeyOnly = diffModelNames(names, key)
@@ -191,6 +207,48 @@ func readCatalogDifferences(ctx context.Context, tx *sql.Tx, provider uuid.UUID,
 	}
 	mergeCatalogDiscovery(view, keys, web)
 	return nil
+}
+
+func indexKeyGroups(datasets []Dataset, keys []discoveryKey, platforms []directoryPlatform) {
+	index := make(map[uuid.UUID]*discoveryKey, len(keys))
+	for i := range keys {
+		index[keys[i].CredentialID] = &keys[i]
+	}
+	for _, dataset := range datasets {
+		key := index[dataset.CredentialID]
+		if key == nil {
+			continue
+		}
+		switch dataset.Kind {
+		case "prices":
+			key.priceError = dataset.LastError
+		case "billing":
+			// The saved panel mapping is display evidence for legacy rows. A
+			// successful live observation supersedes it even if the group is unknown.
+			if dataset.ObservedAt != nil || dataset.GroupID != nil {
+				key.GroupID = dataset.GroupID
+			}
+			key.GroupStale = dataset.BillingState == "stale"
+			key.groupCurrent = dataset.BillingState == "current" && dataset.GroupID != nil
+			if !key.groupCurrent {
+				continue
+			}
+			key.platforms = map[string]bool{}
+			for _, section := range platforms {
+				if namesGroup(section.Groups, *key.GroupID) {
+					key.platforms[strings.ToLower(section.Platform)] = true
+				}
+			}
+		}
+	}
+}
+
+func websiteGroups(groups []directoryGroup) []WebsiteGroup {
+	items := make([]WebsiteGroup, 0, len(groups))
+	for _, group := range groups {
+		items = append(items, group.WebsiteGroup)
+	}
+	return items
 }
 
 func indexDiscoveryKeys(models []Model, keys []discoveryKey, aliases []ModelAlias) {
