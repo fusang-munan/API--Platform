@@ -2,7 +2,6 @@ package dataplane
 
 import (
 	"testing"
-	"time"
 
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/usage"
@@ -67,16 +66,16 @@ func TestBeichenRequestPricingEvidence(t *testing.T) {
 func TestBeichenPricingRequiresCompleteCompatibleCounters(t *testing.T) {
 	for _, tc := range []struct{ usage, reason string }{
 		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}`, ""},
+		{`{"input_tokens":59,"output_tokens":3,"prompt_cache_miss_tokens":55,"prompt_cache_hit_tokens":4}`, ""},
 		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cache_write_tokens":0}}`, beichenIncompleteUsage},
 		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cached_tokens":0}}`, beichenIncompleteUsage},
 		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cached_tokens":58,"cache_write_tokens":2}}`, beichenIncompleteUsage},
 		{`{"input_tokens":59,"output_tokens":3,"total_tokens":100,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}`, beichenIncompleteUsage},
 	} {
-		route := usage.CallRoute{SentAt: time.Now()}
 		response := parseJSONResponseMetrics(modelbinding.AdapterOpenaiResponses, []byte(`{"usage":`+tc.usage+`}`)).finished(false)
-		metrics, reason := beichenReviewMetrics(&route, modelbinding.AdapterOpenaiResponses, response, "")
+		metrics, reason := beichenReviewMetrics(modelbinding.AdapterOpenaiResponses, response, "")
 		if reason != tc.reason || (metrics.State == usage.UsageReported) != (tc.reason == "") ||
-			metrics.PromptTokens == nil || *metrics.PromptTokens != 59 || route.SentAt.IsZero() {
+			metrics.PromptTokens == nil || *metrics.PromptTokens != 59 {
 			t.Fatalf("unexpected pricing eligibility for %s: %q, %+v", tc.usage, reason, metrics)
 		}
 	}
@@ -87,8 +86,7 @@ func TestBeichenAnthropicStreamPricingUsesMessageModelAndSeparateCounters(t *tes
 	const terminal = "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
 	observer := sseObserver{adapter: modelbinding.AdapterAnthropic, beichen: true, expectedModel: "bound"}
 	observer.observe([]byte(opening + terminal))
-	route := usage.CallRoute{SentAt: time.Now()}
-	metrics, reason := beichenReviewMetrics(&route, observer.adapter, observer.metrics.finished(!observer.terminal), observer.review)
+	metrics, reason := beichenReviewMetrics(observer.adapter, observer.metrics.finished(!observer.terminal), observer.review)
 	if !observer.modelReported || reason != "" || metrics.State != usage.UsageReported {
 		t.Fatalf("Anthropic stream was not eligible for token pricing: %q, %+v", reason, metrics)
 	}

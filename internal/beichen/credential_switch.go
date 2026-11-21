@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -264,11 +263,9 @@ func includesSwitchRoute(routes []SwitchRoute, selected uuid.UUID) bool {
 // UseActiveCredentialHealth keeps retired Keys in the switch view while
 // reporting only enabled Keys in the teacher model coverage.
 func (view *Overview) UseActiveCredentialHealth() {
-	enabled := make(map[uuid.UUID]bool)
 	credentials := make([]CredentialSummary, 0, len(view.Credentials))
 	for _, key := range view.Credentials {
 		if key.Status == "active" {
-			enabled[key.CredentialID] = true
 			if key.Health.Pricing.State == "available" && key.PricedModelCount < key.ModelCount {
 				key.Health.Pricing.State = "pending"
 				key.Health.AvailableDimensions--
@@ -277,15 +274,8 @@ func (view *Overview) UseActiveCredentialHealth() {
 		}
 	}
 	view.Credentials = credentials
-	coverage := make(map[string]int)
-	for _, model := range view.Models {
-		if enabled[model.CredentialID] && model.available && (model.catalogPriceState() != "missing" || len(model.protocols) > 0) {
-			coverage[strings.ToLower(model.Model)]++
-		}
-	}
 	for i := range view.ModelCatalog {
 		model := &view.ModelCatalog[i]
-		model.KeyCount = coverage[strings.ToLower(model.Model)]
 		if model.BindingIssue != nil && model.ReadyCount == 0 {
 			model.BindingIssue.Message = "维护中。请在供应商管理打开「渠道切换向导」，同步接替 Key、核对报价和协议，再确认重绑。"
 		}

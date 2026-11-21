@@ -89,7 +89,7 @@ func (g *Gateway) proxyBeichenWebSocket(ctx context.Context, client, upstream *w
 		if active.review == "" && !active.modelReported {
 			active.review = beichenModelUnconfirmed
 		}
-		metrics, review := beichenReviewMetrics(&active.route, adapter, active.metrics.finished(!success), active.review)
+		metrics, review := beichenReviewMetrics(adapter, active.metrics.finished(!success), active.review)
 		if success && review != "" {
 			category, message = review, "The response requires billing review."
 		}
@@ -184,17 +184,14 @@ func (g *Gateway) proxyBeichenWebSocket(ctx context.Context, client, upstream *w
 				if active != nil {
 					event := rawString(payload["type"])
 					response := jsonObject(payload["response"])
-					responseID := rawString(response["id"])
-					if responseID == "" {
-						responseID = rawString(payload["response_id"])
-					}
+					responseID := responsesEventID(payload)
 					switch event {
 					case "response.created":
 						_, replayed := seen[responseID]
 						if active.responseID == "" && responseID != "" && !replayed && len(seen) < 4096 {
 							active.responseID = responseID
 							seen[responseID] = struct{}{}
-							active.metrics = parseJSONResponseMetrics(adapter, data)
+							active.metrics.applyPayload(adapter, payload)
 						} else if responseID != "" && active.responseID != "" && active.responseID != responseID && !replayed {
 							active.review = beichenUnsupportedPrice
 						}
@@ -205,7 +202,7 @@ func (g *Gateway) proxyBeichenWebSocket(ctx context.Context, client, upstream *w
 								active.review = beichenPayloadReview(data, active.route.UpstreamModelName, false)
 								active.modelReported = active.modelReported || beichenModelReported(payload, active.route.UpstreamModelName)
 							}
-							active.metrics = parseJSONResponseMetrics(adapter, data)
+							active.metrics.applyUsageSnapshot(adapter, payload)
 							status := rawString(response["status"])
 							finish((event == "response.completed" || event == "response.done") && (status == "" || status == "completed"))
 						}
@@ -213,6 +210,9 @@ func (g *Gateway) proxyBeichenWebSocket(ctx context.Context, client, upstream *w
 					if active != nil && active.review == "" && (responseID == "" || active.responseID == responseID) {
 						active.review = beichenPayloadReview(data, active.route.UpstreamModelName, false)
 						active.modelReported = active.modelReported || beichenModelReported(payload, active.route.UpstreamModelName)
+					}
+					if active != nil && active.responseID != "" && active.responseID == responseID && event != "response.created" {
+						active.metrics.applyPayload(adapter, payload)
 					}
 				}
 				callMu.Unlock()
@@ -237,4 +237,11 @@ func (g *Gateway) proxyBeichenWebSocket(ctx context.Context, client, upstream *w
 		<-done
 	}
 	finish(false)
+}
+
+func responsesEventID(payload map[string]json.RawMessage) string {
+	if id := rawString(jsonObject(payload["response"])["id"]); id != "" {
+		return id
+	}
+	return rawString(payload["response_id"])
 }

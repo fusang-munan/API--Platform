@@ -14,6 +14,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
+	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
 type Dataset struct {
@@ -38,6 +39,7 @@ type Model struct {
 	PriceCovered         bool            `json:"price_covered"`
 
 	available          bool
+	currentKey         bool
 	protocols          []string
 	probeState         string
 	lastProbeAt        *time.Time
@@ -78,18 +80,19 @@ type Comparison struct {
 }
 
 type Overview struct {
-	WebLoginRequired   bool                `json:"web_login_required,omitempty"`
-	WebsiteSync        WebsiteSyncStatus   `json:"website_sync"`
-	ArchivedUsage      []ArchivedUsage     `json:"archived_usage"`
-	Credentials        []CredentialSummary `json:"credentials"`
-	Datasets           []Dataset           `json:"datasets"`
-	Models             []Model             `json:"models"`
-	ModelCatalog       []CatalogModel      `json:"model_catalog"`
-	Comparison         []Comparison        `json:"comparison"`
-	CatalogDifferences []CatalogDifference `json:"catalog_differences"`
-	WebsiteOnlyModels  []WebsiteOnlyModel  `json:"website_only_models"`
-	WebsiteOnlyStatus  string              `json:"website_only_status"`
-	ProbeRun           ProbeRun            `json:"probe_run"`
+	WebLoginRequired   bool                   `json:"web_login_required,omitempty"`
+	WebsiteSync        WebsiteSyncStatus      `json:"website_sync"`
+	WebsiteDirectory   WebsiteDirectoryStatus `json:"website_directory"`
+	ArchivedUsage      []ArchivedUsage        `json:"archived_usage"`
+	Credentials        []CredentialSummary    `json:"credentials"`
+	Datasets           []Dataset              `json:"datasets"`
+	Models             []Model                `json:"models"`
+	ModelCatalog       []CatalogModel         `json:"model_catalog"`
+	Comparison         []Comparison           `json:"comparison"`
+	CatalogDifferences []CatalogDifference    `json:"catalog_differences"`
+	WebsiteOnlyModels  []WebsiteOnlyModel     `json:"website_only_models"`
+	WebsiteOnlyStatus  string                 `json:"website_only_status"`
+	ProbeRun           ProbeRun               `json:"probe_run"`
 }
 
 type CredentialSummary struct {
@@ -107,24 +110,28 @@ type CredentialSummary struct {
 }
 
 type CatalogModel struct {
-	CanEnable       bool             `json:"can_enable"`
-	SchoolStatus    string           `json:"school_status"`
-	SchoolModel     string           `json:"school_model,omitempty"`
-	Model           string           `json:"model"`
-	CredentialIDs   []uuid.UUID      `json:"credential_ids"`
-	PreferredRoutes []PreferredRoute `json:"preferred_routes"`
-	KeyCount        int              `json:"key_count"`
-	RouteCount      int              `json:"route_count"`
-	ReadyCount      int              `json:"ready_count"`
-	PriceState      string           `json:"price_state"`
-	PriceCovered    bool             `json:"price_covered"`
-	PriceBlocker    *CatalogBlocker  `json:"price_blocker,omitempty"`
-	Blockers        []CatalogBlocker `json:"blockers"`
-	Activation      string           `json:"activation"`
-	Protocols       []string         `json:"protocols"`
-	ProbeState      string           `json:"probe_state"`
-	LastProbeAt     *time.Time       `json:"last_probe_at"`
-	BindingIssue    *CatalogBlocker  `json:"binding_issue,omitempty"`
+	CanEnable        bool              `json:"can_enable"`
+	SchoolStatus     string            `json:"school_status"`
+	SchoolModel      string            `json:"school_model,omitempty"`
+	Model            string            `json:"model"`
+	CredentialIDs    []uuid.UUID       `json:"credential_ids"`
+	PreferredRoutes  []PreferredRoute  `json:"preferred_routes"`
+	KeyCount         int               `json:"key_count"`
+	Source           string            `json:"source,omitempty"`
+	CatalogState     string            `json:"catalog_state"`
+	CatalogKeys      []CatalogKey      `json:"catalog_keys,omitempty"`
+	WebsiteLocations []WebsiteLocation `json:"website_locations,omitempty"`
+	RouteCount       int               `json:"route_count"`
+	ReadyCount       int               `json:"ready_count"`
+	PriceState       string            `json:"price_state"`
+	PriceCovered     bool              `json:"price_covered"`
+	PriceBlocker     *CatalogBlocker   `json:"price_blocker,omitempty"`
+	Blockers         []CatalogBlocker  `json:"blockers"`
+	Activation       string            `json:"activation"`
+	Protocols        []string          `json:"protocols"`
+	ProbeState       string            `json:"probe_state"`
+	LastProbeAt      *time.Time        `json:"last_probe_at"`
+	BindingIssue     *CatalogBlocker   `json:"binding_issue,omitempty"`
 }
 
 type CatalogBlocker struct {
@@ -266,7 +273,8 @@ SELECT m.credential_id, m.model_id::text, p.mode,
   trim_scale(p.upstream_cache_read)::text, trim_scale(p.upstream_cache_write)::text,
   trim_scale(p.school_input * f.factor)::text, trim_scale(p.school_output * f.factor)::text,
   trim_scale(p.school_cache_read * f.factor)::text, trim_scale(p.school_cache_write * f.factor)::text,
-  owner.status = 'active' AND c.status = 'active', m.raw_entry, to_json(m.supported_protocols),
+  owner.status = 'active' AND c.status = 'active', m.last_seen_at >= c.updated_at,
+  m.raw_entry, to_json(m.supported_protocols),
   probe.checked_at, COALESCE(probe.passed, false), COALESCE(probe.credential_rejected, false),
   `+activationFixedSchoolPriceSQL+`
 FROM provider_model_catalog m
@@ -311,7 +319,7 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 		err := rows.Scan(&model.CredentialID, &model.Model, &model.Mode,
 			&model.SchoolStatus, &model.RouteReady, &terms,
 			&upstream.Input, &upstream.Output, &upstream.CacheRead, &upstream.CacheWrite,
-			&school.Input, &school.Output, &school.CacheRead, &school.CacheWrite, &model.available, &rawEntry, &protocols,
+			&school.Input, &school.Output, &school.CacheRead, &school.CacheWrite, &model.available, &model.currentKey, &rawEntry, &protocols,
 			&model.lastProbeAt, &passed, &model.credentialRejected, &fixedPrice)
 		if err != nil {
 			return err
@@ -337,7 +345,7 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 		}
 		model.PriceConditions = terms
 		if len(terms) > 0 {
-			decoder := json.NewDecoder(bytes.NewReader(terms))
+			decoder := json.NewDecoder(bytes.NewReader(usage.BeichenPanelDisplayTerms(terms)))
 			decoder.UseNumber()
 			if err := decoder.Decode(&model.PriceConditionsExact); err != nil {
 				return err
@@ -503,9 +511,6 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 		if row == nil {
 			continue
 		}
-		if state != "missing" || row.available && len(row.protocols) > 0 {
-			item.KeyCount++
-		}
 		if !row.available {
 			continue
 		}
@@ -625,24 +630,29 @@ func readComparison(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, start
 
 // 日对账、区间对账和学校用量共用归属及缓存归一化，避免把 OpenAI 的缓存输入重复计数。
 const attributedColumnsSQL = `a.credential_id, a.model, a.sent_at, c.beichen_state, c.beichen_credit_exact,
-    CASE WHEN c.usage_state = 'reported' THEN
-      CASE WHEN c.cache_miss_tokens IS NOT NULL THEN c.cache_miss_tokens
-           WHEN c.protocol = 'anthropic' THEN c.prompt_tokens::bigint
-           WHEN c.protocol IN ('openai_compatible','openai_responses','openai_realtime')
-             AND cache.reads::numeric + cache.writes <= c.prompt_tokens
+    CASE WHEN c.protocol = 'anthropic' THEN c.prompt_tokens::bigint
+         WHEN c.protocol = 'google_gemini_v1beta' AND cache.reads <= c.prompt_tokens
+           THEN (c.prompt_tokens::bigint - cache.reads)::numeric + COALESCE(c.tool_prompt_tokens,0)
+         WHEN cache.reads::numeric + cache.writes <= c.prompt_tokens
+           AND (c.cache_miss_tokens IS NULL OR c.cache_miss_tokens::numeric + cache.reads + cache.writes = c.prompt_tokens)
            THEN c.prompt_tokens::bigint - cache.reads - cache.writes
-      END
+         WHEN (cache.reads IS NULL OR cache.writes IS NULL) AND (c.prompt_tokens IS NULL OR
+           c.cache_miss_tokens::numeric + COALESCE(cache.reads,0) + COALESCE(cache.writes,0) <= c.prompt_tokens)
+           THEN c.cache_miss_tokens
     END AS input_tokens,
-    CASE WHEN c.usage_state = 'reported' THEN c.completion_tokens::bigint END AS output_tokens,
-    CASE WHEN c.usage_state = 'reported' THEN cache.reads END AS cache_read_tokens,
-    CASE WHEN c.usage_state = 'reported' THEN cache.writes END AS cache_write_tokens`
+    CASE WHEN c.protocol='google_gemini_v1beta' AND num_nonnulls(c.completion_tokens,c.reasoning_tokens)>0
+         THEN COALESCE(c.completion_tokens,0)::numeric + COALESCE(c.reasoning_tokens,0)
+         ELSE c.completion_tokens::numeric END AS output_tokens,
+    cache.reads AS cache_read_tokens, cache.writes AS cache_write_tokens`
 
 const attributedFromSQL = `
   FROM gateway_calls c
   CROSS JOIN LATERAL (SELECT
-    COALESCE(c.cache_hit_tokens, CASE WHEN c.protocol IN ('openai_compatible','openai_responses','openai_realtime')
+    COALESCE(c.cache_hit_tokens, CASE WHEN COALESCE(c.usage_reason,'response_interrupted')='response_interrupted'
+      AND c.protocol IN ('openai_compatible','openai_responses','openai_realtime')
       AND c.cache_miss_tokens::numeric + c.cache_write_tokens = c.prompt_tokens THEN 0::bigint END) AS reads,
-    COALESCE(c.cache_write_tokens, CASE WHEN c.protocol IN ('openai_compatible','openai_responses','openai_realtime')
+    COALESCE(c.cache_write_tokens, CASE WHEN COALESCE(c.usage_reason,'response_interrupted')='response_interrupted'
+      AND c.protocol IN ('openai_compatible','openai_responses','openai_realtime')
       AND c.cache_miss_tokens::numeric + c.cache_hit_tokens = c.prompt_tokens THEN 0::bigint END) AS writes
   ) cache
   CROSS JOIN LATERAL (SELECT
@@ -658,14 +668,14 @@ const attributedFromSQL = `
 
 const comparisonSQL = `
 WITH attributed AS (
-  SELECT ` + attributedColumnsSQL + attributedFromSQL + `
+  SELECT ` + attributedColumnsSQL + `, c.usage_state` + attributedFromSQL + `
 ), priced_calls AS (
   SELECT a.*, COALESCE(alias.school_model, a.model) AS school_model,
-    CASE WHEN cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN
-      beichen_weighted_tokens(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+    CASE WHEN usage_state = 'reported' AND cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN
+      beichen_weighted_tokens(input_tokens::bigint, output_tokens::bigint, cache_read_tokens, cache_write_tokens,
       p.upstream_input, p.upstream_output, p.upstream_cache_read, p.upstream_cache_write) END AS estimated_weight,
-    CASE WHEN cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN
-      beichen_weighted_tokens(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+    CASE WHEN usage_state = 'reported' AND cache_read_tokens IS NOT NULL AND cache_write_tokens IS NOT NULL THEN
+      beichen_weighted_tokens(input_tokens::bigint, output_tokens::bigint, cache_read_tokens, cache_write_tokens,
       p.school_input, p.school_output, p.school_cache_read, p.school_cache_write)
       * CASE WHEN p.mode = 'follow' THEN 100 ELSE 1 END END AS trial_weight
   FROM attributed a ` + joinModelAliasSQL + `

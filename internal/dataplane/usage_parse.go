@@ -21,6 +21,19 @@ func parseJSONResponseMetrics(adapter modelbinding.Adapter, body []byte) Respons
 	metrics := ResponseMetrics{}
 	if json.Unmarshal(body, &payload) == nil {
 		metrics.applyPayload(adapter, payload)
+	} else if adapter == modelbinding.AdapterGoogleGeminiV1beta && bytes.HasPrefix(bytes.TrimSpace(body), []byte("[")) {
+		// Gemini's REST streaming endpoint can return a JSON array when
+		// the caller does not select SSE.
+		var frames []map[string]json.RawMessage
+		if json.Unmarshal(body, &frames) != nil {
+			metrics.UsageReason = "invalid_usage_payload"
+			return metrics
+		}
+		for _, frame := range frames {
+			metrics.applyPayload(adapter, frame)
+		}
+	} else {
+		metrics.UsageReason = "invalid_usage_payload"
 	}
 	return metrics
 }
@@ -30,10 +43,16 @@ func (metrics ResponseMetrics) finished(interrupted bool) usage.CallMetrics {
 	switch {
 	case interrupted:
 		result.State = usage.UsageInterrupted
+		if result.UsageReason == "" {
+			result.UsageReason = "response_interrupted"
+		}
 	case result.HasUsage():
 		result.State = usage.UsageReported
 	default:
 		result.State = usage.UsageMissing
+		if result.UsageReason == "" {
+			result.UsageReason = "usage_not_reported"
+		}
 	}
 	return result
 }
@@ -50,6 +69,7 @@ func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, paylo
 	switch adapter {
 	case modelbinding.AdapterOpenaiResponses:
 		envelope = "response"
+		metrics.noteResponseID(payload["response_id"])
 	case modelbinding.AdapterAnthropic:
 		envelope = "message"
 	}
@@ -61,6 +81,27 @@ func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, paylo
 		}
 	}
 	metrics.applyUsage(adapter, payload["usage"])
+}
+
+// OpenAI's final usage is a snapshot. Earlier counters can still explain a
+// partial observation, but only a complete final snapshot can authorize a debit.
+func (metrics *ResponseMetrics) applyUsageSnapshot(adapter modelbinding.Adapter, payload map[string]json.RawMessage) {
+	final := ResponseMetrics{}
+	final.applyPayload(adapter, payload)
+	if metrics.HasUsage() && final.finished(false).ClassifyBeichenUsage(string(adapter)).State != usage.UsageReported {
+		metrics.applyPayload(adapter, payload)
+		if metrics.UsageReason == "" {
+			metrics.UsageReason = "terminal_usage_incomplete"
+		}
+		return
+	}
+	if final.UpstreamResponseID == "" {
+		final.UpstreamResponseID = metrics.UpstreamResponseID
+	}
+	if final.ReplyClosed == nil {
+		final.ReplyClosed, final.stopExplicit = metrics.ReplyClosed, metrics.stopExplicit
+	}
+	*metrics = final
 }
 
 func (metrics *ResponseMetrics) noteResponseID(raw json.RawMessage) {
@@ -75,8 +116,12 @@ func (metrics *ResponseMetrics) noteResponseID(raw json.RawMessage) {
 func (metrics *ResponseMetrics) applyUsage(adapter modelbinding.Adapter, raw json.RawMessage) {
 	values := jsonObject(raw)
 	if values == nil {
+		if field := bytes.TrimSpace(raw); len(field) != 0 && !bytes.Equal(field, []byte("null")) {
+			metrics.UsageReason = "invalid_usage_payload"
+		}
 		return
 	}
+	mergeCount := metrics.mergeCount
 	switch adapter {
 	case modelbinding.AdapterGoogleGeminiV1beta:
 		mergeCount(&metrics.PromptTokens, math.MaxInt32, values["promptTokenCount"])
@@ -84,19 +129,40 @@ func (metrics *ResponseMetrics) applyUsage(adapter modelbinding.Adapter, raw jso
 		mergeCount(&metrics.TotalTokens, math.MaxInt32, values["totalTokenCount"])
 		mergeCount(&metrics.CacheHitTokens, math.MaxInt64, values["cachedContentTokenCount"])
 		mergeCount(&metrics.ReasoningTokens, math.MaxInt64, values["thoughtsTokenCount"])
+		mergeCount(&metrics.ToolPromptTokens, math.MaxInt64, values["toolUsePromptTokenCount"])
 		return
 	case modelbinding.AdapterAnthropic:
 		mergeCount(&metrics.PromptTokens, math.MaxInt32, values["input_tokens"])
 		mergeCount(&metrics.CompletionTokens, math.MaxInt32, values["output_tokens"])
 		mergeCount(&metrics.CacheHitTokens, math.MaxInt64, values["cache_read_input_tokens"])
-		mergeCount(&metrics.CacheWriteTokens, math.MaxInt64, values["cache_creation_input_tokens"])
+		var writes *int64
+		mergeCount(&writes, math.MaxInt64, values["cache_creation_input_tokens"])
+		cache := jsonObject(values["cache_creation"])
+		var short, long *int64
+		mergeCount(&short, math.MaxInt64, cache["ephemeral_5m_input_tokens"])
+		mergeCount(&long, math.MaxInt64, cache["ephemeral_1h_input_tokens"])
+		if short != nil && long != nil && *short <= math.MaxInt64-*long {
+			total := *short + *long
+			if writes == nil {
+				writes = &total
+			} else if *writes != total {
+				metrics.UsageReason = "conflicting_cache_creation_counts"
+			}
+		} else if short != nil && long != nil {
+			metrics.UsageReason = "invalid_token_count"
+		}
+		if writes != nil {
+			metrics.CacheWriteTokens = writes
+		}
+		mergeCount(&metrics.ReasoningTokens, math.MaxInt64, jsonObject(values["output_tokens_details"])["thinking_tokens"])
 	case modelbinding.AdapterOpenaiResponses:
 		input := jsonObject(values["input_tokens_details"])
 		output := jsonObject(values["output_tokens_details"])
 		mergeCount(&metrics.PromptTokens, math.MaxInt32, values["input_tokens"])
 		mergeCount(&metrics.CompletionTokens, math.MaxInt32, values["output_tokens"])
-		mergeCount(&metrics.CacheHitTokens, math.MaxInt64, input["cached_tokens"])
-		mergeCount(&metrics.CacheWriteTokens, math.MaxInt64, input["cache_write_tokens"])
+		mergeCount(&metrics.CacheHitTokens, math.MaxInt64, input["cached_tokens"], values["prompt_cache_hit_tokens"])
+		mergeCount(&metrics.CacheMissTokens, math.MaxInt64, values["prompt_cache_miss_tokens"])
+		mergeCount(&metrics.CacheWriteTokens, math.MaxInt64, input["cache_write_tokens"], values["prompt_cache_write_tokens"])
 		mergeCount(&metrics.ReasoningTokens, math.MaxInt64, output["reasoning_tokens"])
 	default:
 		input := jsonObject(values["prompt_tokens_details"])
@@ -128,12 +194,19 @@ func jsonObject(raw json.RawMessage) map[string]json.RawMessage {
 	return value
 }
 
-func mergeCount(target **int64, maxValue int64, fields ...json.RawMessage) {
+func (metrics *ResponseMetrics) mergeCount(target **int64, maxValue int64, fields ...json.RawMessage) {
 	for _, field := range fields {
-		n, err := strconv.ParseInt(string(bytes.TrimSpace(field)), 10, 64)
+		value := bytes.TrimSpace(field)
+		if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+			continue
+		}
+		n, err := strconv.ParseInt(string(value), 10, 64)
 		if err == nil && n >= 0 && n <= maxValue {
 			*target = &n
 			return
+		}
+		if metrics.UsageReason == "" {
+			metrics.UsageReason = "invalid_token_count"
 		}
 	}
 }

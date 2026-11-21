@@ -3,9 +3,7 @@ package dataplane
 import (
 	"encoding/json"
 	"io"
-	"math"
 	"strings"
-	"time"
 
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/usage"
@@ -171,10 +169,13 @@ func beichenPayloadReview(data []byte, model string, request bool) string {
 }
 
 func beichenCacheAliasesAgree(counts map[string]any) bool {
-	details := objectField(counts, "prompt_tokens_details")
 	for _, fields := range [][2]string{{"cached_tokens", "prompt_cache_hit_tokens"}, {"cache_write_tokens", "prompt_cache_write_tokens"}} {
-		if nested, exists := details[fields[0]]; exists {
-			if flat, exists := counts[fields[1]]; exists {
+		if flat, exists := counts[fields[1]]; exists {
+			for _, name := range []string{"prompt_tokens_details", "input_tokens_details"} {
+				nested, present := objectField(counts, name)[fields[0]]
+				if !present {
+					continue
+				}
 				left, leftOK := nested.(float64)
 				right, rightOK := flat.(float64)
 				if !leftOK || !rightOK || left != right {
@@ -251,37 +252,13 @@ func beichenTextValue(value any) bool {
 	return true
 }
 
-func beichenReviewMetrics(route *usage.CallRoute, adapter modelbinding.Adapter, metrics usage.CallMetrics, reason string) (usage.CallMetrics, string) {
-	if reason == beichenUnsupportedPrice || reason == beichenModelMismatch {
-		// MarkSent still records dispatch. Without a valid pricing identity,
-		// the ledger must not replay this call against the bound text price.
-		route.SentAt = time.Time{}
+func beichenReviewMetrics(adapter modelbinding.Adapter, metrics usage.CallMetrics, reason string) (usage.CallMetrics, string) {
+	if reason == beichenIncompleteUsage && metrics.UsageReason == "" {
+		metrics.UsageReason = "conflicting_usage_fields"
 	}
-	if metrics.State != usage.UsageReported {
-		return metrics, reason
-	}
-	if reason == "" {
-		if metrics.PromptTokens == nil || metrics.CompletionTokens == nil ||
-			metrics.CacheHitTokens == nil || metrics.CacheWriteTokens == nil {
-			reason = beichenIncompleteUsage
-		} else {
-			input, hit, write := *metrics.PromptTokens, *metrics.CacheHitTokens, *metrics.CacheWriteTokens
-			output := *metrics.CompletionTokens
-			if adapter == modelbinding.AdapterAnthropic {
-				// Anthropic reports uncached input and each cache category separately.
-				if hit > math.MaxInt64-input-output || write > math.MaxInt64-input-output-hit ||
-					(metrics.TotalTokens != nil && *metrics.TotalTokens != input+hit+write+output) {
-					reason = beichenIncompleteUsage
-				}
-			} else if hit > input || write > input-hit ||
-				(metrics.CacheMissTokens != nil && *metrics.CacheMissTokens != input-hit-write) ||
-				(metrics.TotalTokens != nil && *metrics.TotalTokens != input+output) {
-				reason = beichenIncompleteUsage
-			}
-		}
-	}
-	if reason != "" {
-		metrics.State = usage.UsageMissing
+	metrics = metrics.ClassifyBeichenUsage(string(adapter))
+	if reason == "" && metrics.State == usage.UsagePartial {
+		reason = beichenIncompleteUsage
 	}
 	return metrics, reason
 }

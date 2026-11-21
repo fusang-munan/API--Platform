@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
+	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
 const (
@@ -168,17 +169,7 @@ func (s *Service) fetchPanelQuote(ctx context.Context, token, key string, group 
 		}
 		quote.groupID = match.GroupID
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, panelURL, nil)
-	if err != nil {
-		quote.err = errors.New("构建北辰面板请求失败")
-		return quote
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Cache-Control", "no-cache")
-	body, err := s.readResponse(req)
+	body, err := s.fetchPanelBody(ctx, token)
 	if err != nil {
 		quote.err = err
 		return quote
@@ -195,7 +186,14 @@ func (s *Service) fetchPanelQuote(ctx context.Context, token, key string, group 
 	}
 	quote.websiteModels = matched.websiteModels
 	for model, raw := range matched.terms {
-		if !hasPanelPrice(raw) {
+		if hasPanelPrice(raw) {
+			continue
+		}
+		// Keep structural diagnostics for tiers and unsupported fields, even
+		// if this model has no numeric rate in an otherwise observed quote.
+		code, _ := usage.BeichenTokenQuoteBlocker(raw)
+		switch code {
+		case "missing_price", "missing_input", "missing_output":
 			delete(matched.terms, model)
 		}
 	}
@@ -223,6 +221,19 @@ func (s *Service) fetchPanelQuote(ctx context.Context, token, key string, group 
 	}
 	quote.notListed = matched.notListed
 	return quote
+}
+
+func (s *Service) fetchPanelBody(ctx context.Context, token string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, panelURL, nil)
+	if err != nil {
+		return nil, errors.New("构建北辰面板请求失败")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Cache-Control", "no-cache")
+	return s.readResponse(req)
 }
 
 // The optional billing extension independently confirms panel prices. A tiered
@@ -374,6 +385,21 @@ type panelChannel struct {
 }
 
 func decodePanelChannels(body []byte) ([]panelChannel, error) {
+	data, err := panelData(body)
+	if err != nil {
+		return nil, err
+	}
+	var channels []panelChannel
+	if len(data) != 0 && json.Unmarshal(data, &channels) != nil {
+		return nil, errors.New("北辰面板价表格式无效")
+	}
+	if len(channels) == 0 {
+		return nil, errPanelEmpty
+	}
+	return channels, nil
+}
+
+func panelData(body []byte) (json.RawMessage, error) {
 	var payload struct {
 		Code json.RawMessage `json:"code"`
 		Data json.RawMessage `json:"data"`
@@ -383,14 +409,7 @@ func decodePanelChannels(body []byte) ([]panelChannel, error) {
 	}
 	switch string(payload.Code) {
 	case "0":
-		var channels []panelChannel
-		if len(payload.Data) != 0 && json.Unmarshal(payload.Data, &channels) != nil {
-			return nil, errors.New("北辰面板价表格式无效")
-		}
-		if len(channels) == 0 {
-			return nil, errPanelEmpty
-		}
-		return channels, nil
+		return payload.Data, nil
 	case "401", "403", `"UNAUTHORIZED"`, `"FORBIDDEN"`, `"TOKEN_EXPIRED"`:
 		return nil, errPanelLoginRequired
 	default:
@@ -444,19 +463,23 @@ func matchPanelPrices(channels []panelChannel, groupID int64, info billingInfo, 
 	if len(sections) == 0 || modelCount > maxRows {
 		return matchedPanelPrices{}, errors.New("北辰面板找不到映射分组或模型数量超限")
 	}
-	available := make(map[string]bool, len(entries))
+	keyNames := make([]string, 0, len(entries))
 	for _, model := range entries {
-		available[model.ID] = true
+		keyNames = append(keyNames, model.ID)
 	}
+	keyMatcher := newCatalogNameMatcher(keyNames, nil)
 	occurrences := make(map[string]int, modelCount)
+	websiteNames := make([]string, 0, modelCount)
 	complete := true
 	for _, section := range sections {
 		complete = complete && section.Models != nil
 		for _, model := range section.Models {
 			occurrences[model.Name]++
-			complete = complete && validModel(model.Name) && model.Platform == section.Platform
+			complete = complete && validModel(model.Name) && (model.Platform == "" || model.Platform == section.Platform)
+			websiteNames = append(websiteNames, model.Name)
 		}
 	}
+	websiteMatcher := newCatalogNameMatcher(websiteNames, nil)
 	matched := matchedPanelPrices{terms: make(map[string]json.RawMessage)}
 	if complete {
 		matched.websiteModels = make([]string, 0, len(occurrences))
@@ -467,22 +490,25 @@ func matchPanelPrices(channels []panelChannel, groupID int64, info billingInfo, 
 	for _, section := range sections {
 		for _, model := range section.Models {
 			if !validModel(model.Name) || occurrences[model.Name] != 1 ||
-				model.Platform != section.Platform || len(model.Pricing) == 0 || model.Pricing[0] != '{' {
+				(model.Platform != "" && model.Platform != section.Platform) || len(model.Pricing) == 0 || model.Pricing[0] != '{' {
 				continue
 			}
 			matched.hasPrices = matched.hasPrices || hasPanelPrice(model.Pricing)
-			if !available[model.Name] {
+			// Price by the Key's exact request ID after verifying the group.
+			// Only equivalent spellings that agree in both directions qualify.
+			key := keyMatcher.match(model.Name, false).name
+			if key == "" || websiteMatcher.match(key, false).name != model.Name {
 				continue
 			}
-			matched.terms[model.Name] = model.Pricing
+			matched.terms[key] = model.Pricing
 			if rates, ok := flatPanelRates(model.Pricing); ok {
-				matched.rows = append(matched.rows, priceRow{Model: model.Name, Rates: rates})
+				matched.rows = append(matched.rows, priceRow{Model: key, Rates: rates})
 			}
 		}
 	}
 	if complete && matched.hasPrices {
 		for _, model := range entries {
-			if validModel(model.ID) && occurrences[model.ID] == 0 {
+			if validModel(model.ID) && websiteMatcher.match(model.ID, true).kind == "" {
 				matched.notListed = append(matched.notListed, model.ID)
 			}
 		}
@@ -524,43 +550,16 @@ func hasPanelAmounts(fields map[string]json.RawMessage) bool {
 }
 
 func flatPanelRates(raw json.RawMessage) (Rates, bool) {
-	var pricing struct {
-		Mode                 string                     `json:"billing_mode"`
-		Input                *json.Number               `json:"input_price"`
-		Output               *json.Number               `json:"output_price"`
-		CacheRead            *json.Number               `json:"cache_read_price"`
-		CacheWrite           *json.Number               `json:"cache_write_price"`
-		CacheWrite1h         *json.Number               `json:"cache_write_1h_price"`
-		CacheWrite12h        *json.Number               `json:"cache_write_12h_price"`
-		ImageInput           *json.Number               `json:"image_input_price"`
-		ImageOutput          *json.Number               `json:"image_output_price"`
-		VideoInput           *json.Number               `json:"video_input_price"`
-		VideoOutput          *json.Number               `json:"video_output_price"`
-		PerRequest           *json.Number               `json:"per_request_price"`
-		Intervals            []json.RawMessage          `json:"intervals"`
-		ReasoningMultipliers map[string]json.RawMessage `json:"reasoning_effort_multipliers"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&pricing) != nil || (pricing.Mode != "" && pricing.Mode != "token") || pricing.Input == nil || pricing.Output == nil ||
-		pricing.CacheWrite1h != nil || pricing.CacheWrite12h != nil || pricing.ImageInput != nil || pricing.ImageOutput != nil ||
-		pricing.VideoInput != nil || pricing.VideoOutput != nil ||
-		pricing.PerRequest != nil || len(pricing.Intervals) != 0 {
+	input, output, read, write := usage.BeichenFlatTokenPrices(raw)
+	if input == nil || output == nil {
 		return Rates{}, false
-	}
-	for _, multiplier := range pricing.ReasoningMultipliers {
-		var value json.Number
-		if json.Unmarshal(multiplier, &value) != nil || !samePanelRate(value, "1") {
-			return Rates{}, false
-		}
 	}
 	var rates Rates
 	for _, field := range []struct {
 		number *json.Number
 		rate   **int64
 	}{
-		{pricing.Input, &rates.Input}, {pricing.Output, &rates.Output},
-		{pricing.CacheRead, &rates.CacheRead}, {pricing.CacheWrite, &rates.CacheWrite},
+		{input, &rates.Input}, {output, &rates.Output}, {read, &rates.CacheRead}, {write, &rates.CacheWrite},
 	} {
 		if field.number == nil {
 			continue
@@ -584,7 +583,7 @@ func flatPanelRates(raw json.RawMessage) (Rates, bool) {
 // cache TTL nor the context tier required to calculate this request's charge.
 func conditionalPanelPricing(raw json.RawMessage) bool {
 	var fields map[string]json.RawMessage
-	if json.Unmarshal(raw, &fields) != nil {
+	if json.Unmarshal(usage.BeichenPanelDisplayTerms(raw), &fields) != nil {
 		return false
 	}
 	for name, value := range fields {

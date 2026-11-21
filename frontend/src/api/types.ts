@@ -147,12 +147,17 @@ export type BeichenComparison = {
 export type BeichenOverview = {
   web_login_required?: boolean | null
   website_sync?: BeichenWebsiteSync | null
+  website_directory?: {
+    state: 'fresh' | 'stale' | 'unverified'
+    last_success: string | null
+    last_error: string | null
+  }
   maintenance_workspace?: { launch_url?: string | null } | null
   model_catalog?: BeichenCatalogModel[] | null
   credentials?: BeichenCredentialSummary[] | null
   catalog_differences?: BeichenCatalogDifference[] | null
   website_only_models?: BeichenWebsiteOnlyModel[]
-  website_only_status?: 'compared' | 'unverified'
+  website_only_status?: 'compared' | 'stale' | 'unverified'
   probe_run?: BeichenProbeRun
   datasets: BeichenDataset[] | null
   models: BeichenModel[] | null
@@ -168,7 +173,7 @@ export type BeichenCredentialSummary = {
 export type BeichenCatalogDifference = {
   credential_id: string
   label: string
-  state: 'compared' | 'unverified'
+  state: 'compared' | 'stale' | 'unverified'
   group_id: number | null
   checked_at: string | null
   website_only: string[]
@@ -177,6 +182,27 @@ export type BeichenCatalogDifference = {
 export type BeichenWebsiteOnlyModel = {
   model: string
   channels: Array<{ credential_id: string; label: string }>
+}
+export type BeichenWebsiteLocation = {
+  name: string
+  channel_id?: number
+  channel?: string
+  platform?: string
+  groups: Array<{ id?: number; name?: string; status?: string }>
+  observed_at: string
+  has_price: boolean
+  stale?: boolean
+}
+export type BeichenCatalogKey = {
+  credential_id: string
+  label: string
+  school_channel?: string
+  replacement?: boolean
+  group_id: number | null
+  state: 'listed' | 'missing' | 'pending' | 'failed' | 'ambiguous'
+  upstream_model?: string
+  match?: 'exact' | 'normalized' | 'alias'
+  stale?: boolean
 }
 export type BeichenModelAlias = { credential_id: string | null; upstream_model: string; school_model: string }
 export type BeichenModelAliasUpdate = Omit<BeichenModelAlias, 'school_model'> & { school_model: string | null }
@@ -375,6 +401,10 @@ export type BeichenCatalogModel = {
   credential_ids?: string[]
   preferred_routes?: BeichenPreferredRoute[] | null
   key_count?: number | null
+  source?: 'website' | 'key' | 'both'
+  catalog_state?: 'website_only' | 'key_listed' | 'catalog_missing'
+  catalog_keys?: BeichenCatalogKey[]
+  website_locations?: BeichenWebsiteLocation[]
   route_count?: number | null
   ready_count?: number | null
   price_state?: 'confirmed' | 'conditional' | 'manual' | 'missing' | 'mixed' | null

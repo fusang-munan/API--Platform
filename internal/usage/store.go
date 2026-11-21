@@ -739,7 +739,8 @@ func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metri
 	defer func() { _ = tx.Rollback() }()
 	review := false
 	if metrics.State == UsageReported {
-		err = tx.QueryRowContext(ctx, `SELECT COALESCE(beichen_state='pending_review' AND beichen_price_at IS NOT NULL,false)
+		err = tx.QueryRowContext(ctx, `SELECT COALESCE(beichen_state='pending_review' AND beichen_price_at IS NOT NULL
+			AND beichen_review_reason IN ('missing_terminal_usage','incomplete_token_breakdown'),false)
 			FROM gateway_calls WHERE id=$1 FOR UPDATE`, callID).Scan(&review)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
@@ -785,14 +786,25 @@ func writeCallMetrics(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics
 		cache_hit_tokens=COALESCE($7,cache_hit_tokens),cache_miss_tokens=COALESCE($8,cache_miss_tokens),
 		cache_write_tokens=COALESCE($9,cache_write_tokens),reasoning_tokens=COALESCE($10,reasoning_tokens),
 		upstream_credit_micros=COALESCE($11,upstream_credit_micros),
+		tool_prompt_tokens=COALESCE($14,tool_prompt_tokens),
 		usage_state=CASE
+			WHEN $12='reported' THEN 'reported'
 			WHEN usage_state='interrupted' OR $12='interrupted' THEN 'interrupted'
-			WHEN usage_state='reported' OR $12='reported' THEN 'reported'
+			WHEN usage_state='reported' THEN 'reported'
+			WHEN usage_state='partial' OR $12='partial' THEN 'partial'
 			ELSE COALESCE(NULLIF($12,''),usage_state)
+		END,
+		usage_reason=CASE
+			WHEN $12='reported' THEN NULL
+			WHEN $12='' OR (usage_state='interrupted' AND $12<>'interrupted') THEN usage_reason
+			WHEN $12='interrupted' OR usage_state IS NULL OR usage_state='missing' OR $12=usage_state
+				THEN COALESCE(NULLIF($13,''),usage_reason)
+			ELSE usage_reason
 		END
 	WHERE id=$1`, callID, metrics.UpstreamResponseID, metrics.PromptTokens, metrics.CompletionTokens,
 		metrics.TotalTokens, nullBool(metrics.ReplyClosed), metrics.CacheHitTokens, metrics.CacheMissTokens,
-		metrics.CacheWriteTokens, metrics.ReasoningTokens, metrics.UpstreamCreditMicros, string(metrics.State)); err != nil {
+		metrics.CacheWriteTokens, metrics.ReasoningTokens, metrics.UpstreamCreditMicros, string(metrics.State),
+		metrics.UsageReason, metrics.ToolPromptTokens); err != nil {
 		return err
 	}
 	return applyTurnTokenDelta(ctx, tx, turnID.UUID, tokenDelta(metrics.PromptTokens, oldPrompt),

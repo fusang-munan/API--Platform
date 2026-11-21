@@ -1,0 +1,86 @@
+{
+  "code": 0,
+  "data": [
+    {
+      "id": 100,
+      "name": "Claude 渠道",
+      "status": "active",
+      "platforms": [
+        {
+          "platform": "anthropic",
+          "groups": [{"id": 24, "name": "cc不满血", "platform": "anthropic", "rate_multiplier": 1.25, "peak_rate_enabled": false}],
+          "supported_models": [
+            {"name": "Claude Fable 5", "pricing": null},
+            {"name": "claude-opus-5", "platform": "anthropic"},
+            {"name": "claude-haiku-5", "platform": null, "pricing": {"input_price": null}}
+          ]
+        }
+      ]
+    },
+    {
+      "id": 110,
+      "name": "GPT 渠道",
+      "platforms": [
+        {
+          "platform": "openai",
+          "groups": [{"id": 21, "name": "G3", "platform": "openai"}],
+          "supported_models": [
+            {"name": "GPT-6.1-SOL", "pricing": {"billing_mode": "token", "input_price": 0.000001, "intervals": [{"min_tokens": 200000, "max_tokens": null, "output_price": 0.00002}]}},
+            {"name": "GPT 6.2 Sol", "pricing": {"cache_write_1h_price": 0.000003}},
+            {"name": "gpt-mini-20261120", "pricing": {"reasoning_effort_multipliers": {"high": 1.25}}},
+            {"name": "gpt-image-2", "pricing": {"per_request_price": 0.3}}
+          ]
+        },
+        {
+          "platform": "xai",
+          "groups": [{"id": 27, "name": "Grok Plus"}],
+          "supported_models": [
+            {"name": "grok-4.1"}, {"name": "grok-4.2"}, {"name": "grok-4.3-fast", "pricing": null}
+          ]
+        }
+      ]
+    },
+    {
+      "id": 120,
+      "name": "国产模型渠道",
+      "platforms": [
+        {
+          "platform": "deepseek",
+          "groups": [{"id": 22, "name": "GM1", "platform": "composite"}],
+          "supported_models": [
+            {"name": "deepseek-v4"}, {"name": "deepseek-v4-pro"}, {"name": "deepseek-internal-web"}
+          ]
+        },
+        {
+          "platform": "glm",
+          "groups": [{"id": 22, "name": "GM1", "platform": "composite"}],
+          "models": [{"id": "glm-5", "pricing": null}, {"name": "glm-5-turbo"}]
+        },
+        {
+          "platform": "kimi",
+          "groups": null,
+          "supported_models": [{"name": "kimi-k3"}, {"name": "kimi-k3-preview"}]
+        }
+      ]
+    },
+    {
+      "id": 130,
+      "name": "Gemini 渠道",
+      "platforms": [
+        {
+          "platform": "gemini",
+          "supported_models": [
+            {"name": "gemini-3.5-pro"}, {"name": "gemini-3.5-flash", "pricing": null}, {"name": "gemini-3.6-pro"}
+          ]
+        },
+        {"platform": "empty-scope", "groups": [], "supported_models": []}
+      ]
+    },
+    {
+      "id": 140,
+      "platforms": [
+        {"platform": "xai", "groups": [{"id": 28, "name": "Grok 基础组"}], "supported_models": [{"name": "grok-4.1", "pricing": null}]}
+      ]
+    }
+  ]
+}

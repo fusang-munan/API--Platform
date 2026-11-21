@@ -393,6 +393,7 @@ data: {"revision":"01K2..."}
 | 北辰同步与对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen?day=YYYY-MM-DD` | 按北京时间查看同步状态、模型报价和日对账 |
 | 学校级模型用量 | GET | `/api/v1/teacher/model-usage?range=day\|month\|all&provider_id=uuid` | 教师按模型、项目成员、学校 Key 查看北辰调用用量；供应商筛选可省略 |
 | 北辰区间对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/reconciliation?range=day\|month\|all` | 按模型和供应商渠道比较本地扣分、Token 与北辰日账 |
+| 北辰调用对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/reconciliation/calls?day=YYYY-MM-DD&cursor=…` | 按北京时间分页查看本地调用、缺失字段及已验证回执 |
 | 北辰逐笔对账 | GET | `/api/v1/teacher/providers/{provider_id}/beichen/receipts?day=YYYY-MM-DD&cursor=…` | 教师按北京时间分页查看学校已归档的北辰流水及关联的校内扣分 |
 | 北辰手动同步 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/sync` | 执行一次有时限的同步，页面按数据类别显示各自结果 |
 | 北辰手动探活 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/probes` | 接受空请求体或 `{}`，排队后返回 202 |
@@ -450,9 +451,15 @@ data: {"revision":"01K2..."}
 
 `model_catalog[].protocols` 使用网关绑定的协议枚举。`probe_state` 为 `unprobed`、`passed` 或 `failed`。同一模型任一当前 Key 和协议的最近结果通过即为 `passed`。`last_probe_at` 是所有有效最近结果里的最新时间。发布可达线路数仍由 `ready_count` 表示。学校已启用但 `ready_count=0` 时返回 `binding_issue`，整个模型从当前目录消失时仍保留这个异常条目。`price_covered` 表示至少一条启用 Key 有可计算报价，发布时仍逐条检查实际会使用的线路。
 
-线路就绪且报价阻止启用时，`model_catalog[].price_blocker` 返回 `{code, message}`，其中 `message` 为中文说明。常见代码包括 `missing_price`、`billing_mode_non_token`、`tier_missing_input`、`tier_missing_output`、`tier_range_invalid` 和 `effort_multiplier_invalid`。线路未就绪时，查看 `blockers` 中的 `no_ready_route`。
+线路就绪且报价阻止启用时，`model_catalog[].price_blocker` 返回 `{code, message}`，其中 `message` 说明涉及的字段及适用的档位号。常见代码包括 `missing_price`、`billing_mode_non_token`、`price_conditions_invalid`、`tier_missing_input`、`tier_missing_output`、`tier_range_invalid` 和 `effort_multiplier_invalid`。线路未就绪时，查看 `blockers` 中的 `no_ready_route`。
 
-`catalog_differences` 按启用 Key 返回分组、核对时间、`website_only` 和 `key_only`。完整网页目录与 Key 目录都已核实才标为 `compared`，其余标为 `unverified`。模型匹配忽略大小写，列表保留各自来源的原始拼写。
+概览的 `models[].price_conditions` 保留官网报价原值。可按 Token 解析的报价在 `price_conditions_exact` 中显示实际使用的报价字段，数值以字符串返回以保留小数精度。空或省略的计费模式默认按 Token 处理，明确以 Token 为主时会忽略附带的按次、图像和视频单价。
+
+`website_directory` 返回完整官网目录状态、`last_success` 和 `last_error`。`fresh` 表示近期完整采集，`stale` 表示当前使用部分更新或保留的快照，`unverified` 表示等待取得官网目录。`model_catalog` 合并官网与启用 Key 的目录，并保留已发布但失去目录覆盖的模型。`source` 为 `website`、`key` 或 `both`。`catalog_state` 为 `website_only`、`key_listed` 或 `catalog_missing`。`key_count` 按有目录证据的当前 Key 去重。已有 Key 同版本的上次结果在扫描失败后仍可查，`catalog_keys[].stale` 标记该情况。
+
+`website_locations` 带官网原名、渠道、平台、分组、采集时间、缓存状态和报价存在标记。`catalog_keys` 带实际覆盖的 Key 及上游型号，或者给出需要核查的 Key。`state` 可为 `listed`、`missing`、`pending`、`failed` 或 `ambiguous`。已覆盖条目用 `match` 说明原名、名称归一或教师别名，并保留独立的 Key 型号 ID 供教师操作。弱匹配可以识别唯一的日期版本，保留型号数字和具有实际含义的变体。官网已有价格且当前 Key 报价待确认时，教师可同时看到分组和目录证据。
+
+`catalog_differences` 按启用 Key 返回已知分组、核对时间、`website_only` 和 `key_only`。官网分组与当前 Key 目录均可对比时标为 `compared`。比较使用保留的官网数据时标为 `stale`。缺少一方证据时标为 `unverified`。`website_only_models` 汇总当前 Key 均未匹配的官网型号及候选渠道，`website_only_status` 表示该汇总的核对状态。
 
 探活 POST 返回任务对象，GET 返回 `{run, results}`。概览中的 `probe_run` 使用相同任务对象。任务对象含 `state`（`idle`、`queued`、`running`、`completed` 或 `failed`）、`started_at`、`finished_at` 和 `error_code`。同一供应商在排队或执行时收到重复 POST 会合并。没有启用且已同步目录的 Key 时 POST 返回 400，供应商不存在或并非北辰时返回 404。未登录返回 401，角色不符返回 403。两个接口均返回 `Cache-Control: private, no-store`。
 
@@ -460,7 +467,7 @@ data: {"revision":"01K2..."}
 
 维护用的 `beichen/access/{credential_id}` 可读该凭据的同步状态、分组与北辰 Key 数字 ID。学校自动部署通过官网普通账号建立这些关联。旧版专用读取凭据的接口保留兼容。
 
-自动和手动同步都会重读每把 Key 的完整模型目录与倍率。学校预配渠道用学校网页会话读取价表。账单提供分组 ID 时使用该 ID，省略时从账号内的 Key 记录核实当前分组，固定配置的渠道同样需要核实。手动同步遇到网页采价失败会返回同步未完成。已经成功读取的模型目录或倍率仍会保存，对应价格错误可在概览的 `datasets` 中查看。
+自动同步和按供应商的手动同步独立刷新完整官网目录，并按 Key 读取模型清单与倍率。定向重扫只读取所选 Key 的 `/v1/models`，结果保存后下一次概览自动重新匹配。学校预配渠道用学校网页会话读取价表。账单提供分组 ID 时使用该 ID，省略时从账号内的 Key 记录核实当前分组，固定配置的渠道同样需要核实。如果已核实分组内的官网名和 Key 名只有明确的拼写差异，且能双向唯一匹配，报价按 Key 的原名保存。手动同步遇到官网目录或采价失败会返回同步未完成。成功保存的结果可在概览查询，价表错误记录在 `datasets`。
 
 本轮已在当前分组的有效价表中查找该模型，而价表缺少同名条目时，概览的 `models[].price_status` 返回 `not_listed`。分组待核、价表缺失或过期、已列出的同名条目缺少有效价格，均返回 `pending_confirmation`。
 
@@ -483,7 +490,7 @@ data: {"revision":"01K2..."}
 ```json
 {
   "enabled": [{"model": "model-a", "model_id": "uuid"}],
-  "skipped": [{"model": "model-b", "reason": "no_price", "message": "第 2 档缺少输出 Token 单价"}]
+  "skipped": [{"model": "model-b", "reason": "no_price", "message": "第 2 档缺少输出 Token 单价（output_price）"}]
 }
 ```
 
@@ -518,7 +525,13 @@ data: {"revision":"01K2..."}
 | `students[]` | `user_id`、`user_name`、`project_id`、`project_name` 与用量字段；同一账号在不同项目分行，`models[]` 给出各模型积分、Token 和调用数 |
 | `keys[]` | `api_key_id`、`api_key_name`、`user_id`、`user_name`、`project_id`、`project_name` 与用量字段，另含该 Key 的 `models[]` |
 
-`credits` 只累计 `beichen_state=charged` 的精确扣分。待核账计入 `calls`、`pending_calls`，不计入已扣积分和 Token。**Token = 未缓存输入 + 输出 + 缓存读取 + 缓存写入**：只累计 `usage_state=reported` 且四项均可归一化确认的调用；缺一项则该笔 Token 不进入汇总，调用数仍保留。Anthropic 输入本来就不含缓存；OpenAI Chat/Responses/Realtime 的输入含缓存，按明确的缓存明细或未命中数扣除，避免重复计数。所有 Token 和计数为 JSON 数字，积分为去尾零的十进制字符串，空集是零和 `[]`。
+`credits` 累计 `beichen_state=charged` 的精确扣分。已回报的 Token 独立于扣费状态汇总，包括待核或中断调用已记录的分项。OpenAI Chat、Responses 和 Realtime 的原始输入包含缓存，依据明确的缓存明细或未命中数拆分。Anthropic 的原始输入是未缓存输入。Gemini 的已知输入包含工具提示，已知输出包含思考 Token。缺少互斥分项时，`tokens` 包含可以从原始总量或协议计数确认的用量，`tokens_missing` 表示其中尚未归入四类的数量。结合 `completeness` 判断覆盖范围。Token 和计数为 JSON 数字，积分为十进制字符串。
+
+调用对账的 `day` 默认是北京时间当天，响应为 `items` 和可空的 `next_cursor`。每页最多 50 条，以调用派发时间、调用 ID 倒序排列。后续页传回此前的 `next_cursor` 并沿用同一供应商和账日。接口仅供教师读取，返回 `Cache-Control: private, no-store`。
+
+逐笔记录含 `request_id`、协议、模型、派发渠道与 `usage_state`。`reported` 表示四项可确认，`partial` 表示可用计数不完整或存在矛盾，`missing` 表示没有可用计数，`interrupted` 表示响应中断。`recorded_usage_state` 保留历史记录的原始状态。`local_tokens` 与 `receipt_tokens` 分别提供未缓存输入、输出、缓存读、缓存写。不可用字段为 `null`，逐项原因见 `missing_token_reasons`。原始输入、输出、显式总计、思考与工具提示计数单独返回。
+
+`base_credits` 是已记账的基础积分，`expected_credits` 是可追溯到独立计价的基础积分，`actual_credits` 是唯一匹配的北辰回执实扣乘 100。`difference_credits` 等于独立计价减回执实扣积分，`base_difference_credits` 等于已记账基础积分减回执实扣积分。缺少任一依据时，对应差额为 `null`。学校系数、学生实扣、学校承担、档位及价格版本随逐笔记录返回。已用回执实扣补记的跟随价行只有 `base_credits`，独立计价为空。此接口的逐笔差额使用通过校验的回执，区间利润仍以完整日账为依据。
 
 区间对账响应为 `{range,start,end,timezone,coverage,totals,models,keys}`：
 

@@ -53,7 +53,7 @@ func (s *Service) Run(ctx context.Context) {
 	defer ticker.Stop()
 	for ctx.Err() == nil {
 		sweep, cancel := context.WithTimeout(ctx, sweepTimeout)
-		if err := s.syncJobs(sweep, nil); err != nil && ctx.Err() == nil {
+		if err := s.syncWithWebsite(sweep, nil); err != nil && ctx.Err() == nil {
 			slog.Warn("北辰后台同步未完成", "code", domain.ErrorCode(err))
 		}
 		cancel()
@@ -78,7 +78,13 @@ func (s *Service) Sync(ctx context.Context, providerID uuid.UUID) error {
 	if err := checkProvider(ctx, s.db, providerID); err != nil {
 		return err
 	}
-	return s.syncJobs(ctx, &providerID)
+	return s.syncWithWebsite(ctx, &providerID)
+}
+
+func (s *Service) syncWithWebsite(ctx context.Context, provider *uuid.UUID) error {
+	website := make(chan error, 1)
+	go func() { website <- s.syncWebsiteDirectories(ctx, provider) }()
+	return errors.Join(s.syncJobs(ctx, provider), <-website)
 }
 
 // SyncCredential pulls this Key's catalog, pricing, multiplier and recent

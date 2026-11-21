@@ -19,6 +19,7 @@ func reportHandlerRouter(s *Server, role string) *gin.Engine {
 	teacher := router.Group("/api/v1/teacher", requireRole("teacher"))
 	teacher.GET("/model-usage", s.teacherModelUsage)
 	teacher.GET("/providers/:provider_id/beichen/reconciliation", s.beichenReconciliation)
+	teacher.GET("/providers/:provider_id/beichen/reconciliation/calls", s.beichenReconciliationCalls)
 	return router
 }
 
@@ -38,6 +39,7 @@ func TestUsageReportHandlersRejectRangeAndInvalidIDs(t *testing.T) {
 	for _, path := range []string{
 		"/api/v1/teacher/model-usage?provider_id=invalid",
 		"/api/v1/teacher/providers/invalid/beichen/reconciliation",
+		"/api/v1/teacher/providers/invalid/beichen/reconciliation/calls",
 	} {
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))

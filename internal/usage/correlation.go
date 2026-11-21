@@ -33,18 +33,24 @@ type CallMetrics struct {
 	CacheMissTokens    *int64
 	CacheWriteTokens   *int64
 	ReasoningTokens    *int64
+	ToolPromptTokens   *int64
 	// UpstreamCreditMicros is the explicit upstream credit in millionths.
 	UpstreamCreditMicros *int64
 	State                UsageState
+	UsageReason          string
 	// ReplyClosed is set when the upstream stop flag is known.
 	// False means the model asked for a tool and the question is still open.
 	ReplyClosed *bool
 }
 
 func (m CallMetrics) HasUsage() bool {
+	return m.HasTokenUsage() || m.UpstreamCreditMicros != nil
+}
+
+func (m CallMetrics) HasTokenUsage() bool {
 	return m.PromptTokens != nil || m.CompletionTokens != nil || m.TotalTokens != nil ||
 		m.CacheHitTokens != nil || m.CacheMissTokens != nil || m.CacheWriteTokens != nil ||
-		m.ReasoningTokens != nil || m.UpstreamCreditMicros != nil
+		m.ReasoningTokens != nil || m.ToolPromptTokens != nil
 }
 
 type UsageState string
@@ -53,6 +59,7 @@ const DefaultReasoningEffort = "medium"
 
 const (
 	UsageReported    UsageState = "reported"
+	UsagePartial     UsageState = "partial"
 	UsageMissing     UsageState = "missing"
 	UsageInterrupted UsageState = "interrupted"
 )

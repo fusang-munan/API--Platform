@@ -212,6 +212,12 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 ### 北辰教师端用量、定价与对账
 
+#### 官网目录模型数少于网页渠道页
+
+打开「模型管理 → 北辰」，检查「官网目录」的最近完整读取时间，并展开具体模型的「目录来源与分组」。收到官网错误时，页面会保留已存的型号并提示待更新。官网有 Claude 但接替 Key 的目录没有时，核查该行的平台、分组和 CC1 新 Key，选择对应 Key 重扫。重扫成功后仍为零时，核对新 Key 的上游权限、分组和模型原名。出现多个近似名称时，可为正确的上游名称配置教师别名。
+
+配置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run 'TestBeichenWebsiteDirectoryPostgres|TestBeichenDirectoryNameMatching|TestBeichenPanelPricesMatchEquivalentKeySpelling' -count=1 -v`。测试仅用构造数据和假上游，覆盖多平台完整入库、空列表、空价格、名称变体和教师别名、仅官网型号、换 Key 后重新匹配、部分更新、失败保留和退避。运行 `npm test -- BeichenSchoolModels TeacherProviders` 检查教师页显示和指定 Key 重扫。
+
 #### 探活与目录差异
 
 设置 `NEBULA_TEST_POSTGRES` 为隔离的本机 `nebula_test` 后运行 `go test ./internal/beichen -run 'TestBeichenProbeAndCatalogPostgres|TestSingleAndBatchEnableUseSamePricesPostgres' -count=1`。探活测试使用模拟 HTTP 响应，核对协议请求的输出限制、重复排队、每小时触发、结果脱敏和 Key 轮换后的隔离。前端运行 `npm test -- BeichenSchoolModels TeacherProviders` 验证健康项、探活状态和目录差异。
@@ -220,6 +226,8 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 - 「已启用 · 线路异常」时查看模型下的说明，并在供应商页核对 Key 状态和目录差异。目录差异显示「待核对」时，先核实网页读取授权和渠道分组，再同步。纯 Token 条件价需有有效的输入、输出费率及可判定的档位，才能计入报价覆盖。
 
 用 `go test ./internal/usage -run 'TestBeichenTokenQuoteBlocker|TestEvaluateBeichenConditional' -count=1` 验证空计价模式、非 Token 报价、分档缺价及结算。为本机测试库设置 `NEBULA_TEST_POSTGRES` 后，上面的启用测试还会核对概览、单个启用和批量启用的报价提示是否一致，以及线路不可用时是否优先显示线路原因。
+
+纯文本模型探活通过后仍显示「官网报价格式无效」或「非 Token 计价」时，先看 `price_blocker.message` 的字段名。旧解析会拒绝空字符串，并把非 Token 字段的零值当作有费用。运行 `go test ./internal/beichen -run 'TestPanelMixedPriceFixture|TestPanelMixedPricesActivationAndSettlementPostgres' -count=1 -v`，用构造的面板 JSON 和隔离的本机数据库复查。测试覆盖 gpt-6.1-sol 的固定价、gpt-6.2-sol 的两个 Token 档位、缺价档的提示与待核账、两种启用入口及扣分明细中被忽略的字段。
 
 后端使用隔离的本机 PostgreSQL。新建的测试库需在 `public` 安装 `citext`、`pg_trgm` 和 `pgcrypto`。全量测试的网关用例可使用下列本机端口。
 
@@ -248,6 +256,14 @@ go test ./...
 - 对账差额异常大：先看北辰实扣是否为未知、当天账单是否已同步、模型是否只有本地或只有北辰记录。缺失实扣时页面显示“—”，不会把未知当作零；差额仅供参考。
 - 学生额度保存返回 `PROJECT_QUOTA_ALLOCATION_EXCEEDED`：该学生增加后的总额超过项目月额度。先减少其他成员额度或提高项目额度，不能靠前端绕过。
 - 手动价出现 100 倍偏差：检查是否把“积分/百万 Token”又乘了一次 1,000,000。HTTP 新接口接收十进制积分字符串，服务端统一缩放；不要在浏览器里预先缩放。
+
+### 北辰 Token 缺项与逐笔差额
+
+旧版网关会把含部分计数的调用标为 `missing`，旧报表会跳过其中保存的分项。调用数和已扣积分来自账务记录，因而可能同时出现。使用教师调用对账接口，按同一账日核对每行的原始计数、`usage_state` 与 `missing_token_reasons`。Chat 流式用量取上游使用量事件。Responses 流式和 WebSocket 使用对应响应的终止用量。Anthropic 合并开始事件和后续累计计数。Gemini 原生生成回报没有独立的缓存写入分项。
+
+逐笔核对时用 `base_difference_credits` 比较基础积分与回执实扣，用 `difference_credits` 单独核对独立计价与实扣。学校系数与额度封顶可以另用 `school_multiplier`、`student_credits`、`school_absorbed_credits` 复核。存在差额时结合本地和回执 Token、价格档位、渠道倍率版本、推理强度和缓存费率核对。日账缺失时查看逐笔证据，区间利润保持未知。
+
+在上述本机测试库运行 `go test ./internal/dataplane -run 'TestBeichenUsageProtocolMatrix|TestBeichenPostgresGatewayReconciliation' -count=1 -v`。假上游的 41 笔调用覆盖完整用量、缺缓存明细及缺用量，且检验逐笔回执补记、回执重放和差额精度。完整检查使用 `go build ./...` 与 `go test ./...`。
 
 ### 北辰网页报价持续为 0/4
 

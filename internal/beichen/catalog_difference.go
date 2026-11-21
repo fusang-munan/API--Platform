@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -26,12 +27,34 @@ type WebsiteOnlyModel struct {
 	Channels []CredentialRef `json:"channels"`
 }
 
+type WebsiteLocation struct {
+	Name          string         `json:"name"`
+	ChannelID     int64          `json:"channel_id,omitempty"`
+	Channel       string         `json:"channel,omitempty"`
+	Platform      string         `json:"platform,omitempty"`
+	Groups        []WebsiteGroup `json:"groups"`
+	ObservedAt    time.Time      `json:"observed_at"`
+	HasPrice      bool           `json:"has_price"`
+	Stale         bool           `json:"stale,omitempty"`
+	channelStatus string
+}
+
+type CatalogKey struct {
+	CredentialRef
+	SchoolChannel string `json:"school_channel,omitempty"`
+	Replacement   bool   `json:"replacement,omitempty"`
+	GroupID       *int64 `json:"group_id"`
+	State         string `json:"state"`
+	UpstreamModel string `json:"upstream_model,omitempty"`
+	Match         string `json:"match,omitempty"`
+	Stale         bool   `json:"stale,omitempty"`
+}
+
 const keyCatalogCurrentSQL = `(d.last_error IS NULL AND COALESCE(d.last_success >= c.updated_at, false))`
 
 func saveWebsiteCatalog(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, revision time.Time, quote panelQuote) error {
 	if quote.websiteModels == nil {
-		_, err := tx.ExecContext(ctx, `DELETE FROM beichen_website_catalogs WHERE credential_id = $1`, credentialID)
-		return err
+		return nil
 	}
 	models, err := json.Marshal(quote.websiteModels)
 	if err != nil {
@@ -46,113 +69,199 @@ ON CONFLICT (credential_id) DO UPDATE SET credential_revision = EXCLUDED.credent
 	return err
 }
 
-func readCatalogDifferences(ctx context.Context, tx *sql.Tx, provider uuid.UUID, view *Overview) error {
+type discoveryKey struct {
+	CatalogKey
+	hint        string
+	legacyAt    *time.Time
+	legacyNames []string
+	models      map[string]*Model
+	matcher     catalogNameMatcher
+}
+
+func readDiscoveryKeys(ctx context.Context, tx *sql.Tx, provider uuid.UUID) ([]discoveryKey, error) {
 	rows, err := tx.QueryContext(ctx, `
-SELECT c.id, c.label::text, w.group_id, w.checked_at, to_json(w.models),
-  p.status = 'active' AND `+keyCatalogCurrentSQL+`
+SELECT c.id, c.label::text, COALESCE(school.channel,''), COALESCE(c.group_hint,''),
+  EXISTS (SELECT 1 FROM beichen_provision_channels prev JOIN provider_credentials old ON old.id=prev.credential_id
+    WHERE prev.channel=school.channel AND old.provider_id=c.provider_id AND old.created_at<c.created_at),
+  COALESCE(w.group_id,a.group_id), w.checked_at, to_json(w.models),
+  `+keyCatalogCurrentSQL+`, d.last_error IS NOT NULL
 FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
 LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = 'catalog'
 LEFT JOIN beichen_website_catalogs w ON w.credential_id = c.id AND w.credential_revision = c.updated_at
-  AND p.status = 'active' AND `+keyCatalogCurrentSQL+`
-WHERE c.provider_id = $1 AND c.status = 'active'
+LEFT JOIN beichen_panel_access a ON a.credential_id=c.id AND a.updated_at=c.updated_at
+LEFT JOIN beichen_provision_channels school ON school.credential_id=c.id
+WHERE c.provider_id = $1 AND c.status = 'active' AND p.status = 'active'
 ORDER BY c.label, c.id`, provider)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []discoveryKey
+	for rows.Next() {
+		key := discoveryKey{models: map[string]*Model{}}
+		var website []byte
+		var scanned, failed bool
+		if err := rows.Scan(&key.CredentialID, &key.Label, &key.SchoolChannel, &key.hint, &key.Replacement,
+			&key.GroupID, &key.legacyAt, &website, &scanned, &failed); err != nil {
+			return nil, err
+		}
+		switch {
+		case scanned:
+			key.State = "missing"
+		case failed:
+			key.State, key.Stale = "failed", true
+		default:
+			key.State = "pending"
+		}
+		if key.legacyAt != nil {
+			at := key.legacyAt.UTC()
+			key.legacyAt = &at
+			if err := json.Unmarshal(website, &key.legacyNames); err != nil {
+				return nil, err
+			}
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
+func readCatalogDifferences(ctx context.Context, tx *sql.Tx, provider uuid.UUID, view *Overview) error {
+	status, platforms, err := readWebsiteDirectory(ctx, tx, provider)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-
-	keyModels := make(map[uuid.UUID][]string)
-	for _, model := range view.Models {
-		keyModels[model.CredentialID] = append(keyModels[model.CredentialID], model.Model)
+	keys, err := readDiscoveryKeys(ctx, tx, provider)
+	if err != nil {
+		return err
 	}
-	view.CatalogDifferences = []CatalogDifference{}
-	allKeysScanned, anyWebsite := true, false
-	for rows.Next() {
-		diff := CatalogDifference{State: "unverified", WebsiteOnly: []string{}, KeyOnly: []string{}}
-		var website []byte
-		var scanned bool
-		if err := rows.Scan(&diff.CredentialID, &diff.Label, &diff.GroupID, &diff.CheckedAt, &website, &scanned); err != nil {
-			return err
+	aliases, err := readModelAliases(ctx, tx, provider)
+	if err != nil {
+		return err
+	}
+	view.WebsiteDirectory = status
+	indexDiscoveryKeys(view.Models, keys, aliases)
+	web := map[string][]WebsiteLocation{}
+	stale := status.State == "stale"
+	for _, section := range platforms {
+		groups := make([]WebsiteGroup, 0, len(section.Groups))
+		for _, group := range section.Groups {
+			groups = append(groups, group.WebsiteGroup)
 		}
-		allKeysScanned = allKeysScanned && scanned
-		if diff.CheckedAt != nil {
+		for _, model := range section.Models {
+			name := strings.ToLower(model.Name)
+			web[name] = append(web[name], WebsiteLocation{
+				Name: model.Name, ChannelID: section.ChannelID, Channel: section.Channel, Platform: section.Platform,
+				Groups: groups, ObservedAt: model.ObservedAt, HasPrice: hasPanelPrice(model.Pricing),
+				Stale: stale, channelStatus: section.ChannelStatus,
+			})
+		}
+	}
+	view.CatalogDifferences = make([]CatalogDifference, 0, len(keys))
+	view.WebsiteOnlyStatus = "unverified"
+	allKeysScanned, anyWebsite := true, len(platforms) != 0
+	for _, key := range keys {
+		names, checked := websiteGroupCatalog(platforms, key.GroupID)
+		if len(platforms) == 0 && key.legacyAt != nil {
 			anyWebsite = true
-			var websiteModels []string
-			if err := json.Unmarshal(website, &websiteModels); err != nil {
-				return err
+			names, checked = key.legacyNames, key.legacyAt
+			for _, name := range names {
+				lower := strings.ToLower(name)
+				web[lower] = append(web[lower], WebsiteLocation{
+					Name: name, Groups: []WebsiteGroup{{ID: *key.GroupID}}, ObservedAt: *checked,
+				})
 			}
-			at := diff.CheckedAt.UTC()
-			diff.State, diff.CheckedAt = "compared", &at
-			diff.WebsiteOnly, diff.KeyOnly = diffModelNames(websiteModels, keyModels[diff.CredentialID])
+		}
+		diff := CatalogDifference{CredentialID: key.CredentialID, Label: key.Label, GroupID: key.GroupID,
+			CheckedAt: checked, State: "unverified", WebsiteOnly: []string{}, KeyOnly: []string{}}
+		scanned := key.State == "missing"
+		allKeysScanned = allKeysScanned && scanned
+		if scanned && names != nil {
+			diff.State = "compared"
+			if stale {
+				diff.State = "stale"
+			}
+			diff.WebsiteOnly, diff.KeyOnly = diffModelNames(names, key)
 		}
 		view.CatalogDifferences = append(view.CatalogDifferences, diff)
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	view.WebsiteOnlyStatus = "unverified"
-	view.WebsiteOnlyModels = []WebsiteOnlyModel{}
-	if anyWebsite && allKeysScanned {
+	if stale {
+		view.WebsiteOnlyStatus = "stale"
+	} else if anyWebsite && allKeysScanned {
 		view.WebsiteOnlyStatus = "compared"
-		view.WebsiteOnlyModels = collectWebsiteOnlyModels(view.CatalogDifferences, keyModels)
 	}
+	mergeCatalogDiscovery(view, keys, web)
 	return nil
 }
 
-// A per-channel difference is not a website-only model if another active Key lists it.
-func collectWebsiteOnlyModels(differences []CatalogDifference, keyModels map[uuid.UUID][]string) []WebsiteOnlyModel {
-	listed := map[string]bool{}
-	for _, diff := range differences {
-		for _, model := range keyModels[diff.CredentialID] {
-			listed[strings.ToLower(model)] = true
+func indexDiscoveryKeys(models []Model, keys []discoveryKey, aliases []ModelAlias) {
+	index := make(map[uuid.UUID]*discoveryKey, len(keys))
+	for i := range keys {
+		index[keys[i].CredentialID] = &keys[i]
+	}
+	for i := range models {
+		row := &models[i]
+		if key := index[row.CredentialID]; key != nil && row.available && row.currentKey {
+			key.models[row.Model] = row
 		}
 	}
-	website := map[string]WebsiteOnlyModel{}
-	for _, diff := range differences {
-		for _, name := range diff.WebsiteOnly {
-			key := strings.ToLower(name)
-			if listed[key] {
-				continue
+	for i := range keys {
+		key := &keys[i]
+		mapping := map[string]string{}
+		// readModelAliases orders provider-wide defaults before Key overrides.
+		for _, alias := range aliases {
+			if alias.CredentialID == nil || *alias.CredentialID == key.CredentialID {
+				mapping[strings.ToLower(alias.UpstreamModel)] = strings.ToLower(alias.SchoolModel)
 			}
-			row := website[key]
-			if row.Model == "" || name < row.Model {
-				row.Model = name
-			}
-			row.Channels = append(row.Channels, CredentialRef{CredentialID: diff.CredentialID, Label: diff.Label})
-			website[key] = row
 		}
+		key.matcher = newCatalogNameMatcher(slices.Collect(maps.Keys(key.models)), mapping)
 	}
-	result := make([]WebsiteOnlyModel, 0, len(website))
-	for _, row := range website {
-		result = append(result, row)
-	}
-	slices.SortFunc(result, func(a, b WebsiteOnlyModel) int {
-		return strings.Compare(strings.ToLower(a.Model), strings.ToLower(b.Model))
-	})
-	return result
 }
 
-func diffModelNames(website, key []string) ([]string, []string) {
-	index := func(names []string) map[string]string {
-		result := make(map[string]string, len(names))
-		for _, name := range names {
-			lower := strings.ToLower(name)
-			if old, ok := result[lower]; !ok || name < old {
-				result[lower] = name
+func websiteGroupCatalog(platforms []directoryPlatform, groupID *int64) ([]string, *time.Time) {
+	if groupID == nil {
+		return nil, nil
+	}
+	var names []string
+	var checked *time.Time
+	for _, section := range platforms {
+		if namesGroup(section.Groups, *groupID) {
+			if names == nil {
+				names = []string{}
+			}
+			for _, model := range section.Models {
+				names = append(names, model.Name)
+			}
+			if checked == nil || section.ObservedAt.After(*checked) {
+				checked = &section.ObservedAt
 			}
 		}
-		return result
 	}
-	webNames, keyNames := index(website), index(key)
-	only := func(left, right map[string]string) []string {
-		names := []string{}
-		for lower, model := range left {
-			if _, ok := right[lower]; !ok {
-				names = append(names, model)
-			}
+	return names, checked
+}
+
+func namesGroup(groups []directoryGroup, id int64) bool {
+	return slices.ContainsFunc(groups, func(group directoryGroup) bool { return group.ID == id })
+}
+
+func diffModelNames(website []string, key discoveryKey) ([]string, []string) {
+	websiteNames := newCatalogNameMatcher(website, nil)
+	onlyWebsite, onlyKey := []string{}, []string{}
+	matched, seen := map[string]bool{}, map[string]bool{}
+	for _, name := range website {
+		match := matchWebsiteModel(name, key.matcher, websiteNames)
+		if match.name != "" {
+			matched[match.name] = true
+		} else if lower := strings.ToLower(name); !seen[lower] {
+			onlyWebsite = append(onlyWebsite, name)
+			seen[lower] = true
 		}
-		slices.Sort(names)
-		return names
 	}
-	return only(webNames, keyNames), only(keyNames, webNames)
+	for model := range key.models {
+		if !matched[model] {
+			onlyKey = append(onlyKey, model)
+		}
+	}
+	slices.Sort(onlyWebsite)
+	slices.Sort(onlyKey)
+	return onlyWebsite, onlyKey
 }

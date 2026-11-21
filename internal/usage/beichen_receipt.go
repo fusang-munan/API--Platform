@@ -109,14 +109,12 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 		return false, err
 	}
 	var callID uuid.UUID
-	var state, protocol, ttl string
-	var recordedWrites int64
-	var terms []byte
-	err = tx.QueryRowContext(ctx, `SELECT c.id,c.beichen_state,quote.terms,c.protocol,COALESCE(c.cache_ttl,''),COALESCE(c.cache_write_tokens,0)
+	var state string
+	err = tx.QueryRowContext(ctx, `SELECT c.id,c.beichen_state
 		FROM beichen_receipt_response_claims r
 		JOIN gateway_calls c ON c.id=r.first_call_id
 		JOIN beichen_receipt_active_bindings a ON a.credential_id=c.beichen_dispatch_credential_id
-		JOIN beichen_panel_access panel ON panel.credential_id=a.credential_id`+beichenConditionQuoteJoin+`
+		JOIN beichen_panel_access panel ON panel.credential_id=a.credential_id
 		WHERE r.response_id=$1 AND r.conflicted_at IS NULL
 		  AND c.beichen_receipt_response_id=$1 AND NOT c.beichen_receipt_conflict
 		  AND c.beichen_dispatch_kind='beichen' AND c.beichen_dispatch_credential_id=$2
@@ -125,7 +123,7 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 		  AND c.beichen_dispatch_model=$4 AND c.beichen_state IN ('pending_review','charged')
 		  AND $5::timestamptz BETWEEN c.sent_at-interval '2 seconds' AND c.finalized_at+interval '2 minutes'
 		FOR UPDATE OF c FOR SHARE OF panel`, receipt.ResponseID, credentialID, receipt.APIKeyID, receipt.Model, receipt.OccurredAt).
-		Scan(&callID, &state, &terms, &protocol, &ttl, &recordedWrites)
+		Scan(&callID, &state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -135,38 +133,24 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 	applied := state == "pending_review"
 	var charge beichenCharge
 	if applied {
-		// 回执的输入、缓存计数已经互斥；直接加权，不能再次按协议扣除缓存。
-		// 跟随费率沿用 0042 的余额单位；教师费率以积分保存，结果须除以 100。
-		// 条件价无法使用固定官网价补记，已验证的北辰实扣仍可作为依据。
-		conditional := isBeichenConditional(terms) ||
-			(protocol == "anthropic" && (receipt.CacheWriteTokens > 0 || recordedWrites > 0) && beichenCacheTTL(ttl) != "5m")
-		err = tx.QueryRowContext(ctx, `SELECT coalesce(cost.gateway,cost.receipt,$2::numeric*100)::text,
-			CASE WHEN p.mode='manual' AND coalesce(cost.gateway,cost.receipt) IS NOT NULL THEN 'teacher_manual_price'
-			     WHEN cost.gateway IS NOT NULL THEN 'gateway_usage_price'
-			     WHEN cost.receipt IS NOT NULL THEN 'receipt_usage_price' ELSE 'receipt_actual_cost' END,
-			CASE WHEN coalesce(cost.gateway,cost.receipt) IS NOT NULL THEN p.upstream_version END,
-			CASE WHEN coalesce(cost.gateway,cost.receipt) IS NOT NULL THEN p.multiplier_version END
+		// A verified balance debit is authoritative for pending follow-price
+		// calls. The dispatch-time teacher price still applies when evaluable.
+		err = tx.QueryRowContext(ctx, `SELECT coalesce(cost.manual,$2::numeric*100)::text,
+			CASE WHEN cost.manual IS NOT NULL THEN 'teacher_manual_price' ELSE 'receipt_actual_cost' END,
+			CASE WHEN cost.manual IS NOT NULL THEN p.upstream_version END,
+			CASE WHEN cost.manual IS NOT NULL THEN p.multiplier_version END
 			FROM gateway_calls c
 			LEFT JOIN LATERAL beichen_price_at(c.beichen_dispatch_credential_id,c.beichen_dispatch_model,coalesce(c.beichen_price_at,c.sent_at)) p
-			  ON (c.beichen_school_multiplier=1.10 AND NOT $7::boolean) OR p.mode='manual'
+			  ON p.mode='manual'
 			CROSS JOIN LATERAL (SELECT
-			  CASE WHEN c.usage_state='reported' THEN coalesce(
+			  coalesce(CASE WHEN c.usage_state='reported' AND c.usage_reason IS NULL
+			    AND c.beichen_review_reason NOT IN ('unsupported_text_pricing','upstream_model_mismatch','upstream_model_unconfirmed') THEN
 			    beichen_token_credits(c.protocol,c.prompt_tokens,c.completion_tokens,c.cache_hit_tokens,c.cache_miss_tokens,
-			      c.cache_write_tokens,p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)
-			      /CASE WHEN p.mode='manual' THEN 100 ELSE 1 END,
-			    CASE WHEN NOT $7::boolean THEN
-			      beichen_token_credits(c.protocol,c.prompt_tokens,c.completion_tokens,c.cache_hit_tokens,c.cache_miss_tokens,
-			        c.cache_write_tokens,p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write)
-			    END) END AS gateway,
-			  coalesce(
+			      c.cache_write_tokens,p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)/100 END,
 			    beichen_weighted_tokens($3,$4,$5,$6,p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)
-			      /CASE WHEN p.mode='manual' THEN 100 ELSE 1 END,
-			    CASE WHEN NOT $7::boolean THEN
-			      beichen_weighted_tokens($3,$4,$5,$6,p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write)
-			    END)
-			      *0.0000000001::numeric AS receipt) cost
+			      *0.000000000001::numeric) AS manual) cost
 			WHERE c.id=$1`, callID, receipt.ActualCost, receipt.InputTokens, receipt.OutputTokens, receipt.CacheReadTokens,
-			receipt.CacheWriteTokens, conditional).Scan(
+			receipt.CacheWriteTokens).Scan(
 			&charge.base, &charge.source, &charge.upstreamVersion, &charge.multiplierVersion)
 		if err != nil {
 			return false, err

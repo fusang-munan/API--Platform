@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
@@ -124,6 +125,79 @@ func TestGeminiUsageMapsExplicitMetadata(t *testing.T) {
 		!tokenIs(metrics.CacheHitTokens, 4) || metrics.CacheMissTokens != nil ||
 		!tokenIs(metrics.ReasoningTokens, 1) || !tokenIs(metrics.TotalTokens, 9) {
 		t.Fatalf("unexpected metrics: %+v", metrics)
+	}
+}
+
+func TestBeichenUsageProtocolMatrix(t *testing.T) {
+	cases := []struct {
+		name, transport, payload, reason string
+		adapter                          modelbinding.Adapter
+		state                            usage.UsageState
+		prompt, output, read, write      int64 // -1 is an omitted counter
+		reasoning, tool                  int64
+	}{
+		{"Chat JSON", "json", `{"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":6}}`, "",
+			modelbinding.AdapterOpenaiCompatible, usage.UsageReported, 10, 2, 4, 0, -1, -1},
+		{"Chat SSE", "sse", "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\ndata: [DONE]\n\n",
+			"token_breakdown_unconfirmed", modelbinding.AdapterOpenaiCompatible, usage.UsagePartial, 10, 0, 0, -1, -1, -1},
+		{"Chat invalid cache write", "json", `{"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":6,"prompt_cache_write_tokens":-1}}`,
+			"invalid_token_count", modelbinding.AdapterOpenaiCompatible, usage.UsagePartial, 10, 2, 4, -1, -1, -1},
+		{"Responses JSON", "json", `{"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cached_tokens":4,"cache_write_tokens":1},"output_tokens_details":{"reasoning_tokens":1}}}`, "",
+			modelbinding.AdapterOpenaiResponses, usage.UsageReported, 10, 2, 4, 1, 1, -1},
+		{"Responses SSE", "sse", "data: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n",
+			"response_interrupted", modelbinding.AdapterOpenaiResponses, usage.UsageInterrupted, 10, 2, -1, -1, -1, -1},
+		{"Responses WebSocket", "ws", `{"type":"response.done","response":{"id":"ws-1","status":"completed","usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":4,"cache_write_tokens":1}}}}`, "",
+			modelbinding.AdapterOpenaiResponses, usage.UsageReported, 10, 2, 4, 1, -1, -1},
+		{"Anthropic JSON", "json", `{"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":4,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":0}}}`, "",
+			modelbinding.AdapterAnthropic, usage.UsageReported, 5, 2, 4, 1, -1, -1},
+		{"Anthropic SSE", "sse", "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":1}}}\n\n" +
+			"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\ndata: {\"type\":\"message_stop\"}\n\n", "",
+			modelbinding.AdapterAnthropic, usage.UsageReported, 5, 2, 4, 1, -1, -1},
+		{"Anthropic conflicting writes", "json", `{"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":4,"cache_creation_input_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":3}}}`,
+			"conflicting_cache_creation_counts", modelbinding.AdapterAnthropic, usage.UsagePartial, 5, 2, 4, 1, -1, -1},
+		{"Gemini JSON array", "json", `[{"usageMetadata":{"promptTokenCount":10,"cachedContentTokenCount":4}},{"usageMetadata":{"candidatesTokenCount":2,"thoughtsTokenCount":1,"toolUsePromptTokenCount":3,"totalTokenCount":16}}]`,
+			"cache_write_not_in_usage_metadata", modelbinding.AdapterGoogleGeminiV1beta, usage.UsagePartial, 10, 2, 4, -1, 1, 3},
+		{"Gemini SSE", "sse", "data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"cachedContentTokenCount\":4,\"candidatesTokenCount\":2,\"thoughtsTokenCount\":1,\"toolUsePromptTokenCount\":3,\"totalTokenCount\":16}}\n\n",
+			"cache_write_not_in_usage_metadata", modelbinding.AdapterGoogleGeminiV1beta, usage.UsagePartial, 10, 2, 4, -1, 1, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var metrics usage.CallMetrics
+			switch tc.transport {
+			case "json":
+				metrics = parseJSONResponseMetrics(tc.adapter, []byte(tc.payload)).finished(false)
+			case "sse":
+				observer := sseObserver{adapter: tc.adapter, beichen: true}
+				observer.observe([]byte(tc.payload))
+				metrics = observer.metrics.finished(!observer.terminal || observer.incomplete || observer.failed)
+			case "ws":
+				id := uuid.New()
+				observation := legacyResponsesObservation{callID: id, seen: map[string]struct{}{}}
+				observation.observe([]byte(`{"type":"response.created","response":{"id":"ws-1"}}`))
+				found, observed := observation.observe([]byte(tc.payload))
+				if found != id {
+					t.Fatal("terminal usage wasn't linked to response.created")
+				}
+				metrics = observed
+			}
+			metrics = metrics.ClassifyBeichenUsage(string(tc.adapter))
+			if metrics.State != tc.state || metrics.UsageReason != tc.reason {
+				t.Fatalf("state=%q reason=%q, want %q %q", metrics.State, metrics.UsageReason, tc.state, tc.reason)
+			}
+			for _, part := range []struct {
+				name string
+				got  *int64
+				want int64
+			}{
+				{"prompt", metrics.PromptTokens, tc.prompt}, {"output", metrics.CompletionTokens, tc.output},
+				{"read", metrics.CacheHitTokens, tc.read}, {"write", metrics.CacheWriteTokens, tc.write},
+				{"reasoning", metrics.ReasoningTokens, tc.reasoning}, {"tool prompt", metrics.ToolPromptTokens, tc.tool},
+			} {
+				if (part.want < 0 && part.got != nil) || (part.want >= 0 && !tokenIs(part.got, part.want)) {
+					t.Errorf("unexpected %s, expected %d: %+v", part.name, part.want, metrics)
+				}
+			}
+		})
 	}
 }
 
