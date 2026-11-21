@@ -23,11 +23,9 @@ import {
   harnessModelOptions,
   harnessModelSummary,
   keyHarnessSupport,
-  buildKeyReapplyModels,
   gatewayOriginIssue,
   keyCanWithdraw,
   keyIncludesModel,
-  keyReapplyQuota,
   pickClaudeModel,
   pickCodexModel,
   selectCurrentStudentKey,
@@ -147,10 +145,6 @@ describe('studentHarnessConfig', () => {
     expect(keyIncludesModel(active, 'claude-sonnet-4-5')).toBe(false)
     expect(keyCanWithdraw(active)).toBe(false)
     expect(keyCanWithdraw(pending)).toBe(true)
-    expect(keyReapplyQuota(active)).toBe('300.000')
-    expect(keyReapplyQuota(pending)).toBe('150.000')
-    expect(buildKeyReapplyModels(active, 'claude-sonnet-4-5').map(item => item.model_id))
-      .toEqual(['gpt-5.3-codex', 'claude-sonnet-4-5'])
     expect(selectCurrentStudentKey([key({ status: 'rejected' })])).toBeNull()
   })
 

@@ -29,7 +29,6 @@ import (
 	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
@@ -148,7 +147,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		routes, err = g.routesForModel(r.Context(), key.ID, modelID, adapter)
 	}
 	if err != nil || len(routes) == 0 {
-		writeProtocolError(w, r.URL.Path, http.StatusBadRequest, "invalid_request_error", "model_not_allowed", "The requested model is not allowed or is unavailable for this API key.", "model")
+		g.writeModelProtocolRejection(w, r, key.ID, modelID, adapter)
 		return
 	}
 	prompt, promptSource := extractInputSnapshot(r.URL.Path, r.Header.Get("Content-Type"), replay)
@@ -243,6 +242,7 @@ func ensureAnthropicVersion(header http.Header) {
 }
 
 func (g *Gateway) serveModels(w http.ResponseWriter, r *http.Request, key *ent.APIKey) {
+	w.Header().Set("Cache-Control", "no-store")
 	rows, err := g.db.Model.Query().Where(
 		entmodel.HasAPIKeyModelsWith(apikeymodel.APIKeyIDEQ(key.ID)),
 	).Order(ent.Asc(entmodel.FieldModelID)).All(r.Context())
@@ -250,16 +250,127 @@ func (g *Gateway) serveModels(w http.ResponseWriter, r *http.Request, key *ent.A
 		writeOpenAIError(w, http.StatusServiceUnavailable, "server_error", "dependency_unavailable", "Model catalog is unavailable.", "")
 		return
 	}
+	ids := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	protocols, err := catalog.LoadPublishedProtocols(r.Context(), g.db, ids, g.credentialUsable)
+	if err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "server_error", "dependency_unavailable", "Model catalog is unavailable.", "")
+		return
+	}
 	data := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
-		if !catalog.IsOpenAIModelsListable(row.ModelID) {
-			continue
-		}
+		summary := catalog.SummarizeProtocols(row.ModelID, protocols[row.ID])
+		state, reason := modelProtocolAvailability(row, summary)
 		data = append(data, map[string]any{
 			"id": row.ModelID, "object": "model", "created": row.CreatedAt.Unix(), "owned_by": "nebula",
+			"protocols": summary.Protocols, "available_protocols": summary.AvailableProtocols,
+			"recommended_protocol": summary.RecommendedProtocol, "probe_state": summary.ProbeState,
+			"availability": state, "availability_reason": reason,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+func (g *Gateway) credentialUsable(ciphertext []byte) bool {
+	clear, err := g.security.DecryptCredential(ciphertext)
+	return err == nil && strings.TrimSpace(clear) != ""
+}
+
+func modelProtocolAvailability(model *ent.Model, summary catalog.ProtocolSummary) (state, reason string) {
+	switch {
+	case model.Status != entmodel.StatusActive:
+		return "maintenance", "维护中。校内模型已停用或还未发布，请联系老师。"
+	case summary.ProbeState == "failed":
+		return "maintenance", "维护中。所有已配置线路最近一次探活均失败，请联系老师检查渠道 Key 后重新探活。"
+	case len(summary.Protocols) == 0:
+		return "maintenance", "维护中。当前没有可接入的线路，请联系老师核对渠道 Key 和模型绑定。"
+	case len(summary.AvailableProtocols) == 0:
+		return "unverified", "已有绑定线路，当前还没有通过探活的协议。"
+	default:
+		return "available", ""
+	}
+}
+
+func (g *Gateway) modelProtocolRejection(ctx context.Context, keyID uuid.UUID, modelID string, requested modelbinding.Adapter) (int, map[string]any) {
+	fields := map[string]any{"type": "invalid_request_error", "code": "model_not_allowed", "param": "model", "message": gatewayMessageModelNotAllowed}
+	model, err := g.db.Model.Query().Where(
+		entmodel.ModelIDEQ(modelID),
+		entmodel.HasAPIKeyModelsWith(apikeymodel.APIKeyIDEQ(keyID)),
+	).Only(ctx)
+	if ent.IsNotFound(err) {
+		return http.StatusBadRequest, fields
+	}
+	var options map[uuid.UUID][]catalog.ProtocolCapability
+	if err == nil {
+		options, err = catalog.LoadPublishedProtocols(ctx, g.db, []uuid.UUID{model.ID}, g.credentialUsable)
+	}
+	if err != nil {
+		fields["type"], fields["code"], fields["message"] = "server_error", "dependency_unavailable", "暂时无法读取模型线路，请稍后重试。"
+		return http.StatusServiceUnavailable, fields
+	}
+
+	summary := catalog.SummarizeProtocols(model.ModelID, options[model.ID])
+	paths := make(map[string]string, len(summary.Protocols))
+	names := make([]string, 0, len(summary.Protocols))
+	for _, protocol := range summary.Protocols {
+		endpoint := catalog.EndpointForProtocol(protocol)
+		paths[protocol] = endpoint.Path
+		names = append(names, endpoint.Label)
+	}
+	fields["supported_protocols"] = summary.Protocols
+	fields["available_protocols"] = summary.AvailableProtocols
+	fields["recommended_protocol"] = summary.RecommendedProtocol
+	fields["requested_protocol"], fields["protocol_paths"] = requested, paths
+
+	state, reason := modelProtocolAvailability(model, summary)
+	if state == "maintenance" || summary.RecommendedProtocol == nil || *summary.RecommendedProtocol == string(requested) {
+		if reason == "" {
+			reason = "该协议的线路暂不可用，请稍后重试或联系老师检查绑定。"
+		}
+		fields["type"], fields["code"], fields["message"] = "server_error", "model_unavailable", reason
+		return http.StatusServiceUnavailable, fields
+	}
+	endpoint := catalog.EndpointForProtocol(*summary.RecommendedProtocol)
+	instruction := "如果客户端自动加 /v1，Base URL 填学校网关根地址。如果客户端只追加接口名，Base URL 以 /v1 结尾。"
+	switch modelbinding.Adapter(*summary.RecommendedProtocol) {
+	case modelbinding.AdapterGoogleGeminiV1beta, modelbinding.AdapterCohereRerankV2:
+		instruction = "Base URL 填学校网关根地址，按完整路径使用相应版本。"
+	}
+	fields["code"] = "protocol_mismatch"
+	fields["message"] = fmt.Sprintf("该模型支持 %s。请改用 %s，完整请求路径为 %s。%s",
+		strings.Join(names, "、"), endpoint.Label, endpoint.Path, instruction)
+	return http.StatusBadRequest, fields
+}
+
+func (g *Gateway) writeModelProtocolRejection(w http.ResponseWriter, r *http.Request, keyID uuid.UUID, modelID string, requested modelbinding.Adapter) {
+	status, fields := g.modelProtocolRejection(r.Context(), keyID, modelID, requested)
+	path := r.URL.Path
+	code := fields["code"].(string)
+	if fields["supported_protocols"] == nil {
+		writeProtocolError(w, path, status, fields["type"].(string), code, fields["message"].(string), "model")
+		return
+	}
+	switch {
+	case path == "/v1/messages":
+		delete(fields, "param")
+		if status == http.StatusServiceUnavailable {
+			fields["type"] = "api_error"
+		}
+		writeJSON(w, status, map[string]any{"type": "error", "error": fields})
+	case isGeminiPath(path):
+		delete(fields, "type")
+		delete(fields, "param")
+		fields["code"], fields["status"], fields["reason"] = status, geminiStatus(status), code
+		writeJSON(w, status, map[string]any{"error": fields})
+	case path == "/v2/rerank":
+		delete(fields, "type")
+		delete(fields, "param")
+		writeJSON(w, status, fields)
+	default:
+		writeJSON(w, status, map[string]any{"error": fields})
+	}
 }
 
 func (g *Gateway) serveCodexModelCatalog(w http.ResponseWriter, r *http.Request, key *ent.APIKey) {
@@ -350,45 +461,17 @@ func (g *Gateway) resourceRoutes(ctx context.Context, keyID uuid.UUID, resourceT
 func (g *Gateway) decryptRoutes(ctx context.Context, bindings []*ent.ModelBinding) []route {
 	routes := make([]route, 0, len(bindings))
 	for _, binding := range bindings {
-		ready, err := catalog.BindingRouteReady(ctx, g.db, binding)
-		if err != nil || !ready {
-			continue
-		}
 		upstream := binding.Edges.Provider
 		if upstream == nil || upstream.Status != provider.StatusActive {
 			continue
 		}
-		credential, credentialID, err := g.resolveBindingCredential(ctx, binding)
-		if err != nil || strings.TrimSpace(credential) == "" {
+		credential, credentialID, err := catalog.ResolveBindingCredential(ctx, g.db, g.security, binding)
+		if err != nil || credential == "" {
 			continue
 		}
 		routes = append(routes, route{Binding: binding, Provider: upstream, Credential: credential, CredentialID: credentialID})
 	}
 	return routes
-}
-
-func (g *Gateway) resolveBindingCredential(ctx context.Context, binding *ent.ModelBinding) (string, uuid.UUID, error) {
-	credentialID := binding.CredentialID
-	if credentialID == nil {
-		var found bool
-		var err error
-		credentialID, found, err = catalog.FindActiveCatalogCredential(ctx, g.db, binding.ProviderID, binding.UpstreamModelName, uuid.Nil)
-		if err != nil || !found || credentialID == nil {
-			return "", uuid.Nil, errors.New("provider credential is unavailable")
-		}
-	}
-	row, err := g.db.ProviderCredential.Query().
-		Where(
-			providercredential.IDEQ(*credentialID),
-			providercredential.ProviderIDEQ(binding.ProviderID),
-			providercredential.StatusEQ(providercredential.StatusActive),
-		).
-		Only(ctx)
-	if err != nil {
-		return "", uuid.Nil, err
-	}
-	credential, err := g.security.DecryptCredential(row.CredentialCiphertext)
-	return credential, row.ID, err
 }
 
 func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, candidate route, adjustments ...func(map[string]json.RawMessage) error) (*http.Request, func(), error) {
@@ -473,7 +556,7 @@ func (g *Gateway) serveRealtimeWebSocket(w http.ResponseWriter, r *http.Request)
 	}
 	routes, err := g.routesForModel(r.Context(), key.ID, modelID, modelbinding.AdapterOpenaiRealtime)
 	if err != nil || len(routes) == 0 {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "model_not_allowed", gatewayErrorMessage(http.StatusBadRequest, "model_not_allowed", "No allowed model is available for this protocol."), "model")
+		g.writeModelProtocolRejection(w, r, key.ID, modelID, modelbinding.AdapterOpenaiRealtime)
 		return
 	}
 	var upstream *websocket.Conn
@@ -546,7 +629,8 @@ func (g *Gateway) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request
 	}
 	routes, err := g.routesForModel(r.Context(), key.ID, modelID, modelbinding.AdapterOpenaiResponses)
 	if err != nil || len(routes) == 0 {
-		_ = client.WriteJSON(map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "code": "model_not_allowed", "message": gatewayErrorMessage(http.StatusBadRequest, "model_not_allowed", "The requested model is not allowed.")}})
+		_, fields := g.modelProtocolRejection(r.Context(), key.ID, modelID, modelbinding.AdapterOpenaiResponses)
+		_ = client.WriteJSON(map[string]any{"type": "error", "error": fields})
 		return
 	}
 	var upstream *websocket.Conn

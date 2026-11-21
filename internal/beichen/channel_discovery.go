@@ -203,6 +203,10 @@ type discoveryJob struct {
 }
 
 func (s *Service) discoverChannels(ctx context.Context) error {
+	return s.discoverChannelKeys(ctx, nil)
+}
+
+func (s *Service) discoverChannelKeys(ctx context.Context, selected *uuid.UUID) error {
 	if !s.WebSessionConfigured() {
 		return nil
 	}
@@ -210,8 +214,10 @@ func (s *Service) discoverChannels(ctx context.Context) error {
 FROM beichen_provision_channels j JOIN provider_credentials c ON c.id=j.credential_id
 JOIN providers p ON p.id=c.provider_id JOIN beichen_panel_access a ON a.credential_id=c.id
 WHERE j.discover_ids AND a.updated_by=$1 AND c.status='active' AND p.status='active' AND `+beichenProvider+`
- AND (a.group_id IS NULL OR j.checked_at IS NULL OR j.checked_at < clock_timestamp()-interval '15 minutes')
-ORDER BY j.checked_at NULLS FIRST,c.id LIMIT 4`, ProvisionActorID)
+ AND ($2::uuid IS NULL OR c.id=$2)
+ AND (a.group_id IS NULL OR a.updated_at<>c.updated_at OR j.checked_at IS NULL OR j.checked_at < clock_timestamp()-interval '15 minutes'
+      OR ($2 IS NOT NULL AND j.discovery_error IS NOT NULL))
+ORDER BY j.checked_at NULLS FIRST,c.id LIMIT 4`, ProvisionActorID, selected)
 	if err != nil {
 		return err
 	}
@@ -336,6 +342,9 @@ WHERE a.credential_id=$1 AND a.updated_by=$2 AND c.updated_at=$3 AND c.status='a
 		}
 		if !same {
 			if err := s.WritePanelAccessTx(ctx, tx, j.credential, actor, access); err != nil {
+				return err
+			}
+			if err := QueueCredentialSyncTx(ctx, tx, j.credential); err != nil {
 				return err
 			}
 		}

@@ -190,7 +190,9 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 				t.Fatalf("共享模型的已发布北辰线路或报价状态不正确: %+v", m)
 			}
 			if upstream == "special" && (m.PriceState != "conditional" || m.Activation != "blocked" ||
-				len(m.Blockers) != 1 || m.Blockers[0].Code != "conditional_price") {
+				len(m.Blockers) != 1 || m.Blockers[0].Code != "conditional_price" ||
+				m.PriceBlocker == nil || m.PriceBlocker.Code != "tier_missing_output" ||
+				m.PriceBlocker.Message != m.Blockers[0].Message) {
 				t.Fatalf("条件计价模型的状态或阻塞原因不正确: %+v", m)
 			}
 			for _, r := range m.PreferredRoutes {

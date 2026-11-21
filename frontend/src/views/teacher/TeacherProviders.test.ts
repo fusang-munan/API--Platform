@@ -1,12 +1,20 @@
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent } from 'vue'
-import type { Provider } from '../../api/types'
+import type { Provider, ProviderCredential } from '../../api/types'
 import BeichenReconcile from './BeichenReconcile.vue'
 import TeacherProviders from './TeacherProviders.vue'
 
-const api = vi.hoisted(() => ({ providers: vi.fn(), beichenOverview: vi.fn(), beichenAliases: vi.fn(), putBeichenAlias: vi.fn() }))
+const api = vi.hoisted(() => ({
+  providers: vi.fn(), beichenOverview: vi.fn(), beichenAliases: vi.fn(), putBeichenAlias: vi.fn(),
+  createProviderCredential: vi.fn(), updateProviderCredential: vi.fn(), requestBeichenProbes: vi.fn(),
+}))
+const channelAPI = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn() }))
 vi.mock('../../api/teacher', () => ({ teacherAPI: api }))
+vi.mock('../../api/client', async importOriginal => ({
+  ...await importOriginal<typeof import('../../api/client')>(),
+  ...channelAPI,
+}))
 const Dialog = defineComponent({ props: ['open', 'title'], template: '<section v-if="open" role="dialog" :aria-label="title"><slot /></section>' })
 enableAutoUnmount(afterEach)
 
@@ -25,10 +33,137 @@ function view() {
 }
 
 beforeEach(() => {
-  api.providers.mockReset()
-  api.beichenOverview.mockReset()
-  api.beichenAliases.mockReset()
-  api.putBeichenAlias.mockReset()
+  for (const mock of Object.values({ ...api, ...channelAPI })) mock.mockReset()
+})
+
+describe('渠道切换向导', () => {
+  const credential = (id: string, label: string, status: ProviderCredential['status']) => ({
+    id, provider_id: 'north', label, status, credential_configured: true, created_at: '', updated_at: '',
+  })
+  const oldKey = credential('old', 'Claude 原渠道', 'inactive')
+  const newKey = credential('next', 'Claude 新渠道', 'active')
+  const sync = (state: string) => ({ catalog: state, prices: state, billing: state, usage: state })
+  const model = {
+    model: 'claude-fable-5', ready_count: 0, losing_route_count: 0, loses_last_route: false,
+    routes: [{ adapter: 'anthropic', upstream_model: 'claude-fable-5', credential_id: 'old', credential_label: oldKey.label, ready: false, stale: true }],
+  }
+
+  it('保存新 Key 后自动读取预览，显示缺价和协议原因，等确认后才换线', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    api.providers.mockResolvedValue([{ ...provider('north'), credentials: [oldKey] }])
+    api.beichenOverview.mockResolvedValue({ model_catalog: [], comparison: [], credentials: [
+      { credential_id: 'next', label: newKey.label, status: 'active', health: {
+        available_dimensions: 2,
+        credential: { state: 'available', message: '凭据正常' },
+        catalog: { state: 'available', message: '目录正常' },
+        pricing: { state: 'unavailable', message: '缺价', action: 'sync' },
+        probe: { state: 'pending', message: '等待首次探活', action: 'probe' },
+      } },
+      { credential_id: 'old', label: oldKey.label, status: 'inactive', health: { available_dimensions: 0 } },
+    ] })
+    let added = false
+    let synced = false
+    let confirmed = false
+    const route = { upstream_model: model.model, priority: 7, status: 'active' }
+    const changes = [{
+      action: 'update', adapter: 'anthropic', binding_id: 'binding', school_model: model.model,
+      before: { ...route, credential_id: 'old', credential_label: oldKey.label },
+      after: { ...route, credential_id: 'next', credential_label: newKey.label },
+    }]
+    channelAPI.get.mockImplementation((url: string) => ({
+      credentials: [
+        { credential_id: 'old', label: oldKey.label, status: oldKey.status, sync: sync('inactive') },
+        ...(added ? [{ credential_id: 'next', label: newKey.label, status: newKey.status, sync: sync(synced ? 'ready' : 'pending') }] : []),
+      ],
+      counts: { enabled_keys: added ? 1 : 0, enabled_models: 1, maintenance_models: confirmed ? 0 : 1, stale_routes: confirmed ? 0 : 1 },
+      models: confirmed ? [] : [model],
+      preview: synced && url.includes('to_credential_id=next') ? {
+        preview: true, preview_token: 'preview-token', changes: confirmed ? [] : changes,
+        blockers: [
+          { school_model: 'other', adapter: 'anthropic', code: 'missing_price', message: '接替渠道缺少可计算报价。' },
+          { school_model: 'other', adapter: 'openai_responses', code: 'missing_protocol', message: '接替渠道未登记这条线路使用的协议。' },
+        ],
+      } : null,
+    }))
+    api.createProviderCredential.mockImplementation(async () => {
+      added = true
+      return newKey
+    })
+    channelAPI.post.mockImplementation(async (url: string) => {
+      if (url.endsWith('/sync')) return { synced: true }
+      confirmed = true
+      return { preview: false, changes }
+    })
+    const wrapper = view()
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '渠道切换向导')!.trigger('click')
+    await flushPromises()
+    const dialog = wrapper.get('[aria-label="渠道切换向导"]')
+    const button = (label: string) => dialog.findAll('button').find(element => element.text() === label)!
+    expect(dialog.get('[aria-label="受影响模型"]').text().replace(/\s+/gu, ' ')).toContain('claude-fable-5 · 0 条可用线路 · 维护中')
+    await button('添加接替 Key').trigger('click')
+    const form = dialog.get('form')
+    const [name, key] = form.findAll('input')
+    await name.setValue(newKey.label)
+    await key.setValue('sk-local-fixture')
+    await form.trigger('submit')
+    await flushPromises()
+    expect(api.createProviderCredential).toHaveBeenCalledWith('north', {
+      label: newKey.label, credential: 'sk-local-fixture', status: 'active', replaces_credential_id: 'old',
+    })
+    expect(dialog.text()).toContain('等待同步')
+    expect(dialog.find('[aria-label="重绑预览"]').exists()).toBe(false)
+    expect(channelAPI.post).not.toHaveBeenCalled()
+    synced = true
+    await vi.advanceTimersByTimeAsync(5000)
+    await flushPromises()
+    const preview = dialog.get('[aria-label="重绑预览"]')
+    expect(preview.text()).toContain('Claude 原渠道 → Claude 新渠道')
+    expect(preview.text()).toContain('接替渠道缺少可计算报价')
+    expect(preview.text()).toContain('接替渠道未登记这条线路使用的协议')
+    expect(dialog.get('summary').text()).toBe('Key 健康 0/1 把')
+    await button('一键同步').trigger('click')
+    await flushPromises()
+    expect(channelAPI.post).toHaveBeenCalledExactlyOnceWith('/api/v1/teacher/providers/north/beichen/sync', { credential_id: 'next' })
+    await button('确认重绑').trigger('click')
+    await flushPromises()
+    expect(channelAPI.post).toHaveBeenLastCalledWith('/api/v1/teacher/providers/north/beichen/channel-switch', {
+      from_credential_id: 'old', to_credential_id: 'next', preview_token: 'preview-token',
+    })
+    expect(dialog.text()).toContain('已更新 1 条线路')
+    expect(dialog.text()).toContain('维护中 0 个')
+  })
+
+  it('请求停用前读取并列出会失去最后一条线路的模型', async () => {
+    const activeOld = { ...oldKey, status: 'active' as const }
+    api.providers.mockResolvedValue([{ ...provider('north'), credentials: [activeOld] }])
+    api.beichenOverview.mockResolvedValue({ model_catalog: [], comparison: [] })
+    channelAPI.get.mockImplementation((url: string) => ({
+      credentials: [{ credential_id: 'old', label: oldKey.label, status: 'active', sync: sync('ready') }],
+      counts: { enabled_keys: 1, enabled_models: 2, maintenance_models: 0, stale_routes: 0 },
+      models: url.includes('from_credential_id=old') ? [
+        { ...model, ready_count: 1, losing_route_count: 1, loses_last_route: true },
+        { ...model, model: 'has-backup', ready_count: 2, losing_route_count: 1 },
+      ] : [],
+      preview: null,
+    }))
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true)
+    api.updateProviderCredential.mockResolvedValue(oldKey)
+    const wrapper = view()
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '渠道切换向导')!.trigger('click')
+    await flushPromises()
+    const dialog = wrapper.get('[aria-label="渠道切换向导"]')
+    const retire = dialog.findAll('button').find(button => button.text() === '停用原 Key')!
+    await retire.trigger('click')
+    await flushPromises()
+    expect(confirm.mock.calls[0][0]).toContain('进入维护的模型\nclaude-fable-5')
+    expect(confirm.mock.calls[0][0]).toContain('少一条或多条北辰线路的模型\nhas-backup')
+    expect(api.updateProviderCredential).not.toHaveBeenCalled()
+    await retire.trigger('click')
+    await flushPromises()
+    expect(api.updateProviderCredential).toHaveBeenCalledWith('north', 'old', { status: 'inactive' })
+  })
 })
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
 

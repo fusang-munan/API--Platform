@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
-import type { BeichenCatalogModel, BeichenHealthDimension, BeichenModelUsage, BeichenOverview, BeichenProbeRun, BeichenUsageRange, BindingAdapter } from '../../api/types'
+import type { BeichenCapabilities, BeichenCatalogModel, BeichenHealthDimension, BeichenModelCapability, BeichenModelUsage, BeichenOverview, BeichenProbeRun, BeichenUsageRange, BindingAdapter } from '../../api/types'
 import type { BeichenRebindPlan, BeichenRebindRoute } from '../../api/types'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { useToast } from '../../composables/useToast'
@@ -24,6 +24,7 @@ type ProbeBudget = { date: string; used: number; limit: number; remaining: numbe
 type ProbeRunWithBudget = BeichenProbeRun & { budget?: ProbeBudget }
 
 const overview = ref<BeichenOverview>()
+const capabilities = ref<BeichenCapabilities>()
 const usageStates = ref<Partial<Record<BeichenUsageRange, UsageState>>>({})
 const range = ref<BeichenUsageRange>('month')
 const loading = ref(false)
@@ -53,11 +54,142 @@ const filters = [{ id: 'all', label: '全部' }, { id: 'active', label: '已启�
 function adapterLabel(value: string) { return bindingAdapterMeta(value as BindingAdapter).label }
 const filter = ref<typeof filters[number]['id']>('all')
 const priceRow = ref<SchoolCatalogRow>()
-const conditionsRow = ref<SchoolCatalogRow>()
+const conditionsRow = ref<CatalogRow>()
 const usageOpen = ref(false)
 const initialModel = ref('')
 const websiteOnly = computed(() => overview.value?.website_only_models ?? [])
 const websiteOnlyNames = computed(() => new Set(websiteOnly.value.map(row => row.model.toLowerCase())))
+const protocolLabels: Record<string, string> = {
+  openai_compatible: 'OpenAI Chat',
+  openai_responses: 'OpenAI Responses',
+  anthropic: 'Anthropic Messages',
+  google_gemini_v1beta: 'Gemini 原生',
+}
+type CapabilitySummary = {
+  protocols: string[]
+  availableProtocols: string[]
+  recommendedProtocol?: string
+  probeState: 'passed' | 'unprobed' | 'failed' | 'not_applicable'
+  availability: 'available' | 'maintenance' | 'unverified' | 'unavailable' | 'not_published'
+  availabilityReason: string
+  actionHint: string
+  priceState?: PriceState
+  priceBlocker?: string
+  bindingInvalid: boolean
+}
+const availabilityRank: Record<string, number> = { available: 5, unverified: 4, not_published: 3, maintenance: 2, unavailable: 1 }
+const capabilityRows = computed(() => {
+  const result = new Map<string, BeichenModelCapability[]>()
+  for (const row of capabilities.value?.capabilities ?? []) {
+    const model = row.model.trim().toLowerCase()
+    if (!model) continue
+    const rows = result.get(model) ?? []
+    rows.push(row)
+    result.set(model, rows)
+  }
+  return result
+})
+function protocolLabel(value: string) {
+  return protocolLabels[value] ?? bindingAdapterMeta(value as BindingAdapter).label
+}
+function normalizeSignal(value: string) {
+  return value.trim().toLowerCase().replace(/[_ /.:]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')
+}
+function capabilityFamilyRank(model: string, protocol: string) {
+  const name = normalizeSignal(model)
+  const anthropic = Boolean(name) && !name.startsWith('gpt') && ['claude', 'opus', 'sonnet', 'haiku'].some(token => name.includes(token))
+  let preferred = ['openai_compatible', 'openai_responses']
+  if (anthropic) preferred = ['anthropic', 'openai_compatible', 'openai_responses']
+  else if (name.includes('gemini')) preferred = ['google_gemini_v1beta', 'openai_compatible', 'openai_responses']
+  const index = preferred.indexOf(protocol)
+  return index >= 0 ? 3 - index : 0
+}
+function capabilityPriceState(value?: string): PriceState | undefined {
+  return value === 'confirmed' || value === 'conditional' || value === 'manual' || value === 'missing' || value === 'mixed' ? value : undefined
+}
+function uniqueProtocols(values: Array<string | null | undefined>) {
+  return [...new Set(values.filter((value): value is string => Boolean(value)))].sort()
+}
+/** 与后端 catalog.SummarizeProtocols 相同的排序规则，保证教师页与 /v1/models 推荐一致。 */
+function summarizeCapabilities(model: string): CapabilitySummary | undefined {
+  const rows = capabilityRows.value.get(model.trim().toLowerCase())
+  if (!rows?.length) return undefined
+  const ready = rows.filter(row => row.binding_state === 'ready')
+  const published = ready.length > 0
+  const listed = rows.filter(row => row.catalog_state === 'key_listed' || row.catalog_state === 'website_only')
+  const basis = published ? ready : listed.length ? listed : rows
+  const bindingInvalid = rows.some(row => row.binding_state === 'invalid')
+  const priceStates = new Set((published ? ready : basis).map(row => capabilityPriceState(row.price_state)).filter(Boolean) as PriceState[])
+  const priceState = priceStates.size > 1 ? 'mixed' : [...priceStates][0]
+  const priceBlocker = basis.map(row => row.price_blocker?.message?.trim()).find(Boolean)
+  const actionHint = basis.map(row => row.action_hint?.trim()).find(Boolean) ?? ''
+  const details = basis.flatMap(row => row.protocol_details ?? [])
+  if (!details.length) {
+    const chosen = [...basis].sort((left, right) =>
+      (availabilityRank[right.availability] ?? 0) - (availabilityRank[left.availability] ?? 0))[0]
+    const recommended = basis.map(row => row.recommended_protocol?.trim()).find(Boolean)
+    return {
+      protocols: uniqueProtocols(basis.flatMap(row => row.supported_protocols ?? [])),
+      availableProtocols: uniqueProtocols(basis.flatMap(row => row.available_protocols ?? [])),
+      recommendedProtocol: recommended || undefined,
+      probeState: (chosen?.probe_state ?? 'not_applicable') as CapabilitySummary['probeState'],
+      availability: (chosen?.availability ?? 'not_published') as CapabilitySummary['availability'],
+      availabilityReason: chosen?.availability_reason?.trim() ?? '',
+      actionHint,
+      priceState,
+      priceBlocker,
+      bindingInvalid,
+    }
+  }
+  const evidence = new Map<string, number>()
+  for (const detail of details) {
+    if (published && !detail.binding_ready) continue
+    const rank = detail.probe_state === 'passed' ? 2 : detail.probe_state === 'unprobed' ? 1 : 0
+    evidence.set(detail.protocol, Math.max(evidence.get(detail.protocol) ?? -1, rank))
+  }
+  const routedProtocols = [...evidence.keys()].sort()
+  const supportedProtocols = uniqueProtocols(rows.flatMap(row => row.supported_protocols ?? []))
+  const protocols = supportedProtocols.length ? supportedProtocols : routedProtocols
+  const availableProtocols = [...evidence].filter(([, rank]) => rank === 2).map(([protocol]) => protocol).sort()
+  const best = [...evidence.values()].reduce((rank, value) => Math.max(rank, value), 0)
+  const recommendedProtocol = best > 0
+    ? [...evidence].filter(([, rank]) => rank === best)
+      .sort(([left], [right]) => capabilityFamilyRank(model, right) - capabilityFamilyRank(model, left) || left.localeCompare(right))[0][0]
+    : undefined
+  const probeState: CapabilitySummary['probeState'] = !routedProtocols.length ? 'not_applicable'
+    : best === 2 ? 'passed' : best === 1 ? 'unprobed' : 'failed'
+  const reasonFor = (state: string) => basis.find(row => row.availability === state && row.availability_reason?.trim())?.availability_reason?.trim() ?? ''
+  let availability: CapabilitySummary['availability']
+  let availabilityReason = ''
+  if (published) {
+    if (!routedProtocols.length) {
+      availability = 'maintenance'
+      availabilityReason = reasonFor('maintenance') || '维护中。当前没有可接入的线路，请联系老师核对渠道 Key 和模型绑定。'
+    } else if (probeState === 'failed') {
+      availability = 'maintenance'
+      availabilityReason = reasonFor('maintenance') || '维护中。所有已配置线路最近一次探活均失败，请联系老师检查渠道 Key 后重新探活。'
+    } else if (!availableProtocols.length) {
+      availability = 'unverified'
+      availabilityReason = reasonFor('unverified') || '已有绑定线路，当前还没有通过探活的协议。'
+    } else {
+      availability = 'available'
+    }
+  } else {
+    const chosen = [...basis].sort((left, right) =>
+      (availabilityRank[right.availability] ?? 0) - (availabilityRank[left.availability] ?? 0))[0]
+    availability = (chosen?.availability ?? 'not_published') as CapabilitySummary['availability']
+    availabilityReason = chosen?.availability_reason?.trim() ?? ''
+    if (bindingInvalid) {
+      availability = 'maintenance'
+      availabilityReason = rows.find(row => row.binding_state === 'invalid' && row.availability_reason?.trim())?.availability_reason?.trim()
+        || availabilityReason
+    }
+  }
+  return {
+    protocols, availableProtocols, recommendedProtocol, probeState, availability, availabilityReason,
+    actionHint, priceState, priceBlocker, bindingInvalid,
+  }
+}
 const rescanKeys = computed(() => (overview.value?.credentials ?? []).filter(key => key.status === 'active'))
 const rescanKeyAvailable = computed(() => rescanKeys.value.some(key => key.credential_id === rescanKey.value))
 const rebindModelCount = computed(() => new Set(rebindPlan.value?.changes.map(row => row.model_id)).size)
@@ -86,10 +218,17 @@ const catalog = computed(() => {
     const activation = entry?.activation
     const active = row.status === 'active' || activation === 'active' || Boolean(entry?.binding_issue)
     const canDisable = row.canDisable || (activation === 'active' && Boolean(entry?.school_model))
-    const priceState = entry?.price_state ?? oldPriceState(row)
-    const priceCovered = entry?.price_covered ?? (entry?.price_state == null ? row.priceReady
-      : priceState === 'confirmed' || priceState === 'manual' || (priceState === 'mixed' && row.priceReady))
-    const blockers = [...new Set((entry?.blockers ?? []).map(blocker => blocker.message?.trim()).filter(Boolean))]
+    const capability = summarizeCapabilities(row.model)
+    const priceState = capability?.priceState ?? entry?.price_state ?? oldPriceState(row)
+    const priceCovered = capability
+      ? priceState === 'confirmed' || priceState === 'manual' || (priceState === 'mixed' && row.priceReady)
+      : entry?.price_covered ?? (entry?.price_state == null ? row.priceReady
+        : priceState === 'confirmed' || priceState === 'manual' || (priceState === 'mixed' && row.priceReady))
+    const blockers = entry?.blockers ?? []
+    const routeBlocked = entry?.route_count === 0 || blockers.some(blocker => blocker.code === 'no_ready_route')
+    const blockerMessages = blockers
+      .filter(blocker => !routeBlocked || (blocker.code !== 'missing_price' && blocker.code !== 'conditional_price'))
+      .map(blocker => blocker.message?.trim()).filter(Boolean)
     const pricing = (row.quotes.length ? row.quotes : [null]).map(quote => ({
       key: quote?.key ?? 'missing',
       status: quote?.status ?? 'pending',
@@ -100,11 +239,22 @@ const catalog = computed(() => {
       student: displayPrice(quote, true),
     }))
     return {
-      ...row, active, activation, canDisable, blockers, keyCoverage, routeCount, readyCount, priceState, priceCovered, pricing,
+      ...row, active, activation, canDisable, keyCoverage, routeCount, readyCount, priceState, priceCovered, pricing, routeBlocked,
+      blockers: [...new Set(blockerMessages)],
+      priceBlocker: capability ? capability.priceBlocker : entry?.price_blocker?.message.trim(),
       listed: !websiteOnlyNames.value.has(model) && entry?.credential_ids?.length !== 0,
-      protocolCount: entry?.protocols?.length ?? (protocols.size || (routeCount === 0 ? 0 : null)),
-      protocolLabels: entry?.protocols?.map(protocol => bindingAdapterMeta(protocol).label) ?? [],
-      probeState: entry?.probe_state,
+      protocolCount: capability ? capability.protocols.length : entry?.protocols?.length ?? (protocols.size || (routeCount === 0 ? 0 : null)),
+      protocolLabels: capability
+        ? capability.protocols.map(protocolLabel)
+        : entry?.protocols?.map(protocol => bindingAdapterMeta(protocol).label) ?? [],
+      probeState: capability ? (capability.probeState === 'not_applicable' ? undefined : capability.probeState) : entry?.probe_state,
+      recommendedProtocol: capability?.recommendedProtocol,
+      availability: capability?.availability,
+      availabilityReason: capability?.availabilityReason,
+      actionHint: capability?.actionHint,
+      hasCapability: Boolean(capability),
+      bindingInvalid: capability?.bindingInvalid ?? false,
+      protocolMissing: Boolean(capability && capability.protocols.length === 0),
       lastProbeAt: entry?.last_probe_at,
       bindingIssue: entry?.binding_issue,
     }
@@ -209,12 +359,23 @@ async function load() {
   const providerId = props.providerId
   loading.value = true
   error.value = ''
+  capabilities.value = undefined
   try {
     const result = await teacherAPI.beichenOverview(providerId, schoolDay())
-    if (!disposed && request === overviewRequest) overview.value = result
+    if (disposed || request !== overviewRequest) return
+    overview.value = result
+    if ((result.model_catalog ?? []).length && typeof teacherAPI.beichenCapabilities === 'function') {
+      try {
+        const capabilityResult = await teacherAPI.beichenCapabilities(providerId)
+        if (!disposed && request === overviewRequest) capabilities.value = capabilityResult
+      } catch {
+        // 旧版后端没有能力接口时回退现有线路字段。
+      }
+    }
   } catch (e) {
     if (!disposed && request === overviewRequest) {
       overview.value = undefined
+      capabilities.value = undefined
       error.value = apiErrorMessage(e, '读取北辰模型失败，请点击刷新模型重试')
     }
   } finally {
@@ -256,9 +417,34 @@ function publicationLabel(row: CatalogRow) {
   return statusLabel(row.status ?? undefined) || '未发布'
 }
 
+const availabilityLabels: Record<string, string> = {
+  available: '可用', maintenance: '维护中', unverified: '待验证', unavailable: '不可用', not_published: '未发布',
+}
+function rowAvailability(row: CatalogRow) {
+  if (row.hasCapability && row.availability) return row.availability
+  if (row.bindingIssue || row.probeState === 'failed') return 'maintenance'
+  if (row.routeCount === 0) return 'unavailable'
+  return row.active ? 'available' : 'not_published'
+}
+function availabilityLabel(row: CatalogRow) {
+  return availabilityLabels[rowAvailability(row)] ?? '状态待同步'
+}
+function availabilityTone(row: CatalogRow) {
+  const state = rowAvailability(row)
+  return state === 'available' ? 'active' : state === 'maintenance' || state === 'unavailable' ? 'danger' : 'pending'
+}
+
 function canEnableReason(row: CatalogRow) {
   if (!row.listed) return '当前没有渠道 Key 列出此模型'
+  if (row.hasCapability) {
+    if (row.bindingInvalid) return row.availabilityReason || row.bindingIssue?.message || '绑定失效，请检查渠道 Key 与模型协议后重绑。'
+    if (row.availability === 'maintenance') return row.availabilityReason || '维护中，请检查线路后重新探活。'
+    if (row.availability === 'unavailable') return row.availabilityReason || '当前没有可用线路，请检查渠道 Key 后重扫目录。'
+    if (row.protocolMissing) return '当前没有可用协议，请重扫目录并核对官网支持的协议。'
+  }
   if (row.activation === 'ready') return ''
+  if (row.routeBlocked) return row.blockers.join('；') || '线路未就绪，请刷新模型或检查渠道配置'
+  if (row.priceBlocker) return row.priceBlocker
   if (row.blockers.length) return row.blockers.join('；')
   if (row.activation == null && row.canEnable == null) return '启用条件待同步，请先刷新模型'
   if (!row.priceCovered) return row.priceState === 'conditional' ? '条件价待核实，可先手动定价' : '官网未报价，请先手动定价'
@@ -672,11 +858,24 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
           <tr v-for="(row, index) in rows" :key="row.model" :data-model="row.model" :class="{ 'binding-issue-row': row.bindingIssue }">
             <th scope="row" class="model-name">{{ row.model }}</th>
             <td data-label="状态与覆盖" class="model-state">
-              <span>{{ row.keyCoverage }}/{{ keyCount }} 把 Key 覆盖</span> ·
-              <span :title="row.routeCount + ' 条候选线路'">{{ row.protocolCount == null ? '协议数待同步' : row.protocolCount + ' 种协议' }}</span> ·
-              <span>{{ row.readyCount }} 条已发布</span> ·
-              <span>{{ priceStateLabels[row.priceState] ?? '报价待同步' }}</span> ·
-              <strong :class="row.bindingIssue ? 'binding-issue' : row.active ? 'published-state' : undefined">{{ publicationLabel(row) }}</strong>
+              <span class="model-state-summary">
+                <span>{{ row.keyCoverage }}/{{ keyCount }} 把 Key 覆盖</span> ·
+                <span :title="row.routeCount + ' 条候选线路'">{{ row.protocolCount == null ? '协议数待同步' : row.protocolCount + ' 种协议' }}</span> ·
+                <span>{{ row.readyCount }} 条已发布</span> ·
+                <span>{{ priceStateLabels[row.priceState] ?? '报价待同步' }}</span> ·
+                <strong :class="row.bindingIssue ? 'binding-issue' : row.active ? 'published-state' : undefined">{{ publicationLabel(row) }}</strong>
+              </span>
+              <div class="model-capability" data-testid="model-capability">
+                <span class="status-pill" :class="availabilityTone(row)" data-testid="model-availability">{{ availabilityLabel(row) }}</span>
+                <span class="chip recommend" data-testid="recommended-protocol">{{ row.recommendedProtocol
+                  ? '推荐 ' + protocolLabel(row.recommendedProtocol)
+                  : row.hasCapability ? '暂无推荐协议' : '推荐协议待同步' }}</span>
+                <span v-if="row.bindingInvalid" class="status-pill danger" data-testid="binding-invalid">绑定失效</span>
+                <span v-if="row.protocolMissing" class="status-pill pending" data-testid="protocol-missing">缺协议</span>
+                <span v-if="row.priceState === 'missing'" class="status-pill pending" data-testid="price-missing">缺价</span>
+              </div>
+              <small v-if="row.availabilityReason" class="row-note" data-testid="availability-reason">{{ row.availabilityReason }}</small>
+              <small v-if="row.actionHint" class="row-note" data-testid="action-hint">下一步：{{ row.actionHint }}</small>
               <small v-if="row.bindingIssue" class="row-note binding-issue">{{ row.bindingIssue.message }}</small>
               <small v-if="row.protocolLabels.length" class="row-note">{{ row.protocolLabels.join(' · ') }}</small>
               <div v-if="row.probeState" class="model-probe">
@@ -806,6 +1005,12 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
   <AppDialog :open="Boolean(conditionsRow)" :title="(conditionsRow?.model ?? '模型') + ' · 计价档位'" description="查看官网计价条件及按线路倍率换算的学生实价。"
     wide @update:open="open => { if (!open) conditionsRow = undefined }">
     <div class="beichen-stack">
+      <p v-if="conditionsRow && (conditionsRow.routeBlocked || conditionsRow.bindingIssue)" class="beichen-note" data-testid="tier-route-reason">
+        {{ conditionsRow.bindingIssue?.message ?? (conditionsRow.blockers.join('；') || '线路未就绪，请刷新模型或检查渠道配置') }}
+      </p>
+      <p v-if="conditionsRow?.priceBlocker" class="beichen-note price-blocker-note" data-testid="price-blocker-message">
+        {{ conditionsRow.priceBlocker }}
+      </p>
       <section v-for="quote in conditionsRow?.quotes ?? []" :key="quote.key" class="condition-quote">
         <h3>{{ quote.multiplierLabel }}</h3>
         <dl class="condition-prices">
@@ -842,6 +1047,12 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .model-table th, .model-table td { min-width: 0; overflow-wrap: anywhere; }
 .model-name { font-size: 13px; }
 .model-state { font-size: 12px; line-height: 1.75; }
+.model-state-summary { display: inline; }
+.model-capability { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin-top: 8px; }
+.model-capability .chip { padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #f1f4f9; color: var(--ink-soft); }
+.model-capability .chip.recommend { background: #f3efff; color: #5b3ea8; }
+.model-capability .status-pill { white-space: normal; }
+.price-blocker-note { color: #835615; }
 .published-state { color: #16765e; }
 .binding-issue { color: var(--danger, #b42318); }
 .binding-issue-row { background: color-mix(in srgb, var(--danger, #b42318) 5%, transparent); }

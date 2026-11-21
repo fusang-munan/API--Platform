@@ -24,6 +24,7 @@ func TestPanelRates(t *testing.T) {
 		{"fractional micro rate", `"input_price":1e-13,"output_price":1,"intervals":[]`, false},
 		{"tiered", `"input_price":0,"output_price":1,"intervals":[{"min_tokens":1000}]`, false},
 		{"image", `"input_price":0,"output_price":1,"image_output_price":0,"intervals":[]`, false},
+		{"video", `"input_price":0,"output_price":1,"video_output_price":0,"intervals":[]`, false},
 		{"per request", `"input_price":0,"output_price":1,"per_request_price":1,"intervals":[]`, false},
 		{"cache tiers", `"input_price":0,"output_price":1,"cache_write_1h_price":0,"intervals":[]`, false},
 		{"reasoning tiers", `"input_price":0,"output_price":1,"reasoning_effort_multipliers":{"low":0},"intervals":[]`, false},
@@ -33,12 +34,14 @@ func TestPanelRates(t *testing.T) {
 		{"neutral reasoning", `"input_price":1.234567e-6,"output_price":0,"cache_read_price":1e-12,"reasoning_effort_multipliers":{"low":1}`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rates, ok := flatPanelRates(json.RawMessage(`{"billing_mode":"token",` + tc.pricing + `}`))
-			if ok != tc.want {
-				t.Fatalf("flatPanelRates = %v, want %v", ok, tc.want)
-			}
-			if ok && (*rates.Input != 1234567 || *rates.Output != 0 || *rates.CacheRead != 1 || rates.CacheWrite != nil) {
-				t.Fatalf("unexpected converted rates: %+v", rates)
+			for _, mode := range []string{`"billing_mode":"token",`, ""} {
+				rates, ok := flatPanelRates(json.RawMessage(`{` + mode + tc.pricing + `}`))
+				if ok != tc.want {
+					t.Fatalf("flatPanelRates with mode %q = %v, want %v", mode, ok, tc.want)
+				}
+				if ok && (*rates.Input != 1234567 || *rates.Output != 0 || *rates.CacheRead != 1 || rates.CacheWrite != nil) {
+					t.Fatalf("unexpected converted rates: %+v", rates)
+				}
 			}
 		})
 	}
@@ -130,6 +133,7 @@ func TestPanelRetainsVisibleConditionalPricing(t *testing.T) {
 		{`{"billing_mode":"token","input_price":0.000001,"output_price":0.000002,"cache_write_1h_price":0,"cache_write_12h_price":0.000004}`, true},
 		{`{"billing_mode":"token","intervals":[{"min_tokens":200000,"max_tokens":null,"input_price":0.000008}]}`, true},
 		{`{"billing_mode":"per_request","per_request_price":0.3}`, true},
+		{`{"video_output_price":0.3}`, true},
 		{`{"billing_mode":"future","unknown_fee":0.4}`, false},
 	} {
 		const original = `{"billing_mode":"token","input_price":0.000001,"output_price":0,"intervals":[]}`

@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"maps"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 
@@ -212,7 +214,8 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 	var plan activationPlan
 	// The first publication uses the same default protocols shown in the preview.
 	if len(s.bindings) == 0 {
-		for _, r := range m.defaults {
+		for _, adapter := range slices.Sorted(maps.Keys(m.defaults)) {
+			r := m.defaults[adapter]
 			r.SchoolModel = s.name
 			plan.writes = append(plan.writes, activationBinding{route: r})
 			plan.routes = append(plan.routes, r)
@@ -273,7 +276,8 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 	// their configured routes. Once North has bindings, respect its exact
 	// protocol list, including every manually disabled binding.
 	if !hasNorth && strings.EqualFold(s.name, m.name) {
-		for adapter, r := range m.defaults {
+		for _, adapter := range slices.Sorted(maps.Keys(m.defaults)) {
+			r := m.defaults[adapter]
 			if c, exists := choices[adapter]; exists {
 				if lastPriority[adapter] == math.MaxInt32 {
 					continue
@@ -300,31 +304,26 @@ func (p activationPlan) allowed(s *activationSchool) bool {
 	return p.northReady && (!p.foreignActive || s.multiplier != nil && *s.multiplier > 0)
 }
 
-type activationPrice int
-
-const (
-	activationPriceMissing activationPrice = iota
-	activationPriceUnusableConditional
-	activationPriceFixed
-	activationPriceConditional
-
-	activationManualPriceMessage = "北辰线路缺少可自动结算的报价，请先手动定价"
-)
+type activationPrice struct {
+	blocker     *CatalogBlocker
+	conditional bool
+}
 
 func (price activationPrice) ready() bool {
-	return price == activationPriceFixed || price == activationPriceConditional
+	return price.blocker == nil
 }
 
 func routePriceReadiness(fixed bool, terms json.RawMessage) activationPrice {
-	switch {
-	case fixed:
-		return activationPriceFixed
-	case activationTokenPriceReady(terms):
-		return activationPriceConditional
-	case conditionalPanelPricing(terms):
-		return activationPriceUnusableConditional
-	default:
-		return activationPriceMissing
+	if fixed {
+		return activationPrice{}
+	}
+	code, message := usage.BeichenTokenQuoteBlocker(terms)
+	if code == "" {
+		return activationPrice{conditional: true}
+	}
+	return activationPrice{
+		blocker:     &CatalogBlocker{Code: code, Message: message},
+		conditional: conditionalPanelPricing(terms),
 	}
 }
 
@@ -336,7 +335,7 @@ func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx, observed
 		model      string
 	}
 	seen := make(map[routeKey]bool)
-	readiness := activationPriceFixed
+	var readiness activationPrice
 	for _, route := range p.northRoutes {
 		key := routeKey{*route.CredentialID, route.UpstreamModel}
 		if seen[key] {
@@ -351,14 +350,14 @@ func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx, observed
 			var fixed bool
 			var terms []byte
 			if err := tx.QueryRowContext(ctx, activationPriceSQL, key.credential, key.model).Scan(&fixed, &terms); err != nil {
-				return activationPriceMissing, err
+				return activationPrice{}, err
 			}
 			price = routePriceReadiness(fixed, terms)
 		}
 		if !price.ready() {
 			return price, nil
 		}
-		if price == activationPriceConditional {
+		if price.conditional {
 			readiness = price
 		}
 	}
@@ -384,10 +383,6 @@ LEFT JOIN LATERAL (
   ORDER BY effective_at DESC LIMIT 1
 ) snap ON true
 WHERE c.id=$1`
-
-func activationTokenPriceReady(terms json.RawMessage) bool {
-	return usage.BeichenTokenQuoteUsable(terms)
-}
 
 func (m *activationModel) overview() CatalogModel {
 	result := CatalogModel{Model: m.name, CredentialIDs: append([]uuid.UUID{}, m.keys...), SchoolStatus: "not_configured", PreferredRoutes: []PreferredRoute{}}
@@ -526,7 +521,7 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 		return enabled, nil, err
 	}
 	if !price.ready() {
-		return skip("no_price", activationManualPriceMessage)
+		return skip("no_price", price.blocker.Message)
 	}
 	id, err := applyActivationPlan(ctx, tx, provider, actor, target, plan)
 	if err == nil {
@@ -536,7 +531,7 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 		return enabled, nil, err
 	}
 	enabled = BatchEnabledModel{Model: source, ModelID: id}
-	if price == activationPriceConditional {
+	if price.conditional {
 		enabled.Message = "按条件价自动结算"
 	}
 	return enabled, nil, nil
@@ -590,7 +585,7 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 		return uuid.Nil, err
 	}
 	if !price.ready() {
-		return uuid.Nil, invalid(activationManualPriceMessage)
+		return uuid.Nil, invalid(price.blocker.Message)
 	}
 	id, err := applyActivationPlan(ctx, tx, provider, actor, target, plan)
 	if err == nil {

@@ -13,6 +13,8 @@ export const studentAPI = {
   usage: (month?: string) => get<StudentUsage>(`/api/v1/student/usage${month ? `?month=${month}` : ''}`),
   keys: () => get<ApiKey[]>('/api/v1/student/api-keys'),
   key: (id: string) => get<ApiKey>(`/api/v1/student/api-keys/${id}`),
+  addKeyModels: (id: string, modelIDs: string[]) =>
+    post<{ model_ids: string[]; added_model_ids: string[] }>(`/api/v1/student/api-keys/${id}/models`, { model_ids: modelIDs }),
   submit: (body: SubmitApiKey) => post<ApiKey>('/api/v1/student/api-keys', body),
   claim: (id: string) => post<{ api_key: string; key_prefix: string; claimed_at: string }>(`/api/v1/student/api-keys/${id}/claim`),
   regenerate: (id: string) => post<{ api_key: string; key_prefix: string; claimed_at: string }>(`/api/v1/student/api-keys/${id}/regenerate`),

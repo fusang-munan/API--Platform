@@ -490,7 +490,7 @@ func matchPanelPrices(channels []panelChannel, groupID int64, info billingInfo, 
 	return matched, nil
 }
 
-var panelAmountField = regexp.MustCompile(`^(input|output|cache_read|cache_write(_[0-9]+[hm])?|image_input|image_output|per_request)_price$`)
+var panelAmountField = regexp.MustCompile(`^(input|output|cache_read|cache_write(_[0-9]+[hm])?|image_input|image_output|video_input|video_output|per_request)_price$`)
 
 func hasPanelPrice(raw json.RawMessage) bool {
 	var fields map[string]json.RawMessage
@@ -534,14 +534,17 @@ func flatPanelRates(raw json.RawMessage) (Rates, bool) {
 		CacheWrite12h        *json.Number               `json:"cache_write_12h_price"`
 		ImageInput           *json.Number               `json:"image_input_price"`
 		ImageOutput          *json.Number               `json:"image_output_price"`
+		VideoInput           *json.Number               `json:"video_input_price"`
+		VideoOutput          *json.Number               `json:"video_output_price"`
 		PerRequest           *json.Number               `json:"per_request_price"`
 		Intervals            []json.RawMessage          `json:"intervals"`
 		ReasoningMultipliers map[string]json.RawMessage `json:"reasoning_effort_multipliers"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&pricing) != nil || pricing.Mode != "token" || pricing.Input == nil || pricing.Output == nil ||
+	if decoder.Decode(&pricing) != nil || (pricing.Mode != "" && pricing.Mode != "token") || pricing.Input == nil || pricing.Output == nil ||
 		pricing.CacheWrite1h != nil || pricing.CacheWrite12h != nil || pricing.ImageInput != nil || pricing.ImageOutput != nil ||
+		pricing.VideoInput != nil || pricing.VideoOutput != nil ||
 		pricing.PerRequest != nil || len(pricing.Intervals) != 0 {
 		return Rates{}, false
 	}
@@ -587,7 +590,8 @@ func conditionalPanelPricing(raw json.RawMessage) bool {
 	for name, value := range fields {
 		switch {
 		case strings.HasPrefix(name, "cache_write_") && strings.HasSuffix(name, "_price"),
-			name == "per_request_price", name == "image_input_price", name == "image_output_price":
+			name == "per_request_price", name == "image_input_price", name == "image_output_price",
+			name == "video_input_price", name == "video_output_price":
 			var n json.Number
 			if json.Unmarshal(value, &n) == nil && exactDecimal(n) != nil {
 				return true

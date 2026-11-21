@@ -58,7 +58,7 @@ func UsesDualChatBindings(modelID string) bool {
 	return strings.TrimSpace(modelID) != "" && !IsImageGenerationModel(modelID)
 }
 
-// IsOpenAIModelsListable reports models that should appear in GET /v1/models for Codex/CC-switch.
+// IsOpenAIModelsListable reports models suitable for the dedicated Codex catalog.
 // Claude-family models are routed via /v1/messages and belong in the Claude Code harness only.
 func IsOpenAIModelsListable(modelID string) bool {
 	return !IsAnthropicFamilyModel(modelID)

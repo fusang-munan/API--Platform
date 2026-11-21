@@ -1,6 +1,6 @@
 import { del, get, page, patch, post, request } from './client'
 import type { BeichenModelAlias, BeichenModelAliasUpdate, BeichenRebindPlan } from './types'
-import type { BeichenBatchEnableResult, BeichenImport, BeichenModelPriceResult, BeichenModelPriceUpdate, BeichenModelUsage, BeichenOverview, BeichenPriceUpdate, BeichenProbeRun, BeichenProbes, BeichenReceiptPage, BeichenReconcile, BeichenUsageRange } from './types'
+import type { BeichenBatchEnableResult, BeichenCapabilities, BeichenImport, BeichenModelPriceResult, BeichenModelPriceUpdate, BeichenModelUsage, BeichenOverview, BeichenPriceUpdate, BeichenProbeRun, BeichenProbes, BeichenReceiptPage, BeichenReconcile, BeichenUsageRange } from './types'
 import type { Application, Binding, BindingCreate, BindingRouteProbeEndpoint, BindingRouteProbeStep, BindingUpdate, MentorCandidate, Model, ModelCatalogPage, ModelCreate, ModelUpdate, Organization, OrganizationCreate, OrganizationUpdate, ProbeEndpoint, ProbeResponse, Project, ProjectBudget, ProjectBudgetUpdate, ProjectCreate, ProjectUpdate, Provider, ProviderCatalogSyncView, ProviderCreate, ProviderCredential, ProviderCredentialCreate, ProviderCredentialUpdate, ProviderUpdate, ProjectUsage, StudentAccount } from './types'
 interface BeichenPanelStatus { configured: boolean; group_id?: number; upstream_key_id?: number }
 export const teacherAPI = {
@@ -38,6 +38,7 @@ export const teacherAPI = {
   deleteProviderCredential: (providerId: string, credentialId: string) => del(`/api/v1/teacher/providers/${providerId}/credentials/${credentialId}`),
   resetProviderCatalog: (id: string) => post<ProviderCatalogSyncView>(`/api/v1/teacher/providers/${id}/reset-catalog`),
   beichenOverview: (id: string, day: string) => get<BeichenOverview>(`/api/v1/teacher/providers/${id}/beichen?${new URLSearchParams({ day })}`),
+  beichenCapabilities: (id: string) => get<BeichenCapabilities>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/capabilities`),
   beichenProbes: (id: string) => get<BeichenProbes>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/probes`),
   requestBeichenProbes: (id: string) => post<BeichenProbeRun>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/probes`),
   beichenReceipts: (id: string, day: string, cursor: string | null, signal: AbortSignal) => {

@@ -19,7 +19,16 @@ export type Organization = { id: string; name: string; description?: string | nu
 export type MentorSummary = { id: string; name: string; email: string }
 export type StudentProject = { id: string; organization_id: string; name: string; description?: string | null; status: ResourceStatus; has_mentor: boolean }
 export type Project = { id: string; organization_id: string; name: string; description?: string | null; status: ResourceStatus; has_mentor: boolean; mentors?: MentorSummary[]; is_responsible?: boolean; application_status?: ApplicationStatus; monthly_credit_quota: string }
-export type Model = { model_id: string; display_name: string; description?: string | null; category: ModelCategory; capabilities: ModelCapability[]; input_modalities: string[]; output_modalities: string[]; context_window?: number | null; max_input_tokens?: number | null; max_output_tokens?: number | null; is_common: boolean; status: ModelStatus; route_ready: boolean; credit_multiplier: string | null; upstream_metadata?: Record<string, unknown>; provider_id?: string; provider_name?: string; primary_adapter?: BindingAdapter | null; anthropic_ready?: boolean; responses_ready?: boolean; credential_id?: string; credential_label?: string }
+export type ModelProtocolInfo = {
+  /** 网关实际发布的接入协议；与 /v1/models 的 protocols 一致。 */
+  protocols?: string[]
+  available_protocols?: string[]
+  recommended_protocol?: string | null
+  probe_state?: 'passed' | 'unprobed' | 'failed' | 'not_applicable' | string
+  availability?: 'available' | 'maintenance' | 'unverified' | 'unavailable' | 'not_published' | string
+  availability_reason?: string
+}
+export type Model = { model_id: string; display_name: string; description?: string | null; category: ModelCategory; capabilities: ModelCapability[]; input_modalities: string[]; output_modalities: string[]; context_window?: number | null; max_input_tokens?: number | null; max_output_tokens?: number | null; is_common: boolean; status: ModelStatus; route_ready: boolean; credit_multiplier: string | null; upstream_metadata?: Record<string, unknown>; provider_id?: string; provider_name?: string; primary_adapter?: BindingAdapter | null; anthropic_ready?: boolean; responses_ready?: boolean; credential_id?: string; credential_label?: string } & ModelProtocolInfo
 export type StudentModelPlaza = { common_models: Model[]; library_models: Model[] }
 export type BeichenReceiptSpend = {
   beichen_base_credits?: string | null
@@ -69,7 +78,7 @@ export type BindingCreate = { provider_id: string; upstream_model_name: string; 
 export type BindingUpdate = { upstream_model_name?: string; adapter?: BindingAdapter; priority?: number; status?: ResourceStatus }
 export type RequestedModel = { model_id: string; display_name?: string }
 export type SubmitApiKey = { name: string; organization_id: string; project_id: string; models: RequestedModel[]; requested_monthly_credits: string }
-export type ModelCatalogCandidate = { model_id:string;display_name?:string|null;description?:string|null;owned_by?:string|null;upstream_object?:string|null;upstream_created_at?:string|null;credential_id?:string;credential_label?:string;provider_name?:string;credit_multiplier?:string|null;raw_entry:Record<string, unknown> }
+export type ModelCatalogCandidate = { model_id:string;display_name?:string|null;description?:string|null;owned_by?:string|null;upstream_object?:string|null;upstream_created_at?:string|null;credential_id?:string;credential_label?:string;provider_name?:string;credit_multiplier?:string|null;raw_entry:Record<string, unknown> } & ModelProtocolInfo
 export type ModelCatalogPage = { items:ModelCatalogCandidate[];page:number;page_size:number;total:number }
 export type ProviderCatalogSyncView = { provider_id: string; provider_name: string; synced: number; synced_at: string }
 export type BeichenRates = { input: number; output: number; cache_read?: number; cache_write?: number }
@@ -90,7 +99,8 @@ export type BeichenDataset = {
 }
 type BeichenDisplayRates = Partial<Record<keyof BeichenRates, number | string | null>>
 type BeichenPanelPrice = 'input_price' | 'output_price' | 'cache_read_price' | 'cache_write_price' |
-  'cache_write_1h_price' | 'cache_write_12h_price' | 'image_input_price' | 'image_output_price' | 'per_request_price'
+  'cache_write_1h_price' | 'cache_write_12h_price' | 'image_input_price' | 'image_output_price' |
+  'video_input_price' | 'video_output_price' | 'per_request_price'
 export type BeichenPriceTier = Partial<Record<BeichenPanelPrice | 'min_tokens' | 'max_tokens', number | string | null>> & {
   billing_mode?: string | null
 }
@@ -369,6 +379,7 @@ export type BeichenCatalogModel = {
   ready_count?: number | null
   price_state?: 'confirmed' | 'conditional' | 'manual' | 'missing' | 'mixed' | null
   price_covered?: boolean
+  price_blocker?: { code: string; message: string } | null
   blockers?: Array<{ code: string; message: string }> | null
   activation?: 'active' | 'ready' | 'blocked' | null
   protocols?: BindingAdapter[]
@@ -380,6 +391,34 @@ export type BeichenPreferredRoute = {
   school_model: string; upstream_model?: string; adapter: string; provider_id: string; credential_id?: string | null; credential_label?: string | null
   priority: number; state: 'ready' | 'candidate'; effective_multiplier?: number | string | null
   effective_multiplier_text?: string | null
+}
+export type BeichenProtocolCapability = {
+  protocol: string
+  binding_ready: boolean
+  probe_state: 'passed' | 'unprobed' | 'failed' | string
+  probe?: { checked_at: string; status_code: number; error_code?: string } | null
+}
+export type BeichenModelCapability = {
+  model: string
+  credential_id: string | null
+  credential_label: string
+  supported_protocols: string[]
+  available_protocols: string[]
+  recommended_protocol: string | null
+  protocol_details: BeichenProtocolCapability[]
+  catalog_state: string
+  availability: 'available' | 'maintenance' | 'unverified' | 'unavailable' | 'not_published' | string
+  availability_reason?: string
+  price_state: 'confirmed' | 'conditional' | 'manual' | 'missing' | 'mixed' | string
+  price_blocker: { code: string; message: string; action_hint?: string } | null
+  multiplier_state: string
+  probe_state: 'passed' | 'unprobed' | 'failed' | 'not_applicable' | string
+  binding_state: string
+  action_hint: string
+}
+export type BeichenCapabilities = {
+  capabilities: BeichenModelCapability[]
+  gaps: Array<{ model: string; credential_id: string | null; credential_label: string; category: string; code: string; message: string; action_hint: string }>
 }
 export type ProbeEndpoint = 'chat_completions'|'responses'|'messages'|'embeddings'|'rerank'
 export type ProbeResponse = { results:Array<{endpoint:ProbeEndpoint|'models';path:string;http_status:number;duration_ms:number;truncated:boolean;error?:string;limits:{context_window?:number;max_input_tokens?:number;max_output_tokens?:number}}>;configuration:{description?:string;category?:ModelCategory;capabilities?:ModelCapability[];input_modalities?:string[];output_modalities?:string[];context_window?:number;max_input_tokens?:number;max_output_tokens?:number} }

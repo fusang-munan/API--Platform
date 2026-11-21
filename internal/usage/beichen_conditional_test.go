@@ -2,8 +2,59 @@ package usage
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
+
+func TestBeichenTokenQuoteBlocker(t *testing.T) {
+	for _, tc := range []struct {
+		name, quote, code, messagePart string
+	}{
+		{name: "omitted mode", quote: `{"input_price":0,"output_price":1e-8}`},
+		{name: "empty mode", quote: `{"billing_mode":"","input_price":"0","output_price":"0.000000000000000000000000000001","cache_write_1h_price":"0.1"}`},
+		{name: "valid tiers", quote: `{"billing_mode":"token","intervals":[
+			{"min_tokens":0,"max_tokens":100,"input_price":0,"output_price":1},
+			{"min_tokens":100,"max_tokens":null,"input_price":"1","output_price":"2"}]}`},
+		{name: "missing flat output", quote: `{"billing_mode":"token","input_price":0,"output_price":null}`,
+			code: "missing_output", messagePart: "缺少输出"},
+		{name: "malformed price", quote: `{"billing_mode":"token","input_price":0,"output_price":"n/a"}`,
+			code: "price_conditions_invalid", messagePart: "格式无效"},
+		{name: "negative price", quote: `{"billing_mode":"token","input_price":0,"output_price":-1}`,
+			code: "price_invalid", messagePart: "输出单价无效"},
+		{name: "no input in tier", quote: `{"intervals":[{"min_tokens":0,"output_price":1}]}`,
+			code: "tier_missing_input", messagePart: "第 1 档缺少输入"},
+		{name: "no output in one tier even with a base price", quote: `{"input_price":0,"output_price":1,"intervals":[
+			{"min_tokens":0,"max_tokens":100,"input_price":0,"output_price":1},
+			{"min_tokens":100,"input_price":2}]}`, code: "tier_missing_output", messagePart: "第 2 档缺少输出"},
+		{name: "explicit non-token mode", quote: `{"billing_mode":"video","input_price":0,"output_price":1}`,
+			code: "billing_mode_non_token", messagePart: "非 Token 计价"},
+		{name: "per request price with omitted mode", quote: `{"input_price":0,"output_price":1,"per_request_price":0}`,
+			code: "billing_mode_non_token", messagePart: "非 Token 计价"},
+		{name: "image price mixed with token prices", quote: `{"billing_mode":"token","input_price":0,"output_price":1,"image_output_price":0}`,
+			code: "billing_mode_non_token", messagePart: "非 Token 计价"},
+		{name: "video price in tier", quote: `{"intervals":[{"min_tokens":0,"input_price":0,"output_price":1,"video_output_price":2}]}`,
+			code: "billing_mode_non_token", messagePart: "第 1 档"},
+		{name: "invalid range", quote: `{"intervals":[{"min_tokens":10,"max_tokens":10,"input_price":0,"output_price":1}]}`,
+			code: "tier_range_invalid", messagePart: "第 1 档"},
+		{name: "overlapping ranges", quote: `{"intervals":[
+			{"min_tokens":0,"max_tokens":100,"input_price":0,"output_price":1},
+			{"min_tokens":90,"input_price":0,"output_price":1}]}`,
+			code: "tier_range_invalid", messagePart: "重叠"},
+		{name: "invalid effort multiplier", quote: `{"input_price":0,"output_price":1,"reasoning_effort_multipliers":{"medium":-1}}`,
+			code: "effort_multiplier_invalid", messagePart: "推理强度倍率无效"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := json.RawMessage(tc.quote)
+			code, message := BeichenTokenQuoteBlocker(raw)
+			if code != tc.code || !strings.Contains(message, tc.messagePart) || (code == "") != (message == "") {
+				t.Fatalf("got blocker (%q, %q), want (%q, containing %q)", code, message, tc.code, tc.messagePart)
+			}
+			if BeichenTokenQuoteUsable(raw) != (tc.code == "") {
+				t.Fatalf("unexpected usability for blocker %q", tc.code)
+			}
+		})
+	}
+}
 
 func TestEvaluateBeichenConditional(t *testing.T) {
 	const tiers = `{
@@ -44,6 +95,10 @@ func TestEvaluateBeichenConditional(t *testing.T) {
 		{name: "tier 3 unbounded", terms: tiers, usage: metrics(10000, 0, 0, 0), credits: "9", tier: "[200,)"},
 		{name: "OpenAI cache already in prompt", terms: tiers, usage: openaiCache, credits: "0.0545", tier: "[100,200)"},
 		{name: "Anthropic cache counts separate", terms: tiers, usage: metrics(80, 0, 15, 5), protocol: "anthropic", ttl: "5m", credits: "0.0545", tier: "[100,200)"},
+		{name: "tiered default mode", terms: `{"intervals":[{"min_tokens":0,"input_price":1e-6,"output_price":2e-6}]}`,
+			usage: metrics(1, 1, 0, 0), credits: "0.0003", tier: "[0,)"},
+		{name: "tier missing output ignores base rate", terms: rates + `,"intervals":[{"min_tokens":0,"input_price":1e-6}]}`,
+			usage: metrics(1, 1, 0, 0), review: "missing_output_price"},
 		{name: "tier gap ignores base rates", terms: rates + `,"intervals":[{"min_tokens":100}]}`,
 			usage: metrics(99, 0, 0, 0), review: "missing_price_tier"},
 		{name: "tiers overlap", terms: rates + `,"intervals":[{"min_tokens":0},{"min_tokens":50}]}`,

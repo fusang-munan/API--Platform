@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
@@ -47,6 +48,39 @@ func BindingRouteReady(ctx context.Context, client *ent.Client, binding *ent.Mod
 	}
 	_, found, err := FindActiveCatalogCredential(ctx, client, binding.ProviderID, upstream, uuid.Nil)
 	return found, err
+}
+
+// ResolveBindingCredential checks the same local route and credential state for
+// the gateway and for model authorization. An unavailable binding returns no credential.
+func ResolveBindingCredential(ctx context.Context, client *ent.Client, manager *security.Manager, binding *ent.ModelBinding) (string, uuid.UUID, error) {
+	ready, err := BindingRouteReady(ctx, client, binding)
+	if err != nil || !ready {
+		return "", uuid.Nil, err
+	}
+	credentialID := binding.CredentialID
+	if credentialID == nil {
+		var found bool
+		credentialID, found, err = FindActiveCatalogCredential(ctx, client, binding.ProviderID, binding.UpstreamModelName, uuid.Nil)
+		if err != nil || !found || credentialID == nil {
+			return "", uuid.Nil, err
+		}
+	}
+	row, err := client.ProviderCredential.Query().Where(
+		providercredential.IDEQ(*credentialID),
+		providercredential.ProviderIDEQ(binding.ProviderID),
+		providercredential.StatusEQ(providercredential.StatusActive),
+	).Only(ctx)
+	if ent.IsNotFound(err) {
+		return "", uuid.Nil, nil
+	}
+	if err != nil {
+		return "", uuid.Nil, err
+	}
+	credential, err := manager.DecryptCredential(row.CredentialCiphertext)
+	if err != nil || strings.TrimSpace(credential) == "" {
+		return "", uuid.Nil, nil
+	}
+	return credential, row.ID, nil
 }
 
 // ModelHasActiveRoute reports whether a model has at least one routable binding.

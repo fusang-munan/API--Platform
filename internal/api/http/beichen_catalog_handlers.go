@@ -6,9 +6,64 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/beichen"
 	"github.com/starprince1234/Nebula-api/internal/controlplane"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 )
+
+func (s *Server) beichenChannelSwitch(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	provider, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	var scope beichen.CredentialSwitch
+	query := c.Request.URL.Query()
+	for name, target := range map[string]*uuid.UUID{"from_credential_id": &scope.From, "to_credential_id": &scope.To} {
+		if values, exists := query[name]; exists {
+			if len(values) != 1 {
+				writeError(c, domain.NewError(domain.CodeValidation, "每次只能选择一个原渠道和一个接替渠道"))
+				return
+			}
+			id, err := controlplane.UUID(values[0])
+			if err == nil && id == uuid.Nil {
+				err = domain.NewError(domain.CodeValidation, "需要有效的渠道 ID")
+			}
+			if err != nil {
+				writeError(c, err)
+				return
+			}
+			*target = id
+		}
+	}
+	view, err := s.service.Beichen().ChannelSwitch(c.Request.Context(), provider, scope)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, view)
+}
+
+func (s *Server) confirmBeichenChannelSwitch(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	provider, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	var input struct {
+		beichen.CredentialSwitch
+		Token string `json:"preview_token"`
+	}
+	if !bindBeichenJSON(c, &input, false) {
+		return
+	}
+	plan, err := s.service.Beichen().ConfirmCredentialSwitch(c.Request.Context(), provider, identity(c).UserID, input.CredentialSwitch, input.Token)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, plan)
+}
 
 func (s *Server) beichenModelAliases(c *gin.Context) {
 	c.Header("Cache-Control", "private, no-store")

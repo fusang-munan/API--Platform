@@ -1,7 +1,7 @@
 import { DOMWrapper, enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { defineComponent } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { BeichenBatchEnableResult, BeichenCatalogModel, BeichenModelUsage, BeichenOverview, BeichenRebindPlan, BeichenUsageRange, BeichenUsageTotals } from '../../api/types'
+import type { BeichenBatchEnableResult, BeichenCatalogModel, BeichenModelCapability, BeichenModelUsage, BeichenOverview, BeichenRebindPlan, BeichenUsageRange, BeichenUsageTotals } from '../../api/types'
 import BeichenPriceDrawer from '../../components/BeichenPriceDrawer.vue'
 import BeichenSchoolModels from './BeichenSchoolModels.vue'
 import componentSource from './BeichenSchoolModels.vue?raw'
@@ -11,6 +11,7 @@ const api = vi.hoisted(() => ({
   updateModel: vi.fn(), syncBeichen: vi.fn(), setBeichenModelPrice: vi.fn(),
   requestBeichenProbes: vi.fn(), beichenProbes: vi.fn(),
   previewBeichenRebind: vi.fn(), applyBeichenRebind: vi.fn(), rescanBeichenCatalog: vi.fn(),
+  beichenCapabilities: vi.fn(),
 }))
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }))
 vi.mock('../../api/teacher', () => ({ teacherAPI: api }))
@@ -68,12 +69,23 @@ function deferred<T>() {
   const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail })
   return { promise, resolve, reject }
 }
+function capability(model: string, overrides: Partial<BeichenModelCapability> = {}): BeichenModelCapability {
+  return {
+    model, credential_id: 'key-' + model, credential_label: '渠道一',
+    supported_protocols: ['openai_compatible'], available_protocols: [], recommended_protocol: null,
+    protocol_details: [{ protocol: 'openai_compatible', binding_ready: true, probe_state: 'unprobed' }],
+    catalog_state: 'key_listed', availability: 'unverified', price_state: 'confirmed', price_blocker: null,
+    multiplier_state: 'current', probe_state: 'unprobed', binding_state: 'ready', action_hint: '',
+    ...overrides,
+  }
+}
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset()
   toast.success.mockReset(); toast.error.mockReset()
   vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
   vi.stubGlobal('confirm', vi.fn(() => true))
   api.beichenOverview.mockResolvedValue(overview([{ model: 'lab/a' }]))
+  api.beichenCapabilities.mockResolvedValue({ capabilities: [], gaps: [] })
   api.modelUsage.mockImplementation(async (range: BeichenUsageRange) => usage(range))
   api.enableBeichenModelsBatch.mockResolvedValue({ enabled: [], skipped: [] })
   api.enableBeichenModel.mockResolvedValue({ model_id: 'school-id', status: 'active' })
@@ -211,6 +223,91 @@ describe('北辰模型管理', () => {
     expect(wrapper.get('[data-model="lab/tiered"]').text()).toContain('探活失败')
     expect(wrapper.get('[data-model="lab/tiered"]').text()).toContain('可启用')
     expect(button(wrapper, '立即探活').attributes('disabled')).toBeUndefined()
+  })
+
+  it('优先展示 capabilities 的推荐协议、可用性、下一步和绑定问题', async () => {
+    api.beichenOverview.mockResolvedValue(overview([
+      { model: 'lab/ready', active: true, catalog: { activation: 'active', protocols: ['openai_compatible'], probe_state: 'unprobed' } },
+      { model: 'lab/down', active: true, catalog: { activation: 'active', protocols: ['anthropic'], probe_state: 'failed' } },
+    ]))
+    api.beichenCapabilities.mockResolvedValue({
+      capabilities: [
+        capability('lab/ready', {
+          supported_protocols: ['openai_compatible', 'openai_responses'], available_protocols: ['openai_responses'],
+          recommended_protocol: 'openai_responses', probe_state: 'passed', availability: 'available',
+          protocol_details: [
+            { protocol: 'openai_compatible', binding_ready: true, probe_state: 'unprobed' },
+            { protocol: 'openai_responses', binding_ready: true, probe_state: 'passed' },
+          ],
+          action_hint: '可使用推荐协议接入。',
+        }),
+        capability('lab/down', {
+          supported_protocols: ['anthropic'], available_protocols: [], recommended_protocol: null, probe_state: 'failed',
+          availability: 'maintenance', availability_reason: '维护中。当前线路的协议最近一次探活均失败。',
+          protocol_details: [{ protocol: 'anthropic', binding_ready: true, probe_state: 'failed' }],
+          action_hint: '请检查渠道是否启用，使用当前 Key 重扫目录。',
+        }),
+      ],
+      gaps: [],
+    })
+    const wrapper = view()
+    await flushPromises()
+
+    const ready = wrapper.get('[data-model="lab/ready"]')
+    expect(ready.get('[data-testid="model-availability"]').text()).toBe('可用')
+    expect(ready.get('[data-testid="recommended-protocol"]').text()).toBe('推荐 OpenAI Responses')
+    expect(ready.get('[data-testid="action-hint"]').text()).toContain('可使用推荐协议接入')
+    expect(ready.text()).toContain('OpenAI Chat')
+
+    const down = wrapper.get('[data-model="lab/down"]')
+    expect(down.get('[data-testid="model-availability"]').text()).toBe('维护中')
+    expect(down.get('[data-testid="recommended-protocol"]').text()).toBe('暂无推荐协议')
+    expect(down.get('[data-testid="availability-reason"]').text()).toContain('探活均失败')
+    expect(down.get('[data-testid="action-hint"]').text()).toContain('重扫目录')
+  })
+
+  it('capabilities 读取失败时回退现有线路字段，不按模型名猜推荐', async () => {
+    api.beichenCapabilities.mockRejectedValueOnce(new Error('404'))
+    api.beichenOverview.mockResolvedValue(overview([{ model: 'lab/a', catalog: {
+      activation: 'active', protocols: ['anthropic'], probe_state: 'passed',
+    } }]))
+    const wrapper = view()
+    await flushPromises()
+
+    const row = wrapper.get('[data-model="lab/a"]')
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('可用')
+    expect(row.get('[data-testid="recommended-protocol"]').text()).toBe('推荐协议待同步')
+    expect(row.text()).toContain('Anthropic Messages')
+    expect(row.text()).toContain('探活通过')
+  })
+
+  it('查看档位优先展示 capabilities 的 price_blocker.message 与缺价状态', async () => {
+    const data = overview([{ model: 'lab/tiered', catalog: {
+      activation: 'blocked', price_state: 'missing', price_covered: false,
+      price_blocker: { code: 'old_blocker', message: '旧报价阻塞原因' },
+    } }])
+    const [model] = data.models!
+    model.price_status = 'conditional'
+    model.upstream_rates = null
+    model.price_conditions_exact = { intervals: [
+      { min_tokens: '0', max_tokens: null, input_price: '0.000001', output_price: '0.000002' },
+    ] }
+    api.beichenOverview.mockResolvedValue(data)
+    api.beichenCapabilities.mockResolvedValue({
+      capabilities: [capability('lab/tiered', {
+        price_state: 'missing', availability: 'available', probe_state: 'passed',
+        price_blocker: { code: 'price_snapshot_expired', message: '该模型的官网报价快照已过期。' },
+      })],
+      gaps: [],
+    })
+    const wrapper = view()
+    await flushPromises()
+
+    const row = wrapper.get('[data-model="lab/tiered"]')
+    expect(row.get('[data-testid="price-missing"]').text()).toBe('缺价')
+    await button(row, '查看档位').trigger('click')
+    const dialog = wrapper.get('[aria-label="lab/tiered · 计价档位"]')
+    expect(dialog.get('[data-testid="price-blocker-message"]').text()).toBe('该模型的官网报价快照已过期。')
   })
 
   it('一键启用只提交当前筛选中可启用的新旧模型', async () => {
@@ -391,6 +488,41 @@ describe('北辰模型管理', () => {
     expect(drawer.props('row')?.model).toBe('lab/missing')
   })
 
+  it.each([false, true])('条件价行和档位弹窗共用原因，线路不可用为 %s', async noRoute => {
+    const priceBlocker = { code: 'tier_missing_output', message: '第 2 档缺少输出 Token 单价' }
+    const routeMessage = '没有可启用的北辰线路，请检查渠道状态和线路配置'
+    const data = overview([{ model: 'lab/tiered', catalog: {
+      activation: 'blocked', price_state: 'conditional', price_covered: false, price_blocker: priceBlocker,
+      route_count: noRoute ? 0 : 1,
+      blockers: [
+        { code: 'conditional_price', message: '线路按条件计价，请先设置手动价' },
+        ...(noRoute ? [{ code: 'no_ready_route', message: routeMessage }] : []),
+      ],
+    } }])
+    const [model] = data.models!
+    model.price_status = 'conditional'
+    model.upstream_rates = null
+    model.price_conditions_exact = { intervals: [
+      { min_tokens: '0', max_tokens: '100', input_price: '0.000001', output_price: '0.000002' },
+      { min_tokens: '100', max_tokens: null, input_price: '0.000002' },
+    ] }
+    api.beichenOverview.mockResolvedValue(data)
+    const wrapper = view()
+    await flushPromises()
+    const row = wrapper.get('[data-model="lab/tiered"]')
+    const reason = noRoute ? routeMessage : priceBlocker.message
+    expect(button(row, '启用').element.disabled).toBe(true)
+    expect(row.get('.enable-reason').text()).toBe(reason)
+    await button(row, '查看档位').trigger('click')
+    const dialog = wrapper.get('[aria-label="lab/tiered · 计价档位"]')
+    expect(dialog.get('.beichen-note').text()).toBe(reason)
+    expect(dialog.get('.price-detail').text()).toContain('每百万 Token 的积分')
+    expect(dialog.get('[data-testid="price-blocker-message"]').text()).toBe(priceBlocker.message)
+    if (noRoute) expect(dialog.get('[data-testid="tier-route-reason"]').text()).toBe(routeMessage)
+    else expect(dialog.find('[data-testid="tier-route-reason"]').exists()).toBe(false)
+    expect(dialog.text()).not.toContain('请先设置手动价')
+  })
+
   it('官网价和学生实价精确换算积分及元，保留字符串零价与缺项', async () => {
     const data = overview([{ model: 'lab/a' }])
     const [model] = data.models!
@@ -445,13 +577,13 @@ describe('北辰模型管理', () => {
     api.modelUsage.mockResolvedValue({ ...usage(), totals: { ...total(), cache_hit_rate: null, completeness: null }, models: [], students: [] })
     const wrapper = view()
     await flushPromises()
-    const states = wrapper.findAll('.model-state').map(row => row.text())
+    const states = wrapper.findAll('.model-state-summary').map(row => row.text())
     expect(states).toEqual([
       '2/3 把 Key 覆盖 · 2 种协议 · 2 条已发布 · 报价已确认 · 可启用',
       '1/3 把 Key 覆盖 · 1 种协议 · 1 条已发布 · 报价已确认 · 已启用',
       '1/3 把 Key 覆盖 · 0 种协议 · 0 条已发布 · 缺少报价 · 未发布',
     ])
-    expect(wrapper.get('.model-state [title]').attributes('title')).toBe('4 条候选线路')
+    expect(wrapper.get('.model-state-summary [title]').attributes('title')).toBe('4 条候选线路')
     const empty = wrapper.get('[data-model="lab/empty"]')
     expect(empty.findAll('.price-value').map(cell => cell.text())).toEqual(Array(8).fill('—'))
     expect(wrapper.get('[aria-label="本月用量汇总"]').findAll('dd')[2].text()).toBe('—')

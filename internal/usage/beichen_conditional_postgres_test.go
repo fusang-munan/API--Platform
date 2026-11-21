@@ -34,7 +34,7 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 		VALUES($1,$2,$3,'Conditional Key','active','conditional-test-hash','fixture',now(),now(),now())`, key, project, student)
 	exec(`INSERT INTO api_key_models(id,api_key_id,model_id,created_at) VALUES(gen_random_uuid(),$1,$2,now())`, key, model)
 
-	const conditional = `{"billing_mode":"token","intervals":[
+	const conditional = `{"intervals":[
 		{"min_tokens":0,"max_tokens":100,"input_price":0.01,"output_price":0.01},
 		{"min_tokens":100,"max_tokens":null,"input_price":0.000001000000000000000001,"output_price":0.000002,
 		"cache_read_price":0.0000005,"cache_write_price":0.00000025,"cache_write_1h_price":0.00000075}

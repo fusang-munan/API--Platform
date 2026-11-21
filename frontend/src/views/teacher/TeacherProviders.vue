@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { teacherAPI } from '../../api/teacher'
-import type { BeichenCatalogDifference, BeichenModelAlias, BeichenModelAliasUpdate, Provider, ProviderCredential } from '../../api/types'
-import { APIError } from '../../api/client'
+import type { BeichenCatalogDifference, BeichenCredentialSummary, BeichenModelAlias, BeichenModelAliasUpdate, BeichenProbeRun, BeichenRebindPlan, BindingAdapter, Provider, ProviderCredential } from '../../api/types'
+import { APIError, get, post } from '../../api/client'
 import StatusBadge from '../../components/StatusBadge.vue'
 import AppDialog from '../../components/AppDialog.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
@@ -11,6 +11,7 @@ import { useToast } from '../../composables/useToast'
 import BeichenSchoolModels from './BeichenSchoolModels.vue'
 import BeichenReconcile from './BeichenReconcile.vue'
 import { isBeichenProvider } from '../../utils/beichenModels'
+import { bindingAdapterMeta } from '../../utils/bindingAdapters'
 import { schoolDay } from '../../utils/format'
 
 type KeyDraft = {
@@ -20,6 +21,31 @@ type KeyDraft = {
   status: 'active' | 'inactive'
   configured: boolean
 }
+
+type ChannelSyncState = 'inactive' | 'pending' | 'syncing' | 'ready' | 'failed'
+type ChannelKey = {
+  credential_id: string
+  label: string
+  status: ProviderCredential['status']
+  sync: Record<'catalog' | 'prices' | 'billing' | 'usage', ChannelSyncState>
+  identity?: ChannelSyncState
+  school_channel?: string
+}
+type ChannelSwitch = {
+  credentials: ChannelKey[]
+  counts: { enabled_keys: number; enabled_models: number; maintenance_models: number; stale_routes: number }
+  models: Array<{
+    model: string
+    ready_count: number
+    losing_route_count: number
+    loses_last_route: boolean
+    routes: Array<{ adapter: BindingAdapter; upstream_model: string; credential_label: string | null; credential_id: string | null; ready: boolean; stale: boolean }>
+  }>
+  preview: (BeichenRebindPlan & {
+    blockers: Array<{ school_model: string; adapter: BindingAdapter; code: string; message: string }>
+  }) | null
+}
+type HealthAction = 'sync' | 'probe' | 'replace'
 
 const rows = ref<Provider[]>([])
 const schoolProvider = ref<Provider>()
@@ -32,7 +58,29 @@ const savingAlias = ref(false)
 const aliasError = ref('')
 let aliasRequest = 0
 const reconcileProviderIds = ref<string[]>([])
-const anomalies = ref<Record<string, { pendingCalls?: number; missingModels?: number; differences?: BeichenCatalogDifference[] }>>({})
+const anomalies = ref<Record<string, { pendingCalls?: number; missingModels?: number; differences?: BeichenCatalogDifference[]; health?: BeichenCredentialSummary[] }>>({})
+const channelProvider = ref<Provider>()
+const channel = ref<ChannelSwitch>()
+const channelCounts = ref<Record<string, ChannelSwitch['counts']>>({})
+const channelFrom = ref('')
+const channelTo = ref('')
+const channelError = ref('')
+const channelNotice = ref('')
+const channelBusy = ref(false)
+const channelReading = ref(false)
+const addingChannel = ref(false)
+const newChannel = reactive({ label: '', key: '' })
+let channelReadVersion = 0
+let channelPoll: number | undefined
+const healthDimensions = [['credential', '凭据'], ['catalog', '目录'], ['pricing', '报价'], ['probe', '探活']] as const
+const healthActions: Record<typeof healthDimensions[number][0], HealthAction> = {
+  credential: 'replace', catalog: 'sync', pricing: 'sync', probe: 'probe',
+}
+const healthActionLabels: Record<HealthAction, string> = { replace: '更换 Key', sync: '重新同步', probe: '重新探活' }
+const syncDimensions = [['catalog', '目录'], ['prices', '报价'], ['billing', '倍率'], ['usage', '用量']] as const
+const syncLabels: Record<ChannelSyncState, string> = {
+  inactive: '已停用', pending: '等待同步', syncing: '同步中', ready: '已同步', failed: '同步失败',
+}
 const query = ref('')
 const status = ref('')
 const drawer = ref(false)
@@ -56,6 +104,12 @@ const filtered = computed(() => rows.value.filter(p =>
 ))
 
 const activeKey = computed(() => keyRows.value[activeKeyIndex.value] ?? null)
+const originalChannel = computed(() => channel.value?.credentials.find(key => key.credential_id === channelFrom.value))
+const replacementChannel = computed(() => channel.value?.credentials.find(key => key.credential_id === channelTo.value))
+const retirementImpact = computed(() => channel.value?.models.filter(model => model.losing_route_count > 0) ?? [])
+const channelHealth = computed(() => (anomalies.value[channelProvider.value?.id ?? '']?.health ?? [])
+  .filter(key => key.status === 'active' && key.health))
+const healthyKeys = computed(() => channelHealth.value.filter(key => key.health?.available_dimensions === healthDimensions.length).length)
 
 function activeKeyCount(provider: Provider) {
   return (provider.credentials ?? []).filter(item => item.status === 'active').length
@@ -127,10 +181,196 @@ async function loadAnomalies(providerId: string, day: string, version: number) {
       pendingCalls: counts.length ? counts.reduce((sum, count) => sum + count, 0) : undefined,
       missingModels: missing.size || (listed.length && listed.every(model => model.price_state != null) ? 0 : undefined),
       differences: overview.catalog_differences ?? undefined,
+      health: overview.credentials ?? undefined,
     }
   } catch {
     // 异常摘要可独立缺省，供应商操作和对账入口仍可用。
   }
+}
+
+function channelPath(providerID: string) {
+  return `/api/v1/teacher/providers/${encodeURIComponent(providerID)}/beichen`
+}
+
+function closeChannelSwitch() {
+  window.clearTimeout(channelPoll)
+  channelReadVersion++
+  channelProvider.value = undefined
+  channel.value = undefined
+  channelFrom.value = ''
+  channelTo.value = ''
+  channelReading.value = false
+  addingChannel.value = false
+  newChannel.label = ''
+  newChannel.key = ''
+  channelError.value = ''
+  channelNotice.value = ''
+}
+
+function openChannelSwitch(provider: Provider) {
+  closeChannelSwitch()
+  channelProvider.value = provider
+  void readChannelSwitch(true)
+}
+
+async function readChannelSwitch(chooseChannels = false): Promise<ChannelSwitch | undefined> {
+  const provider = channelProvider.value
+  if (!provider) return
+  window.clearTimeout(channelPoll)
+  const version = ++channelReadVersion
+  const query = new URLSearchParams()
+  if (channelFrom.value) query.set('from_credential_id', channelFrom.value)
+  if (channelTo.value) query.set('to_credential_id', channelTo.value)
+  channelReading.value = true
+  try {
+    const view = await get<ChannelSwitch>(`${channelPath(provider.id)}/channel-switch?${query}`)
+    if (version !== channelReadVersion) return
+    const newPreview = view.preview && view.preview.preview_token !== channel.value?.preview?.preview_token
+    channel.value = view
+    channelCounts.value[provider.id] = view.counts
+    if (newPreview) void loadAnomalies(provider.id, schoolDay(), loadVersion)
+    if (chooseChannels) {
+      const staleKeys = new Set(view.models.flatMap(model => model.routes.flatMap(route =>
+        route.stale && route.credential_id ? [route.credential_id] : [])))
+      const active = view.credentials.filter(key => key.status === 'active')
+      if (staleKeys.size === 1) {
+        channelFrom.value = Array.from(staleKeys)[0]
+        const original = view.credentials.find(key => key.credential_id === channelFrom.value)
+        const candidates = active.filter(key => key.credential_id !== channelFrom.value)
+        const matches = candidates.filter(key => original?.label.startsWith(key.label + ' (archived ') ||
+          (original?.school_channel && original.school_channel === key.school_channel))
+        channelTo.value = matches.length === 1 ? matches[0].credential_id : candidates.length === 1 ? candidates[0].credential_id : ''
+      } else if (active.length === 1 && staleKeys.size === 0) {
+        channelFrom.value = active[0].credential_id
+      }
+      if (channelFrom.value) return await readChannelSwitch()
+    }
+    const sync = replacementChannel.value?.sync
+    const identityPending = replacementChannel.value?.identity === 'pending' &&
+      view.preview?.blockers.some(blocker => blocker.code === 'unverified_identity')
+    if (identityPending || (sync && !view.preview && [sync.catalog, sync.billing, sync.usage].some(state => state === 'pending' || state === 'syncing'))) {
+      channelPoll = window.setTimeout(() => { void readChannelSwitch() }, 5000)
+    }
+    return view
+  } catch (e) {
+    if (version === channelReadVersion) channelError.value = msg(e)
+  } finally {
+    if (version === channelReadVersion) channelReading.value = false
+  }
+}
+
+function selectChannel(side: 'from' | 'to') {
+  if (channelFrom.value === channelTo.value) {
+    if (side === 'from') channelTo.value = ''
+    else channelFrom.value = ''
+  }
+  channelNotice.value = ''
+  channelError.value = ''
+  if (channel.value) channel.value.preview = null
+  void readChannelSwitch()
+}
+
+async function runChannelAction(action: (providerID: string) => Promise<void>) {
+  const provider = channelProvider.value
+  if (!provider || channelBusy.value || channelReading.value) return
+  window.clearTimeout(channelPoll)
+  channelBusy.value = true
+  channelError.value = ''
+  channelNotice.value = ''
+  try {
+    await action(provider.id)
+  } catch (e) {
+    channelError.value = msg(e)
+  } finally {
+    await readChannelSwitch()
+    void loadAnomalies(provider.id, schoolDay(), loadVersion)
+    channelBusy.value = false
+  }
+}
+
+async function addChannel() {
+  const label = newChannel.label.trim()
+  const key = newChannel.key.trim()
+  if (!label || !key) return
+  await runChannelAction(async providerID => {
+    const input = { label, credential: key, status: 'active' as const, replaces_credential_id: channelFrom.value || undefined }
+    const saved = await teacherAPI.createProviderCredential(providerID, input)
+    updateChannelRow(saved)
+    channelTo.value = saved.id
+    newChannel.label = ''
+    newChannel.key = ''
+    addingChannel.value = false
+    channelNotice.value = '新 Key 已保存，后台将同步目录、报价、倍率和用量。'
+  })
+}
+
+function updateChannelRow(credential: ProviderCredential) {
+  const provider = rows.value.find(row => row.id === credential.provider_id)
+  if (provider) provider.credentials = [...(provider.credentials ?? []).filter(key => key.id !== credential.id), credential]
+}
+
+async function syncChannel(key = channelTo.value) {
+  await runChannelAction(async providerID => {
+    await post<{ synced: boolean }>(`${channelPath(providerID)}/sync`, key ? { credential_id: key } : undefined)
+    channelNotice.value = '同步完成。可查看最新报价、协议与重绑预览。'
+  })
+}
+
+async function previewChannel() {
+  channelError.value = ''
+  await readChannelSwitch()
+}
+
+async function confirmChannel() {
+  const preview = channel.value?.preview
+  if (!preview?.changes.length) return
+  await runChannelAction(async providerID => {
+    const result = await post<BeichenRebindPlan>(`${channelPath(providerID)}/channel-switch`, {
+      from_credential_id: channelFrom.value, to_credential_id: channelTo.value, preview_token: preview.preview_token,
+    })
+    channelNotice.value = `已更新 ${result.changes.length} 条线路。`
+  })
+}
+
+async function setOriginalChannelStatus() {
+  const key = originalChannel.value
+  if (!key) return
+  await runChannelAction(async providerID => {
+    const disabling = key.status === 'active'
+    if (disabling) {
+      const current = await readChannelSwitch()
+      if (!current) return
+      const lost = current.models.filter(model => model.loses_last_route).map(model => model.model)
+      const partlyLost = current.models.filter(model => model.losing_route_count > 0 && !model.loses_last_route).map(model => model.model)
+      const warning = lost.length ? `停用后将失去最后一条可用线路并进入维护的模型\n${lost.join('、')}\n\n` : ''
+      const partial = partlyLost.length ? `停用后将少一条或多条北辰线路的模型\n${partlyLost.join('、')}\n\n` : ''
+      if (!window.confirm(`${warning}${partial}停用「${key.label}」？`)) return
+    }
+    const updated = await teacherAPI.updateProviderCredential(providerID, key.credential_id, { status: disabling ? 'inactive' : 'active' })
+    updateChannelRow(updated)
+    channelNotice.value = disabling ? '原 Key 已停用。' : '原 Key 已启用，等待同步。'
+  })
+}
+
+async function probeChannels() {
+  await runChannelAction(async providerID => {
+    const result: BeichenProbeRun & { budget?: { exhausted: boolean } } = await teacherAPI.requestBeichenProbes(providerID)
+    channelNotice.value = result.budget?.exhausted ? '今日探活额度已用完。' : '探活请求已排队，可稍后刷新查看健康状态。'
+  })
+}
+
+function runHealthAction(key: string, action: HealthAction) {
+  if (action === 'probe') return probeChannels()
+  if (action === 'sync') return syncChannel(key)
+  channelFrom.value = key
+  addingChannel.value = true
+  selectChannel('from')
+}
+
+function openChannelModels() {
+  const provider = channelProvider.value
+  closeChannelSwitch()
+  schoolProvider.value = provider
 }
 
 function refreshSchoolCatalog() {
@@ -397,7 +637,7 @@ async function remove(p: Provider) {
 function msg(e: unknown) { return e instanceof APIError ? e.message : '请求失败' }
 
 onMounted(load)
-onBeforeUnmount(() => { loadVersion++ })
+onBeforeUnmount(() => { loadVersion++; closeChannelSwitch() })
 </script>
 
 <template>
@@ -433,6 +673,7 @@ onBeforeUnmount(() => { loadVersion++ })
                 <span class="chip">最近目录同步 {{ catalogSyncTime(p) }}<template v-if="catalogSyncTime(p) !== '—'">（北京时间）</template></span>
                 <span v-if="anomalies[p.id]?.pendingCalls != null" class="chip">今日待核 {{ anomalies[p.id].pendingCalls }} 笔</span>
                 <span v-if="anomalies[p.id]?.missingModels != null" class="chip">缺价模型 {{ anomalies[p.id].missingModels }} 个</span>
+                <span v-if="channelCounts[p.id]?.maintenance_models" class="chip">维护中 {{ channelCounts[p.id].maintenance_models }} 个模型</span>
                 <a :href="`#beichen-reconcile-${p.id}`" class="provider-compare" @click.prevent="jumpToReconciliation(p.id)">对账对比</a>
               </div>
             </div>
@@ -440,6 +681,7 @@ onBeforeUnmount(() => { loadVersion++ })
               <StatusBadge :status="p.status" />
               <button v-if="isBeichenProvider(p.base_url)" type="button" class="button secondary" :aria-expanded="reconcileProviderIds.includes(p.id)" :aria-controls="`beichen-reconcile-${p.id}`" @click="toggleReconciliation(p.id)">北辰对账</button>
               <button v-if="isBeichenProvider(p.base_url)" class="button secondary" @click="schoolProvider = p">查看模型</button>
+              <button v-if="isBeichenProvider(p.base_url)" type="button" class="button secondary" @click="openChannelSwitch(p)">渠道切换向导</button>
               <button v-if="isBeichenProvider(p.base_url)" type="button" class="button secondary" @click="openAliases(p)">模型别名</button>
               <template v-else>
                 <button class="button secondary" :disabled="resetting === p.id" @click="resetCatalog(p)">{{ resetting === p.id ? '重置中…' : '配置重置' }}</button>
@@ -481,6 +723,115 @@ onBeforeUnmount(() => { loadVersion++ })
       </section>
     </LoadingRegion>
 
+    <AppDialog :open="Boolean(channelProvider)" title="渠道切换向导" description="同步接替 Key，检查受影响线路并确认换线。" wide
+      @update:open="open => { if (!open && !channelBusy) closeChannelSwitch() }">
+      <section v-if="channelProvider" class="switch-panel" :aria-busy="channelBusy || channelReading">
+        <p v-if="channelError" class="error" role="alert">{{ channelError }}</p>
+        <p v-if="channelNotice" role="status">{{ channelNotice }}</p>
+        <p v-if="channelReading && !channel" role="status">正在读取渠道状态…</p>
+        <div v-if="channel" class="chip-list" aria-label="渠道状态统计">
+          <span class="chip">启用 Key {{ channel.counts.enabled_keys }} 把</span>
+          <span class="chip">已启用模型 {{ channel.counts.enabled_models }} 个</span>
+          <span class="chip">维护中 {{ channel.counts.maintenance_models }} 个</span>
+          <span class="chip">失效绑定 {{ channel.counts.stale_routes }} 条</span>
+        </div>
+        <div class="grid two">
+          <label>原渠道<select v-model="channelFrom" :disabled="channelBusy || !channel" @change="selectChannel('from')">
+            <option value="">请选择原 Key</option>
+            <option v-for="key in channel?.credentials ?? []" :key="key.credential_id" :value="key.credential_id">
+              {{ key.label }}{{ key.status === 'inactive' ? '（已停用）' : '' }}
+            </option>
+          </select></label>
+          <label>接替渠道<select v-model="channelTo" :disabled="channelBusy || !channel" @change="selectChannel('to')">
+            <option value="">请选择接替 Key</option>
+            <option v-for="key in (channel?.credentials ?? []).filter(item => item.status === 'active' && item.credential_id !== channelFrom)"
+              :key="key.credential_id" :value="key.credential_id">{{ key.label }}</option>
+          </select></label>
+        </div>
+        <div class="actions">
+          <button type="button" class="button secondary" :disabled="channelBusy || channelReading || !channel || (!channelFrom && channel.credentials.length > 0)" @click="addingChannel = !addingChannel">
+            {{ addingChannel ? '收起新 Key 表单' : '添加接替 Key' }}
+          </button>
+          <button type="button" class="button secondary" :disabled="channelBusy || channelReading || !channelTo" @click="syncChannel()">一键同步</button>
+          <button type="button" class="button secondary" :disabled="channelBusy || channelReading || !channelFrom || !channelTo" @click="previewChannel">预览重绑</button>
+        </div>
+        <p v-if="channel?.credentials.length && !channelFrom" class="muted">请先选择要替换的原渠道，再添加或选择接替 Key。</p>
+        <form v-if="addingChannel" class="key-panel" aria-label="添加接替 Key" @submit.prevent="addChannel">
+          <label>新渠道名称<input v-model="newChannel.label" maxlength="128" required :disabled="channelBusy"></label>
+          <label>新 Key<input v-model="newChannel.key" type="password" autocomplete="new-password" required :disabled="channelBusy"></label>
+          <div class="actions"><button type="submit" class="button primary" :disabled="channelBusy || channelReading">保存并同步</button></div>
+        </form>
+        <div v-if="replacementChannel" class="chip-list" aria-label="接替渠道同步进度">
+          <span v-for="[kind, title] in syncDimensions" :key="kind" class="chip">{{ title }} · {{ syncLabels[replacementChannel.sync[kind]] }}</span>
+          <span v-if="replacementChannel.identity" class="chip">官网账单归属 · {{ syncLabels[replacementChannel.identity] }}</span>
+        </div>
+        <p v-if="channelFrom && channelTo && channel && !channel.preview && !channelError" class="muted">
+          等待接替渠道完成同步。目录可用后，这里会自动显示重绑预览。同步失败时可点「一键同步」重试。
+        </p>
+        <section v-if="channel?.preview" class="switch-section" aria-label="重绑预览">
+          <h3>重绑预览</h3>
+          <ul v-if="channel.preview.changes.length" class="switch-list">
+            <li v-for="change in channel.preview.changes" :key="change.binding_id">
+              <strong>{{ change.school_model }}</strong> · {{ bindingAdapterMeta(change.adapter as BindingAdapter).label }}
+              <div>{{ change.before?.credential_label }} → {{ change.after.credential_label }} · {{ change.after.upstream_model }}</div>
+            </li>
+          </ul>
+          <p v-else class="muted">当前没有可以迁移的线路。</p>
+          <ul v-if="channel.preview.blockers.length" class="switch-list">
+            <li v-for="item in channel.preview.blockers" :key="item.school_model + '/' + item.adapter">
+              <strong>{{ item.school_model }}</strong> · {{ bindingAdapterMeta(item.adapter).label }}
+              <div>{{ item.message }}</div>
+            </li>
+          </ul>
+          <div class="actions">
+            <button type="button" class="button primary" :disabled="channelBusy || channelReading || !channel.preview.changes.length" @click="confirmChannel">确认重绑</button>
+            <button v-if="channel.preview.blockers.some(item => item.code === 'missing_price')" type="button" class="button secondary" @click="openChannelModels">查看模型定价</button>
+            <button v-if="channel.preview.blockers.some(item => item.code === 'missing_protocol')" type="button" class="button secondary" :disabled="channelBusy || channelReading" @click="probeChannels">重新探活</button>
+          </div>
+        </section>
+        <section v-if="channel?.models.length" class="switch-section" aria-label="受影响模型">
+          <h3>受影响模型</h3>
+          <ul class="switch-list">
+            <li v-for="model in channel.models" :key="model.model">
+              <strong>{{ model.model }}</strong> · {{ model.ready_count }} 条可用线路
+              <strong v-if="model.ready_count === 0" class="danger-text"> · 维护中</strong>
+              <span v-if="model.loses_last_route" class="danger-text"> · 停用原 Key 后将进入维护</span>
+              <span v-else-if="model.losing_route_count" class="danger-text"> · 停用原 Key 会失去 {{ model.losing_route_count }} 条北辰线路</span>
+              <div v-for="route in model.routes" :key="route.adapter">
+                {{ route.credential_label ?? '自动选 Key' }} · {{ route.upstream_model }} · {{ bindingAdapterMeta(route.adapter).label }}
+                <span v-if="route.stale" class="danger-text"> · 绑定失效</span>
+                <span v-else-if="!route.ready"> · 未启用</span>
+              </div>
+              <small v-if="model.ready_count === 0">选择原 Key 和接替 Key，依次同步、核对报价与协议，然后确认重绑。</small>
+            </li>
+          </ul>
+        </section>
+        <div v-if="originalChannel" class="actions">
+          <button type="button" class="button secondary" :disabled="channelBusy || channelReading" @click="setOriginalChannelStatus">
+            {{ originalChannel.status === 'active' ? '停用原 Key' : '重新启用原 Key' }}
+          </button>
+          <span v-if="retirementImpact.length" class="danger-text">停用会影响 {{ retirementImpact.length }} 个模型</span>
+        </div>
+        <details v-if="channelHealth.length" class="switch-section">
+          <summary>Key 健康 {{ healthyKeys }}/{{ channel?.counts.enabled_keys ?? channelHealth.length }} 把</summary>
+          <section v-for="key in channelHealth" :key="key.credential_id">
+            <h3>{{ key.label }} · {{ key.health?.available_dimensions }}/{{ healthDimensions.length }} 项可用</h3>
+            <dl v-if="key.health" class="switch-health">
+              <div v-for="[dimension, title] in healthDimensions" :key="dimension">
+                <dt>{{ title }}</dt>
+                <dd>{{ key.health[dimension].message }}</dd>
+                <dd v-if="key.health[dimension].state !== 'available'">
+                  <button type="button" class="button ghost" :disabled="channelBusy || channelReading"
+                    @click="runHealthAction(key.credential_id, healthActions[dimension])">
+                    {{ healthActionLabels[healthActions[dimension]] }}
+                  </button>
+                </dd>
+              </div>
+            </dl>
+          </section>
+        </details>
+      </section>
+    </AppDialog>
     <AppDialog :open="Boolean(schoolProvider)" title="北辰模型" description="查看学校首选倍率并管理模型启用状态。" wide @update:open="open => { if (!open) schoolProvider = undefined }">
       <BeichenSchoolModels v-if="schoolProvider" :key="schoolProvider.id" :provider-id="schoolProvider.id" provider-maintenance @catalog-synced="refreshSchoolCatalog" />
     </AppDialog>
@@ -594,6 +945,15 @@ onBeforeUnmount(() => { loadVersion++ })
   .provider-row-head > .actions { width: 100%; }
 }
 .provider-form { display: grid; gap: 1rem; }
+.switch-panel { display: grid; gap: 12px; overflow-wrap: anywhere; }
+.switch-panel p, .switch-panel h3 { margin: 0; }
+.switch-section { border-top: 1px solid var(--line); padding-top: 10px; }
+.switch-section h3 { font-size: 14px; }
+.switch-section summary { cursor: pointer; }
+.switch-list { display: grid; gap: 8px; margin: 8px 0; padding-inline-start: 20px; }
+.switch-health { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 140px), 1fr)); gap: 8px; margin: 8px 0; }
+.switch-health dt { font-weight: 600; }
+.switch-health dd { margin: 4px 0; }
 .alias-panel { display: grid; gap: 1rem; }
 .alias-panel p, .alias-list { margin: 0; }
 .alias-list { padding: 0; list-style: none; }

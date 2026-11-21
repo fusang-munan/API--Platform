@@ -118,6 +118,7 @@ type CatalogModel struct {
 	ReadyCount      int              `json:"ready_count"`
 	PriceState      string           `json:"price_state"`
 	PriceCovered    bool             `json:"price_covered"`
+	PriceBlocker    *CatalogBlocker  `json:"price_blocker,omitempty"`
 	Blockers        []CatalogBlocker `json:"blockers"`
 	Activation      string           `json:"activation"`
 	Protocols       []string         `json:"protocols"`
@@ -347,7 +348,7 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 		if upstream.Input != nil && upstream.Output != nil {
 			model.PriceStatus = "confirmed"
 			model.UpstreamRates = &upstream
-		} else if model.priceReadiness == activationPriceConditional || conditionalPanelPricing(terms) {
+		} else if model.priceReadiness.conditional || fixedPrice && conditionalPanelPricing(terms) {
 			model.PriceStatus = "conditional"
 		}
 		if school.Input != nil {
@@ -560,10 +561,10 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 	}
 
 	target := m.target("")
-	missingPrice, conditionalPrice := priceStates["missing"], priceStates["conditional"]
-	routeReady := item.CanEnable
-	if routeReady {
-		price, err := m.plan(target).priceReadiness(ctx, tx, records)
+	var price activationPrice
+	if item.CanEnable {
+		var err error
+		price, err = m.plan(target).priceReadiness(ctx, tx, records)
 		if err != nil {
 			return CatalogModel{}, err
 		}
@@ -571,21 +572,26 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 			item.Activation = "ready"
 			return item, nil
 		}
-		missingPrice, conditionalPrice = price == activationPriceMissing, price == activationPriceUnusableConditional
 	}
 
 	item.Activation = "blocked"
 	if target == nil || target.status == "not_configured" {
 		item.Blockers = append(item.Blockers, CatalogBlocker{"not_configured", "请确认此目录模型对应的校内模型和线路"})
 	}
-	if !routeReady {
+	if !item.CanEnable {
 		item.Blockers = append(item.Blockers, CatalogBlocker{"no_ready_route", "没有可启用的北辰线路，请检查渠道状态和线路配置"})
+		// Keep the missing-price summary for the credential coverage view.
+		if priceStates["missing"] {
+			item.Blockers = append(item.Blockers, CatalogBlocker{"missing_price", "线路缺少可用报价，请同步官网价或设置手动价"})
+		}
 	}
-	if missingPrice {
-		item.Blockers = append(item.Blockers, CatalogBlocker{"missing_price", "线路缺少可用报价，请同步官网价或设置手动价"})
-	}
-	if conditionalPrice {
-		item.Blockers = append(item.Blockers, CatalogBlocker{"conditional_price", "线路按条件计价，请先设置手动价"})
+	if price.blocker != nil {
+		item.PriceBlocker = price.blocker
+		code := "missing_price"
+		if price.conditional {
+			code = "conditional_price"
+		}
+		item.Blockers = append(item.Blockers, CatalogBlocker{Code: code, Message: price.blocker.Message})
 	}
 	for _, id := range m.keys {
 		if syncFailed[id] {
