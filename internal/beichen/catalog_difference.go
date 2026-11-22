@@ -230,7 +230,8 @@ func indexKeyGroups(datasets []Dataset, keys []discoveryKey, platforms []directo
 			if dataset.ObservedAt != nil || dataset.GroupID != nil || dataset.GroupStatus != "" {
 				key.GroupID = dataset.GroupID
 			}
-			key.GroupStale = dataset.GroupStatus == "" && dataset.BillingState == "stale"
+			key.GroupStale = dataset.BillingState == "stale" &&
+				(dataset.GroupStatus == "" || dataset.GroupStatus == "assigned")
 			key.groupCurrent = dataset.BillingState == "current" && dataset.GroupID != nil
 			if !key.groupCurrent {
 				continue

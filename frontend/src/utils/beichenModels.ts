@@ -1,4 +1,4 @@
-import type { BeichenCatalogModel, BeichenDataset, BeichenModel, BeichenOverview, BeichenPriceConditions, BeichenPriceTier } from '../api/types'
+import type { BeichenCatalogModel, BeichenDataset, BeichenModel, BeichenOverview, BeichenPriceConditions, BeichenPriceTier, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../api/types'
 import { shiftDecimal } from './credits'
 
 export function isBeichenProvider(baseUrl: string) {
@@ -106,7 +106,56 @@ export type SchoolCatalogRow = {
   quotes: SchoolQuote[]
 }
 
-export function schoolCatalog(overview: BeichenOverview, providerId: string): SchoolCatalogRow[] {
+type WebsiteKeyRateVersion = BeichenWebsiteKey & { observed_at?: string | null }
+type WebsiteKeyGroups = {
+  current: boolean
+  matched: ReadonlyMap<string, WebsiteKeyRateVersion>
+}
+
+export const lastKnownKeyGroupLabel = '上次分组（未确认）'
+
+export function indexWebsiteKeyGroups(inventory?: BeichenWebsiteKeyInventory): WebsiteKeyGroups {
+  const matched = new Map<string, WebsiteKeyRateVersion>()
+  for (const key of inventory?.keys ?? []) {
+    if (key.match_status === 'matched' && key.credential_id) matched.set(key.credential_id, key)
+  }
+  return { current: inventory?.status === 'current', matched }
+}
+
+export function lastKnownKeyGroup(key?: WebsiteKeyRateVersion, billing?: BeichenDataset, catalogGroupId?: number | null) {
+  const id = key?.group_id ?? billing?.group_id ?? catalogGroupId
+  if (id == null) return undefined
+  const sameWebsiteGroup = key?.group_id === id
+  const sameBillingGroup = billing?.group_id === id
+  return {
+    id,
+    name: (sameWebsiteGroup ? key.group_name : undefined) ?? (sameBillingGroup ? billing.group_name : undefined),
+    rate: (sameWebsiteGroup ? key.rate : undefined) ?? (sameBillingGroup ? billing.group_rate : undefined),
+  }
+}
+
+export function verifiedWebsiteKeyBilling(key: WebsiteKeyRateVersion, billing?: BeichenDataset) {
+  // 概览里的分组字段可能已更新，生效倍率仍须有同组、同版本的计费观测。
+  if (key.group_id != null && billing?.billing_state === 'current' && !billing.last_error && !keyGroupIssue(billing) &&
+    billing.group_id === key.group_id && keyGroupRate(billing.group_rate) === keyGroupRate(key.rate ?? undefined) &&
+    key.observed_at && billing.observed_at && Date.parse(billing.observed_at) >= Date.parse(key.observed_at)) {
+    return billing
+  }
+}
+
+export function websiteKeyEffectiveRate(key: WebsiteKeyRateVersion, billing?: BeichenDataset) {
+  if (key.group_id == null || (billing?.group_id === key.group_id && billing.group_status === 'not_allowed')) return null
+  const verified = verifiedWebsiteKeyBilling(key, billing)
+  return verified?.effective_multiplier_text ?? verified?.effective_multiplier ?? key.rate
+}
+
+export function priceBelongsToWebsiteKeyGroup(key: WebsiteKeyRateVersion, observedAt?: string | null, groupId?: number | null) {
+  if (key.group_id == null) return false
+  if (key.observed_at) return Boolean(observedAt && Date.parse(observedAt) >= Date.parse(key.observed_at))
+  return groupId == null || groupId === key.group_id
+}
+
+export function schoolCatalog(overview: BeichenOverview, providerId: string, websiteGroups?: WebsiteKeyGroups): SchoolCatalogRow[] {
   const records = new Map<string, BeichenModel[]>()
   const prices = new Map<string, BeichenModel>()
   for (const row of overview.models ?? []) {
@@ -134,13 +183,19 @@ export function schoolCatalog(overview: BeichenOverview, providerId: string): Sc
     const canDisable = status === 'active' && (entry.school_status === 'active' || selected.length > 0)
     const quotes = new Map<string, ReturnType<typeof schoolQuote>>()
     const credentials = new Map<string, { credential_id: string; label: string; mode: 'follow' | 'manual'; priceReady: boolean }>()
+    const catalogGroups = new Map(entry.catalog_keys?.map(key => [key.credential_id, key.group_id]))
     for (const route of selected) {
       if (route.provider_id !== providerId || !route.credential_id) continue
       const upstreamName = (route.upstream_model ?? entry.model).toLowerCase()
       const record = prices.get(route.credential_id + ':' + upstreamName)
+      const billing = datasets.get('billing:' + route.credential_id)
+      const priceDataset = datasets.get('prices:' + route.credential_id)
+      const matchedKey = websiteGroups?.matched.get(route.credential_id)
+      const websiteKey = websiteGroups?.current ? matchedKey : undefined
+      const previousGroup = lastKnownKeyGroup(websiteKey?.group_id != null ? undefined : matchedKey,
+        billing, catalogGroups.get(route.credential_id))
       const quote = schoolQuote(record, route.effective_multiplier_text ?? route.effective_multiplier,
-        route.state === 'candidate', datasets.get('prices:' + route.credential_id)?.last_error,
-        datasets.get('billing:' + route.credential_id), datasets.get('prices:' + route.credential_id))
+        route.state === 'candidate', billing, priceDataset, websiteKey, previousGroup)
       quotes.set(JSON.stringify(quote), quote)
       credentials.set(route.credential_id, {
         credential_id: route.credential_id,
@@ -354,31 +409,40 @@ export function schoolQuoteDetail(quote: SchoolQuote, student: boolean): PriceDe
 }
 
 function schoolQuote(record: BeichenModel | undefined, reported: string | number | null | undefined,
-  candidate: boolean, priceError?: string | null, billing?: BeichenDataset, priceDataset?: BeichenDataset) {
+  candidate: boolean, billing?: BeichenDataset, priceDataset?: BeichenDataset, websiteKey?: WebsiteKeyRateVersion,
+  previousGroup?: ReturnType<typeof lastKnownKeyGroup>) {
   const status: SchoolQuote['status'] = record?.price_status === 'confirmed' || record?.price_status === 'conditional' ||
     record?.price_status === 'derived' || record?.price_status === 'not_listed' ? record.price_status : 'pending'
   const derived = record?.price_source === 'derived_from_usage' || status === 'derived'
   const mode: 'follow' | 'manual' = record?.mode === 'manual' ? 'manual' : 'follow'
   const billingError = billing?.last_error
+  const priceError = priceDataset?.last_error
   const groupIssue = keyGroupIssue(billing)
   const missingOfficial = priceDataset?.official_price_missing
   const stale = billing?.billing_state === 'stale'
   const billingRate = billing?.effective_multiplier_text ?? billing?.effective_multiplier
-  const observedRate = billing?.billing_state === 'current' ? billingRate : reported
-  const rate = groupIssue || billingError || stale ? null : nonNegativeDecimal(observedRate)
-  const lastRate = stale ? nonNegativeDecimal(billingRate) : null
+  const hasGroupEvidence = Boolean(websiteKey || previousGroup)
+  const matchingQuote = websiteKey && priceBelongsToWebsiteKeyGroup(websiteKey,
+    record?.price_observed_at ?? priceDataset?.last_success, billing?.group_id ?? previousGroup?.id)
+  const observedRate = hasGroupEvidence
+    ? matchingQuote ? websiteKeyEffectiveRate(websiteKey, billing) : null
+    : billing?.billing_state === 'current' ? billingRate : reported
+  const rate = !hasGroupEvidence && (groupIssue || billingError || stale) ? null : nonNegativeDecimal(observedRate)
+  const lastRate = !hasGroupEvidence && stale ? nonNegativeDecimal(billingRate) : null
   const multiplier = lastRate ? formatDecimal(lastRate) + '× · 已陈旧'
     : rate ? formatDecimal(rate) + (candidate ? '× · 待启用' : '×')
       : groupIssue || billingError || observedRate == null || observedRate === '' ? '待同步' : '倍率无效'
   const source = record?.price_conditions_exact ?? record?.price_conditions
-  const terms = status !== 'not_listed' && source && typeof source === 'object' && !Array.isArray(source) ? source : null
+  const terms = (websiteKey?.group_id == null || matchingQuote) && status !== 'not_listed' &&
+    source && typeof source === 'object' && !Array.isArray(source) ? source : null
   const canCalculate = !priceError && (status === 'confirmed' || status === 'conditional' || status === 'derived') ? rate : null
   const prices = terms ? formatPriceConditions(terms, canCalculate, true) : null
   const standard = prices?.standard ?? null
   // Older confirmed quotes can have effective token rates without a website pricing object.
   const legacy = !terms && canCalculate && status === 'confirmed' ? legacyEffectivePrice(record?.upstream_rates) : null
   const actual = prices?.actual ?? legacy?.actual ?? null
-  const schoolRates = stale && mode === 'follow' ? null : record?.school_rates
+  const schoolRates = mode === 'follow' && (stale || hasGroupEvidence &&
+    (!matchingQuote || !verifiedWebsiteKeyBilling(websiteKey, billing))) ? null : record?.school_rates
   const actualRates = schoolRates ? {
     input: scaledNumber(schoolRates.input, 6), output: scaledNumber(schoolRates.output, 6),
     cache_read: scaledNumber(schoolRates.cache_read, 6), cache_write: scaledNumber(schoolRates.cache_write, 6),
@@ -396,10 +460,12 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
   const officialObservedAt = derived ? record?.price_observed_at ?? websiteObservedAt : websiteObservedAt
   const schoolObservedAt = mode === 'manual' ? record?.price_observed_at ?? null : officialObservedAt
   const notes: string[] = []
-  if (billing?.group_status && billing.group_id != null) {
-    const groupRate = keyGroupRate(billing.group_rate)
-    notes.push([`Key 分组 ${billing.group_id}`, billing.group_name, groupRate && '分组倍率 ' + groupRate]
-      .filter(Boolean).join(' · '))
+  const group = websiteKey?.group_id == null ? previousGroup
+    : { id: websiteKey.group_id, name: websiteKey.group_name, rate: websiteKey.rate }
+  if (group) {
+    const groupRate = keyGroupRate(group.rate ?? undefined)
+    const groupLabel = websiteKey?.group_id == null ? lastKnownKeyGroupLabel : 'Key 分组'
+    notes.push([`${groupLabel} ${group.id}`, group.name, groupRate && '分组倍率 ' + groupRate].filter(Boolean).join(' · '))
   }
   if (derived) {
     notes.push('输入、输出单价由历史流水反推。缓存单价缺证据时，使用缓存的调用待核账。')

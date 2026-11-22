@@ -3,14 +3,17 @@ import { computed, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
 import type { BeichenCapabilities, BeichenCatalogModel, BeichenHealthDimension, BeichenModelCapability, BeichenModelUsage, BeichenOverview, BeichenProbeRun, BeichenUsageRange, BindingAdapter } from '../../api/types'
-import type { BeichenCatalogKey, BeichenModel, BeichenPreferredRoute, BeichenPriceConditions, BeichenRebindPlan, BeichenRebindRoute, BeichenWebsiteLocation } from '../../api/types'
+import type { BeichenCatalogKey, BeichenModel, BeichenPreferredRoute, BeichenPriceConditions, BeichenRebindPlan, BeichenRebindRoute, BeichenWebsiteKeyInventory, BeichenWebsiteLocation } from '../../api/types'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { useToast } from '../../composables/useToast'
-import { formatPriceConditions, keyGroupIssue, keyGroupRate, missingPriceDetailLabels, schoolCatalog, type SchoolCatalogRow, type SchoolQuote } from '../../utils/beichenModels'
+import {
+  formatObservedAt, formatPriceConditions, indexWebsiteKeyGroups, keyGroupIssue, keyGroupRate, lastKnownKeyGroup,
+  lastKnownKeyGroupLabel, missingPriceDetailLabels, priceBelongsToWebsiteKeyGroup, schoolCatalog,
+  verifiedWebsiteKeyBilling, websiteKeyEffectiveRate, type SchoolCatalogRow, type SchoolQuote,
+} from '../../utils/beichenModels'
 import { bindingAdapterMeta } from '../../utils/bindingAdapters'
 import { formatPercent, formatTokens, multiplyDecimal, shiftDecimal } from '../../utils/credits'
 import { buildGroupPriceRows } from '../../utils/groupPriceRows'
-import { calculateBeichenPriceTable, type BeichenPriceTableInput } from '../../utils/priceCalculation'
 import { schoolDay, statusLabel } from '../../utils/format'
 import AppDialog from '../../components/AppDialog.vue'
 import BeichenGroupPrices from '../../components/BeichenGroupPrices.vue'
@@ -29,10 +32,13 @@ type ProbeBudget = { date: string; used: number; limit: number; remaining: numbe
 type ProbeRunWithBudget = BeichenProbeRun & { budget?: ProbeBudget }
 
 const overview = ref<BeichenOverview>()
+const websiteKeyInventory = ref<BeichenWebsiteKeyInventory>()
 const capabilities = ref<BeichenCapabilities>()
 const usageStates = ref<Partial<Record<BeichenUsageRange, UsageState>>>({})
 const range = ref<BeichenUsageRange>('month')
 const loading = ref(false)
+const refreshingWebsiteKeys = ref(false)
+const websiteKeyRefreshError = ref('')
 const updating = ref('')
 const syncing = ref(false)
 const rescanKey = ref('')
@@ -54,7 +60,7 @@ const filters = [{ id: 'all', label: '全部' }, { id: 'active', label: '已启�
 function adapterLabel(value: string) { return bindingAdapterMeta(value as BindingAdapter).label }
 const filter = ref<typeof filters[number]['id']>('all')
 const priceRow = ref<SchoolCatalogRow>()
-const conditionsRow = ref<CatalogRow>()
+const conditionsModel = ref<string>()
 const usageOpen = ref(false)
 const initialModel = ref('')
 const websiteDirectory = computed(() => overview.value?.website_directory)
@@ -197,58 +203,124 @@ const billingByKey = computed(() => new Map((overview.value?.datasets ?? [])
   .filter(dataset => dataset.kind === 'billing').map(dataset => [dataset.credential_id, dataset])))
 const pricesByKey = computed(() => new Map((overview.value?.datasets ?? [])
   .filter(dataset => dataset.kind === 'prices').map(dataset => [dataset.credential_id, dataset])))
+const websiteKeyGroups = computed(() => indexWebsiteKeyGroups(websiteKeyInventory.value))
+function confirmedWebsiteKey(credentialId?: string | null) {
+  return credentialId && websiteKeyGroups.value.current ? websiteKeyGroups.value.matched.get(credentialId) : undefined
+}
+const websiteKeysNeedRefresh = computed(() => {
+  const inventory = websiteKeyInventory.value
+  return !websiteKeyGroups.value.current || !inventory?.keys.length ||
+    inventory.keys.some(key => key.match_status !== 'matched' || !key.credential_id) ||
+    rescanKeys.value.some(key => !confirmedWebsiteKey(key.credential_id))
+})
+const websiteKeysRefreshHint = computed(() => {
+  const status = websiteKeyInventory.value?.status
+  if (status === 'session_expired') {
+    return '北辰网页会话已过期。请在北辰网页登录重新授权，再刷新清单。'
+  }
+  if (status === 'stale') return '这里显示上次读取的清单。刷新后可重新核对学校 Key 的分组和倍率。'
+  if (status !== 'current') return '请从北辰官网刷新 Key 清单，以确认学校 Key 的分组和倍率。'
+  if (websiteKeysNeedRefresh.value) {
+    return '有 Key 缺少匹配记录。刷新清单可重新核对分组和倍率。'
+  }
+  return '在北辰官网换组后，可在这里立即核对 Key 的分组和倍率。'
+})
 const billingRows = computed(() => rescanKeys.value.flatMap(key => {
   const billing = billingByKey.value.get(key.credential_id)
-  return billing?.billing_state ? [{ ...billing, label: key.label }] : []
+  const websiteKey = confirmedWebsiteKey(key.credential_id)
+  const previousGroup = websiteKey?.group_id == null
+    ? lastKnownKeyGroup(websiteKeyGroups.value.matched.get(key.credential_id), billing) : undefined
+  if (!billing?.billing_state && !websiteKey && !previousGroup) return []
+  const currentBilling = websiteKey ? verifiedWebsiteKeyBilling(websiteKey, billing) : undefined
+  return [{ ...billing, websiteKey, previousGroup, currentBilling, credential_id: key.credential_id, label: key.label }]
+}))
+const keyCapabilities = computed(() => (overview.value?.key_capabilities ?? []).map(key => {
+  const group = key.website_group
+  const websiteKey = confirmedWebsiteKey(key.credential_id)
+  if (!group || (websiteKey?.group_id != null && websiteKey.group_id === group.id &&
+      rateLabel(websiteKey.rate) === rateLabel(group.rate_multiplier))) {
+    return key
+  }
+  return { ...key, website_group: null }
 }))
 const rebindModelCount = computed(() => new Set(rebindPlan.value?.changes.map(row => row.model_id)).size)
+
+function keyGroupDiagnosis(key?: BeichenCatalogKey) {
+  if (!key) return undefined
+  const websiteKey = confirmedWebsiteKey(key.credential_id)
+  if (websiteKey ? websiteKey.group_id === key.group_id : !key.group_stale) return key.group_diagnosis
+}
 
 function currentGroupPrices(locations: BeichenWebsiteLocation[], credentialId: string | undefined,
   key: BeichenCatalogKey | undefined, route: BeichenPreferredRoute | undefined, record: BeichenModel | undefined) {
   const billing = credentialId ? billingByKey.value.get(credentialId) : undefined
   const prices = credentialId ? pricesByKey.value.get(credentialId) : undefined
-  const groupId = key?.group_stale || billing?.group_status === 'not_found' || billing?.group_status === 'pending'
-    ? null : billing?.group_id ?? key?.group_id ?? null
-  const groupRows = buildGroupPriceRows(locations, groupId)
-  const currentGroup = groupRows.find(group => group.is_current_key_group)
+  const websiteKey = confirmedWebsiteKey(credentialId)
+  const groupId = websiteKey?.group_id ?? null
+  const previousGroup = credentialId && groupId == null
+    ? lastKnownKeyGroup(websiteKeyGroups.value.matched.get(credentialId), billing, key?.group_id) : undefined
   const matchingGroup = (location: BeichenWebsiteLocation) => location.groups.find(group =>
     group.id === groupId && (!group.status || group.status === 'active'))
-  const websiteQuotes = locations.filter(location => !location.stale && location.has_price && location.price_conditions_exact)
-  const sameGroup = websiteQuotes.filter(matchingGroup)
+  const sameGroup = locations.filter(location =>
+    !location.stale && location.has_price && location.price_conditions_exact && matchingGroup(location))
   const official = sameGroup.find(location => location.price_complete) ?? sameGroup[0]
   const websiteGroup = official ? matchingGroup(official) : undefined
 
   const legacyTerms = record?.price_conditions
   const terms = record?.price_conditions_exact ?? (legacyTerms && Object.fromEntries(
     Object.entries(legacyTerms).filter(([field, value]) => !field.endsWith('_price') || value !== 0)))
-  const isDerived = record?.price_source === 'derived_from_usage' || record?.price_status === 'derived'
-  const website = official ?? (!isDerived && terms && record?.price_status !== 'not_listed' &&
-    key?.group_diagnosis !== 'price_outside_key_group' && key?.group_diagnosis !== 'model_outside_key_group'
-    ? { price_conditions_exact: terms, observed_at: record?.price_observed_at ?? prices?.last_success } : null)
-  const derived = !websiteQuotes.length && isDerived && record?.price_status === 'derived' && terms
+  const isDerived = record?.price_source === 'derived_from_usage' || (!record?.price_source && record?.price_status === 'derived')
+  const priceObservedAt = record?.price_observed_at ?? prices?.last_success
+  const canUseRecord = websiteKey ? priceBelongsToWebsiteKeyGroup(websiteKey, priceObservedAt, billing?.group_id ?? key?.group_id)
+    : !previousGroup && !keyGroupIssue(billing)
+  const diagnosis = keyGroupDiagnosis(key)
+  const website = official ?? (canUseRecord && !locations.length && !isDerived && terms && record?.price_status !== 'not_listed' &&
+    diagnosis !== 'price_outside_key_group' && diagnosis !== 'model_outside_key_group'
+    ? { price_conditions_exact: terms, observed_at: priceObservedAt } : null)
+  const derived = canUseRecord && isDerived && record?.price_status === 'derived' && terms
     ? { price_conditions_exact: terms, observed_at: record.price_observed_at } : null
 
-  const rateUnavailable = Boolean(billing?.last_error || keyGroupIssue(billing) || billing?.group_status === 'not_allowed' ||
+  const rateUnavailable = Boolean(billing?.last_error || keyGroupIssue(billing) ||
     billing?.billing_state === 'stale' || billing?.billing_state === 'unverified' || key?.group_stale)
   const synchronizedRate = billing?.billing_state === 'current'
     ? billing.effective_multiplier_text ?? billing.effective_multiplier : null
-  const websiteRate = key?.group_diagnosis === 'group_rate_mismatch' ? null
-    : websiteGroup?.account_rate_multiplier ?? websiteGroup?.rate_multiplier ?? billing?.group_rate
-  const rate = synchronizedRate ?? route?.effective_multiplier_text ?? route?.effective_multiplier ?? websiteRate
-  const priceCurrent = official || (record?.price_status === 'confirmed' || record?.price_status === 'conditional' || derived) &&
+  const legacyRate = synchronizedRate ?? route?.effective_multiplier_text ?? route?.effective_multiplier
+  const legacyPriceCurrent = (record?.price_status === 'confirmed' || record?.price_status === 'conditional' || derived) &&
     (!prices?.last_error || prices.official_price_missing)
-  const table: BeichenPriceTableInput = { website, derived, groupMultiplier: !rateUnavailable && priceCurrent ? rate : null }
-
-  if (currentGroup) {
-    const [input, output, cache5m, cache1h, cacheRead] = calculateBeichenPriceTable(table).rows
-    currentGroup.input = input.student?.credits ?? null
-    currentGroup.output = output.student?.credits ?? null
-    currentGroup.cache5m = cache5m.student?.credits ?? null
-    currentGroup.cache1h = cache1h.student?.credits ?? null
-    currentGroup.cache_read = cacheRead.student?.credits ?? null
+  const groupMultiplier = websiteKey ? websiteKeyEffectiveRate(websiteKey, billing)
+    : canUseRecord && !rateUnavailable && legacyPriceCurrent ? legacyRate : null
+  const groupName = websiteKey?.group_name ?? websiteGroup?.name
+  const baseRate = websiteKey?.rate
+  const groupRate = keyGroupRate(baseRate == null ? undefined : String(baseRate))
+  const rateForPrices = groupMultiplier == null ? null : baseRate ?? groupMultiplier
+  const accountRate = groupMultiplier != null && keyGroupRate(String(rateForPrices)) !== keyGroupRate(String(groupMultiplier))
+    ? groupMultiplier : null
+  // 只传当前分组的官网报价和这把 Key 的流水，避免其它分组使用该 Key 的反推价。
+  const currentLocations = groupId != null && website ? [{
+    name: official?.name ?? record?.model ?? '',
+    groups: [{ id: groupId }],
+    observed_at: website.observed_at ?? '',
+    has_price: true,
+    price_conditions_exact: website.price_conditions_exact,
+  }] : []
+  const [current] = groupId == null ? [] : buildGroupPriceRows(currentLocations, groupId, {
+    keyGroup: { id: groupId, name: groupName, rate: rateForPrices, account_rate: accountRate },
+    derived: derived?.price_conditions_exact,
+  })
+  const observedAt = (current?.student_source === 'derived' ? derived : website)?.observed_at
+  const comparisonRows = buildGroupPriceRows(locations, previousGroup?.id, { keyGroup: previousGroup })
+    .filter(group => group.group_id !== groupId)
+    .map(group => group.is_current_key_group
+      ? { ...group, is_current_key_group: false, name: lastKnownKeyGroupLabel + ' · ' + group.name }
+      : group)
+  return {
+    current, website, derived, groupMultiplier, observedAt,
+    unmatched: Boolean(credentialId && groupId == null),
+    currentTitle: current ? `当前分组 ${current.group_id} · ${groupRate || '倍率待同步'}` : '',
+    observedLabel: formatObservedAt(observedAt),
+    comparisonRows,
+    officialPriceMissing: prices?.official_price_missing,
   }
-  const hasTable = Boolean(currentGroup || website || derived)
-  return { table, groupId, groupRows, currentGroup, hasTable, officialPriceMissing: prices?.official_price_missing }
 }
 
 const catalog = computed(() => {
@@ -264,7 +336,7 @@ const catalog = computed(() => {
     observedKeys.set(model, ids)
     observedPrices.set(record.credential_id + ':' + model, record)
   }
-  return schoolCatalog(data, props.providerId).map(row => {
+  return schoolCatalog(data, props.providerId, websiteKeyGroups.value).map(row => {
     const model = row.model.toLowerCase()
     const entry = entries.get(model)
     const routes = (entry?.preferred_routes ?? []).filter(route => route.provider_id === props.providerId)
@@ -295,26 +367,33 @@ const catalog = computed(() => {
       .map(blocker => blocker.message?.trim()).filter(Boolean)
     const catalogKeys = entry?.catalog_keys ?? []
     const locations = entry?.website_locations ?? []
+    const hasConfirmedGroup = (id?: string | null) => confirmedWebsiteKey(id)?.group_id != null
     const priceRoute = routes.filter(route => route.credential_id && route.school_model.toLowerCase() === row.school.toLowerCase())
-      .sort((left, right) => Number(right.state === 'ready') - Number(left.state === 'ready') || left.priority - right.priority)[0]
-    const credentialId = priceRoute?.credential_id ?? catalogKeys.find(key => key.state === 'listed' && !key.stale)?.credential_id ??
+      .sort((left, right) => Number(hasConfirmedGroup(right.credential_id)) - Number(hasConfirmedGroup(left.credential_id)) ||
+        Number(right.state === 'ready') - Number(left.state === 'ready') || left.priority - right.priority)[0]
+    const listedKeys = catalogKeys.filter(key => key.state === 'listed' && !key.stale)
+    const credentialId = priceRoute?.credential_id ?? (listedKeys.find(key => hasConfirmedGroup(key.credential_id)) ?? listedKeys[0])?.credential_id ??
       (keys.size === 1 ? [...keys][0] : undefined)
     const priceKey = catalogKeys.find(key => key.credential_id === credentialId)
     const upstreamModel = (priceRoute?.upstream_model ?? priceKey?.upstream_model ?? row.model).toLowerCase()
     const record = credentialId ? observedPrices.get(credentialId + ':' + upstreamModel) : undefined
     const groupPrices = currentGroupPrices(locations, credentialId, priceKey, priceRoute, record)
-    const websiteTerms = groupPrices.table.website?.price_conditions_exact
+    const websiteTerms = groupPrices.website?.price_conditions_exact
     const detailQuotes = row.quotes.filter(quote => hasPriceConditions(quote) || needsPriceDetails(quote.conditions) ||
       (!quote.conditions && quote.status === 'confirmed' && quote.actual))
     const detailWebsite = websiteTerms && needsPriceDetails(websiteTerms) && !detailQuotes.some(quote => quote.conditions === websiteTerms)
       ? formatPriceConditions(websiteTerms, null, true).standard : null
-    const groupStatuses = [...new Set([...keys, ...catalogKeys.map(key => key.credential_id)])].map(id => billingByKey.value.get(id))
+    const groupStatuses = [...new Set([...keys, ...catalogKeys.map(key => key.credential_id)])].map(id => {
+      const billing = billingByKey.value.get(id)
+      const websiteKey = confirmedWebsiteKey(id)
+      return !websiteKey || websiteKey.group_id === billing?.group_id ? billing : undefined
+    })
     const deniedGroups = [...new Set(groupStatuses.filter(group => group?.group_status === 'not_allowed')
       .map(group => group?.group_id == null ? '分组无权限' : '分组无权限 · 分组 ' + group.group_id))]
-    const missingGroup = groupStatuses.some(group => group?.group_status === 'not_found')
-    const groupMismatch = missingGroup || catalogKeys.some(key => key.group_diagnosis === 'model_outside_key_group' ||
-      key.group_diagnosis === 'price_outside_key_group' && !websiteTerms) ||
-      (groupPrices.groupId != null && groupPrices.groupRows.length > 0 && !groupPrices.currentGroup)
+    const missingGroup = confirmedWebsiteKey(credentialId)?.group_id === null || groupStatuses.some(group => group?.group_status === 'not_found')
+    const groupDiagnoses = new Set(catalogKeys.map(keyGroupDiagnosis))
+    const groupMismatch = missingGroup || groupDiagnoses.has('model_outside_key_group') ||
+      (groupDiagnoses.has('price_outside_key_group') && !websiteTerms && !groupPrices.derived)
     const protocolCount = entry?.protocols ? new Set(entry.protocols).size
       : capability?.protocols.length ?? (protocols.size || (routeCount === 0 ? 0 : null))
     const priceMissing = !websiteOnly && !priceCovered && priceState === 'missing' &&
@@ -329,7 +408,7 @@ const catalog = computed(() => {
       source,
       locations, groupPrices, detailQuotes, detailWebsite,
       catalogKeys, groupMismatch, deniedGroups, missingGroup, protocolCount,
-      groupRateMismatch: catalogKeys.some(key => key.group_diagnosis === 'group_rate_mismatch'),
+      groupRateMismatch: groupDiagnoses.has('group_rate_mismatch'),
       protocolLabels: entry?.catalog_state ? entry.protocols?.map(protocolLabel) ?? [] : capability
         ? capability.protocols.map(protocolLabel)
         : entry?.protocols?.map(protocol => bindingAdapterMeta(protocol).label) ?? [],
@@ -347,6 +426,7 @@ const catalog = computed(() => {
   })
 })
 type CatalogRow = (typeof catalog.value)[number]
+const conditionsRow = computed(() => conditionsModel.value == null ? undefined : catalog.value.find(row => row.model === conditionsModel.value))
 const listedModels = computed(() => catalog.value.filter(row => row.listed))
 const discoveredModels = computed(() => catalog.value.filter(row => row.discovered))
 const probeRun = computed<ProbeRunWithBudget | undefined>(() => probeOverride.value ?? overview.value?.probe_run as ProbeRunWithBudget | undefined)
@@ -394,7 +474,8 @@ const batchSelection = ref<string[]>()
 const batchBusy = ref(false)
 const batchProgress = ref<{ completed: number; total: number }>()
 const batchResults = ref<BatchOutcome[]>([])
-const busy = computed(() => loading.value || syncing.value || rescanning.value || rebinding.value || Boolean(updating.value) || batchBusy.value)
+const busy = computed(() => loading.value || refreshingWebsiteKeys.value || syncing.value || rescanning.value || rebinding.value ||
+  Boolean(updating.value) || batchBusy.value)
 const batchPlan = computed(() => planBatch(batchSelection.value ?? []))
 const batchEligible = computed(() => batchPlan.value.filter(item => !item.reason))
 const batchSkipped = computed(() => batchPlan.value.filter(item => item.reason))
@@ -441,17 +522,23 @@ const workspaceUrl = computed(() => {
 })
 
 let overviewRequest = 0
+let websiteKeysRefreshRequest = 0
 let initialized = false
 let disposed = false
-async function load() {
+async function load(refreshedInventory?: BeichenWebsiteKeyInventory) {
   const request = ++overviewRequest
   const providerId = props.providerId
   loading.value = true
   error.value = ''
   capabilities.value = undefined
   try {
-    const result = await teacherAPI.beichenOverview(providerId, schoolDay())
+    const [result, keyInventory] = await Promise.all([
+      teacherAPI.beichenOverview(providerId, schoolDay()),
+      refreshedInventory ?? teacherAPI.beichenWebsiteKeys?.(providerId).catch(() => undefined),
+    ])
     if (disposed || request !== overviewRequest) return
+    if (keyInventory) websiteKeyInventory.value = keyInventory
+    else if (websiteKeyInventory.value) websiteKeyInventory.value = { ...websiteKeyInventory.value, status: 'unavailable' }
     overview.value = result
     if ((result.model_catalog ?? []).length && typeof teacherAPI.beichenCapabilities === 'function') {
       try {
@@ -528,14 +615,19 @@ function availabilityTone(row: CatalogRow) {
 function keyCoverageLabel(key: BeichenCatalogKey) {
   const channel = key.school_channel || key.label
   const label = channel + (key.replacement ? ' 新 Key' : ' Key')
-  const group = key.group_id == null ? '' : (key.group_stale ? ' · 上次分组 ' : ' · 分组 ') + key.group_id
+  const websiteKey = confirmedWebsiteKey(key.credential_id)
+  const previousGroup = websiteKey?.group_id == null
+    ? lastKnownKeyGroup(websiteKeyGroups.value.matched.get(key.credential_id), billingByKey.value.get(key.credential_id), key.group_id)
+    : undefined
+  const group = websiteKey?.group_id != null ? ' · 分组 ' + websiteKey.group_id
+    : previousGroup ? ' · ' + lastKnownKeyGroupLabel + ' ' + previousGroup.id : ''
   const details = (key.label === channel ? '' : ' · ' + key.label) + group
   const matchLabels = { exact: '', normalized: '名称归一后匹配', alias: '按教师别名匹配' } as const
   switch (key.state) {
     case 'listed':
       return label + (key.stale ? ' 上次目录有' : ' 目录有') + ' · ' + key.upstream_model
         + (key.match && matchLabels[key.match] ? ' · ' + matchLabels[key.match] : '') + details
-    case 'missing': return key.group_diagnosis === 'model_outside_key_group'
+    case 'missing': return keyGroupDiagnosis(key) === 'model_outside_key_group'
       ? label + details + ' · 分组不含此模型'
       : '官网有、' + label + ' 无' + details
     case 'failed': return label + ' 目录读取失败' + details
@@ -550,8 +642,7 @@ function rateLabel(value?: string | number | null) {
 }
 
 function websiteLocationLabel(location: BeichenWebsiteLocation) {
-  const groups = location.groups.map(group => [group.name, group.id != null ? '分组 ' + group.id : '',
-    rateLabel(group.rate_multiplier), group.account_rate_multiplier != null ? '账户 ' + rateLabel(group.account_rate_multiplier) : ''].filter(Boolean).join(' '))
+  const groups = location.groups.map(group => [group.name, group.id != null ? '分组 ' + group.id : ''].filter(Boolean).join(' '))
   return [location.channel || (location.channel_id != null ? '渠道 ' + location.channel_id : ''),
     location.platform, groups.length ? groups.join('、') : '分组待核', location.name,
     location.has_price ? '官网有报价' : '官网无报价',
@@ -573,7 +664,7 @@ function canEnableReason(row: CatalogRow) {
   if (row.activation == null && row.canEnable == null) return '启用条件待同步，请先刷新模型'
   if (!row.priceCovered) {
     if (row.priceState === 'conditional') return '条件价待核实，可先手动定价'
-    if (row.groupPrices.table.website || row.groupPrices.table.derived) return '报价尚未生效，请同步价格'
+    if (row.groupPrices.website || row.groupPrices.derived) return '报价尚未生效，请同步价格'
     return '官网未报价，请先手动定价'
   }
   if (row.activation === 'blocked' || !row.canEnable || !row.routeCount) return '线路未就绪，请刷新模型或检查渠道配置'
@@ -592,6 +683,26 @@ function planBatch(models: string[]) {
 
 async function refreshOverview() {
   if (!busy.value) await load()
+}
+
+async function refreshWebsiteKeys() {
+  if (busy.value) return
+  const request = ++websiteKeysRefreshRequest
+  const providerId = props.providerId
+  const isCurrent = () => !disposed && request === websiteKeysRefreshRequest && props.providerId === providerId
+  refreshingWebsiteKeys.value = true
+  websiteKeyRefreshError.value = ''
+  if (websiteKeyInventory.value?.status === 'current') {
+    websiteKeyInventory.value = { ...websiteKeyInventory.value, status: 'stale' }
+  }
+  try {
+    const inventory = await teacherAPI.refreshBeichenWebsiteKeys(providerId)
+    if (isCurrent()) await load(inventory)
+  } catch (e) {
+    if (isCurrent()) websiteKeyRefreshError.value = apiErrorMessage(e, '刷新官网 Key 失败，请稍后重试')
+  } finally {
+    if (isCurrent()) refreshingWebsiteKeys.value = false
+  }
 }
 
 async function syncPrices() {
@@ -833,7 +944,7 @@ function withYuan(text: string, factor?: string) {
 }
 
 function missingPriceLabel(row: CatalogRow) {
-  const terms = row.groupPrices.table.website?.price_conditions_exact ?? row.detailQuotes[0]?.conditions
+  const terms = row.groupPrices.website?.price_conditions_exact ?? row.detailQuotes[0]?.conditions
   const labels = missingPriceDetailLabels(terms)
   const detail = row.priceBlocker || (row.groupPrices.officialPriceMissing ? '官方价表缺失' : labels.join('、'))
   return detail ? '缺价 · ' + detail : '缺价'
@@ -851,6 +962,10 @@ function modelTokens(model: string) {
 
 watch(() => props.providerId, () => {
   overview.value = undefined
+  websiteKeyInventory.value = undefined
+  websiteKeysRefreshRequest++
+  refreshingWebsiteKeys.value = false
+  websiteKeyRefreshError.value = ''
   probeOverride.value = undefined
   probeError.value = ''
   probeSubmitting.value = false
@@ -863,7 +978,7 @@ watch(() => props.providerId, () => {
   rebindError.value = ''
   usageStates.value = {}
   priceRow.value = undefined
-  conditionsRow.value = undefined
+  conditionsModel.value = undefined
   usageOpen.value = false
   batchSelection.value = undefined
   batchProgress.value = undefined
@@ -891,7 +1006,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
   </section>
   <BeichenRecentReceipts v-if="providerMaintenance" :provider-id="providerId" :website-sync="overview?.website_sync"
     @refresh-overview="refreshOverview" />
-  <section class="beichen-stack beichen-models" aria-label="北辰模型目录" :aria-busy="loading">
+  <section class="beichen-stack beichen-models" aria-label="北辰模型目录" :aria-busy="loading || refreshingWebsiteKeys">
     <section class="beichen-card monthly-usage" aria-label="本月用量汇总" :aria-busy="monthlyUsage.loading">
       <div class="beichen-section-head">
         <h2>本月用量</h2>
@@ -925,22 +1040,52 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
         </dl>
       </details>
     </section>
+    <section v-if="overview" class="beichen-card" aria-label="官网 Key 清单">
+      <div class="beichen-section-head">
+        <h3 aria-live="polite">{{ websiteKeysNeedRefresh ? '官网 Key 清单待刷新' : '官网 Key 清单' }}</h3>
+        <button type="button" class="button secondary" :disabled="busy" @click="refreshWebsiteKeys">
+          {{ refreshingWebsiteKeys ? '刷新中…' : '刷新官网 Key' }}
+        </button>
+      </div>
+      <p class="beichen-note">{{ websiteKeysRefreshHint }}</p>
+      <p v-if="websiteKeyRefreshError" class="error" role="alert">{{ websiteKeyRefreshError }}</p>
+    </section>
     <section v-if="billingRows.length" class="beichen-card" aria-label="北辰 Key 计费倍率">
       <h3>Key 分组与倍率</h3>
       <p v-for="billing in billingRows" :key="billing.credential_id" :role="billing.alert ? 'alert' : undefined" class="beichen-note">
         <strong>{{ billing.label }}</strong>
-        <template v-if="billing.group_id != null"> · {{ billing.billing_state === 'stale' && !billing.group_status ? '上次分组' : '分组' }} {{ billing.group_id }}<template v-if="billing.group_name"> · {{ billing.group_name }}</template></template> · {{ billing.billing_state === 'stale' ? '上次生效倍率' : '生效倍率' }} {{ rateLabel(billing.effective_multiplier_text ?? billing.effective_multiplier) }}
-        <template v-if="billing.group_rate != null"> · 分组倍率 {{ billing.group_status ? keyGroupRate(billing.group_rate) : rateLabel(billing.group_rate) }}</template>
-        <template v-if="billing.peak_enabled"> · 高峰系数 {{ rateLabel(billing.peak_rate) }}</template>
-        <strong v-if="billing.billing_state === 'stale'"> · 倍率已陈旧，保留上次记录</strong>
+        <template v-if="billing.websiteKey?.group_id != null">
+          · 分组 {{ billing.websiteKey.group_id }}<template v-if="billing.websiteKey.group_name"> · {{ billing.websiteKey.group_name }}</template>
+          · 分组倍率 {{ keyGroupRate(billing.websiteKey.rate ?? undefined) || '待同步' }}
+          <template v-if="billing.currentBilling">
+            · 生效倍率 {{ rateLabel(billing.currentBilling.effective_multiplier_text ?? billing.currentBilling.effective_multiplier) }}
+            <template v-if="billing.currentBilling.peak_enabled"> · 高峰系数 {{ rateLabel(billing.currentBilling.peak_rate) }}</template>
+          </template>
+        </template>
+        <template v-else>
+          · 当前 Key 分组未匹配
+          <template v-if="billing.previousGroup">
+            · {{ lastKnownKeyGroupLabel }} {{ billing.previousGroup.id }}<template v-if="billing.previousGroup.name"> · {{ billing.previousGroup.name }}</template>
+            <template v-if="billing.previousGroup.rate != null"> · 分组倍率 {{ keyGroupRate(billing.previousGroup.rate) }}</template>
+          </template>
+          <template v-if="billing.effective_multiplier_text || billing.effective_multiplier != null">
+            · 上次生效倍率 {{ rateLabel(billing.effective_multiplier_text ?? billing.effective_multiplier) }}
+          </template>
+        </template>
+        <strong v-if="billing.billing_state === 'stale'">
+          · {{ billing.websiteKey?.group_id != null ? '生效倍率待重新核实' : '倍率已陈旧，保留上次记录' }}
+        </strong>
         <span v-else-if="billing.billing_state === 'unverified'"> · 计费倍率待核实</span>
         · 上次成功 {{ syncTime(billing.last_success) }}
         <strong v-if="billing.alert"> · 计费信息连续读取失败 {{ billing.failure_count === 6 ? '至少 6' : billing.failure_count }} 次</strong>
-        <span v-if="keyGroupIssue(billing) || billing.last_error || billing.group_id == null"> · {{ keyGroupIssue(billing) || billing.last_error || '分组待同步' }}</span>
+        <span v-if="(!billing.websiteKey || billing.websiteKey.group_id === billing.group_id) &&
+          (keyGroupIssue(billing) || billing.last_error || billing.group_id == null)">
+          · {{ keyGroupIssue(billing) || billing.last_error || '分组待同步' }}
+        </span>
       </p>
     </section>
-    <BeichenKeyCapabilities v-if="overview?.key_capabilities?.length" :key="providerId"
-      :provider-id="providerId" :capabilities="overview.key_capabilities" :disabled="busy" @refresh="refreshOverview" />
+    <BeichenKeyCapabilities v-if="keyCapabilities.length" :key="providerId"
+      :provider-id="providerId" :capabilities="keyCapabilities" :disabled="busy" @refresh="refreshOverview" />
     <section v-if="overview?.website_only_status" class="beichen-card website-catalog" aria-label="官网目录">
       <div class="beichen-section-head">
         <h3>官网目录</h3>
@@ -1071,19 +1216,24 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
             </td>
             <td data-label="价格" class="model-price">
               <div class="model-price-content">
-                <div v-if="(row.groupPrices.groupId != null && row.groupPrices.hasTable) || row.mode !== 'follow'" class="model-price-context">
-                  <small v-if="row.groupPrices.groupId != null && row.groupPrices.hasTable">
-                    当前 Key · 分组 {{ row.groupPrices.groupId }}
-                  </small>
-                  <span v-if="row.mode !== 'follow'" class="status-pill manual">
-                    {{ row.mode === 'manual' ? '手动价生效' : '部分 Key 使用手动价' }} · 官网报价供参考
-                  </span>
-                </div>
-                <BeichenPriceTable v-if="row.groupPrices.hasTable" v-bind="row.groupPrices.table" />
-                <button v-if="row.detailQuotes.length || row.detailWebsite" type="button" class="price-link" @click="conditionsRow = row">查看档位</button>
-                <BeichenGroupPrices v-if="row.groupPrices.groupRows.length" :rows="row.groupPrices.groupRows" />
-                <p v-else-if="row.groupPrices.groupId == null || !row.groupPrices.hasTable"
+                <span v-if="row.mode !== 'follow'" class="status-pill manual model-price-mode">
+                  {{ row.mode === 'manual' ? '手动价生效' : '部分 Key 使用手动价' }} · 官网报价供参考
+                </span>
+                <BeichenGroupPrices v-if="row.groupPrices.current" class="current-group-prices"
+                  :rows="[row.groupPrices.current]" :title="row.groupPrices.currentTitle">
+                  <template #actions>
+                    <small v-if="row.groupPrices.observedAt && row.groupPrices.observedLabel" class="group-price-note">
+                      采集时间 <time :datetime="row.groupPrices.observedAt">{{ row.groupPrices.observedLabel }}（北京时间）</time>
+                    </small>
+                  </template>
+                </BeichenGroupPrices>
+                <BeichenPriceTable v-else-if="row.groupPrices.website || row.groupPrices.derived"
+                  :website="row.groupPrices.website" :derived="row.groupPrices.derived" :group-multiplier="row.groupPrices.groupMultiplier" />
+                <button v-if="row.detailQuotes.length || row.detailWebsite" type="button" class="price-link" @click="conditionsModel = row.model">查看档位</button>
+                <p v-if="row.groupPrices.unmatched"
                   class="group-missing-note" data-testid="current-group-missing">当前 Key 分组未匹配</p>
+                <BeichenGroupPrices v-if="row.groupPrices.comparisonRows.length" class="other-groups"
+                  :rows="row.groupPrices.comparisonRows" title="其它分组" />
               </div>
             </td>
             <td data-label="本月用量" class="model-usage">
@@ -1178,7 +1328,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
     </section>
   </AppDialog>
   <AppDialog :open="Boolean(conditionsRow)" :title="(conditionsRow?.model ?? '模型') + ' · 计价档位'" description="查看计价条件、结算价及学生价。"
-    wide @update:open="open => { if (!open) conditionsRow = undefined }">
+    wide @update:open="open => { if (!open) conditionsModel = undefined }">
     <div class="beichen-stack">
       <p v-if="conditionsRow && (conditionsRow.routeBlocked || conditionsRow.bindingIssue)" class="beichen-note" data-testid="tier-route-reason">
         {{ conditionsRow.bindingIssue?.message ?? (conditionsRow.blockers.join('；') || '线路未就绪，请刷新模型或检查渠道配置') }}
@@ -1227,8 +1377,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .model-state { font-size: 12px; line-height: 1.75; }
 .model-state-summary span { white-space: nowrap; }
 .model-price-content { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
-.model-price-context { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
-.model-price-context small, .group-missing-note { color: var(--ink-soft); font-size: 12px; }
+.model-price-mode { justify-self: start; }
+.group-price-note, .group-missing-note { color: var(--ink-soft); font-size: 12px; }
 .group-missing-note { margin: 0; }
 .catalog-evidence { margin-top: 4px; font-size: 12px; color: var(--ink-soft); }
 .catalog-evidence summary { cursor: pointer; }

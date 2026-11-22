@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { BeichenOverview } from '../api/types'
-import { manualPriceDetailRows, missingPriceDetailLabels, priceDetailRows, schoolCatalog } from './beichenModels'
+import { indexWebsiteKeyGroups, manualPriceDetailRows, missingPriceDetailLabels, priceDetailRows, schoolCatalog } from './beichenModels'
 
 function overview(model: Record<string, unknown>): BeichenOverview {
   return {
@@ -72,6 +72,52 @@ describe('schoolCatalog credits', () => {
     }), 'provider-1')
     expect(rows[0].quotes[0].priceReady).toBe(false)
     expect(rows[0].priceReady).toBe(false)
+  })
+
+  it.each(['current', 'stale'] as const)('keeps a %s billing group as history without a confirmed website Key', billing_state => {
+    const data = overview({
+      credential_id: 'cred-1', model: 'claude-fable-5', mode: 'follow', school_status: 'active',
+      price_status: 'confirmed',
+      price_conditions_exact: { billing_mode: 'token', input_price: 0.00001, output_price: 0.00005 },
+      upstream_rates: { input: 1500000, output: 7500000 },
+      school_rates: { input: 150000000, output: 750000000 },
+    })
+    data.datasets = [{
+      credential_id: 'cred-1', kind: 'billing', group_id: 15, group_name: '旧组', group_rate: '0.15',
+      group_status: 'assigned', billing_state, effective_multiplier: '0.15',
+    }]
+    const quote = schoolCatalog(data, 'provider-1')[0].quotes[0]
+    expect(quote.notes).toContain('上次分组（未确认） 15 · 旧组 · 分组倍率 0.15×')
+    expect(quote.multiplier).toBe('待同步')
+    expect(quote.actual).toBeNull()
+    expect(quote.actualRates).toBeNull()
+  })
+
+  it('does not apply earlier price terms to the newly confirmed group in the quote details', () => {
+    const data = overview({
+      credential_id: 'cred-1', model: 'claude-fable-5', mode: 'follow', school_status: 'active',
+      price_status: 'confirmed', price_observed_at: '2026-11-21T12:00:00Z',
+      price_conditions_exact: { billing_mode: 'token', input_price: '0.000004', output_price: '0.00002' },
+    })
+    data.datasets = [{
+      credential_id: 'cred-1', kind: 'billing', group_id: 2, group_status: 'assigned',
+      billing_state: 'current', group_rate: '0.15', effective_multiplier: '0.15',
+    }]
+    const lastSeen = '2026-11-21T13:00:00Z'
+    const key = {
+      id: 1, name: '测试 Key', key_prefix: null, group_id: 16, group_name: '新组', rate: '0.6',
+      status: 'active', enabled: true, created_at: null, last_seen: lastSeen, observed_at: lastSeen,
+      credential_id: 'cred-1', match_status: 'matched',
+    } as const
+    const groups = indexWebsiteKeyGroups({ status: 'current', last_seen: lastSeen, keys: [key] })
+
+    const oldQuote = schoolCatalog(data, 'provider-1', groups)[0].quotes[0]
+    expect(oldQuote).toMatchObject({ multiplier: '待同步', conditions: null, standard: null, actual: null })
+
+    data.models![0].price_observed_at = lastSeen
+    const currentQuote = schoolCatalog(data, 'provider-1', groups)[0].quotes[0]
+    expect(currentQuote.multiplier).toBe('0.6×')
+    expect(currentQuote.actual).toContain('输入 240')
   })
 })
 
