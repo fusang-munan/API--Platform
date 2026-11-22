@@ -100,6 +100,8 @@ INSERT INTO beichen_datasets (credential_id,kind,last_error) VALUES ($1,'prices'
 		switch r.URL.String() {
 		case panelURL:
 			body = website
+		case "https://beichenapi.com/api/v1/groups/rates":
+			body = `{"code":0,"data":{"5":0.30,"17":0.50}}`
 		case accountKeysURL + "?page_size=100&page=1":
 			body = fmt.Sprintf(`{"code":0,"data":{"items":[{"id":41,"user_id":13,"key":%q,"name":"哈吉米","status":"active",%s}],
 				"total":1,"page":1,"page_size":100,"pages":1}}`, listedSecret, group)

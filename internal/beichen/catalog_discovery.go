@@ -15,7 +15,7 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 	var published []string
 	for i, model := range view.ModelCatalog {
 		rows[strings.ToLower(model.Model)] = i
-		if model.SchoolStatus == "active" || model.BindingIssue != nil {
+		if model.published() {
 			published = append(published, model.Model)
 		}
 	}
@@ -27,8 +27,14 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 	websiteNames := newCatalogNameMatcher(names, nil)
 	for _, key := range keys {
 		for name := range key.models {
-			row := &view.ModelCatalog[rows[strings.ToLower(name)]]
-			setCatalogKey(row, key.listed(name, ""))
+			if i, ok := rows[strings.ToLower(name)]; ok {
+				setCatalogKey(&view.ModelCatalog[i], key.listed(name, ""))
+			}
+		}
+		for _, name := range key.staleModels {
+			if i, ok := rows[strings.ToLower(name)]; ok {
+				setCatalogKey(&view.ModelCatalog[i], key.listed(name, ""))
+			}
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(web)) {
@@ -67,16 +73,22 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 	view.WebsiteOnlyModels = []WebsiteOnlyModel{}
 	for i := range view.ModelCatalog {
 		row := &view.ModelCatalog[i]
-		row.KeyCount = 0
+		row.CurrentKeyCount, row.StaleKeyCount = 0, 0
 		protocols := map[string]bool{}
 		for _, key := range row.CatalogKeys {
-			if key.State == "listed" {
-				row.KeyCount++
+			switch {
+			case key.State != "listed":
+				continue
+			case key.Stale:
+				row.StaleKeyCount++
+			default:
+				row.CurrentKeyCount++
 				for _, protocol := range byKey[key.CredentialID][key.UpstreamModel].protocols {
 					protocols[protocol] = true
 				}
 			}
 		}
+		row.KeyCount = row.CurrentKeyCount
 		row.Protocols = slices.Sorted(maps.Keys(protocols))
 		if row.Protocols == nil {
 			row.Protocols = []string{}
@@ -86,6 +98,17 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 			row.Source, row.CatalogState = "key", "key_listed"
 			if len(row.WebsiteLocations) != 0 {
 				row.Source = "both"
+			}
+		case row.published():
+			row.CatalogState = "published_unavailable"
+			if len(row.WebsiteLocations) != 0 {
+				row.Source = "website"
+			}
+			if row.BindingIssue == nil {
+				row.BindingIssue = &CatalogBlocker{"catalog_missing", "当前 Key 目录里已找不到校内模型，请重扫目录并核查供货渠道。"}
+				if row.StaleKeyCount != 0 {
+					row.BindingIssue = &CatalogBlocker{"catalog_stale", "该模型的 Key 目录记录待刷新，请重扫渠道目录。"}
+				}
 			}
 		case len(row.WebsiteLocations) != 0:
 			row.Source, row.CatalogState = "website", "website_only"
@@ -104,6 +127,10 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 	slices.SortFunc(view.WebsiteOnlyModels, func(a, b WebsiteOnlyModel) int {
 		return strings.Compare(strings.ToLower(a.Model), strings.ToLower(b.Model))
 	})
+}
+
+func (row CatalogModel) published() bool {
+	return row.SchoolStatus == "active" || row.SchoolModel != "" || row.BindingIssue != nil
 }
 
 func catalogWebsiteMatches(keys []discoveryKey, websiteNames catalogNameMatcher, locations []WebsiteLocation) (map[string]bool, []CatalogKey) {

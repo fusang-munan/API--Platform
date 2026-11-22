@@ -73,6 +73,14 @@ VALUES(gen_random_uuid(),$1,$2,$3,'fallback','anthropic',20,now(),now())`, model
 	var requestLock sync.Mutex
 	requests := map[string]int{}
 	service.client.Transport = transportFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet && r.URL.String() == origin+modelsPath && r.Header.Get("Authorization") == "Bearer "+fakeKey {
+			const body = `{"data":[
+				{"id":"claude-fable-5","supported_protocols":["anthropic"]},
+				{"id":"no-quote","supported_protocols":["anthropic"]},
+				{"id":"wrong-protocol","supported_protocols":["openai_responses"]}
+			]}`
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+		}
 		if r.URL.Host != publicKeyHost || r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer "+bearer {
 			return nil, errors.New("mock only accepts the authenticated website")
 		}
@@ -83,6 +91,8 @@ VALUES(gen_random_uuid(),$1,$2,$3,'fallback','anthropic',20,now(),now())`, model
 		switch r.URL.Path {
 		case "/api/v1/keys":
 			body = websiteKeyListFixture(fakeKey, "Claude 新 Key", 41, 7)
+		case "/api/v1/groups/rates":
+			body = `{"code":0,"data":{"7":1.25}}`
 		case "/api/v1/channels/available":
 			body = directory
 		case "/api/v1/usage":
@@ -220,6 +230,103 @@ FROM beichen_datasets WHERE credential_id=$1 AND kind='key_usage'`, to.ID).Scan(
 	recovered := read()
 	if recovered.Counts.MaintenanceModels != 3 || recovered.Counts.StaleRoutes != 4 || len(recovered.Preview.Changes) != 0 {
 		t.Fatalf("确认后应只恢复支持的线路: %+v", recovered)
+	}
+}
+
+func TestRebindRequiresCurrentKeyCatalogPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	from, to := keys[0], keys[1]
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id IN ($1,$2)", keys[2], keys[3])
+	exec("UPDATE provider_credentials SET updated_at=now()-interval '2 hours' WHERE id=$1", to)
+	saveCatalogFixture(t, ctx, db, provider, from, []catalog.ProviderEntry{
+		{ID: "previous", SupportedProtocols: []string{"anthropic"}},
+		{ID: "legacy", SupportedProtocols: []string{"anthropic"}},
+	}, nil)
+	saveCatalogFixture(t, ctx, db, provider, to, []catalog.ProviderEntry{
+		{ID: "replacement", SupportedProtocols: []string{"anthropic", "openai_responses"}},
+	}, nil)
+	exec("UPDATE provider_model_catalog SET catalog_source='website' WHERE credential_id=$1 AND model_id='legacy'", from)
+	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success) VALUES($1,'billing',now()),($1,'key_usage',now())`, to)
+	exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+VALUES($1,'replacement','school','manual','teacher',$2,1000000,2000000)`, to, actor)
+	moved, legacy := uuid.New(), uuid.New()
+	school := "move"
+	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES($1,$3,'Move','active',1000,now(),now()),($2,'legacy','Legacy','active',1000,now(),now())`, moved, legacy, school)
+	exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$3,$4,'previous','anthropic',0,now(),now()),
+      (gen_random_uuid(),$2,$3,$4,'legacy','anthropic',0,now(),now())`, moved, legacy, provider, from)
+	service := New(db, nil)
+	if err := service.PutModelAlias(ctx, provider, actor, &to, "replacement", &school); err != nil {
+		t.Fatal(err)
+	}
+	scope := CredentialSwitch{From: from, To: to}
+	readSwitch := func(t *testing.T) *SwitchPreview {
+		t.Helper()
+		view, err := service.ChannelSwitch(ctx, provider, scope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return view.Preview
+	}
+	currentSwitch := readSwitch(t)
+	if currentSwitch == nil || len(currentSwitch.Changes) != 1 || currentSwitch.Changes[0].SchoolModel != school {
+		t.Fatalf("current Key listing should allow the channel switch: %+v", currentSwitch)
+	}
+	currentRebind, err := service.Rebind(ctx, provider, actor, true, "")
+	if err != nil || len(currentRebind.Changes) != 2 || currentRebind.Changes[0].Action != "update" ||
+		currentRebind.Changes[1].Action != "add" {
+		t.Fatalf("current Key listing should allow new bindings: %+v (%v)", currentRebind, err)
+	}
+
+	setCatalog := func(source string, minutesAgo, rowMinutesAgo int, scanError string) {
+		t.Helper()
+		exec(`UPDATE beichen_datasets SET last_success=now()-make_interval(mins=>$2),last_error=NULLIF($3,'')
+WHERE credential_id=$1 AND kind='catalog'`, to, minutesAgo, scanError)
+		exec(`UPDATE provider_model_catalog SET catalog_source=$2,last_seen_at=now()-make_interval(mins=>$3)
+WHERE credential_id=$1 AND model_id='replacement'`, to, source, rowMinutesAgo)
+	}
+	for _, tc := range []struct {
+		name, source, scanError   string
+		minutesAgo, rowMinutesAgo int
+	}{
+		{name: "expired dataset", source: "key", minutesAgo: 31},
+		{name: "failed scan", source: "key", scanError: "fixture scan failed"},
+		{name: "website row", source: "website"},
+		{name: "old Key revision", source: "key", rowMinutesAgo: 121},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setCatalog(tc.source, tc.minutesAgo, tc.rowMinutesAgo, tc.scanError)
+			if preview := readSwitch(t); preview != nil && len(preview.Changes) != 0 {
+				t.Fatalf("channel switch offered unverified routes: %+v", preview)
+			}
+			if _, err := service.ConfirmCredentialSwitch(ctx, provider, actor, scope, currentSwitch.PreviewToken); domain.ErrorCode(err) != domain.CodeInvalidTransition {
+				t.Fatalf("channel switch accepted an invalidated preview: %v", err)
+			}
+			plan, err := service.Rebind(ctx, provider, actor, true, "")
+			if tc.minutesAgo > 0 || tc.scanError != "" {
+				if domain.ErrorCode(err) != domain.CodeInvalidTransition {
+					t.Fatalf("rebuild should require a successful recent scan: %v", err)
+				}
+			} else if err != nil || len(plan.Changes) != 0 {
+				t.Fatalf("rebuild should keep old routes without publishing unverified routes: %+v (%v)", plan, err)
+			}
+			if _, err := service.Rebind(ctx, provider, actor, false, currentRebind.PreviewToken); domain.ErrorCode(err) != domain.CodeInvalidTransition {
+				t.Fatalf("rebuild accepted an invalidated preview: %v", err)
+			}
+		})
+	}
+	setCatalog("key", 0, 0, "")
+	if _, err := service.Rebind(ctx, provider, actor, false, currentRebind.PreviewToken); err != nil {
+		t.Fatalf("rebuild should accept the restored catalog: %v", err)
+	}
+	var newRoutes, legacyRoutes int
+	if err := db.QueryRowContext(ctx, `SELECT
+  count(*) FILTER(WHERE model_id=$1 AND credential_id=$3 AND upstream_model_name='replacement'),
+  count(*) FILTER(WHERE model_id=$2 AND credential_id=$4 AND upstream_model_name='legacy')
+FROM model_bindings WHERE provider_id=$5 AND status='active'`, moved, legacy, to, from, provider).Scan(&newRoutes, &legacyRoutes); err != nil || newRoutes != 2 || legacyRoutes != 1 {
+		t.Fatalf("rebuilt or legacy bindings are incorrect: new=%d legacy=%d (%v)", newRoutes, legacyRoutes, err)
 	}
 }
 

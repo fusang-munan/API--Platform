@@ -67,8 +67,8 @@ func ReplaceCredentialEntries(ctx context.Context, tx *sql.Tx, providerID, crede
 		_, err = tx.ExecContext(ctx, `
 INSERT INTO provider_model_catalog(
   id, provider_id, credential_id, model_id, display_name, description, owned_by, upstream_object, upstream_created_at,
-  raw_entry, status, last_seen_at, synced_at, created_at, updated_at, supported_protocols
-) VALUES ($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10::jsonb,'active',$11,$11,$11,$11,
+  raw_entry, catalog_source, status, last_seen_at, synced_at, created_at, updated_at, supported_protocols
+) VALUES ($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10::jsonb,'key','active',$11,$11,$11,$11,
   ARRAY(SELECT jsonb_array_elements_text($12::jsonb)))
 ON CONFLICT(credential_id, model_id) DO UPDATE SET
   display_name=EXCLUDED.display_name,
@@ -77,6 +77,7 @@ ON CONFLICT(credential_id, model_id) DO UPDATE SET
   upstream_object=EXCLUDED.upstream_object,
   upstream_created_at=EXCLUDED.upstream_created_at,
   raw_entry=EXCLUDED.raw_entry,
+  catalog_source=EXCLUDED.catalog_source,
   supported_protocols=EXCLUDED.supported_protocols || ARRAY(
     SELECT probe.protocol FROM upstream_probes probe
     JOIN provider_credentials c ON c.id = probe.credential_id AND c.provider_id = probe.provider_id

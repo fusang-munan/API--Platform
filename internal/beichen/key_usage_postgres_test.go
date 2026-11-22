@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,6 +55,7 @@ func TestWebsiteCC2GroupCatalog(t *testing.T) {
 		}
 	}
 	cc2, _ := selectWebsiteKeyCatalog(crawl.platforms, 602)
+	cc2.group.AccountRate = cc2.group.Rate
 	info, quote, err := cc2.billing()
 	if err != nil || quote.err != nil || info.Multiplier != "0.6" || len(quote.rows) != 2 {
 		t.Fatalf("incorrect CC2 price: %+v, %v", quote, err)
@@ -134,12 +136,25 @@ VALUES($1,$2,$3::date,'glm-5.3',2,160000,'usage')`, provider, cc2, day)
 	keysBody := websiteFixture(t, "cc2-website-keys")
 	channelsBody := websiteFixture(t, "cc2-website-channels")
 	usageBody := websiteFixture(t, "cc2-website-usage")
-	badKey, hits := false, 0
+	badKey := false
+	var hits atomic.Int32
 	service.client.Transport = transportFunc(func(r *http.Request) (*http.Response, error) {
-		hits++
+		hits.Add(1)
+		if r.URL.String() == origin+modelsPath && r.Method == http.MethodGet {
+			var models string
+			switch r.Header.Get("Authorization") {
+			case "Bearer sk-fixture-cc2":
+				models = `{"data":[{"id":"claude-opus-4-6"},{"id":"claude-sonnet-4-6"}]}`
+			case "Bearer sk-fixture-cc03":
+				models = `{"data":[{"id":"claude-haiku-4-5"},{"id":"claude-sonnet-4-6"}]}`
+			default:
+				return nil, fmt.Errorf("unexpected Key for metadata request %s", r.URL.Path)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(models))}, nil
+		}
 		if r.URL.Scheme != "https" || r.URL.Host != "beichenapi.com" || r.Method != http.MethodGet ||
 			r.Header.Get("Authorization") != "Bearer "+bearer {
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 		body := ""
 		switch r.URL.Path {
@@ -147,6 +162,8 @@ VALUES($1,$2,$3::date,'glm-5.3',2,160000,'usage')`, provider, cc2, day)
 			body = keysBody
 		case "/api/v1/channels/available":
 			body = channelsBody
+		case "/api/v1/groups/rates":
+			body = `{"code":0,"data":{"301":0.30,"602":0.60}}`
 		case "/api/v1/usage":
 			q := r.URL.Query()
 			if q.Get("api_key_id") != "42" || q.Get("start_date") != q.Get("end_date") ||
@@ -171,11 +188,11 @@ VALUES($1,$2,$3::date,'glm-5.3',2,160000,'usage')`, provider, cc2, day)
 	})
 	target, claude := "0.6", true
 	input := KeyUsageTarget{Multiplier: &target, ExpectClaude: &claude}
-	if err := service.RefreshKeyUsage(ctx, provider, cc2, input); err == nil || hits != 0 {
+	if err := service.RefreshKeyUsage(ctx, provider, cc2, input); err == nil || hits.Load() != 0 {
 		t.Fatal("a missing web session must not fall back to the public API")
 	}
 	service.ConfigurePanelFallback(bearer)
-	if err := service.RefreshKeyUsage(ctx, provider, uuid.New(), input); domain.ErrorCode(err) != domain.CodeNotFound || hits != 0 {
+	if err := service.RefreshKeyUsage(ctx, provider, uuid.New(), input); domain.ErrorCode(err) != domain.CodeNotFound || hits.Load() != 0 {
 		t.Fatal("a different credential must not send a request")
 	}
 	if err := service.RefreshKeyUsage(ctx, provider, cc2, input); err != nil {

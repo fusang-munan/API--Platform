@@ -1,16 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { BeichenPriceConditions, BeichenWebsiteGroup, BeichenWebsiteLocation } from '../api/types'
-import { buildGroupPriceRows } from './groupPriceRows'
-
-const glmPrice: BeichenPriceConditions = {
-  billing_mode: 'token',
-  input_price: '0.000008',
-  output_price: '0.000028',
-  cache_write_price: '0',
-  cache_write_1h_price: null,
-  cache_read_price: '0.000002',
-  intervals: [],
-}
+import { buildCurrentGroupPriceRow, priceReferenceText } from './groupPriceRows'
 
 const claudePrice: BeichenPriceConditions = {
   billing_mode: 'token',
@@ -22,150 +12,108 @@ const claudePrice: BeichenPriceConditions = {
   intervals: [],
 }
 
-function location(group: BeichenWebsiteGroup,
-  price: BeichenPriceConditions | null = glmPrice): BeichenWebsiteLocation {
+function location(group: BeichenWebsiteGroup, price: BeichenPriceConditions | null = claudePrice,
+  overrides: Partial<BeichenWebsiteLocation> = {}): BeichenWebsiteLocation {
   return {
-    name: 'glm-5.3', platform: 'openai', groups: [group], observed_at: '2026-11-21T00:00:00Z',
+    name: 'claude-opus-5-5', platform: 'anthropic', groups: [group], observed_at: '2026-11-21T00:00:00Z',
     has_price: price != null, price_complete: price != null,
     ...(price ? { price_conditions_exact: price } : {}),
+    ...overrides,
   }
 }
 
-function glmLocations() {
-  return [
-    location({ id: 15, name: '分组 15', status: 'active', rate_multiplier: '0.16' }),
-    location({ id: 14, name: '分组 14', status: 'active', rate_multiplier: 0.15 }),
-    location({ id: 6, name: '分组 6', status: 'active', rate_multiplier: '0.1' }),
-    location({ id: 15, name: '分组 15', status: 'active', rate_multiplier: '0.16' }),
-  ]
-}
-
-function claudeLocations() {
-  return [
-    location({ id: 2, name: '[CC1]Claudecode-kiro-015', status: 'active', rate_multiplier: '0.15' },
-      claudePrice),
-  ]
-}
-
-describe('北辰分组价格行', () => {
-  it('glm-5.3 的分组 15、14、6 各一行并按 group_id 去重', () => {
-    const rows = buildGroupPriceRows(glmLocations(), 15)
-    expect(rows.map(row => row.group_id)).toEqual([15, 14, 6])
-    expect(rows.map(row => row.rate)).toEqual(['0.16', '0.15', '0.1'])
-    expect(rows.filter(row => row.group_id === 15)).toHaveLength(1)
+describe('当前 Key 分组价格行', () => {
+  it('当前分组有完整官网价时，直接使用该分组基础价', () => {
+    const row = buildCurrentGroupPriceRow([
+      location({ id: 16, name: '[CC2]ClaudeCode高智', status: 'active', rate_multiplier: '0.6' }),
+    ], 16, { keyGroup: { id: 16, name: '[CC2]ClaudeCode高智', rate: '0.6' } })
+    expect(row?.official).toEqual({ input: '4', output: '20', cache5m: '5', cache1h: '6', cache_read: '0.4' })
+    expect(row?.student).toEqual({ input: '264', output: '1320', cache5m: '330', cache1h: '396', cache_read: '26.4' })
+    expect(row?.student_source).toBe('website')
+    expect(row?.base_from_other_group).toBe(false)
+    expect(row?.base_note).toBeNull()
   })
 
-  it('五项学生价按分组倍率和 1.10 换算成积分 / 1M Token', () => {
-    const [own] = buildGroupPriceRows(glmLocations(), 15)
-    expect(own.is_current_key_group).toBe(true)
-    expect(own.input).toBe('140.8')
-    expect(own.output).toBe('492.8')
-    expect(own.cache5m).toBe('0')
-    expect(own.cache1h).toBeNull()
-    expect(own.cache_read).toBe('35.2')
-    const [other] = buildGroupPriceRows(glmLocations(), 6).filter(row => row.group_id === 14)
-    expect(other.input).toBe('132')
+  it('当前分组没有完整官网价时，取 CC1 同名模型基础价再乘当前 Key 倍率', () => {
+    const row = buildCurrentGroupPriceRow([
+      location({ id: 16, name: '[CC2]ClaudeCode高智', status: 'active', rate_multiplier: '0.6' },
+        { input_price: '0.000009' }, { price_complete: false }),
+      location({ id: 2, name: '[CC1]Claudecode-kiro-015', status: 'active', rate_multiplier: '0.15' },
+        claudePrice, { channel: 'Claude 渠道', price_scope: 'platform' }),
+    ], 16, { keyGroup: { id: 16, name: '[CC2]ClaudeCode高智', rate: '0.6' } })
+    expect(row?.official).toEqual({ input: '4', output: '20', cache5m: '5', cache1h: '6', cache_read: '0.4' })
+    expect(row?.student).toEqual({ input: '264', output: '1320', cache5m: '330', cache1h: '396', cache_read: '26.4' })
+    expect(row?.base_from_other_group).toBe(true)
+    expect(row?.base_group_id).toBe(2)
+    expect(row?.base_label).toBe('CC1')
+    expect(row?.base_note).toBe('基础价来自 CC1 同名模型；当前 Key 分组 16 的倍率为 0.60×')
   })
 
-  it('官网价与学生价都固定包含五项', () => {
-    const [row] = buildGroupPriceRows(claudeLocations(), 2)
-    const keys = ['input', 'output', 'cache5m', 'cache1h', 'cache_read']
-    expect(Object.keys(row.official).sort()).toEqual([...keys].sort())
-    expect(Object.keys(row.student).sort()).toEqual([...keys].sort())
-    expect(row.official).toEqual({
-      input: '4', output: '20', cache5m: '5', cache1h: '6', cache_read: '0.4',
-    })
+  it('分组专属价和缺少 price_scope 的旧数据不能跨组作为基础价', () => {
+    const row = buildCurrentGroupPriceRow([
+      location({ id: 2, name: '[CC1]Claudecode-kiro-015', status: 'active', rate_multiplier: '0.15' },
+        claudePrice, { channel: 'CC1', price_scope: 'group' }),
+      location({ id: 3, name: '分组 3', status: 'active' }, claudePrice, { price_scope: undefined }),
+    ], 16, { keyGroup: { id: 16, name: '[CC2]ClaudeCode高智', rate: '0.6' } })
+    expect(row?.base_missing).toBe(true)
+    expect(row?.base_from_other_group).toBe(false)
+    expect(row?.base_note).toBeNull()
+    expect(row?.official).toEqual({ input: null, output: null, cache5m: null, cache1h: null, cache_read: null })
+    expect(row?.student).toEqual({ input: null, output: null, cache5m: null, cache1h: null, cache_read: null })
+    expect(row?.effective_rate).toBe('0.6')
   })
 
-  it('CC1 0.15 与 group16 0.6 各自显示两排价格', () => {
-    const rows = buildGroupPriceRows(claudeLocations(), null, {
-      keyGroup: { id: 16, name: '[CC2]ClaudeCode高智', rate: '0.6' },
-      derived: claudePrice,
-    })
-    expect(rows.map(row => row.group_id)).toEqual([16, 2])
-    const [group16, cc1] = rows
-    expect(cc1.official).toEqual({
-      input: '4', output: '20', cache5m: '5', cache1h: '6', cache_read: '0.4',
-    })
-    expect(cc1.student).toEqual({
-      input: '66', output: '330', cache5m: '82.5', cache1h: '99', cache_read: '6.6',
-    })
-    expect(cc1.student_source).toBe('website')
-    expect(group16.official).toEqual({
-      input: null, output: null, cache5m: null, cache1h: null, cache_read: null,
-    })
-    expect(group16.student).toEqual({
-      input: '264', output: '1320', cache5m: '330', cache1h: '396', cache_read: '26.4',
-    })
-    expect(group16.student_source).toBe('derived')
-    expect(group16.rate).toBe('0.6')
-    expect(group16.is_current_key_group).toBe(true)
+  it('表头生效倍率优先 account_rate，并单独说明分组倍率差异', () => {
+    const row = buildCurrentGroupPriceRow([
+      location({ id: 10, name: 'GPT 分组', status: 'active', rate_multiplier: '0.24' },
+        { input_price: '0.000008', output_price: '0.00004' }),
+    ], 10, { keyGroup: { id: 10, name: 'GPT 分组', rate: '0.24', account_rate: '0.2' } })
+    expect(row?.rate).toBe('0.24')
+    expect(row?.account_rate).toBe('0.2')
+    expect(row?.effective_rate).toBe('0.2')
+    expect(row?.rate_note).toBe('分组 0.24× / 账号 0.20×')
+    expect(row?.student.input).toBe('176')
   })
 
-  it('官网缺该组价时学生价用历史流水反推', () => {
-    const [row] = buildGroupPriceRows(claudeLocations(), null, {
-      keyGroup: { id: 16, name: '[CC2]ClaudeCode高智', rate: '0.6' },
-      derived: claudePrice,
+  it('陈旧或未标完整的 location 不能作为基础价', () => {
+    const row = buildCurrentGroupPriceRow([
+      location({ id: 2, name: 'CC1', status: 'active' }, claudePrice, { stale: true }),
+      location({ id: 3, name: 'CC2', status: 'active' }, claudePrice, { price_complete: false }),
+    ], 16, { keyGroup: { id: 16, name: '分组 16', rate: '0.6' } })
+    expect(row?.base_missing).toBe(true)
+    expect(row?.official).toEqual({ input: null, output: null, cache5m: null, cache1h: null, cache_read: null })
+    expect(row?.student).toEqual({ input: null, output: null, cache5m: null, cache1h: null, cache_read: null })
+    expect(row?.student_source).toBeNull()
+  })
+
+  it('账户倍率优先于分组倍率计算学生价', () => {
+    const row = buildCurrentGroupPriceRow([
+      location({ id: 15, name: '分组 15', status: 'active', rate_multiplier: '0.2', account_rate_multiplier: '0.16' }),
+    ], 15, { keyGroup: { id: 15, name: '分组 15', rate: '0.2', account_rate: '0.16' } })
+    expect(row?.rate).toBe('0.2')
+    expect(row?.account_rate).toBe('0.16')
+    expect(row?.student.input).toBe('70.4')
+    expect(row?.student.output).toBe('352')
+  })
+
+  it('没有官网基础价时主价留空，历史反推价只生成参考文字', () => {
+    const derived: BeichenPriceConditions = { billing_mode: 'token', input_price: '0.000004', output_price: '0.00002' }
+    const row = buildCurrentGroupPriceRow([], 16, {
+      keyGroup: { id: 16, name: '[CC2]ClaudeCode高智', rate: '0.6' }, derived,
     })
-    expect(row.official.input).toBeNull()
-    expect(row.student.input).toBe('264')
-    expect(row.student_source).toBe('derived')
+    expect(row?.base_missing).toBe(true)
+    expect(row?.official.input).toBeNull()
+    expect(row?.student.input).toBeNull()
+    expect(row?.student_source).toBeNull()
+    expect(priceReferenceText(derived)).toBe('输入 4 元、输出 20 元')
   })
 
-  it('/keys 的 group_id/rate 覆盖官网同组倍率', () => {
-    const [row] = buildGroupPriceRows(claudeLocations(), null, {
-      keyGroup: { id: 2, name: '[CC1]Claudecode-kiro-015', rate: '0.2', account_rate: '0.18' },
-    })
-    expect(row.is_current_key_group).toBe(true)
-    expect(row.rate).toBe('0.2')
-    expect(row.account_rate).toBe('0.18')
-    expect(row.student.input).toBe('79.2')
-  })
-
-  it('官网完全没有该组时也保留当前组行', () => {
-    const rows = buildGroupPriceRows(claudeLocations(), null, {
-      keyGroup: { id: 16, name: '[CC2]ClaudeCode高智', rate: '0.6' },
-    })
-    expect(rows[0]).toMatchObject({
-      group_id: 16, name: '[CC2]ClaudeCode高智', rate: '0.6',
-      is_current_key_group: true, student_source: null,
-    })
-    expect(rows[0].official.input).toBeNull()
-    expect(rows[0].student.input).toBeNull()
-  })
-
-  it('旧扁平五项与学生实价保持同步，兼容教师页回写', () => {
-    const [row] = buildGroupPriceRows(glmLocations(), 15)
-    expect(row.input).toBe('140.8')
-    row.input = '999'
-    expect(row.student.input).toBe('999')
-  })
-
-  it('账户倍率覆盖分组倍率：0.1 / 0.08 按 0.08 计算', () => {
-    const [row] = buildGroupPriceRows([
-      location({ id: 15, name: '分组 15', status: 'active', rate_multiplier: '0.1', account_rate_multiplier: '0.08' }),
-    ], 15)
-    expect(row.rate).toBe('0.1')
-    expect(row.account_rate).toBe('0.08')
-    expect(row.input).toBe('70.4')
-  })
-
-  it('账户倍率覆盖分组倍率：0.15 / 0.14 按 0.14 计算', () => {
-    const [row] = buildGroupPriceRows([
-      location({ id: 14, name: '分组 14', status: 'active', rate_multiplier: '0.15', account_rate_multiplier: '0.14' }),
-    ], 14)
-    expect(row.rate).toBe('0.15')
-    expect(row.account_rate).toBe('0.14')
-    expect(row.input).toBe('123.2')
-  })
-
-  it('同组缺价记录不会覆盖已有的完整报价', () => {
-    const rows = buildGroupPriceRows([
-      location({ id: 15, name: '分组 15', status: 'active', rate_multiplier: '0.16' }, null),
-      location({ id: 15, name: '分组 15', status: 'active', rate_multiplier: '0.16' }),
-    ], 15)
-    expect(rows).toHaveLength(1)
-    expect(rows[0].input).toBe('140.8')
-    expect(rows[0].official.input).toBe('8')
+  it('扁平五项与学生实价保持同步，兼容旧调用方', () => {
+    const row = buildCurrentGroupPriceRow([
+      location({ id: 16, name: '分组 16', status: 'active', rate_multiplier: '0.6' }),
+    ], 16)
+    expect(row?.input).toBe('264')
+    row!.input = '999'
+    expect(row?.student.input).toBe('999')
   })
 })

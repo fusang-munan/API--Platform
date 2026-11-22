@@ -13,11 +13,10 @@ import {
 } from '../../utils/beichenModels'
 import { bindingAdapterMeta } from '../../utils/bindingAdapters'
 import { formatPercent, formatTokens, multiplyDecimal, shiftDecimal } from '../../utils/credits'
-import { buildGroupPriceRows } from '../../utils/groupPriceRows'
+import { buildCurrentGroupPriceRow, priceReferenceText } from '../../utils/groupPriceRows'
 import { schoolDay, statusLabel } from '../../utils/format'
 import AppDialog from '../../components/AppDialog.vue'
 import BeichenGroupPrices from '../../components/BeichenGroupPrices.vue'
-import BeichenPriceTable from '../../components/BeichenPriceTable.vue'
 import BeichenPriceDrawer from '../../components/BeichenPriceDrawer.vue'
 import BeichenModelUsageDrawer from '../../components/BeichenModelUsageDrawer.vue'
 import BeichenRecentReceipts from './BeichenRecentReceipts.vue'
@@ -56,7 +55,7 @@ const error = ref('')
 const toast = useToast()
 const reasonId = useId()
 const convertibleUnits = new Set(['每百万 Token 的积分', '积分/次', '积分/秒'])
-const filters = [{ id: 'all', label: '全部' }, { id: 'active', label: '已启用' }, { id: 'pending', label: '待配置' }, { id: 'unpriced', label: '无报价' }, { id: 'manual', label: '手动价' }] as const
+const filters = [{ id: 'all', label: '全部' }, { id: 'active', label: '已启用' }, { id: 'pending', label: '待配置' }, { id: 'unpriced', label: '无报价' }, { id: 'manual', label: '手动价' }, { id: 'anomaly', label: '异常' }] as const
 function adapterLabel(value: string) { return bindingAdapterMeta(value as BindingAdapter).label }
 const filter = ref<typeof filters[number]['id']>('all')
 const priceRow = ref<SchoolCatalogRow>()
@@ -259,24 +258,15 @@ function currentGroupPrices(locations: BeichenWebsiteLocation[], credentialId: s
   const groupId = websiteKey?.group_id ?? null
   const previousGroup = credentialId && groupId == null
     ? lastKnownKeyGroup(websiteKeyGroups.value.matched.get(credentialId), billing, key?.group_id) : undefined
-  const matchingGroup = (location: BeichenWebsiteLocation) => location.groups.find(group =>
-    group.id === groupId && (!group.status || group.status === 'active'))
-  const sameGroup = locations.filter(location =>
-    !location.stale && location.has_price && location.price_conditions_exact && matchingGroup(location))
-  const official = sameGroup.find(location => location.price_complete) ?? sameGroup[0]
-  const websiteGroup = official ? matchingGroup(official) : undefined
 
+  const isDerived = record?.price_source === 'derived_from_usage' || (!record?.price_source && record?.price_status === 'derived')
   const legacyTerms = record?.price_conditions
   const terms = record?.price_conditions_exact ?? (legacyTerms && Object.fromEntries(
     Object.entries(legacyTerms).filter(([field, value]) => !field.endsWith('_price') || value !== 0)))
-  const isDerived = record?.price_source === 'derived_from_usage' || (!record?.price_source && record?.price_status === 'derived')
   const priceObservedAt = record?.price_observed_at ?? prices?.last_success
   const canUseRecord = websiteKey ? priceBelongsToWebsiteKeyGroup(websiteKey, priceObservedAt, billing?.group_id ?? key?.group_id)
     : !previousGroup && !keyGroupIssue(billing)
-  const diagnosis = keyGroupDiagnosis(key)
-  const website = official ?? (canUseRecord && !locations.length && !isDerived && terms && record?.price_status !== 'not_listed' &&
-    diagnosis !== 'price_outside_key_group' && diagnosis !== 'model_outside_key_group'
-    ? { price_conditions_exact: terms, observed_at: priceObservedAt } : null)
+  // 历史反推价只作小字参考，不再作为主价。
   const derived = canUseRecord && isDerived && record?.price_status === 'derived' && terms
     ? { price_conditions_exact: terms, observed_at: record.price_observed_at } : null
 
@@ -289,36 +279,33 @@ function currentGroupPrices(locations: BeichenWebsiteLocation[], credentialId: s
     (!prices?.last_error || prices.official_price_missing)
   const groupMultiplier = websiteKey ? websiteKeyEffectiveRate(websiteKey, billing)
     : canUseRecord && !rateUnavailable && legacyPriceCurrent ? legacyRate : null
-  const groupName = websiteKey?.group_name ?? websiteGroup?.name
+  const groupName = websiteKey?.group_name ?? undefined
   const baseRate = websiteKey?.rate
-  const groupRate = keyGroupRate(baseRate == null ? undefined : String(baseRate))
   const rateForPrices = groupMultiplier == null ? null : baseRate ?? groupMultiplier
   const accountRate = groupMultiplier != null && keyGroupRate(String(rateForPrices)) !== keyGroupRate(String(groupMultiplier))
     ? groupMultiplier : null
-  // 只传当前分组的官网报价和这把 Key 的流水，避免其它分组使用该 Key 的反推价。
-  const currentLocations = groupId != null && website ? [{
-    name: official?.name ?? record?.model ?? '',
-    groups: [{ id: groupId }],
-    observed_at: website.observed_at ?? '',
-    has_price: true,
-    price_conditions_exact: website.price_conditions_exact,
-  }] : []
-  const [current] = groupId == null ? [] : buildGroupPriceRows(currentLocations, groupId, {
+  const effectiveRateText = groupMultiplier == null ? '' : keyGroupRate(String(groupMultiplier))
+
+  const current = groupId == null ? null : buildCurrentGroupPriceRow(locations, groupId, {
     keyGroup: { id: groupId, name: groupName, rate: rateForPrices, account_rate: accountRate },
     derived: derived?.price_conditions_exact,
   })
-  const observedAt = (current?.student_source === 'derived' ? derived : website)?.observed_at
-  const comparisonRows = buildGroupPriceRows(locations, previousGroup?.id, { keyGroup: previousGroup })
-    .filter(group => group.group_id !== groupId)
-    .map(group => group.is_current_key_group
-      ? { ...group, is_current_key_group: false, name: lastKnownKeyGroupLabel + ' · ' + group.name }
-      : group)
+  const website = current?.price_conditions_exact
+    ? { price_conditions_exact: current.price_conditions_exact, observed_at: current.observed_at }
+    : null
+  const observedAt = current?.observed_at ?? derived?.observed_at ?? null
+  const reference = derived?.price_conditions_exact ? priceReferenceText(derived.price_conditions_exact) : null
+  const derivedNote = current?.base_missing && reference
+    ? `历史流水参考：${reference}（每 1M Token，未作为主价）`
+    : ''
   return {
     current, website, derived, groupMultiplier, observedAt,
     unmatched: Boolean(credentialId && groupId == null),
-    currentTitle: current ? `当前分组 ${current.group_id} · ${groupRate || '倍率待同步'}` : '',
+    currentTitle: current ? `当前 Key 分组 ${current.group_id} · ${effectiveRateText ? '生效 ' + effectiveRateText : '倍率待核实'}` : '',
+    baseNote: current?.base_note ?? '',
+    baseMissing: Boolean(current?.base_missing),
+    derivedNote,
     observedLabel: formatObservedAt(observedAt),
-    comparisonRows,
     officialPriceMissing: prices?.official_price_missing,
   }
 }
@@ -428,7 +415,7 @@ const catalog = computed(() => {
 type CatalogRow = (typeof catalog.value)[number]
 const conditionsRow = computed(() => conditionsModel.value == null ? undefined : catalog.value.find(row => row.model === conditionsModel.value))
 const listedModels = computed(() => catalog.value.filter(row => row.listed))
-const discoveredModels = computed(() => catalog.value.filter(row => row.discovered))
+const websiteOnlyModels = computed(() => catalog.value.filter(row => row.websiteOnly))
 const probeRun = computed<ProbeRunWithBudget | undefined>(() => probeOverride.value ?? overview.value?.probe_run as ProbeRunWithBudget | undefined)
 const probeBudget = computed(() => probeRun.value?.budget)
 const probeInProgress = computed(() => probeRun.value?.state === 'queued' || probeRun.value?.state === 'running')
@@ -446,16 +433,25 @@ const probeRunLabel = computed(() => {
 })
 const catalogByModel = computed(() => new Map(catalog.value.map(row => [row.model.toLowerCase(), row])))
 const modelFilter = computed(() => normalizeSignal(props.query ?? ''))
+/** 已发布但当前四把 Key 都没探测到的异常模型，只在“异常”筛选里出现。 */
+function anomalousRow(row: CatalogRow) {
+  return !row.listed && !row.websiteOnly && (row.active || Boolean(row.bindingIssue))
+}
 const searchedRows = computed(() => catalog.value.filter(row =>
+  (row.listed || anomalousRow(row)) &&
   (!modelFilter.value || [row.model, ...row.locations.map(location => location.name), ...row.catalogKeys.map(key => key.upstream_model ?? '')]
     .some(name => normalizeSignal(name).includes(modelFilter.value))) &&
   (!props.commonIds || props.commonIds.has(row.model.toLowerCase()))))
-const rows = computed(() => searchedRows.value.filter(row => filter.value === 'all' ||
-  filter.value === 'active' && row.active ||
-  filter.value === 'pending' && !row.active ||
-  filter.value === 'unpriced' && !row.priceCovered ||
-  filter.value === 'manual' && (row.mode !== 'follow' || row.priceState === 'manual')))
-const batchRows = computed(() => rows.value.filter(row => row.listed || row.active && !row.websiteOnly))
+const rows = computed(() => searchedRows.value.filter(row => {
+  if (filter.value === 'anomaly') return anomalousRow(row)
+  if (!row.listed) return false
+  return filter.value === 'all' ||
+    filter.value === 'active' && row.active ||
+    filter.value === 'pending' && !row.active ||
+    filter.value === 'unpriced' && !row.priceCovered ||
+    filter.value === 'manual' && (row.mode !== 'follow' || row.priceState === 'manual')
+}))
+const batchRows = computed(() => rows.value.filter(row => row.listed))
 const monthlyUsage = computed<UsageState>(() => usageStates.value.month ?? {})
 const drawerUsage = computed<UsageState>(() => usageStates.value[range.value] ?? {})
 const usageByModel = computed(() => new Map((monthlyUsage.value.data?.models ?? []).map(row => [row.model.toLowerCase(), row])))
@@ -664,7 +660,7 @@ function canEnableReason(row: CatalogRow) {
   if (row.activation == null && row.canEnable == null) return '启用条件待同步，请先刷新模型'
   if (!row.priceCovered) {
     if (row.priceState === 'conditional') return '条件价待核实，可先手动定价'
-    if (row.groupPrices.website || row.groupPrices.derived) return '报价尚未生效，请同步价格'
+    if (row.groupPrices.website) return '报价尚未生效，请同步价格'
     return '官网未报价，请先手动定价'
   }
   if (row.activation === 'blocked' || !row.canEnable || !row.routeCount) return '线路未就绪，请刷新模型或检查渠道配置'
@@ -1023,9 +1019,10 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
       </div>
     </section>
     <div class="beichen-summary model-summary" aria-label="模型概况">
-      <div class="beichen-stat"><span>目录模型</span><strong>{{ overview ? formatTokens(discoveredModels.length) : '—' }}</strong><small>已从上游发现</small></div>
+      <div class="beichen-stat"><span>可探测模型</span><strong>{{ overview ? formatTokens(listedModels.length) : '—' }}</strong><small>四把 Key 当前目录列出</small></div>
       <div class="beichen-stat"><span>已启用</span><strong>{{ overview ? formatTokens(catalog.filter(row => row.active).length) : '—' }}</strong><small>学校模型</small></div>
-      <div class="beichen-stat"><span>报价覆盖</span><strong>{{ overview ? discoveredModels.filter(row => row.priceCovered).length + ' / ' + discoveredModels.length : '—' }}</strong><small>含可计算的 Token 条件价与手动价</small></div>
+      <div class="beichen-stat"><span>官网目录</span><strong>{{ overview ? formatTokens(websiteOnlyModels.length) : '—' }}</strong><small>仅官网可见，不进主表</small></div>
+      <div class="beichen-stat"><span>报价覆盖</span><strong>{{ overview ? listedModels.filter(row => row.priceCovered).length + ' / ' + listedModels.length : '—' }}</strong><small>含可计算的 Token 条件价与手动价</small></div>
       <div class="beichen-stat sync-stat"><span>价格最后同步</span><strong>{{ syncTime(lastSync) }}</strong><small>北京时间</small></div>
     </div>
     <section v-if="keyHealth.length" class="beichen-card key-health" aria-label="Key 健康">
@@ -1220,20 +1217,17 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
                   {{ row.mode === 'manual' ? '手动价生效' : '部分 Key 使用手动价' }} · 官网报价供参考
                 </span>
                 <BeichenGroupPrices v-if="row.groupPrices.current" class="current-group-prices"
-                  :rows="[row.groupPrices.current]" :title="row.groupPrices.currentTitle">
+                  :row="row.groupPrices.current" :title="row.groupPrices.currentTitle"
+                  :note="row.groupPrices.baseNote" :derived-note="row.groupPrices.derivedNote">
                   <template #actions>
                     <small v-if="row.groupPrices.observedAt && row.groupPrices.observedLabel" class="group-price-note">
                       采集时间 <time :datetime="row.groupPrices.observedAt">{{ row.groupPrices.observedLabel }}（北京时间）</time>
                     </small>
                   </template>
                 </BeichenGroupPrices>
-                <BeichenPriceTable v-else-if="row.groupPrices.website || row.groupPrices.derived"
-                  :website="row.groupPrices.website" :derived="row.groupPrices.derived" :group-multiplier="row.groupPrices.groupMultiplier" />
                 <button v-if="row.detailQuotes.length || row.detailWebsite" type="button" class="price-link" @click="conditionsModel = row.model">查看档位</button>
                 <p v-if="row.groupPrices.unmatched"
                   class="group-missing-note" data-testid="current-group-missing">当前 Key 分组未匹配</p>
-                <BeichenGroupPrices v-if="row.groupPrices.comparisonRows.length" class="other-groups"
-                  :rows="row.groupPrices.comparisonRows" title="其它分组" />
               </div>
             </td>
             <td data-label="本月用量" class="model-usage">

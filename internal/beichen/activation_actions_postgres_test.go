@@ -95,6 +95,8 @@ VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now())`, provider, keys[0], 
 VALUES(gen_random_uuid(),$1,$2,'blocked',now(),now(),now(),now()),
 (gen_random_uuid(),$1,$3,'mixed-price',now(),now(),now(),now())`, provider, keys[3], keys[1])
 	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", keys[3])
+	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success)
+VALUES($1,'catalog',clock_timestamp()),($2,'catalog',clock_timestamp())`, keys[0], keys[1])
 	for _, name := range []string{"flat", "mixed-price", "fail-enable", "fresh"} {
 		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,cache_read_rate,cache_write_rate)
 VALUES($1,$2,'upstream','effective','billing',0,2000000,0,0)`, keys[0], name)
@@ -154,6 +156,7 @@ CREATE TRIGGER reject_action_fixture BEFORE INSERT ON models FOR EACH ROW EXECUT
 func TestSingleAndBatchEnableUseSamePricesPostgres(t *testing.T) {
 	ctx, db, provider, actor, keys := newActionsPostgres(t)
 	service := New(db, nil)
+	execCatalogTestSQL(t, ctx, db, "INSERT INTO beichen_datasets(credential_id,kind,last_success) VALUES($1,'catalog',clock_timestamp())", keys[0])
 	const missingOutput = `{"input_price":0,"output_price":1,"intervals":[{"min_tokens":0,"input_price":1}]}`
 	for _, tc := range []struct {
 		name, conditions, code, messagePart string
@@ -261,7 +264,9 @@ FROM provider_credentials c CROSS JOIN rate WHERE c.id=$1`, key, single, batch, 
 					t.Fatal(err)
 				}
 				for _, model := range view.ModelCatalog {
-					if model.Model == single && model.ReadyCount == 0 && model.BindingIssue != nil && model.BindingIssue.Code == "catalog_missing" {
+					if model.Model == single && model.CatalogState == "published_unavailable" && model.SchoolStatus == "active" &&
+						model.KeyCount == 0 && model.ReadyCount == 0 && !model.CanEnable &&
+						model.BindingIssue != nil && model.BindingIssue.Code == "catalog_missing" {
 						return
 					}
 				}
@@ -283,6 +288,158 @@ FROM provider_credentials c CROSS JOIN rate WHERE c.id=$1`, key, single, batch, 
 				t.Fatalf("缺少可用报价时不应创建模型: created=%d err=%v", created, err)
 			}
 		})
+	}
+}
+
+func TestEnableRequiresCurrentKeyCatalogPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	key := keys[0]
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	exec("UPDATE provider_credentials SET updated_at=now()-interval '1 hour' WHERE id=$1", key)
+	newModels := []string{"new-single", "new-batch", "configured"}
+	models := append(slices.Clone(newModels), "published")
+	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,supported_protocols,last_seen_at,synced_at,created_at,updated_at)
+SELECT gen_random_uuid(),$1,$2,model,ARRAY['openai_compatible'],now(),now(),now(),now() FROM unnest($3::text[]) model`, provider, key, models)
+	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success) VALUES($1,'catalog',now())`, key)
+	exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+SELECT $1,model,'school','manual','teacher',$2,1000000,2000000 FROM unnest($3::text[]) model`, key, actor, models)
+	configured, published := uuid.New(), uuid.New()
+	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES($1,'configured','Configured','inactive',1000,now(),now()),($2,'published','Published','active',1000,now(),now())`, configured, published)
+	exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$3,NULL,'configured','openai_compatible',0,now(),now()),
+      (gen_random_uuid(),$2,$3,$4,'published','openai_compatible',0,now(),now())`, configured, published, provider, key)
+	service := New(db, nil)
+	scanError := "fixture scan failed"
+	for _, tc := range []struct {
+		name       string
+		minutesAgo int
+		lastError  *string
+	}{
+		{name: "expired", minutesAgo: 31},
+		{name: "scan failed", lastError: &scanError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec(`UPDATE beichen_datasets SET last_success=now()-make_interval(mins=>$2),last_error=$3
+WHERE credential_id=$1 AND kind='catalog'`, key, tc.minutesAgo, tc.lastError)
+			view, err := service.Overview(ctx, provider, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range newModels {
+				i := slices.IndexFunc(view.ModelCatalog, func(model CatalogModel) bool { return model.Model == name })
+				if i < 0 || view.ModelCatalog[i].CanEnable || view.ModelCatalog[i].Activation != "blocked" {
+					t.Fatalf("%s should be blocked in the preview: %+v", name, view.ModelCatalog)
+				}
+				if id, err := service.EnableModel(ctx, provider, actor, name, ""); id != uuid.Nil || domain.ErrorCode(err) != domain.CodeValidation {
+					t.Fatalf("%s should be rejected despite its manual price: %s (%v)", name, id, err)
+				}
+			}
+			i := slices.IndexFunc(view.ModelCatalog, func(model CatalogModel) bool { return model.Model == "published" })
+			if i < 0 || view.ModelCatalog[i].ReadyCount != 1 || view.ModelCatalog[i].Activation != "active" {
+				t.Fatalf("the published binding should still be ready: %+v", view.ModelCatalog)
+			}
+			if id, err := service.EnableModel(ctx, provider, actor, "published", ""); err != nil || id != published {
+				t.Fatalf("the published model should still resolve to %s: %s (%v)", published, id, err)
+			}
+			result, err := service.EnableModelsBatch(ctx, provider, actor, models)
+			if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 4 {
+				t.Fatalf("unexpected batch result: %+v (%v)", result, err)
+			}
+			for i, reason := range []string{"route_not_ready", "route_not_ready", "route_not_ready", "already_active"} {
+				if result.Skipped[i].Model != models[i] || result.Skipped[i].Reason != reason {
+					t.Fatalf("unexpected batch skip: %+v", result.Skipped[i])
+				}
+			}
+		})
+	}
+	var inactive bool
+	var created int
+	if err := db.QueryRowContext(ctx, `SELECT (SELECT status='inactive' FROM models WHERE id=$1),
+  (SELECT count(*) FROM models WHERE model_id IN ('new-single','new-batch'))`, configured).Scan(&inactive, &created); err != nil || !inactive || created != 0 {
+		t.Fatalf("rejected actions published models: inactive=%v created=%d (%v)", inactive, created, err)
+	}
+
+	exec("UPDATE beichen_datasets SET last_success=now(),last_error=NULL WHERE credential_id=$1 AND kind='catalog'", key)
+	// The unpinned binding will try the lower Key ID first, even if its listing predates that Key.
+	other := keys[1]
+	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success) VALUES($1,'catalog',now())`, other)
+	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,'configured',now()-interval '1 hour',now(),now(),now())`, provider, other)
+	if _, err := service.EnableModel(ctx, provider, actor, "configured", ""); domain.ErrorCode(err) != domain.CodeValidation {
+		t.Fatalf("another Key's current listing must not authorize the unpinned binding: %v", err)
+	}
+	exec("UPDATE provider_model_catalog SET status='inactive' WHERE credential_id=$1", other)
+	if id, err := service.EnableModel(ctx, provider, actor, "new-single", ""); err != nil || id == uuid.Nil {
+		t.Fatalf("current catalog should allow single enable: %s (%v)", id, err)
+	}
+	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{"new-batch", "configured"})
+	if err != nil || len(result.Skipped) != 0 || len(result.Enabled) != 2 || result.Enabled[1].ModelID != configured {
+		t.Fatalf("current catalog should allow batch enable: %+v (%v)", result, err)
+	}
+}
+
+func TestActivationRejectsDerivedPricesPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	key := keys[0]
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	models := []string{"derived-single", "derived-batch"}
+	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at)
+SELECT gen_random_uuid(),$1,$2,model,now(),now(),now(),now() FROM unnest($3::text[]) model`, provider, key, models)
+	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success) VALUES($1,'catalog',now())`, key)
+	exec(`WITH rate AS (
+  INSERT INTO beichen_multiplier_versions(credential_id,effective_at,multiplier) VALUES($1,now(),1)
+  RETURNING id,effective_at
+), snapshot AS (
+  INSERT INTO beichen_panel_snapshots(credential_id,effective_at,credential_revision,group_id,expires_at,multiplier_version,model_pricing)
+  SELECT c.id,rate.effective_at,c.updated_at,16,rate.effective_at+interval '1 hour',rate.id,'{}'::jsonb
+  FROM provider_credentials c CROSS JOIN rate WHERE c.id=$1
+  RETURNING effective_at
+)
+INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,cache_read_rate,cache_write_rate,group_id,effective_at,observed_at)
+SELECT $1,model,'upstream','base','derived_from_usage',1000000,2000000,0,0,16,effective_at,effective_at-interval '1 minute'
+FROM snapshot CROSS JOIN unnest($2::text[]) model`, key, models)
+	service := New(db, nil)
+	checkPreview := func(wantActivation, wantPriceState string) {
+		t.Helper()
+		view, err := service.Overview(ctx, provider, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(view.Models) != len(models) || len(view.ModelCatalog) != len(models) {
+			t.Fatalf("missing fixture models: %+v", view.ModelCatalog)
+		}
+		for _, row := range view.Models {
+			if row.PriceSource != derivedPriceSource || row.UpstreamRates == nil {
+				t.Fatalf("expected the stored derived price to remain visible: %+v", row)
+			}
+		}
+		for _, row := range view.ModelCatalog {
+			if row.Activation != wantActivation || row.PriceState != wantPriceState ||
+				(wantActivation == "blocked" && (row.PriceBlocker == nil || row.PriceBlocker.Code != "missing_price")) {
+				t.Fatalf("unexpected activation preview: %+v", row)
+			}
+		}
+	}
+	checkPreview("blocked", "derived")
+	if id, err := service.EnableModel(ctx, provider, actor, models[0], ""); id != uuid.Nil || domain.ErrorCode(err) != domain.CodeValidation ||
+		!strings.Contains(err.Error(), "缺少可用报价") {
+		t.Fatalf("single activation accepted the derived price: %s (%v)", id, err)
+	}
+	result, err := service.EnableModelsBatch(ctx, provider, actor, models[1:])
+	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 || result.Skipped[0].Reason != "no_price" {
+		t.Fatalf("batch activation accepted the derived price: %+v (%v)", result, err)
+	}
+
+	exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+SELECT $1,model,'school','manual','teacher',$2,1000000,2000000 FROM unnest($3::text[]) model`, key, actor, models)
+	checkPreview("ready", "manual")
+	if id, err := service.EnableModel(ctx, provider, actor, models[0], ""); err != nil || id == uuid.Nil {
+		t.Fatalf("single activation rejected the manual price: %s (%v)", id, err)
+	}
+	result, err = service.EnableModelsBatch(ctx, provider, actor, models[1:])
+	if err != nil || len(result.Enabled) != 1 || len(result.Skipped) != 0 || result.Enabled[0].Message != "" {
+		t.Fatalf("batch activation rejected the manual price: %+v (%v)", result, err)
 	}
 }
 

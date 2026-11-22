@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { BeichenOverview } from '../api/types'
-import { indexWebsiteKeyGroups, manualPriceDetailRows, missingPriceDetailLabels, priceDetailRows, schoolCatalog } from './beichenModels'
+import { indexWebsiteKeyGroups, manualPriceDetailRows, missingPriceDetailLabels, priceDetailRows, schoolCatalog, websiteKeyEffectiveRate } from './beichenModels'
 
 function overview(model: Record<string, unknown>): BeichenOverview {
   return {
@@ -112,12 +112,49 @@ describe('schoolCatalog credits', () => {
     const groups = indexWebsiteKeyGroups({ status: 'current', last_seen: lastSeen, keys: [key] })
 
     const oldQuote = schoolCatalog(data, 'provider-1', groups)[0].quotes[0]
-    expect(oldQuote).toMatchObject({ multiplier: '待同步', conditions: null, standard: null, actual: null })
+    expect(oldQuote).toMatchObject({ multiplier: '待核实', conditions: null, standard: null, actual: null })
 
     data.models![0].price_observed_at = lastSeen
     const currentQuote = schoolCatalog(data, 'provider-1', groups)[0].quotes[0]
-    expect(currentQuote.multiplier).toBe('0.6×')
-    expect(currentQuote.actual).toContain('输入 240')
+    // 计费观测仍属于分组 2，不能把官网新分组的 0.6 当作已核实倍率。
+    expect(currentQuote).toMatchObject({ multiplier: '待核实', actual: null, actualRates: null })
+    expect(currentQuote.conditions).not.toBeNull()
+    expect(currentQuote.standard).toContain('输入 4')
+  })
+})
+
+describe('website key effective rate', () => {
+  const key = {
+    id: 1, name: '测试 Key', key_prefix: null, group_id: 2, group_name: '分组 2', rate: '0.15',
+    status: 'active' as const, enabled: true, created_at: null, last_seen: '2026-11-21T13:00:00Z',
+    credential_id: 'cred-1', match_status: 'matched' as const, observed_at: '2026-11-21T13:00:00Z',
+  }
+  const billing = (overrides = {}) => ({
+    credential_id: 'cred-1', kind: 'billing', group_id: 2, group_rate: '0.15', group_status: 'assigned' as const,
+    billing_state: 'current' as const, effective_multiplier: '0.12', observed_at: '2026-11-21T13:05:00Z', ...overrides,
+  })
+
+  it('没有同组、同版本的计费观测时不回退到官网分组倍率', () => {
+    expect(websiteKeyEffectiveRate(key)).toBeNull()
+    expect(websiteKeyEffectiveRate(key, billing({ billing_state: 'stale' }))).toBeNull()
+    expect(websiteKeyEffectiveRate(key, billing({ group_id: 16 }))).toBeNull()
+    expect(websiteKeyEffectiveRate(key, billing({ observed_at: '2026-11-21T12:59:00Z' }))).toBeNull()
+  })
+
+  it('只采用已核实的账号计费倍率', () => {
+    expect(websiteKeyEffectiveRate(key, billing())).toBe('0.12')
+  })
+
+  it('倍率版本时间早于 Key 时，以最近一次计费成功时间判定已核实', () => {
+    expect(websiteKeyEffectiveRate(key, billing({
+      observed_at: '2026-11-21T12:59:00Z', last_success: '2026-11-21T13:07:00Z',
+    }))).toBe('0.12')
+  })
+
+  it('最近一次计费成功时间也早于 Key 时仍待核实', () => {
+    expect(websiteKeyEffectiveRate(key, billing({
+      observed_at: '2026-11-21T12:58:00Z', last_success: '2026-11-21T12:59:00Z',
+    }))).toBeNull()
   })
 })
 

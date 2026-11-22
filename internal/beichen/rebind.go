@@ -54,10 +54,10 @@ type rebindSlot struct {
 }
 
 type rebindCatalogEntry struct {
-	explicit  bool
-	school    rebindSchool
-	route     RebindRoute
-	protocols []string
+	explicit, catalogCurrent bool
+	school                   rebindSchool
+	route                    RebindRoute
+	protocols                []string
 }
 
 func (s *Service) Rebind(ctx context.Context, provider, actor uuid.UUID, preview bool, token string) (RebindPlan, error) {
@@ -201,12 +201,12 @@ func readCredentialRebind(ctx context.Context, tx *sql.Tx, provider uuid.UUID, f
 	priced := map[string]bool{}
 	for _, row := range observed.Models {
 		if row.CredentialID == to.CredentialID {
-			priced[row.Model] = row.PriceCovered
+			priced[row.Model] = row.activationPrice().ready()
 		}
 	}
 	byUpstream, bySchool := map[string][]rebindCatalogEntry{}, map[uuid.UUID][]rebindCatalogEntry{}
 	for _, entry := range entries {
-		if *entry.route.CredentialID != to.CredentialID {
+		if !entry.catalogCurrent || *entry.route.CredentialID != to.CredentialID {
 			continue
 		}
 		if !entry.explicit {
@@ -348,9 +348,11 @@ WHERE provider_id<>$1 AND status='active' GROUP BY model_id,adapter`, provider)
 func readRebindCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID) ([]rebindCatalogEntry, error) {
 	rows, err := tx.QueryContext(ctx, `
 SELECT a.model,a.credential_id,c.label::text,a.raw_entry,to_json(a.supported_protocols),
+  a.catalog_source='key' AND a.last_seen_at>=c.updated_at AND `+keyCatalogCurrentSQL+`,
   alias.school_model IS NOT NULL,m.id,m.model_id::text
 FROM (SELECT k.model_id::text AS model,k.* FROM provider_model_catalog k WHERE k.provider_id=$1 AND k.status='active') a
 JOIN provider_credentials c ON c.id=a.credential_id AND c.provider_id=a.provider_id
+LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='catalog'
 `+joinModelAliasSQL+`
 LEFT JOIN models m ON m.model_id=COALESCE(alias.school_model,a.model)::citext
 WHERE c.status='active' ORDER BY a.credential_id,a.model`, provider)
@@ -365,7 +367,7 @@ WHERE c.status='active' ORDER BY a.credential_id,a.model`, provider)
 		var schoolName *string
 		var raw, protocols []byte
 		if err := rows.Scan(&entry.route.UpstreamModel, &entry.route.CredentialID, &entry.route.CredentialLabel,
-			&raw, &protocols, &entry.explicit, &schoolID, &schoolName); err != nil {
+			&raw, &protocols, &entry.catalogCurrent, &entry.explicit, &schoolID, &schoolName); err != nil {
 			return nil, err
 		}
 		if schoolID != nil {
@@ -402,18 +404,27 @@ func planRebind(bindings map[rebindSlot]RebindChange, entries []rebindCatalogEnt
 	for _, entry := range entries {
 		for _, adapter := range entry.protocols {
 			var targets []rebindSchool
-			if entry.school.id != uuid.Nil {
+			if entry.catalogCurrent && entry.school.id != uuid.Nil {
 				targets = append(targets, entry.school)
 			}
-			if !entry.explicit {
+			if !entry.explicit || !entry.catalogCurrent {
 				targets = append(targets, legacy[upstreamProtocol{strings.ToLower(entry.route.UpstreamModel), adapter}]...)
 			}
 			for _, school := range targets {
 				slot := rebindSlot{school.id, adapter}
 				change := bindings[slot]
 				route := entry.route
+				// A transition row can keep the existing binding exactly as it is.
+				if !entry.catalogCurrent {
+					before := change.Before
+					if before == nil || before.Status != "active" ||
+						(before.CredentialID != nil && !sameRouteKey(before.CredentialID, route.CredentialID)) {
+						continue
+					}
+					route = *before
+				}
 				rank := 0
-				if entry.explicit {
+				if entry.explicit && entry.catalogCurrent {
 					rank += 4
 				}
 				if change.Before != nil {

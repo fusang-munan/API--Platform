@@ -14,7 +14,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
-	"github.com/starprince1234/Nebula-api/internal/catalog"
 )
 
 func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
@@ -42,7 +41,11 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 	if err != nil || len(paths) == 0 {
 		t.Fatal("locate migrations")
 	}
+	const sourceMigration = "0061_provider_catalog_source.sql"
 	for _, path := range paths {
+		if filepath.Base(path) == sourceMigration {
+			continue
+		}
 		sql, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -56,6 +59,22 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 	first, second, alias := uuid.New(), uuid.New(), uuid.New()
 	execTestSQL(t, ctx, tx, `INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
 		VALUES ($1,$3,'Gemini','fake',now(),now()),($2,$3,'Claude','fake',now(),now())`, first, second, provider)
+	execTestSQL(t, ctx, tx, `INSERT INTO provider_model_catalog
+		(id,provider_id,credential_id,model_id,raw_entry,last_seen_at,synced_at,created_at,updated_at)
+		VALUES(gen_random_uuid(),$3,$1,'shared','{"source":"beichen_website_group"}',now(),now(),now(),now()),
+		(gen_random_uuid(),$3,$1,'website-obsolete','{"source":"beichen_website_group"}',now(),now(),now(),now()),
+		(gen_random_uuid(),$3,$2,'shared','{"id":"shared"}',now(),now(),now(),now())`, first, second, provider)
+	applyBeichenTestMigrations(t, ctx, tx, sourceMigration)
+	checkSource := func(key uuid.UUID, model, wantSource, wantStatus string) {
+		t.Helper()
+		var source, status string
+		err := tx.QueryRowContext(ctx, "SELECT catalog_source,status FROM provider_model_catalog WHERE credential_id=$1 AND model_id=$2", key, model).Scan(&source, &status)
+		if err != nil || source != wantSource || status != wantStatus {
+			t.Fatalf("%s: expected %s/%s, got %s/%s (%v)", model, wantSource, wantStatus, source, status, err)
+		}
+	}
+	checkSource(first, "shared", "website", "active")
+	checkSource(second, "shared", "key", "active")
 	execTestSQL(t, ctx, tx, `INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
 		VALUES($1,'school-alias','Alias','active',1000,now(),now()),
 		(gen_random_uuid(),'special','Special','pending_configuration',NULL,now(),now())`, alias)
@@ -75,13 +94,15 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 		if err != nil {
 			t.Fatalf("fetch catalog: %v", err)
 		}
-		if _, err := catalog.ReplaceCredentialEntries(ctx, tx, provider, id, entries, s.now().UTC()); err != nil {
+		if err := saveKeyCatalog(ctx, tx, syncJob{provider: provider, credential: id}, entries, s.now().UTC()); err != nil {
 			t.Fatal(err)
 		}
 	}
 	snapshot(first, `{"data":[{"id":"shared"},{"id":"removed"}]}`)
 	snapshot(first, `{"data":[{"id":"shared"},{"id":"special"},{"id":"no-quote"}]}`)
 	snapshot(second, `{"data":[{"id":"shared"}]}`)
+	checkSource(first, "shared", "key", "active")
+	checkSource(first, "website-obsolete", "website", "inactive")
 	// A previous price, another key's quote and even an explicit zero have distinct meanings.
 	execTestSQL(t, ctx, tx, `INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate)
 		VALUES($1,'shared','upstream','effective','billing',0,4),($2,'shared','upstream','effective','billing',19,7),
@@ -100,7 +121,7 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 	}
 	rows := read()
 	a, b := rows[first]["shared"], rows[second]["shared"]
-	if len(rows[first]) != 3 || len(rows[second]) != 1 || !a.RouteReady || b.RouteReady ||
+	if len(rows[first]) != 3 || len(rows[second]) != 1 || a.CatalogSource != "key" || b.CatalogSource != "key" || !a.RouteReady || b.RouteReady ||
 		a.SchoolStatus != "active" || b.SchoolStatus != "not_configured" || a.PriceStatus != "confirmed" ||
 		a.UpstreamRates == nil || *a.UpstreamRates.Input != "0" || b.UpstreamRates == nil || *b.UpstreamRates.Input != "19" {
 		t.Fatalf("incorrect per-key route or price: %+v", rows)
@@ -259,14 +280,16 @@ VALUES(gen_random_uuid(),$1,$2,'Mixed',now(),now(),now(),now()),
 	exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,cache_read_rate,cache_write_rate,actor_id)
 VALUES($1,'Mixed','upstream','effective','billing',0,2000000,0,0,NULL),
  ($1,'manual','school','manual','teacher',1000000,1000000,0,0,$2)`, first, actor)
-	base := time.Date(2026, 1, 1, 0, 0, 0, 0, beijing)
+	base := time.Now().UTC().Add(-4 * time.Minute).Truncate(time.Microsecond)
+	exec("UPDATE provider_credentials SET updated_at=$3 WHERE id IN ($1,$2)", first, second, base)
 	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success,last_error,failure_count,next_attempt)
 VALUES($1,'catalog',$3,NULL,0,'-infinity'),
  ($1,'billing',$3+interval '1 minute','账单同步失败',2,$3+interval '7 minutes'),
  ($1,'key_usage',$3+interval '2 minutes','较早的用量同步失败',1,$3+interval '5 minutes'),
  ($1,'usage',$3+interval '3 hours','旧公开账单读取失败',1,$3+interval '1 day'),
  ($1,'prices',$3+interval '3 minutes',NULL,0,'-infinity'),
- ($2,'catalog',NULL,'目录同步失败',0,'-infinity')`, first, second, base)
+ ($2,'catalog',$3,NULL,0,'-infinity'),
+ ($2,'prices',NULL,'价格同步失败',0,'-infinity')`, first, second, base)
 
 	service := New(db, nil)
 	view, err := service.Overview(ctx, provider, "2026-01-01")

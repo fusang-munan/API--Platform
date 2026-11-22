@@ -40,6 +40,7 @@ type Dataset struct {
 type Model struct {
 	CredentialID         uuid.UUID       `json:"credential_id"`
 	Model                string          `json:"model"`
+	CatalogSource        string          `json:"catalog_source,omitempty"`
 	Mode                 string          `json:"mode"`
 	SchoolStatus         string          `json:"school_status"`
 	RouteReady           bool            `json:"route_ready"`
@@ -53,7 +54,8 @@ type Model struct {
 	PriceCovered         bool            `json:"price_covered"`
 
 	available          bool
-	currentKey         bool
+	currentKey         bool // the saved row belongs to this revision of the credential
+	catalogCurrent     bool // the Key catalog can support current probe status
 	protocols          []string
 	probeState         string
 	lastProbeAt        *time.Time
@@ -132,6 +134,8 @@ type CatalogModel struct {
 	CredentialIDs    []uuid.UUID       `json:"credential_ids"`
 	PreferredRoutes  []PreferredRoute  `json:"preferred_routes"`
 	KeyCount         int               `json:"key_count"`
+	CurrentKeyCount  int               `json:"current_key_count,omitempty"`
+	StaleKeyCount    int               `json:"stale_key_count,omitempty"`
 	Source           string            `json:"source,omitempty"`
 	CatalogState     string            `json:"catalog_state"`
 	CatalogKeys      []CatalogKey      `json:"catalog_keys,omitempty"`
@@ -331,9 +335,9 @@ func (view *Overview) billingByCredential() map[uuid.UUID]Dataset {
 
 func readModels(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Overview) error {
 	rows, err := tx.QueryContext(ctx, `
-SELECT m.credential_id, m.model_id::text, p.mode,
+SELECT m.credential_id, m.model_id::text, m.catalog_source, p.mode,
   COALESCE(route.school_status, named.status, 'not_configured'),
-  owner.status = 'active' AND c.status = 'active' AND COALESCE(route.binding_ready, false),
+  owner.status = 'active' AND c.status = 'active' AND m.last_seen_at >= c.updated_at AND COALESCE(route.binding_ready, false),
   CASE WHEN version.source='derived_from_usage' AND p.upstream_input IS NOT NULL THEN
        jsonb_strip_nulls(jsonb_build_object('billing_mode','token',
         'input_price',trim_scale(version.input_rate * 0.000000000001::numeric),
@@ -349,12 +353,15 @@ SELECT m.credential_id, m.model_id::text, p.mode,
   trim_scale(p.school_input * f.factor)::text, trim_scale(p.school_output * f.factor)::text,
   trim_scale(p.school_cache_read * f.factor)::text, trim_scale(p.school_cache_write * f.factor)::text,
   owner.status = 'active' AND c.status = 'active', m.last_seen_at >= c.updated_at,
-  m.raw_entry, to_json(m.supported_protocols),
+  key_catalog.current, m.raw_entry, to_json(m.supported_protocols),
   probe.checked_at, COALESCE(probe.passed, false), COALESCE(probe.credential_rejected, false),
   `+activationFixedSchoolPriceSQL+`
 FROM provider_model_catalog m
 JOIN provider_credentials c ON c.id = m.credential_id AND c.provider_id = m.provider_id
 JOIN providers owner ON owner.id = c.provider_id
+LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='catalog'
+CROSS JOIN LATERAL (SELECT m.catalog_source='key' AND m.last_seen_at >= c.updated_at
+  AND `+keyCatalogCurrentSQL+` AS current) key_catalog
 LEFT JOIN models named ON named.model_id = m.model_id
 LEFT JOIN LATERAL (
   SELECT expires_at, credential_revision, credential_ciphertext_sha256, model_pricing FROM beichen_panel_snapshots
@@ -392,10 +399,10 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 		var upstream, school DisplayRates
 		var terms, rawEntry, protocols []byte
 		var passed, fixedPrice bool
-		err := rows.Scan(&model.CredentialID, &model.Model, &model.Mode,
+		err := rows.Scan(&model.CredentialID, &model.Model, &model.CatalogSource, &model.Mode,
 			&model.SchoolStatus, &model.RouteReady, &terms, &model.PriceSource, &model.PriceObservedAt,
 			&upstream.Input, &upstream.Output, &upstream.CacheRead, &upstream.CacheWrite,
-			&school.Input, &school.Output, &school.CacheRead, &school.CacheWrite, &model.available, &model.currentKey, &rawEntry, &protocols,
+			&school.Input, &school.Output, &school.CacheRead, &school.CacheWrite, &model.available, &model.currentKey, &model.catalogCurrent, &rawEntry, &protocols,
 			&model.lastProbeAt, &passed, &model.credentialRejected, &fixedPrice)
 		if err != nil {
 			return err
@@ -406,6 +413,9 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 		}
 		model.protocols = catalog.RegisteredProtocols(entry)
 		model.probeState = "unprobed"
+		if !model.catalogCurrent {
+			model.lastProbeAt = nil
+		}
 		if model.lastProbeAt != nil {
 			at := model.lastProbeAt.UTC()
 			model.lastProbeAt = &at
@@ -463,7 +473,13 @@ func (m *Model) catalogPriceState() string {
 }
 
 func readCredentials(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Overview) error {
-	counts := credentialModelCounts(view.Models)
+	keyModels := make([]Model, 0, len(view.Models))
+	for _, row := range view.Models {
+		if row.CatalogSource == "key" {
+			keyModels = append(keyModels, row)
+		}
+	}
+	counts := credentialModelCounts(keyModels)
 	billing := view.billingByCredential()
 	datasetErrors := make(map[uuid.UUID]map[string]*string)
 	for _, data := range view.Datasets {
@@ -595,7 +611,7 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 		if row == nil {
 			continue
 		}
-		if !row.available {
+		if !row.available || !row.currentKey {
 			continue
 		}
 		item.PriceCovered = item.PriceCovered || row.PriceCovered

@@ -34,6 +34,7 @@ type WebsiteLocation struct {
 	ChannelID            int64          `json:"channel_id,omitempty"`
 	Channel              string         `json:"channel,omitempty"`
 	Platform             string         `json:"platform,omitempty"`
+	PriceScope           string         `json:"price_scope"`
 	Groups               []WebsiteGroup `json:"groups"`
 	ObservedAt           time.Time      `json:"observed_at"`
 	HasPrice             bool           `json:"has_price"`
@@ -56,7 +57,8 @@ type CatalogKey struct {
 	Stale          bool   `json:"stale,omitempty"`
 }
 
-const keyCatalogCurrentSQL = `(d.last_error IS NULL AND COALESCE(d.last_success >= c.updated_at, false))`
+const keyCatalogCurrentSQL = `(d.last_error IS NULL AND COALESCE(
+  d.last_success >= c.updated_at AND d.last_success > statement_timestamp() - interval '30 minutes', false))`
 
 func saveWebsiteCatalog(ctx context.Context, tx *sql.Tx, credentialID uuid.UUID, revision time.Time, quote panelQuote) error {
 	if quote.websiteModels == nil {
@@ -82,6 +84,8 @@ type discoveryKey struct {
 	legacyGroup  *int64
 	legacyNames  []string
 	models       map[string]*Model
+	staleModels  []string
+	nonKeyNames  []string
 	matcher      catalogNameMatcher
 	groupCurrent bool
 	platforms    map[string]bool
@@ -94,7 +98,9 @@ SELECT c.id, c.label::text, COALESCE(school.channel,''), COALESCE(c.group_hint,'
   EXISTS (SELECT 1 FROM beichen_provision_channels prev JOIN provider_credentials old ON old.id=prev.credential_id
     WHERE prev.channel=school.channel AND old.provider_id=c.provider_id AND old.created_at<c.created_at),
   COALESCE(w.group_id,a.group_id), w.group_id, w.checked_at, to_json(w.models),
-  `+keyCatalogCurrentSQL+`, d.last_error IS NOT NULL
+  `+keyCatalogCurrentSQL+`, d.last_error IS NOT NULL, d.last_success IS NOT NULL,
+  to_json(ARRAY(SELECT m.model_id::text FROM provider_model_catalog m
+    WHERE m.credential_id=c.id AND m.status='active' AND m.catalog_source<>'key'))
 FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
 LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = 'catalog'
 LEFT JOIN beichen_website_catalogs w ON w.credential_id = c.id AND w.credential_revision = c.updated_at
@@ -109,10 +115,13 @@ ORDER BY c.label, c.id`, provider)
 	var keys []discoveryKey
 	for rows.Next() {
 		key := discoveryKey{models: map[string]*Model{}}
-		var website []byte
-		var scanned, failed bool
+		var website, nonKeyModels []byte
+		var scanned, failed, previouslyScanned bool
 		if err := rows.Scan(&key.CredentialID, &key.Label, &key.SchoolChannel, &key.hint, &key.Replacement,
-			&key.GroupID, &key.legacyGroup, &key.legacyAt, &website, &scanned, &failed); err != nil {
+			&key.GroupID, &key.legacyGroup, &key.legacyAt, &website, &scanned, &failed, &previouslyScanned, &nonKeyModels); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(nonKeyModels, &key.nonKeyNames); err != nil {
 			return nil, err
 		}
 		switch {
@@ -121,7 +130,7 @@ ORDER BY c.label, c.id`, provider)
 		case failed:
 			key.State, key.Stale = "failed", true
 		default:
-			key.State = "pending"
+			key.State, key.Stale = "pending", previouslyScanned
 		}
 		if key.legacyAt != nil {
 			at := key.legacyAt.UTC()
@@ -158,10 +167,14 @@ func readCatalogDifferences(ctx context.Context, tx *sql.Tx, provider uuid.UUID,
 			name := strings.ToLower(model.Name)
 			location := WebsiteLocation{
 				Name: model.Name, ChannelID: section.ChannelID, Channel: section.Channel, Platform: section.Platform,
+				PriceScope: "platform",
 				Groups:     websiteGroups(directoryModelGroups(section, model)),
 				ObservedAt: model.ObservedAt, HasPrice: hasPanelPrice(model.Pricing),
 				PriceComplete: usage.BeichenDirectoryQuoteBlocker(model.Pricing) == "",
 				Stale:         stale, channelStatus: section.ChannelStatus,
+			}
+			if model.GroupID != 0 {
+				location.PriceScope = "group"
 			}
 			if location.HasPrice {
 				decoder := json.NewDecoder(bytes.NewReader(usage.BeichenPanelDisplayTerms(model.Pricing)))
@@ -185,7 +198,7 @@ func readCatalogDifferences(ctx context.Context, tx *sql.Tx, provider uuid.UUID,
 			for _, name := range names {
 				lower := strings.ToLower(name)
 				web[lower] = append(web[lower], WebsiteLocation{
-					Name: name, Groups: []WebsiteGroup{{ID: *key.GroupID}}, ObservedAt: *checked,
+					Name: name, PriceScope: "group", Groups: []WebsiteGroup{{ID: *key.GroupID}}, ObservedAt: *checked,
 				})
 			}
 		}
@@ -261,12 +274,29 @@ func indexDiscoveryKeys(models []Model, keys []discoveryKey, aliases []ModelAlia
 	}
 	for i := range models {
 		row := &models[i]
-		if key := index[row.CredentialID]; key != nil && row.available && row.currentKey {
+		key := index[row.CredentialID]
+		if key == nil || !row.available || !row.currentKey {
+			continue
+		}
+		// The crawler reads only names from the same database snapshot.
+		if row.CatalogSource == "" && key.nonKeyNames != nil && !slices.Contains(key.nonKeyNames, row.Model) {
+			row.CatalogSource = "key"
+		}
+		if row.CatalogSource != "key" {
+			continue
+		}
+		if key.State == "missing" {
 			key.models[row.Model] = row
+		} else if key.Stale {
+			key.staleModels = append(key.staleModels, row.Model)
 		}
 	}
 	for i := range keys {
 		key := &keys[i]
+		// A legacy website snapshot may have recorded catalog success.
+		if key.State == "missing" && len(key.nonKeyNames) != 0 && len(key.models) == 0 {
+			key.State, key.Stale = "pending", true
+		}
 		mapping := map[string]string{}
 		// readModelAliases orders provider-wide defaults before Key overrides.
 		for _, alias := range aliases {

@@ -170,6 +170,24 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 			return response(http.StatusServiceUnavailable, nil)
 		}
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if r.URL.String() == origin+modelsPath {
+			for i, secret := range secrets {
+				if token != secret {
+					continue
+				}
+				entries := []map[string]string{{"id": "shared"}}
+				switch i {
+				case 0:
+					entries = append(entries, map[string]string{"id": "tiered"}, map[string]string{"id": "listed-without-price"})
+					if round >= 3 {
+						entries = append(entries, map[string]string{"id": "new-model"})
+					}
+				case 1:
+					entries = append(entries, map[string]string{"id": "mixed-model"})
+				}
+				return response(http.StatusOK, map[string]any{"data": entries})
+			}
+		}
 		if r.URL.Host == "beichenapi.com" {
 			if round == 2 && token == "initial-access" {
 				return response(http.StatusUnauthorized, nil)
@@ -179,6 +197,12 @@ VALUES($1,$2,$3,$4)`, ids[i], name, bytes.Repeat([]byte{byte(i)}, 32), i != 3)
 				return nil, fmt.Errorf("wrong website authorization")
 			}
 			switch r.URL.Path {
+			case "/api/v1/groups/rates":
+				rates := make(map[int]json.Number, len(currentGroups))
+				for i, group := range currentGroups {
+					rates[group] = useAmount(multipliers[i])
+				}
+				return response(http.StatusOK, map[string]any{"code": 0, "data": rates})
 			case "/api/v1/channels/available":
 				websiteReads.Add(1)
 				return response(200, websiteBody())

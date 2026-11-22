@@ -112,13 +112,17 @@ func (s *Store) StartAttempt(ctx context.Context, r Reservation, route CallRoute
 func (s *Store) BeichenOutputPrice(ctx context.Context, route CallRoute) (string, error) {
 	var price sql.NullString
 	err := s.db.QueryRowContext(ctx, `SELECT
-		trim_scale(p.school_output * CASE WHEN p.mode='manual' THEN 0.00000001 ELSE 0.000001 END *
-		CASE WHEN EXISTS (
-			SELECT 1 FROM beichen_provision_channels school
-			JOIN provider_credentials pc ON pc.id=school.credential_id
-			WHERE school.credential_id=$1 AND pc.provider_id=$3
-		) THEN 1.10 ELSE 1 END)::text
-		FROM beichen_price_at($1,$2,statement_timestamp()) p`, route.CredentialID, route.UpstreamModelName, route.ProviderID).
+		trim_scale(CASE WHEN p.mode='manual' OR version.source IS DISTINCT FROM $4 THEN
+			p.school_output * CASE WHEN p.mode='manual' THEN 0.00000001 ELSE 0.000001 END *
+			CASE WHEN EXISTS (
+				SELECT 1 FROM beichen_provision_channels school
+				JOIN provider_credentials pc ON pc.id=school.credential_id
+				WHERE school.credential_id=$1 AND pc.provider_id=$3
+			) THEN 1.10 ELSE 1 END
+		END)::text
+		FROM beichen_price_at($1,$2,statement_timestamp()) p
+		LEFT JOIN beichen_price_versions version ON version.id=p.upstream_version`,
+		route.CredentialID, route.UpstreamModelName, route.ProviderID, derivedPriceSource).
 		Scan(&price)
 	return price.String, err
 }

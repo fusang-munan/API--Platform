@@ -225,9 +225,15 @@ WHERE c.id = $1 AND p.id = $2 AND p.status = 'active' AND c.status = 'active' AN
 	key, err := s.crypto.DecryptCredential(credential.ciphertext)
 	if err != nil {
 		result := fetchResult{err: errors.New("北辰凭据解密失败")}
-		if job.kind == "billing" {
+		if job.kind == "billing" || job.kind == "catalog" {
 			result.save = func(ctx context.Context, tx *sql.Tx) error {
-				return saveBillingObservation(ctx, tx, job.credential, credential.updatedAt, billingInfo{}, result.err, 0, panelQuote{})
+				if err := recordDatasetError(ctx, tx, job.credential, "catalog", result.err.Error()); err != nil {
+					return err
+				}
+				if job.kind == "billing" {
+					return saveBillingObservation(ctx, tx, job.credential, credential.updatedAt, billingInfo{}, result.err, 0, panelQuote{})
+				}
+				return nil
 			}
 		}
 		if job.kind == "key_usage" {
@@ -250,23 +256,17 @@ UPDATE beichen_key_observations SET models_error=$3,usage_error=$3 WHERE credent
 func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credentialRecord, key string, manual bool) fetchResult {
 	switch job.kind {
 	case "catalog":
+		result := s.fetchKeyCatalogJob(ctx, job, key)
 		if !job.websiteCatalog {
-			entries, err := s.fetchKeyCatalog(ctx, key)
-			at := s.now().UTC()
-			return fetchResult{err: err, save: func(ctx context.Context, tx *sql.Tx) error {
-				if err != nil {
-					return recordDatasetError(ctx, tx, job.credential, "catalog", err.Error())
-				}
-				return saveKeyCatalog(ctx, tx, job, entries, at)
-			}}
+			return result
 		}
-		directory, err := s.readCredentialWebsiteCatalog(ctx, job.credential, key)
-		return fetchResult{err: err, save: func(ctx context.Context, tx *sql.Tx) error {
-			if err != nil {
-				return recordDatasetError(ctx, tx, job.credential, "catalog", err.Error())
-			}
-			if err := saveKeyCatalog(ctx, tx, job, directory.entries, directory.at); err != nil {
+		directory, websiteErr := s.readCredentialWebsiteCatalog(ctx, job.credential, key)
+		return fetchResult{err: errors.Join(result.err, websiteErr), save: func(ctx context.Context, tx *sql.Tx) error {
+			if err := result.save(ctx, tx); err != nil {
 				return err
+			}
+			if websiteErr != nil {
+				return nil
 			}
 			return saveWebsiteCatalog(ctx, tx, job.credential, credential.updatedAt, directory.catalogQuote())
 		}}
@@ -281,11 +281,13 @@ func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credenti
 
 func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision time.Time, key string) fetchResult {
 	startedAt := s.now().UTC()
-	directory, catalogErr := s.readBillingCatalog(ctx, job, key)
+	keyResults := make(chan fetchResult, 1)
+	go func() { keyResults <- s.fetchKeyCatalogJob(ctx, job, key) }()
+	directory, websiteErr := s.readBillingCatalog(ctx, job, key)
 	var info billingInfo
 	var quote panelQuote
-	billingErr := catalogErr
-	if catalogErr == nil {
+	billingErr := websiteErr
+	if websiteErr == nil {
 		info, quote, billingErr = directory.billing()
 	}
 	partialErr := quote.err
@@ -294,23 +296,31 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 		// website quote remains unavailable and is reported separately.
 		partialErr = nil
 	}
-	return fetchResult{err: billingErr, partialErr: partialErr, save: func(ctx context.Context, tx *sql.Tx) error {
+	keyResult := <-keyResults
+	return fetchResult{err: billingErr, partialErr: errors.Join(partialErr, keyResult.err), save: func(ctx context.Context, tx *sql.Tx) error {
 		if err := saveBillingGroup(ctx, tx, job.credential, revision, startedAt, directory, billingErr); err != nil {
 			return err
 		}
-		if catalogErr != nil {
-			if err := recordDatasetError(ctx, tx, job.credential, "catalog", catalogErr.Error()); err != nil {
-				return err
-			}
-		} else {
-			if err := saveKeyCatalog(ctx, tx, job, directory.entries, directory.at); err != nil {
-				return err
-			}
+		if err := keyResult.save(ctx, tx); err != nil {
+			return err
+		}
+		if websiteErr == nil {
 			if err := saveWebsiteCatalog(ctx, tx, job.credential, revision, directory.catalogQuote()); err != nil {
 				return err
 			}
 		}
 		return saveBillingObservation(ctx, tx, job.credential, revision, info, billingErr, quote.groupID, quote)
+	}}
+}
+
+func (s *Service) fetchKeyCatalogJob(ctx context.Context, job syncJob, key string) fetchResult {
+	entries, err := s.fetchKeyCatalog(ctx, key)
+	at := s.now().UTC()
+	return fetchResult{err: err, save: func(ctx context.Context, tx *sql.Tx) error {
+		if err != nil {
+			return recordDatasetError(ctx, tx, job.credential, "catalog", err.Error())
+		}
+		return saveKeyCatalog(ctx, tx, job, entries, at)
 	}}
 }
 
@@ -435,22 +445,25 @@ WITH observation AS (
     NULLIF($6::text, '')::numeric AS group_rate, $7::boolean AS peak_enabled,
     NULLIF($8::text, '')::numeric AS peak_rate, NULLIF($9::text, '') AS peak_start,
     NULLIF($10::text, '') AS peak_end, $11::timestamptz AS observed_at
-)
-INSERT INTO beichen_multiplier_versions
-  (credential_id, multiplier, timezone, effective_at, group_id, group_rate, peak_enabled, peak_rate, peak_start, peak_end, observed_at)
-SELECT observation.* FROM observation
-WHERE NOT EXISTS (
-  SELECT 1 FROM (
-    SELECT * FROM beichen_multiplier_versions WHERE credential_id = $1
+), reused AS (
+  UPDATE beichen_multiplier_versions previous
+  SET observed_at = GREATEST(previous.observed_at, observation.observed_at)
+  FROM observation
+  WHERE previous.id = (
+    SELECT id FROM beichen_multiplier_versions WHERE credential_id = observation.credential_id
     ORDER BY effective_at DESC, id DESC LIMIT 1
-  ) previous
-  WHERE previous.stale_at IS NULL AND
+  ) AND previous.stale_at IS NULL AND
     ROW(previous.multiplier, previous.timezone, previous.group_id, previous.group_rate, previous.peak_enabled,
         previous.peak_rate, previous.peak_start, previous.peak_end)
     IS NOT DISTINCT FROM
     ROW(observation.multiplier, observation.timezone, observation.group_id, observation.group_rate, observation.peak_enabled,
         observation.peak_rate, observation.peak_start, observation.peak_end)
-)`, credentialID, info.Multiplier.String(), info.Timezone, effectiveAt, billingPanelGroup(info),
+  RETURNING previous.id
+)
+INSERT INTO beichen_multiplier_versions
+  (credential_id, multiplier, timezone, effective_at, group_id, group_rate, peak_enabled, peak_rate, peak_start, peak_end, observed_at)
+SELECT observation.* FROM observation
+WHERE NOT EXISTS (SELECT 1 FROM reused)`, credentialID, info.Multiplier.String(), info.Timezone, effectiveAt, billingPanelGroup(info),
 		info.GroupRate.String(), info.PeakEnabled, info.PeakRate.String(), info.PeakStart, info.PeakEnd, observedAt)
 	return err
 }

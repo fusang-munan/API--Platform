@@ -1,7 +1,7 @@
 import { DOMWrapper, enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { defineComponent } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { BeichenBatchEnableResult, BeichenCatalogModel, BeichenModelCapability, BeichenModelUsage, BeichenOverview, BeichenRebindPlan, BeichenUsageRange, BeichenUsageTotals, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../../api/types'
+import type { BeichenBatchEnableResult, BeichenCatalogModel, BeichenModelCapability, BeichenModelUsage, BeichenOverview, BeichenPriceConditions, BeichenRebindPlan, BeichenUsageRange, BeichenUsageTotals, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../../api/types'
 import BeichenPriceDrawer from '../../components/BeichenPriceDrawer.vue'
 import BeichenSchoolModels from './BeichenSchoolModels.vue'
 import componentSource from './BeichenSchoolModels.vue?raw'
@@ -70,6 +70,17 @@ function usage(range: BeichenUsageRange = 'month'): BeichenModelUsage {
     keys: [{ api_key_id: 'school-key', api_key_name: '学校 Key 甲', user_id: 'student-a', user_name: '学生甲', project_name: '教学项目', credits: '33', tokens: 2000, calls: 8 }],
   }
 }
+function pricedLocation(id: number, name: string, rate: string, input: string, output: string,
+  channel?: string, complete = true, priceScope?: 'platform' | 'group') {
+  return {
+    name: 'model', platform: 'test', observed_at: '2026-11-21T12:00:00Z',
+    groups: [{ id, name, status: 'active', rate_multiplier: rate }],
+    has_price: true, price_complete: complete,
+    price_conditions_exact: { billing_mode: 'token', input_price: input, output_price: output },
+    ...(channel ? { channel } : {}),
+    ...(priceScope ? { price_scope: priceScope } : {}),
+  }
+}
 function view(props: { query?: string; commonIds?: Set<string> } = {}) {
   return mount(BeichenSchoolModels, { props: { providerId: 'north', ...props }, global: { stubs } })
 }
@@ -77,9 +88,6 @@ function button(root: Pick<DOMWrapper<Element>, 'findAll'>, label: string) {
   const target = root.findAll('button').find(node => node.text() === label)
   if (!target) throw new Error('没有找到按钮 ' + label)
   return target
-}
-function quoteAmounts(row: Pick<DOMWrapper<Element>, 'get'>, key: string) {
-  return row.get('.quote-table [data-key="' + key + '"]').findAll('td').map(cell => cell.text().replace(/\s+/g, ' '))
 }
 function currentGroupAmounts(row: Pick<DOMWrapper<Element>, 'get'>, key: string) {
   return row.get('.current-group-prices table').findAll(`tbody [data-price="${key}"]`).map(cell => cell.text())
@@ -149,8 +157,8 @@ describe('北辰模型管理', () => {
       } },
     ])
     data.datasets = [
-      { kind: 'billing', credential_id: 'key-' + claude, group_id: 16, group_status: 'assigned',
-        billing_state: 'current', effective_multiplier: 0.4, effective_multiplier_text: '0.6' },
+      { kind: 'billing', credential_id: 'key-' + claude, group_id: 16, group_rate: '0.6', group_status: 'assigned',
+        billing_state: 'current', effective_multiplier: 0.4, effective_multiplier_text: '0.6', observed_at: observedAt },
       { kind: 'billing', credential_id: 'key-' + gpt, group_id: 11, group_status: 'assigned', group_rate: '0.2',
         billing_state: 'current', effective_multiplier: '0.16', observed_at: observedAt },
     ]
@@ -161,7 +169,7 @@ describe('北辰模型管理', () => {
     data.model_catalog![1].preferred_routes![0].effective_multiplier_text = null
     api.beichenOverview.mockResolvedValue(data)
     api.beichenWebsiteKeys.mockResolvedValue(websiteKeys(
-      { credential_id: 'key-' + claude, group_id: 16, group_name: 'Claude 分组', rate: '0.6' },
+      { credential_id: 'key-' + claude, group_id: 16, group_name: 'Claude 分组', rate: '0.6', observed_at: observedAt },
       { credential_id: 'key-' + gpt, group_id: 11, group_name: 'GPT 分组', rate: '0.2', observed_at: observedAt },
     ))
     const wrapper = view()
@@ -184,13 +192,166 @@ describe('北辰模型管理', () => {
     expect(wrapper.text()).toContain('学生扣费 = 结算价 × 1.10；100 积分 = 1 元')
     expect(wrapper.text()).not.toContain('当前 Key 报价待核对')
 
-    expect(gptRow.get('[data-group-id="11"] button').attributes('aria-expanded')).toBe('true')
-    const other = gptRow.get('.other-groups [data-group-id="8"]')
-    expect(other.get('button').attributes('aria-expanded')).toBe('false')
-    await other.get('button').trigger('click')
-    expect(other.get('[data-price-row="student"] [data-price="cache_read"]').text()).toBe('4.4')
-    await other.get('button').trigger('click')
-    expect(other.find('table').exists()).toBe(false)
+    expect(gptRow.findAll('.current-group-prices table')).toHaveLength(1)
+    expect(gptRow.find('.other-groups').exists()).toBe(false)
+    expect(gptRow.findAll('.group-price-summary')).toHaveLength(0)
+    expect(gptRow.text()).not.toContain('0.15×')
+  })
+
+  it('主表只显示四把 Key 探测到的 10 个模型，官网-only 和异常默认不出现', async () => {
+    const families = [
+      { model: 'gpt-6.2-astra', key: 'key-gpt', group: 11, groupName: 'GPT 分组', rate: '0.2',
+        input: '0.000008', output: '0.00004' },
+      { model: 'glm-5.3', key: 'key-cn', group: 20, groupName: '国模分组', rate: '1',
+        input: '0.00000016', output: '0.00000064' },
+      { model: 'deepseek-v4.1', key: 'key-cn', group: 20, groupName: '国模分组', rate: '1',
+        input: '0.0000002', output: '0.0000008' },
+      { model: 'kimi-k2.5', key: 'key-cn', group: 20, groupName: '国模分组', rate: '1',
+        input: '0.0000003', output: '0.0000012' },
+      { model: 'qwen3.5-max', key: 'key-cn', group: 20, groupName: '国模分组', rate: '1',
+        input: '0.0000004', output: '0.0000016' },
+      { model: 'gemini-3.7-pro', key: 'key-cn', group: 20, groupName: '国模分组', rate: '1',
+        input: '0.0000005', output: '0.000002' },
+      { model: 'grok-4.5', key: 'key-cn', group: 20, groupName: '国模分组', rate: '1',
+        input: '0.0000006', output: '0.0000024' },
+      { model: 'doubao-2.5-pro', key: 'key-cn', group: 20, groupName: '国模分组', rate: '1',
+        input: '0.0000007', output: '0.0000028' },
+    ]
+    const claudeLocations = [
+      pricedLocation(2, '[CC1]Claudecode-kiro-015', '0.15', '0.000004', '0.00002', 'CC1', true, 'platform'),
+      pricedLocation(16, '[CC2]ClaudeCode高智', '0.6', '0.000009', '0.00002', undefined, false),
+    ]
+    const entries: Entry[] = [
+      { model: 'claude-opus-5-5', catalog: {
+        source: 'both', catalog_state: 'key_listed', credential_ids: ['key-cc2'], key_count: 1,
+        route_count: 1, ready_count: 1, activation: 'ready', protocols: ['anthropic'],
+        preferred_routes: [{ school_model: 'claude-opus-5-5', provider_id: 'north', credential_id: 'key-cc2',
+          adapter: 'anthropic', priority: 1, state: 'ready', effective_multiplier_text: '0.6' }],
+        catalog_keys: [{ credential_id: 'key-cc2', label: 'CC2', state: 'listed', group_id: 16, upstream_model: 'claude-opus-5-5' }],
+        website_locations: claudeLocations,
+      } },
+      { model: 'claude-sonnet-5-5', catalog: {
+        source: 'both', catalog_state: 'key_listed', credential_ids: ['key-cc2'], key_count: 1,
+        route_count: 1, ready_count: 1, activation: 'ready', protocols: ['anthropic'],
+        preferred_routes: [{ school_model: 'claude-sonnet-5-5', provider_id: 'north', credential_id: 'key-cc2',
+          adapter: 'anthropic', priority: 1, state: 'ready', effective_multiplier_text: '0.6' }],
+        catalog_keys: [{ credential_id: 'key-cc2', label: 'CC2', state: 'listed', group_id: 16, upstream_model: 'claude-sonnet-5-5' }],
+        website_locations: [
+          pricedLocation(2, '[CC1]Claudecode-kiro-015', '0.15', '0.000002', '0.00001', 'CC1', true, 'platform'),
+          pricedLocation(16, '[CC2]ClaudeCode高智', '0.6', '0.000003', '0.000015', undefined, false),
+        ],
+      } },
+      ...families.map((family): Entry => ({ model: family.model, catalog: {
+        source: 'both', catalog_state: 'key_listed', credential_ids: [family.key], key_count: 1,
+        route_count: 1, ready_count: 1, activation: 'ready', protocols: ['openai_compatible'],
+        preferred_routes: [{ school_model: family.model, provider_id: 'north', credential_id: family.key,
+          adapter: 'openai_compatible', priority: 1, state: 'ready', effective_multiplier_text: family.rate }],
+        catalog_keys: [{ credential_id: family.key, label: 'Key', state: 'listed', group_id: family.group, upstream_model: family.model }],
+        website_locations: [pricedLocation(family.group, family.groupName, family.rate, family.input, family.output)],
+      } })),
+    ]
+    const data = overview(entries)
+    data.credentials = [
+      { credential_id: 'key-cc1', label: 'CC1', status: 'active' },
+      { credential_id: 'key-cc2', label: 'CC2', status: 'active' },
+      { credential_id: 'key-gpt', label: 'GPT', status: 'active' },
+      { credential_id: 'key-cn', label: '国模', status: 'active' },
+    ]
+    const keyFor = new Map(entries.map(entry => [entry.model, entry.catalog?.preferred_routes?.[0]?.credential_id ?? '']))
+    data.models = data.models!.map(row => ({ ...row, credential_id: keyFor.get(row.model) ?? row.credential_id }))
+    data.model_catalog!.push({
+      model: 'claude-fable-5', source: 'website', catalog_state: 'website_only', key_count: 0,
+      route_count: 0, protocols: [], can_enable: false,
+      website_locations: [pricedLocation(2, '[CC1]Claudecode-kiro-015', '0.15', '0.000004', '0.00002', 'CC1', true, 'platform')],
+    })
+    data.model_catalog!.push({
+      model: 'claude-opus-5-legacy', school_status: 'active', source: 'key', catalog_state: 'catalog_missing',
+      credential_ids: [], key_count: 0, route_count: 0, ready_count: 0, protocols: [], can_enable: false,
+      binding_issue: { code: 'catalog_missing', message: '已发布，但四把 Key 当前目录都没有它。' },
+    })
+    data.datasets = [
+      { kind: 'billing', credential_id: 'key-cc1', group_id: 2, group_rate: '0.15', group_status: 'assigned',
+        billing_state: 'current', effective_multiplier: '0.15', observed_at: '2026-11-21T12:05:00Z' },
+      { kind: 'billing', credential_id: 'key-cc2', group_id: 16, group_rate: '0.6', group_status: 'assigned',
+        billing_state: 'current', effective_multiplier: '0.6', observed_at: '2026-11-21T12:05:00Z' },
+      { kind: 'billing', credential_id: 'key-gpt', group_id: 11, group_rate: '0.2', group_status: 'assigned',
+        billing_state: 'current', effective_multiplier: '0.2', observed_at: '2026-11-21T12:05:00Z' },
+      { kind: 'billing', credential_id: 'key-cn', group_id: 20, group_rate: '1', group_status: 'assigned',
+        billing_state: 'current', effective_multiplier: '1', observed_at: '2026-11-21T12:05:00Z' },
+    ]
+    api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys(
+      { credential_id: 'key-cc1', group_id: 2, group_name: '[CC1]Claudecode-kiro-015', rate: '0.15', observed_at: '2026-11-21T12:00:00Z' },
+      { credential_id: 'key-cc2', group_id: 16, group_name: '[CC2]ClaudeCode高智', rate: '0.6', observed_at: '2026-11-21T12:00:00Z' },
+      { credential_id: 'key-gpt', group_id: 11, group_name: 'GPT 分组', rate: '0.2', observed_at: '2026-11-21T12:00:00Z' },
+      { credential_id: 'key-cn', group_id: 20, group_name: '国模分组', rate: '1', observed_at: '2026-11-21T12:00:00Z' },
+    ))
+    const wrapper = view()
+    await flushPromises()
+
+    const rows = wrapper.findAll('.model-table > tbody > tr')
+    expect(rows).toHaveLength(10)
+    expect(rows.map(row => row.attributes('data-model'))).not.toContain('claude-fable-5')
+    expect(wrapper.text()).not.toContain('claude-fable-5')
+    expect(wrapper.get('.model-summary').text()).toContain('可探测模型10')
+    expect(wrapper.get('.model-summary').text()).toContain('官网目录1')
+    expect(wrapper.text()).not.toContain('[CC1]Claudecode-kiro-015 · 0.15×')
+    for (const price of wrapper.findAll('.current-group-prices')) expect(price.text()).not.toContain('0.15×')
+    expect(wrapper.find('.other-groups').exists()).toBe(false)
+    expect(wrapper.findAll('[data-testid="model-price-table"]')).toHaveLength(10)
+    for (const row of rows) {
+      expect(row.findAll('[data-testid="model-price-table"]')).toHaveLength(1)
+      expect(row.findAll('[data-testid="model-price-table"] thead th')).toHaveLength(6)
+      expect(row.findAll('[data-testid="model-price-table"] tbody [data-price-row]')).toHaveLength(2)
+    }
+    const opus = wrapper.get('[data-model="claude-opus-5-5"]')
+    expect(currentGroupAmounts(opus, 'input')).toEqual(['4', '264'])
+    expect(currentGroupAmounts(opus, 'output')).toEqual(['20', '1320'])
+    expect(opus.get('[data-testid="price-basis"]').text()).toBe('基础价来自 CC1 同名模型；当前 Key 分组 16 的倍率为 0.60×')
+    const sonnet = wrapper.get('[data-model="claude-sonnet-5-5"]')
+    expect(currentGroupAmounts(sonnet, 'input')).toEqual(['2', '132'])
+    expect(currentGroupAmounts(sonnet, 'output')).toEqual(['10', '660'])
+    const gpt = wrapper.get('[data-model="gpt-6.2-astra"]')
+    expect(currentGroupAmounts(gpt, 'input')).toEqual(['8', '176'])
+    expect(currentGroupAmounts(gpt, 'output')).toEqual(['40', '880'])
+    const domestic = wrapper.get('[data-model="glm-5.3"]')
+    expect(currentGroupAmounts(domestic, 'input')).toEqual(['0.16', '17.6'])
+    expect(currentGroupAmounts(domestic, 'output')).toEqual(['0.64', '70.4'])
+
+    expect(wrapper.find('[data-model="claude-opus-5-legacy"]').exists()).toBe(false)
+    await button(wrapper, '异常').trigger('click')
+    expect(wrapper.findAll('.model-table > tbody > tr').map(row => row.attributes('data-model')))
+      .toEqual(['claude-opus-5-legacy'])
+    expect(button(wrapper, '一键启用').element.disabled).toBe(true)
+    expect(wrapper.find('[data-model="claude-fable-5"]').exists()).toBe(false)
+    await button(wrapper, '全部').trigger('click')
+    expect(wrapper.findAll('.model-table > tbody > tr')).toHaveLength(10)
+  })
+
+  it('表头显示生效倍率：分组 0.24× 但账号 0.20× 时学生价按 0.20× 计算', async () => {
+    const model = 'gpt-6.2-astra'
+    const data = overview([{ model, catalog: {
+      source: 'both', catalog_state: 'key_listed', credential_ids: ['key-gpt'], key_count: 1,
+      website_locations: [pricedLocation(10, 'GPT 分组', '0.24', '0.000008', '0.00004')],
+      preferred_routes: [{ school_model: model, provider_id: 'north', credential_id: 'key-gpt',
+        adapter: 'openai_compatible', priority: 1, state: 'ready', effective_multiplier_text: '0.24' }],
+      catalog_keys: [{ credential_id: 'key-gpt', label: 'GPT', state: 'listed', group_id: 10, upstream_model: model }],
+    } }])
+    data.datasets = [{ credential_id: 'key-gpt', kind: 'billing', group_id: 10, group_rate: '0.24',
+      group_status: 'assigned', billing_state: 'current', effective_multiplier: 0.2, effective_multiplier_text: '0.2',
+      observed_at: '2026-11-21T13:00:00Z' }]
+    api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys({
+      credential_id: 'key-gpt', group_id: 10, group_name: 'GPT 分组', rate: '0.24', observed_at: '2026-11-21T12:00:00Z',
+    }))
+    const wrapper = view()
+    await flushPromises()
+
+    const row = wrapper.get('[data-model="' + model + '"]')
+    expect(row.get('.group-prices-head strong').text()).toBe('当前 Key 分组 10 · 生效 0.20×')
+    expect(row.get('[data-testid="rate-note"]').text()).toBe('分组 0.24× / 账号 0.20×')
+    expect(currentGroupAmounts(row, 'input')).toEqual(['8', '176'])
+    expect(currentGroupAmounts(row, 'output')).toEqual(['40', '880'])
   })
 
   it('在模型报价中区分分组权限、分组不存在、官方缺价和历史反推', async () => {
@@ -211,23 +372,24 @@ describe('北辰模型管理', () => {
       { credential_id: 'key-' + gemini, kind: 'prices', effective_multiplier: null, last_error: '账号无 group 5 权限' },
       { credential_id: 'key-lab/no-group', kind: 'billing', effective_multiplier: null, group_status: 'not_found' },
       { credential_id: 'key-lab/no-price', kind: 'billing', effective_multiplier: '0.5', billing_state: 'current',
-        group_status: 'assigned', group_id: 17, group_rate: '0.5' },
+        group_status: 'assigned', group_id: 17, group_rate: '0.5', observed_at: '2026-11-21T12:14:00Z' },
       { credential_id: 'key-lab/no-price', kind: 'prices', effective_multiplier: null, official_price_missing: true,
         last_error: '北辰渠道页没有当前 Key 的有效模型报价' },
       { credential_id: 'key-' + claude, kind: 'billing', effective_multiplier: '0.6', billing_state: 'current',
-        group_status: 'assigned', group_id: 16, group_rate: '0.6' },
+        group_status: 'assigned', group_id: 16, group_rate: '0.6', observed_at: '2026-11-21T12:14:00Z' },
     ]
     data.model_catalog![0].protocols = []
     data.model_catalog![0].website_locations = [{
-      name: gemini, observed_at: '2026-11-21T12:14:00Z', has_price: true, groups: [{ id: 5, rate_multiplier: '0.3' }],
+      name: gemini, observed_at: '2026-11-21T12:14:00Z', has_price: true, price_complete: true,
+      groups: [{ id: 5, rate_multiplier: '0.3' }],
       price_conditions_exact: { input_price: '0.000001', output_price: '0.000002' },
     }]
     api.beichenOverview.mockResolvedValue(data)
     api.beichenWebsiteKeys.mockResolvedValue(websiteKeys(
       { credential_id: 'key-' + gemini, group_id: 5, group_name: '[Gemini]国外豆包', rate: '0.3' },
       { credential_id: 'key-lab/no-group', group_id: null, group_name: null, rate: null },
-      { credential_id: 'key-lab/no-price', group_id: 17, group_name: '分组 17', rate: '0.5' },
-      { credential_id: 'key-' + claude, group_id: 16, group_name: '分组 16', rate: '0.6' },
+      { credential_id: 'key-lab/no-price', group_id: 17, group_name: '分组 17', rate: '0.5', observed_at: '2026-11-21T12:10:00Z' },
+      { credential_id: 'key-' + claude, group_id: 16, group_name: '分组 16', rate: '0.6', observed_at: '2026-11-21T12:10:00Z' },
     ))
     const wrapper = view()
     await flushPromises()
@@ -241,12 +403,13 @@ describe('北辰模型管理', () => {
     expect(noGroup.get('[data-testid="current-group-missing"]').text()).toBe('当前 Key 分组未匹配')
     const noPrice = wrapper.get('[data-model="lab/no-price"]')
     expect(noPrice.get('[data-testid="price-missing"]').text()).toBe('缺价 · 官方价表缺失')
-    expect(noPrice.get('.current-group-prices .group-prices-head strong').text()).toBe('当前分组 17 · 0.50×')
+    expect(noPrice.get('.current-group-prices .group-prices-head strong').text()).toBe('当前 Key 分组 17 · 生效 0.50×')
     expect(noPrice.find('[data-testid="current-group-missing"]').exists()).toBe(false)
     expect(currentGroupAmounts(noPrice, 'input')).toEqual(['未列', '—'])
     const claudeRow = wrapper.get(`[data-model="${claude}"]`)
-    expect(claudeRow.get('[data-testid="student-derived"]').text()).toContain('历史流水反推')
-    expect(claudeRow.get('.current-group-prices .group-prices-head strong').text()).toBe('当前分组 16 · 0.60×')
+    expect(claudeRow.get('[data-testid="price-base-missing"]').text()).toBe('未匹配到官网基础价')
+    expect(claudeRow.get('[data-testid="derived-reference"]').text()).toContain('历史流水参考')
+    expect(claudeRow.get('.current-group-prices .group-prices-head strong').text()).toBe('当前 Key 分组 16 · 生效 0.60×')
   })
 
   it('官网模型计入主表，换 Claude Key 缺目录时显示分组与原因，重扫后恢复', async () => {
@@ -294,14 +457,10 @@ describe('北辰模型管理', () => {
     expect(web.text()).toContain('读到 17 个模型、8 个平台、4 个分组，耗时 87 毫秒')
     expect(web.text()).toContain('响应中能辨认出 20 个不同型号')
     expect(web.get('[aria-label="抓取失败项"]').text()).toContain('Claude 渠道 / anthropic · models 不是模型数组')
-    const claude = wrapper.get('[data-model="' + model + '"]')
-    expect(claude.get('[data-testid="catalog-source"]').text()).toBe('来源 官网')
-    expect(claude.get('[data-testid="key-catalog-gap"]').text()).toContain('官网有、CC1 新 Key 无')
-    expect(claude.text()).toContain('Claude 渠道 · anthropic · CC1 分组 分组 24')
-    expect(claude.get('.model-state-summary').text()).toBe('Key 覆盖 0/2 · 协议 0 · 已发布 0')
-    expect(claude.find('[data-testid="current-group-missing"]').exists()).toBe(false)
-    expect(claude.get('[data-testid="model-availability"]').text()).toBe('仅官网可见')
-    expect(wrapper.get('.beichen-stat strong').text()).toBe('2')
+    expect(wrapper.find('[data-model="' + model + '"]').exists()).toBe(false)
+    expect(wrapper.get('.model-summary').text()).toContain('可探测模型1')
+    expect(wrapper.get('.model-summary').text()).toContain('官网目录1')
+    expect(wrapper.get('.beichen-stat strong').text()).toBe('1')
     expect(wrapper.find('[aria-label="启用 ' + model + '"]').exists()).toBe(false)
     await button(wrapper, '一键启用').trigger('click')
     const dialog = wrapper.get('[role="dialog"]')
@@ -313,7 +472,9 @@ describe('北辰模型管理', () => {
     await flushPromises()
     expect(api.syncBeichen).toHaveBeenCalledExactlyOnceWith('north', 'second')
     expect(api.beichenOverview).toHaveBeenCalledTimes(2)
+    const claude = wrapper.get('[data-model="' + model + '"]')
     expect(claude.get('[data-testid="catalog-source"]').text()).toBe('来源 官网和 Key')
+    expect(claude.text()).toContain('Claude 渠道 · anthropic · CC1 分组 分组 24')
     expect(claude.get('.model-state-summary').text()).toContain('Key 覆盖 1/2 · 协议 1')
     expect(claude.find('[data-testid="key-catalog-gap"]').exists()).toBe(false)
     expect(wrapper.find('[aria-label="启用 ' + model + '"]').exists()).toBe(true)
@@ -328,20 +489,22 @@ describe('北辰模型管理', () => {
     current.credentials = [{ credential_id: key, label: 'CC1', status: 'active' }]
     current.website_only_status = 'compared'
     current.model_catalog![0].website_locations = [15, 60].map(id => ({
-      name: model, observed_at: checked, groups: [{ id }], has_price: true,
+      name: model, observed_at: checked, groups: [{ id }], has_price: true, price_complete: true,
       price_conditions_exact: { input_price: id === 15 ? '0.000001' : '0.000002', output_price: '0.000004' },
     }))
     const c = { credential_id: key, label: 'CC1', school_channel: 'CC1', group_id: 60 } as const
     current.model_catalog!.push({
-      model: opus, source: 'website', catalog_state: 'website_only', key_count: 0,
+      model: opus, source: 'both', catalog_state: 'key_listed', credential_ids: [key], key_count: 1,
       catalog_keys: [{ ...c, state: 'missing', group_diagnosis: 'model_outside_key_group' }],
       website_locations: [{
-        name: opus, platform: 'anthropic', groups: [{ id: 15, rate_multiplier: 0.15 }], has_price: true, observed_at: checked,
+        name: opus, platform: 'anthropic', groups: [{ id: 15, rate_multiplier: 0.15 }], has_price: true,
+        price_complete: true, observed_at: checked,
         price_conditions_exact: { billing_mode: 'token', input_price: '0.000004', output_price: '0.000008' },
       }],
     })
     const before = { ...current, model_catalog: current.model_catalog!.slice(0, 1), datasets: [{
-      credential_id: key, kind: 'billing', group_id: 15, effective_multiplier: '0.15', billing_state: 'current' as const,
+      credential_id: key, kind: 'billing', group_id: 15, group_rate: '0.15', effective_multiplier: '0.15',
+      billing_state: 'current' as const, observed_at: checked,
     }] }
     const newBilling = { ...before.datasets[0], group_id: 60, group_rate: '0.6', effective_multiplier: '0.6', last_success: checked }
     const switched = { ...current, datasets: [newBilling] }
@@ -349,8 +512,8 @@ describe('北辰模型管理', () => {
       failure_count: 3, alert: true, last_error: '北辰接口返回 HTTP 503' }] }
     api.beichenOverview.mockResolvedValueOnce(before).mockResolvedValueOnce(switched).mockResolvedValue(stale)
     api.beichenWebsiteKeys
-      .mockResolvedValueOnce(websiteKeys({ credential_id: key, group_id: 15, group_name: '原分组', rate: '0.15' }))
-      .mockResolvedValueOnce(websiteKeys({ credential_id: key, group_id: 60, group_name: '新分组', rate: '0.6' }))
+      .mockResolvedValueOnce(websiteKeys({ credential_id: key, group_id: 15, group_name: '原分组', rate: '0.15', observed_at: checked }))
+      .mockResolvedValueOnce(websiteKeys({ credential_id: key, group_id: 60, group_name: '新分组', rate: '0.6', observed_at: checked }))
       .mockRejectedValue(new Error('Key 清单暂时读取失败'))
     api.syncBeichen.mockResolvedValueOnce({ synced: true }).mockRejectedValueOnce(new Error('同步未完成'))
     const wrapper = view()
@@ -359,20 +522,19 @@ describe('北辰模型管理', () => {
     expect(tariff.text()).toContain('分组 15 · 原分组 · 分组倍率 0.15×')
     const modelRow = wrapper.get('[data-model="' + model + '"]')
     expect(currentGroupAmounts(modelRow, 'input')).toEqual(['1', '16.5'])
-    expect(modelRow.get('.current-group-prices [data-current="true"]').attributes('data-group-id')).toBe('15')
+    expect(modelRow.get('.current-group-prices .group-prices-head strong').text()).toContain('分组 15')
     const directory = wrapper.get('[aria-label="官网目录"]')
     await directory.get('select').setValue(key)
     await directory.get('form').trigger('submit')
     await flushPromises()
     expect(tariff.text()).toContain('分组 60 · 新分组 · 分组倍率 0.60×')
     expect(currentGroupAmounts(modelRow, 'input')).toEqual(['2', '132'])
-    expect(modelRow.get('.current-group-prices [data-current="true"]').attributes('data-group-id')).toBe('60')
-    expect(modelRow.get('.other-groups [data-group-id="15"] button').attributes('aria-expanded')).toBe('false')
+    expect(modelRow.get('.current-group-prices .group-prices-head strong').text()).toContain('分组 60')
+    expect(modelRow.find('.other-groups').exists()).toBe(false)
     const mismatch = wrapper.get('[data-model="' + opus + '"]')
     expect(mismatch.get('[data-testid="group-mismatch"]').text()).toBe('分组不匹配')
     expect(mismatch.find('[data-testid="current-group-missing"]').exists()).toBe(false)
-    expect(mismatch.find('.quote-table').exists()).toBe(false)
-    expect(mismatch.get('.other-groups [data-group-id="15"] button').attributes('aria-expanded')).toBe('false')
+    expect(mismatch.find('.other-groups').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('重扫该 Key')
     await directory.get('form').trigger('submit')
     await flushPromises()
@@ -385,11 +547,11 @@ describe('北辰模型管理', () => {
     expect(wrapper.text()).toContain('官网 Key 清单待刷新')
     expect(modelRow.find('.current-group-prices').exists()).toBe(false)
     expect(modelRow.get('[data-testid="current-group-missing"]').text()).toBe('当前 Key 分组未匹配')
-    expect(modelRow.get('.other-groups [data-group-id="60"] button').text()).toContain('上次分组（未确认）')
+    expect(modelRow.find('.other-groups').exists()).toBe(false)
     expect(api.beichenWebsiteKeys.mock.calls).toEqual([['north'], ['north'], ['north']])
   })
 
-  it('陈旧的 0.15 只在其它分组，刷新官网 Key 并重读概览后显示分组 16 的 0.6', async () => {
+  it('陈旧的 0.15 只在其它分组，刷新官网 Key 后使用分组 16 基础价但倍率待核实', async () => {
     const model = 'claude-sonnet-5'
     const credential_id = 'key-' + model
     const observed_at = '2026-11-21T13:08:00Z'
@@ -417,10 +579,8 @@ describe('北辰模型管理', () => {
     expect(inventory.text()).toContain('官网 Key 清单待刷新')
     expect(inventory.text()).toContain('重新核对学校 Key 的分组和倍率')
     expect(modelRow.get('[data-testid="current-group-missing"]').text()).toBe('当前 Key 分组未匹配')
-    expect(modelRow.find('[data-current="true"]').exists()).toBe(false)
-    const old = modelRow.get('.other-groups [data-group-id="2"]')
-    expect(old.get('button').text()).toContain('上次分组（未确认） · 旧组 · 0.15×')
-    expect(old.get('button').attributes('aria-expanded')).toBe('false')
+    expect(modelRow.find('.current-group-prices').exists()).toBe(false)
+    expect(modelRow.find('.other-groups').exists()).toBe(false)
 
     await button(inventory, '刷新官网 Key').trigger('click')
     expect(api.refreshBeichenWebsiteKeys).toHaveBeenCalledExactlyOnceWith('north')
@@ -435,22 +595,28 @@ describe('北辰模型管理', () => {
     expect(api.requestBeichenProbes).not.toHaveBeenCalled()
     expect(inventory.text()).not.toContain('官网 Key 清单待刷新')
     const current = modelRow.get('.current-group-prices')
-    expect(current.text()).toContain('当前分组 16 · 0.60×')
+    expect(current.text()).toContain('当前 Key 分组 16 · 倍率待核实')
     expect(current.text()).not.toContain('0.15×')
-    expect(currentGroupAmounts(modelRow, 'input')).toEqual(['4', '264'])
-    expect(modelRow.get('.other-groups [data-group-id="2"] button').attributes('aria-expanded')).toBe('false')
+    expect(currentGroupAmounts(modelRow, 'input')).toEqual(['4', '—'])
+    expect(modelRow.find('.other-groups').exists()).toBe(false)
   })
 
   it('官网 Key 刷新返回会话过期时，提示重新授权并把原分组保留为历史', async () => {
     const credential_id = 'key-lab/a'
     const before = websiteKeys({ credential_id, group_id: 2, group_name: '旧组', rate: '0.15' })
+    const data = overview([{ model: 'lab/a', catalog: { website_locations: [{
+      name: 'lab/a', observed_at: '2026-11-21T00:00:00Z', groups: [{ id: 2, name: '旧组', rate_multiplier: '0.15' }],
+      has_price: true, price_complete: true,
+      price_conditions_exact: { input_price: '0.000004', output_price: '0.00002' },
+    }] } }])
+    api.beichenOverview.mockResolvedValue(data)
     api.beichenWebsiteKeys.mockResolvedValue(before)
     api.refreshBeichenWebsiteKeys.mockResolvedValueOnce({ ...before, status: 'session_expired' })
     const wrapper = view()
     await flushPromises()
 
     const row = wrapper.get('[data-model="lab/a"]')
-    expect(row.get('.current-group-prices').text()).toContain('当前分组 2 · 0.15×')
+    expect(row.get('.current-group-prices').text()).toContain('当前 Key 分组 2 · 倍率待核实')
     const inventory = wrapper.get('[aria-label="官网 Key 清单"]')
     await button(inventory, '刷新官网 Key').trigger('click')
     await flushPromises()
@@ -458,8 +624,8 @@ describe('北辰模型管理', () => {
     expect(inventory.text()).toContain('官网 Key 清单待刷新')
     expect(inventory.text()).toContain('请在北辰网页登录重新授权')
     expect(button(inventory, '刷新官网 Key').attributes('disabled')).toBeUndefined()
-    expect(row.find('[data-current="true"]').exists()).toBe(false)
-    expect(row.get('.other-groups [data-group-id="2"] button').text()).toContain('上次分组（未确认）')
+    expect(row.find('.current-group-prices').exists()).toBe(false)
+    expect(row.get('[data-testid="current-group-missing"]').text()).toBe('当前 Key 分组未匹配')
   })
 
   it.each(['missing', 'unmatched', 'ambiguous'] as const)(
@@ -479,11 +645,8 @@ describe('北辰模型管理', () => {
       const row = wrapper.get('[data-model="lab/a"]')
       expect(row.get('[data-testid="current-group-missing"]').text()).toBe('当前 Key 分组未匹配')
       expect(row.find('.current-group-prices').exists()).toBe(false)
-      expect(row.find('.quote-table').exists()).toBe(false)
-      const old = row.get('.other-groups [data-group-id="2"] button')
-      expect(old.text()).toContain('上次分组（未确认）')
-      expect(old.text()).toContain('0.15×')
-      expect(old.attributes('aria-expanded')).toBe('false')
+      expect(row.find('.other-groups').exists()).toBe(false)
+      expect(row.text()).not.toContain('0.15×')
     },
   )
 
@@ -507,6 +670,14 @@ describe('北辰模型管理', () => {
       price_source: 'derived_from_usage', price_observed_at: observed_at,
       price_conditions_exact: { input_price: '0.000004', output_price: '0.00002' },
     }]
+    entry.website_locations = [{
+      name: 'lab/a-verified', channel: 'CC1', observed_at,
+      groups: [{ id: 2, name: '[CC1]Claudecode-kiro-015', rate_multiplier: '0.15' }],
+      has_price: true, price_complete: true, price_scope: 'platform',
+      price_conditions_exact: { input_price: '0.000004', output_price: '0.00002' },
+    }]
+    data.datasets = [{ kind: 'billing', credential_id: 'confirmed', group_id: 16, group_rate: '0.6',
+      group_status: 'assigned', billing_state: 'current', effective_multiplier: '0.6', observed_at }]
     api.beichenOverview.mockResolvedValue(data)
     api.beichenWebsiteKeys.mockResolvedValue(websiteKeys(
       { credential_id: 'confirmed', group_id: 16, group_name: '已匹配分组', rate: '0.6', observed_at },
@@ -518,8 +689,9 @@ describe('北辰模型管理', () => {
     await flushPromises()
 
     const row = wrapper.get('[data-model="lab/a"]')
-    expect(row.get('.current-group-prices [data-current="true"]').attributes('data-group-id')).toBe('16')
-    expect(currentGroupAmounts(row, 'input')).toEqual(['未列', '264'])
+    expect(row.get('.current-group-prices .group-prices-head strong').text()).toBe('当前 Key 分组 16 · 生效 0.60×')
+    expect(row.get('[data-testid="price-basis"]').text()).toContain('基础价来自 CC1 同名模型')
+    expect(currentGroupAmounts(row, 'input')).toEqual(['4', '264'])
     expect(row.find('[data-testid="current-group-missing"]').exists()).toBe(false)
   })
 
@@ -603,8 +775,11 @@ describe('北辰模型管理', () => {
     expect(health.get('summary').text()).toContain('3/4 维可用')
     expect(health.findAll('dt').map(node => node.text())).toEqual(['凭据 · 可用', '目录 · 可用', '报价 · 可用', '探活 · 待确认'])
     expect(wrapper.get('.model-summary').text()).toContain('报价覆盖1 / 1')
+    expect(wrapper.find('[data-model="lab/dropped"]').exists()).toBe(false)
+    await button(wrapper, '异常').trigger('click')
     expect(wrapper.get('[data-model="lab/dropped"]').classes()).toContain('binding-issue-row')
     expect(wrapper.get('[data-model="lab/dropped"]').text()).toContain('当前 Key 目录里已找不到它')
+    await button(wrapper, '全部').trigger('click')
     expect(wrapper.get('[data-model="lab/tiered"]').text()).toContain('OpenAI Responses')
     expect(wrapper.get('[data-model="lab/tiered"] .model-probe').text()).toContain('待探活')
 
@@ -758,15 +933,27 @@ describe('北辰模型管理', () => {
       .toBe('缺价 · 输入、输出、缓存写入(5m)、缓存写入(1h)、缓存读取')
   })
 
-  it('官网价显示官网正式价徽章和价格同步 observed_at', async () => {
-    const data = overview([{ model: 'lab/a' }])
-    data.datasets = [{ credential_id: 'key-lab/a', kind: 'prices', last_success: '2026-11-21T11:30:00Z', effective_multiplier: null }]
+  it('价格表使用当前 Key 分组的完整官网价和采集时间', async () => {
+    const data = overview([{ model: 'lab/a', catalog: { website_locations: [{
+      name: 'lab/a', observed_at: '2026-11-21T11:30:00Z', groups: [{ id: 2, name: '分组 2', rate_multiplier: '0.1' }],
+      has_price: true, price_complete: true,
+      price_conditions_exact: { input_price: '0.000004', output_price: '0.00002' },
+    }] } }])
+    data.datasets = [
+      { credential_id: 'key-lab/a', kind: 'prices', last_success: '2026-11-21T11:30:00Z', effective_multiplier: null },
+      { credential_id: 'key-lab/a', kind: 'billing', group_id: 2, group_rate: '0.1', group_status: 'assigned',
+        billing_state: 'current', effective_multiplier: '0.1', observed_at: '2026-11-21T11:35:00Z' },
+    ]
     api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys({ credential_id: 'key-lab/a', group_id: 2, group_name: '分组 2', rate: '0.1',
+      observed_at: '2026-11-21T11:30:00Z' }))
     const wrapper = view()
     await flushPromises()
     const row = wrapper.get('[data-model="lab/a"]')
-    expect(row.get('[data-source="website"] strong').text()).toBe('官网正式价')
-    expect(row.get('[data-source="website"] time').text()).toContain('2026/11/21 19:30')
+    expect(row.get('[data-price-source="website"]')).toBeTruthy()
+    expect(row.get('.current-group-prices .group-prices-head strong').text()).toBe('当前 Key 分组 2 · 生效 0.10×')
+    expect(row.get('.current-group-prices time').attributes('datetime')).toBe('2026-11-21T11:30:00Z')
+    expect(row.get('.current-group-prices time').text()).toContain('2026/11/21 19:30')
   })
 
   it('按 200 个分批显示进度，展示逐项原因，重试只发送失败项', async () => {
@@ -943,26 +1130,35 @@ describe('北辰模型管理', () => {
   it('官网价和学生实价精确换算积分及元，保留字符串零价与缺项', async () => {
     const data = overview([{ model: 'lab/a' }])
     const [model] = data.models!
-    model.price_conditions_exact = {
+    const exact: BeichenPriceConditions = {
       billing_mode: 'token', input_price: '0.000001234567890123', output_price: '0.000002', cache_read_price: '0', cache_write_price: null,
     }
+    model.price_conditions_exact = exact
+    data.model_catalog![0].website_locations = [{
+      name: 'lab/a', observed_at: '2026-11-21T11:30:00Z', groups: [{ id: 2, name: '分组 2', rate_multiplier: '0.125' }],
+      has_price: true, price_complete: true, price_conditions_exact: exact,
+    }]
     const route = data.model_catalog![0].preferred_routes![0]
     route.effective_multiplier_text = '0.125'
     route.effective_multiplier = '2'
+    data.datasets = [{ credential_id: 'key-lab/a', kind: 'billing', group_id: 2, group_rate: '0.125',
+      group_status: 'assigned', billing_state: 'current', effective_multiplier: '0.125',
+      observed_at: '2026-11-21T11:35:00Z' }]
     api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys({ credential_id: 'key-lab/a', group_id: 2, group_name: '分组 2', rate: '0.125',
+      observed_at: '2026-11-21T11:30:00Z' }))
     const wrapper = view()
     await flushPromises()
     expect(wrapper.findAll('.model-table > thead th').map(cell => cell.text())).toEqual(['模型', '状态与覆盖', '价格', '本月用量', '操作'])
     const row = wrapper.get('[data-model="lab/a"]')
-    expect(row.findAll('.quote-table thead th').map(cell => cell.text())).toEqual(['项目', '官网价', '分组倍率', '结算价', '学生实价'])
-    expect(quoteAmounts(row, 'input')).toEqual([
-      '123.4567890123 积分（1.234567890123 元）', '0.125×',
-      '15.4320986265375 积分（0.154320986265375 元）', '16.97530848919125 积分（0.1697530848919125 元）',
-    ])
-    expect(quoteAmounts(row, 'cache_write_5m')).toEqual(['— 未列单价', '0.125×', '—', '—'])
-    expect(quoteAmounts(row, 'cache_write_1h')).toEqual(['— 未列单价', '0.125×', '—', '—'])
-    expect(quoteAmounts(row, 'cache_read')).toEqual(['0 积分（0 元）', '0.125×', '0 积分（0 元）', '0 积分（0 元）'])
-    expect(row.get('[data-testid="current-group-missing"]').text()).toBe('当前 Key 分组未匹配')
+    expect(row.findAll('[data-testid="model-price-table"] thead th').map(cell => cell.text()))
+      .toEqual(['价格', '输入', '输出', '缓存写入(5m)', '缓存写入(1h)', '缓存读取'])
+    expect(currentGroupAmounts(row, 'input')).toEqual(['1.234567890123', '16.97530848919125'])
+    expect(currentGroupAmounts(row, 'output')).toEqual(['2', '27.5'])
+    expect(currentGroupAmounts(row, 'cache5m')).toEqual(['未列', '—'])
+    expect(currentGroupAmounts(row, 'cache1h')).toEqual(['未列', '—'])
+    expect(currentGroupAmounts(row, 'cache_read')).toEqual(['0', '0'])
+    expect(row.find('[data-testid="current-group-missing"]').exists()).toBe(false)
     expect(componentSource).toContain('@container (max-width: 60rem)')
     expect(componentSource).not.toContain('overflow-x: auto')
   })
@@ -977,12 +1173,26 @@ describe('北辰模型管理', () => {
       '积分/次 · 图像输出 8 积分（0.08 元）', '积分/次 · 图像输出 8.8 积分（0.088 元）'],
   ] as const)('通过档位入口保留 %s 的价格明细', async (billing_mode, fields, official, settlement, student) => {
     const data = overview([{ model: 'lab/a' }])
-    data.models![0].price_conditions_exact = { billing_mode, ...fields }
+    const terms: BeichenPriceConditions = { billing_mode, ...fields }
+    data.models![0].price_conditions_exact = terms
+    data.models![0].price_observed_at = '2026-11-21T00:05:00Z'
+    data.model_catalog![0].website_locations = [{
+      name: 'lab/a', observed_at: '2026-11-21T00:00:00Z', groups: [{ id: 2, name: '分组 2', rate_multiplier: '0.1' }],
+      has_price: true, price_complete: true, price_conditions_exact: terms,
+    }]
+    data.datasets = [{ credential_id: 'key-lab/a', kind: 'billing', group_id: 2, group_rate: '0.1',
+      group_status: 'assigned', billing_state: 'current', effective_multiplier: '0.1',
+      observed_at: '2026-11-21T00:05:00Z' }]
     api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys({ credential_id: 'key-lab/a', group_id: 2, group_name: '分组 2', rate: '0.1',
+      observed_at: '2026-11-21T00:00:00Z' }))
     const wrapper = view()
     await flushPromises()
     const row = wrapper.get('[data-model="lab/a"]')
-    expect(quoteAmounts(row, 'input')[0]).toBe('不适用')
+    expect(row.findAll('[data-price-row="official"] td').map(cell => cell.text()))
+      .toEqual(['未列', '未列', '未列', '未列', '未列'])
+    expect(row.findAll('[data-price-row="student"] td').map(cell => cell.text()))
+      .toEqual(['—', '—', '—', '—', '—'])
     await button(row, '查看档位').trigger('click')
     const dialog = wrapper.get('[aria-label="lab/a · 计价档位"]')
     expect(dialog.findAll('.condition-prices dt').map(cell => cell.text())).toEqual(['官网价', '结算价', '学生价'])
@@ -996,17 +1206,25 @@ describe('北辰模型管理', () => {
     data.models![0].price_observed_at = '2026-11-21T12:14:00Z'
     data.models![0].price_conditions_exact = { billing_mode: 'token', input_price: '0.000004', output_price: '0.00002' }
     api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys({
+      credential_id: 'key-claude-opus-5-5', group_id: 16, group_name: '分组 16', rate: '0.6',
+    }))
     const wrapper = view()
     await flushPromises()
     const model = wrapper.get('[data-model="claude-opus-5-5"]')
-    expect(model.findAll('.quote-table')).toHaveLength(1)
-    expect(model.get('[data-source="derived"]').text()).toContain('历史流水反推价，待核对')
-    expect(model.get('[data-source="derived"] time').text()).toContain('2026/11/21 20:14')
-    expect(model.get('.quote-table thead').text()).toContain('反推基础价')
+    expect(model.findAll('[data-testid="model-price-table"]')).toHaveLength(1)
+    expect(model.get('[data-testid="price-base-missing"]').text()).toBe('未匹配到官网基础价')
+    expect(model.get('[data-testid="derived-reference"]').text()).toContain('输入 4 元、输出 20 元')
+    expect(model.get('.current-group-prices time').text()).toContain('2026/11/21 20:14')
+    expect(currentGroupAmounts(model, 'input')).toEqual(['未列', '—'])
     expect(model.get('[aria-label="定价 claude-opus-5-5"]').text()).toBe('手动定价')
   })
 
-  it.each([2, 16])('当前 Key 为分组 16 时从流水报价，不采用概览分组 %s 的旧倍率', async billingGroupId => {
+  it.each([
+    [2, '倍率待核实', ['—', '—', '—', '—', '—']],
+    [16, '生效 0.60×', ['264', '1320', '—', '—', '—']],
+  ] as const)('当前 Key 为分组 16 时使用 CC1 基础价，不采用概览分组 %s 的旧倍率',
+    async (billingGroupId, rateLabel, student) => {
     const model = 'claude-opus-5-5'
     const credentialId = 'key-' + model
     const cc1 = '[CC1]Claudecode-kiro-015'
@@ -1016,15 +1234,16 @@ describe('北辰模型管理', () => {
         state: 'listed', upstream_model: model, group_diagnosis: 'price_outside_key_group' }],
       website_locations: [
         { name: model, observed_at: '2026-11-21T00:00:00Z', groups: [{ id: 2, name: cc1, rate_multiplier: '0.15' }],
-          has_price: true, price_conditions_exact: { input_price: '0.000004', output_price: '0.000008' } },
+          has_price: true, price_complete: true, channel: 'CC1', price_scope: 'platform',
+          price_conditions_exact: { input_price: '0.000004', output_price: '0.00002' } },
         { name: model, observed_at: '2026-11-21T00:00:00Z', groups: [{ id: 17, rate_multiplier: '0.5' }], has_price: false },
       ],
     } }])
     data.credentials = [{ credential_id: credentialId, label: 'cc不满血', status: 'active' }]
     data.datasets = [
       { kind: 'billing', credential_id: credentialId, group_id: billingGroupId, group_name: billingGroupId === 2 ? cc1 : cc2,
-        group_rate: billingGroupId === 2 ? '0.15' : '0.60', effective_multiplier: '0.15', billing_state: 'current',
-        observed_at: '2026-11-21T09:00:00Z', group_status: 'assigned' },
+        group_rate: billingGroupId === 2 ? '0.15' : '0.60', effective_multiplier: billingGroupId === 2 ? '0.15' : '0.6',
+        billing_state: 'current', observed_at: '2026-11-21T13:00:00Z', group_status: 'assigned' },
       { kind: 'prices', credential_id: credentialId, effective_multiplier: null, official_price_missing: true,
         last_error: '北辰渠道页没有当前 Key 的有效模型报价' },
     ]
@@ -1042,38 +1261,31 @@ describe('北辰模型管理', () => {
     expect(api.beichenWebsiteKeys).toHaveBeenCalledExactlyOnceWith('north')
     const row = wrapper.get(`[data-model="${model}"]`)
     const current = row.get('.current-group-prices')
-    expect(current.get('.group-prices-head strong').text()).toBe('当前分组 16 · 0.60×')
-    expect(current.get('.group-price-title').text()).toContain(cc2)
+    expect(current.get('.group-prices-head strong').text()).toBe('当前 Key 分组 16 · ' + rateLabel)
+    expect(current.get('[data-testid="price-basis"]').text())
+      .toBe(rateLabel === '倍率待核实'
+        ? '基础价来自 CC1 同名模型；当前 Key 分组 16 的倍率待核实'
+        : '基础价来自 CC1 同名模型；当前 Key 分组 16 的倍率为 0.60×')
     expect(current.text()).not.toContain('0.15×')
+    expect(current.text()).not.toContain(cc1)
     expect(wrapper.get('[aria-label="北辰 Key 计费倍率"]').text()).not.toContain('0.15×')
     expect(row.find('[data-testid="current-group-missing"]').exists()).toBe(false)
     expect(row.find('[data-testid="group-mismatch"]').exists()).toBe(false)
-    const group = current.get('[data-group-id="16"][data-current="true"]')
-    expect(group.get('button').attributes('aria-expanded')).toBe('true')
-    expect(group.get('[data-price-source="derived"] [data-testid="student-derived"]').text()).toContain('历史流水反推')
-    expect(current.get('time').attributes('datetime')).toBe('2026-11-21T12:14:00Z')
-    const table = group.get('table')
-    expect(table.findAll('thead th').map(cell => cell.text())).toEqual(['价格', '输入', '输出', '缓存 5m', '缓存 1h', '缓存读取'])
-    expect(table.findAll('[data-price-row] > th').map(cell => cell.text())).toEqual(['官网价（元 / 1M）', '学生实价（积分 / 1M）'])
-    expect(group.findAll('[data-price-row="official"] td').map(cell => cell.text())).toEqual(['未列', '未列', '未列', '未列', '未列'])
-    expect(group.findAll('[data-price-row="student"] td').map(cell => cell.text())).toEqual(['264', '1320', '—', '—', '—'])
-
-    const comparison = row.get('.other-groups')
-    expect(comparison.get('.group-prices-head').text()).toBe('其它分组')
-    const other = comparison.get('[data-group-id="2"]')
-    expect(other.get('.group-price-title').text()).toBe(cc1 + ' · 0.15×')
-    expect(other.get('button').attributes('aria-expanded')).toBe('false')
-    expect(other.find('table').exists()).toBe(false)
-    await other.get('button').trigger('click')
-    expect(other.get('[data-price-row="student"] [data-price="input"]').text()).toBe('66')
-    const unpriced = comparison.get('[data-group-id="17"]')
-    await unpriced.get('button').trigger('click')
-    expect(unpriced.get('[data-price-row="student"] [data-price="input"]').text()).toBe('—')
-    expect(unpriced.find('[data-testid="student-derived"]').exists()).toBe(false)
+    expect(current.get('time').attributes('datetime')).toBe('2026-11-21T00:00:00Z')
+    const table = current.get('[data-testid="model-price-table"]')
+    expect(table.findAll('thead th').map(cell => cell.text()))
+      .toEqual(['价格', '输入', '输出', '缓存写入(5m)', '缓存写入(1h)', '缓存读取'])
+    expect(table.findAll('[data-price-row] > th').map(cell => cell.text()))
+      .toEqual(['上游基础价（元 / 1M）', '学生实价（积分 / 1M）'])
+    expect(table.findAll('[data-price-row="official"] td').map(cell => cell.text()))
+      .toEqual(['4', '20', '未列', '未列', '未列'])
+    expect(table.findAll('[data-price-row="student"] td').map(cell => cell.text()))
+      .toEqual(student)
+    expect(row.find('.other-groups').exists()).toBe(false)
   })
 
   it.each([
-    [undefined, ['16.5', '33', '20.625', '33', '0']],
+    [undefined, ['—', '—', '—', '—', '—']],
     ['2026-11-21T13:07:00Z', ['13.2', '26.4', '16.5', '26.4', '0']],
   ])('分组 2 展示完整的官网及学生报价，计费倍率观测时间为 %s', async (billingObservedAt, student) => {
     const model = 'claude-sonnet-5-5'
@@ -1098,12 +1310,56 @@ describe('北辰模型管理', () => {
 
     const row = wrapper.get(`[data-model="${model}"]`)
     const current = row.get('.current-group-prices')
-    expect(current.get('.group-prices-head strong').text()).toBe('当前分组 2 · 0.15×')
+    expect(current.get('.group-prices-head strong').text())
+      .toBe('当前 Key 分组 2 · ' + (billingObservedAt ? '生效 0.12×' : '倍率待核实'))
+    if (billingObservedAt) {
+      expect(current.get('[data-testid="rate-note"]').text()).toBe('分组 0.15× / 账号 0.12×')
+    } else {
+      expect(current.find('[data-testid="rate-note"]').exists()).toBe(false)
+    }
     expect(row.find('.other-groups').exists()).toBe(false)
-    const quote = current.get('[data-group-id="2"] [data-price-source="website"]')
+    expect(current.attributes('data-price-source')).toBe('website')
+    const quote = current.get('[data-testid="model-price-table"]')
     expect(quote.findAll('[data-price-row="official"] td').map(cell => cell.text())).toEqual(['1', '2', '1.25', '2', '0'])
     expect(quote.findAll('[data-price-row="student"] td').map(cell => cell.text())).toEqual(student)
-    if (billingObservedAt) expect(current.get('.group-price-title').text()).toContain('0.12×')
+  })
+
+  it('分组 16 不使用分组 2 的专属 Sonnet 价，只有平台级价可作跨组基础价', async () => {
+    const groupOnly = 'claude-sonnet-5-5'
+    const platform = 'claude-sonnet-5-5-platform'
+    const cc1 = '[CC1]Claudecode-kiro-015'
+    const data = overview([
+      { model: groupOnly, catalog: {
+        website_locations: [pricedLocation(2, cc1, '0.15', '0.000002', '0.00001', 'CC1', true, 'group')],
+      } },
+      { model: platform, catalog: {
+        website_locations: [pricedLocation(2, cc1, '0.15', '0.000002', '0.00001', 'CC1', true, 'platform')],
+      } },
+    ])
+    data.datasets = [groupOnly, platform].map(model => ({
+      kind: 'billing' as const, credential_id: 'key-' + model, group_id: 16, group_rate: '0.6',
+      group_status: 'assigned' as const, billing_state: 'current' as const, effective_multiplier: '0.6',
+      observed_at: '2026-11-21T12:05:00Z',
+    }))
+    api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys(
+      { credential_id: 'key-' + groupOnly, group_id: 16, group_name: '分组 16', rate: '0.6', observed_at: '2026-11-21T12:00:00Z' },
+      { credential_id: 'key-' + platform, group_id: 16, group_name: '分组 16', rate: '0.6', observed_at: '2026-11-21T12:00:00Z' },
+    ))
+    const wrapper = view()
+    await flushPromises()
+
+    const exclusive = wrapper.get('[data-model="' + groupOnly + '"]')
+    expect(exclusive.get('[data-testid="price-base-missing"]').text()).toBe('未匹配到官网基础价')
+    expect(exclusive.findAll('[data-price-row="official"] td').map(cell => cell.text()))
+      .toEqual(['未列', '未列', '未列', '未列', '未列'])
+    expect(exclusive.findAll('[data-price-row="student"] td').map(cell => cell.text()))
+      .toEqual(['—', '—', '—', '—', '—'])
+
+    const shared = wrapper.get('[data-model="' + platform + '"]')
+    expect(shared.find('[data-testid="price-base-missing"]').exists()).toBe(false)
+    expect(currentGroupAmounts(shared, 'input')).toEqual(['2', '132'])
+    expect(currentGroupAmounts(shared, 'output')).toEqual(['10', '660'])
   })
 
   it('Key 清单明确未分组时提示未匹配，保留上次分组供比较', async () => {
@@ -1125,10 +1381,7 @@ describe('北辰模型管理', () => {
     const row = wrapper.get('[data-model="lab/a"]')
     expect(row.get('[data-testid="current-group-missing"]').text()).toBe('当前 Key 分组未匹配')
     expect(row.find('.current-group-prices').exists()).toBe(false)
-    expect(row.find('.quote-table').exists()).toBe(false)
-    const old = row.get('.other-groups [data-group-id="2"] button')
-    expect(old.text()).toContain('上次分组（未确认）')
-    expect(old.attributes('aria-expanded')).toBe('false')
+    expect(row.find('.other-groups').exists()).toBe(false)
   })
 
   it('显示四路核对的型号差异与官网报价单位', async () => {
@@ -1180,7 +1433,7 @@ describe('北辰模型管理', () => {
     ])
     expect(wrapper.get('.model-state-summary [title]').attributes('title')).toBe('4 条候选线路')
     const empty = wrapper.get('[data-model="lab/empty"]')
-    expect(empty.find('.quote-table').exists()).toBe(false)
+    expect(empty.find('[data-testid="model-price-table"]').exists()).toBe(false)
     expect(empty.get('[data-testid="protocol-missing"]').text()).toBe('缺协议')
     expect(empty.get('[data-testid="price-missing"]').text()).toBe('缺价 · 输入、输出、缓存写入(5m)、缓存写入(1h)、缓存读取')
     expect(wrapper.get('[aria-label="本月用量汇总"]').findAll('dd')[2].text()).toBe('—')

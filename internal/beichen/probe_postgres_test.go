@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
@@ -188,8 +189,10 @@ VALUES(gen_random_uuid(),$1,$2,'inactive-key-model',now(),now(),now(),now())`, p
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	if err := recordSuccess(ctx, tx, first, "catalog"); err != nil {
-		t.Fatal(err)
+	for _, credential := range []uuid.UUID{first, second} {
+		if err := recordSuccess(ctx, tx, credential, "catalog"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var revision time.Time
 	if err := tx.QueryRowContext(ctx, "SELECT updated_at FROM provider_credentials WHERE id = $1", first).Scan(&revision); err != nil {

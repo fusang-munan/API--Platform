@@ -1,5 +1,5 @@
 import type { BeichenPriceConditions, BeichenWebsiteGroup, BeichenWebsiteLocation } from '../api/types'
-import { priceDetailRows } from './beichenModels'
+import { keyGroupRate, priceDetailRows } from './beichenModels'
 import { multiplyDecimal, trimDecimal } from './credits'
 
 /** 五项 Token 单价，按每 1M Token 展示。 */
@@ -19,18 +19,36 @@ export type GroupPriceKeyGroup = {
   account_rate?: number | string | null
 }
 
+/** 每个模型只保留一行：当前 Key 分组的上游基础价和学生实价。 */
 export type GroupPriceRow = {
   group_id: number
   name: string
   rate: string | null
   account_rate: string | null
-  is_current_key_group: boolean
-  /** 官网列出的基础价，单位：元 / 1M Token。官网未列时五项均为 null。 */
+  is_current_key_group: true
+  /** 官网列出的基础价，单位：元 / 1M Token。找不到完整官网价时五项均为 null。 */
   official: GroupPriceValues
-  /** 学生实价，单位：积分 / 1M Token。官网缺价时可由历史流水反推。 */
+  /** 学生实价，单位：积分 / 1M Token。没有官网基础价时五项均为 null。 */
   student: GroupPriceValues
-  /** 学生价所依据的基础价来源；官网和反推都没有时为 null。 */
-  student_source: 'website' | 'derived' | null
+  /** 学生价所依据的基础价来源；没有官网基础价时为 null。 */
+  student_source: 'website' | null
+  /** 基础价来自哪个官网分组。当前分组自己的完整报价时与 group_id 相同。 */
+  base_group_id: number | null
+  base_group_name: string | null
+  /** 页面提示用的来源简称，如 CC1；优先取分组名，分组名为空才用渠道名。 */
+  base_label: string | null
+  base_from_other_group: boolean
+  base_missing: boolean
+  /** 基础价来自其他分组时的整句提示。 */
+  base_note: string | null
+  /** account_rate 优先的生效倍率。 */
+  effective_rate: string | null
+  /** 分组倍率与账号倍率不同时的简短说明。 */
+  rate_note: string | null
+  /** 基础价对应官网 location 的采集时间。 */
+  observed_at: string | null
+  /** 基础价原始条件，供“查看档位”使用。 */
+  price_conditions_exact: BeichenPriceConditions | null
   /** 兼容旧调用方：与 student 的五项保持同步。 */
   input: string | null
   output: string | null
@@ -42,7 +60,7 @@ export type GroupPriceRow = {
 export type GroupPriceRowOptions = {
   /** /keys 的当前 Key 分组；它的分组倍率优先于官网同组倍率。 */
   keyGroup?: GroupPriceKeyGroup | null
-  /** 官网没有该组价时，用这份历史流水反推的基础单价计算学生价。 */
+  /** 没有官网基础价时，只用于页面小字参考，不参与主价计算。 */
   derived?: BeichenPriceConditions | null
 }
 
@@ -58,28 +76,14 @@ const detailKeys: Record<ValueKey, 'input' | 'output' | 'cache_write_5m' | 'cach
   cache_read: 'cache_read',
 }
 
-type Candidate = {
-  row: GroupPriceRow
-  rank: number
-}
-
 function emptyValues(): GroupPriceValues {
   return { input: null, output: null, cache5m: null, cache1h: null, cache_read: null }
 }
 
 function decimalText(value: string | number | null | undefined) {
   if (value == null) return null
-  const text = trimDecimal(value, 8)
+  const text = trimDecimal(value, 30)
   return text === '—' ? null : text
-}
-
-function groupName(group: BeichenWebsiteGroup, groupID: number) {
-  return group.name?.trim() || '分组 ' + groupID
-}
-
-function locationRank(location: BeichenWebsiteLocation) {
-  return (location.stale ? 0 : 4) + (location.price_complete ? 2 : 0) +
-    (location.price_conditions_exact ? 1 : 0) + (location.has_price ? 1 : 0)
 }
 
 function priceFactor(rate: string | null, accountRate: string | null) {
@@ -109,32 +113,113 @@ function hasValues(values: GroupPriceValues) {
   return valueKeys.some(key => values[key] != null)
 }
 
-function makeRow(groupID: number, name: string, rate: string | null, accountRate: string | null,
-  officialTerms: BeichenPriceConditions | null | undefined,
-  derivedTerms: BeichenPriceConditions | null | undefined,
-  isCurrent: boolean): GroupPriceRow {
-  const official = pickValues(officialTerms, 'official', rate, accountRate)
-  // 官网整组缺价时才使用历史流水反推，避免把其他分组的官网价混进来。
-  const studentSource: GroupPriceRow['student_source'] = hasValues(official) ? 'website'
-    : derivedTerms ? 'derived' : null
-  const basis = studentSource === 'derived' ? derivedTerms : officialTerms
-  const student = pickValues(basis, 'student', rate, accountRate)
+/** 只有非陈旧、确实有价且官网判定完整的 location 才能作为基础价。 */
+function completeLocation(location: BeichenWebsiteLocation) {
+  return !location.stale && location.has_price && location.price_complete === true &&
+    Boolean(location.price_conditions_exact)
+}
+
+function locationTime(location: BeichenWebsiteLocation) {
+  const time = Date.parse(location.observed_at)
+  return Number.isFinite(time) ? time : 0
+}
+
+function activeGroup(group: BeichenWebsiteGroup | undefined) {
+  if (!group) return undefined
+  return !group.status || group.status === 'active' ? group : undefined
+}
+
+function chooseComplete(locations: BeichenWebsiteLocation[], groupID: number | null, platformOnly = false) {
+  return locations
+    .filter(completeLocation)
+    // 跨组回退只能使用平台级基础价；旧数据没有 price_scope 时按分组专属价处理。
+    .filter(location => !platformOnly || location.price_scope === 'platform')
+    .filter(location => groupID == null || location.groups.some(group => group.id === groupID && activeGroup(group)))
+    .sort((left, right) => locationTime(right) - locationTime(left) || (left.name || '').localeCompare(right.name || ''))[0]
+}
+
+function bracketLabel(name: string | null | undefined) {
+  const text = name?.trim() ?? ''
+  const match = /^\[([^\]]+)\]/.exec(text)
+  return (match ? match[1] : text).trim()
+}
+
+function sourceLabel(location: BeichenWebsiteLocation) {
+  const group = location.groups.map(item => item.name).find(name => Boolean(name?.trim()))
+  if (group) return bracketLabel(group)
+  const channel = location.channel?.trim()
+  if (channel) return bracketLabel(channel)
+  return location.name.trim() || '官网'
+}
+
+function sourceGroup(location: BeichenWebsiteLocation) {
+  return location.groups.find(group => Boolean(group.name?.trim()) && activeGroup(group)) ?? location.groups[0]
+}
+
+/**
+ * 为一个模型生成唯一价格行。
+ *
+ * 1. 先找当前 Key 分组的完整官网价；
+ * 2. 找不到时，只用平台级（price_scope=platform）的完整官网 location 作模型级基础价；
+ *    分组专属价或缺少 price_scope 的旧数据不能跨组使用；
+ * 3. 没有官网基础价时不使用历史反推价，只把反推价留给页面作小字参考。
+ */
+export function buildCurrentGroupPriceRow(locations: BeichenWebsiteLocation[],
+  currentGroupID?: number | null, options: GroupPriceRowOptions = {}): GroupPriceRow | null {
+  const keyGroup = options.keyGroup ?? null
+  const groupID = keyGroup?.id ?? currentGroupID ?? null
+  if (groupID == null) return null
+
+  const websiteGroup = locations.flatMap(location => location.groups)
+    .find(group => group.id === groupID && activeGroup(group))
+  // keyGroup 存在时以 /keys 为准；rate 为 null 表示当前倍率不可用，不能回退到官网旧值。
+  const rate = keyGroup ? decimalText(keyGroup.rate) : decimalText(websiteGroup?.rate_multiplier)
+  // /keys 没有给账户倍率时，不沿用官网里可能过期的账户倍率。
+  const accountRate = decimalText(keyGroup?.account_rate ?? (keyGroup ? null : websiteGroup?.account_rate_multiplier))
+  const name = keyGroup?.name?.trim() || websiteGroup?.name?.trim() || '分组 ' + groupID
+
+  const current = chooseComplete(locations, groupID)
+  const fallback = current ? undefined : chooseComplete(locations, null, true)
+  const source = current ?? fallback
+  const official = pickValues(source?.price_conditions_exact, 'official', null, null)
+  const student = source ? pickValues(source.price_conditions_exact, 'student', rate, accountRate) : emptyValues()
+  const baseGroup = source ? sourceGroup(source) : undefined
+  const baseFromOtherGroup = Boolean(source && !current)
+  const effectiveRate = accountRate ?? rate
+  const effectiveRateText = effectiveRate ? keyGroupRate(effectiveRate) : ''
+  const rateNote = rate && accountRate && keyGroupRate(rate) !== keyGroupRate(accountRate)
+    ? `分组 ${keyGroupRate(rate)} / 账号 ${keyGroupRate(accountRate)}`
+    : null
   const row = {
     group_id: groupID,
     name,
     rate,
     account_rate: accountRate,
-    is_current_key_group: isCurrent,
+    is_current_key_group: true as const,
     official,
     student,
-    student_source: studentSource,
+    student_source: hasValues(official) ? 'website' as const : null,
+    base_group_id: source ? baseGroup?.id ?? groupID : null,
+    base_group_name: baseGroup?.name?.trim() || null,
+    base_label: baseFromOtherGroup && source ? sourceLabel(source) : null,
+    base_from_other_group: baseFromOtherGroup,
+    base_missing: !hasValues(official),
+    base_note: baseFromOtherGroup && source
+      ? effectiveRateText
+        ? `基础价来自 ${sourceLabel(source)} 同名模型；当前 Key 分组 ${groupID} 的倍率为 ${effectiveRateText}`
+        : `基础价来自 ${sourceLabel(source)} 同名模型；当前 Key 分组 ${groupID} 的倍率待核实`
+      : null,
+    effective_rate: effectiveRate,
+    rate_note: rateNote,
+    observed_at: source?.observed_at ?? null,
+    price_conditions_exact: source?.price_conditions_exact ?? null,
     input: student.input,
     output: student.output,
     cache5m: student.cache5m,
     cache1h: student.cache1h,
     cache_read: student.cache_read,
   } as GroupPriceRow
-  // 教师页会直接回写旧扁平五项；用访问器让学生价始终只有一份事实来源。
+  // 兼容旧调用方：扁平五项始终跟随 student，不保留第二份事实来源。
   for (const key of valueKeys) {
     Object.defineProperty(row, key, {
       enumerable: true,
@@ -146,62 +231,10 @@ function makeRow(groupID: number, name: string, rate: string | null, accountRate
   return row
 }
 
-function withKeyGroup(group: BeichenWebsiteGroup, keyGroup: GroupPriceKeyGroup): BeichenWebsiteGroup {
-  return {
-    ...group,
-    name: keyGroup.name?.trim() || group.name,
-    rate_multiplier: keyGroup.rate ?? group.rate_multiplier,
-    // /keys 未给账户倍率时清掉官网旧值，避免用过期倍率计算学生价。
-    account_rate_multiplier: keyGroup.account_rate ?? undefined,
-  }
+/** 历史反推价只用于小字参考，不参与主价。 */
+export function priceReferenceText(terms: BeichenPriceConditions | null | undefined) {
+  const rows = priceDetailRows(terms, null)
+    .filter(row => !row.notApplicable && row.yuan != null)
+    .map(row => `${row.label} ${row.yuan} 元`)
+  return rows.length ? rows.join('、') : null
 }
-
-function candidate(location: BeichenWebsiteLocation, group: BeichenWebsiteGroup,
-  groupID: number, currentGroupID: number | null,
-  derived: BeichenPriceConditions | null): Candidate {
-  const rate = decimalText(group.rate_multiplier)
-  const accountRate = decimalText(group.account_rate_multiplier)
-  return {
-    rank: locationRank(location),
-    row: makeRow(groupID, groupName(group, groupID), rate, accountRate,
-      location.price_conditions_exact ?? null, derived, groupID === currentGroupID),
-  }
-}
-
-/**
- * 把一个模型的官网分组位置整理成一行一个分组。重复 group_id 只保留
- * 观测更完整的一份，当前 Key 分组排在首位。
- *
- * 当前分组由 /keys 的 group_id 决定；传入 keyGroup 时，它的倍率优先于官网
- * 同组倍率，并且即使官网没有该组也会补出一行，避免当前组消失。
- */
-export function buildGroupPriceRows(locations: BeichenWebsiteLocation[],
-  currentGroupID?: number | null, options: GroupPriceRowOptions = {}): GroupPriceRow[] {
-  const keyGroup = options.keyGroup ?? null
-  const derived = options.derived ?? null
-  const current = keyGroup?.id ?? currentGroupID ?? null
-  const groups = new Map<number, Candidate>()
-  for (const location of locations) {
-    if (location.stale) continue
-    for (const group of location.groups ?? []) {
-      if (group.id == null || !Number.isFinite(group.id)) continue
-      if (group.status && group.status !== 'active') continue
-      const effective = keyGroup && group.id === keyGroup.id ? withKeyGroup(group, keyGroup) : group
-      const next = candidate(location, effective, group.id, current, derived)
-      const previous = groups.get(group.id)
-      if (!previous || next.rank > previous.rank) groups.set(group.id, next)
-    }
-  }
-  if (current != null && !groups.has(current)) {
-    groups.set(current, {
-      rank: -1,
-      row: makeRow(current, keyGroup?.name?.trim() || '分组 ' + current,
-        decimalText(keyGroup?.rate), decimalText(keyGroup?.account_rate), null, derived, true),
-    })
-  }
-  const rows = Array.from(groups.values(), item => item.row)
-  const own = rows.filter(row => row.is_current_key_group)
-  return [...own, ...rows.filter(row => !row.is_current_key_group)]
-}
-
-export const groupPriceRows = buildGroupPriceRows

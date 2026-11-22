@@ -186,6 +186,7 @@ type beichenCharge struct {
 
 const beichenBaseCreditsSQL = `coalesce(c.beichen_base_credits,(c.pricing_detail->>'base_credits')::numeric,c.beichen_credit_exact)`
 const beichenBaseSourceSQL = `coalesce(c.beichen_base_source,c.pricing_detail->>'base_source')`
+const derivedPriceSource = "derived_from_usage"
 
 func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics) error {
 	var school, upstream, effort sql.NullString
@@ -228,11 +229,7 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 		return err
 	}
 	charge.source = "gateway_usage_price"
-	if mode == "manual" && school.Valid {
-		charge.source = "teacher_manual_price"
-	} else if upstreamSource == "derived_from_usage" {
-		charge.source = upstreamSource
-	} else if mode == "manual" {
+	if mode == "manual" {
 		charge.source = "teacher_manual_price"
 	}
 	base := school
@@ -244,6 +241,9 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 	anthropicWrite := protocol == "anthropic" && metrics.CacheWriteTokens != nil && *metrics.CacheWriteTokens > 0
 	cacheDuration := beichenCacheTTL(ttl)
 	switch {
+	case upstreamSource == derivedPriceSource && !manualPriced:
+		base = sql.NullString{}
+		reason = "derived_price_requires_review"
 	case metrics.ClassifyBeichenUsage(protocol).State != UsageReported:
 		base = sql.NullString{}
 		reason = "incomplete_token_breakdown"
