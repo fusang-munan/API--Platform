@@ -1,7 +1,6 @@
 package beichen
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -19,10 +18,7 @@ func TestBeichenDerivedPricesPostgres(t *testing.T) {
 	ctx, db, provider, teacher, keys := newActionsPostgres(t)
 	credential := keys[0]
 	const opus, sonnet = "claude-opus-5-5", "claude-sonnet-5-5"
-	const noOfficial = `{"code":0,"data":[{"platforms":[{"platform":"anthropic","groups":[{"id":2}],"supported_models":[
-	{"name":"claude-opus-5-5","pricing":{"billing_mode":"token","input_price":0.9,"output_price":0.9}}]},
-	{"platform":"openai","groups":[{"id":10}],"supported_models":[{"name":"unrelated","pricing":"invalid"}]}]}]}`
-	const official = `{"code":0,"data":[{"platforms":[{"platform":"anthropic","groups":[{"id":16,
+	const groupOfficial = `{"code":0,"data":[{"platforms":[{"platform":"anthropic","groups":[{"id":16,
 	"platform":"anthropic","subscription_type":"standard","peak_rate_enabled":false,"rate_multiplier":0.6}],"supported_models":[
 	{"name":"claude-opus-5.5","pricing":{"billing_mode":"token","input_price":0.000008,"output_price":0.000020,"cache_read_price":0,"cache_write_price":0}},
 	{"name":"claude-sonnet-5-5","pricing":{"billing_mode":"token","intervals":[{"min_tokens":0,"input_price":0.000003,
@@ -41,7 +37,8 @@ func TestBeichenDerivedPricesPostgres(t *testing.T) {
 	exec(`UPDATE provider_credentials SET credential_ciphertext=$2 WHERE id=$1`, credential, sealed)
 	exec(`INSERT INTO beichen_provision_channels(credential_id,channel,key_fingerprint,discover_ids)
 VALUES($1,'CC1',sha256('derived-price-fixture'::bytea),false)`, credential)
-	website, keyGroup := noOfficial, 16
+	sharedWebsite := string(readWebsitePricingFixture(t))
+	website := sharedWebsite
 	service.client.Transport = panelTransport(func(r *http.Request) (*http.Response, error) {
 		if r.Method != http.MethodGet {
 			return nil, errors.New("only metadata GET is accepted")
@@ -51,8 +48,10 @@ VALUES($1,'CC1',sha256('derived-price-fixture'::bytea),false)`, credential)
 		case r.URL.String() == panelURL:
 			body = website
 		case r.URL.Host == publicKeyHost && r.URL.Path == "/api/v1/keys":
-			body = strings.Replace(websiteKeyListFixture(secret, "CC1", 41, keyGroup), `"status":"active"`,
-				fmt.Sprintf(`"status":"active","group":{"id":%d,"name":"Claude 分组","rate_multiplier":0.60}`, keyGroup), 1)
+			body = strings.Replace(websiteKeyListFixture(secret, "CC1", 41, 16), `"status":"active"`,
+				`"status":"active","group":{"id":16,"name":"Claude 分组","platform":"anthropic","rate_multiplier":0.60}`, 1)
+		case r.URL.Host == publicKeyHost && r.URL.Path == "/api/v1/groups/rates":
+			body = `{"code":0,"data":{"2":0.15,"16":0.60}}`
 		case r.URL.Host == "api.beichenapi.com" && r.URL.Path == billingPath:
 			body = fmt.Sprintf(`{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token",
 "effective_rate_multiplier":0.6,"group_rate_multiplier":0.6,"peak_rate_enabled":false,"group_id":16,"api_key_id":41,"observed_at":%q}`,
@@ -72,7 +71,6 @@ VALUES($1,'CC1',sha256('derived-price-fixture'::bytea),false)`, credential)
 	if err := refresh(); err != nil {
 		t.Fatal(err)
 	}
-	observed := time.Date(2026, 11, 21, 12, 14, 0, 0, time.UTC)
 	view, err := service.Overview(ctx, provider, "")
 	if err != nil || len(view.Models) != 2 {
 		t.Fatalf("overview should have both Key models: %v", err)
@@ -84,16 +82,15 @@ VALUES($1,'CC1',sha256('derived-price-fixture'::bytea),false)`, credential)
 		t.Fatalf("missing verified CC group and rate: %+v", group)
 	}
 	for _, row := range view.Models {
-		if row.PriceStatus != "derived" || row.PriceSource != derivedPriceSource || row.PriceObservedAt == nil ||
-			!row.PriceObservedAt.Equal(observed) || !row.PriceCovered || row.UpstreamRates == nil ||
-			row.UpstreamRates.CacheRead != nil || row.UpstreamRates.CacheWrite != nil {
-			t.Fatalf("unlabelled or incomplete derived quote: %+v", row)
+		if row.PriceStatus != "conditional" || !row.PriceCovered || row.PriceConditionsExact["cache_read_price"] == nil ||
+			row.PriceConditionsExact["cache_write_1h_price"] == nil {
+			t.Fatalf("expected the shared website quote with cache prices: %+v", row)
 		}
 	}
 	capabilities, err := catalog.ReadBeichenCapabilities(ctx, db, provider)
-	if err != nil || len(capabilities.Capabilities) != 2 || capabilities.Capabilities[0].PriceState != "derived" ||
-		capabilities.Capabilities[1].PriceState != "derived" {
-		t.Fatalf("capability report lost derived provenance: %+v, %v", capabilities.Capabilities, err)
+	if err != nil || len(capabilities.Capabilities) != 2 || capabilities.Capabilities[0].PriceState != "conditional" ||
+		capabilities.Capabilities[1].PriceState != "conditional" {
+		t.Fatalf("capability report did not select the website price: %+v, %v", capabilities.Capabilities, err)
 	}
 	org, student, project, studentKey := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	exec(`INSERT INTO organizations(id,name,created_at,updated_at) VALUES($1,'Fixture',now(),now())`, org)
@@ -131,11 +128,11 @@ VALUES($1,$2,$3,'Fixture','active','derived-prices-fixture','fixture',now(),now(
 		route.SentAt = time.Now().UTC()
 		return call, route
 	}
-	settle := func(call usage.Reservation, route usage.CallRoute, cacheRead int64, wantSource, wantVersion, wantBase, wantDebit string) {
+	settle := func(call usage.Reservation, route usage.CallRoute, wantSource, wantVersion, wantBase, wantDebit, wantReason string) {
 		t.Helper()
 		input, output, zero := int64(1000), int64(100), int64(0)
 		metrics := usage.CallMetrics{State: usage.UsageReported, PromptTokens: &input, CompletionTokens: &output,
-			CacheHitTokens: &cacheRead, CacheWriteTokens: &zero}
+			CacheHitTokens: &zero, CacheWriteTokens: &zero}
 		if err := store.Finalize(ctx, call, true, "succeeded", "", "", route, metrics); err != nil {
 			t.Fatal(err)
 		}
@@ -147,28 +144,50 @@ FROM gateway_calls c LEFT JOIN beichen_price_versions p ON p.id=c.beichen_upstre
 WHERE c.id=$1`, call.CallID).Scan(&source, &version, &base, &debit, &why); err != nil {
 			t.Fatal(err)
 		}
-		if source != wantSource || version != wantVersion || base != wantBase || debit != wantDebit ||
-			(cacheRead > 0 && why != "missing_cache_read_price") {
+		if source != wantSource || version != wantVersion || base != wantBase || debit != wantDebit || why != wantReason {
 			t.Fatalf("%s: source %q, version %q, base %q, debit %q, review %q", route.UpstreamModelName, source, version, base, debit, why)
 		}
 	}
 	call, route := dispatch(opus)
-	settle(call, route, 0, derivedPriceSource, derivedPriceSource, "0.36", "0.396")
+	settle(call, route, "gateway_usage_price", "", "0.36", "0.396", "")
 	call, route = dispatch(sonnet)
-	settle(call, route, 0, derivedPriceSource, derivedPriceSource, "0.18", "0.198")
-	call, route = dispatch(opus)
-	settle(call, route, 10, "", derivedPriceSource, "", "")
-	old, oldRoute := dispatch(opus)
+	settle(call, route, "gateway_usage_price", "", "0.18", "0.198", "")
+	old, oldRoute := dispatch(sonnet)
 
-	website = official
+	website = strings.Replace(sharedWebsite, "claude-sonnet-5.5", "unrelated-sonnet", 1)
+	// Leave one usable, exact-name quote under OpenAI and none under Anthropic.
+	website = strings.Replace(website, "deepseek-v4-pro", sonnet, 1)
 	if err := refresh(); err != nil {
 		t.Fatal(err)
 	}
-	settle(old, oldRoute, 0, derivedPriceSource, derivedPriceSource, "0.36", "0.396")
-	call, route = dispatch(opus)
-	settle(call, route, 0, "gateway_usage_price", "panel", "0.6", "0.66")
 	call, route = dispatch(sonnet)
-	settle(call, route, 0, "gateway_usage_price", "", "0.252", "0.2772")
+	settle(call, route, "", "", "", "", "missing_upstream_price")
+	call, route = dispatch(opus)
+	settle(call, route, "gateway_usage_price", "", "0.36", "0.396", "")
+
+	website = `{"code":0,"data":[]}`
+	if err := refresh(); err != nil {
+		t.Fatal(err)
+	}
+	view, err = service.Overview(ctx, provider, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prices := datasetForCredential(t, view, credential, "prices"); !prices.OfficialPriceMissing {
+		t.Fatalf("expected an explicit missing price state: %+v", prices)
+	}
+	call, route = dispatch(opus)
+	settle(call, route, "", "", "", "", "missing_upstream_price")
+	settle(old, oldRoute, "gateway_usage_price", "", "0.18", "0.198", "")
+
+	website = groupOfficial
+	if err := refresh(); err != nil {
+		t.Fatal(err)
+	}
+	call, route = dispatch(opus)
+	settle(call, route, "gateway_usage_price", "panel", "0.6", "0.66", "")
+	call, route = dispatch(sonnet)
+	settle(call, route, "gateway_usage_price", "", "0.252", "0.2772", "")
 
 	input, output, zero := int64(500_000_000), int64(2_000_000_000), int64(0)
 	if err := service.SetPrice(ctx, provider, credential, teacher, opus, PriceInput{Mode: "manual", Rates: &Rates{
@@ -177,27 +196,17 @@ WHERE c.id=$1`, call.CallID).Scan(&source, &version, &base, &debit, &why); err !
 		t.Fatal(err)
 	}
 	call, route = dispatch(opus)
-	settle(call, route, 0, "teacher_manual_price", "panel", "0.7", "0.77")
+	settle(call, route, "teacher_manual_price", "panel", "0.7", "0.77", "")
 
-	today := time.Now().In(beijing).Format(dayLayout)
-	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
+	var observations, published int
+	if err := db.QueryRowContext(ctx, `
+SELECT
+  (SELECT count(*) FROM beichen_group_price_observations WHERE provider_id=$1 AND group_id=16 AND source=$3),
+  (SELECT count(*) FROM beichen_price_versions WHERE credential_id=$2 AND source=$3)`,
+		provider, credential, derivedPriceSource).Scan(&observations, &published); err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback()
-	report, err := readDashboardLocalRows(ctx, tx, provider, dashboardWindow{StartDate: today, EndDate: today})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for key, row := range report {
-		if key.Model == opus && (row.StandardSource != "mixed" || row.StandardPriceLabel != "含反推价，待核对") {
-			t.Fatalf("report lost mixed source label: %+v", row)
-		}
-		if key.Model == sonnet && (row.StandardSource != derivedPriceSource || row.StandardPriceLabel != derivedPriceLabel) {
-			t.Fatalf("report lost derived source label: %+v", row)
-		}
-	}
-	if len(report) != 2 {
-		t.Fatalf("expected both models in report, got %d rows", len(report))
+	if observations != 2 || published != 0 {
+		t.Fatalf("derived prices must stay as audit evidence: observed=%d, published=%d", observations, published)
 	}
 }

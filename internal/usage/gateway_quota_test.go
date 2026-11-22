@@ -131,9 +131,30 @@ func TestGatewayQuotaPostgres(t *testing.T) {
 		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate)
 			VALUES ($1,$2,'upstream','effective','billing',1000000,8000000)`, route.CredentialID, route.UpstreamModelName)
 		check("8")
+		exec(`WITH multiplier AS (
+			INSERT INTO beichen_multiplier_versions(credential_id,effective_at,multiplier,group_id)
+			VALUES($1,statement_timestamp(),0.5,16) RETURNING id,effective_at
+		), snapshot AS (
+			INSERT INTO beichen_panel_snapshots(credential_id,effective_at,credential_revision,group_id,expires_at,multiplier_version)
+			SELECT $1,effective_at,effective_at,16,effective_at+interval '15 minutes',id FROM multiplier
+			RETURNING effective_at
+		)
+		INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,group_id,observed_at,effective_at)
+		SELECT $1,$2,'upstream','base','derived_from_usage',1000000,8000000,16,effective_at,effective_at FROM snapshot`,
+			route.CredentialID, route.UpstreamModelName)
+		var inferredOutput string
+		if err := db.QueryRowContext(ctx, `SELECT trim_scale(school_output)::text
+			FROM beichen_price_at($1,$2,statement_timestamp())`, route.CredentialID, route.UpstreamModelName).
+			Scan(&inferredOutput); err != nil || inferredOutput != "4000000" {
+			t.Fatalf("fixture must select the inferred price: %q (%v)", inferredOutput, err)
+		}
+		check("")
 		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
 			VALUES ($1,$2,'school','manual','teacher',$3,100000000,600000000)`, route.CredentialID, route.UpstreamModelName, student)
 		check("6")
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id)
+			VALUES ($1,$2,'school','follow','teacher',$3)`, route.CredentialID, route.UpstreamModelName, student)
+		check("")
 	})
 
 	t.Run("dispatch shares a limit across keys and projects", func(t *testing.T) {

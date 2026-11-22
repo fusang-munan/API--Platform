@@ -136,9 +136,12 @@ export function lastKnownKeyGroup(key?: WebsiteKeyRateVersion, billing?: Beichen
 
 export function verifiedWebsiteKeyBilling(key: WebsiteKeyRateVersion, billing?: BeichenDataset) {
   // 概览里的分组字段可能已更新，生效倍率仍须有同组、同版本的计费观测。
+  // 同倍率重复核实不会新增倍率版本，observed_at 会停留在首次观测；
+  // last_success 才是最近一次计费读取成功的时间，优先用它判断核实时间。
+  const verifiedAt = billing?.last_success || billing?.observed_at
   if (key.group_id != null && billing?.billing_state === 'current' && !billing.last_error && !keyGroupIssue(billing) &&
     billing.group_id === key.group_id && keyGroupRate(billing.group_rate) === keyGroupRate(key.rate ?? undefined) &&
-    key.observed_at && billing.observed_at && Date.parse(billing.observed_at) >= Date.parse(key.observed_at)) {
+    key.observed_at && verifiedAt && Date.parse(verifiedAt) >= Date.parse(key.observed_at)) {
     return billing
   }
 }
@@ -146,7 +149,8 @@ export function verifiedWebsiteKeyBilling(key: WebsiteKeyRateVersion, billing?: 
 export function websiteKeyEffectiveRate(key: WebsiteKeyRateVersion, billing?: BeichenDataset) {
   if (key.group_id == null || (billing?.group_id === key.group_id && billing.group_status === 'not_allowed')) return null
   const verified = verifiedWebsiteKeyBilling(key, billing)
-  return verified?.effective_multiplier_text ?? verified?.effective_multiplier ?? key.rate
+  // 官网 Key 的分组倍率只是参考值；没有同组、同版本的计费观测时不得当作生效倍率。
+  return verified?.effective_multiplier_text ?? verified?.effective_multiplier ?? null
 }
 
 export function priceBelongsToWebsiteKeyGroup(key: WebsiteKeyRateVersion, observedAt?: string | null, groupId?: number | null) {
@@ -427,11 +431,13 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
   const observedRate = hasGroupEvidence
     ? matchingQuote ? websiteKeyEffectiveRate(websiteKey, billing) : null
     : billing?.billing_state === 'current' ? billingRate : reported
+  const rateUnverified = Boolean(websiteKey && !verifiedWebsiteKeyBilling(websiteKey, billing))
   const rate = !hasGroupEvidence && (groupIssue || billingError || stale) ? null : nonNegativeDecimal(observedRate)
   const lastRate = !hasGroupEvidence && stale ? nonNegativeDecimal(billingRate) : null
   const multiplier = lastRate ? formatDecimal(lastRate) + '× · 已陈旧'
     : rate ? formatDecimal(rate) + (candidate ? '× · 待启用' : '×')
-      : groupIssue || billingError || observedRate == null || observedRate === '' ? '待同步' : '倍率无效'
+      : rateUnverified ? '待核实'
+        : groupIssue || billingError || observedRate == null || observedRate === '' ? '待同步' : '倍率无效'
   const source = record?.price_conditions_exact ?? record?.price_conditions
   const terms = (websiteKey?.group_id == null || matchingQuote) && status !== 'not_listed' &&
     source && typeof source === 'object' && !Array.isArray(source) ? source : null

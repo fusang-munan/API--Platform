@@ -117,10 +117,16 @@ WHERE d.provider_id=$1 GROUP BY d.platforms`, provider).Scan(&platformCount, &oc
 	}
 	web := overview()
 	fullRun := web.WebsiteDirectory.LastRun
-	if web.WebsiteDirectory.State != "fresh" || len(web.ModelCatalog) != 20 || len(web.WebsiteOnlyModels) != 20 ||
+	if web.WebsiteDirectory.State != "fresh" || len(web.ModelCatalog) != 20 || len(web.WebsiteOnlyModels) != 19 ||
 		fullRun == nil || fullRun.StartedAt.IsZero() || fullRun.PlatformCount != 9 || fullRun.GroupCount != 5 ||
 		fullRun.ModelCount != 20 || fullRun.ExpectedModelCount != 20 || len(fullRun.Failures) != 0 {
 		t.Fatalf("完整抓取后官网目录或最近抓取报告不符: %+v", web.WebsiteDirectory)
+	}
+	if row := findModel(web, "claude-fable-5"); row.CatalogState != "published_unavailable" ||
+		row.KeyCount != 0 || row.BindingIssue == nil || slices.ContainsFunc(web.WebsiteOnlyModels, func(model WebsiteOnlyModel) bool {
+		return strings.EqualFold(model.Model, row.Model)
+	}) {
+		t.Fatalf("已发布 Claude 应保留在异常目录: %+v", row)
 	}
 	secrets := []string{"sk-fixture-gemini", "sk-fixture-gm1", "sk-fixture-g3", "sk-fixture-original-cc1"}
 	for i, key := range keys {
@@ -210,7 +216,8 @@ WHERE d.provider_id=$1 GROUP BY d.platforms`, provider).Scan(&platformCount, &oc
 	if err := service.RescanCatalog(ctx, provider, replacement.ID); err != nil {
 		t.Fatal(err)
 	}
-	if row := checkClaude("missing"); row.Source != "website" || row.KeyCount != 0 || len(row.Protocols) != 0 || row.BindingIssue == nil {
+	if row := checkClaude("missing"); row.Source != "website" || row.CatalogState != "published_unavailable" ||
+		row.KeyCount != 0 || len(row.Protocols) != 0 || row.BindingIssue == nil {
 		t.Fatalf("新 Key 无 Claude 时应标明官网和原有绑定状态: %+v", row)
 	}
 	keyResponses[newKey] = keyResponses[secrets[3]]

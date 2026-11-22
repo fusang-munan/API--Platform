@@ -6,7 +6,7 @@ import router from '../router'
 import { token } from '../api/client'
 import { useAuthStore } from '../store/auth'
 import type { BeichenModel, BeichenModelUsage, BeichenOverview, BeichenPriceConditions, ProjectUsage, Role } from '../api/types'
-import { schoolCatalog } from '../utils/beichenModels'
+import { indexWebsiteKeyGroups, schoolCatalog } from '../utils/beichenModels'
 import { schoolDay, schoolMonth } from '../utils/format'
 
 vi.mock('../api/client', async original => ({
@@ -26,6 +26,7 @@ let enabled: boolean
 let discoveredEnabled: boolean
 let discoveredPriced: boolean
 let failQuota: boolean
+let keyRate = '2.125000000000000000000001'
 let role: Role
 let widget: VueWrapper
 const writes = vi.fn()
@@ -85,7 +86,13 @@ async function fetchFixture(url: string, init?: RequestInit) {
   if (path.endsWith('/providers')) return reply([school, other])
   if (path === '/api/v1/teacher/model-usage') return reply({ ...modelUsage(), range: new URL(url, 'https://school.test').searchParams.get('range') })
   if (path === '/api/v1/teacher/providers/north/beichen/receipts') return reply({ items: [], next_cursor: null })
-  if (path === '/api/v1/teacher/providers/north/beichen/keys') return reply({ status: 'unsynced', last_seen: null, keys: [] })
+  if (path === '/api/v1/teacher/providers/north/beichen/keys') return reply({
+    status: 'current', last_seen: '2026-11-21T13:00:00Z', keys: [
+      { id: 1, name: '首选 Key', key_prefix: null, status: 'active', enabled: true, created_at: null, last_seen: '2026-11-21T13:00:00Z', observed_at: '2026-11-21T13:00:00Z', match_status: 'matched', credential_id: 'chosen', group_id: 11, group_name: '首选分组', rate: keyRate },
+      { id: 2, name: '低价 Key', key_prefix: null, status: 'active', enabled: true, created_at: null, last_seen: '2026-11-21T13:00:00Z', observed_at: '2026-11-21T13:00:00Z', match_status: 'matched', credential_id: 'cheap', group_id: 12, group_name: '低价分组', rate: '0.0625' },
+      { id: 3, name: '陈旧 Key', key_prefix: null, status: 'active', enabled: true, created_at: null, last_seen: '2026-11-21T13:00:00Z', match_status: 'matched', credential_id: 'stale', group_id: 13, group_name: '陈旧分组', rate: '0.3' },
+    ],
+  })
   if (path.endsWith('/beichen')) return reply({
     web_login_required: true,
     maintenance_workspace: { launch_url: workspaceUrl },
@@ -94,16 +101,19 @@ async function fetchFixture(url: string, init?: RequestInit) {
       price_last_seen: '2026-11-01T15:30:00Z', receipt_last_checked: '2026-11-01T16:02:03Z',
     },
     datasets: [
-      { kind: 'billing', credential_id: 'cheap', effective_multiplier: 0.1 },
+      { kind: 'billing', credential_id: 'chosen', group_id: 11, group_rate: keyRate, group_status: 'assigned',
+        billing_state: 'current', effective_multiplier: keyRate, observed_at: '2026-11-21T13:05:00Z' },
+      { kind: 'billing', credential_id: 'cheap', group_id: 12, group_rate: '0.0625', group_status: 'assigned',
+        billing_state: 'current', effective_multiplier: '0.0625', observed_at: '2026-11-21T13:05:00Z' },
       { kind: 'billing', credential_id: 'stale', last_error: '本轮读取失败', effective_multiplier: 0.3 },
     ],
     models: [
-      { credential_id: 'chosen', model: 'shared', price_status: 'confirmed', price_conditions: {
+      { credential_id: 'chosen', model: 'shared', price_status: 'confirmed', price_observed_at: '2026-11-21T13:00:00Z', price_conditions: {
         billing_mode: 'token', input_price: '0.0000001', output_price: '0.0000002', cache_read_price: '0', cache_write_price: null,
       }, upstream_rates: {
         input: '0.000000031', output: '2', cache_read: '0', cache_write: null,
       } },
-      { credential_id: 'cheap', model: 'shared', price_status: 'conditional', upstream_rates: { input: '1', output: '2' }, price_conditions: { cache_write_1h_price: 0.1 },
+      { credential_id: 'cheap', model: 'shared', price_status: 'conditional', price_observed_at: '2026-11-21T13:00:00Z', upstream_rates: { input: '1', output: '2' }, price_conditions: { cache_write_1h_price: 0.1 },
         price_conditions_exact: { billing_mode: 'token', cache_write_1h_price: '0', cache_write_12h_price: '0.000004', internal_route: '隐藏的渠道',
           intervals: [{ min_tokens: '200000', max_tokens: null, input_price: '0.000008000000000000000019' }],
           reasoning_effort_multipliers: { low: '0.5' },
@@ -114,20 +124,36 @@ async function fetchFixture(url: string, init?: RequestInit) {
       }] : []),
     ],
     model_catalog: [
-      { model: 'shared', school_model: 'school-alias', school_status: enabled ? 'active' : 'inactive', can_enable: !enabled, preferred_routes: [
+      { model: 'shared', school_model: 'school-alias', school_status: enabled ? 'active' : 'inactive', can_enable: !enabled,
+        source: 'both', catalog_state: 'key_listed', credential_ids: ['chosen', 'cheap'], key_count: 2,
+        website_locations: [
+          { name: 'shared', observed_at: '2026-11-21T13:00:00Z', groups: [{ id: 11, name: '首选分组', rate_multiplier: keyRate }],
+            has_price: true, price_complete: true,
+            price_conditions_exact: { billing_mode: 'token', input_price: '0.0000001', output_price: '0.0000002', cache_read_price: '0', cache_write_price: null } },
+          { name: 'shared', observed_at: '2026-11-21T13:00:00Z', groups: [{ id: 12, name: '低价分组', rate_multiplier: '0.0625' }],
+            has_price: true, price_complete: true,
+            price_conditions_exact: { billing_mode: 'token', input_price: '0.0000001', output_price: '0.0000002', cache_read_price: '0', cache_write_price: null } },
+        ],
+        preferred_routes: [
         { school_model: 'school-alias', adapter: 'openai_responses', state: enabled ? 'ready' : 'candidate', provider_id: 'north', credential_id: 'chosen', priority: 10,
           effective_multiplier: 2.125, effective_multiplier_text: '2.125000000000000000000001' },
         { school_model: 'school-alias', adapter: 'anthropic', state: 'candidate', provider_id: 'north', credential_id: 'cheap', priority: 1, effective_multiplier: '0.0625' },
       ] },
       { model: 'lab/new-model', school_status: discoveredEnabled ? 'active' : 'not_configured', can_enable: !discoveredEnabled,
+        source: 'both', catalog_state: 'key_listed', credential_ids: ['chosen'], key_count: 1,
+        website_locations: discoveredPriced ? [{
+          name: 'lab/new-model', observed_at: '2026-11-21T13:00:00Z', groups: [{ id: 11, name: '首选分组', rate_multiplier: keyRate }],
+          has_price: true, price_complete: true,
+          price_conditions_exact: { billing_mode: 'token', input_price: '0.000001', output_price: '0.000002' },
+        }] : [],
         preferred_routes: ['openai_responses', 'openai_compatible'].map(adapter => ({
           school_model: 'lab/new-model', adapter, state: discoveredEnabled ? 'ready' : 'candidate', provider_id: 'north',
           credential_id: 'chosen', effective_multiplier: 0.15,
         })) },
       { model: 'paused', school_status: 'not_configured', can_enable: false, preferred_routes: [
         { school_model: 'paused', adapter: 'anthropic', state: 'candidate', provider_id: 'north', credential_id: 'stale', effective_multiplier: '0.3' },
-      ] },
-      { model: 'no-price', preferred_routes: [] },
+      ], catalog_state: 'key_listed', credential_ids: ['stale'], key_count: 1 },
+      { model: 'no-price', preferred_routes: [], catalog_state: 'key_listed', credential_ids: [], key_count: 0 },
     ],
   })
   if (path.endsWith('/models')) return reply(['cheap', 'chosen'].map(credential_id =>
@@ -143,6 +169,7 @@ async function fetchFixture(url: string, init?: RequestInit) {
 const request = vi.fn(fetchFixture)
 beforeEach(() => {
   quota = '10'; enabled = true; discoveredEnabled = false; discoveredPriced = false; failQuota = false
+  keyRate = '2.125000000000000000000001'
   writes.mockClear(); request.mockClear()
   vi.stubGlobal('fetch', request)
   vi.stubGlobal('confirm', vi.fn(() => true))
@@ -170,10 +197,9 @@ function button(label: string, root: Pick<DOMWrapper<Element>, 'findAll'> = page
 }
 
 function visiblePrices(row: Pick<DOMWrapper<Element>, 'findAll'>) {
-  return row.findAll('.quote-table tbody tr').map(line => {
-    const [base, , settlement, student] = line.findAll('td')
-    return [line.get('th').text(), ...[base, settlement, student].map(cell =>
-      cell.find('strong').exists() ? cell.get('strong').text() : cell.text())]
+  return row.findAll('[data-testid="model-price-table"] tbody tr').map(line => {
+    const label = line.get('th').text().replace(/（.*$/, '')
+    return [label, ...line.findAll('td').map(cell => cell.text())]
   })
 }
 
@@ -201,15 +227,12 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   expect(button('手动定价', paused).exists()).toBe(true)
   expect(historical.text()).toContain('启用条件待同步')
   expect(table.text()).toContain('北辰官网需要学校后台重新授权')
-  expect(shared.findAll('.quote-table')).toHaveLength(1)
+  expect(shared.findAll('[data-testid="model-price-table"]')).toHaveLength(1)
   expect(visiblePrices(shared)).toEqual([
-    ['输入', '10 积分', '21.25000000000000000000001 积分', '23.375000000000000000000011 积分'],
-    ['输出', '20 积分', '42.50000000000000000000002 积分', '46.750000000000000000000022 积分'],
-    ['缓存写入(5m)', '— 未列单价', '—', '—'],
-    ['缓存写入(1h)', '— 未列单价', '—', '—'],
-    ['缓存读取', '0 积分', '0 积分', '0 积分'],
+    ['上游基础价', '0.1', '0.2', '未列', '未列', '0'],
+    ['学生实价', '23.375000000000000000000011', '46.750000000000000000000022', '—', '—', '0'],
   ])
-  expect(shared.get('[data-source="website"]').text()).toContain('官网正式价')
+  expect(shared.get('[data-testid="group-prices"]').attributes('data-price-source')).toBe('website')
   expect(shared.text()).not.toContain('上下文分档')
   await button('查看档位', shared).trigger('click')
   await flushPromises()
@@ -228,13 +251,13 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
     '每百万 Token 的积分 · 输入 50.00000000000000011875 积分（0.5000000000000000011875 元）',
   ].join('\n'))
   await conditions.get('button[aria-label="关闭"]').trigger('click')
-  expect(shared.find('details').exists()).toBe(false)
+  expect(shared.find('details.catalog-evidence').exists()).toBe(true)
   expect(table.text()).not.toMatch(/隐藏的|chosen|cheap|school-alias|OpenAI|Anthropic|路由|渠道/i)
   expect(writes).not.toHaveBeenCalled()
   await button('禁用', shared).trigger('click')
   await flushPromises()
   expect(writes).toHaveBeenLastCalledWith('/api/v1/teacher/models/configuration', { model_id: 'school-alias', status: 'inactive' })
-  expect(shared.get('.quote-table').text()).toContain('0.0625×')
+  expect(shared.get('.current-group-prices').text()).toContain('0.0625×')
   await button('启用', shared).trigger('click')
   await flushPromises()
   expect(writes).toHaveBeenLastCalledWith('/api/v1/teacher/providers/north/beichen/models/enable', { model: 'shared', school_model: 'school-alias' })
@@ -256,7 +279,7 @@ it('教师从目录直接启用未配置模型，失败后可重试，后台成�
   const row = table.get('[data-model="lab/new-model"]')
   expect(row.text()).toContain('未配置')
   expect(row.get('[data-testid="price-missing"]').text()).toContain('缺价')
-  expect(row.find('.quote-table').exists()).toBe(false)
+  expect(row.get('[data-testid="price-base-missing"]').text()).toBe('未匹配到官网基础价')
   expect(button('启用', row).element.disabled).toBe(true)
   // 目录已发现模型但尚无价格时，先等待下一轮补价，再允许启用。
   discoveredPriced = true
@@ -289,7 +312,7 @@ it('教师从目录直接启用未配置模型，失败后可重试，后台成�
   ])
   expect(writes).toHaveBeenCalledExactlyOnceWith('/api/v1/teacher/providers/north/beichen/models/enable', { model: 'lab/new-model' })
   expect(row.text()).toContain('已启用')
-  expect(row.text()).toContain('0.15×')
+  expect(row.text()).toContain('2.125000000000000000000001×')
   expect(row.text()).not.toMatch(/待启用|未配置|openai|chosen/i)
   expect(button('禁用', row).exists()).toBe(true)
 })
@@ -298,10 +321,19 @@ const discoveredModel = 'catalog/new-from-key'
 type PriceSnapshot = Pick<BeichenModel, 'price_status' | 'price_conditions' | 'price_conditions_exact' | 'upstream_rates'>
 
 function discoveredOverview(price: PriceSnapshot | null, multiplier: string | null = '0.125'): BeichenOverview {
+  keyRate = multiplier ?? '0.125'
+  const terms = price?.price_conditions_exact
+  const complete = Boolean(terms && (price?.price_status === 'confirmed' || price?.price_status === 'conditional'))
   return {
     datasets: [], comparison: [],
     model_catalog: [{
       model: discoveredModel, school_status: 'not_configured', can_enable: true,
+      source: 'both', catalog_state: 'key_listed', credential_ids: ['chosen'], key_count: 1,
+      website_locations: complete ? [{
+        name: discoveredModel, observed_at: '2026-11-21T13:00:00Z',
+        groups: [{ id: 11, name: '首选分组', rate_multiplier: keyRate }],
+        has_price: true, price_complete: true, price_conditions_exact: terms ?? undefined,
+      }] : [],
       preferred_routes: [{
         school_model: discoveredModel, upstream_model: discoveredModel, provider_id: 'north', credential_id: 'chosen',
         adapter: 'openai_responses', priority: 10, state: 'candidate', effective_multiplier_text: multiplier,
@@ -311,6 +343,25 @@ function discoveredOverview(price: PriceSnapshot | null, multiplier: string | nu
   }
 }
 
+function verifiedGroups(multiplier = keyRate) {
+  const key = {
+    id: 1, name: '首选 Key', key_prefix: null, status: 'active' as const, enabled: true,
+    created_at: null, last_seen: '2026-11-21T13:00:00Z', observed_at: '2026-11-21T13:00:00Z',
+    match_status: 'matched' as const, credential_id: 'chosen', group_id: 11, group_name: '首选分组', rate: multiplier,
+  }
+  return indexWebsiteKeyGroups({
+    status: 'current', last_seen: '2026-11-21T13:00:00Z', keys: [key],
+  })
+}
+
+function withVerifiedRate(data: BeichenOverview, multiplier = keyRate) {
+  data.datasets = [{ kind: 'billing', credential_id: 'chosen', group_id: 11, group_rate: multiplier,
+    group_status: 'assigned', billing_state: 'current', effective_multiplier: multiplier,
+    observed_at: '2026-11-21T13:05:00Z' }]
+  data.models = (data.models ?? []).map(row => ({ ...row, price_observed_at: '2026-11-21T13:00:00Z' }))
+  return data
+}
+
 it('教师页自动发现目录里的新模型，等待当前 Key 的报价并更新学生实价', async () => {
   vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
   await enter('teacher', '/teacher/models')
@@ -318,6 +369,7 @@ it('教师页自动发现目录里的新模型，等待当前 Key 的报价并�
   expect(table.text()).not.toContain(discoveredModel)
   const before = request.mock.calls.length
   const update = async (snapshot: BeichenOverview) => {
+    withVerifiedRate(snapshot)
     request.mockResolvedValueOnce(reply(snapshot))
     await vi.advanceTimersByTimeAsync(60_000)
     await flushPromises()
@@ -327,33 +379,27 @@ it('教师页自动发现目录里的新模型，等待当前 Key 的报价并�
   const forOtherKey = discoveredOverview(null)
   forOtherKey.models = [{ credential_id: 'cheap', model: discoveredModel, mode: 'follow', price_status: 'not_listed' }]
   const pending = await update(forOtherKey)
-  expect(pending.get('[data-testid="current-group-missing"]').text()).toBe('当前 Key 分组未匹配')
-  expect(pending.find('.quote-table').exists()).toBe(false)
+  expect(pending.get('[data-testid="price-base-missing"]').text()).toBe('未匹配到官网基础价')
+  expect(pending.findAll('[data-testid="model-price-table"]')).toHaveLength(1)
 
   const unlisted = await update(discoveredOverview({ price_status: 'not_listed', price_conditions: null }))
   expect(unlisted.get('[data-testid="price-missing"]').text()).toContain('缺价')
-  expect(unlisted.find('.quote-table').exists()).toBe(false)
+  expect(unlisted.get('[data-testid="price-base-missing"]').text()).toBe('未匹配到官网基础价')
 
   const price: BeichenPriceConditions = { billing_mode: 'token', input_price: '8e-6', output_price: '0.000016' }
   const confirmed = await update(discoveredOverview({ price_status: 'confirmed', price_conditions_exact: price }))
-  expect(confirmed.get('.quote-table').text()).toContain('0.125×')
+  expect(confirmed.get('.current-group-prices').text()).toContain('0.125×')
   expect(visiblePrices(confirmed)).toEqual([
-    ['输入', '800 积分', '100 积分', '110 积分'],
-    ['输出', '1600 积分', '200 积分', '220 积分'],
-    ['缓存写入(5m)', '— 未列单价', '—', '—'],
-    ['缓存写入(1h)', '— 未列单价', '—', '—'],
-    ['缓存读取', '— 未列单价', '—', '—'],
+    ['上游基础价', '8', '16', '未列', '未列', '未列'],
+    ['学生实价', '110', '220', '—', '—', '—'],
   ])
   const changed = await update(discoveredOverview({
     price_status: 'confirmed', price_conditions_exact: { ...price, input_price: '0.000012' },
   }, '0.25'))
-  expect(changed.get('.quote-table').text()).toContain('0.25×')
+  expect(changed.get('.current-group-prices').text()).toContain('0.25×')
   expect(visiblePrices(changed)).toEqual([
-    ['输入', '1200 积分', '300 积分', '330 积分'],
-    ['输出', '1600 积分', '400 积分', '440 积分'],
-    ['缓存写入(5m)', '— 未列单价', '—', '—'],
-    ['缓存写入(1h)', '— 未列单价', '—', '—'],
-    ['缓存读取', '— 未列单价', '—', '—'],
+    ['上游基础价', '12', '16', '未列', '未列', '未列'],
+    ['学生实价', '330', '440', '—', '—', '—'],
   ])
   expect(request.mock.calls.slice(before).map(([url, init]) => [init?.method ?? 'GET', url.split('?')[0]])).toEqual(
     Array.from({ length: 4 }, () => [
@@ -372,15 +418,17 @@ it.each([
     '积分/次 · 图像输出 80\n官网原值（单位未知） · 图像输入 0.4', '积分/次 · 图像输出 10'],
 ] as const)('按 %s 的官网单位保留档位入口与结算价', async (billing_mode, fields, standard, actual) => {
   await enter('teacher', '/teacher/models')
-  const data = discoveredOverview({
+  const data = withVerifiedRate(discoveredOverview({
     price_status: 'confirmed', price_conditions_exact: { billing_mode, ...fields, input_price: '999' },
-  })
-  expect(schoolCatalog(data, 'north')[0].quotes[0]).toMatchObject({ status: 'confirmed', standard, actual })
+  }))
+  expect(schoolCatalog(data, 'north', verifiedGroups('0.125'))[0].quotes[0])
+    .toMatchObject({ status: 'confirmed', standard, actual })
   request.mockResolvedValueOnce(reply(data))
   await button('刷新模型', widget.get('[aria-label="北辰模型目录"]')).trigger('click')
   await flushPromises()
   const row = widget.get('[data-model="' + discoveredModel + '"]')
-  expect(row.get('.quote-table [data-key="input"]').text()).toContain('不适用')
+  expect(row.findAll('[data-price-row="official"] td').map(cell => cell.text()))
+    .toEqual(['未列', '未列', '未列', '未列', '未列'])
   await button('查看档位', row).trigger('click')
   const details = page().get('[role="dialog"] .condition-prices')
   const [official, settlement] = details.findAll('dd')

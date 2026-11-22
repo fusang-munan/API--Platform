@@ -37,32 +37,44 @@ type activationSchool struct {
 }
 
 type activationBinding struct {
-	id                uuid.UUID
-	route             PreferredRoute
-	active, reachable bool
+	id                                  uuid.UUID
+	route                               PreferredRoute
+	active, reachable, gatewayReachable bool
+	catalogCurrent                      bool
 }
 
 type activationPlan struct {
 	routes, northRoutes       []PreferredRoute
 	writes                    []activationBinding
 	northReady, foreignActive bool
+	catalogBlocked            bool
 }
 
 func loadActivationCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID, source string) ([]*activationModel, error) {
+	// Legacy website membership can sustain an existing published route until the first Key scan.
 	query := `
-SELECT k.model_id::text,k.raw_entry,p.name::text,c.id,c.label::text,
- p.status='active' AND c.status='active',
- CASE WHEN d.last_error IS NULL AND d.last_success>=c.updated_at
-   AND d.last_success>statement_timestamp()-interval '16 minutes'
+SELECT k.model_id::text,k.raw_entry,p.name::text,c.id,c.label::text,k.catalog_source='key',
+ p.status='active' AND c.status='active' AND k.last_seen_at>=c.updated_at,
+ ` + keyCatalogCurrentSQL + `,
+ CASE WHEN billing.last_error IS NULL AND billing.last_success>=c.updated_at
+   AND billing.last_success>statement_timestamp()-interval '16 minutes'
    AND mv.stale_at IS NULL
  THEN mv.multiplier::text END, to_json(k.supported_protocols)
 FROM provider_model_catalog k JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
 JOIN providers p ON p.id=c.provider_id
-LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='billing'
+LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='catalog'
+LEFT JOIN beichen_datasets billing ON billing.credential_id=c.id AND billing.kind='billing'
 LEFT JOIN LATERAL (SELECT multiplier,stale_at FROM beichen_multiplier_versions WHERE credential_id=c.id
  AND effective_at<=statement_timestamp()
  ORDER BY effective_at DESC,id DESC LIMIT 1) mv ON true
-WHERE p.id=$1 AND ` + beichenProvider + ` AND k.status='active' AND ($2::text='' OR k.model_id=$2::citext)
+WHERE p.id=$1 AND ` + beichenProvider + ` AND k.status='active'
+ AND (k.catalog_source='key' OR (k.catalog_source='website' AND EXISTS (
+   SELECT 1 FROM model_bindings b JOIN models s ON s.id=b.model_id
+   WHERE b.provider_id=k.provider_id AND btrim(b.upstream_model_name)::citext=k.model_id
+     AND (b.credential_id IS NULL OR b.credential_id=k.credential_id)
+     AND b.status='active' AND s.status='active'
+ )))
+ AND ($2::text='' OR k.model_id=$2::citext)
 ORDER BY lower(k.model_id::text),c.id`
 	if source != "" {
 		query += " FOR SHARE OF p,c,k"
@@ -75,15 +87,24 @@ ORDER BY lower(k.model_id::text),c.id`
 	var models []*activationModel
 	index := map[string]*activationModel{}
 	rates := map[uuid.UUID]*json.Number{}
+	var legacyPublished bool
 	for rows.Next() {
 		var modelID string
 		var raw, protocols []byte
 		var providerName, label string
 		var key uuid.UUID
-		var available bool
+		var keyListed, available, catalogCurrent bool
 		var rate *string
-		if err := rows.Scan(&modelID, &raw, &providerName, &key, &label, &available, &rate, &protocols); err != nil {
+		if err := rows.Scan(&modelID, &raw, &providerName, &key, &label, &keyListed, &available, &catalogCurrent, &rate, &protocols); err != nil {
 			return nil, err
+		}
+		if available && rate != nil {
+			n := json.Number(*rate)
+			rates[key] = &n
+		}
+		if !keyListed {
+			legacyPublished = legacyPublished || available
+			continue
 		}
 		name := strings.ToLower(modelID)
 		m := index[name]
@@ -93,16 +114,12 @@ ORDER BY lower(k.model_id::text),c.id`
 			models = append(models, m)
 		}
 		m.keys = append(m.keys, key)
-		if !available {
+		if !available || !catalogCurrent {
 			continue
 		}
 		entry, err := storedCatalogEntry(modelID, raw, protocols)
 		if err != nil {
 			return nil, err
-		}
-		if rate != nil {
-			n := json.Number(*rate)
-			rates[key] = &n
 		}
 		for _, protocol := range catalog.RegisteredProtocols(entry) {
 			if _, ok := m.defaults[protocol]; ok {
@@ -118,31 +135,45 @@ ORDER BY lower(k.model_id::text),c.id`
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	if len(models) == 0 && source != "" {
+	if len(models) == 0 && !legacyPublished && source != "" {
 		return models, nil
 	}
+	// An unpinned binding can still display a reachable Key during transition.
+	// Publication requires evidence for the first Key the gateway will pick.
 	bound, err := tx.QueryContext(ctx, `
 WITH north AS (
- SELECT DISTINCT model_id FROM provider_model_catalog WHERE provider_id=$1 AND status='active' AND ($2::text='' OR model_id=$2::citext)
+ SELECT DISTINCT k.model_id FROM provider_model_catalog k
+ WHERE k.provider_id=$1 AND ($2::text='' OR k.model_id=$2::citext)
+   AND ((k.status='active' AND k.catalog_source='key')
+     OR ($2::text='' AND EXISTS (SELECT 1 FROM models s WHERE s.model_id=k.model_id)))
  UNION
  SELECT btrim(b.upstream_model_name)::citext FROM model_bindings b JOIN models s ON s.id = b.model_id
- WHERE b.provider_id=$1 AND $2::text='' AND s.status='active' AND btrim(b.upstream_model_name)<>''
+ WHERE b.provider_id=$1 AND s.status='active' AND btrim(b.upstream_model_name)<>''
+   AND ($2::text='' OR btrim(b.upstream_model_name)::citext=$2::citext)
 ), names AS (
  SELECT n.model_id AS upstream,m.id FROM north n JOIN models m ON m.model_id=n.model_id
  UNION
  SELECT n.model_id,b.model_id FROM north n JOIN model_bindings b ON b.provider_id=$1 AND lower(btrim(b.upstream_model_name))=lower(n.model_id::text)
 )
 SELECT n.upstream::text,m.id,m.model_id::text,m.status,m.credit_multiplier_milli,b.id,b.adapter,b.upstream_model_name,
- b.provider_id,p.name::text,b.priority,b.status='active',p.status='active' AND picked.id IS NOT NULL,
- CASE WHEN b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1 THEN picked.id END,
- CASE WHEN b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1 THEN picked.label::text END
+ b.provider_id,p.name::text,b.priority,b.status='active',
+ p.status='active' AND COALESCE(picked.reachable,false),p.status='active' AND picked.id IS NOT NULL,
+ COALESCE(picked.catalog_current,false),
+ CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.id END,
+ CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.label::text END
 FROM names n JOIN models m ON m.id=n.id
 LEFT JOIN model_bindings b ON b.model_id=m.id LEFT JOIN providers p ON p.id=b.provider_id
 LEFT JOIN LATERAL (
- SELECT c.id,c.label,count(*) OVER() AS count FROM provider_model_catalog k
+ SELECT c.id,c.label,count(*) OVER() AS count,
+   (b.provider_id<>$1 OR k.last_seen_at>=c.updated_at) AS reachable,
+   k.catalog_source='key' AND k.last_seen_at>=c.updated_at AND `+keyCatalogCurrentSQL+`
+     AND c.id=first_value(c.id) OVER (ORDER BY c.id) AS catalog_current
+ FROM provider_model_catalog k
  JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
+ LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='catalog'
  WHERE k.provider_id=b.provider_id AND k.model_id=btrim(b.upstream_model_name)::citext AND k.status='active' AND c.status='active'
- AND (b.credential_id IS NULL OR c.id=b.credential_id) ORDER BY c.id LIMIT 1
+   AND (b.credential_id IS NULL OR c.id=b.credential_id)
+ ORDER BY reachable DESC,c.id LIMIT 1
 ) picked ON true
 ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source)
 	if err != nil {
@@ -155,9 +186,10 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source)
 		var id, owner, key *uuid.UUID
 		var adapter, upstream, providerName, label *string
 		var priority *int
-		var active, reachable *bool
+		var active, reachable, gatewayReachable *bool
+		var catalogCurrent bool
 		if err := bound.Scan(&source, &school.id, &school.name, &school.status, &school.multiplier, &id, &adapter, &upstream, &owner, &providerName,
-			&priority, &active, &reachable, &key, &label); err != nil {
+			&priority, &active, &reachable, &gatewayReachable, &catalogCurrent, &key, &label); err != nil {
 			return nil, err
 		}
 		group := strings.ToLower(source)
@@ -180,7 +212,10 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source)
 			r.EffectiveMultiplier = rates[*key]
 		}
 		s := m.schools[name]
-		s.bindings = append(s.bindings, activationBinding{id: *id, route: r, active: *active, reachable: *reachable})
+		s.bindings = append(s.bindings, activationBinding{
+			id: *id, route: r, active: *active, reachable: *reachable,
+			gatewayReachable: *gatewayReachable, catalogCurrent: catalogCurrent,
+		})
 	}
 	sort.Slice(models, func(i, j int) bool { return strings.ToLower(models[i].name) < strings.ToLower(models[j].name) })
 	return models, bound.Err()
@@ -207,6 +242,10 @@ func (m *activationModel) target(name string) *activationSchool {
 		}
 	}
 	return nil
+}
+
+func (s *activationSchool) published() bool {
+	return s.status == "active" && s.multiplier != nil && *s.multiplier > 0
 }
 
 func (m *activationModel) plan(s *activationSchool) activationPlan {
@@ -243,6 +282,7 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 			plan.foreignActive = true
 		}
 		rank := 0
+		repair := false
 		switch {
 		case b.active && b.reachable:
 			rank = 2
@@ -261,7 +301,12 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 				plan.writes = append(plan.writes, activationBinding{id: b.id, route: r})
 				plan.northReady = true
 				rank = 2
+				repair = true
 			}
+		}
+		// Activating the school model publishes its retained gateway bindings too.
+		if r.ProviderID == m.provider && !s.published() && b.active && b.gatewayReachable && !b.catalogCurrent && !repair {
+			plan.catalogBlocked = true
 		}
 		if rank > 0 && r.ProviderID == m.provider {
 			plan.northRoutes = append(plan.northRoutes, r)
@@ -300,7 +345,7 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 }
 
 func (p activationPlan) allowed(s *activationSchool) bool {
-	return p.northReady && (!p.foreignActive || s.multiplier != nil && *s.multiplier > 0)
+	return p.northReady && !p.catalogBlocked && (!p.foreignActive || s.multiplier != nil && *s.multiplier > 0)
 }
 
 type activationPrice struct {
@@ -326,6 +371,14 @@ func routePriceReadiness(fixed bool, terms json.RawMessage) activationPrice {
 	}
 }
 
+func (model Model) activationPrice() activationPrice {
+	// Overview synthesizes display terms for derived prices. They cannot settle new calls.
+	if model.PriceSource == derivedPriceSource && model.Mode != "manual" {
+		return routePriceReadiness(false, nil)
+	}
+	return model.priceReadiness
+}
+
 // Check the North routes that can actually be used after publication,
 // including fallbacks hidden by a higher-priority route in the preview.
 func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx, observed map[string]map[uuid.UUID]*Model) (activationPrice, error) {
@@ -344,7 +397,7 @@ func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx, observed
 		record := observed[strings.ToLower(key.model)][key.credential]
 		var price activationPrice
 		if record != nil && record.Model == key.model {
-			price = record.priceReadiness
+			price = record.activationPrice()
 		} else {
 			var fixed bool
 			var terms []byte
@@ -365,12 +418,13 @@ func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx, observed
 
 // Read the original terms without converting any prices to floating point.
 const activationFixedSchoolPriceSQL = `p.school_input IS NOT NULL AND p.school_output IS NOT NULL
-  AND (p.mode = 'manual' OR COALESCE(version.source = 'derived_from_usage', false)
-       OR (p.school_cache_read IS NOT NULL AND p.school_cache_write IS NOT NULL))`
+  AND (p.mode = 'manual' OR (version.source IS DISTINCT FROM '` + derivedPriceSource + `'
+       AND p.school_cache_read IS NOT NULL AND p.school_cache_write IS NOT NULL))`
 
 const activationPriceSQL = `
 SELECT ` + activationFixedSchoolPriceSQL + `,
-  CASE WHEN snap.expires_at > statement_timestamp()
+  CASE WHEN version.source IS DISTINCT FROM '` + derivedPriceSource + `'
+       AND snap.expires_at > statement_timestamp()
        AND COALESCE(snap.credential_ciphertext_sha256 = sha256(c.credential_ciphertext), snap.credential_revision = c.updated_at)
        THEN snap.model_pricing -> ($2::text) END
 FROM provider_credentials c
@@ -390,8 +444,10 @@ func (m *activationModel) overview() CatalogModel {
 	if target != nil {
 		plan := m.plan(target)
 		result.SchoolStatus = target.status
-		result.SchoolModel = target.name
-		result.CanEnable = plan.allowed(target) && (target.status != "active" || len(plan.writes) > 0 || target.multiplier == nil || *target.multiplier <= 0)
+		if target.id != uuid.Nil {
+			result.SchoolModel = target.name
+		}
+		result.CanEnable = plan.allowed(target) && (!target.published() || len(plan.writes) > 0)
 		if len(m.schools) == 0 {
 			result.PreferredRoutes = append(result.PreferredRoutes, plan.routes...)
 		}
@@ -511,9 +567,9 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 	}
 	plan := m.plan(target)
 	if !plan.allowed(target) {
-		return skip("route_not_ready", "当前北辰凭据、已配置的线路或其他供应商计价尚未就绪")
+		return skip("route_not_ready", "当前北辰 Key 目录、已配置的线路或其他供应商计价尚未就绪")
 	}
-	if target.status == "active" && len(plan.writes) == 0 && target.multiplier != nil && *target.multiplier > 0 {
+	if target.published() && len(plan.writes) == 0 {
 		return skip("already_active", "模型已启用")
 	}
 	price, err := plan.priceReadiness(ctx, tx, nil)
@@ -575,9 +631,9 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 	}
 	plan := m.plan(target)
 	if !plan.allowed(target) {
-		return uuid.Nil, invalid("当前北辰凭据、已配置的路线或其他供应商计价不支持直接启用")
+		return uuid.Nil, invalid("当前北辰 Key 目录、已配置的路线或其他供应商计价不支持直接启用")
 	}
-	if target.status == "active" && len(plan.writes) == 0 && target.multiplier != nil && *target.multiplier > 0 {
+	if target.published() && len(plan.writes) == 0 {
 		return target.id, nil
 	}
 	price, err := plan.priceReadiness(ctx, tx, nil)

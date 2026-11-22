@@ -2,10 +2,12 @@ package beichen
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,15 +37,36 @@ func (s *Service) fetchBillingCatalog(ctx context.Context, provider uuid.UUID, t
 			return directory, errWebsiteDirectoryEmpty
 		}
 		fallback.keyGroup, fallback.keyGroupAt = directory.keyGroup, directory.keyGroupAt
-		if err == nil && fallback.keyGroup.Rate == nil {
+		if err != nil {
+			return fallback, err
+		}
+		if fallback.keyGroup.Rate == nil {
 			fallback.keyGroup.Rate = fallback.group.Rate
 		}
-		// The verified Key has a group even when the price directory omits it.
-		return fallback, err
-	}
-	if websiteErr != nil {
+		fallback.prices = matchWebsitePrices(fallback.entries, directory.prices)
+		directory = fallback
+	} else if websiteErr != nil {
 		return directory, websiteErr
 	}
+	rates, _ := s.fetchWebsiteAccountRates(ctx, token)
+	if rate, ok := rates[directory.group.ID]; ok {
+		directory.group.AccountRate = &rate
+	} else if directory.keyBilling == nil {
+		info, err := s.fetchKeyBillingInfo(ctx, key, identity)
+		if err == nil && verifyWebsiteKeyRate(directory.group, &info) {
+			if at, err := s.currentKeyBillingAt(ctx, info); err == nil {
+				directory.keyRate, directory.at = &info, at
+			}
+		}
+	}
+	if directory.keyBilling != nil {
+		if directory.group.AccountRate == nil {
+			slog.Warn("北辰官网账户倍率未核实，使用 Key 账单确认的生效倍率", "provider_id", provider, "group_id", directory.group.ID)
+		}
+		return directory, nil
+	}
+	// Existing evidence can require reconciling legacy model spellings even
+	// after the group is published. Quote terms still come from the website.
 	var hasEvidence bool
 	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (
 SELECT 1 FROM beichen_group_price_observations
@@ -62,42 +85,55 @@ WHERE provider_id=$1 AND group_id=$2 AND source='derived_from_usage' AND observe
 }
 
 func (directory websiteKeyCatalog) withActualModels(actual []catalog.ProviderEntry) websiteKeyCatalog {
-	website := crawlModelIDs(directory.entries)
-	pairs, _, _ := compareCrawlModelNames(crawlModelIDs(actual), website)
-	prices := make(map[string]json.RawMessage, len(pairs))
-	for _, pair := range pairs {
-		prices[pair.KeyModel] = directory.prices[pair.ChannelModel]
-	}
-	directory.websiteModels, directory.entries, directory.prices = website, actual, prices
+	directory.websiteModels = crawlModelIDs(directory.entries)
+	directory.entries = actual
+	directory.prices = matchWebsitePrices(actual, directory.prices)
 	return directory
 }
 
-func (s *Service) fetchKeyBillingCatalog(ctx context.Context, key string, identity listedKey) (websiteKeyCatalog, error) {
+func matchWebsitePrices(actual []catalog.ProviderEntry, official map[string]json.RawMessage) map[string]json.RawMessage {
+	pairs, _, _ := compareCrawlModelNames(crawlModelIDs(actual), slices.Sorted(maps.Keys(official)))
+	prices := make(map[string]json.RawMessage, len(pairs))
+	for _, pair := range pairs {
+		prices[pair.KeyModel] = official[pair.ChannelModel]
+	}
+	return prices
+}
+
+func (s *Service) fetchKeyBillingInfo(ctx context.Context, key string, identity listedKey) (billingInfo, error) {
 	body, err := s.fetch(ctx, key, billingPath, nil)
 	if err != nil {
-		return websiteKeyCatalog{}, keyMetadataError(err, identity.GroupID, "北辰 Key 的当前计费倍率无法读取")
+		return billingInfo{}, keyMetadataError(err, identity.GroupID, "北辰 Key 的当前计费倍率无法读取")
 	}
 	info, err := parseBilling(body)
 	if err != nil {
-		return websiteKeyCatalog{}, err
+		return billingInfo{}, err
 	}
 	if group := billingPanelGroup(info); group != 0 && group != identity.GroupID {
-		return websiteKeyCatalog{}, errPanelRulesConflict
+		return billingInfo{}, errPanelRulesConflict
 	}
 	if (info.KeyID != 0 && info.KeyID != identity.ID) || (info.APIKeyID != 0 && info.APIKeyID != identity.ID) {
-		return websiteKeyCatalog{}, errPanelRulesConflict
+		return billingInfo{}, errPanelRulesConflict
 	}
 	if group := identity.Group; group != nil {
 		if group.SubscriptionType != "" && group.SubscriptionType != "standard" {
-			return websiteKeyCatalog{}, errPanelRulesConflict
+			return billingInfo{}, errPanelRulesConflict
 		}
 		if (group.Rate != "" && info.GroupRate != "" && !samePanelRate(group.Rate, info.GroupRate)) ||
 			(group.PeakEnabled != nil && info.PeakEnabled != nil && *group.PeakEnabled != *info.PeakEnabled) {
-			return websiteKeyCatalog{}, errPanelRulesConflict
+			return billingInfo{}, errPanelRulesConflict
 		}
 		if info.GroupRate == "" && websiteGroupRate(group.Rate) != nil {
 			info.GroupRate = group.Rate
 		}
+	}
+	return info, nil
+}
+
+func (s *Service) fetchKeyBillingCatalog(ctx context.Context, key string, identity listedKey) (websiteKeyCatalog, error) {
+	info, err := s.fetchKeyBillingInfo(ctx, key, identity)
+	if err != nil {
+		return websiteKeyCatalog{}, err
 	}
 	// A separately published Key price table needs its own official-price
 	// verification. Do not select an estimate over those declared terms.
@@ -108,23 +144,11 @@ func (s *Service) fetchKeyBillingCatalog(ctx context.Context, key string, identi
 	if err != nil {
 		return websiteKeyCatalog{}, keyMetadataError(err, identity.GroupID, "北辰 Key 的实际型号清单无法读取")
 	}
-	info.GroupID = &identity.GroupID
-	at := s.now().UTC()
-	// The two hosts may differ by a fraction of a second. Wait for a near
-	// future sample to become current rather than changing its timestamp.
-	if delay := info.ObservedAt.Sub(at); delay > 0 && delay <= time.Second {
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return websiteKeyCatalog{}, ctx.Err()
-		case <-timer.C:
-			at = s.now().UTC()
-		}
-	}
-	if _, err := panelExpiry(info, at); err != nil {
+	at, err := s.currentKeyBillingAt(ctx, info)
+	if err != nil {
 		return websiteKeyCatalog{}, err
 	}
+	info.GroupID = &identity.GroupID
 	group := directoryGroup{WebsiteGroup: WebsiteGroup{ID: identity.GroupID, PeakEnabled: info.PeakEnabled}}
 	if identity.Group != nil {
 		group.Name = identity.Group.Name
@@ -138,6 +162,30 @@ func (s *Service) fetchKeyBillingCatalog(ctx context.Context, key string, identi
 	return websiteKeyCatalog{group: group, entries: entries, at: at, keyBilling: &info}, nil
 }
 
+func (s *Service) currentKeyBillingAt(ctx context.Context, info billingInfo) (time.Time, error) {
+	at := s.now().UTC()
+	// The two hosts may differ by a fraction of a second. Wait for a near
+	// future sample to become current rather than changing its timestamp.
+	if delay := info.ObservedAt.Sub(at); delay > 0 && delay <= time.Second {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return time.Time{}, ctx.Err()
+		case <-timer.C:
+			at = s.now().UTC()
+		}
+	}
+	expires, err := panelExpiry(info, at)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !expires.After(at) {
+		return time.Time{}, errors.New("北辰 Key 倍率的采样时段已结束")
+	}
+	return at, nil
+}
+
 type deniedKeyGroup int64
 
 func (group deniedKeyGroup) Error() string { return fmt.Sprintf("账号无 group %d 权限", group) }
@@ -148,41 +196,4 @@ func keyMetadataError(err error, groupID int64, message string) error {
 		return deniedKeyGroup(groupID)
 	}
 	return errors.New(message)
-}
-
-type derivedPriceRow struct {
-	priceRow
-	observedAt time.Time
-}
-
-func readDerivedPrices(ctx context.Context, tx *sql.Tx, credential uuid.UUID, group int64, at time.Time,
-	official map[string]json.RawMessage) ([]derivedPriceRow, error) {
-	rows, err := tx.QueryContext(ctx, `
-SELECT DISTINCT ON (o.model) o.model,o.pricing,o.observed_at
-FROM provider_credentials c
-JOIN beichen_group_price_observations o ON o.provider_id=c.provider_id
-JOIN provider_model_catalog m ON m.credential_id=c.id AND m.provider_id=c.provider_id
-  AND m.model_id::text=o.model AND m.status='active' AND m.last_seen_at>=c.updated_at
-WHERE c.id=$1 AND o.group_id=$2 AND o.source='derived_from_usage' AND o.observed_at<=$3
-ORDER BY o.model,o.observed_at DESC`, credential, group, at)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var prices []derivedPriceRow
-	for rows.Next() {
-		var row derivedPriceRow
-		var raw json.RawMessage
-		if err := rows.Scan(&row.Model, &raw, &row.observedAt); err != nil {
-			return nil, err
-		}
-		if !websiteMissing(official[row.Model]) {
-			continue
-		}
-		if rates, ok := flatPanelRates(raw); ok {
-			row.Rates = rates
-			prices = append(prices, row)
-		}
-	}
-	return prices, rows.Err()
 }

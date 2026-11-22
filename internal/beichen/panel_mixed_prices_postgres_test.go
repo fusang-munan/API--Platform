@@ -38,6 +38,9 @@ VALUES($1,'G3',decode(repeat('ab',32),'hex'),false)`, credential)
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
+	if err := recordSuccess(ctx, tx, credential, "catalog"); err != nil {
+		t.Fatal(err)
+	}
 	if err := saveBillingObservation(ctx, tx, credential, revision, info, nil, 1, quote); err != nil {
 		t.Fatal(err)
 	}

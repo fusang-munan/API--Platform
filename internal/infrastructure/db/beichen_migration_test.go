@@ -74,6 +74,89 @@ SELECT (SELECT count(*) FROM schema_migrations WHERE split_part(version,'_',1) B
 	}
 }
 
+func TestBeichenMigration0062ExpiresPre026Prices(t *testing.T) {
+	ctx, conn := openMigrationTestDB(t)
+	applyMigrationTestBaseline(t, ctx, conn, "0062")
+
+	provider, legacy, panel := uuid.New(), uuid.New(), uuid.New()
+	const model = "pre-026-model"
+	var historical time.Time
+	if err := conn.QueryRowContext(ctx, "SELECT now() - interval '1 hour'").Scan(&historical); err != nil {
+		t.Fatal(err)
+	}
+	older := historical.Add(-2 * time.Hour)
+	ended := historical.Add(-time.Hour)
+	unavailable := historical.Add(-30 * time.Minute)
+	originalExpiry := historical.Add(2 * time.Hour)
+	seed := func(query string, args ...any) {
+		t.Helper()
+		if _, err := conn.ExecContext(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(`INSERT INTO providers(id,name,base_url,created_at,updated_at)
+VALUES($1,'Price migration fixture','https://api.beichenapi.com',now(),now())`, provider)
+	seed(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
+VALUES($1,$3,'Legacy pricing','fixture'::bytea,$4,$4), ($2,$3,'Panel pricing','fixture'::bytea,$4,$4)`,
+		legacy, panel, provider, older)
+	seed(`INSERT INTO beichen_multiplier_versions(credential_id,effective_at,multiplier,group_id,stale_at)
+VALUES($1,$3,0.2,NULL,$5), ($1,$4,0.15,NULL,NULL), ($2,$3,0.2,15,NULL), ($2,$4,0.15,15,$6)`,
+		legacy, panel, older, historical, ended, originalExpiry)
+	seed(`INSERT INTO beichen_panel_snapshots(credential_id,effective_at,credential_revision,group_id,expires_at,multiplier_version)
+SELECT $1,effective_at,$2,group_id,CASE WHEN effective_at=$2 THEN $3::timestamptz ELSE $4 END,id
+FROM beichen_multiplier_versions WHERE credential_id=$1`, panel, older, ended, originalExpiry)
+	seed(`INSERT INTO beichen_panel_snapshots(credential_id,effective_at,credential_revision) VALUES($1,$2,$3)`,
+		panel, unavailable, older)
+	seed(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,effective_at,group_id)
+VALUES($1,$3,'upstream','base','billing',1000,2000,$4,NULL), ($2,$3,'upstream','base','panel',1000,2000,$4,15)`,
+		legacy, panel, model, historical)
+
+	checkPrice := func(credential uuid.UUID, at time.Time, hasVersion, usable bool) {
+		t.Helper()
+		var priceVersion, multiplierVersion bool
+		var input sql.NullString
+		want := sql.NullString{String: "150", Valid: true}
+		if !usable {
+			want = sql.NullString{}
+		}
+		err := conn.QueryRowContext(ctx, `
+SELECT upstream_version IS NOT NULL, multiplier_version IS NOT NULL, trim_scale(upstream_input)::text
+FROM beichen_price_at($1,$2,$3)`, credential, model, at).Scan(&priceVersion, &multiplierVersion, &input)
+		if err != nil || priceVersion != hasVersion || multiplierVersion != usable || input != want {
+			t.Fatalf("price at %s for %s: price version=%t, multiplier version=%t, input=%+v, want %t/%t/%+v (%v)",
+				at, credential, priceVersion, multiplierVersion, input, hasVersion, usable, want, err)
+		}
+	}
+	checkPrice(legacy, historical.Add(time.Hour), true, true)
+	checkPrice(panel, historical.Add(time.Hour), true, true)
+
+	if err := Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	var cutoff time.Time
+	if err := conn.QueryRowContext(ctx, `
+SELECT applied_at FROM schema_migrations WHERE version='0062_expire_pre_026_prices.sql'`).Scan(&cutoff); err != nil {
+		t.Fatal(err)
+	}
+	checkPrice(legacy, cutoff, true, false) // The legacy price row still exists, but its multiplier has expired.
+	checkPrice(panel, cutoff, false, false)
+	checkPrice(legacy, historical, true, true)
+	checkPrice(panel, historical, true, true)
+
+	var multiplierBoundaries, panelBoundaries bool
+	err := conn.QueryRowContext(ctx, `
+SELECT (SELECT count(*) FROM beichen_multiplier_versions
+        WHERE credential_id IN ($1,$2) AND stale_at=$3)=3
+       AND (SELECT stale_at FROM beichen_multiplier_versions WHERE credential_id=$1 AND effective_at=$4)=$5,
+       (SELECT expires_at FROM beichen_panel_snapshots WHERE credential_id=$2 AND effective_at=$6)=$3
+       AND (SELECT expires_at FROM beichen_panel_snapshots WHERE credential_id=$2 AND effective_at=$4)=$5
+       AND (SELECT expires_at IS NULL FROM beichen_panel_snapshots WHERE credential_id=$2 AND effective_at=$7)`,
+		legacy, panel, cutoff, older, ended, historical, unavailable).Scan(&multiplierBoundaries, &panelBoundaries)
+	if err != nil || !multiplierBoundaries || !panelBoundaries {
+		t.Fatalf("expiry boundaries after migration: multipliers=%t, panels=%t (%v)", multiplierBoundaries, panelBoundaries, err)
+	}
+}
+
 func openMigrationTestDB(t *testing.T) (context.Context, *sql.DB) {
 	t.Helper()
 	dsn := os.Getenv("NEBULA_TEST_POSTGRES")

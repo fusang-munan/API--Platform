@@ -112,7 +112,8 @@ func TestBeichenWebsitePriceDetailsGroups(t *testing.T) {
 
 func TestBeichenWebsitePriceDetailsPostgres(t *testing.T) {
 	ctx, db, provider, _, credentials := newActionsPostgres(t)
-	body := readWebsitePriceDetailsFixture(t)
+	body := bytes.Replace(readWebsitePriceDetailsFixture(t), []byte(`"name": "gpt-6.2-astra",`),
+		[]byte(`"name": "gpt-6.2-astra", "group_id": 10,`), 1)
 	const claudeKey, gptKey = "sk-fixture-price-details-claude", "sk-fixture-price-details-gpt"
 	manager := switchTestManager(t)
 	service := New(db, manager)
@@ -126,7 +127,7 @@ func TestBeichenWebsitePriceDetailsPostgres(t *testing.T) {
 		execCatalogTestSQL(t, ctx, db, `UPDATE provider_credentials SET credential_ciphertext=$2 WHERE id=$1`, priceCredentials[i], sealed)
 	}
 	keysFixture := fmt.Sprintf(`{"code":0,"data":{"items":[
-{"id":41,"user_id":1,"group_id":16,"key":%q,"name":"fixture Claude","status":"active","group":{"id":16,"name":"分组 16","rate_multiplier":0.6}},
+{"id":41,"user_id":1,"group_id":16,"key":%q,"name":"fixture Claude","status":"active","group":{"id":16,"name":"分组 16","platform":"anthropic","rate_multiplier":0.6}},
 {"id":42,"user_id":1,"group_id":10,"key":%q,"name":"fixture GPT","status":"active","group":{"id":10,"rate_multiplier":0.18}}
 ],"total":2,"page":1,"pages":1,"page_size":100}}`, claudeKey, gptKey)
 	service.client.Transport = panelTransport(func(req *http.Request) (*http.Response, error) {
@@ -139,12 +140,16 @@ func TestBeichenWebsitePriceDetailsPostgres(t *testing.T) {
 			reply = string(body)
 		case req.URL.Host == publicKeyHost && req.URL.Path == "/api/v1/keys":
 			reply = keysFixture
+		case req.URL.Host == publicKeyHost && req.URL.Path == "/api/v1/groups/rates":
+			reply = `{"code":0,"data":{"10":0.18,"16":0.60}}`
 		case req.URL.Host == "api.beichenapi.com" && req.Header.Get("Authorization") == "Bearer "+claudeKey && req.URL.Path == billingPath:
 			reply = fmt.Sprintf(`{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token",
 "effective_rate_multiplier":0.6,"group_rate_multiplier":0.6,"peak_rate_enabled":false,"group_id":16,"api_key_id":41,"observed_at":%q}`,
 				time.Now().UTC().Format(time.RFC3339Nano))
 		case req.URL.Host == "api.beichenapi.com" && req.Header.Get("Authorization") == "Bearer "+claudeKey && req.URL.Path == modelsPath:
 			reply = `{"data":[{"id":"claude-sonnet-4-6","supported_protocols":["anthropic"]}]}`
+		case req.URL.Host == "api.beichenapi.com" && req.Header.Get("Authorization") == "Bearer "+gptKey && req.URL.Path == modelsPath:
+			reply = `{"data":[{"id":"gpt-6.2-astra","supported_protocols":["openai"]}]}`
 		default:
 			return nil, errors.New("未模拟的接口")
 		}
@@ -173,31 +178,32 @@ func TestBeichenWebsitePriceDetailsPostgres(t *testing.T) {
 	}
 	gpt := readModel(detailGPT)
 	if len(gpt.WebsiteLocations) != 1 || !gpt.WebsiteLocations[0].PriceComplete || !gpt.PriceCovered || gpt.PriceState != "conditional" ||
+		gpt.WebsiteLocations[0].PriceScope != "group" || len(gpt.WebsiteLocations[0].Groups) != 1 || gpt.WebsiteLocations[0].Groups[0].ID != 10 ||
 		gpt.WebsiteLocations[0].PriceConditionsExact["cache_write_1h_price"] != "0.00001" {
-		t.Fatalf("教师概览缺少 GPT 的 1 小时报价：%+v", gpt)
+		t.Fatalf("教师概览应提供 GPT 分组 10 专属的 1 小时报价：%+v", gpt)
 	}
 	claude := readModel(detailClaude)
-	if len(claude.WebsiteLocations) != 1 || !claude.WebsiteLocations[0].PriceComplete || claude.PriceCovered || claude.Activation != "blocked" ||
+	if len(claude.WebsiteLocations) != 1 || !claude.WebsiteLocations[0].PriceComplete || !claude.PriceCovered ||
+		claude.WebsiteLocations[0].PriceScope != "platform" ||
 		claude.WebsiteLocations[0].PriceConditionsExact["cache_write_price"] != "0.00000375" {
-		t.Fatalf("教师概览应提供 Claude 官网价，并等待当前 Key 的报价：%+v", claude)
+		t.Fatalf("教师概览应提供 Claude 官网价，并用于已核实的 Key：%+v", claude)
 	}
 	if slices.ContainsFunc(claude.Blockers, func(blocker CatalogBlocker) bool { return blocker.Code == "sync_failed" }) {
-		t.Fatal("当前 Key 分组未列官网报价被误报为同步失败")
+		t.Fatal("当前 Key 已匹配官网基础价，不应显示同步失败")
 	}
-	assertGroupMismatch := func(matches []CatalogKey, credential uuid.UUID) {
+	assertKeyGroup := func(matches []CatalogKey, credential uuid.UUID) {
 		t.Helper()
 		for _, match := range matches {
-			if match.CredentialID == credential && match.GroupID != nil && *match.GroupID == 16 &&
-				match.GroupDiagnosis == "price_outside_key_group" {
+			if match.CredentialID == credential && match.GroupID != nil && *match.GroupID == 16 && match.State == "listed" {
 				return
 			}
 		}
-		t.Fatalf("未识别官网分组 2 与 Claude Key 分组 16 的差异：%+v", matches)
+		t.Fatalf("应用官网共享价后，Claude Key 仍应归属分组 16：%+v", matches)
 	}
-	assertGroupMismatch(claude.CatalogKeys, priceCredentials[0])
+	assertKeyGroup(claude.CatalogKeys, priceCredentials[0])
 	report, err := service.CrawlDirectory(ctx, CrawlOptions{Fixture: body, MatchDB: true, ProviderID: provider})
 	if err != nil || report.KeyMatching != "checked" {
 		t.Fatalf("抓取报告应核对 Key 分组：%+v (%v)", report.CrawlRun, err)
 	}
-	assertGroupMismatch(crawlTestModel(t, report, detailClaude).KeyMatches, priceCredentials[0])
+	assertKeyGroup(crawlTestModel(t, report, detailClaude).KeyMatches, priceCredentials[0])
 }

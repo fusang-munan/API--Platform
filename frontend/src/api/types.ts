@@ -278,6 +278,8 @@ export type BeichenWebsiteLocation = {
   channel_id?: number
   channel?: string
   platform?: string
+  /** 官网价的作用域：platform 可跨组作模型级基础价；group（含旧数据缺省）只属于所列分组。 */
+  price_scope?: 'platform' | 'group'
   groups: BeichenWebsiteGroup[]
   observed_at: string
   has_price: boolean

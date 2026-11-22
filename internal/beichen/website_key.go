@@ -1,6 +1,7 @@
 package beichen
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,7 +13,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
+	"github.com/starprince1234/Nebula-api/internal/usage"
 )
+
+var errWebsiteAccountRateUnverified = errors.New("北辰官网账户倍率未核实，分组倍率仅供参考")
 
 type websiteKeyCatalog struct {
 	group         directoryGroup
@@ -21,7 +25,8 @@ type websiteKeyCatalog struct {
 	entries       []catalog.ProviderEntry
 	prices        map[string]json.RawMessage
 	at            time.Time
-	keyBilling    *billingInfo
+	keyBilling    *billingInfo // Key-only catalog when the group has no website listing.
+	keyRate       *billingInfo // Rate confirmation for a group listed on the website.
 	websiteModels []string
 }
 
@@ -110,6 +115,9 @@ func (s *Service) fetchWebsiteKeyCatalog(ctx context.Context, token string, key 
 	}
 	directory, err := selectWebsiteKeyCatalog(crawl.platforms, group.ID)
 	if err != nil {
+		if errors.Is(err, errPanelGroupNotFound) && key.Group != nil {
+			observed.prices = websiteBasePrices(crawl.platforms, key.Group.Platform)
+		}
 		return observed, err
 	}
 	if group.Rate != nil && (directory.group.Rate == nil || !samePanelRate(*group.Rate, *directory.group.Rate)) {
@@ -123,6 +131,33 @@ func (s *Service) fetchWebsiteKeyCatalog(ctx context.Context, token string, key 
 	}
 	directory.keyGroup, directory.keyGroupAt = &group, groupAt
 	return directory, nil
+}
+
+// Only shared quotes from the Key group's confirmed platform are eligible.
+func websiteBasePrices(platforms []directoryPlatform, platform string) map[string]json.RawMessage {
+	if platform == "" || platform == "composite" {
+		return nil
+	}
+	prices := make(map[string]json.RawMessage)
+	for _, section := range platforms {
+		if section.Platform != platform || (section.ChannelStatus != "" && section.ChannelStatus != "active") {
+			continue
+		}
+		for _, model := range section.Models {
+			if model.GroupID != 0 || (model.Platform != "" && model.Platform != section.Platform) {
+				continue
+			}
+			var price json.RawMessage
+			if usage.BeichenTokenQuoteUsable(model.Pricing) {
+				price = model.Pricing
+			}
+			if previous, found := prices[model.Name]; found && !bytes.Equal(previous, price) {
+				price = nil
+			}
+			prices[model.Name] = price
+		}
+	}
+	return prices
 }
 
 func (key listedKey) websiteGroup() WebsiteGroup {
@@ -214,59 +249,54 @@ func sameWebsiteGroup(left, right directoryGroup) bool {
 }
 
 func (directory websiteKeyCatalog) billing() (billingInfo, panelQuote, error) {
-	if directory.keyBilling != nil {
-		info := *directory.keyBilling
-		expires, err := panelExpiry(info, directory.at)
-		quote := panelQuote{groupID: directory.group.ID, expiresAt: expires, err: errPanelEmpty, verifiedKeyModels: true,
-			terms: map[string]json.RawMessage{}, notListed: crawlModelIDs(directory.entries)}
-		return info, quote, err
-	}
 	group := directory.group
-	info := billingInfo{GroupID: &group.ID, ObservedAt: directory.at, Timezone: group.Timezone,
-		PeakEnabled: group.PeakEnabled, PeakStart: group.PeakStart, PeakEnd: group.PeakEnd}
-	quote := panelQuote{groupID: group.ID, verifiedKeyModels: directory.websiteModels != nil}
-	if group.Subscription != "standard" || group.Rate == nil || group.PeakEnabled == nil {
-		return info, quote, errors.New("北辰网页分组缺少可确认的余额计费规则")
-	}
-	rate := exactDecimal(*group.Rate)
-	if rate == nil || rate.Cmp(big.NewRat(1000, 1)) > 0 {
-		return info, quote, errors.New("北辰网页分组倍率无效")
-	}
-	info.GroupRate, info.ResolvedRate, info.Multiplier = *group.Rate, *group.Rate, *group.Rate
-	if group.PeakRate != nil {
-		info.PeakRate = *group.PeakRate
-	}
-	if *group.PeakEnabled {
-		loc, locErr := time.LoadLocation(group.Timezone)
-		start, startErr := time.Parse("15:04", group.PeakStart)
-		end, endErr := time.Parse("15:04", group.PeakEnd)
-		factor := exactDecimal(info.PeakRate)
-		if group.Timezone == "" || group.Timezone == "Local" || locErr != nil ||
-			startErr != nil || endErr != nil || !start.Before(end) || factor == nil {
-			return info, quote, errors.New("北辰网页分组缺少可确认的高峰计费规则")
+	quote := directory.catalogQuote()
+	quote.verifiedKeyModels = directory.keyBilling != nil || directory.websiteModels != nil
+	var info billingInfo
+	if directory.keyBilling != nil {
+		info = *directory.keyBilling
+		if info.ResolvedRate == "" && info.PeakEnabled != nil && !*info.PeakEnabled {
+			info.ResolvedRate = info.Multiplier
 		}
-		info.AppliedPeak = "1"
-		if inPanelPeak(directory.at.In(loc), start, end) {
-			info.AppliedPeak = info.PeakRate
-			value := new(big.Rat).Mul(rate, factor)
-			if value.Cmp(big.NewRat(1000, 1)) > 0 {
-				return info, quote, errors.New("北辰网页分组的高峰有效倍率超限")
-			}
-			info.Multiplier = json.Number(websiteDecimalText(value))
+	} else {
+		info = billingInfo{GroupID: &group.ID, ObservedAt: directory.at, Timezone: group.Timezone,
+			PeakEnabled: group.PeakEnabled, PeakStart: group.PeakStart, PeakEnd: group.PeakEnd}
+		if group.Subscription != "standard" || group.Rate == nil || group.PeakEnabled == nil {
+			return info, quote, errors.New("北辰网页分组缺少可确认的余额计费规则")
+		}
+		if websiteGroupRate(*group.Rate) == nil {
+			return info, quote, errors.New("北辰网页分组倍率无效")
+		}
+		info.GroupRate, info.ResolvedRate = *group.Rate, *group.Rate
+		if group.PeakRate != nil {
+			info.PeakRate = *group.PeakRate
 		}
 	}
+	if group.AccountRate != nil {
+		info.UserRate, info.ResolvedRate = group.AccountRate, *group.AccountRate
+	}
+	if directory.keyRate != nil {
+		rate := directory.keyRate
+		info.UserRate, info.ResolvedRate = rate.UserRate, rate.ResolvedRate
+		info.ObservedAt, info.Multiplier, info.AppliedPeak = rate.ObservedAt, rate.Multiplier, rate.AppliedPeak
+	} else if directory.keyBilling == nil || group.AccountRate != nil {
+		if err := applyWebsiteBillingRate(&info); err != nil {
+			return info, quote, err
+		}
+	}
+
 	ends, err := panelExpiry(info, directory.at)
 	if err != nil {
 		return info, quote, err
 	}
 	quote.expiresAt = ends
 	quote.terms = make(map[string]json.RawMessage)
-	quote.websiteModels = make([]string, 0, len(directory.entries))
 	for _, model := range directory.entries {
 		raw := directory.prices[model.ID]
-		quote.websiteModels = append(quote.websiteModels, model.ID)
 		if hasPanelPrice(raw) {
 			quote.terms[model.ID] = raw
+		} else if directory.keyBilling != nil {
+			quote.notListed = append(quote.notListed, model.ID)
 		}
 		if rates, ok := flatPanelRates(raw); ok {
 			quote.rows = append(quote.rows, priceRow{Model: model.ID, Rates: rates})
@@ -275,7 +305,72 @@ func (directory websiteKeyCatalog) billing() (billingInfo, panelQuote, error) {
 	if len(quote.terms) == 0 {
 		quote.err = errPanelEmpty
 	}
+	if directory.keyBilling == nil && group.AccountRate == nil && directory.keyRate == nil {
+		// Preserve the default rate in the observation. Billing must wait for
+		// a verified account or Key rate before publishing a payable snapshot.
+		return info, quote, errWebsiteAccountRateUnverified
+	}
 	return info, quote, nil
+}
+
+func verifyWebsiteKeyRate(group directoryGroup, info *billingInfo) bool {
+	if billingPanelGroup(*info) != group.ID || group.Subscription != "standard" || group.Rate == nil || group.PeakEnabled == nil {
+		return false
+	}
+	if info.GroupRate == "" {
+		info.GroupRate = *group.Rate
+	}
+	if info.PeakEnabled == nil {
+		info.PeakEnabled = group.PeakEnabled
+	}
+	if info.ResolvedRate == "" {
+		if info.UserRate != nil {
+			info.ResolvedRate = *info.UserRate
+		} else if !*group.PeakEnabled {
+			info.ResolvedRate = info.Multiplier
+		}
+	}
+	rules := panelGroup{Rate: *group.Rate, PeakEnabled: group.PeakEnabled, PeakStart: group.PeakStart, PeakEnd: group.PeakEnd}
+	if *group.PeakEnabled {
+		if group.PeakRate == nil || group.Timezone != info.Timezone {
+			return false
+		}
+		rules.PeakRate = *group.PeakRate
+	}
+	comparison := *info
+	if comparison.UserRate == nil {
+		// The authenticated Key can report the resolved override by itself.
+		comparison.UserRate = &comparison.ResolvedRate
+	}
+	return matchesPanelMultiplier(rules, comparison)
+}
+
+func applyWebsiteBillingRate(info *billingInfo) error {
+	rate := exactDecimal(info.ResolvedRate)
+	if rate == nil || rate.Cmp(big.NewRat(1000, 1)) > 0 {
+		return errors.New("北辰网页生效倍率无效")
+	}
+	info.Multiplier = info.ResolvedRate
+	if info.PeakEnabled != nil && *info.PeakEnabled {
+		loc, locErr := time.LoadLocation(info.Timezone)
+		start, startErr := time.Parse("15:04", info.PeakStart)
+		end, endErr := time.Parse("15:04", info.PeakEnd)
+		factor := exactDecimal(info.PeakRate)
+		if info.Timezone == "" || info.Timezone == "Local" || locErr != nil ||
+			startErr != nil || endErr != nil || !start.Before(end) || factor == nil {
+			return errors.New("北辰网页分组缺少可确认的高峰计费规则")
+		}
+		info.AppliedPeak = "1"
+		if inPanelPeak(info.ObservedAt.In(loc), start, end) {
+			info.AppliedPeak = info.PeakRate
+			value := new(big.Rat).Mul(rate, factor)
+			if value.Cmp(big.NewRat(1000, 1)) > 0 {
+				return errors.New("北辰网页分组的高峰有效倍率超限")
+			}
+			info.Multiplier = json.Number(websiteDecimalText(value))
+		}
+	}
+	return nil
 }
 
 func websiteDecimalText(value *big.Rat) string {

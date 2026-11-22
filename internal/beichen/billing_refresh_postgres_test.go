@@ -3,6 +3,7 @@ package beichen
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -45,6 +46,8 @@ VALUES($1,'CC1',sha256('cc1-fixture'::bytea),false)`, key)
 	var directoryReads atomic.Int32
 	group, peak := 15, "1"
 	websiteStatus := http.StatusOK
+	ratesStatus := http.StatusOK
+	billingKeyID := 41
 	directory, err := os.ReadFile("testdata/billing-group-switch.json")
 	if err != nil {
 		t.Fatal(err)
@@ -53,10 +56,26 @@ VALUES($1,'CC1',sha256('cc1-fixture'::bytea),false)`, key)
 		reply := func(status int, body string) (*http.Response, error) {
 			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
 		}
+		if req.Method == http.MethodGet && req.URL.Host == "api.beichenapi.com" && req.URL.Path == billingPath &&
+			req.Header.Get("Authorization") == "Bearer "+secret {
+			return reply(http.StatusOK, fmt.Sprintf(`{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token",
+				"api_key_id":%d,"group_id":%d,"group_rate_multiplier":0.6,"effective_rate_multiplier":0.6,
+				"peak_rate_enabled":false,"observed_at":%q}`, billingKeyID, group, time.Now().UTC().Format(time.RFC3339Nano)))
+		}
+		if req.Method == http.MethodGet && req.URL.Host == "api.beichenapi.com" && req.URL.Path == modelsPath &&
+			req.Header.Get("Authorization") == "Bearer "+secret {
+			models := `{"id":"claude-sonnet-5","supported_protocols":["anthropic"]},{"id":"claude-key-listed","supported_protocols":["anthropic"]}`
+			if group == 15 {
+				models += `,{"id":"claude-opus-5","supported_protocols":["anthropic"]}`
+			}
+			return reply(http.StatusOK, `{"data":[`+models+`]}`)
+		}
 		if req.Method == http.MethodGet && req.URL.Host == publicKeyHost && req.Header.Get("Authorization") == "Bearer "+bearer {
 			switch req.URL.Path {
 			case "/api/v1/keys":
 				return reply(http.StatusOK, websiteKeyListFixture(secret, "CC1", 41, group))
+			case "/api/v1/groups/rates":
+				return reply(ratesStatus, `{"code":0,"data":{"15":0.15,"60":0.6}}`)
 			case "/api/v1/channels/available":
 				directoryReads.Add(1)
 				body := strings.ReplaceAll(string(directory), `"peak_rate_enabled": false`, `"peak_rate_enabled": false, "peak_rate_multiplier": `+peak)
@@ -206,10 +225,25 @@ beichen_multiplier_version,beichen_state FROM gateway_calls WHERE id=$1`, call.C
 	checkCharge(newCall, newVersion, "1.2", "1.32")
 	t.Logf("1 sync: group 15 → 60, multiplier 0.15 → 0.6, versions %d → %d, charges 0.165 → 1.32", oldVersion, newVersion)
 
+	readEffectiveAt := func() time.Time {
+		t.Helper()
+		var at time.Time
+		if err := db.QueryRowContext(ctx, "SELECT effective_at FROM beichen_multiplier_versions WHERE id=$1", newVersion).Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	effectiveAt := readEffectiveAt()
 	if err := service.SyncCredential(ctx, provider, key); err != nil {
 		t.Fatal(err)
 	}
-	multiplierVersion(2)
+	if id, at := multiplierVersion(2), readEffectiveAt(); id != newVersion || !at.Equal(effectiveAt) {
+		t.Fatalf("same rule must reuse version %d effective at %s, got version %d effective at %s", newVersion, effectiveAt, id, at)
+	}
+	refreshed := billing(overview(), "current", "0.6", 60)
+	if !refreshed.ObservedAt.After(*current.ObservedAt) {
+		t.Fatalf("same rule must refresh observed_at: previous=%s, current=%s", current.ObservedAt, refreshed.ObservedAt)
+	}
 	peak = "0.8"
 	if err := service.SyncCredential(ctx, provider, key); err != nil {
 		t.Fatal(err)
@@ -264,4 +298,32 @@ beichen_multiplier_version,beichen_state FROM gateway_calls WHERE id=$1`, call.C
 		t.Fatalf("recovery should not backdate pricing into the stale interval: %s (%v)", state, err)
 	}
 	t.Log("stale preserves 0.6 and last_success, alerts at 3 failures, and leaves new costs pending until billing recovers")
+
+	ratesStatus = http.StatusServiceUnavailable
+	if _, err := service.runJob(ctx, syncJob{provider: provider, credential: key, kind: "billing"}, true); err != nil {
+		t.Fatalf("matching Key billing should keep the website quote active during an account rate outage: %v", err)
+	}
+	verified := billing(overview(), "current", "0.6", 60)
+	if verified.LastError != nil || !verified.LastSuccess.After(*recovered.LastSuccess) {
+		t.Fatalf("Key billing should record a successful refresh: %+v", verified)
+	}
+	verifiedCall, verifiedRoute := dispatch()
+	finalize(verifiedCall, verifiedRoute)
+	checkCharge(verifiedCall, recoveredVersion, "1.2", "1.32")
+
+	billingKeyID = 42
+	if _, err := service.runJob(ctx, syncJob{provider: provider, credential: key, kind: "billing"}, true); !errors.Is(err, errWebsiteAccountRateUnverified) {
+		t.Fatalf("the account rate outage and mismatched Key should require review: %v", err)
+	}
+	missingRate := billing(overview(), "stale", "0.6", 60)
+	if missingRate.GroupRate == nil || *missingRate.GroupRate != "0.6" || missingRate.LastError == nil ||
+		*missingRate.LastError != errWebsiteAccountRateUnverified.Error() {
+		t.Fatalf("account rate failure should preserve the group default and record a billing error: %+v", missingRate)
+	}
+	call, route := dispatch()
+	finalize(call, route)
+	if err := db.QueryRowContext(ctx, `SELECT beichen_state,student_credits::text FROM gateway_calls WHERE id=$1`, call.CallID).
+		Scan(&state, &debit); err != nil || state != "pending_review" || debit.Valid {
+		t.Fatalf("unverified account rate was used to charge a call: %s %+v (%v)", state, debit, err)
+	}
 }

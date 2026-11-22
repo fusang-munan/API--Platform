@@ -13,6 +13,8 @@ func testBeichenManualBilling(t *testing.T, ctx context.Context, db *sql.DB, org
 	t.Helper()
 	exec := func(q string, args ...any) { t.Helper(); ledgerTestExec(t, ctx, db, q, args...) }
 	actor, project, key := uuid.New(), uuid.New(), uuid.New()
+	exec(`INSERT INTO beichen_provision_channels(credential_id,channel,key_fingerprint,discover_ids)
+VALUES($1,'GM1',sha256('manual-billing-fixture'::bytea),false) ON CONFLICT (credential_id) DO NOTHING`, credential)
 	exec(`INSERT INTO users(id,name,email,password_hash,role,created_at,updated_at)
 VALUES($1,'手动价教师','manual-billing@example.test','fixture','teacher',now(),now())`, actor)
 	exec(`INSERT INTO projects(id,organization_id,name,monthly_credit_quota_milli,created_at,updated_at)
@@ -157,6 +159,39 @@ cache_hit_tokens=20000,cache_write_tokens=10000 WHERE id=$1`, r.CallID)
 			t.Fatalf("历史回执不应重新扣费: %t, %v", applied, err)
 		}
 		check(old, "charged", "12.25", "gateway_usage_price", "13.475")
+	})
+	t.Run("历史反推价待核账", func(t *testing.T) {
+		const name = "legacy-derived-model"
+		exec(`WITH rate AS (
+  INSERT INTO beichen_multiplier_versions(credential_id,effective_at,multiplier,group_id)
+  VALUES($1,now()-interval '1 minute',0.60,16)
+  RETURNING id,credential_id,effective_at,group_id
+), snapshot AS (
+  INSERT INTO beichen_panel_snapshots(credential_id,effective_at,credential_revision,group_id,expires_at,multiplier_version)
+  SELECT c.id,rate.effective_at,c.updated_at,rate.group_id,now()+interval '15 minutes',rate.id
+  FROM rate JOIN provider_credentials c ON c.id=rate.credential_id
+  RETURNING credential_id,effective_at,group_id
+)
+INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,effective_at,group_id,observed_at,
+  input_rate,output_rate,cache_read_rate,cache_write_rate)
+SELECT credential_id,$2,'upstream','base','derived_from_usage',effective_at,group_id,effective_at,
+  1000000,2000000,500000,250000 FROM snapshot`, credential, name)
+
+		pending, pendingRoute, _ := reserve(name, "openai_responses", 850)
+		finish(pending, pendingRoute, report)
+		check(pending, "pending_review", "", "", "")
+		var reason, source string
+		err := db.QueryRowContext(ctx, `SELECT c.beichen_review_reason,p.source
+FROM gateway_calls c JOIN beichen_price_versions p ON p.id=c.beichen_upstream_price_version
+WHERE c.id=$1`, pending.CallID).Scan(&reason, &source)
+		if err != nil || reason != "derived_price_requires_review" || source != "derived_from_usage" {
+			t.Fatalf("旧反推价应留作待核证据: reason=%q source=%q err=%v", reason, source, err)
+		}
+
+		manual(name, false, false)
+		priced, pricedRoute, _ := reserve(name, "openai_responses", 851)
+		finish(priced, pricedRoute, report)
+		check(priced, "charged", "23.25", "teacher_manual_price", "25.575")
 	})
 	var balanced bool
 	err := db.QueryRowContext(ctx, `SELECT (SELECT sum(beichen_credit_exact) FROM gateway_calls WHERE project_id=$1)=

@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	httpapi "github.com/starprince1234/Nebula-api/internal/api/http"
 	"github.com/starprince1234/Nebula-api/internal/beichen"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/controlplane"
 	"github.com/starprince1234/Nebula-api/internal/dataplane"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
@@ -66,9 +67,10 @@ VALUES($1,$2,'school','manual','teacher',$3,1000000,1000000,0,0)`, credential, u
 	if err != nil {
 		t.Fatal(err)
 	}
-	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at) VALUES($1,$2,'line A',$3,now(),now())`, key, provider, ciphertext)
+	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
+VALUES($1,$2,'line A',$3,now()-interval '1 hour',now()-interval '1 hour')`, key, provider, ciphertext)
 	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at) VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now())`, provider, key, model)
-	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success) VALUES($1,'billing',now())`, key)
+	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success) VALUES($1,'billing',now()),($1,'catalog',now())`, key)
 	exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier) VALUES($1,0.250000000000000000000019)`, key)
 	exec(`INSERT INTO users(id,name,email,password_hash,role,created_at,updated_at) VALUES($1,'Teacher','t@example.test','fixture','teacher',now(),now()),($2,'Student','s@example.test','fixture','student',now(),now())`, teacher, student)
 	quote(key, model)
@@ -160,6 +162,99 @@ VALUES($1,$2,'school','manual','teacher',$3,1000000,1000000,0,0)`, credential, u
 	if sends != 1 {
 		t.Fatal("expected one in-memory student call")
 	}
+	exec(`INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,duration_ms,checked_at)
+VALUES($1,$2,$3,'openai_responses',200,1,clock_timestamp())`, provider, key, model)
+	if fresh := status(); fresh.CatalogState != "key_listed" || fresh.CurrentKeyCount != 1 || fresh.ProbeState != "passed" {
+		t.Fatalf("expected current Key and probe evidence: %+v", fresh)
+	}
+	exec(`UPDATE beichen_datasets SET last_success=clock_timestamp()-interval '31 minutes'
+WHERE credential_id=$1 AND kind='catalog'`, key)
+	var overview struct{ Data beichen.Overview }
+	if err := json.Unmarshal([]byte(request("GET", path, teacherToken, "", 200)), &overview); err != nil {
+		t.Fatal(err)
+	}
+	if len(overview.Data.Models) != 1 || !overview.Data.Models[0].RouteReady {
+		t.Fatalf("an expired catalogue changed the published route: %+v", overview.Data.Models)
+	}
+	stale := status()
+	if stale.CatalogState != "published_unavailable" || stale.BindingIssue == nil || stale.BindingIssue.Code != "catalog_stale" ||
+		stale.KeyCount != 0 || stale.CurrentKeyCount != 0 || stale.StaleKeyCount != 1 ||
+		stale.ProbeState != "unprobed" || stale.LastProbeAt != nil || stale.ReadyCount == 0 || stale.Activation != "active" {
+		t.Fatalf("expired Key evidence should need a refresh while the published route stays active: %+v", stale)
+	}
+	if !strings.Contains(request("GET", "/v1/models", studentKey, "", 200), model) {
+		t.Fatal("published model disappeared from the student gateway after catalogue expiry")
+	}
+	request("POST", "/v1/responses", studentKey, postBody, 200)
+	if sends != 2 {
+		t.Fatalf("expected the existing route to reach the fake upstream after catalogue expiry, sends=%d", sends)
+	}
+	t.Run("published website catalog remains usable until the first Key sync", func(t *testing.T) {
+		const websiteOnly = "fixture-website-only"
+		exec(`UPDATE provider_model_catalog
+SET catalog_source='website',raw_entry='{"source":"beichen_website_group"}'
+WHERE credential_id=$1 AND model_id=$2`, key, model)
+		exec(`INSERT INTO provider_model_catalog
+(id,provider_id,credential_id,model_id,catalog_source,raw_entry,last_seen_at,synced_at,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,$3,'website','{"source":"beichen_website_group"}',now(),now(),now(),now())`, provider, key, websiteOnly)
+		exec("UPDATE beichen_datasets SET last_success=clock_timestamp() WHERE credential_id=$1 AND kind='catalog'", key)
+
+		legacy := status()
+		if legacy.CatalogState != "published_unavailable" || legacy.KeyCount != 0 || legacy.CurrentKeyCount != 0 ||
+			len(legacy.CredentialIDs) != 0 || len(legacy.Protocols) != 0 || legacy.ProbeState != "unprobed" || legacy.LastProbeAt != nil ||
+			legacy.ReadyCount == 0 || legacy.Activation != "active" || len(legacy.PreferredRoutes) == 0 ||
+			legacy.PreferredRoutes[0].State != "ready" || legacy.PreferredRoutes[0].EffectiveMultiplierText != "0.250000000000000000000019" {
+			t.Fatalf("legacy membership should keep the published route without claiming Key evidence: %+v", legacy)
+		}
+		if enable() != id {
+			t.Fatal("the published legacy route must keep its original model")
+		}
+		request("POST", path+"/models/enable", teacherToken, `{"model":"fixture-website-only"}`, 404)
+		checkStudentRoute := func() {
+			t.Helper()
+			if !strings.Contains(request("GET", "/v1/models", studentKey, "", 200), model) {
+				t.Fatal("published model missing from the student gateway")
+			}
+			priorSends := sends
+			request("POST", "/v1/responses", studentKey, postBody, 200)
+			if sends != priorSends+1 {
+				t.Fatal("published route did not reach the fake upstream")
+			}
+		}
+		checkStudentRoute()
+
+		// Apply the fixture /v1/models response through the same snapshot writer as Key sync.
+		entries, err := catalog.ParseBeichenModels([]byte(`{"data":[{"id":"fixture-discovered"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if _, err := catalog.ReplaceCredentialEntries(ctx, tx, provider, key, entries, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE beichen_datasets SET last_success=clock_timestamp() WHERE credential_id=$1 AND kind='catalog'", key); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		var confirmed, retired, legacyActive int
+		if err := db.QueryRowContext(ctx, `SELECT
+  count(*) FILTER (WHERE model_id=$2 AND catalog_source='key' AND status='active'),
+  count(*) FILTER (WHERE model_id=$3 AND catalog_source='website' AND status='inactive'),
+  count(*) FILTER (WHERE catalog_source='website' AND status='active')
+FROM provider_model_catalog WHERE credential_id=$1`, key, model, websiteOnly).Scan(&confirmed, &retired, &legacyActive); err != nil || confirmed != 1 || retired != 1 || legacyActive != 0 {
+			t.Fatalf("first Key snapshot did not replace legacy rows: confirmed=%d retired=%d active website=%d (%v)", confirmed, retired, legacyActive, err)
+		}
+		if current := status(); current.CatalogState != "key_listed" || current.CurrentKeyCount != 1 || current.ReadyCount == 0 {
+			t.Fatalf("confirmed Key snapshot should restore current coverage: %+v", current)
+		}
+		checkStudentRoute()
+	})
 	// Model-level disable survives discovery; only a second explicit click repairs
 	// the retired key. A stale or manually disabled protocol is never revived by GET.
 	exec("UPDATE models SET status='inactive',credit_multiplier_milli=NULL WHERE id=$1", id)
@@ -170,6 +265,7 @@ VALUES($1,$2,'school','manual','teacher',$3,1000000,1000000,0,0)`, credential, u
 	replacement := uuid.New()
 	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at) VALUES($1,$2,'line B',$3,now(),now())`, replacement, provider, ciphertext)
 	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at) VALUES(gen_random_uuid(),$1,$2,$3,now(),now(),now(),now())`, provider, replacement, model)
+	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success) VALUES($1,'catalog',now())`, replacement)
 	quote(replacement, model)
 	exec("UPDATE model_bindings SET status='inactive' WHERE model_id=$1 AND adapter='openai_compatible'", id)
 	exec("UPDATE models SET model_id='school-alias' WHERE id=$1", id)

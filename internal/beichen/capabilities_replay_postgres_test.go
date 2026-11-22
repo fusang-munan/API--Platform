@@ -70,6 +70,8 @@ func TestBeichenCapabilityRescanAndReplayPostgres(t *testing.T) {
 			switch r.URL.Path {
 			case "/api/v1/keys":
 				body = websiteKeyListFixture(fakeKey, "CC1", 41, 7)
+			case "/api/v1/groups/rates":
+				body = `{"code":0,"data":{"7":1.25}}`
 			case "/api/v1/channels/available":
 				groupReads.Add(1)
 				body = directory
@@ -161,7 +163,8 @@ SELECT (SELECT count(*) FROM model_bindings), (SELECT count(*) FROM provider_mod
 			t.Fatalf("replay round %d: got %+v, want %+v", attempt+1, current, want)
 		}
 	}
-	if scans.Load() != 1 || groupReads.Load() != 6 || usageReads.Load() != 4 || messages.Load() != 1 || chat.Load() != 1 {
+	// The explicit rescan and both billing refreshes read the actual Key catalog.
+	if scans.Load() != 3 || groupReads.Load() != 6 || usageReads.Load() != 4 || messages.Load() != 1 || chat.Load() != 1 {
 		t.Fatalf("unexpected fake requests: catalog=%d group=%d usage=%d messages=%d chat=%d",
 			scans.Load(), groupReads.Load(), usageReads.Load(), messages.Load(), chat.Load())
 	}
