@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"database/sql"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,6 +135,14 @@ func TestBeichenLedgerPostgres(t *testing.T) {
 	unsent := reserve()
 	finalize(unsent, CallRoute{DefinitelyNotSent: true}, CallMetrics{})
 	check(unsent.CallID, "released", "")
+	rejected := reserve()
+	rejectedRoute := prepare(rejected, route)
+	rejectedRoute.UpstreamStatus = http.StatusBadRequest
+	if err := store.Finalize(ctx, rejected, false, "upstream_failed", "http", "HTTP 400", rejectedRoute,
+		CallMetrics{State: UsageMissing}); err != nil {
+		t.Fatal(err)
+	}
+	check(rejected.CallID, "released", "")
 	unknown := reserve()
 	prepare(unknown, route)
 	ledgerTestExec(t, ctx, isolated, `UPDATE gateway_calls SET lease_expires_at=now()-interval '1 hour' WHERE id=$1`, unknown.CallID)

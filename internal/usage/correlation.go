@@ -72,6 +72,9 @@ type CallRoute struct {
 	CredentialID      uuid.UUID
 	BindingID         uuid.UUID
 	UpstreamModelName string
+	// UpstreamStatus is the final HTTP status returned by the upstream, when known.
+	// A deterministic 4xx means the request was rejected before any billable work.
+	UpstreamStatus int
 	// ReasoningEffort is the observed level or the default for an omitted level.
 	// A nil value means the gateway could not observe the request.
 	ReasoningEffort *string
