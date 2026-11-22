@@ -156,11 +156,34 @@ func run() error {
 		defer close(probesDone)
 		controlService.Beichen().RunProbes(syncContext, cfg.BeichenProbesEnabled)
 	}()
+	catalogDone := make(chan struct{})
+	go func() {
+		defer close(catalogDone)
+		materialize := func() {
+			runContext, cancel := context.WithTimeout(syncContext, 2*time.Minute)
+			defer cancel()
+			if err := controlService.MaterializeBeichenCatalogs(runContext); err != nil && syncContext.Err() == nil {
+				slog.Warn("北辰目录物化未完成", "error", err)
+			}
+		}
+		materialize()
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-syncContext.Done():
+				return
+			case <-ticker.C:
+				materialize()
+			}
+		}
+	}()
 	defer func() {
 		cancelSync()
 		<-syncDone
 		<-receiptsDone
 		<-probesDone
+		<-catalogDone
 	}()
 	var secureServer *http.Server
 	if addr := os.Getenv("LAB_MAINTENANCE_TLS_ADDR"); addr != "" {
