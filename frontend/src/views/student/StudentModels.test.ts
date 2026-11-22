@@ -60,6 +60,19 @@ function activeKey(models: unknown[] = []) {
   return fixture.key({ status: 'active', models })
 }
 
+function maintainedModel(modelID: string, overrides: Record<string, unknown> = {}) {
+  return fixture.model(modelID, false, {
+    availability: 'maintenance',
+    availability_reason: '维护中。当前没有可接入的线路，请联系老师核对渠道 Key 和模型绑定。',
+    protocols: [],
+    ...overrides,
+  })
+}
+
+async function showGroup(wrapper: ReturnType<typeof mountPage>, group: string) {
+  await wrapper.get(`[data-testid="model-group-${group}"]`).trigger('click')
+}
+
 function mountPage() {
   return mount(StudentModels, {
     global: {
@@ -111,7 +124,7 @@ describe('StudentModels single model list', () => {
     const selector = wrapper.get('[data-testid="current-key"]')
     expect((selector.element as HTMLSelectElement).value).toBe('second-project')
     expect(wrapper.findAll('.plaza-column')).toHaveLength(1)
-    expect(wrapper.get('h2').text()).toBe('可用模型')
+    expect(wrapper.get('h2').text()).toBe('我的模型')
     expect(wrapper.find('[data-model="gpt-5.3-codex"] [data-testid="model-key-status"]').exists()).toBe(false)
 
     await selector.setValue('key-1')
@@ -131,6 +144,7 @@ describe('StudentModels single model list', () => {
     })
     const wrapper = mountPage()
     await flushPromises()
+    await showGroup(wrapper, 'addable')
 
     const card = wrapper.get('[data-model="claude-sonnet-4-5"]')
     await card.get('[data-testid="sync-key-model"]').trigger('click')
@@ -140,9 +154,11 @@ describe('StudentModels single model list', () => {
     expect(studentAPI.addModel).not.toHaveBeenCalled()
     expect(studentAPI.withdraw).not.toHaveBeenCalled()
     expect(studentAPI.submit).not.toHaveBeenCalled()
-    expect(card.get('[data-testid="model-key-status"]').text()).toBe('可调用')
-    expect(card.get('[data-testid="model-key-status"]').classes()).toContain('ok')
-    expect(card.find('[data-testid="sync-key-model"]').exists()).toBe(false)
+    await showGroup(wrapper, 'callable')
+    const joined = wrapper.get('[data-model="claude-sonnet-4-5"]')
+    expect(joined.get('[data-testid="model-key-status"]').text()).toBe('可调用')
+    expect(joined.get('[data-testid="model-key-status"]').classes()).toContain('ok')
+    expect(joined.find('[data-testid="sync-key-model"]').exists()).toBe(false)
     wrapper.unmount()
   })
 
@@ -180,6 +196,7 @@ describe('StudentModels key model states', () => {
     vi.mocked(studentAPI.addKeyModels).mockRejectedValueOnce(new APIError(serverMessage, 409, 'MODEL_NOT_READY'))
     const wrapper = mountPage()
     await flushPromises()
+    await showGroup(wrapper, 'addable')
 
     await wrapper.get('[data-model="claude-sonnet-4-5"] [data-testid="sync-key-model"]').trigger('click')
     await flushPromises()
@@ -200,6 +217,7 @@ describe('StudentModels key model states', () => {
     vi.mocked(studentAPI.addKeyModels).mockResolvedValueOnce({ model_ids: ['claude-sonnet-4-5'], added_model_ids: ['claude-sonnet-4-5'] })
     const wrapper = mountPage()
     await flushPromises()
+    await showGroup(wrapper, 'unverified')
 
     const card = wrapper.get('[data-model="claude-sonnet-4-5"]')
     expect(card.get('[data-testid="model-availability"]').text()).toBe('待验证')
@@ -216,7 +234,9 @@ describe('StudentModels key model states', () => {
 
   it('marks a maintenance model as joined but not callable and never uses green', async () => {
     const maintenance = fixture.model('gpt-5.3-codex', false, {
-      availability: 'maintenance', availability_reason: '所有线路探活失败。',
+      availability: 'maintenance',
+      availability_reason: '维护中。当前没有可接入的线路，请联系老师核对渠道 Key 和模型绑定。',
+      protocols: ['anthropic'], recommended_protocol: 'anthropic',
     })
     vi.mocked(studentAPI.models).mockResolvedValueOnce({
       common_models: [maintenance, fixture.model('gemini-2.5-pro', true, { availability: 'maintenance', availability_reason: '维护中。' })],
@@ -225,6 +245,7 @@ describe('StudentModels key model states', () => {
     vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([maintenance])] as never)
     const wrapper = mountPage()
     await flushPromises()
+    await showGroup(wrapper, 'maintenance')
 
     const joined = wrapper.get('[data-model="gpt-5.3-codex"]')
     expect(joined.get('[data-testid="model-key-status"]').text()).toBe('已加入 · 维护中')
@@ -233,6 +254,9 @@ describe('StudentModels key model states', () => {
     expect(joined.get('[data-testid="model-availability"]').classes()).not.toContain('ok')
     expect(joined.get('[data-testid="remove-key-model"]').text()).toBe('从当前 Key 移除')
     expect(joined.find('[data-testid="sync-key-model"]').exists()).toBe(false)
+    expect(joined.get('[data-testid="model-unavailable-reason"]').text()).toBe('历史授权 · 当前无上游线路')
+    expect(joined.find('[data-testid="protocol-mismatch"]').exists()).toBe(false)
+    expect(joined.text()).not.toContain('请切换协议')
 
     const notJoined = wrapper.get('[data-model="gemini-2.5-pro"]')
     expect(notJoined.get('[data-testid="sync-key-model"]').text()).toBe('维护中，暂不能加入')
@@ -253,9 +277,109 @@ describe('StudentModels key model states', () => {
     expect(window.confirm).toHaveBeenCalledWith('从当前 Key「我的 Key」移除 gpt-5.3-codex？')
     expect(studentAPI.removeKeyModels).toHaveBeenLastCalledWith('key-1', ['gpt-5.3-codex'])
     expect(studentAPI.removeModel).not.toHaveBeenCalled()
-    expect(card.find('[data-testid="remove-key-model"]').exists()).toBe(false)
-    expect(card.get('[data-testid="sync-key-model"]').text()).toBe('添加到我的 Key')
+    await showGroup(wrapper, 'addable')
+    const removed = wrapper.get('[data-model="gpt-5.3-codex"]')
+    expect(removed.find('[data-testid="remove-key-model"]').exists()).toBe(false)
+    expect(removed.get('[data-testid="sync-key-model"]').text()).toBe('添加到我的 Key')
     expect(wrapper.text()).toContain('当前 Key 已加入 0 个模型')
+    wrapper.unmount()
+  })
+})
+
+describe('StudentModels availability groups', () => {
+  const callableIDs = ['claude-opus-5-5', 'deepseek-v4.1-flash', 'gpt-6.2-astra', 'gpt-6.2-sol']
+  const maintainedIDs = ['glm-5.3-flash', 'glm-5.3', 'gemini-3.8-flash', 'kimi-k3.1-pro', 'gemini-3.1-flash-lite']
+
+  function callableModels() {
+    return callableIDs.map(modelID => fixture.model(modelID, true))
+  }
+
+  function maintainedModels() {
+    return maintainedIDs.map(modelID => maintainedModel(modelID,
+      modelID === 'kimi-k3.1-pro' ? { protocols: ['anthropic'], recommended_protocol: 'anthropic' } : {}))
+  }
+
+  function mountPlaza() {
+    vi.mocked(studentAPI.models).mockResolvedValueOnce({
+      common_models: [...callableModels(), fixture.model('gpt-6.1-terra', true)],
+      library_models: [],
+    } as never)
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([...callableModels(), ...maintainedModels()])] as never)
+    return mountPage()
+  }
+
+  it('shows only callable models by default and separates maintenance and addable groups', async () => {
+    const wrapper = mountPlaza()
+    await flushPromises()
+
+    const cards = wrapper.findAll('[data-model]')
+    expect(cards).toHaveLength(4)
+    expect(cards.map(card => card.attributes('data-model')).sort()).toEqual([...callableIDs].sort())
+    expect(wrapper.get('[data-testid="model-summary"]').text())
+      .toBe('当前 Key 已授权 9 个 · 可调用 4 · 待验证 0 · 维护中 5 · 可添加 1')
+
+    await showGroup(wrapper, 'maintenance')
+    const maintained = wrapper.findAll('[data-model]')
+    expect(maintained).toHaveLength(5)
+    expect(maintained.map(card => card.attributes('data-model')).sort()).toEqual([...maintainedIDs].sort())
+    expect(wrapper.findAll('[data-testid="model-unavailable-reason"]').map(item => item.text()))
+      .toEqual(Array(5).fill('历史授权 · 当前无上游线路'))
+    expect(wrapper.findAll('[data-testid="protocol-mismatch"]')).toHaveLength(0)
+    expect(wrapper.get('.plaza-cards').text()).not.toContain('协议不匹配')
+    expect(wrapper.get('.plaza-cards').text()).not.toContain('请切换协议')
+
+    await showGroup(wrapper, 'addable')
+    expect(wrapper.findAll('[data-model]').map(card => card.attributes('data-model'))).toEqual(['gpt-6.1-terra'])
+    wrapper.unmount()
+  })
+
+  it('cleans every unavailable authorization at once and refreshes the key', async () => {
+    vi.mocked(studentAPI.models).mockResolvedValue({
+      common_models: [...callableModels(), fixture.model('gpt-6.1-terra', true)],
+      library_models: [],
+    } as never)
+    vi.mocked(studentAPI.keys)
+      .mockResolvedValueOnce([activeKey([...callableModels(), ...maintainedModels()])] as never)
+      .mockResolvedValueOnce([activeKey(callableModels())] as never)
+    vi.mocked(studentAPI.removeKeyModels).mockResolvedValueOnce({
+      model_ids: callableIDs, removed_model_ids: maintainedIDs,
+    })
+    const wrapper = mountPage()
+    await flushPromises()
+    await showGroup(wrapper, 'maintenance')
+
+    await wrapper.get('[data-testid="cleanup-maintenance"]').trigger('click')
+    await flushPromises()
+
+    expect(window.confirm).toHaveBeenCalledWith('从当前 Key「我的 Key」清理 5 个不可用授权？')
+    expect(studentAPI.removeKeyModels).toHaveBeenCalledTimes(1)
+    const [keyID, modelIDs] = vi.mocked(studentAPI.removeKeyModels).mock.calls[0]
+    expect(keyID).toBe('key-1')
+    expect([...modelIDs].sort()).toEqual([...maintainedIDs].sort())
+    expect(studentAPI.keys).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('[data-testid="model-summary"]').text())
+      .toBe('当前 Key 已授权 4 个 · 可调用 4 · 待验证 0 · 维护中 0 · 可添加 1')
+    expect(wrapper.findAll('[data-model]')).toHaveLength(0)
+    wrapper.unmount()
+  })
+
+  it('keeps the authorization list when bulk cleanup fails', async () => {
+    vi.mocked(studentAPI.models).mockResolvedValueOnce({
+      common_models: [...callableModels(), fixture.model('gpt-6.1-terra', true)],
+      library_models: [],
+    } as never)
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([...callableModels(), ...maintainedModels()])] as never)
+    vi.mocked(studentAPI.removeKeyModels).mockRejectedValueOnce(new APIError('服务暂不可用', 503, 'DEPENDENCY_UNAVAILABLE'))
+    const wrapper = mountPage()
+    await flushPromises()
+    await showGroup(wrapper, 'maintenance')
+
+    await wrapper.get('[data-testid="cleanup-maintenance"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('服务暂不可用')
+    expect(studentAPI.keys).toHaveBeenCalledTimes(1)
+    expect(wrapper.findAll('[data-model]')).toHaveLength(5)
     wrapper.unmount()
   })
 })
@@ -296,6 +420,7 @@ describe('StudentModels usage without prices', () => {
   })
 
   it('shows 本月未使用 when the usage response has no row for the model', async () => {
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([fixture.model('gpt-5.3-codex', false)])] as never)
     const wrapper = mountPage()
     await flushPromises()
 
@@ -319,6 +444,7 @@ describe('StudentModels protocol guidance', () => {
     vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([])] as never)
     const wrapper = mountPage()
     await flushPromises()
+    await showGroup(wrapper, 'addable')
 
     const chips = wrapper.findAll('[data-testid="protocol-chip"]').map(chip => chip.text())
     expect(chips).toContain('Chat')
@@ -342,12 +468,13 @@ describe('StudentModels protocol guidance', () => {
         { ...fixture.model('claude-sonnet-4-5'), protocols: ['openai_compatible'], recommended_protocol: 'openai_compatible' },
         { ...fixture.model('gpt-5.3-codex'), protocols: ['openai_compatible', 'openai_responses'], recommended_protocol: 'openai_responses' },
         { ...fixture.model('deepseek-chat'), protocols: ['anthropic'], recommended_protocol: 'anthropic' },
-        { ...fixture.model('gemini-2.5-pro'), protocols: [], recommended_protocol: null, availability: 'unverified' },
+        { ...fixture.model('gemini-2.5-pro'), protocols: ['openai_compatible'], recommended_protocol: null },
       ],
       library_models: [],
     } as never)
     const wrapper = mountPage()
     await flushPromises()
+    await showGroup(wrapper, 'addable')
 
     const recommendations = wrapper.findAll('[data-testid="recommended-protocol"]').map(chip => chip.text())
     expect(recommendations.sort()).toEqual(['推荐 Anthropic Messages', '推荐 OpenAI Chat', '推荐 OpenAI Responses'])
@@ -366,6 +493,7 @@ describe('StudentModels protocol guidance', () => {
     } as never)
     const wrapper = mountPage()
     await flushPromises()
+    await showGroup(wrapper, 'maintenance')
 
     expect(wrapper.get('[data-testid="model-availability"]').text()).toBe('维护中')
     const reason = wrapper.get('[data-testid="model-unavailable-reason"]').text()
@@ -387,6 +515,7 @@ describe('StudentModels protocol guidance', () => {
     } as never)
     const wrapper = mountPage()
     await flushPromises()
+    await showGroup(wrapper, 'maintenance')
 
     const card = wrapper.get('[data-model="claude-sonnet-4-5"]')
     expect(card.get('[data-testid="model-availability"]').text()).toBe('维护中')
