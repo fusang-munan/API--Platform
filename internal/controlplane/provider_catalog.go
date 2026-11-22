@@ -3,8 +3,10 @@ package controlplane
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +20,10 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providermodelcatalog"
 )
+
+// beichenMaterializeMu serializes scheduled materialization with any manual
+// catalog refresh so two writers cannot interleave model and binding updates.
+var beichenMaterializeMu sync.Mutex
 
 type ProviderCatalogSyncView struct {
 	ProviderID string `json:"provider_id"`
@@ -407,6 +413,40 @@ func (s *Service) materializeStoredProviderCatalog(ctx context.Context, provider
 		}
 	}
 	return nil
+}
+
+// MaterializeBeichenCatalogs folds the freshest per-Key Beichen catalog rows
+// into platform models and bindings without resetting teacher governance. The
+// scheduled Beichen jobs already refresh provider_model_catalog every few
+// minutes; this pass makes newly probed models visible as candidates instead of
+// leaving them stranded in the raw catalog table.
+func (s *Service) MaterializeBeichenCatalogs(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	beichenMaterializeMu.Lock()
+	defer beichenMaterializeMu.Unlock()
+	rows, err := s.db.Provider.Query().Where(provider.StatusEQ(provider.StatusActive)).All(ctx)
+	if err != nil {
+		return domain.WrapError(domain.CodeDependencyUnavailable, "query active providers", err)
+	}
+	var failures []error
+	for _, row := range rows {
+		if ctx.Err() != nil {
+			return errors.Join(append(failures, ctx.Err())...)
+		}
+		if !catalog.IsBeichenBaseURL(row.BaseURL) {
+			continue
+		}
+		if err := s.materializeStoredProviderCatalog(ctx, row.ID, false); err != nil {
+			failures = append(failures, fmt.Errorf("provider %s: %w", row.ID, err))
+			continue
+		}
+		if err := catalog.ReconcileProviderBindingRoutes(ctx, s.db, row.ID); err != nil {
+			failures = append(failures, fmt.Errorf("provider %s: %w", row.ID, err))
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func (s *Service) fetchAndStoreCredentialCatalog(ctx context.Context, providerRow *ent.Provider, credentialRow *ent.ProviderCredential, syncedAt time.Time) (int, error) {

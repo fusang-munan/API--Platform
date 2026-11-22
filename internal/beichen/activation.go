@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -371,6 +372,34 @@ func routePriceReadiness(fixed bool, terms json.RawMessage) activationPrice {
 	}
 }
 
+// derivedPriceSuggestion returns the newest usage-derived upstream rates for the
+// first usable North route. Official quotes always win; this only fills the
+// "no price" gap with evidence the teacher can review and apply manually.
+func derivedPriceSuggestion(ctx context.Context, tx *sql.Tx, routes []PreferredRoute) *SuggestedRates {
+	for _, route := range routes {
+		if route.CredentialID == nil || *route.CredentialID == uuid.Nil || strings.TrimSpace(route.UpstreamModel) == "" {
+			continue
+		}
+		var suggestion SuggestedRates
+		err := tx.QueryRowContext(ctx, `
+SELECT input_rate, output_rate, COALESCE(cache_read_rate, 0), COALESCE(cache_write_rate, 0), effective_at
+FROM beichen_price_versions
+WHERE credential_id = $1 AND model = $2 AND track = 'upstream' AND source = '`+derivedPriceSource+`'
+ORDER BY effective_at DESC, id DESC LIMIT 1`,
+			*route.CredentialID, route.UpstreamModel).
+			Scan(&suggestion.InputRate, &suggestion.OutputRate, &suggestion.CacheReadRate, &suggestion.CacheWriteRate, &suggestion.ObservedAt)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return nil
+		}
+		suggestion.Source = derivedPriceSource
+		return &suggestion
+	}
+	return nil
+}
+
 func (model Model) activationPrice() activationPrice {
 	// Overview synthesizes display terms for derived prices. They cannot settle new calls.
 	if model.PriceSource == derivedPriceSource && model.Mode != "manual" {
@@ -478,9 +507,21 @@ type BatchEnabledModel struct {
 }
 
 type BatchSkippedModel struct {
-	Model   string `json:"model"`
-	Reason  string `json:"reason"`
-	Message string `json:"message"`
+	Model          string          `json:"model"`
+	Reason         string          `json:"reason"`
+	Message        string          `json:"message"`
+	SuggestedRates *SuggestedRates `json:"suggested_rates,omitempty"`
+}
+
+// SuggestedRates carries a usage-derived upstream price so a missing official
+// quote is actionable: the teacher can accept these numbers as a manual price.
+type SuggestedRates struct {
+	InputRate      int64     `json:"input_rate"`
+	OutputRate     int64     `json:"output_rate"`
+	CacheReadRate  int64     `json:"cache_read_rate"`
+	CacheWriteRate int64     `json:"cache_write_rate"`
+	ObservedAt     time.Time `json:"observed_at"`
+	Source         string    `json:"source"`
 }
 
 type BatchEnableResult struct {
@@ -577,7 +618,10 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 		return enabled, nil, err
 	}
 	if !price.ready() {
-		return skip("no_price", price.blocker.Message)
+		return enabled, &BatchSkippedModel{
+			Model: source, Reason: "no_price", Message: price.blocker.Message,
+			SuggestedRates: derivedPriceSuggestion(ctx, tx, plan.northRoutes),
+		}, nil
 	}
 	id, err := applyActivationPlan(ctx, tx, provider, actor, target, plan)
 	if err == nil {
