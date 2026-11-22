@@ -7,7 +7,7 @@ import CreditDonut from '../../components/CreditDonut.vue'
 import EmptyState from '../../components/EmptyState.vue'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { formatPercent, formatTokens, shiftDecimal } from '../../utils/credits'
-import { beichenBillingExplanation, calculateCredits, fullTime, quotaBalance, schoolMonth, statusLabel } from '../../utils/format'
+import { calculateCredits, fullTime, quotaBalance, schoolMonth, statusLabel } from '../../utils/format'
 
 type UsageRange = 'day' | 'month' | 'all'
 type RecentRange = 'today' | 'month' | 'all'
@@ -29,11 +29,7 @@ type StudentCallReceipt = {
   model_id: string
   channel: string
   billing_state: string
-  base_credits: string | null
-  base_source: string | null
-  school_multiplier: string | null
   charged_credits: string | null
-  actual_cost: string | null
   receipt_applied: boolean | null
   created_at?: string | null
   input_tokens?: number | null
@@ -71,6 +67,7 @@ const ranges: Array<{ id: UsageRange; label: string }> = [
   { id: 'month', label: '本月' },
   { id: 'all', label: '全部' },
 ]
+const creditRateNote = '100 积分 = 1 元；金额统一用积分显示。'
 const recentRanges: Array<{ id: RecentRange; label: string }> = [
   { id: 'today', label: '今天' },
   { id: 'month', label: '本月' },
@@ -250,10 +247,6 @@ function receiptAppliedText(value?: boolean | null) {
   return value == null ? '—' : value ? '已回执' : '未回执'
 }
 
-function receiptCost(value?: string | null) {
-  return value == null || value === '' ? '—' : `${value} 元`
-}
-
 const recentStatusLabels: Record<string, string> = {
   succeeded: '成功',
   upstream_failed: '上游失败',
@@ -329,7 +322,7 @@ onMounted(() => { void loadRecent(true) })
       <label>月份<input v-model="month" type="month" @change="refresh"></label>
     </div>
     <p v-if="error" class="error banner">{{ error }}</p>
-    <p class="muted">{{ beichenBillingExplanation }}</p>
+    <p class="muted" data-testid="credit-rate-note">{{ creditRateNote }}</p>
 
     <section class="panel student-usage-summary-panel">
       <div class="beichen-section-head">
@@ -500,9 +493,6 @@ onMounted(() => { void loadRecent(true) })
       <div v-if="receipt" class="student-receipt-meta">
         <span>请求编号 <code>{{ receipt.request_id }}</code></span>
         <span>渠道 {{ receipt.channel }}</span>
-        <span>基础积分 {{ creditText(receipt.base_credits) }}</span>
-        <span>学校倍率 {{ receipt.school_multiplier ?? '—' }}</span>
-        <span>实际成本 {{ receiptCost(receipt.actual_cost) }}</span>
         <span>回执 {{ receiptAppliedText(receipt.receipt_applied) }}</span>
       </div>
     </section>

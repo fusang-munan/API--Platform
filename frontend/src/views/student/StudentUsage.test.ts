@@ -207,6 +207,11 @@ describe('StudentUsage', () => {
     expect(callRow.text()).toContain('已扣')
     expect(wrapper.text()).toContain('req-123')
     expect(wrapper.text()).toContain('已回执')
+    expect(wrapper.get('[data-testid="credit-rate-note"]').text()).toBe('100 积分 = 1 元；金额统一用积分显示。')
+    expect(wrapper.text()).not.toContain('基础积分')
+    expect(wrapper.text()).not.toContain('学校倍率')
+    expect(wrapper.text()).not.toContain('实际成本')
+    expect(wrapper.text()).not.toContain('0.1100 元')
     wrapper.unmount()
   })
 
