@@ -12,6 +12,34 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestIndexKeyGroupsMarksStaleBillingGroup(t *testing.T) {
+	credentialID := uuid.New()
+	oldGroupID := int64(2)
+	for _, tc := range []struct {
+		name, groupStatus, billingState string
+		wantStale, wantCurrent          bool
+	}{
+		{"assigned stale", "assigned", "stale", true, false},
+		{"legacy stale", "", "stale", true, false},
+		{"assigned current", "assigned", "current", false, true},
+		{"assigned unverified", "assigned", "unverified", false, false},
+		{"not allowed", "not_allowed", "stale", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			keys := []discoveryKey{{CatalogKey: CatalogKey{CredentialRef: CredentialRef{CredentialID: credentialID}}}}
+			indexKeyGroups([]Dataset{{
+				CredentialID: credentialID, Kind: "billing", GroupID: &oldGroupID,
+				GroupStatus: tc.groupStatus, BillingState: tc.billingState,
+			}}, keys, nil)
+			key := keys[0]
+			if key.GroupID == nil || *key.GroupID != oldGroupID || key.GroupStale != tc.wantStale ||
+				key.groupCurrent != tc.wantCurrent {
+				t.Fatalf("unexpected group state: %+v", key)
+			}
+		})
+	}
+}
+
 func TestBeichenGroupDenialError(t *testing.T) {
 	cases := []struct {
 		name, host, body string

@@ -33,7 +33,7 @@ SELECT status,last_seen FROM beichen_website_key_sync WHERE provider_id=$1`, pro
 	if err != nil {
 		return view, err
 	}
-	if view.Status == "current" && view.LastSeen != nil && s.now().Sub(*view.LastSeen) > 2*websiteDirectoryInterval {
+	if view.Status == "current" && (view.LastSeen == nil || s.now().Sub(*view.LastSeen) > 2*websiteDirectoryInterval) {
 		view.Status = "stale"
 	}
 	rows, err := tx.QueryContext(ctx, `

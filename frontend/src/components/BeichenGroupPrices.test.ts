@@ -5,72 +5,152 @@ import { buildGroupPriceRows, type GroupPriceRow } from '../utils/groupPriceRows
 import BeichenGroupPrices from './BeichenGroupPrices.vue'
 import componentSource from './BeichenGroupPrices.vue?raw'
 
-const glmPrice: BeichenPriceConditions = {
-  billing_mode: 'token', input_price: '0.000008', output_price: '0.000028',
-  cache_write_price: '0', cache_write_1h_price: null, cache_read_price: '0.000002', intervals: [],
+const claudePrice: BeichenPriceConditions = {
+  billing_mode: 'token',
+  input_price: '0.000004',
+  output_price: '0.00002',
+  cache_write_price: '0.000005',
+  cache_write_1h_price: '0.000006',
+  cache_read_price: '0.0000004',
+  intervals: [],
 }
 
-function location(group: BeichenWebsiteGroup): BeichenWebsiteLocation {
+function location(group: BeichenWebsiteGroup,
+  price: BeichenPriceConditions | null = claudePrice): BeichenWebsiteLocation {
   return {
-    name: 'glm-5.3', platform: 'openai', groups: [group], observed_at: '2026-11-21T00:00:00Z',
-    has_price: true, price_complete: true, price_conditions_exact: glmPrice,
+    name: 'claude-opus-5-5', platform: 'anthropic', groups: [group], observed_at: '2026-11-21T00:00:00Z',
+    has_price: price != null, price_complete: price != null,
+    ...(price ? { price_conditions_exact: price } : {}),
   }
 }
 
-function rows(): GroupPriceRow[] {
+function claudeRows(): GroupPriceRow[] {
   return buildGroupPriceRows([
-    location({ id: 15, name: '分组 15', status: 'active', rate_multiplier: '0.16' }),
-    location({ id: 14, name: '分组 14', status: 'active', rate_multiplier: '0.15' }),
-    location({ id: 6, name: '分组 6', status: 'active', rate_multiplier: '0.1' }),
-  ], 15)
+    location({ id: 2, name: '[CC1]Claudecode-kiro-015', status: 'active', rate_multiplier: '0.15' }),
+  ], null, {
+    keyGroup: { id: 16, name: '[CC2]ClaudeCode高智', rate: '0.6' },
+    derived: claudePrice,
+  })
+}
+
+function rowsWithoutCurrent(): GroupPriceRow[] {
+  return buildGroupPriceRows([
+    location({ id: 2, name: '[CC1]Claudecode-kiro-015', status: 'active', rate_multiplier: '0.15' }),
+  ], null)
 }
 
 describe('北辰分组价格组件', () => {
-  it('默认只展开当前 Key 分组，其余分组显示折叠行', () => {
-    const wrapper = mount(BeichenGroupPrices, { props: { rows: rows() } })
-    const own = wrapper.get('[data-group-id="15"]')
+  it('默认只展开当前 Key 分组，其它分组折叠', () => {
+    const wrapper = mount(BeichenGroupPrices, { props: { rows: claudeRows() } })
+    const own = wrapper.get('[data-group-id="16"]')
     expect(own.attributes('data-current')).toBe('true')
     expect(own.classes()).toContain('is-current')
     expect(own.find('table').exists()).toBe(true)
-    expect(wrapper.get('[data-group-id="14"]').find('table').exists()).toBe(false)
-    expect(wrapper.get('[data-group-id="14"] .group-price-summary').text())
-      .toBe('分组 14 · 0.15× · 展开对比')
-    expect(wrapper.get('[data-group-id="6"] .group-price-summary').text())
-      .toBe('分组 6 · 0.1× · 展开对比')
+    expect(wrapper.get('[data-group-id="2"]').find('table').exists()).toBe(false)
+    expect(wrapper.get('[data-group-id="2"] .group-price-summary').text())
+      .toBe('[CC1]Claudecode-kiro-015 · 0.15×')
   })
 
-  it('点击其它分组展开五项价格小表，再点一次收起', async () => {
-    const wrapper = mount(BeichenGroupPrices, { props: { rows: rows() } })
-    const summary = wrapper.get('[data-group-id="14"] .group-price-summary')
+  it('分组摘要与当前分组标题使用相同的两位小数倍率', () => {
+    const wrapper = mount(BeichenGroupPrices, { props: { rows: claudeRows() } })
+    expect(wrapper.get('[data-group-id="16"] .group-price-title').text())
+      .toBe('[CC2]ClaudeCode高智 · 0.60×')
+  })
+
+  it('展开分组后固定两排：官网价和学生实价', async () => {
+    const wrapper = mount(BeichenGroupPrices, { props: { rows: claudeRows() } })
+    const summary = wrapper.get('[data-group-id="2"] .group-price-summary')
     expect(summary.attributes('aria-expanded')).toBe('false')
     await summary.trigger('click')
-    const row = wrapper.get('[data-group-id="14"]')
+    const row = wrapper.get('[data-group-id="2"]')
     expect(row.find('table').exists()).toBe(true)
     expect(summary.attributes('aria-expanded')).toBe('true')
-    expect(row.findAll('th').map(node => node.text())).toEqual(['输入', '输出', '缓存 5m', '缓存 1h', '缓存读取'])
-    expect(row.get('[data-price="input"]').text()).toBe('132')
-    expect(row.get('[data-price="cache1h"]').text()).toBe('—')
+    expect(row.findAll('thead th').map(node => node.text()))
+      .toEqual(['价格', '输入', '输出', '缓存 5m', '缓存 1h', '缓存读取'])
+    const official = row.get('[data-price-row="official"]')
+    expect(official.findAll('td').map(node => node.text())).toEqual(['4', '20', '5', '6', '0.4'])
+    const student = row.get('[data-price-row="student"]')
+    expect(student.findAll('td').map(node => node.text())).toEqual(['66', '330', '82.5', '99', '6.6'])
     await summary.trigger('click')
     expect(row.find('table').exists()).toBe(false)
   })
 
-  it('当前组高亮，并显示唯一的当前 Key 分组标记', () => {
-    const wrapper = mount(BeichenGroupPrices, { props: { rows: rows() } })
-    expect(wrapper.findAll('.group-price-current')).toHaveLength(1)
-    expect(wrapper.get('.group-price-current').text()).toBe('当前 Key 分组')
-    expect(wrapper.get('[data-group-id="15"]').classes()).toContain('is-current')
+  it('官网缺该组价时官网价显示未列，学生价用历史流水反推', () => {
+    const wrapper = mount(BeichenGroupPrices, { props: { rows: claudeRows() } })
+    const row = wrapper.get('[data-group-id="16"]')
+    const official = row.get('[data-price-row="official"]')
+    expect(official.findAll('td').map(node => node.text()))
+      .toEqual(['未列', '未列', '未列', '未列', '未列'])
+    const student = row.get('[data-price-row="student"]')
+    expect(student.findAll('td').map(node => node.text()))
+      .toEqual(['264', '1320', '330', '396', '26.4'])
+    expect(row.get('[data-testid="student-derived"]').text()).toContain('历史流水反推')
   })
 
-  it('没有当前组时全部折叠并提示未匹配', () => {
-    const withoutCurrent = rows().map(row => ({ ...row, is_current_key_group: false }))
-    const wrapper = mount(BeichenGroupPrices, { props: { rows: withoutCurrent } })
+  it('表头只保留标题，不显示分组数量', () => {
+    const wrapper = mount(BeichenGroupPrices, { props: { rows: claudeRows() } })
+    expect(wrapper.get('header').text()).toBe('分组价格对比')
+    expect(componentSource).not.toContain('共 {{ rows.length }} 个分组')
+  })
+
+  it('当前组高亮，并显示唯一的当前 Key 分组标记', () => {
+    const wrapper = mount(BeichenGroupPrices, { props: { rows: claudeRows() } })
+    expect(wrapper.findAll('.group-price-current')).toHaveLength(1)
+    expect(wrapper.get('.group-price-current').text()).toBe('当前 Key 分组')
+    expect(wrapper.get('[data-group-id="16"]').classes()).toContain('is-current')
+  })
+
+  it('没有当前组时仍列出分组，不误报未匹配', () => {
+    const wrapper = mount(BeichenGroupPrices, { props: { rows: rowsWithoutCurrent() } })
+    expect(wrapper.findAll('[data-group-id]')).toHaveLength(1)
     expect(wrapper.findAll('table')).toHaveLength(0)
-    expect(wrapper.get('[data-testid="current-group-missing"]').text()).toBe('当前 Key 分组未匹配')
+    expect(wrapper.text()).not.toContain('未匹配')
+    expect(wrapper.find('[data-testid="current-group-missing"]').exists()).toBe(false)
+  })
+
+  it('以 currentGroupId 标记并默认展开当前组', () => {
+    const wrapper = mount(BeichenGroupPrices, { props: { rows: rowsWithoutCurrent(), currentGroupId: 2 } })
+    expect(wrapper.get('[data-group-id="2"]').attributes('data-current')).toBe('true')
+    expect(wrapper.get('[data-group-id="2"]').find('table').exists()).toBe(true)
+  })
+
+  it('直接传官网分组、/keys 当前组和历史反推价时，当前组默认展开', () => {
+    const wrapper = mount(BeichenGroupPrices, {
+      props: {
+        locations: [location({ id: 2, name: '[CC1]Claudecode-kiro-015', status: 'active', rate_multiplier: '0.15' })],
+        keyGroup: { id: 16, name: '[CC2]ClaudeCode高智', rate: '0.6' },
+        derivedPrice: claudePrice,
+      },
+    })
+    const own = wrapper.get('[data-group-id="16"]')
+    expect(own.attributes('data-current')).toBe('true')
+    expect(own.find('table').exists()).toBe(true)
+    expect(own.get('[data-price-row="student"] [data-price="input"]').text()).toBe('264')
+  })
+
+  it('行里缺少当前组时补出当前组，不显示未匹配', () => {
+    const wrapper = mount(BeichenGroupPrices, { props: { rows: rowsWithoutCurrent(), currentGroupId: 16 } })
+    const own = wrapper.get('[data-group-id="16"]')
+    expect(own.attributes('data-current')).toBe('true')
+    expect(own.find('table').exists()).toBe(true)
+    expect(own.get('[data-price-row="official"] [data-price="input"]').text()).toBe('未列')
+    expect(own.get('[data-price-row="student"] [data-price="input"]').text()).toBe('—')
+    expect(wrapper.text()).not.toContain('未匹配')
+  })
+
+  it('教师页回写扁平学生价后，表内仍显示回写值', () => {
+    const rows = claudeRows()
+    const current = rows.find(row => row.is_current_key_group)
+    expect(current).toBeDefined()
+    current!.input = '999'
+    const wrapper = mount(BeichenGroupPrices, { props: { rows } })
+    expect(wrapper.get('[data-group-id="16"] [data-price-row="student"] [data-price="input"]').text())
+      .toBe('999')
   })
 
   it('组件只提供一个外部操作插槽，不重复重扫提示', () => {
     const wrapper = mount(BeichenGroupPrices, {
-      props: { rows: rows() }, slots: { actions: '<button class="external-action">外部操作</button>' },
+      props: { rows: claudeRows() }, slots: { actions: '<button class="external-action">外部操作</button>' },
     })
     expect(wrapper.findAll('.external-action')).toHaveLength(1)
     expect(componentSource).toContain('<slot name="actions" />')
