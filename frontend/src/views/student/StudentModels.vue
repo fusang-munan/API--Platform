@@ -37,6 +37,8 @@ type KeyModelMutation = {
 }
 type ModelAvailability = { state: string; label: string; available: boolean; addable: boolean; reason: string }
 type KeyCoverage = { inKey: boolean; label: string; tone: 'ok' | 'warn' | 'unavailable' | 'muted' }
+type ModelGroup = 'callable' | 'unverified' | 'maintenance' | 'addable'
+type ModelGroupCounts = Record<ModelGroup, number>
 
 const commonRows = ref<ModelWithProtocols[]>([])
 const libraryRows = ref<ModelWithProtocols[]>([])
@@ -59,6 +61,9 @@ const catalogTotal = ref(0)
 const error = ref('')
 const syncingModelID = ref('')
 const removingModelID = ref('')
+const cleaningMaintenance = ref(false)
+const modelGroup = ref<ModelGroup>('callable')
+const modelGroupChosen = ref(false)
 const actionError = ref('')
 const actionNotice = ref('')
 let keyListRevision = 0
@@ -88,14 +93,55 @@ const allRows = computed(() => uniqueModels([
   libraryRows.value,
   ...keys.value.map(key => key.models ?? []),
 ]))
-const filteredModels = computed(() => sortModelsByRecency(
+const modelGroupOptions: Array<{ value: ModelGroup; label: string }> = [
+  { value: 'callable', label: '可调用' },
+  { value: 'unverified', label: '待验证' },
+  { value: 'maintenance', label: '维护中 · 历史授权' },
+  { value: 'addable', label: '可添加' },
+]
+const searchModels = computed(() => sortModelsByRecency(
   filterStudentModels(allRows.value, query.value, category.value, status.value),
 ) as ModelWithProtocols[])
-const hasAnyModels = computed(() => filteredModels.value.length > 0)
+const groupedModels = computed<Record<ModelGroup, ModelWithProtocols[]>>(() => {
+  const buckets: Record<ModelGroup, ModelWithProtocols[]> = {
+    callable: [], unverified: [], maintenance: [], addable: [],
+  }
+  for (const model of searchModels.value) buckets[modelGroupFor(model)].push(model)
+  return buckets
+})
+const groupCounts = computed<ModelGroupCounts>(() => ({
+  callable: groupedModels.value.callable.length,
+  unverified: groupedModels.value.unverified.length,
+  maintenance: groupedModels.value.maintenance.length,
+  addable: groupedModels.value.addable.length,
+}))
+const filteredModels = computed(() => groupedModels.value[modelGroup.value])
+const hasAnyModels = computed(() => searchModels.value.length > 0)
+const maintenanceInKeyModels = computed(() => (currentKey.value?.models ?? [])
+  .filter(model => modelGroupFor(model) === 'maintenance'))
+const maintenanceInKeyModelIDs = computed(() => maintenanceInKeyModels.value.map(model => model.model_id))
+const keyedModelCount = computed(() => currentKey.value?.models.length ?? 0)
+const modelSummaryText = computed(() => {
+  const prefix = currentKey.value ? `当前 Key 已授权 ${keyedModelCount.value} 个 · ` : ''
+  return `${prefix}可调用 ${groupCounts.value.callable} · 待验证 ${groupCounts.value.unverified} · 维护中 ${groupCounts.value.maintenance} · 可添加 ${groupCounts.value.addable}`
+})
+const currentGroupEmptyTitle = computed(() => {
+  if (!searchModels.value.length) return '还没有模型'
+  switch (modelGroup.value) {
+    case 'callable': return '当前 Key 还没有可调用的模型'
+    case 'unverified': return '当前没有待验证的模型'
+    case 'maintenance': return '当前没有维护中的历史授权'
+    case 'addable': return '没有可添加的新模型'
+  }
+})
 const catalogPages = computed(() => Math.max(1, Math.ceil(catalogTotal.value / 20)))
 const selectableKeys = computed(() => keys.value.filter(key => key.status === 'active'))
 const currentKey = computed(() => selectableKeys.value.find(key => key.id === currentKeyID.value) ?? null)
 const existingKey = computed(() => selectCurrentStudentKey(keys.value))
+// 有生效 Key 时默认看「可调用」；还没有 Key 时「可调用」必然为空，先展示可添加的目录模型。
+watch([currentKey, modelGroupChosen], () => {
+  if (!modelGroupChosen.value) modelGroup.value = currentKey.value ? 'callable' : 'addable'
+}, { immediate: true })
 const currentKeyModelIDs = computed(() => new Set((currentKey.value?.models ?? []).map(model => modelKey(model.model_id))))
 const currentKeyUsage = computed(() => {
   for (const project of usage.value?.projects ?? []) {
@@ -138,7 +184,7 @@ const usedCreditsByModel = computed(() => {
 const protocolOptions = BINDING_ADAPTER_OPTIONS.filter(item =>
   ['openai_compatible', 'openai_responses', 'anthropic', 'google_gemini_v1beta'].includes(item.value))
 const selectedProtocolLabel = computed(() => protocol.value ? protocolMeta(protocol.value).label : '')
-const busy = computed(() => Boolean(syncingModelID.value || removingModelID.value))
+const busy = computed(() => Boolean(syncingModelID.value || removingModelID.value || cleaningMaintenance.value))
 
 function modelUsageLabel(modelID: string) {
   if (usageFailed.value) return '用量暂不可用'
@@ -254,7 +300,15 @@ function modelAvailability(model: ModelWithProtocols): ModelAvailability {
 }
 
 function modelUnavailableReason(model: ModelWithProtocols) {
-  return modelAvailability(model).reason
+  const availability = modelAvailability(model)
+  const reason = availability.reason.trim()
+  if (availability.state !== 'maintenance') return reason
+  // 历史授权没有上游线路，切换协议也无法恢复；直接说明真实原因。
+  if (keyHasModel(model.model_id) && /(当前没有可接入的线路|所有已配置线路)/.test(reason)) {
+    return '历史授权 · 当前无上游线路'
+  }
+  if (reason && !reason.startsWith('维护中')) return `维护中：${reason}`
+  return reason || '维护中：线路探活失败或老师停用，等待恢复。'
 }
 
 function availabilityTone(model: ModelWithProtocols) {
@@ -266,6 +320,14 @@ function availabilityTone(model: ModelWithProtocols) {
 
 function keyHasModel(modelID: string) {
   return currentKeyModelIDs.value.has(modelKey(modelID))
+}
+
+function modelGroupFor(model: ModelWithProtocols): ModelGroup {
+  const state = modelAvailability(model).state
+  const inKey = keyHasModel(model.model_id)
+  if (state === 'available') return inKey ? 'callable' : 'addable'
+  if (state === 'unverified') return 'unverified'
+  return 'maintenance'
 }
 
 function keyCoverage(model: ModelWithProtocols): KeyCoverage {
@@ -395,6 +457,8 @@ function catalogAddLabel(item: CatalogWithProtocols) {
 
 function protocolMismatch(model: ModelWithProtocols) {
   if (!protocol.value) return ''
+  const availability = modelAvailability(model)
+  if (availability.state !== 'available' && availability.state !== 'unverified') return ''
   const supported = protocolsFor(model)
   if (!supported.length || supported.includes(protocol.value)) return ''
   const alternatives = supported.map(value => protocolMeta(value).label)
@@ -425,6 +489,11 @@ function onKeyChange() {
   actionError.value = ''
   actionNotice.value = ''
   syncKeyQuery(currentKeyID.value)
+}
+
+function selectModelGroup(group: ModelGroup) {
+  modelGroupChosen.value = true
+  modelGroup.value = group
 }
 
 watch(catalogQuery, () => { catalogPage.value = 1 })
@@ -603,6 +672,32 @@ async function removeModel(modelID: string) {
   }
 }
 
+async function cleanupUnavailable() {
+  if (busy.value || !currentKey.value) return
+  const key = currentKey.value
+  const modelIDs = maintenanceInKeyModelIDs.value
+  if (!modelIDs.length) return
+  if (!confirm(`从当前 Key「${key.name}」清理 ${modelIDs.length} 个不可用授权？`)) return
+  cleaningMaintenance.value = true
+  actionError.value = ''
+  actionNotice.value = ''
+  try {
+    const result = await studentAPI.removeKeyModels(key.id, modelIDs) as KeyModelMutation
+    const removed = new Set((result.removed_model_ids?.length ? result.removed_model_ids : modelIDs).map(modelKey))
+    key.models = key.models.filter(model => !removed.has(modelKey(model.model_id)))
+    ++keyListRevision
+    const warning = warningsText(result)
+    if (warning) actionNotice.value = warning
+    toast.success('已清理不可用授权')
+    // 以服务端返回的 Key 为准重新拉取，避免本地列表和后端白名单不一致。
+    await load()
+  } catch (caught) {
+    actionError.value = caught instanceof APIError ? caught.message : '清理不可用授权失败，请稍后重试'
+  } finally {
+    cleaningMaintenance.value = false
+  }
+}
+
 function refresh() { void load() }
 
 function keyStatusLabel(status: ApiKey['status']) {
@@ -652,6 +747,9 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
           <span class="chip ok">{{ keyStatusLabel(currentKey.status) }}</span>
         </div>
         <p class="muted">当前 Key 已加入 {{ currentKey.models.length }} 个模型。这里的添加和移除会立即写入这把 Key 的白名单。</p>
+        <p class="muted key-note" data-testid="v1-models-note">
+          DSH/Codex 的 /v1/models 默认只返回可调用模型；维护中的旧授权不会出现在客户端模型选择器里，可在这里清理或等老师恢复线路。
+        </p>
       </template>
       <template v-else-if="keysLoaded">
         <p v-if="existingKey" class="muted">「{{ existingKey.name }}」{{ keyStatusLabel(existingKey.status) }}。Key 生效后才能选择模型。</p>
@@ -674,7 +772,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
         </select>
       </label>
       <p class="muted">
-        每个模型卡片会列出当前可用线路支持的协议。协议不匹配时会提示可用替代协议；请把客户端切到对应协议，网关不会自动转换协议。
+        每个模型卡片会列出当前可用线路支持的协议。只有可调用或待验证且线路可用的模型才会提示替代协议；网关不做协议转换，客户端需直接使用卡片上列出的协议之一。
       </p>
     </section>
 
@@ -683,9 +781,21 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
         <section class="plaza-column">
           <div class="plaza-heading">
             <div>
-              <h2>可用模型</h2>
-              <p class="muted">共 {{ filteredModels.length }} 个；绿色「可调用」表示已加入当前 Key 并能使用。</p>
+              <h2>我的模型</h2>
+              <p class="muted" data-testid="model-summary">{{ modelSummaryText }}</p>
             </div>
+            <button v-if="modelGroup === 'maintenance' && maintenanceInKeyModels.length"
+              class="button ghost danger-text" data-testid="cleanup-maintenance"
+              :disabled="busy" @click="cleanupUnavailable">
+              {{ cleaningMaintenance ? '正在清理…' : '清理全部不可用授权' }}
+            </button>
+          </div>
+          <div class="segmented model-groups" role="tablist" aria-label="模型分组">
+            <button v-for="option in modelGroupOptions" :key="option.value" role="tab"
+              :aria-selected="modelGroup === option.value" :class="{ active: modelGroup === option.value }"
+              :data-testid="`model-group-${option.value}`" @click="selectModelGroup(option.value)">
+              {{ option.label }}<span class="group-count">{{ groupCounts[option.value] }}</span>
+            </button>
           </div>
           <div class="plaza-cards">
             <article v-for="model in filteredModels" :key="model.model_id" class="panel is-interactive" :data-model="model.model_id">
@@ -745,10 +855,10 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
               </Transition>
             </article>
           </div>
-          <EmptyState v-if="!filteredModels.length" title="没有匹配的可用模型" />
+          <EmptyState v-if="!filteredModels.length" :title="currentGroupEmptyTitle" />
         </section>
       </div>
-      <EmptyState v-else title="还没有可用模型" />
+      <EmptyState v-else title="还没有模型" />
     </LoadingRegion>
 
     <AppDialog :open="addOpen" title="检索添加模型" wide @update:open="addOpen = $event">
@@ -811,9 +921,14 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
 .key-context-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .notice.banner { border-color: #f0c987; background: #fff8eb; color: #7a4a00; }
 .plaza-layout { display: grid; gap: 20px; }
-.plaza-heading { margin-bottom: 16px; }
+.plaza-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
 .plaza-heading h2 { margin: 0; font-size: 18px; }
 .plaza-heading p { margin: 4px 0 0; }
+.model-groups { margin: 12px 0 16px; }
+.model-groups button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.group-count { padding: 1px 6px; border-radius: 999px; background: rgba(101, 66, 220, .1); font-size: 11px; }
+.model-groups button.active .group-count { background: rgba(101, 66, 220, .16); }
+.key-note { font-size: 12px; margin-top: 6px; }
 .plaza-cards { display: grid; gap: 16px; }
 .chip.preset { background: #eef3ff; color: #3b5bdb; }
 .chip.warn { background: #fff4e5; color: #9a4d00; }
