@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { studentAPI } from '../../api/student'
-import type { ApiKey, BindingAdapter, Model, ModelCatalogCandidate, ModelCategory, ModelStatus } from '../../api/types'
+import type { ApiKey, BindingAdapter, Model, ModelCatalogCandidate, ModelCategory, ModelStatus, StudentUsage } from '../../api/types'
 import { BINDING_ADAPTER_OPTIONS, bindingAdapterMeta } from '../../utils/bindingAdapters'
 import { capabilityLabel, formatTokenK } from '../../utils/modelCatalog'
 import { selectCurrentStudentKey } from '../../utils/studentHarnessConfig'
 import { sortModelsByRecency } from '../../utils/modelSort'
 import { filterStudentModels } from '../../utils/studentModels'
-import { catalogCreditsLabel, catalogProviderLabel, modelCreditsLabel, modelDescriptionText, modelProviderLabel } from '../../utils/modelPlazaDisplay'
+import { catalogProviderLabel, modelDescriptionText, modelProviderLabel } from '../../utils/modelPlazaDisplay'
+import { formatCredits } from '../../utils/credits'
+import { calculateCredits } from '../../utils/format'
 import StatusBadge from '../../components/StatusBadge.vue'
 import EmptyState from '../../components/EmptyState.vue'
 import AppDialog from '../../components/AppDialog.vue'
@@ -42,6 +44,9 @@ const keys = ref<PlazaKey[]>([])
 const keysLoaded = ref(false)
 const currentKeyID = ref('')
 const catalogItems = ref<ModelCatalogCandidate[]>([])
+const usage = ref<StudentUsage | null>(null)
+const usageLoaded = ref(false)
+const usageFailed = ref(false)
 const query = ref('')
 const category = ref<ModelCategory | ''>('')
 const status = ref<ModelStatus | ''>('')
@@ -92,10 +97,63 @@ const selectableKeys = computed(() => keys.value.filter(key => key.status === 'a
 const currentKey = computed(() => selectableKeys.value.find(key => key.id === currentKeyID.value) ?? null)
 const existingKey = computed(() => selectCurrentStudentKey(keys.value))
 const currentKeyModelIDs = computed(() => new Set((currentKey.value?.models ?? []).map(model => modelKey(model.model_id))))
+const currentKeyUsage = computed(() => {
+  for (const project of usage.value?.projects ?? []) {
+    const match = (project.keys ?? []).find(key => key.id === currentKeyID.value)
+    if (match) return { key: match, project }
+  }
+  return null
+})
+const availableCredits = computed(() => {
+  const keyAvailable = currentKeyUsage.value?.key.available
+  if (typeof keyAvailable === 'string' && keyAvailable.trim() !== '') return keyAvailable.trim()
+  const projects = usage.value?.projects ?? []
+  if (!projects.length) return null
+  let total = '0.000'
+  for (const project of projects) {
+    const raw = project.available?.trim()
+    if (!raw || !/^\d+(?:\.\d+)?$/.test(raw)) return null
+    total = calculateCredits(total, raw, 'add')
+  }
+  return total
+})
+const balanceText = computed(() => usageLoaded.value && availableCredits.value != null
+  ? `${formatCredits(availableCredits.value)} 积分`
+  : '—')
+const usedCreditsByModel = computed(() => {
+  const totals = new Map<string, string>()
+  for (const project of usage.value?.projects ?? []) {
+    for (const key of project.keys ?? []) {
+      for (const model of key.models ?? []) {
+        const modelID = modelKey(model.id || model.name || '')
+        const credits = String(model.credits ?? '').trim()
+        if (!modelID || !/^\d+(?:\.\d+)?$/.test(credits)) continue
+        const previous = totals.get(modelID)
+        totals.set(modelID, previous ? calculateCredits(previous, credits, 'add') : credits)
+      }
+    }
+  }
+  return totals
+})
 const protocolOptions = BINDING_ADAPTER_OPTIONS.filter(item =>
   ['openai_compatible', 'openai_responses', 'anthropic', 'google_gemini_v1beta'].includes(item.value))
 const selectedProtocolLabel = computed(() => protocol.value ? protocolMeta(protocol.value).label : '')
 const busy = computed(() => Boolean(syncingModelID.value || removingModelID.value))
+
+function modelUsageLabel(modelID: string) {
+  if (usageFailed.value) return '用量暂不可用'
+  if (!usageLoaded.value) return '用量读取中…'
+  const credits = usedCreditsByModel.value.get(modelKey(modelID))
+  if (!credits || Number(credits) <= 0) return '本月未使用'
+  return `本月已用 ${formatCredits(credits)} 积分`
+}
+
+function studentSafeReason(reason: string, fallback: string) {
+  if (!reason) return fallback
+  return /(价格|报价|单价|倍率|官网|反推|基础积分|折后|加价|price|quote|cost|multiplier)/i.test(reason)
+    ? fallback
+    : reason
+}
 
 const protocolShortLabels: Record<string, string> = {
   openai_compatible: 'Chat',
@@ -147,7 +205,7 @@ function recommendedProtocolLabel(model: ModelWithProtocols) {
   return value ? protocolFriendlyLabels[value] ?? protocolMeta(value).label : ''
 }
 
-function hasStudentPrice(model: { credit_multiplier?: string | number | null }) {
+function hasConfiguredPrice(model: { credit_multiplier?: string | number | null }) {
   if (model.credit_multiplier == null) return false
   const value = String(model.credit_multiplier).trim()
   return value !== '' && Number(value) > 0
@@ -157,28 +215,28 @@ function modelAvailability(model: ModelWithProtocols): ModelAvailability {
   const state = model.availability?.trim() ?? ''
   const reason = model.availability_reason?.trim() ?? ''
   if (state === 'available') {
-    if (!hasStudentPrice(model)) {
-      return { state: 'missing_price', label: '缺价', available: false, addable: false, reason: '报价尚未配置，等待老师补上学校倍率后才能调用。' }
+    if (!hasConfiguredPrice(model)) {
+      return { state: 'unavailable', label: '暂不可用', available: false, addable: false, reason: '该模型暂未开放，请等待老师开放。' }
     }
     return { state, label: '可用', available: true, addable: true, reason: '' }
   }
   if (state === 'unverified') {
-    if (!hasStudentPrice(model)) {
-      return { state: 'missing_price', label: '缺价', available: false, addable: false, reason: '报价尚未配置，等待老师补上学校倍率后才能调用。' }
+    if (!hasConfiguredPrice(model)) {
+      return { state: 'unavailable', label: '暂不可用', available: false, addable: false, reason: '该模型暂未开放，请等待老师开放。' }
     }
     return {
       state, label: '待验证', available: false, addable: true,
-      reason: reason || '线路尚未完成探活；可以先加入当前 Key，但调用可能失败。',
+      reason: studentSafeReason(reason, '线路尚未完成探活；可以先加入当前 Key，但调用可能失败。'),
     }
   }
   if (state === 'maintenance') {
-    return { state, label: '维护中', available: false, addable: false, reason: reason || '维护中，等待老师恢复线路。' }
+    return { state, label: '维护中', available: false, addable: false, reason: studentSafeReason(reason, '维护中，等待老师恢复线路。') }
   }
   if (state === 'unavailable') {
-    return { state, label: '不可用', available: false, addable: false, reason: reason || '当前不可用，等待老师开放。' }
+    return { state, label: '不可用', available: false, addable: false, reason: studentSafeReason(reason, '当前不可用，等待老师开放。') }
   }
   if (state === 'not_published') {
-    return { state, label: '未发布', available: false, addable: false, reason: reason || '老师还未发布该模型。' }
+    return { state, label: '未发布', available: false, addable: false, reason: studentSafeReason(reason, '老师还未发布该模型。') }
   }
   if (model.status !== 'active') {
     return { state: 'maintenance', label: '维护中', available: false, addable: false, reason: '老师已停用该模型，等待老师恢复后才会重新开放。' }
@@ -189,8 +247,8 @@ function modelAvailability(model: ModelWithProtocols): ModelAvailability {
   if (hasProtocolInfo(model) && !protocolsFor(model).length) {
     return { state: 'unverified', label: '待验证', available: false, addable: true, reason: '已有线路但还没有通过探活的协议；可以加入当前 Key，但调用可能失败。' }
   }
-  if (!hasStudentPrice(model)) {
-    return { state: 'missing_price', label: '缺价', available: false, addable: false, reason: '报价尚未配置，等待老师补上学校倍率后才能调用。' }
+  if (!hasConfiguredPrice(model)) {
+    return { state: 'unavailable', label: '暂不可用', available: false, addable: false, reason: '该模型暂未开放，请等待老师开放。' }
   }
   return { state: 'available', label: '可用', available: true, addable: true, reason: '' }
 }
@@ -264,19 +322,19 @@ function catalogAvailability(item: CatalogWithProtocols): ModelAvailability {
     const rawReason = rawCatalogValue(item, 'availability_reason')
     const reason = typeof rawReason === 'string' && rawReason ? rawReason : (known?.availability_reason ?? '')
     if (state === 'maintenance') {
-      return { state, label: '维护中', available: false, addable: false, reason: reason || '维护中，等待老师恢复线路。' }
+      return { state, label: '维护中', available: false, addable: false, reason: studentSafeReason(reason, '维护中，等待老师恢复线路。') }
     }
     if (state === 'unavailable' || state === 'not_published') {
-      return { state, label: '不可用', available: false, addable: false, reason: reason || '当前不可用，等待老师开放。' }
+      return { state, label: '不可用', available: false, addable: false, reason: studentSafeReason(reason, '当前不可用，等待老师开放。') }
     }
     const itemPrice = known?.credit_multiplier ?? item.credit_multiplier
-    if (!hasStudentPrice({ credit_multiplier: itemPrice ?? null })) {
-      return { state: 'missing_price', label: '缺价', available: false, addable: false, reason: '报价未配置，等待老师补充。' }
+    if (!hasConfiguredPrice({ credit_multiplier: itemPrice ?? null })) {
+      return { state: 'unavailable', label: '暂不可用', available: false, addable: false, reason: '该模型暂未开放，请等待老师开放。' }
     }
     if (state === 'unverified') {
       return {
         state, label: '待验证', available: false, addable: true,
-        reason: reason || '线路尚未完成探活；可以先加入当前 Key，但调用可能失败。',
+        reason: studentSafeReason(reason, '线路尚未完成探活；可以先加入当前 Key，但调用可能失败。'),
       }
     }
     return { state, label: '可用', available: true, addable: true, reason: '' }
@@ -296,8 +354,8 @@ function catalogAvailability(item: CatalogWithProtocols): ModelAvailability {
   }
   const rawCredits = rawCatalogValue(item, 'credit_multiplier')
   const credits = (rawCredits ?? known?.credit_multiplier) as string | number | null | undefined
-  if (!hasStudentPrice({ credit_multiplier: credits ?? null })) {
-    return { state: 'missing_price', label: '缺价', available: false, addable: false, reason: '报价未配置，等待老师补充。' }
+  if (!hasConfiguredPrice({ credit_multiplier: credits ?? null })) {
+    return { state: 'unavailable', label: '暂不可用', available: false, addable: false, reason: '该模型暂未开放，请等待老师开放。' }
   }
   return { state: 'available', label: '可用', available: true, addable: true, reason: '' }
 }
@@ -375,7 +433,22 @@ async function load() {
   const revision = ++keyListRevision
   await loadState.run(async () => {
     try {
-      const [plaza, keyList] = await Promise.all([studentAPI.models(), studentAPI.keys()])
+      const usageRequest = typeof studentAPI.usage === 'function'
+        ? studentAPI.usage()
+          .then(payload => {
+            if (revision !== keyListRevision) return
+            usage.value = payload
+            usageLoaded.value = true
+            usageFailed.value = false
+          })
+          .catch(() => {
+            if (revision !== keyListRevision) return
+            usage.value = null
+            usageLoaded.value = false
+            usageFailed.value = true
+          })
+        : Promise.resolve()
+      const [plaza, keyList] = await Promise.all([studentAPI.models(), studentAPI.keys(), usageRequest])
       if (revision !== keyListRevision) return
       commonRows.value = plaza.common_models
       libraryRows.value = plaza.library_models
@@ -451,21 +524,21 @@ function findModelForMutation(modelID: string, catalogItem?: CatalogWithProtocol
 function warningsText(result: KeyModelMutation) {
   const warnings = result.warnings ?? []
   return warnings.map(item => {
-    if (typeof item === 'string') return item
+    if (typeof item === 'string') return studentSafeReason(item, '')
     const code = (item.code ?? '').toLowerCase()
-    if (/unverified|probe/.test(code)) return item.message || '该模型尚未通过探活，已加入当前 Key，但调用可能失败。'
-    if (/price|quote/.test(code)) return item.message || '该模型还没有配置学校报价。'
-    if (/maintenance/.test(code)) return item.message || '该模型正在维护，暂不可调用。'
-    return item.message || item.code || item.model_id || ''
+    if (/unverified|probe/.test(code)) return studentSafeReason(item.message ?? '', '该模型尚未通过探活，已加入当前 Key，但调用可能失败。')
+    if (/price|quote/.test(code)) return '该模型暂未开放。'
+    if (/maintenance/.test(code)) return studentSafeReason(item.message ?? '', '该模型正在维护，暂不可调用。')
+    return studentSafeReason(item.message ?? '', item.code || item.model_id || '')
   }).filter(Boolean).join('；')
 }
 
 function keyModelFailureMessage(caught: unknown, modelID: string) {
   if (!(caught instanceof APIError)) return '加入当前 Key 失败，请稍后重试'
   const raw = `${caught.serverMessage} ${caught.code}`.toLowerCase()
-  if (/price|quote|报价/.test(raw)) return `「${modelID}」还没有配置学校报价，暂时不能加入当前 Key。`
+  if (/price|quote|报价/.test(raw)) return `「${modelID}」暂未开放，暂时不能加入当前 Key。`
   if (/maintenance|维护|停用|不可用/.test(raw)) {
-    return `「${modelID}」当前不能加入：${caught.serverMessage || '请等待老师恢复模型。'}`
+    return `「${modelID}」当前不能加入：${studentSafeReason(caught.serverMessage, '请等待老师恢复模型。')}`
   }
   if (/unverified|not verified|probe|还没有通过探活|尚未.*探活/.test(raw)) {
     return `「${modelID}」还没有通过探活，暂时不能加入当前 Key。`
@@ -473,7 +546,7 @@ function keyModelFailureMessage(caught: unknown, modelID: string) {
   if (/no usable route|no route|route.*(missing|unavailable)|无可用线路/.test(raw)) {
     return `「${modelID}」暂时没有可用线路，请等待老师恢复线路。`
   }
-  return caught.message || '加入当前 Key 失败，请稍后重试'
+  return studentSafeReason(caught.message, '加入当前 Key 失败，请稍后重试')
 }
 
 async function addModel(modelID: string, catalogItem?: CatalogWithProtocols) {
@@ -558,6 +631,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
         <p class="eyebrow">STUDENT</p>
         <h1>模型广场</h1>
         <p class="muted">挑一个可用模型，直接加入当前 Key；个人模型库不再作为授权门槛。</p>
+        <p class="muted" data-testid="credit-rate-note">100 积分 = 1 元；金额统一用积分显示。</p>
       </div>
       <button class="button primary" :disabled="!currentKey" @click="openAdd">检索添加</button>
     </div>
@@ -626,7 +700,8 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
                 <span v-if="model.is_common" class="chip preset">预置</span>
                 <span class="chip" :class="availabilityTone(model)" data-testid="model-availability">{{ modelAvailability(model).label }}</span>
                 <span v-if="keyCoverage(model).inKey" class="chip" :class="keyCoverage(model).tone" data-testid="model-key-status">{{ keyCoverage(model).label }}</span>
-                <span class="chip">{{ modelCreditsLabel(model) }}</span>
+                <span class="chip" data-testid="model-used">{{ modelUsageLabel(model.model_id) }}</span>
+                <span class="chip" data-testid="model-balance">余额 {{ balanceText }}</span>
                 <span v-if="model.provider_name" class="chip">{{ model.provider_name }}</span>
                 <span v-for="value in protocolsFor(model)" :key="value" class="chip protocol-chip" data-testid="protocol-chip">{{ protocolShortLabel(value) }}</span>
                 <span v-if="recommendedProtocolLabel(model)" class="chip recommend" data-testid="recommended-protocol">推荐 {{ recommendedProtocolLabel(model) }}</span>
@@ -654,7 +729,8 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
                 <dl v-if="expanded === model.model_id">
                   <dt>模型名</dt><dd>{{ model.model_id }}</dd>
                   <dt>中转厂商</dt><dd>{{ modelProviderLabel(model) }}</dd>
-                  <dt>消耗点数</dt><dd>{{ modelCreditsLabel(model) }}</dd>
+                  <dt>本月已用</dt><dd>{{ modelUsageLabel(model.model_id) }}</dd>
+                  <dt>余额</dt><dd>{{ balanceText }}</dd>
                   <dt>支持协议</dt><dd>
                     <template v-if="protocolsFor(model).length">
                       <span v-for="(value, index) in protocolsFor(model)" :key="value">{{ index ? '、' : '' }}{{ protocolMeta(value).label }}（{{ protocolMeta(value).gatewayPath }}）</span>
@@ -694,7 +770,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
           <div class="model-table-head">
             <span>模型名</span>
             <span>中转厂商</span>
-            <span>消耗点数</span>
+            <span>本月已用</span>
             <span>协议</span>
             <span>当前 Key</span>
             <span />
@@ -702,7 +778,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
           <div v-for="item in catalogItems" :key="item.model_id" class="model-table-row">
             <span class="model-name">{{ item.model_id }}</span>
             <span>{{ catalogProviderLabel(item) }}</span>
-            <span>{{ catalogCreditsLabel(item) }}</span>
+            <span>{{ modelUsageLabel(item.model_id) }}</span>
             <span class="catalog-protocols">
               <span v-for="value in catalogProtocols(item)" :key="value" class="chip protocol-chip" data-testid="catalog-protocol-chip">{{ protocolShortLabel(value) }}</span>
               <small v-if="catalogRecommendedLabel(item)" class="muted" data-testid="catalog-recommendation">推荐 {{ catalogRecommendedLabel(item) }}</small>

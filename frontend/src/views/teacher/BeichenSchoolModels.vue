@@ -1,18 +1,20 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, useId, watch } from 'vue'
-import { RouterLink } from 'vue-router'
 import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
 import type { BeichenCapabilities, BeichenCatalogModel, BeichenHealthDimension, BeichenModelCapability, BeichenModelUsage, BeichenOverview, BeichenProbeRun, BeichenUsageRange, BindingAdapter } from '../../api/types'
-import type { BeichenCatalogKey, BeichenRebindPlan, BeichenRebindRoute, BeichenWebsiteLocation } from '../../api/types'
+import type { BeichenCatalogKey, BeichenModel, BeichenPreferredRoute, BeichenPriceConditions, BeichenRebindPlan, BeichenRebindRoute, BeichenWebsiteLocation } from '../../api/types'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { useToast } from '../../composables/useToast'
-import { emptyPriceDetail, formatPriceConditions, keyGroupIssue, keyGroupRate, missingPriceDetailLabels, schoolCatalog, schoolQuoteDetail, webPriceDetail, type SchoolCatalogRow, type SchoolQuote } from '../../utils/beichenModels'
+import { formatPriceConditions, keyGroupIssue, keyGroupRate, missingPriceDetailLabels, schoolCatalog, type SchoolCatalogRow, type SchoolQuote } from '../../utils/beichenModels'
 import { bindingAdapterMeta } from '../../utils/bindingAdapters'
-import { formatPercent, formatTokens, shiftDecimal } from '../../utils/credits'
+import { formatPercent, formatTokens, multiplyDecimal, shiftDecimal } from '../../utils/credits'
+import { buildGroupPriceRows } from '../../utils/groupPriceRows'
+import { calculateBeichenPriceTable, type BeichenPriceTableInput } from '../../utils/priceCalculation'
 import { schoolDay, statusLabel } from '../../utils/format'
 import AppDialog from '../../components/AppDialog.vue'
-import BeichenPriceDetail from '../../components/BeichenPriceDetail.vue'
+import BeichenGroupPrices from '../../components/BeichenGroupPrices.vue'
+import BeichenPriceTable from '../../components/BeichenPriceTable.vue'
 import BeichenPriceDrawer from '../../components/BeichenPriceDrawer.vue'
 import BeichenModelUsageDrawer from '../../components/BeichenModelUsageDrawer.vue'
 import BeichenRecentReceipts from './BeichenRecentReceipts.vue'
@@ -47,15 +49,7 @@ const probeError = ref('')
 const error = ref('')
 const toast = useToast()
 const reasonId = useId()
-const priceColumns = computed(() => [
-  { id: 'official', label: rows.value.some(row => row.pricing.some(quote => quote.status === 'derived')) ? '基础报价' : '官网价' },
-  { id: 'student', label: '学生实价' },
-] as const)
-const priceStateLabels: Record<PriceState, string> = {
-  confirmed: '报价已确认', conditional: '按条件计价', derived: '反推价，待核对', manual: '手动价', missing: '缺少报价', mixed: '混合报价',
-}
-const tokenPriceUnit = '每百万 Token 的积分'
-const convertibleUnits = new Set([tokenPriceUnit, '积分/次', '积分/秒'])
+const convertibleUnits = new Set(['每百万 Token 的积分', '积分/次', '积分/秒'])
 const filters = [{ id: 'all', label: '全部' }, { id: 'active', label: '已启用' }, { id: 'pending', label: '待配置' }, { id: 'unpriced', label: '无报价' }, { id: 'manual', label: '手动价' }] as const
 function adapterLabel(value: string) { return bindingAdapterMeta(value as BindingAdapter).label }
 const filter = ref<typeof filters[number]['id']>('all')
@@ -201,21 +195,74 @@ const rescanKeys = computed(() => (overview.value?.credentials ?? []).filter(key
 const rescanKeyAvailable = computed(() => rescanKeys.value.some(key => key.credential_id === rescanKey.value))
 const billingByKey = computed(() => new Map((overview.value?.datasets ?? [])
   .filter(dataset => dataset.kind === 'billing').map(dataset => [dataset.credential_id, dataset])))
+const pricesByKey = computed(() => new Map((overview.value?.datasets ?? [])
+  .filter(dataset => dataset.kind === 'prices').map(dataset => [dataset.credential_id, dataset])))
 const billingRows = computed(() => rescanKeys.value.flatMap(key => {
   const billing = billingByKey.value.get(key.credential_id)
   return billing?.billing_state ? [{ ...billing, label: key.label }] : []
 }))
 const rebindModelCount = computed(() => new Set(rebindPlan.value?.changes.map(row => row.model_id)).size)
+
+function currentGroupPrices(locations: BeichenWebsiteLocation[], credentialId: string | undefined,
+  key: BeichenCatalogKey | undefined, route: BeichenPreferredRoute | undefined, record: BeichenModel | undefined) {
+  const billing = credentialId ? billingByKey.value.get(credentialId) : undefined
+  const prices = credentialId ? pricesByKey.value.get(credentialId) : undefined
+  const groupId = key?.group_stale || billing?.group_status === 'not_found' || billing?.group_status === 'pending'
+    ? null : billing?.group_id ?? key?.group_id ?? null
+  const groupRows = buildGroupPriceRows(locations, groupId)
+  const currentGroup = groupRows.find(group => group.is_current_key_group)
+  const matchingGroup = (location: BeichenWebsiteLocation) => location.groups.find(group =>
+    group.id === groupId && (!group.status || group.status === 'active'))
+  const websiteQuotes = locations.filter(location => !location.stale && location.has_price && location.price_conditions_exact)
+  const sameGroup = websiteQuotes.filter(matchingGroup)
+  const official = sameGroup.find(location => location.price_complete) ?? sameGroup[0]
+  const websiteGroup = official ? matchingGroup(official) : undefined
+
+  const legacyTerms = record?.price_conditions
+  const terms = record?.price_conditions_exact ?? (legacyTerms && Object.fromEntries(
+    Object.entries(legacyTerms).filter(([field, value]) => !field.endsWith('_price') || value !== 0)))
+  const isDerived = record?.price_source === 'derived_from_usage' || record?.price_status === 'derived'
+  const website = official ?? (!isDerived && terms && record?.price_status !== 'not_listed' &&
+    key?.group_diagnosis !== 'price_outside_key_group' && key?.group_diagnosis !== 'model_outside_key_group'
+    ? { price_conditions_exact: terms, observed_at: record?.price_observed_at ?? prices?.last_success } : null)
+  const derived = !websiteQuotes.length && isDerived && record?.price_status === 'derived' && terms
+    ? { price_conditions_exact: terms, observed_at: record.price_observed_at } : null
+
+  const rateUnavailable = Boolean(billing?.last_error || keyGroupIssue(billing) || billing?.group_status === 'not_allowed' ||
+    billing?.billing_state === 'stale' || billing?.billing_state === 'unverified' || key?.group_stale)
+  const synchronizedRate = billing?.billing_state === 'current'
+    ? billing.effective_multiplier_text ?? billing.effective_multiplier : null
+  const websiteRate = key?.group_diagnosis === 'group_rate_mismatch' ? null
+    : websiteGroup?.account_rate_multiplier ?? websiteGroup?.rate_multiplier ?? billing?.group_rate
+  const rate = synchronizedRate ?? route?.effective_multiplier_text ?? route?.effective_multiplier ?? websiteRate
+  const priceCurrent = official || (record?.price_status === 'confirmed' || record?.price_status === 'conditional' || derived) &&
+    (!prices?.last_error || prices.official_price_missing)
+  const table: BeichenPriceTableInput = { website, derived, groupMultiplier: !rateUnavailable && priceCurrent ? rate : null }
+
+  if (currentGroup) {
+    const [input, output, cache5m, cache1h, cacheRead] = calculateBeichenPriceTable(table).rows
+    currentGroup.input = input.student?.credits ?? null
+    currentGroup.output = output.student?.credits ?? null
+    currentGroup.cache5m = cache5m.student?.credits ?? null
+    currentGroup.cache1h = cache1h.student?.credits ?? null
+    currentGroup.cache_read = cacheRead.student?.credits ?? null
+  }
+  const hasTable = Boolean(currentGroup || website || derived)
+  return { table, groupId, groupRows, currentGroup, hasTable, officialPriceMissing: prices?.official_price_missing }
+}
+
 const catalog = computed(() => {
   const data = overview.value
   if (!data) return []
   const entries = new Map((data.model_catalog ?? []).map(row => [row.model.toLowerCase(), row]))
   const observedKeys = new Map<string, Set<string>>()
+  const observedPrices = new Map<string, BeichenModel>()
   for (const record of data.models ?? []) {
     const model = record.model.toLowerCase()
     const ids = observedKeys.get(model) ?? new Set<string>()
     ids.add(record.credential_id)
     observedKeys.set(model, ids)
+    observedPrices.set(record.credential_id + ':' + model, record)
   }
   return schoolCatalog(data, props.providerId).map(row => {
     const model = row.model.toLowerCase()
@@ -236,6 +283,7 @@ const catalog = computed(() => {
     const canDisable = row.canDisable || (activation === 'active' && Boolean(entry?.school_model))
     const capability = summarizeCapabilities(row.model)
     const priceState = capability?.priceState ?? entry?.price_state ?? oldPriceState(row)
+    const priceBlocker = capability ? capability.priceBlocker : entry?.price_blocker?.message.trim()
     const priceCovered = !websiteOnly && (capability
       ? priceState === 'confirmed' || priceState === 'manual' || (priceState === 'mixed' && row.priceReady)
       : entry?.price_covered ?? (entry?.price_state == null ? row.priceReady
@@ -246,37 +294,42 @@ const catalog = computed(() => {
       .filter(blocker => !routeBlocked || (blocker.code !== 'missing_price' && blocker.code !== 'conditional_price'))
       .map(blocker => blocker.message?.trim()).filter(Boolean)
     const catalogKeys = entry?.catalog_keys ?? []
-    const groupMismatch = catalogKeys.some(key => key.group_diagnosis)
     const locations = entry?.website_locations ?? []
-    const websitePrices = locations.filter(location => location.price_complete && location.price_conditions_exact)
-    const showWebsitePrices = websitePrices.length > 0 && !row.quotes.some(quote =>
-      (quote.status === 'confirmed' || quote.status === 'conditional') && quote.standard)
-    const hasStudentPrice = row.quotes.some(quote => quote.mode === 'manual' || quote.actual)
-    const quotedKeys = new Set(row.credentials.map(key => key.credential_id))
-    const groupIssues = [...new Set([...keys].filter(id => !quotedKeys.has(id))
-      .map(id => keyGroupIssue(billingByKey.value.get(id))).filter(Boolean))]
-    const pricing = (row.quotes.length ? row.quotes : [null]).map(quote => ({
-      key: quote?.key ?? 'missing',
-      hasQuote: Boolean(quote),
-      status: quote?.status ?? 'pending',
-      statusLabel: groupMismatch && !quote?.issue && (!quote || quote.status === 'pending' || quote.status === 'not_listed')
-        ? '分组报价需核对' : quote?.statusLabel ?? '单价待同步',
-      multiplierLabel: quote?.multiplierLabel ?? (groupMismatch ? '请查看分组倍率' : undefined),
-      notes: quote?.notes ?? [],
-      official: displayPrice(quote, false),
-      student: displayPrice(quote, true),
-    }))
+    const priceRoute = routes.filter(route => route.credential_id && route.school_model.toLowerCase() === row.school.toLowerCase())
+      .sort((left, right) => Number(right.state === 'ready') - Number(left.state === 'ready') || left.priority - right.priority)[0]
+    const credentialId = priceRoute?.credential_id ?? catalogKeys.find(key => key.state === 'listed' && !key.stale)?.credential_id ??
+      (keys.size === 1 ? [...keys][0] : undefined)
+    const priceKey = catalogKeys.find(key => key.credential_id === credentialId)
+    const upstreamModel = (priceRoute?.upstream_model ?? priceKey?.upstream_model ?? row.model).toLowerCase()
+    const record = credentialId ? observedPrices.get(credentialId + ':' + upstreamModel) : undefined
+    const groupPrices = currentGroupPrices(locations, credentialId, priceKey, priceRoute, record)
+    const websiteTerms = groupPrices.table.website?.price_conditions_exact
+    const detailQuotes = row.quotes.filter(quote => hasPriceConditions(quote) || needsPriceDetails(quote.conditions) ||
+      (!quote.conditions && quote.status === 'confirmed' && quote.actual))
+    const detailWebsite = websiteTerms && needsPriceDetails(websiteTerms) && !detailQuotes.some(quote => quote.conditions === websiteTerms)
+      ? formatPriceConditions(websiteTerms, null, true).standard : null
+    const groupStatuses = [...new Set([...keys, ...catalogKeys.map(key => key.credential_id)])].map(id => billingByKey.value.get(id))
+    const deniedGroups = [...new Set(groupStatuses.filter(group => group?.group_status === 'not_allowed')
+      .map(group => group?.group_id == null ? '分组无权限' : '分组无权限 · 分组 ' + group.group_id))]
+    const missingGroup = groupStatuses.some(group => group?.group_status === 'not_found')
+    const groupMismatch = missingGroup || catalogKeys.some(key => key.group_diagnosis === 'model_outside_key_group' ||
+      key.group_diagnosis === 'price_outside_key_group' && !websiteTerms) ||
+      (groupPrices.groupId != null && groupPrices.groupRows.length > 0 && !groupPrices.currentGroup)
+    const protocolCount = entry?.protocols ? new Set(entry.protocols).size
+      : capability?.protocols.length ?? (protocols.size || (routeCount === 0 ? 0 : null))
+    const priceMissing = !websiteOnly && !priceCovered && priceState === 'missing' &&
+      (Boolean(priceBlocker) || !websiteTerms || missingPriceDetailLabels(websiteTerms).some(label => !label.startsWith('缓存')))
     return {
-      ...row, active, activation, canDisable, keyCoverage, routeCount, readyCount, priceState, priceCovered, pricing, routeBlocked,
+      ...row, active, activation, canDisable, keyCoverage, routeCount, readyCount, priceState, priceCovered, priceMissing, routeBlocked,
       blockers: [...new Set(blockerMessages)],
-      priceBlocker: capability ? capability.priceBlocker : entry?.price_blocker?.message.trim(),
+      priceBlocker,
       listed,
       discovered: Boolean(source) || listed,
       websiteOnly,
       source,
-      locations, websitePrices, showWebsitePrices, hasStudentPrice,
-      catalogKeys, groupIssues,
-      protocolCount: entry?.protocols?.length ?? (capability ? capability.protocols.length : protocols.size || (routeCount === 0 ? 0 : null)),
+      locations, groupPrices, detailQuotes, detailWebsite,
+      catalogKeys, groupMismatch, deniedGroups, missingGroup, protocolCount,
+      groupRateMismatch: catalogKeys.some(key => key.group_diagnosis === 'group_rate_mismatch'),
       protocolLabels: entry?.catalog_state ? entry.protocols?.map(protocolLabel) ?? [] : capability
         ? capability.protocols.map(protocolLabel)
         : entry?.protocols?.map(protocol => bindingAdapterMeta(protocol).label) ?? [],
@@ -287,7 +340,7 @@ const catalog = computed(() => {
       actionHint: capability?.actionHint,
       hasCapability: Boolean(capability),
       bindingInvalid: capability?.bindingInvalid ?? false,
-      protocolMissing: Boolean(capability && capability.protocols.length === 0),
+      protocolMissing: capability ? capability.protocols.length === 0 : protocolCount === 0,
       lastProbeAt: entry?.last_probe_at,
       bindingIssue: entry?.binding_issue,
     }
@@ -483,38 +536,17 @@ function keyCoverageLabel(key: BeichenCatalogKey) {
       return label + (key.stale ? ' 上次目录有' : ' 目录有') + ' · ' + key.upstream_model
         + (key.match && matchLabels[key.match] ? ' · ' + matchLabels[key.match] : '') + details
     case 'missing': return key.group_diagnosis === 'model_outside_key_group'
-      ? label + details + '。Key 分组不含该模型。'
-      : '官网有、' + label + ' 无' + details + '。请核查分组后重扫。'
-    case 'failed': return label + ' 目录读取失败' + details + '，请重扫。'
-    case 'pending': return label + ' 目录待同步' + details + '。'
-    case 'ambiguous': return label + ' 有多个近似名称，请核查目录和教师别名。'
+      ? label + details + ' · 分组不含此模型'
+      : '官网有、' + label + ' 无' + details
+    case 'failed': return label + ' 目录读取失败' + details
+    case 'pending': return label + ' 目录待同步' + details
+    case 'ambiguous': return label + ' · 多个近似型号'
   }
 }
 
 function rateLabel(value?: string | number | null) {
   const rate = shiftDecimal(value, 0)
   return rate === '—' ? '未知' : rate + '×'
-}
-
-function groupPriceComparison(key: BeichenCatalogKey, locations: BeichenWebsiteLocation[]) {
-  const billing = billingByKey.value.get(key.credential_id)
-  const rulesDiffer = key.group_diagnosis === 'group_rate_mismatch'
-  const website = locations.flatMap(location => {
-    if (location.stale || !location.has_price) return []
-    const price = location.price_conditions_exact
-      ? formatPriceConditions(location.price_conditions_exact, null, true).standard : null
-    return location.groups
-      .filter(group => group.id != null && (!group.status || group.status === 'active') &&
-        (rulesDiffer ? group.id === key.group_id : group.id !== key.group_id))
-      .map(group => `官网分组 ${group.id} 价 · 倍率 ${rateLabel(group.rate_multiplier)}` +
-        (group.account_rate_multiplier != null ? ' · 账户倍率 ' + rateLabel(group.account_rate_multiplier) : '') +
-        (group.peak_rate_enabled ? ' · 高峰系数 ' + rateLabel(group.peak_rate_multiplier) : '') +
-        (price ? '\n' + withYuan(price) : ' · 单价明细未确认'))
-  })
-  const own = `Key 分组 ${key.group_id} 价 · 倍率 ${rateLabel(billing?.group_rate ?? billing?.effective_multiplier_text ?? billing?.effective_multiplier)}` +
-    (billing?.peak_enabled ? ' · 高峰系数 ' + rateLabel(billing.peak_rate) : '') +
-    (rulesDiffer ? ' · 分组计费规则待核对' : ' · 当前分组未列可匹配报价')
-  return [...new Set(website), own]
 }
 
 function websiteLocationLabel(location: BeichenWebsiteLocation) {
@@ -524,26 +556,6 @@ function websiteLocationLabel(location: BeichenWebsiteLocation) {
     location.platform, groups.length ? groups.join('、') : '分组待核', location.name,
     location.has_price ? '官网有报价' : '官网无报价',
     location.stale ? '缓存目录' : ''].filter(Boolean).join(' · ')
-}
-
-function websiteGroupPrice(location: BeichenWebsiteLocation) {
-  if (!location.has_price || !location.price_conditions_exact) return ''
-  const base = formatPriceConditions(location.price_conditions_exact, null, true).standard
-  return base ? withYuan(base) : ''
-}
-
-function websitePriceHeading(location: BeichenWebsiteLocation) {
-  const groups = location.groups.flatMap(group => group.id == null ? [] : [group.id])
-  const title = location.stale ? '上次官网报价' : '官网报价'
-  return groups.length ? title + ' · 分组 ' + groups.join('、') : title
-}
-
-function catalogPriceLabel(row: CatalogRow) {
-  if (!row.priceCovered && row.catalogKeys.some(key => key.group_diagnosis)) return '分组报价需核对'
-  if ((row.websiteOnly || row.priceState === 'missing') && row.locations.some(location => location.has_price)) {
-    return '官网有报价，待 Key 确认'
-  }
-  return row.websiteOnly ? '官网未给出报价' : priceStateLabels[row.priceState] ?? '报价待同步'
 }
 
 function canEnableReason(row: CatalogRow) {
@@ -556,14 +568,14 @@ function canEnableReason(row: CatalogRow) {
   }
   if (row.activation === 'ready') return ''
   if (row.routeBlocked) return row.blockers.join('；') || '线路未就绪，请刷新模型或检查渠道配置'
-  if (!row.priceCovered && row.websitePrices.length && row.catalogKeys.some(key => key.group_diagnosis)) {
-    return '当前 Key 报价待核对，请检查分组。'
-  }
   if (row.priceBlocker) return row.priceBlocker
   if (row.blockers.length) return row.blockers.join('；')
   if (row.activation == null && row.canEnable == null) return '启用条件待同步，请先刷新模型'
-  if (!row.priceCovered && row.websitePrices.length) return '当前 Key 报价待核对，请检查分组。'
-  if (!row.priceCovered) return row.priceState === 'conditional' ? '条件价待核实，可先手动定价' : '官网未报价，请先手动定价'
+  if (!row.priceCovered) {
+    if (row.priceState === 'conditional') return '条件价待核实，可先手动定价'
+    if (row.groupPrices.table.website || row.groupPrices.table.derived) return '报价尚未生效，请同步价格'
+    return '官网未报价，请先手动定价'
+  }
   if (row.activation === 'blocked' || !row.canEnable || !row.routeCount) return '线路未就绪，请刷新模型或检查渠道配置'
   return ''
 }
@@ -598,8 +610,9 @@ async function syncPrices() {
   }
 }
 
-async function rescanCatalog(credentialId = rescanKey.value) {
-  if (busy.value || !rescanKeys.value.some(key => key.credential_id === credentialId)) return
+async function rescanCatalog() {
+  if (busy.value || !rescanKeyAvailable.value) return
+  const credentialId = rescanKey.value
   const providerId = props.providerId
   const current = () => !disposed && props.providerId === providerId
   rescanning.value = true
@@ -802,45 +815,28 @@ function hasPriceConditions(quote: SchoolQuote) {
   return quote.status === 'conditional' || /上下文分档|推理强度/u.test((quote.standard ?? '') + (quote.actual ?? ''))
 }
 
-function withYuan(text: string) {
+function needsPriceDetails(terms?: BeichenPriceConditions | null) {
+  return Boolean(terms && (terms.billing_mode && terms.billing_mode !== 'token' || terms.intervals?.length ||
+    Object.keys(terms.reasoning_effort_multipliers ?? {}).length || terms.cache_write_12h_price != null ||
+    terms.image_input_price != null || terms.image_output_price != null))
+}
+
+function withYuan(text: string, factor?: string) {
   return text.split('\n').map(line => {
     const [unit, ...amounts] = line.split(' · ')
     if (!convertibleUnits.has(unit)) return line
-    return [unit, ...amounts.map(amount => amount.replace(/ (\d+(?:\.\d+)?)$/, (_match, credits: string) =>
-      ` ${credits} 积分（${shiftDecimal(credits, -2)} 元）`))].join(' · ')
+    return [unit, ...amounts.map(amount => amount.replace(/ (\d+(?:\.\d+)?)$/, (_match, credits: string) => {
+      const value = factor ? multiplyDecimal(credits, factor) : credits
+      return ` ${value} 积分（${shiftDecimal(value, -2)} 元）`
+    }))].join(' · ')
   }).join('\n')
 }
 
-function displayPrice(quote: SchoolQuote | null, student: boolean) {
-  const manual = student && quote?.mode === 'manual'
-  if (quote && hasPriceConditions(quote) && !manual) {
-    const terms = quote.conditions
-    const showBase = !student && terms?.billing_mode === 'token' &&
-      (terms.cache_write_1h_price != null || terms.cache_write_12h_price != null) &&
-      !terms.intervals?.length && !Object.keys(terms.reasoning_effort_multipliers ?? {}).length
-    return { conditional: true, showBase, detail: schoolQuoteDetail(quote, student), details: '' }
-  }
-  if (!quote) return { conditional: false, detail: emptyPriceDetail(), details: '' }
-  const text = (manual ? '' : student ? quote.actual : quote.standard) ?? ''
-  const [first, ...other] = text.split('\n')
-  const tokenLine = first.startsWith(tokenPriceUnit) ? first : ''
-  return {
-    conditional: false,
-    detail: schoolQuoteDetail(quote, student),
-    details: withYuan(tokenLine ? other.join('\n') : text),
-  }
-}
-
 function missingPriceLabel(row: CatalogRow) {
-  const labels = new Set<string>()
-  for (const quote of row.quotes) {
-    for (const label of missingPriceDetailLabels(quote.conditions)) labels.add(label)
-  }
-  const requiredMissing = labels.has('输入') || labels.has('输出') || labels.has('每次请求') || labels.has('每秒') || labels.has('图像单价')
-  if (requiredMissing) return '缺价：' + [...labels].join('、')
-  if (row.priceBlocker) return '缺价：' + row.priceBlocker
-  if (labels.size) return '缺价：' + [...labels].join('、')
-  return '缺价：输入、输出、缓存写入(5m)、缓存写入(1h)、缓存读取'
+  const terms = row.groupPrices.table.website?.price_conditions_exact ?? row.detailQuotes[0]?.conditions
+  const labels = missingPriceDetailLabels(terms)
+  const detail = row.priceBlocker || (row.groupPrices.officialPriceMissing ? '官方价表缺失' : labels.join('、'))
+  return detail ? '缺价 · ' + detail : '缺价'
 }
 
 function modelUsage(model: string) { return usageByModel.value.get(model.toLowerCase()) }
@@ -1016,62 +1012,54 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
     </p>
     <p v-if="probeError" class="error" role="alert">{{ probeError }}</p>
     <div class="model-filters" role="group" aria-label="模型状态筛选"><button v-for="item in filters" :key="item.id" type="button" :aria-pressed="filter === item.id" @click="filter = item.id">{{ item.label }}</button><small>当前筛选 {{ rows.length }} 个模型</small></div>
-    <p class="beichen-note">官网报价单位为{{ websiteDirectory?.price_unit ?? '元（北辰余额单位）' }}。Token 单价按每百万 Token 计，1 元 = 100 积分。跟随官网时，学生实价按该线路的倍率计算。</p>
+    <p class="beichen-note">学生扣费 = 结算价 × 1.10；100 积分 = 1 元</p>
+    <p class="beichen-note">官网报价单位为{{ websiteDirectory?.price_unit ?? '元（北辰余额单位）' }}。</p>
     <p v-if="error && !batchSelection" class="error" role="alert">{{ error }}</p>
     <p v-if="providerMaintenance && loginNeeded" role="status">北辰官网需要学校后台重新授权。</p>
     <p v-if="priceErrors.length" class="error" role="alert">价格同步失败：{{ priceErrors.join('；') }}</p>
     <div v-if="loading && !overview" class="model-skeleton" role="status"><span class="sr-only">正在读取模型…</span><i v-for="index in 3" :key="index" aria-hidden="true" /></div>
     <div v-if="rows.length" class="model-list" data-layout="responsive-cards">
-      <table class="beichen-table model-table">
+      <table class="model-table">
         <caption class="sr-only">北辰模型覆盖、价格与本月用量</caption>
-        <colgroup><col class="model-col"><col class="state-col"><col class="price-col"><col class="price-col"><col class="usage-col"><col class="action-col"></colgroup>
+        <colgroup><col class="model-col"><col class="state-col"><col class="price-col"><col class="usage-col"><col class="action-col"></colgroup>
         <thead>
-          <tr><th scope="col">模型</th><th scope="col">状态与覆盖</th><th v-for="column in priceColumns" :key="column.id" scope="col">{{ column.label }}</th><th scope="col">本月用量</th><th scope="col">操作</th></tr>
+          <tr><th scope="col">模型</th><th scope="col">状态与覆盖</th><th scope="col">价格</th><th scope="col">本月用量</th><th scope="col">操作</th></tr>
         </thead>
         <tbody>
           <tr v-for="(row, index) in rows" :key="row.model" :data-model="row.model" :class="{ 'binding-issue-row': row.bindingIssue }">
             <th scope="row" class="model-name">{{ row.model }}</th>
             <td data-label="状态与覆盖" class="model-state">
-              <span class="model-state-summary">
-                <span>{{ row.keyCoverage }}/{{ keyCount }} 把 Key 覆盖</span> ·
-                <span :title="row.routeCount + ' 条候选线路'">{{ row.protocolCount == null ? '协议数待同步' : row.protocolCount + ' 种协议' }}</span> ·
-                <span>{{ row.readyCount }} 条已发布</span> ·
-                <span>{{ catalogPriceLabel(row) }}</span> ·
+              <div class="model-state-summary">
+                <span>Key 覆盖 {{ row.keyCoverage }}/{{ keyCount }}</span> ·
+                <span :title="row.routeCount + ' 条候选线路'">协议 {{ row.protocolCount ?? '待同步' }}</span> ·
+                <span>已发布 {{ row.readyCount }}</span>
+              </div>
+              <div class="model-capability" data-testid="model-capability">
                 <strong :class="row.bindingIssue ? 'binding-issue' : row.active ? 'published-state' : undefined">{{ publicationLabel(row) }}</strong>
-              </span>
+                <span class="status-pill" :class="availabilityTone(row)" data-testid="model-availability">{{ availabilityLabel(row) }}</span>
+                <span v-if="row.groupMismatch" class="status-pill pending" data-testid="group-mismatch"
+                  :title="row.missingGroup ? 'Key 分组不存在' : undefined">分组不匹配</span>
+                <span v-for="denied in row.deniedGroups" :key="denied" class="status-pill danger" data-testid="group-denied">{{ denied }}</span>
+                <span v-if="row.groupRateMismatch" class="status-pill pending">分组计费规则待核对</span>
+                <span v-if="!row.websiteOnly && row.protocolMissing" class="status-pill pending" data-testid="protocol-missing">缺协议</span>
+                <span v-if="row.priceMissing" class="status-pill pending" data-testid="price-missing">{{ missingPriceLabel(row) }}</span>
+                <span v-if="row.bindingInvalid" class="status-pill danger" data-testid="binding-invalid">绑定失效</span>
+                <span v-if="!row.websiteOnly" class="chip recommend" data-testid="recommended-protocol">{{ row.recommendedProtocol
+                  ? '推荐 ' + protocolLabel(row.recommendedProtocol)
+                  : row.hasCapability ? '暂无推荐协议' : '推荐协议待同步' }}</span>
+              </div>
               <small v-if="row.source" class="row-note" data-testid="catalog-source">来源 {{ sourceLabels[row.source] }}</small>
               <small v-for="key in row.catalogKeys.filter(key => key.state !== 'listed')" :key="key.credential_id"
                 class="row-note" data-testid="key-catalog-gap">{{ keyCoverageLabel(key) }}</small>
-              <div v-for="key in row.catalogKeys.filter(key => key.group_diagnosis)" :key="'group-' + key.credential_id"
-                class="row-note" data-testid="group-price-comparison">
-                <div v-for="line in groupPriceComparison(key, row.locations)" :key="line" class="price-detail">{{ line }}</div>
-                <p v-if="key.group_diagnosis === 'model_outside_key_group'">请在北辰切换到含该型号的分组，或在
-                  <RouterLink :to="{ name: 'teacher-providers' }">供应商管理</RouterLink>换用对应分组的 Key。</p>
-                <button type="button" class="button ghost" :disabled="busy" @click="rescanCatalog(key.credential_id)">重扫该 Key</button>
-              </div>
-              <small v-if="row.keyCoverage === 0 && !row.catalogKeys.length" class="row-note">
-                {{ row.websiteOnly ? '暂无匹配的渠道 Key，请根据官网分组核对。' : '当前启用 Key 无目录覆盖，请查看 Key 健康和目录同步状态。' }}
-              </small>
               <details v-if="row.locations.length || row.catalogKeys.some(key => key.state === 'listed')" class="catalog-evidence">
                 <summary>目录来源与分组</summary>
                 <ul>
                   <li v-for="(location, sourceIndex) in row.locations" :key="sourceIndex">
                     {{ websiteLocationLabel(location) }} · {{ syncTime(location.observed_at) }}
-                    <div v-for="line in websiteGroupPrice(location).split('\n').filter(Boolean)" :key="line" class="row-note">{{ line }}</div>
                   </li>
                   <li v-for="key in row.catalogKeys.filter(key => key.state === 'listed')" :key="key.credential_id">{{ keyCoverageLabel(key) }}</li>
                 </ul>
               </details>
-              <div class="model-capability" data-testid="model-capability">
-                <span class="status-pill" :class="availabilityTone(row)" data-testid="model-availability">{{ availabilityLabel(row) }}</span>
-                <span v-if="!row.websiteOnly" class="chip recommend" data-testid="recommended-protocol">{{ row.recommendedProtocol
-                  ? '推荐 ' + protocolLabel(row.recommendedProtocol)
-                  : row.hasCapability ? '暂无推荐协议' : '推荐协议待同步' }}</span>
-                <span v-if="row.bindingInvalid" class="status-pill danger" data-testid="binding-invalid">绑定失效</span>
-                <span v-if="!row.websiteOnly && row.protocolMissing" class="status-pill pending" data-testid="protocol-missing">缺协议</span>
-                <span v-if="!row.websiteOnly && row.priceState === 'missing' && !row.websitePrices.length" class="status-pill pending" data-testid="price-missing">{{ missingPriceLabel(row) }}</span>
-              </div>
-              <small v-for="issue in row.groupIssues" :key="issue" class="row-note">{{ issue }}</small>
               <small v-if="!row.websiteOnly && row.availabilityReason" class="row-note" data-testid="availability-reason">{{ row.availabilityReason }}</small>
               <small v-if="!row.websiteOnly && row.actionHint" class="row-note" data-testid="action-hint">下一步：{{ row.actionHint }}</small>
               <small v-if="row.bindingIssue" class="row-note binding-issue">{{ row.bindingIssue.message }}</small>
@@ -1081,69 +1069,21 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
                 <small v-if="row.lastProbeAt">{{ syncTime(row.lastProbeAt) }}（北京时间）</small>
               </div>
             </td>
-            <td v-for="column in priceColumns" :key="column.id" :data-label="column.label"
-              :class="column.id === 'official' ? 'standard-price' : 'actual-price'">
-              <template v-if="column.id === 'official' && row.showWebsitePrices">
-                <div v-for="(location, index) in row.websitePrices" :key="index" class="quote-row">
-                  <BeichenPriceDetail v-if="location.price_conditions_exact?.billing_mode === 'token' &&
-                    !location.price_conditions_exact.intervals?.length"
-                    :title="websitePriceHeading(location)"
-                    :detail="webPriceDetail(location.price_conditions_exact, null, 'website', location.observed_at)" />
-                  <template v-else>
-                    <span>{{ websitePriceHeading(location) }}</span>
-                    <p class="price-line">{{ websiteGroupPrice(location) }}</p>
-                  </template>
+            <td data-label="价格" class="model-price">
+              <div class="model-price-content">
+                <div v-if="(row.groupPrices.groupId != null && row.groupPrices.hasTable) || row.mode !== 'follow'" class="model-price-context">
+                  <small v-if="row.groupPrices.groupId != null && row.groupPrices.hasTable">
+                    当前 Key · 分组 {{ row.groupPrices.groupId }}
+                  </small>
+                  <span v-if="row.mode !== 'follow'" class="status-pill manual">
+                    {{ row.mode === 'manual' ? '手动价生效' : '部分 Key 使用手动价' }} · 官网报价供参考
+                  </span>
                 </div>
-              </template>
-              <p v-if="column.id === 'student' && row.showWebsitePrices && !row.hasStudentPrice" class="price-empty">当前 Key 报价待核对</p>
-              <div v-else v-for="(quote, quoteIndex) in column.id === 'official' && row.showWebsitePrices
-                ? row.pricing.filter(quote => quote.status === 'derived') : row.pricing"
-                :key="quote.key" class="quote-row" :data-price-status="quote.status">
-                <div class="quote-caption">
-                  <span v-if="row.pricing.length > 1">报价 {{ quoteIndex + 1 }}</span>
-                  <span v-if="column.id === 'official'" class="status-pill" :class="quote.status">{{ quote.statusLabel }}</span>
-                  <span v-else>{{ quote.multiplierLabel ?? '倍率待同步' }}</span>
-                  <span v-if="quote.hasQuote" class="status-pill price-source" :data-source="quote[column.id].detail.source">{{ quote[column.id].detail.sourceLabel }}</span>
-                  <small v-if="quote.hasQuote" class="price-observed">observed_at {{ quote[column.id].detail.observedLabel }}</small>
-                </div>
-                <template v-if="quote[column.id].conditional">
-                  <button v-if="column.id === 'official'" type="button" class="price-link" @click="conditionsRow = row">查看档位</button>
-                  <span v-else class="price-empty">随计价档位变化</span>
-                </template>
-                <template v-if="quote.hasQuote && quote[column.id].detail && (!quote[column.id].conditional || quote[column.id].showBase)">
-                  <p class="billing-mode-line">计费模式：{{ quote[column.id].detail.billingModeLabel }}</p>
-                  <dl v-if="quote[column.id].detail.rows.some(row => !row.notApplicable)" class="price-table">
-                    <div v-for="cell in quote[column.id].detail.rows" :key="cell.key" class="price-row price-cell"
-                      :data-key="cell.key" :data-missing="cell.missing">
-                      <dt class="price-label">{{ cell.label }}</dt>
-                      <dd class="price-value">
-                        <span class="price-amount">
-                          <template v-if="cell.notApplicable">
-                            <span class="price-figure price-empty">—</span>
-                            <small class="price-gap price-not-applicable">不适用：{{ cell.label }}</small>
-                          </template>
-                          <template v-else-if="cell.missing">
-                            <span class="price-figure price-yuan">—</span>
-                            <span class="price-figure price-credits">—</span>
-                            <span class="price-unit">/ 1M Token</span>
-                            <small class="price-gap">{{ cell.key === 'cache_write_1h' ? '未列单价' : '缺价' }}：{{ cell.label }}</small>
-                          </template>
-                          <template v-else>
-                            <span class="price-figure price-yuan">{{ cell.yuan }}<small class="price-unit-mark"> 元</small></span>
-                            <span class="price-figure price-credits">{{ cell.credits }}<small class="price-unit-mark"> 积分</small></span>
-                            <span class="price-unit">/ 1M Token</span>
-                            <small v-if="cell.shared" class="price-shared">与缓存写入(5m)同价</small>
-                          </template>
-                        </span>
-                      </dd>
-                    </div>
-                  </dl>
-                </template>
-                <p v-if="quote[column.id].details" class="price-line">{{ quote[column.id].details }}</p>
-                <span v-else-if="!quote.hasQuote" class="price-empty">缺价</span>
-                <template v-if="column.id === 'official'">
-                  <small v-for="note in quote.notes" :key="note" class="row-note">{{ note }}</small>
-                </template>
+                <BeichenPriceTable v-if="row.groupPrices.hasTable" v-bind="row.groupPrices.table" />
+                <button v-if="row.detailQuotes.length || row.detailWebsite" type="button" class="price-link" @click="conditionsRow = row">查看档位</button>
+                <BeichenGroupPrices v-if="row.groupPrices.groupRows.length" :rows="row.groupPrices.groupRows" />
+                <p v-else-if="row.groupPrices.groupId == null || !row.groupPrices.hasTable"
+                  class="group-missing-note" data-testid="current-group-missing">当前 Key 分组未匹配</p>
               </div>
             </td>
             <td data-label="本月用量" class="model-usage">
@@ -1237,7 +1177,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
       </div>
     </section>
   </AppDialog>
-  <AppDialog :open="Boolean(conditionsRow)" :title="(conditionsRow?.model ?? '模型') + ' · 计价档位'" description="查看官网计价条件及按线路倍率换算的学生实价。"
+  <AppDialog :open="Boolean(conditionsRow)" :title="(conditionsRow?.model ?? '模型') + ' · 计价档位'" description="查看计价条件、结算价及学生价。"
     wide @update:open="open => { if (!open) conditionsRow = undefined }">
     <div class="beichen-stack">
       <p v-if="conditionsRow && (conditionsRow.routeBlocked || conditionsRow.bindingIssue)" class="beichen-note" data-testid="tier-route-reason">
@@ -1246,11 +1186,13 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
       <p v-if="conditionsRow?.priceBlocker" class="beichen-note price-blocker-note" data-testid="price-blocker-message">
         {{ conditionsRow.priceBlocker }}
       </p>
-      <section v-for="quote in conditionsRow?.quotes ?? []" :key="quote.key" class="condition-quote">
+      <p v-if="conditionsRow?.detailWebsite" class="price-detail">{{ withYuan(conditionsRow.detailWebsite) }}</p>
+      <section v-for="quote in conditionsRow?.detailQuotes ?? []" :key="quote.key" class="condition-quote">
         <h3>{{ quote.multiplierLabel }}</h3>
         <dl class="condition-prices">
           <div><dt>{{ quote.status === 'derived' ? '反推基础价' : '官网价' }}</dt><dd class="price-detail">{{ quote.standard ? withYuan(quote.standard) : '尚未取得报价明细' }}</dd></div>
-          <div><dt>学生实价</dt><dd class="price-detail">{{ quote.mode === 'manual' ? '请查看列表中的手动价' : quote.actual ? withYuan(quote.actual) : '尚无可用单价' }}</dd></div>
+          <div><dt>结算价</dt><dd class="price-detail">{{ quote.actual ? withYuan(quote.actual) : '尚无可用单价' }}</dd></div>
+          <div><dt>学生价</dt><dd class="price-detail">{{ quote.mode === 'manual' ? '请查看手动定价' : quote.actual ? withYuan(quote.actual, '1.10') : '尚无可用单价' }}</dd></div>
         </dl>
         <p v-for="note in quote.notes" :key="note" class="beichen-note">{{ note }}</p>
       </section>
@@ -1276,13 +1218,18 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .model-summary { grid-template-columns: repeat(auto-fit, minmax(min(100%, 130px), 1fr)); }
 .model-toolbar { justify-content: flex-end; }
 .model-list { container-type: inline-size; }
-.model-table { table-layout: fixed; }
-.model-col { width: 15%; } .state-col { width: 16%; } .price-col { width: 25%; } .usage-col { width: 8%; } .action-col { width: 11%; }
-.model-table thead th { white-space: normal; }
-.model-table th, .model-table td { min-width: 0; overflow-wrap: anywhere; }
-.model-name { font-size: 13px; }
+.model-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+.model-col { width: 13%; } .state-col { width: 17%; } .price-col { width: 50%; } .usage-col { width: 9%; } .action-col { width: 11%; }
+.model-table > thead > tr > th { color: var(--ink-soft); font-size: 11px; }
+.model-table > :is(thead, tbody) > tr > :is(th, td) {
+  min-width: 0; padding: 12px 10px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left;
+}
 .model-state { font-size: 12px; line-height: 1.75; }
-.model-state-summary { display: inline; }
+.model-state-summary span { white-space: nowrap; }
+.model-price-content { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.model-price-context { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.model-price-context small, .group-missing-note { color: var(--ink-soft); font-size: 12px; }
+.group-missing-note { margin: 0; }
 .catalog-evidence { margin-top: 4px; font-size: 12px; color: var(--ink-soft); }
 .catalog-evidence summary { cursor: pointer; }
 .catalog-evidence ul { margin: 4px 0; padding-inline-start: 18px; overflow-wrap: anywhere; }
@@ -1302,16 +1249,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .model-actions .row-note { flex-basis: 100%; }
 .row-note { display: block; color: var(--ink-soft); font-size: 11px; line-height: 1.5; margin-top: 6px; overflow-wrap: anywhere; }
 .enable-reason { color: #835615; }
-.price-line { white-space: pre-line; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; font-size: 12px; line-height: 1.6; margin: 0; }
-.billing-mode-line { margin: 0; color: var(--ink-soft); font-size: 11px; line-height: 1.6; }
-.price-observed { color: var(--ink-soft); font-size: 11px; font-weight: 400; overflow-wrap: anywhere; }
-.price-source { white-space: normal; }
-.quote-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
-.quote-row + .quote-row { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
-.quote-caption { display: flex; align-items: center; gap: 6px; min-height: 22px; flex-wrap: wrap; font-size: 11px; font-variant-numeric: tabular-nums; }
-.quote-caption .status-pill { white-space: normal; }
-.price-cell { min-width: 0; }
 .price-link, .usage-link { padding: 0; border: 0; background: transparent; text-align: left; color: var(--primary-strong); font-weight: 700; font-size: 12px; overflow-wrap: anywhere; }
+.price-link { justify-self: start; }
 .price-link:hover, .usage-link:hover { text-decoration: underline; text-underline-offset: 3px; }
 .model-filters { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
 .model-filters button { border: 1px solid var(--line); background: #fff; color: var(--ink-soft); border-radius: 999px; font-size: 12px; padding: 6px 12px; }
@@ -1342,22 +1281,22 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .batch-list li span { font-size: 12px; color: var(--ink-soft); }
 .batch-list [data-batch-status="failed"] span { color: var(--danger, #b53b55); }
 .condition-quote h3 { font-size: 14px; margin-top: 0; }
-.condition-prices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; margin: 0; }
+.condition-prices { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; margin: 0; }
 .condition-prices dt { font-weight: 700; font-size: 13px; margin-bottom: 8px; }
 .price-detail { white-space: pre-line; overflow-wrap: anywhere; color: var(--ink-soft); font-variant-numeric: tabular-nums; font-size: 13px; margin: 0; line-height: 1.7; }
 button:focus-visible, summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
 @container (max-width: 60rem) {
   .model-table { display: block; }
-  .model-table colgroup, .model-table thead { display: none; }
-  .model-table tbody { display: grid; gap: 16px; }
-  .model-table tbody tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 10px; padding: 16px 0; border: 1px solid var(--line); border-radius: 14px; }
-  .model-table th, .model-table td { display: block; width: auto; padding: 0 14px; border: 0; }
-  .model-name, .model-state { grid-column: 1 / -1; }
+  .model-table > colgroup, .model-table > thead { display: none; }
+  .model-table > tbody { display: grid; gap: 16px; }
+  .model-table > tbody > tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 10px; padding: 16px 0; border: 1px solid var(--line); border-radius: 14px; }
+  .model-table > tbody > tr > :is(th, td) { display: block; width: auto; padding: 0 14px; border: 0; }
+  .model-name, .model-state, .model-price { grid-column: 1 / -1; }
   .model-table td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 6px; font-size: 11px; color: var(--ink-soft); }
   .model-actions .row-note { margin-top: 0; }
 }
 @container (max-width: 29rem) {
-  .model-table tbody tr { grid-template-columns: minmax(0, 1fr); }
+  .model-table > tbody > tr { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 900px) {
   .condition-prices { grid-template-columns: minmax(0, 1fr); gap: 16px; }

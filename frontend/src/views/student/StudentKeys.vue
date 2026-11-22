@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { studentAPI } from '../../api/student'
-import type { ApiKey, BindingAdapter, Model, Organization, StudentProject, SubmitApiKey } from '../../api/types'
+import type { ApiKey, BindingAdapter, Model, Organization, StudentProject, StudentUsage, SubmitApiKey } from '../../api/types'
 import { APIError } from '../../api/client'
 import StatusProgress from '../../components/StatusProgress.vue'
 import StatusBadge from '../../components/StatusBadge.vue'
@@ -13,14 +13,14 @@ import { usePendingActions } from '../../composables/usePendingActions'
 import { useToast } from '../../composables/useToast'
 import { changedApiKeyID } from '../../utils/keyStatusEvents'
 import { calculateCredits, fullTime, quotaBalance } from '../../utils/format'
-import { modelCreditsLabel } from '../../utils/modelPlazaDisplay'
+import { formatCredits } from '../../utils/credits'
 import { harnessDialogTitle, keyCanWithdraw, keyHarnessSupport } from '../../utils/studentHarnessConfig'
 import { BINDING_ADAPTER_OPTIONS, bindingAdapterMeta } from '../../utils/bindingAdapters'
 
 type KeyModelAvailability = 'available' | 'unverified' | 'maintenance'
 type KeyHealthState = 'ok' | 'pending' | 'blocked'
 type KeyHealthItem = {
-  id: 'credential' | 'catalog' | 'pricing' | 'probe'
+  id: 'credential' | 'catalog' | 'probe'
   title: string
   state: KeyHealthState
   value: string
@@ -31,6 +31,9 @@ type KeyHealthItem = {
 const orgs = ref<Organization[]>([])
 const projects = ref<StudentProject[]>([])
 const keys = ref<ApiKey[]>([])
+const usage = ref<StudentUsage | null>(null)
+const usageLoaded = ref(false)
+const usageFailed = ref(false)
 const detail = ref<ApiKey | null>(null)
 const memberBalance = computed(() => {
   const key = detail.value
@@ -61,6 +64,16 @@ const selectableProjects = computed(() => projects.value.filter(project =>
   project.status === 'active' && !blockedProjectIds.value.has(project.id),
 ))
 const canSubmit = computed(() => Boolean(form.organization_id && form.project_id && form.name.trim() && form.requested_monthly_credits.trim()))
+const keyUsageByID = computed(() => {
+  const rows = new Map<string, { used: string; available: string | null }>()
+  for (const project of usage.value?.projects ?? []) {
+    for (const key of project.keys ?? []) {
+      const available = key.available?.trim() ? key.available.trim() : (project.available?.trim() || null)
+      rows.set(key.id, { used: key.used, available })
+    }
+  }
+  return rows
+})
 const keyCards = computed(() => keys.value.map(key => {
   const rows = keyModelList(key).map(model => ({ model, availability: keyModelAvailability(model) }))
   const availableModels = rows.filter(row => row.availability === 'available').map(row => row.model)
@@ -69,6 +82,7 @@ const keyCards = computed(() => keys.value.map(key => {
     key, rows, availableCount: key.status === 'active' ? availableModels.length : 0,
     protocols: keyProtocols(key),
     health: keyHealth(key, availableModels, hasUnverified),
+    usage: keyUsageByID.value.get(key.id) ?? null,
   }
 }))
 const maskedKey = (key: ApiKey) => key.key_prefix ? key.key_prefix + '••••••' : '密钥已生成，点击「查看密钥」'
@@ -139,27 +153,28 @@ function keyModelRecommendedLabel(model: Model) {
   return value ? keyProtocolLabel(value) : '暂无'
 }
 
-function modelPriced(model: Model) {
-  const raw = model.credit_multiplier?.trim()
-  return Boolean(raw) && /^\d+(?:\.\d+)?$/.test(raw!) && Number(raw) > 0
-}
-
 function keyModelAvailability(model: Model): KeyModelAvailability {
   const state = model.availability
   if (state === 'available' || state === 'unverified' || state === 'maintenance') return state
-  if (state || model.status !== 'active' || !model.route_ready || model.probe_state === 'failed' || !modelPriced(model)) {
+  if (state || model.status !== 'active' || !model.route_ready || model.probe_state === 'failed') {
     return 'maintenance'
   }
   return model.probe_state === 'passed' ? 'available' : 'unverified'
 }
 
+function studentSafeReason(reason: string, fallback: string) {
+  if (!reason) return fallback
+  return /(价格|报价|单价|倍率|官网|反推|基础积分|折后|加价|price|quote|cost|multiplier)/i.test(reason)
+    ? fallback
+    : reason
+}
+
 function keyModelReason(model: Model, availability: KeyModelAvailability) {
   const reason = model.availability_reason?.trim()
-  if (reason) return reason
+  if (reason) return studentSafeReason(reason, '老师暂未开放该模型。')
   if (availability === 'available') return '已有可调用线路。'
   if (availability === 'unverified') return '已有绑定线路，尚无通过探活的协议。'
   if (model.status === 'inactive') return '老师已停用该模型。'
-  if (!modelPriced(model)) return '该模型暂无有效报价。'
   if (model.probe_state === 'failed') return '当前线路探活失败。'
   return '当前没有可接入的线路。'
 }
@@ -224,24 +239,10 @@ function keyHealth(key: ApiKey, availableModels: Model[], hasUnverified: boolean
   const models = keyModelList(key)
   if (!models.length) return [credentialHealth(key)]
 
-  const priced = models.filter(modelPriced)
-  const unpricedCount = models.length - priced.length
-
   const catalog: KeyHealthItem = {
     id: 'catalog', title: '目录', state: 'ok', value: `已登记 ${models.length} 个模型`,
     detail: '每个模型的可用状态见下方 Key 白名单。', action: '',
   }
-
-  const pricing: KeyHealthItem = unpricedCount > 0
-    ? {
-        id: 'pricing', title: '报价', state: 'blocked', value: `缺少 ${unpricedCount} 个模型的报价`,
-        detail: `已配置 ${priced.length}/${models.length} 个模型。`,
-        action: '请老师补齐缺失模型的报价。',
-      }
-    : {
-        id: 'pricing', title: '报价', state: 'ok', value: `已配置 ${priced.length} 个模型`,
-        detail: '调用时会按模型卡片上的点数扣费。', action: '',
-      }
 
   const probe: KeyHealthItem = key.status !== 'active'
     ? {
@@ -264,7 +265,7 @@ function keyHealth(key: ApiKey, availableModels: Model[], hasUnverified: boolean
             action: '如需恢复线路，请联系老师并提供 Key 名称和模型名。',
           }
 
-  return [credentialHealth(key), catalog, pricing, probe]
+  return [credentialHealth(key), catalog, probe]
 }
 
 function openHarness(key: ApiKey) {
@@ -279,7 +280,24 @@ async function load() {
   const sequence = ++loadSequence
   await loadState.run(async () => {
     try {
-      const [organizations, apiKeys] = await Promise.all([studentAPI.organizations(), studentAPI.keys()])
+      const usageRequest = typeof studentAPI.usage === 'function'
+        ? studentAPI.usage()
+          .then(payload => {
+            if (sequence !== loadSequence) return
+            usage.value = payload
+            usageLoaded.value = true
+            usageFailed.value = false
+          })
+          .catch(() => {
+            if (sequence !== loadSequence) return
+            usage.value = null
+            usageLoaded.value = false
+            usageFailed.value = true
+          })
+        : Promise.resolve()
+      const [organizations, apiKeys] = await Promise.all([
+        studentAPI.organizations(), studentAPI.keys(), usageRequest,
+      ])
       if (sequence !== loadSequence) return
       orgs.value = organizations
       keys.value = apiKeys
@@ -437,13 +455,13 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
       </div>
       <button class="button secondary" @click="load">刷新</button>
     </div>
+    <p class="muted" data-testid="credit-rate-note">100 积分 = 1 元；金额统一用积分显示。</p>
     <p v-if="error" class="error banner">{{ error }}</p>
     <section class="panel key-health-guide" data-testid="key-health-guide">
       <h2>Key 可用状态怎么看</h2>
       <div class="key-health-guide-grid">
         <div><strong>凭据</strong><p>学校发给你的那串 Key 是否已签发、能证明你的身份。</p></div>
         <div><strong>目录</strong><p>这个 Key 的白名单里有哪些模型；模型不在目录里，调用会被拒绝。</p></div>
-        <div><strong>报价</strong><p>每个模型调用一次扣多少积分；没有报价的模型不会对学生开放。</p></div>
         <div><strong>探活</strong><p>网关确认请求能不能真正发到上游模型。学生端显示老师同步的线路状态，不是实时探测。</p></div>
       </div>
     </section>
@@ -455,7 +473,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
             <label>1. 组织<select v-model="form.organization_id" @change="chooseOrg"><option value="">请选择</option><option v-for="org in orgs" :key="org.id" :value="org.id">{{ org.name }}</option></select></label>
             <label>2. 项目<select v-model="form.project_id" :disabled="!form.organization_id"><option value="">请选择</option><option v-for="project in selectableProjects" :key="project.id" :value="project.id">{{ project.name }}</option></select></label>
             <label>3. Key 名称<input v-model="form.name" maxlength="128" required></label>
-            <label>4. 个人申请月额度（credits）<input v-model="form.requested_monthly_credits" inputmode="decimal" required></label>
+            <label>4. 个人申请月额度（积分）<input v-model="form.requested_monthly_credits" inputmode="decimal" required></label>
             <button class="button primary wide" :disabled="!canSubmit || actions.pending('submit')">
               {{ actions.pending('submit') ? '提交中…' : '提交申请' }}
             </button>
@@ -472,14 +490,22 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
         <section class="panel">
           <h2>我的申请</h2>
           <p v-if="!keys.length" class="muted">暂无进行中的申请，可在左侧提交新申请。</p>
-          <article v-for="{ key, rows, availableCount, protocols, health } in keyCards" :key="key.id" class="key-card">
+          <article v-for="{ key, rows, availableCount, protocols, health, usage } in keyCards" :key="key.id" class="key-card">
             <div class="row">
               <div>
                 <strong>{{ key.name }}</strong>
-                <p class="muted">{{ key.project.name }} · 申请 {{ key.requested_monthly_credits }} credits</p>
+                <p class="muted">{{ key.project.name }} · 申请 {{ key.requested_monthly_credits }} 积分</p>
               </div>
               <StatusBadge :status="keyDisplayStatus(key)" />
             </div>
+            <p class="muted key-credit-summary" data-testid="key-credit-summary">
+              <template v-if="usageFailed">本月用量暂不可用</template>
+              <template v-else-if="!usageLoaded">本月用量读取中…</template>
+              <template v-else-if="usage && Number(usage.used) > 0">本月已用 <strong>{{ formatCredits(usage.used) }}</strong> 积分</template>
+              <template v-else>本月未使用</template>
+              · <template v-if="usageLoaded && usage?.available">余额 <strong>{{ formatCredits(usage.available) }}</strong> 积分</template>
+              <template v-else>余额 —</template>
+            </p>
             <StatusProgress :current="key.progress.current" :completed="key.progress.completed_steps" />
             <div v-if="rows.length" class="key-protocols" data-testid="key-protocols">
               <span class="muted">支持协议：</span>
@@ -576,8 +602,8 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
         </div>
         <p v-if="keyProtocols(detail).length" class="protocol-note">网关不做协议转换，客户端需使用对应模型支持的协议。</p>
         <p>学生申请 {{ detail.requested_monthly_credits }} · 导师审核 {{ detail.mentor_monthly_credits ?? '—' }} · 审批额度 {{ detail.monthly_credits ?? '—' }} 积分</p>
-        <p v-if="memberBalance">当前月额度 {{ detail.member_monthly_credits }} · 学校已用 {{ detail.member_used_credits }} · {{ memberBalance.label }} {{ memberBalance.amount }} 积分</p>
-        <p v-if="keyModelList(detail).length">{{ keyModelList(detail).map(model => `${model.model_id}（${keyModelProtocolLabel(model)} · 推荐 ${keyModelRecommendedLabel(model)} · ${modelCreditsLabel(model)}）`).join('、') }}</p>
+        <p v-if="memberBalance">当前月额度 {{ detail.member_monthly_credits }} · 已用 {{ detail.member_used_credits }} · {{ memberBalance.label }} {{ memberBalance.amount }} 积分</p>
+        <p v-if="keyModelList(detail).length">{{ keyModelList(detail).map(model => `${model.model_id}（${keyModelProtocolLabel(model)} · 推荐 ${keyModelRecommendedLabel(model)}）`).join('、') }}</p>
         <div v-if="keyCanWithdraw(detail)" class="actions key-card-actions">
           <button class="button ghost" @click="withdrawConfirm = detail">撤回申请</button>
         </div>

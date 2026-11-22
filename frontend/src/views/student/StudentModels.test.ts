@@ -52,6 +52,7 @@ vi.mock('../../api/student', () => ({
     removeModel: vi.fn(),
     withdraw: vi.fn(),
     submit: vi.fn(),
+    usage: vi.fn(),
   },
 }))
 
@@ -89,6 +90,7 @@ beforeEach(() => {
   vi.mocked(studentAPI.removeModel).mockReset()
   vi.mocked(studentAPI.withdraw).mockReset().mockResolvedValue({ withdrawn: true } as never)
   vi.mocked(studentAPI.submit).mockReset().mockResolvedValue({} as never)
+  vi.mocked(studentAPI.usage).mockReset().mockResolvedValue({ month: '2026-11', projects: [] } as never)
 })
 
 afterEach(() => {
@@ -172,7 +174,7 @@ describe('StudentModels key model states', () => {
   it.each([
     ['model has no usable route for this API key', '没有可用线路'],
     ['model route is unverified', '没有通过探活'],
-    ['model is missing a student price', '没有配置学校报价'],
+    ['model is missing a student price', '暂未开放'],
   ])('distinguishes adding failure: %s', async (serverMessage, expected) => {
     vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([])] as never)
     vi.mocked(studentAPI.addKeyModels).mockRejectedValueOnce(new APIError(serverMessage, 409, 'MODEL_NOT_READY'))
@@ -254,6 +256,53 @@ describe('StudentModels key model states', () => {
     expect(card.find('[data-testid="remove-key-model"]').exists()).toBe(false)
     expect(card.get('[data-testid="sync-key-model"]').text()).toBe('添加到我的 Key')
     expect(wrapper.text()).toContain('当前 Key 已加入 0 个模型')
+    wrapper.unmount()
+  })
+})
+
+describe('StudentModels usage without prices', () => {
+  it('aggregates model-level used credits and shows the key balance without unit prices', async () => {
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([fixture.model('gpt-5.3-codex', false)])] as never)
+    vi.mocked(studentAPI.usage).mockResolvedValueOnce({
+      month: '2026-11',
+      projects: [{
+        project_id: 'project', project_name: 'Project', quota: '200.000', used: '17.500', pending: '0.000', available: '182.500',
+        keys: [
+          {
+            id: 'key-1', name: '我的 Key', status: 'active', used: '15.000', pending: '0.000', available: '185.000',
+            models: [
+              { id: 'gpt-5.3-codex', name: 'gpt-5.3-codex', credits: '10.000', calls: 2 },
+              { id: 'claude-sonnet-4-5', name: 'claude-sonnet-4-5', credits: '5.000', calls: 1 },
+            ],
+          },
+          {
+            id: 'key-2', name: '第二把 Key', status: 'active', used: '2.500', pending: '0.000', available: '0.000',
+            models: [{ id: 'gpt-5.3-codex', name: 'gpt-5.3-codex', credits: '2.500', calls: 1 }],
+          },
+        ],
+      }],
+    } as never)
+    const wrapper = mountPage()
+    await flushPromises()
+
+    const card = wrapper.get('[data-model="gpt-5.3-codex"]')
+    expect(card.get('[data-testid="model-used"]').text()).toBe('本月已用 12.5 积分')
+    expect(card.get('[data-testid="model-balance"]').text()).toBe('余额 185 积分')
+    expect(wrapper.get('[data-testid="credit-rate-note"]').text()).toBe('100 积分 = 1 元；金额统一用积分显示。')
+    expect(wrapper.text()).not.toContain('点/次')
+    expect(wrapper.text()).not.toContain('基础积分')
+    expect(wrapper.text()).not.toContain('消耗点数')
+    wrapper.unmount()
+  })
+
+  it('shows 本月未使用 when the usage response has no row for the model', async () => {
+    const wrapper = mountPage()
+    await flushPromises()
+
+    const card = wrapper.get('[data-model="gpt-5.3-codex"]')
+    expect(card.get('[data-testid="model-used"]').text()).toBe('本月未使用')
+    expect(card.get('[data-testid="model-balance"]').text()).toBe('余额 —')
+    expect(card.text()).not.toContain('0 积分')
     wrapper.unmount()
   })
 })

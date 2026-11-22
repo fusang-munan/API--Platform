@@ -35,6 +35,7 @@ function mockStudentRequests(routes: Record<string, unknown> = {}) {
     [`GET ${studentPath}/organizations`]: [organization],
     [`GET ${studentPath}/organizations/${organization.id}/projects`]: [project],
     [`GET ${keysPath}`]: [],
+    [`GET ${studentPath}/usage`]: { month: '2026-11', projects: [] },
     ...routes,
   }))
   vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
@@ -180,6 +181,39 @@ describe('学生 Key 申请与领取', () => {
 })
 
 describe('Key 白名单', () => {
+  it('只显示本月已用积分和余额，不显示单价表', async () => {
+    const key = makeKey({ api_key: 'neb_sk_fake_credit_key' })
+    mockStudentRequests({
+      [`GET ${keysPath}`]: [key],
+      [`GET ${keysPath}/${key.id}`]: key,
+      [`GET ${studentPath}/usage`]: {
+        month: '2026-11',
+        projects: [{
+          project_id: project.id, project_name: project.name, quota: '200.000', used: '12.500', pending: '0.000', available: '187.500',
+          keys: [{
+            id: key.id, name: key.name, status: 'active', used: '12.500', pending: '0.000', available: '187.500',
+            models: [{ id: readyModel.model_id, name: readyModel.display_name, credits: '12.500', calls: 3 }],
+          }],
+        }],
+      },
+    })
+    const { wrapper } = await mountPage()
+
+    const card = wrapper.get('.key-card')
+    const summary = card.get('[data-testid="key-credit-summary"]').text()
+    expect(summary).toContain('本月已用 12.5 积分')
+    expect(summary).toContain('余额 187.5 积分')
+    expect(card.text()).not.toContain('点/次')
+    expect(card.text()).not.toContain('基础积分')
+    expect(card.text()).not.toContain('报价')
+
+    await card.findAll('button').find(button => button.text() === '查看密钥')!.trigger('click')
+    await flushPromises()
+    const detail = wrapper.get('[data-title="申请详情"]')
+    expect(detail.text()).toContain('推荐 OpenAI Chat')
+    expect(detail.text()).not.toContain('点/次')
+  })
+
   it('保留九条旧授权，显示两条可调用和七条需处理并说明每一行', async () => {
     const models: Model[] = [
       readyModel,
@@ -285,16 +319,19 @@ describe('Key 白名单', () => {
     expect(wrapper.find('[data-testid="configure-api-key"]').exists()).toBe(false)
   })
 
-  it('说明凭据、目录、报价和探活，并展示旧响应里的协议信息', async () => {
+  it('说明凭据、目录和探活，并展示旧响应里的协议信息', async () => {
     const model = { ...readyModel, availability: undefined, probe_state: undefined, last_probe_at: null }
     mockStudentRequests({ [`GET ${keysPath}`]: [makeKey({ models: [model] })] })
     const { wrapper } = await mountPage()
 
     const guide = wrapper.get('[data-testid="key-health-guide"]').text()
-    for (const label of ['凭据', '目录', '报价', '探活', '不是实时探测']) expect(guide).toContain(label)
+    for (const label of ['凭据', '目录', '探活', '不是实时探测']) expect(guide).toContain(label)
+    expect(guide).not.toContain('报价')
     expect(wrapper.get('[data-health="credential"]').text()).toContain('已签发')
     expect(wrapper.get('[data-health="catalog"]').text()).toContain('已登记 1 个模型')
-    expect(wrapper.get('[data-health="pricing"]').text()).toContain('已配置 1 个模型')
+    expect(wrapper.find('[data-health="pricing"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="credit-rate-note"]').text()).toBe('100 积分 = 1 元；金额统一用积分显示。')
+    expect(wrapper.get('[data-testid="key-credit-summary"]').text()).toContain('本月未使用')
     expect(wrapper.get('[data-health="probe"]').text()).toContain('待验证')
     expect(wrapper.get('[data-testid="key-model-row"]').attributes('data-availability')).toBe('unverified')
     const protocols = wrapper.get('[data-testid="key-protocols"]').text()
@@ -303,7 +340,7 @@ describe('Key 白名单', () => {
     expect(wrapper.text()).toContain('网关不做协议转换')
   })
 
-  it('显示缺少报价或线路的授权，保留生效 Key 的真实状态', async () => {
+  it('显示缺少线路的授权，保留生效 Key 的真实状态', async () => {
     const brokenModel = {
       ...readyModel, status: 'inactive' as const, route_ready: false, credit_multiplier: null,
       availability: undefined, probe_state: undefined, protocols: [],
@@ -315,7 +352,7 @@ describe('Key 白名单', () => {
     expect(wrapper.get('[data-health="credential"]').text()).toContain('已生效，待生成')
     expect(wrapper.get('[data-testid="key-model-row"]').text()).toContain('老师已停用该模型')
     expect(wrapper.get('[data-testid="key-model-row"]').text()).toContain('支持协议：暂无')
-    expect(wrapper.get('[data-health="pricing"]').text()).toContain('缺少 1 个模型的报价')
+    expect(wrapper.find('[data-health="pricing"]').exists()).toBe(false)
     expect(wrapper.get('[data-health="probe"]').text()).toContain('线路不可用')
   })
 })
