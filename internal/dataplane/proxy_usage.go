@@ -220,6 +220,7 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 			g.markCallSent(ctx, reservation.CallID)
 		}
 		status := response.StatusCode
+		attempted.UpstreamStatus = status
 		success := status >= 200 && status < 300
 		canRetry := !routed && attempt < upstreamRetryAttempts-1 && ctx.Err() == nil
 		if upstreamHTTPRetryable(status) && canRetry {

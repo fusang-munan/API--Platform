@@ -91,6 +91,14 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 	if recoveredBeforeDispatch || (!success && route.DefinitelyNotSent) {
 		next, reason = "released", ""
 	}
+	// A deterministic upstream 4xx rejects the request before billable work.
+	// Keeping these calls in pending_review exhausts the student's review limit
+	// and blocks unrelated models after a few bad client requests.
+	upstreamRejected := !success && route.UpstreamStatus >= 400 && route.UpstreamStatus < 500 &&
+		route.UpstreamStatus != 408
+	if upstreamRejected && !route.DefinitelyNotSent {
+		next, billing, reason = "released", "failed", ""
+	}
 	if legacyCharge {
 		next, billing, reason = "released", "charged", ""
 	}
