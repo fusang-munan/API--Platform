@@ -36,16 +36,39 @@ func (s *Server) beichenReconciliation(c *gin.Context) {
 	if !ok {
 		return
 	}
+	scope, ok := unmatchedScopeQuery(c)
+	if !ok {
+		return
+	}
 	providerID, ok := pathID(c, "provider_id")
 	if !ok {
 		return
 	}
-	view, err := s.service.Beichen().Reconciliation(c.Request.Context(), providerID, value, time.Now())
+	view, err := s.service.Beichen().ReconciliationPage(c.Request.Context(), providerID, value,
+		scope, c.Query("unmatched_cursor"), time.Now())
 	if err != nil {
 		writeError(c, err)
 		return
 	}
 	respond(c, http.StatusOK, view)
+}
+
+func unmatchedScopeQuery(c *gin.Context) (string, bool) {
+	value := c.DefaultQuery("unmatched_scope", "observed")
+	if value == "" {
+		value = "observed"
+	}
+	switch value {
+	case "observed", "comparable":
+		return value, true
+	default:
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
+			"error": gin.H{"code": domain.CodeValidation, "message": "unmatched_scope 须为 observed 或 comparable",
+				"details": []gin.H{{"field": "unmatched_scope", "reason": "invalid_enum"}}},
+			"request_id": requestID(c),
+		})
+		return "", false
+	}
 }
 
 func (s *Server) beichenDiagnostics(c *gin.Context) {

@@ -71,8 +71,13 @@ export const teacherAPI = {
     const query = new URLSearchParams({ range, ...(providerID ? { provider_id: providerID } : {}) })
     return get<BeichenModelUsage>(`/api/v1/teacher/model-usage?${query}`)
   },
-  beichenReconciliation: (id: string, range: BeichenUsageRange) =>
-    get<BeichenReconcile>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/reconciliation?${new URLSearchParams({ range })}`),
+  beichenReconciliation: (id: string, range: BeichenUsageRange,
+    options?: { unmatchedScope?: 'observed' | 'comparable'; unmatchedCursor?: string }) => {
+    const query = new URLSearchParams({ range })
+    if (options?.unmatchedScope) query.set('unmatched_scope', options.unmatchedScope)
+    if (options?.unmatchedCursor) query.set('unmatched_cursor', options.unmatchedCursor)
+    return get<BeichenReconcile>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/reconciliation?${query}`)
+  },
   syncBeichen: (id: string, credentialId?: string) =>
     post<{ synced: boolean }>(`/api/v1/teacher/providers/${id}/beichen/sync`, credentialId ? { credential_id: credentialId } : undefined),
   beichenAliases: (id: string) =>

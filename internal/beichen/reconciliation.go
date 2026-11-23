@@ -126,11 +126,19 @@ type ReconciliationView struct {
 	Keys     []ReconciliationKey    `json:"keys"`
 }
 
+const (
+	unmatchedScopeObserved   = "observed"
+	unmatchedScopeComparable = "comparable"
+)
+
 type ReconciliationReport struct {
 	ReportPeriod
 	ReconciliationView
-	ComparableOnly    *ReconciliationView    `json:"comparable_only"`
-	UnmatchedUpstream []UnmatchedUpstreamRow `json:"unmatched_upstream"`
+	ComparableOnly      *ReconciliationView    `json:"comparable_only"`
+	UnmatchedUpstream   []UnmatchedUpstreamRow `json:"unmatched_upstream"`
+	UnmatchedTotal      int64                  `json:"unmatched_total"`
+	UnmatchedNextCursor *string                `json:"unmatched_next_cursor"`
+	UnmatchedScope      string                 `json:"unmatched_scope"`
 }
 
 // grouping=0 按凭据和别名解析后的模型，grouping=1 按凭据，grouping=3 为总计。
@@ -191,18 +199,27 @@ selected_calls AS (
    count(DISTINCT COALESCE(beichen_school_multiplier, 1)) > 1 AS multiplier_mixed
  FROM priced_calls GROUP BY GROUPING SETS ((credential_id, school_model), (credential_id), ())
 )` + reconciliationSourcesSQL + `,
-expected_days AS (
+credential_lifecycle AS (
+ SELECT id, created_at, COALESCE(status,'active')='active' AS required,
+   (updated_at AT TIME ZONE 'Asia/Shanghai')::date AS retired_day
+ FROM provider_credentials WHERE provider_id = $1
+), expected_days AS (
  SELECT c.id AS credential_id, d.day::date AS day
- FROM provider_credentials c CROSS JOIN LATERAL generate_series(
+ FROM credential_lifecycle c CROSS JOIN LATERAL generate_series(
    GREATEST((c.created_at AT TIME ZONE 'Asia/Shanghai')::date, $4::text::date)::timestamp,
    ($5::text::date - 1)::timestamp, interval '1 day') d(day)
- WHERE c.provider_id = $1
+ WHERE c.required OR (c.retired_day IS NOT NULL AND d.day::date <= c.retired_day)
  UNION
- SELECT credential_id, (sent_at AT TIME ZONE 'Asia/Shanghai')::date FROM report_calls
- UNION
- SELECT credential_id, day FROM model_usage_rows
- UNION
- SELECT credential_id, day FROM key_usage_days
+ SELECT f.credential_id, f.day
+ FROM (
+   SELECT credential_id, (sent_at AT TIME ZONE 'Asia/Shanghai')::date AS day FROM report_calls
+   UNION
+   SELECT credential_id, day FROM model_usage_rows
+   UNION
+   SELECT credential_id, day FROM key_usage_days
+ ) f
+ LEFT JOIN credential_lifecycle c ON c.id = f.credential_id
+ WHERE c.id IS NULL OR c.required OR (c.retired_day IS NOT NULL AND f.day <= c.retired_day)
 ), coverage_days AS (
  SELECT e.*, COALESCE(NOT d.stale,false) OR w.credential_id IS NOT NULL AS synced,
    COALESCE(d.stale,false) AND w.credential_id IS NULL AS stale
@@ -325,6 +342,11 @@ SELECT jsonb_build_object(
    'multiplier_mixed', (SELECT multiplier_mixed FROM local_summary WHERE level = 3)))`
 
 func readReconciliation(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, period ReportPeriod, now time.Time) (ReconciliationReport, error) {
+	return readReconciliationPage(ctx, tx, providerID, period, now, unmatchedScopeObserved, "")
+}
+
+func readReconciliationPage(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, period ReportPeriod, now time.Time,
+	scope, cursor string) (ReconciliationReport, error) {
 	var startDay any
 	if period.Start != nil {
 		startDay = period.Start.In(beijing).Format(dayLayout)
@@ -363,10 +385,20 @@ func readReconciliation(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, p
 			return report, err
 		}
 	}
-	var err error
-	report.UnmatchedUpstream, err = readUnmatchedUpstream(ctx, tx, providerID, period.Start, end)
+	var dates []string
+	if scope == unmatchedScopeComparable {
+		dates = report.Coverage.EligibleDates
+	}
+	page, err := readUnmatchedUpstream(ctx, tx, providerID, period.Start, end, dates, scope, cursor)
+	if err != nil {
+		return report, err
+	}
+	report.UnmatchedUpstream = page.Rows
+	report.UnmatchedTotal = page.Total
+	report.UnmatchedNextCursor = page.NextCursor
+	report.UnmatchedScope = scope
 	report.ReportPeriod = period
-	return report, err
+	return report, nil
 }
 
 func (view *ReconciliationView) describeCoverage() {
@@ -382,6 +414,16 @@ func (view *ReconciliationView) describeCoverage() {
 }
 
 func (s *Service) Reconciliation(ctx context.Context, providerID uuid.UUID, value string, now time.Time) (ReconciliationReport, error) {
+	return s.ReconciliationPage(ctx, providerID, value, unmatchedScopeObserved, "", now)
+}
+
+func (s *Service) ReconciliationPage(ctx context.Context, providerID uuid.UUID, value, scope, cursor string, now time.Time) (ReconciliationReport, error) {
+	if scope == "" {
+		scope = unmatchedScopeObserved
+	}
+	if scope != unmatchedScopeObserved && scope != unmatchedScopeComparable {
+		return ReconciliationReport{}, invalid("unmatched_scope 须为 observed 或 comparable")
+	}
 	period, err := reportPeriod(value, now)
 	if err != nil {
 		return ReconciliationReport{}, err
@@ -399,7 +441,7 @@ func (s *Service) Reconciliation(ctx context.Context, providerID uuid.UUID, valu
 	if err := checkProvider(ctx, tx, providerID); err != nil {
 		return ReconciliationReport{}, err
 	}
-	report, err := readReconciliation(ctx, tx, providerID, period, now)
+	report, err := readReconciliationPage(ctx, tx, providerID, period, now, scope, cursor)
 	if err == nil {
 		err = tx.Commit()
 	}
