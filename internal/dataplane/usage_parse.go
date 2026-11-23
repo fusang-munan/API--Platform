@@ -178,8 +178,11 @@ func applyReplyState(adapter modelbinding.Adapter, metrics *ResponseMetrics, pay
 	if deltaRaw, ok := payload["delta"]; ok {
 		var delta map[string]json.RawMessage
 		if json.Unmarshal(deltaRaw, &delta) == nil {
-			noteStopReason(metrics, rawString(delta["stop_reason"]))
-			noteStopReason(metrics, rawString(delta["finish_reason"]))
+			if adapter == modelbinding.AdapterAnthropic {
+				noteStopReason(metrics, rawString(delta["stop_reason"]))
+			} else {
+				noteStopReason(metrics, rawString(delta["finish_reason"]))
+			}
 			noteToolRequest(metrics, deltaRaw)
 		}
 	}
@@ -196,8 +199,11 @@ func applyReplyState(adapter modelbinding.Adapter, metrics *ResponseMetrics, pay
 	if reason := rawString(jsonObject(payload["promptFeedback"])["blockReason"]); adapter == modelbinding.AdapterGoogleGeminiV1beta && reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
 		metrics.terminal = true
 	}
-	noteStopReason(metrics, rawString(payload["stop_reason"]))
-	noteStopReason(metrics, rawString(payload["finish_reason"]))
+	if adapter == modelbinding.AdapterAnthropic {
+		noteStopReason(metrics, rawString(payload["stop_reason"]))
+	} else {
+		noteStopReason(metrics, rawString(payload["finish_reason"]))
+	}
 	eventType := strings.ToLower(rawString(payload["type"]))
 	status := strings.ToLower(rawString(payload["status"]))
 	messageStop := adapter == modelbinding.AdapterAnthropic && eventType == "message_stop"
