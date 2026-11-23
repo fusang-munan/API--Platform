@@ -28,18 +28,22 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
-func TestBeichenPostgresGatewayReconciliation(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	db := openBeichenGatewayTestSchema(t, ctx)
+const (
+	studentKey    = "fixture-student-api-key"
+	upstreamKey   = "fixture-beichen-api-key"
+	publicModel   = "fixture-public"
+	upstreamModel = "fixture-g3"
+)
 
-	const studentKey = "fixture-student-api-key"
-	const upstreamKey = "fixture-beichen-api-key"
-	const publicModel = "fixture-public"
-	const upstreamModel = "fixture-g3"
-	const gmModel = "fixture-gm1"
-	const trustedReceipt = "7482ba6e-0219-4a6a-b935-fde623e9baa5"
-	const forgedReceipt = "706d4cbe-fb65-4839-8f33-7ae5d878b8f6"
+type beichenGatewayFixture struct {
+	db                                     *sql.DB
+	gateway                                *Gateway
+	provider, credential, binding, teacher uuid.UUID
+}
+
+func newBeichenGatewayFixture(t *testing.T, ctx context.Context) beichenGatewayFixture {
+	t.Helper()
+	db := openBeichenGatewayTestSchema(t, ctx)
 	manager, err := security.NewManager(nil, nil, []byte("fixture-key-pepper"), make([]byte, 32), time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -82,6 +86,18 @@ VALUES ($1,$2,'upstream','base','billing',2000000,10000000,100000,2500000)`, cre
 	client := ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db)))
 	store := usage.NewStore(db)
 	gateway := NewGateway(client, store, nil, manager, Config{MaxRequestBytes: 4096})
+	return beichenGatewayFixture{db, gateway, provider, credential, binding, teacher}
+}
+
+func TestBeichenPostgresGatewayReconciliation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	f := newBeichenGatewayFixture(t, ctx)
+	db, gateway, store := f.db, f.gateway, f.gateway.usage
+	provider, credential, binding, teacher := f.provider, f.credential, f.binding, f.teacher
+	const gmModel = "fixture-gm1"
+	const trustedReceipt = "7482ba6e-0219-4a6a-b935-fde623e9baa5"
+	const forgedReceipt = "706d4cbe-fb65-4839-8f33-7ae5d878b8f6"
 	const outputChunk = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"
 	for _, tc := range []struct {
 		id, contentType, body, state, exact, monthly string

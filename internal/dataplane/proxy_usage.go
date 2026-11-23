@@ -169,6 +169,7 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 		started := time.Now()
 		var attemptID uuid.UUID
 		var writeObservation func() (time.Time, bool)
+		var cancelAttempt context.CancelFunc
 		if reservation != nil {
 			attempted.DefinitelyNotSent = true
 			attemptID, err = g.usage.StartAttempt(ctx, *reservation, attempted, quotaBudget)
@@ -187,7 +188,19 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 					break
 				}
 			}
-			request, writeObservation = traceUpstreamWrite(request, routed)
+			if north && beichenNonStreamingRequest(original, replay) {
+				if ctx.Err() != nil {
+					if request.Body != nil {
+						_ = request.Body.Close()
+					}
+					cleanup()
+					g.finishAttempt(ctx, attemptID, started, false, nil, category, message)
+					break
+				}
+				request, writeObservation, cancelAttempt = beichenHTTPAttempt(request, g.disconnectGrace)
+			} else {
+				request, writeObservation = traceUpstreamWrite(request, routed)
+			}
 		}
 		client := g.client
 		if north || routed {
@@ -198,6 +211,15 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 		}
 		response, err := client.Do(request)
 		cleanup()
+		if cancelAttempt != nil && err == nil {
+			// A routed response is final. Keep its context through the body read.
+			defer cancelAttempt()
+			if isSSEResponse(response) {
+				// Unexpected SSE must retain the original disconnect behavior.
+				stop := context.AfterFunc(ctx, cancelAttempt)
+				defer stop()
+			}
+		}
 		if reservation != nil && routed {
 			var connected bool
 			attempted.SentAt, connected = writeObservation()
@@ -207,6 +229,9 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 			}
 		}
 		if err != nil {
+			if cancelAttempt != nil {
+				cancelAttempt()
+			}
 			category, message = "connection", "Unable to connect to the upstream provider."
 			g.finishAttempt(ctx, attemptID, started, false, nil, category, message)
 			if routed && !attempted.DefinitelyNotSent {
@@ -256,7 +281,7 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 		if !north {
 			g.finishAttempt(ctx, attemptID, started, success, &status, "", "")
 		}
-		interrupted := g.proxyHTTPBody(w, original, response, candidate.Binding.Adapter, attempted, reservation, success, north, review)
+		interrupted := g.proxyHTTPBody(request.Context(), w, original, response, candidate.Binding.Adapter, attempted, reservation, success, north, review)
 		if north {
 			switch {
 			case interrupted:
@@ -276,6 +301,9 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, original *http.Request, repla
 		}
 		_ = g.finalizeCall(ctx, *reservation, false, category, message, attempted, usage.CallMetrics{State: state})
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	if rejection != nil {
 		writeModelCallRejection(w, original.URL.Path, rejection)
 		return
@@ -294,9 +322,9 @@ func isSSEResponse(response *http.Response) bool {
 	return strings.EqualFold(strings.TrimSpace(mediaType), "text/event-stream")
 }
 
-func (g *Gateway) proxyHTTPBody(w http.ResponseWriter, original *http.Request, response *http.Response, adapter modelbinding.Adapter, candidate usage.CallRoute, reservation *usage.Reservation, success, north bool, review string) bool {
+func (g *Gateway) proxyHTTPBody(attemptCtx context.Context, w http.ResponseWriter, original *http.Request, response *http.Response, adapter modelbinding.Adapter, candidate usage.CallRoute, reservation *usage.Reservation, success, north bool, review string) bool {
 	if reservation == nil {
-		_ = copyUpstreamResponse(w, response)
+		_ = copyUpstreamResponse(original.Context(), w, response)
 		return false
 	}
 	ctx := original.Context()
@@ -319,7 +347,7 @@ func (g *Gateway) proxyHTTPBody(w http.ResponseWriter, original *http.Request, r
 			io.Closer
 		}{Reader: io.MultiReader(bytes.NewReader(prefix), body), Closer: body}
 		switch {
-		case err != nil:
+		case err != nil || (north && attemptCtx.Err() != nil):
 			metrics.State, metrics.UsageReason = usage.UsageInterrupted, "response_interrupted"
 		case int64(len(prefix)) <= limit:
 			interrupted := false
@@ -332,7 +360,7 @@ func (g *Gateway) proxyHTTPBody(w http.ResponseWriter, original *http.Request, r
 			if north && adapter == modelbinding.AdapterOpenaiResponses {
 				payload := jsonObject(prefix)
 				status := rawString(payload["status"])
-				interrupted = status != "" && status != "completed" && !beichenResponsesOutputLimited(payload)
+				interrupted = (status != "" || ctx.Err() != nil) && status != "completed" && !beichenResponsesOutputLimited(payload)
 			}
 			metrics = parseJSONResponseMetrics(adapter, prefix).finished(interrupted)
 			if isCreation {
@@ -353,13 +381,15 @@ func (g *Gateway) proxyHTTPBody(w http.ResponseWriter, original *http.Request, r
 	}
 	if err := g.finalizeCall(ctx, *reservation, success, category, message, candidate, metrics); err != nil {
 		_ = response.Body.Close()
-		writeProtocolError(w, original.URL.Path, http.StatusServiceUnavailable, "server_error", "billing_unavailable", "Unable to finalize model usage.", "")
+		if ctx.Err() == nil {
+			writeProtocolError(w, original.URL.Path, http.StatusServiceUnavailable, "server_error", "billing_unavailable", "Unable to finalize model usage.", "")
+		}
 		return metrics.State == usage.UsageInterrupted
 	}
 	if resourceBody != nil {
 		g.rememberResourceRoute(ctx, resourceBody, resourceType, candidate.BindingID)
 	}
-	if err := copyUpstreamResponse(w, response); !north && metrics.State != usage.UsageInterrupted && (err != nil || ctx.Err() != nil) {
+	if err := copyUpstreamResponse(ctx, w, response); !north && metrics.State != usage.UsageInterrupted && (err != nil || ctx.Err() != nil) {
 		g.completeCallMetrics(ctx, reservation.CallID, usage.CallMetrics{State: usage.UsageInterrupted})
 	}
 	return metrics.State == usage.UsageInterrupted

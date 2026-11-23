@@ -500,7 +500,7 @@ func TestHTTPUsageLimitDoesNotTruncateResponse(t *testing.T) {
 	response := &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	w := httptest.NewRecorder()
-	gateway.proxyHTTPBody(w, request, response, candidate.Binding.Adapter, candidate.callRoute(), &reservation, true, false, "")
+	gateway.proxyHTTPBody(request.Context(), w, request, response, candidate.Binding.Adapter, candidate.callRoute(), &reservation, true, false, "")
 	if w.Code != http.StatusOK || w.Body.String() != body {
 		t.Fatalf("response status %d or length %d differs from upstream", w.Code, w.Body.Len())
 	}
@@ -532,7 +532,7 @@ func TestHTTPAndSSECanSettleAfterClientCancellation(t *testing.T) {
 				gateway.proxySSE(w, request, response, reservation, candidate.callRoute(), &observer, body, len(body), context.Canceled, false)
 			} else {
 				expectUsageWrite(mock, reservation.CallID, "", nil, nil, nil, usage.UsageInterrupted)
-				gateway.proxyHTTPBody(w, request, response, candidate.Binding.Adapter, candidate.callRoute(), &reservation, true, false, "")
+				gateway.proxyHTTPBody(request.Context(), w, request, response, candidate.Binding.Adapter, candidate.callRoute(), &reservation, true, false, "")
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatal(err)
