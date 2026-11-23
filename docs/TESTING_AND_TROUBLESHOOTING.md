@@ -213,6 +213,10 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 ### 北辰教师端用量、定价与对账
 
+「北辰对账」默认总计的下一页若返回 503，核对请求是否使用同一账期、口径和供应商。旧版把查询时刻写进游标，同一天的下一次请求也会失效。当前查询把截止固定在北京时间次日 00:00，换账期或跨过零点后从第一页刷新。页面上的「重试本页」会重新请求刚才失败的那一页。
+
+采价配置变更后，若停用渠道又导致后续账日缺同步，检查是否应用迁移 `0067`。在本机隔离测试库对照 `provider_credentials.retired_at` 和 `updated_at`，确认改采价配置只更新版本时间，停用当天继续计入覆盖要求。执行 `go test -p 1 ./internal/beichen -run 'Test(ReconciliationUnmatchedCursorPostgres|ReconciliationRetiredCredentialStopsExpectedDaysPostgres|SaveCredentialRetiredAtPostgres|ReconciliationPostgresVerifiedCallsRequireUnconflictedReceipt)$' -count=1` 可复查分页和停用行为。进入 `frontend` 执行 `npm run test -- --run BeichenReconcile`，复查账期切换、失败重试和严格视图的加载、错误及空态。
+
 #### 官网目录模型数少于网页渠道页
 
 打开「模型管理 → 北辰」，检查「官网目录」的最近完整读取时间，并展开具体模型的「目录来源与分组」。收到官网错误时，页面会保留已存的型号并提示待更新。官网有 Claude 但接替 Key 的目录没有时，核查该行的平台、分组和 CC1 新 Key，选择对应 Key 重扫。重扫成功后仍为零时，核对新 Key 的上游权限、分组和模型原名。出现多个近似名称时，可为正确的上游名称配置教师别名。

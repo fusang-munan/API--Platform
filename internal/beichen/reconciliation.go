@@ -201,7 +201,7 @@ selected_calls AS (
 )` + reconciliationSourcesSQL + `,
 credential_lifecycle AS (
  SELECT id, created_at, COALESCE(status,'active')='active' AS required,
-   (updated_at AT TIME ZONE 'Asia/Shanghai')::date AS retired_day
+   (retired_at AT TIME ZONE 'Asia/Shanghai')::date AS retired_day
  FROM provider_credentials WHERE provider_id = $1
 ), expected_days AS (
  SELECT c.id AS credential_id, d.day::date AS day
@@ -352,21 +352,14 @@ func readReconciliationPage(ctx context.Context, tx *sql.Tx, providerID uuid.UUI
 		startDay = period.Start.In(beijing).Format(dayLayout)
 	}
 	localNow := now.In(beijing)
-	// 尚未开始的未来账日不纳入对账。当天按日账同步标记判断覆盖。
-	coverageEnd := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, beijing).AddDate(0, 0, 1)
-	end := period.End.In(beijing)
-	if coverageEnd.Before(end) {
-		end = coverageEnd
-	}
-	endDay := time.Date(end.Year(), end.Month(), end.Day(), 0, 0, 0, 0, beijing)
-	if end.After(endDay) {
-		endDay = endDay.AddDate(0, 0, 1)
-	}
+	// 汇总和逐笔查询使用同一截止时间，游标在同一北京时间账日内有效。
+	end := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, beijing).AddDate(0, 0, 1)
+	period.End = end.UTC()
 	var report ReconciliationReport
 	readView := func(dates []string, view *ReconciliationView) error {
 		var raw []byte
-		err := tx.QueryRowContext(ctx, reconciliationSQL, providerID, period.Start, end.UTC(),
-			startDay, endDay.Format(dayLayout), localNow.Format(dayLayout), now.UTC(), dates).Scan(&raw)
+		err := tx.QueryRowContext(ctx, reconciliationSQL, providerID, period.Start, period.End,
+			startDay, end.Format(dayLayout), localNow.Format(dayLayout), now.UTC(), dates).Scan(&raw)
 		if err != nil {
 			return err
 		}
@@ -389,7 +382,7 @@ func readReconciliationPage(ctx context.Context, tx *sql.Tx, providerID uuid.UUI
 	if scope == unmatchedScopeComparable {
 		dates = report.Coverage.EligibleDates
 	}
-	page, err := readUnmatchedUpstream(ctx, tx, providerID, period.Start, end, dates, scope, cursor)
+	page, err := readUnmatchedUpstream(ctx, tx, providerID, period.Start, period.End, dates, scope, cursor)
 	if err != nil {
 		return report, err
 	}

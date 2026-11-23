@@ -18,6 +18,12 @@ import (
 
 func reportTestTransaction(t *testing.T) (context.Context, *sql.Tx) {
 	t.Helper()
+	ctx, _, tx := reportTestSetup(t)
+	return ctx, tx
+}
+
+func reportTestSetup(t *testing.T) (context.Context, *sql.DB, *sql.Tx) {
+	t.Helper()
 	dsn := os.Getenv("NEBULA_TEST_POSTGRES")
 	if dsn == "" {
 		t.Skip("需要隔离的本机 nebula_test PostgreSQL")
@@ -31,13 +37,21 @@ func reportTestTransaction(t *testing.T) (context.Context, *sql.Tx) {
 	t.Cleanup(cancel)
 	db := stdlib.OpenDB(*config)
 	t.Cleanup(func() { _ = db.Close() })
-	tx, err := db.BeginTx(ctx, nil)
+	schema := pgx.Identifier{"beichen_reports_" + uuid.NewString()}.Sanitize()
+	execTestSQL(t, ctx, db, "CREATE SCHEMA "+schema)
+	t.Cleanup(func() {
+		if _, err := db.ExecContext(context.Background(), "DROP SCHEMA "+schema+" CASCADE"); err != nil {
+			t.Error(err)
+		}
+	})
+	config.RuntimeParams["search_path"] = schema + ",public"
+	isolated := stdlib.OpenDB(*config)
+	t.Cleanup(func() { _ = isolated.Close() })
+	tx, err := isolated.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = tx.Rollback() })
-	schema := pgx.Identifier{"beichen_reports_" + uuid.NewString()}.Sanitize()
-	execTestSQL(t, ctx, tx, "CREATE SCHEMA "+schema+"; SET LOCAL search_path TO "+schema)
 	execTestSQL(t, ctx, tx, `
 CREATE TABLE providers(id uuid PRIMARY KEY, base_url text NOT NULL);
 CREATE TABLE provider_credentials(id uuid PRIMARY KEY, provider_id uuid NOT NULL, label text, created_at timestamptz NOT NULL);
@@ -57,7 +71,7 @@ CREATE TABLE gateway_calls(
 		t.Fatal(err)
 	}
 	execTestSQL(t, ctx, tx, string(migration))
-	return ctx, tx
+	return ctx, isolated, tx
 }
 
 type reportCallFixture struct {

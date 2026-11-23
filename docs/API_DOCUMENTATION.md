@@ -587,7 +587,9 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `base_credits` 是已记账的基础积分，`expected_credits` 是可追溯到独立计价的基础积分，`actual_credits` 是唯一匹配的北辰回执实扣乘 100。`difference_credits` 等于独立计价减回执实扣积分，`base_difference_credits` 等于已记账基础积分减回执实扣积分。缺少任一依据时，对应差额为 `null`。学校系数、学生实扣、学校承担、档位及价格版本随逐笔记录返回。已用回执实扣补记的跟随价行只有 `base_credits`，独立计价为空。此接口的逐笔差额使用通过校验的回执，区间利润仍以完整日账为依据。
 
-区间对账响应为 `{range,start,end,timezone,coverage,totals,models,keys}`：
+区间对账的 `end` 固定为北京时间次日 00:00，汇总与未关联流水均排除该时刻及之后的数据。`range=all` 的 `start` 为 `null`，其他范围从对应起点开始。
+
+`unmatched_scope` 默认为 `observed`。传入 `comparable` 时只返回 `coverage.eligible_dates` 内的流水，非法口径返回 422。第一页省略 `unmatched_cursor`，后续页传回 `unmatched_next_cursor`，并沿用供应商、范围及口径。跨北京时间零点或严格视图的入选日期变化后，从第一页重新查询。
 
 | 对账字段 | 内容 |
 | --- | --- |
@@ -598,12 +600,15 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 | `keys[]` | 按供应商凭据聚合的 `credential_id`、`label`、`local`、`upstream`、金额、占比；不是学生的学校 API Key，已删除渠道的标签可空，历史账单仍保留 |
 | `models[].match_status` / `keys[].match_status` | `matched`、`local_only`、`upstream_only`，表示该分组两侧是否有记录，不表示逐笔账单已全部核对成功 |
 | `coverage` | `days_expected`、`days_present`（按“渠道 × 账日”计数）、去重 `missing_days` 日期数组和逐渠道 `credentials[]`。`key_usage_days`、`key_usage_model_days`、`stale_key_usage_days` 分别记录使用网页 Key 账日数、附有已核对模型实付的账日数、沿用陈旧快照的账日数。另含 `pending_calls`、`unpriced_calls` 和 `multiplier_mixed`。 |
+| `coverage.eligible_dates` / `comparable_only` | 已结束、同步完整且有可比较实扣金额的账日，以及这些日期的汇总。没有可比日期时汇总字段为 `null`。 |
+| `unmatched_upstream` | 每页最多 50 条未取得已验证扣款关联的归档流水。`local_source=unique_claim` 表示有唯一认领，`local_status` 提供可读取的本地状态。认领可在回执明细缺失时单独显示，此时 `receipt_id` 为空。 |
+| `unmatched_total` / `unmatched_next_cursor` / `unmatched_scope` | 当前口径的流水总数、下一页游标和当前口径。末页游标为 `null`。 |
 
 本地侧与学校用量使用同一归属和 Token 口径。每个渠道账日依次选用人工导入、确认完整的长期归档流水和官网单 Key 快照，归档标记 `website_receipts`，近期快照标记 `key_usage`。历史归档可独立确认账日，核对范围包括已停用渠道。账日是否完整取决于官网核对结果。日和模型实付均汇总网页流水的 `actual_cost`。明确回报的零提供 `"0"`，缺失金额或混合单位的总金额为 `null`。按模型和按渠道分别合并两侧，保留仅一侧存在的记录。`estimated_micros` 需要完整报价和用量。
 
 学校金额按 **100 积分 = 1 元** 换算。`student_yuan` 取已扣积分乘 0.01，`base_yuan` 取保存的基础积分或按该笔学校系数反推后的折算值。`actual_yuan` 适用于同为 CNY 的上游金额或沿用旧日账口径的数据。金额差额需要完整日账、同一金额单位及未陈旧的实扣。USD 等原单位通过 `unit` 返回，`actual_yuan`、`margin_yuan`、`margin_rate` 为空。`local_share` / `upstream_share` 分别是模型或渠道 Token 占对应侧总 Token 的 0 至 1 十进制字符串，总 Token 为零时为 `"0"`。
 
-覆盖范围从每条当前供应商凭据的北京时间创建日与所选区间起点较晚者开始，截止到区间结束或北京时间今天（包含今天）较早者；尚未开始的未来账日不算缺失。`beichen_usage_days` 中明确确认的空账日也算已同步。`missing_days` 按日期排序且去重，`credentials[]` 给出各渠道的 `credential_id`、`label`、`expected_days`、`synced_days`、`missing_days`，可定位同一天缺哪条渠道。`unpriced_calls` 是已扣款但未保存基础积分的调用数，`multiplier_mixed` 表示范围内出现过不同学校系数。尚未整日确认的今天可能显示缺失，日账覆盖不等同于分钟级流水扫描进度。
+覆盖范围从每条当前供应商凭据的北京时间创建日与所选区间起点较晚者开始。在用渠道要求同步至今天，停用渠道要求同步至停用当天，两者均含当天。`beichen_usage_days` 中明确确认的空账日也算已同步。`missing_days` 按日期排序且去重，`credentials[]` 给出各渠道的 `credential_id`、`label`、`expected_days`、`synced_days`、`missing_days`，可定位同一天缺哪条渠道。`unpriced_calls` 是已扣款但未保存基础积分的调用数，`multiplier_mixed` 表示范围内出现过不同学校系数。尚未整日确认的今天可能显示缺失，日账覆盖不等同于分钟级流水扫描进度。
 
 #### Key 网页核对
 

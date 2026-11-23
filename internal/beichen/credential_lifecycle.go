@@ -47,8 +47,9 @@ func (s *Service) SaveCredential(ctx context.Context, providerID, credentialID u
 			return nil, unavailable("生成北辰凭据编号失败", err)
 		}
 		err = tx.QueryRowContext(ctx, `
-INSERT INTO provider_credentials(id,provider_id,label,group_hint,credential_ciphertext,status,created_at,updated_at)
-VALUES($1,$2,$3,NULLIF($4::text,''),$5,$6,statement_timestamp(),statement_timestamp())
+INSERT INTO provider_credentials(id,provider_id,label,group_hint,credential_ciphertext,status,created_at,updated_at,retired_at)
+VALUES($1,$2,$3,NULLIF($4::text,''),$5,$6::text,statement_timestamp(),statement_timestamp(),
+ CASE WHEN $6::text<>'active' THEN statement_timestamp() END)
 RETURNING id,label,group_hint,status,created_at,updated_at,credential_ciphertext`,
 			credentialID, providerID, edit.Label, edit.GroupHint, edit.Ciphertext, edit.Status).Scan(values...)
 	} else {
@@ -65,6 +66,10 @@ SELECT status FROM provider_credentials WHERE id=$1 AND provider_id=$2 FOR NO KE
 UPDATE provider_credentials SET label=COALESCE($3::citext,label),
  group_hint=CASE WHEN $4::text IS NULL THEN group_hint ELSE NULLIF($4::text,'') END,
  status=COALESCE($5::text,status),
+ retired_at=CASE
+   WHEN COALESCE($5::text,status)='active' THEN NULL
+   WHEN status='active' THEN clock_timestamp()
+   ELSE retired_at END,
  updated_at=CASE WHEN COALESCE($5::text,status)<>status THEN clock_timestamp() ELSE updated_at END
 WHERE id=$1 AND provider_id=$2
 RETURNING id,label,group_hint,status,created_at,updated_at,credential_ciphertext`,
