@@ -8,6 +8,7 @@ import EmptyState from '../../components/EmptyState.vue'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { formatPercent, formatTokens, shiftDecimal } from '../../utils/credits'
 import { calculateCredits, fullTime, quotaBalance, schoolMonth, statusLabel } from '../../utils/format'
+import { summarizeStudentModels, type StudentModelUsageRow } from '../../utils/studentUsage'
 
 type UsageRange = 'day' | 'month' | 'all'
 type RecentRange = 'today' | 'month' | 'all'
@@ -190,9 +191,11 @@ const modelRows = computed<ModelRow[]>(() => {
   return rows
 })
 
+const modelSummaryRows = computed(() => summarizeStudentModels(usage.value?.projects ?? []))
+
 const rangeNote = computed(() => range.value === 'month'
   ? ''
-  : `学生用量接口当前只返回本月汇总；「${selectedRange.value.label}」范围暂未接入，积分、Token 与缓存命中率显示为「—」。`)
+  : `学生用量接口当前只返回本月汇总；「${selectedRange.value.label}」范围暂未接入，积分、调用次数、Token 与缓存命中率显示为「—」。`)
 
 function modelCredits(row: ModelRow) {
   return range.value === 'month' ? creditText(row.model.credits) : '—'
@@ -212,7 +215,7 @@ function modelCacheHitRate(row: ModelRow) {
 }
 
 function modelCalls(row: ModelRow) {
-  return range.value === 'month' && row.model.calls != null ? `${formatTokens(row.model.calls)} 次` : '—'
+  return range.value === 'month' ? `${formatTokens(row.model.calls ?? 0)} 次` : '—'
 }
 
 function modelDetail(row: ModelRow) {
@@ -220,8 +223,27 @@ function modelDetail(row: ModelRow) {
     row.modelId && row.modelId !== row.modelName ? row.modelId : '',
     row.projectName,
     row.keyName,
-    modelCalls(row),
   ].filter(Boolean).join(' · ')
+}
+
+function summaryCredits(row: StudentModelUsageRow) {
+  return range.value === 'month' ? creditText(row.credits) : '—'
+}
+
+function summaryCalls(row: StudentModelUsageRow) {
+  return range.value === 'month' ? `${formatTokens(row.calls)} 次` : '—'
+}
+
+function summaryTokens(row: StudentModelUsageRow) {
+  return range.value === 'month' ? formatTokens(row.tokens) : '—'
+}
+
+function summaryCacheHitRate(row: StudentModelUsageRow) {
+  return range.value === 'month' ? formatPercent(row.cacheHitRate, 1) : '—'
+}
+
+function summaryNote(row: StudentModelUsageRow) {
+  return range.value === 'month' && row.zeroCost ? '0 积分但有调用（未结算/待核或免费）' : '—'
 }
 
 const billingStateLabels: Record<string, string> = {
@@ -361,6 +383,41 @@ onMounted(() => { void loadRecent(true) })
         </div>
       </div>
       <p v-if="rangeNote" class="beichen-note" role="status">{{ rangeNote }}</p>
+
+      <h3 class="student-model-subhead">按模型合计</h3>
+      <p class="muted student-model-hint">同一模型跨项目、跨 Key 合并；在途/待核按 Key 汇总，尚未分摊到模型。</p>
+      <div v-if="modelSummaryRows.length" class="beichen-table-wrap">
+        <table class="beichen-table student-model-summary-table" data-testid="student-model-summary">
+          <caption class="sr-only">{{ selectedRange.label }}按模型合计</caption>
+          <thead>
+            <tr>
+              <th scope="col">模型</th>
+              <th scope="col" class="numeric-cell">已扣积分</th>
+              <th scope="col" class="numeric-cell">调用次数</th>
+              <th scope="col" class="numeric-cell">Token</th>
+              <th scope="col" class="numeric-cell">缓存命中率</th>
+              <th scope="col">说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in modelSummaryRows" :key="row.id">
+              <th scope="row">
+                <strong>{{ row.name }}</strong>
+                <small v-if="row.name !== row.id">{{ row.id }}</small>
+              </th>
+              <td class="numeric-cell" data-label="已扣积分">{{ summaryCredits(row) }}</td>
+              <td class="numeric-cell" data-label="调用次数">{{ summaryCalls(row) }}</td>
+              <td class="numeric-cell" data-label="Token">{{ summaryTokens(row) }}</td>
+              <td class="numeric-cell" data-label="缓存命中率">{{ summaryCacheHitRate(row) }}</td>
+              <td data-label="说明">{{ summaryNote(row) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <EmptyState v-else-if="loaded" title="所选范围暂无模型用量" />
+      <p v-else class="muted" role="status">正在加载模型用量…</p>
+
+      <h3 class="student-model-subhead">按 Key 明细</h3>
       <div v-if="modelRows.length" class="beichen-table-wrap">
         <table class="beichen-table student-model-table">
           <caption class="sr-only">{{ selectedRange.label }}按模型用量</caption>
@@ -368,6 +425,7 @@ onMounted(() => { void loadRecent(true) })
             <tr>
               <th scope="col">模型</th>
               <th scope="col" class="numeric-cell">积分</th>
+              <th scope="col" class="numeric-cell">调用次数</th>
               <th scope="col" class="numeric-cell">Token</th>
               <th scope="col" class="numeric-cell">缓存命中率</th>
             </tr>
@@ -379,14 +437,14 @@ onMounted(() => { void loadRecent(true) })
                 <small>{{ modelDetail(row) }}</small>
               </th>
               <td class="numeric-cell" data-label="积分">{{ modelCredits(row) }}</td>
+              <td class="numeric-cell" data-label="调用次数">{{ modelCalls(row) }}</td>
               <td class="numeric-cell" data-label="Token">{{ modelTokens(row) }}</td>
               <td class="numeric-cell" data-label="缓存命中率">{{ modelCacheHitRate(row) }}</td>
             </tr>
           </tbody>
         </table>
       </div>
-      <EmptyState v-else-if="loaded" title="所选范围暂无模型用量" />
-      <p v-else class="muted" role="status">正在加载模型用量…</p>
+      <EmptyState v-else-if="loaded && modelSummaryRows.length" title="所选范围暂无按 Key 明细" />
     </section>
 
     <section class="panel student-recent-panel">
@@ -530,7 +588,7 @@ onMounted(() => { void loadRecent(true) })
               <strong>{{ key.name }}</strong>
               <span class="muted">{{ statusLabel(key.status) }} · 学校已用 {{ key.used }} 积分 · 在途 {{ key.pending }}<template v-if="key.pending_review"> · 有调用待核账</template></span>
               <ul v-if="key.models.length" class="key-models">
-                <li v-for="model in key.models" :key="model.id">{{ model.name }} · 学校已用 {{ model.credits }} 积分</li>
+                <li v-for="model in key.models" :key="model.id">{{ model.name }} · 学校已用 {{ model.credits }} 积分 · {{ formatTokens(model.calls ?? 0) }} 次</li>
               </ul>
             </article>
           </section>
@@ -557,21 +615,34 @@ onMounted(() => { void loadRecent(true) })
   overflow-wrap: anywhere;
 }
 
-.student-model-table th small {
+.student-model-subhead {
+  margin: 8px 0 0;
+  font-size: 14px;
+}
+
+.student-model-hint {
+  margin: 0;
+}
+
+.student-model-table th small,
+.student-model-summary-table th small {
   display: block;
   margin-top: 4px;
   color: var(--ink-soft);
   font-size: 11px;
   font-weight: 400;
   line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
-.student-model-table th[scope="row"] {
+.student-model-table th[scope="row"],
+.student-model-summary-table th[scope="row"] {
   min-width: 0;
   overflow-wrap: anywhere;
 }
 
 .student-model-table td[data-label],
+.student-model-summary-table td[data-label],
 .student-recent-table td[data-label],
 .student-call-table td[data-label] {
   overflow-wrap: anywhere;
@@ -630,6 +701,7 @@ onMounted(() => { void loadRecent(true) })
 
 @media (max-width: 900px) {
   .student-model-table tbody tr,
+  .student-model-summary-table tbody tr,
   .student-recent-table tbody tr,
   .student-call-table tbody tr {
     display: grid;
@@ -639,6 +711,7 @@ onMounted(() => { void loadRecent(true) })
   }
 
   .student-model-table tbody th,
+  .student-model-summary-table tbody th,
   .student-recent-table tbody th,
   .student-call-table td[colspan] {
     grid-column: 1 / -1;
@@ -646,6 +719,8 @@ onMounted(() => { void loadRecent(true) })
 
   .student-model-table th,
   .student-model-table td,
+  .student-model-summary-table th,
+  .student-model-summary-table td,
   .student-recent-table th,
   .student-recent-table td,
   .student-call-table th,
@@ -654,6 +729,7 @@ onMounted(() => { void loadRecent(true) })
   }
 
   .student-model-table td[data-label]::before,
+  .student-model-summary-table td[data-label]::before,
   .student-recent-table td[data-label]::before,
   .student-call-table td[data-label]::before {
     content: attr(data-label);
@@ -663,6 +739,7 @@ onMounted(() => { void loadRecent(true) })
   }
 
   .student-model-table .numeric-cell,
+  .student-model-summary-table .numeric-cell,
   .student-recent-table .numeric-cell,
   .student-call-table .numeric-cell {
     text-align: left;

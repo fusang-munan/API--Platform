@@ -466,7 +466,7 @@ describe('StudentModels usage without prices', () => {
     await flushPromises()
 
     const card = wrapper.get('[data-model="gpt-5.3-codex"]')
-    expect(card.get('[data-testid="model-used"]').text()).toBe('本月已用 12.5 积分')
+    expect(card.get('[data-testid="model-used"]').text()).toBe('本月已用 12.5 积分 · 3 次')
     expect(card.get('[data-testid="model-balance"]').text()).toBe('余额 185 积分')
     expect(wrapper.get('[data-testid="credit-rate-note"]').text()).toBe('100 积分 = 1 元；金额统一用积分显示。')
     expect(wrapper.text()).not.toContain('点/次')
@@ -475,15 +475,53 @@ describe('StudentModels usage without prices', () => {
     wrapper.unmount()
   })
 
-  it('shows 本月未使用 when the usage response has no row for the model', async () => {
+  it('shows zero credits and zero calls when the usage response has no row for the model', async () => {
     vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([fixture.model('gpt-5.3-codex', false)])] as never)
     const wrapper = mountPage()
     await flushPromises()
 
     const card = wrapper.get('[data-model="gpt-5.3-codex"]')
-    expect(card.get('[data-testid="model-used"]').text()).toBe('本月未使用')
+    expect(card.get('[data-testid="model-used"]').text()).toBe('本月 0.000 积分 · 0 次')
     expect(card.get('[data-testid="model-balance"]').text()).toBe('余额 —')
-    expect(card.text()).not.toContain('0 积分')
+    expect(card.text()).not.toContain('本月 0 积分 ·')
+    wrapper.unmount()
+  })
+
+  it('shows zero charged credits with calls instead of calling the model unused', async () => {
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([fixture.model('gpt-5.3-codex', false)])] as never)
+    vi.mocked(studentAPI.usage).mockResolvedValueOnce({
+      month: '2026-11',
+      projects: [{
+        project_id: 'project', project_name: 'Project', quota: '200.000', used: '0.000', pending: '0.000', available: '200.000',
+        keys: [{
+          id: 'key-1', name: '我的 Key', status: 'active', used: '0.000', pending: '0.000', available: '200.000',
+          models: [{ id: 'gpt-5.3-codex', name: 'gpt-5.3-codex', credits: '0.000', calls: 3 }],
+        }],
+      }],
+    } as never)
+    const wrapper = mountPage()
+    await flushPromises()
+
+    expect(wrapper.get('[data-model="gpt-5.3-codex"] [data-testid="model-used"]').text())
+      .toBe('本月 0 积分 · 3 次（未结算/待核或免费）')
+    wrapper.unmount()
+  })
+
+  it('shows pending credits that are not allocated to a model yet', async () => {
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([fixture.model('gpt-5.3-codex', false)])] as never)
+    vi.mocked(studentAPI.usage).mockResolvedValueOnce({
+      month: '2026-11',
+      projects: [
+        { project_id: 'p1', project_name: 'P1', quota: '10.000', used: '0.000', pending: '1.250', available: '8.750', keys: [] },
+        { project_id: 'p2', project_name: 'P2', quota: '10.000', used: '0.000', pending: '0.500', available: '9.500', keys: [] },
+      ],
+    } as never)
+    const wrapper = mountPage()
+    await flushPromises()
+
+    const note = wrapper.get('[data-testid="usage-pending-note"]')
+    expect(note.text()).toContain('有 1.75 积分在途/待核，尚未分摊到具体模型')
+    expect(wrapper.text()).not.toContain('本月未使用')
     wrapper.unmount()
   })
 })

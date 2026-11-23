@@ -9,6 +9,7 @@ import { sortModelsByRecency } from '../../utils/modelSort'
 import { filterStudentModels } from '../../utils/studentModels'
 import { catalogProviderLabel, modelDescriptionText, modelProviderLabel } from '../../utils/modelPlazaDisplay'
 import { formatCredits } from '../../utils/credits'
+import { formatStudentModelUsage, summarizeStudentModels, sumPendingCredits } from '../../utils/studentUsage'
 import { calculateCredits } from '../../utils/format'
 import StatusBadge from '../../components/StatusBadge.vue'
 import EmptyState from '../../components/EmptyState.vue'
@@ -169,21 +170,10 @@ const availableCredits = computed(() => {
 const balanceText = computed(() => usageLoaded.value && availableCredits.value != null
   ? `${formatCredits(availableCredits.value)} 积分`
   : '—')
-const usedCreditsByModel = computed(() => {
-  const totals = new Map<string, string>()
-  for (const project of usage.value?.projects ?? []) {
-    for (const key of project.keys ?? []) {
-      for (const model of key.models ?? []) {
-        const modelID = modelKey(model.id || model.name || '')
-        const credits = String(model.credits ?? '').trim()
-        if (!modelID || !/^\d+(?:\.\d+)?$/.test(credits)) continue
-        const previous = totals.get(modelID)
-        totals.set(modelID, previous ? calculateCredits(previous, credits, 'add') : credits)
-      }
-    }
-  }
-  return totals
-})
+const modelUsageRows = computed(() => summarizeStudentModels(usage.value?.projects ?? []))
+const modelUsageByID = computed(() => new Map(modelUsageRows.value.map(row => [row.id.toLowerCase(), row])))
+const pendingCredits = computed(() => sumPendingCredits(usage.value?.projects ?? []))
+const hasPendingCredits = computed(() => usageLoaded.value && pendingCredits.value !== '0.000')
 const protocolOptions = BINDING_ADAPTER_OPTIONS.filter(item =>
   ['openai_compatible', 'openai_responses', 'anthropic', 'google_gemini_v1beta'].includes(item.value))
 const selectedProtocolLabel = computed(() => protocol.value ? protocolMeta(protocol.value).label : '')
@@ -192,9 +182,7 @@ const busy = computed(() => Boolean(syncingModelID.value || removingModelID.valu
 function modelUsageLabel(modelID: string) {
   if (usageFailed.value) return '用量暂不可用'
   if (!usageLoaded.value) return '用量读取中…'
-  const credits = usedCreditsByModel.value.get(modelKey(modelID))
-  if (!credits || Number(credits) <= 0) return '本月未使用'
-  return `本月已用 ${formatCredits(credits)} 积分`
+  return formatStudentModelUsage(modelUsageByID.value.get(modelKey(modelID)))
 }
 
 function studentSafeReason(reason: string, fallback: string) {
@@ -751,12 +739,16 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
         <h1>模型广场</h1>
         <p class="muted">挑一个可用模型，直接加入当前 Key；个人模型库不再作为授权门槛。</p>
         <p class="muted" data-testid="credit-rate-note">100 积分 = 1 元；金额统一用积分显示。</p>
+        <p class="muted" data-testid="usage-scope-note">卡片上的本月用量只统计已成功结算的调用；在途/待核按项目汇总，尚未分摊到具体模型。</p>
       </div>
       <button class="button primary" :disabled="!currentKey" @click="openAdd">检索添加</button>
     </div>
     <p v-if="error" class="error banner">{{ error }}</p>
     <p v-if="actionError && !addOpen" class="error banner" role="alert">{{ actionError }}</p>
     <p v-if="actionNotice && !addOpen" class="notice banner" role="status">{{ actionNotice }}</p>
+    <p v-if="hasPendingCredits" class="notice banner usage-pending-note" data-testid="usage-pending-note" role="status">
+      有 {{ formatCredits(pendingCredits) }} 积分在途/待核，尚未分摊到具体模型。
+    </p>
 
     <section class="panel key-context">
       <template v-if="currentKey">
@@ -863,7 +855,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
                 <dl v-if="expanded === model.model_id">
                   <dt>模型名</dt><dd>{{ model.model_id }}</dd>
                   <dt>中转厂商</dt><dd>{{ modelProviderLabel(model) }}</dd>
-                  <dt>本月已用</dt><dd>{{ modelUsageLabel(model.model_id) }}</dd>
+                  <dt>本月用量</dt><dd>{{ modelUsageLabel(model.model_id) }}</dd>
                   <dt>余额</dt><dd>{{ balanceText }}</dd>
                   <dt>支持协议</dt><dd>
                     <template v-if="protocolsFor(model).length">
@@ -904,7 +896,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
           <div class="model-table-head">
             <span>模型名</span>
             <span>中转厂商</span>
-            <span>本月已用</span>
+            <span>本月用量</span>
             <span>协议</span>
             <span>当前 Key</span>
             <span />
@@ -948,6 +940,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
 .key-context-head label { flex: 1 1 320px; }
 .key-context-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .notice.banner { border-color: #f0c987; background: #fff8eb; color: #7a4a00; }
+.usage-pending-note { margin: 0; }
 .plaza-layout { display: grid; gap: 20px; }
 .plaza-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
 .plaza-heading h2 { margin: 0; font-size: 18px; }
