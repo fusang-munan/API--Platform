@@ -348,9 +348,11 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 `NEBULA_PENDING_AUTO_SETTLE` 默认 `1`。成功且无其他待核原因的调用，先使用现有定价。缓存分项导致金额仍不确定时，以派发凭据、模型和时间查询 `beichen_price_at`，将四项有效上游费率乘以 `10^-12` 换算为元/Token。`NEBULA_PENDING_AUTO_SETTLE_YUAN` 默认 `0.001`，`NEBULA_PENDING_AUTO_SETTLE_RELATIVE` 默认 `0.01`。绝对宽度或相对于金额下界的宽度满足阈值即可进入试算；下界为零时仅使用绝对阈值。
 
-已扣调用的 `pricing_detail` 保留原有价格明细，并附加 `auto_settled=true`、`min_yuan`、`max_yuan`、`recommended_yuan`（均为上游元）、`recommended_read_tokens`、`recommended_write_tokens`、`prior_read_share` 和 `policy_version=pending-audit-v1`。推荐分项仅用于定价，调用行保留上游观测。先验用派发前 30 天内同学生、同 `model_name`、同协议已扣调用的 Token 加权比例，Anthropic 用缓存读除以普通输入、缓存读和缓存写之和，OpenAI 用缓存读除以输入。有效比例限制在 0.05 至 0.95，无有效样本用 0.5。
+已扣调用的 `pricing_detail` 保留原有价格明细，并附加 `auto_settled=true`、`min_yuan`、`max_yuan`、`recommended_yuan`（均为上游元）、`recommended_read_tokens`、`recommended_write_tokens`、`prior_read_share` 和 `policy_version=pending-audit-v1`。推荐分项仅用于定价，调用行保留上游观测。先验用派发前 30 天内同学生、同 `model_id`、同协议且当时已扣款的 Token 加权比例。模型改显示名后仍共用历史。Anthropic 用缓存读除以普通输入、缓存读和缓存写之和，OpenAI 用缓存读除以输入。有效比例限制在 0.05 至 0.95，无有效样本用 0.5。
 
-试算使用原扣款函数，事务内校验学生精确扣款不超过 `max_yuan × 100 × (multiplier_milli / 1000) × beichen_school_multiplier`。倍率无法确定时合计按 2 倍换算，明确保存的零倍率仍按零计算。如仍待核，有上界时将换算值向上取整并限制为 1 至 1000 **整积分**，无上界时保留已有预留。确认扣款或释放时清零。关闭开关恢复原定价和预留，不追溯改写历史账。
+试算以 `max_yuan × 100 × COALESCE(beichen_school_multiplier, 2)` 为学生积分上界。派发报价已含北辰分组倍率。自动定价候选超过上界 `1e-9` 积分以上则待核，容差内最多扣到上界，月桶按实际学生扣款更新。已有教师价和唯一金额路径保持业务优先级，包括 `estimated_unique_amount`。Gemini 仍待核，不自动结算。
+
+结束事务先锁学生行，再锁调用行，单独查询同学生其他待核行之和，得到剩余额度。默认预留、重放和上界预留均截到剩余额度，额度用完只挂待核状态、预留 0。已知上界先向上取整并限制在 1 至 1000 整积分。`NEBULA_UNRESOLVED_EXPOSURE=0` 将准入回退到旧的每学生待核笔数限制（默认 20），同时停用分项试算。仅 `NEBULA_PENDING_AUTO_SETTLE=0` 时保留新金额准入和上界预留。两种切换均只作用于之后的处理。
 
 迁移 0049 为 `gateway_calls.usage_state` 增加 `partial`，用 `usage_reason` 保存网关无法确认完整用量的原因，用 `tool_prompt_tokens` 保存 Gemini 单列的工具提示计数。网关用量字段可空，明确上报的零单独保存。账务待核原因记录在 `beichen_review_reason`。区间与逐笔查询按已有原始分项读取历史数据，迁移无需重写历史调用或金额。
 

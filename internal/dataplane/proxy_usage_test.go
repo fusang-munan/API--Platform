@@ -176,6 +176,8 @@ func expectProxyReservationReleased(mock sqlmock.Sqlmock, candidate route, reser
 }
 
 func expectLegacyLedgerLock(mock sqlmock.Sqlmock, callID uuid.UUID) {
+	mock.ExpectExec("SELECT id FROM users .*FOR NO KEY UPDATE").WithArgs(callID, false).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT beichen_state IS NOT NULL.*FOR UPDATE").WithArgs(callID).
 		WillReturnRows(sqlmock.NewRows([]string{"routed", "pending", "expired"}).AddRow(false, true, false))
 }

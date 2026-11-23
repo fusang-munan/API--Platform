@@ -24,7 +24,7 @@ type pendingAuditBooking struct {
 // CanAuditBeichenSplit admits terminal cache allocation gaps. Parser conflicts,
 // interrupted streams and request/model review categories retain their own handling.
 func (m CallMetrics) CanAuditBeichenSplit() bool {
-	if m.State != UsagePartial || strings.TrimSpace(os.Getenv("NEBULA_PENDING_AUTO_SETTLE")) == "0" {
+	if m.State != UsagePartial || !unresolvedExposureEnabled() {
 		return false
 	}
 	switch m.UsageReason {
@@ -42,7 +42,7 @@ func pendingThreshold(name string, fallback float64) float64 {
 	return v
 }
 
-func auditPendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, protocol string, metrics CallMetrics) error {
+func auditPendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, protocol string, metrics CallMetrics, headroom int64) error {
 	in := pendingaudit.Input{
 		Protocol: protocol, PromptTokens: metrics.PromptTokens, CompletionTokens: metrics.CompletionTokens,
 		TotalTokens: metrics.TotalTokens, CacheReadTokens: metrics.CacheHitTokens, CacheWriteTokens: metrics.CacheWriteTokens,
@@ -58,7 +58,7 @@ func auditPendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, proto
 		CROSS JOIN LATERAL (
 			SELECT sum(g.cache_hit_tokens)::numeric / nullif(sum(CASE WHEN g.protocol='anthropic'
 				THEN g.prompt_tokens::numeric+g.cache_hit_tokens+g.cache_write_tokens ELSE g.prompt_tokens END),0) AS share
-			FROM gateway_calls g WHERE g.user_id=c.user_id AND g.model_name=c.model_name AND g.protocol=c.protocol
+			FROM gateway_calls g WHERE g.user_id=c.user_id AND g.model_id=c.model_id AND g.protocol=c.protocol
 				AND g.billing_state='charged' AND g.created_at >= c.beichen_price_at - interval '30 days'
 				AND g.created_at < c.beichen_price_at AND COALESCE(g.finalized_at,g.created_at) <= c.beichen_price_at
 				AND g.prompt_tokens IS NOT NULL AND g.cache_hit_tokens IS NOT NULL
@@ -77,16 +77,16 @@ func auditPendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, proto
 
 	var booking pendingAuditBooking
 	err = tx.QueryRowContext(ctx, `WITH bound AS (
-		SELECT $2::numeric*100*COALESCE(multiplier_milli*0.001*beichen_school_multiplier,2)
+		SELECT $2::numeric*100*COALESCE(beichen_school_multiplier,2)
 			AS credits FROM gateway_calls WHERE id=$1
 	)
-	UPDATE gateway_calls SET unresolved_credit_milli=LEAST(1000,GREATEST(1,ceil(bound.credits)))::bigint
+	UPDATE gateway_calls SET unresolved_credit_milli=LEAST($3::bigint,1000,GREATEST(1,ceil(bound.credits)))::bigint
 	FROM bound WHERE id=$1 AND beichen_state='pending_review' RETURNING bound.credits::text`,
-		callID, strconv.FormatFloat(result.MaxYuan, 'g', -1, 64)).Scan(&booking.maxCredits)
+		callID, strconv.FormatFloat(result.MaxYuan, 'g', -1, 64), headroom).Scan(&booking.maxCredits)
 	if err != nil {
 		return err
 	}
-	if !result.CanAutoSettle {
+	if !result.CanAutoSettle || strings.TrimSpace(os.Getenv("NEBULA_PENDING_AUTO_SETTLE")) == "0" {
 		return refreshLedgerTurn(ctx, tx, callID, "0", false)
 	}
 	adjusted := metrics

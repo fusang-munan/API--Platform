@@ -719,19 +719,21 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 网关按模型倍率执行月度 credit 额度检查与调用记录；目录查询、视频状态查询和内容下载不计费。
 
-模型调用在受理和向上游发出前均检查学生额度。同一学生的所有 Key 共用待核金额上限。已有待核记录的 `unresolved_credit_milli` 合计加上本笔预留，达到或超过上限时返回 HTTP 429，响应头 `X-Nebula-Error-Code` 为 `unresolved_exposure_limit`。旧码 `pending_review_limit` 保留兼容。已达并发限制时优先返回 HTTP 429 和 `student_concurrency_exceeded`。
+受理时按首选路由检查，派发前再按实际路由检查。默认仅北辰路由检查待核金额，同学生跨 Key、跨项目共用额度。待核积分合计加本笔默认预留达到上限时返回 HTTP 429，响应头 `X-Nebula-Error-Code` 为 `unresolved_exposure_limit`。所有路由都检查并发，已达并发限制时优先返回 429 `student_concurrency_exceeded`。
 
 | 后端环境变量 | 默认值 | 含义 |
 | --- | ---: | --- |
-| `NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT` | 1000 | 每学生待核金额上限，整积分，折合 10 元 |
+| `NEBULA_UNRESOLVED_EXPOSURE` | 1 | 设为 `0` 整体回退，所有路由恢复按学生待核笔数准入，达到上限返回 429 `pending_review_limit`，关闭推荐分项自动结算 |
+| `NEBULA_STUDENT_PENDING_REVIEW_LIMIT` | 20 | 整体回退模式的待核笔数上限 |
+| `NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT` | 1000 | 每学生待核预留上限，整积分 |
 | `NEBULA_STUDENT_PENDING_RESERVE_CREDITS` | 10 | 每笔新待核调用预留的整积分，折合 0.1 元 |
 | `NEBULA_STUDENT_CONCURRENCY_LIMIT` | 2 | 每学生同时派发的调用数 |
 
-上述配置接受正整数，缺省或无效时使用默认值。按默认值，已有 98 笔各 10 积分时，第 99 笔可发出；已有 99 笔各 10 积分时，下一笔正好触顶，须等部分记录完成核账后再试。更换 Key 共用同一上限。
+笔数、额度和并发数接受正整数，缺省或无效时使用默认值。按默认值，已有 98 笔各 10 积分时，第 99 笔可发出。已有 99 笔各 10 积分时，下一笔北辰请求正好触顶，须等部分记录完成核账后再试。
 
-北辰成功调用缺少缓存分项时，`NEBULA_PENDING_AUTO_SETTLE` 默认 `1`，设为 `0` 恢复原待核行为。`NEBULA_PENDING_AUTO_SETTLE_YUAN`（默认 `0.001` 上游元）和 `NEBULA_PENDING_AUTO_SETTLE_RELATIVE`（默认 `0.01`，即 1%）可设为非负有限数，无效值使用默认值。区间宽度满足任一阈值（相对宽度为宽度除以下界）或金额唯一时，按推荐分项交给原定价流程。入账成功后 `pricing_detail.auto_settled=true`，另存上下界、推荐金额、历史比例和策略版本。
+`NEBULA_PENDING_AUTO_SETTLE` 默认 `1`，单独设为 `0` 仍计算待核预留并执行金额准入，仅关闭推荐分项自动扣款。支持的纯文本协议为 OpenAI Chat、Responses 和 Anthropic Messages。Gemini 原生响应缺少缓存写入明细，仍待核，不自动结算。`NEBULA_PENDING_AUTO_SETTLE_YUAN`（默认 `0.001` 上游元）和 `NEBULA_PENDING_AUTO_SETTLE_RELATIVE`（默认 `0.01`，即 1%）可设为非负有限数，无效值使用默认值。区间宽度满足任一阈值或金额唯一时，按推荐分项交给原定价流程。成功后 `pricing_detail.auto_settled=true`，另存上下界、推荐金额、历史比例和策略版本。
 
-待核的学生金额上界为上游 `MaxYuan × 100 × 分组倍率 × 学校倍率`，倍率缺失时合计按 2 倍。可计算上界的待核调用按此数向上取整，单笔 1 至 1000 整积分。例如上界 0.250012 元、倍率 1.25 和 1.10，待核预留 35 积分。首次待核且缺少上界时沿用默认 10 积分。自动扣款校验使用未取整的学生上界。
+`MaxYuan` 已含北辰分组倍率。学生上界为 `MaxYuan × 100 × 学校倍率`，缺学校倍率按 2 换算。同一基础报价 0.250012 元，学校倍率 1.10，分组倍率 1、2 分别预留 28、56 整积分。已知上界向上取整并限制在 1 至 1000，首次未知上界取默认预留，两者均以学生剩余额度为限（可为 0）。候选扣款低于或等于未取整上界时按原值扣款。高出不超过 `0.000000001` 积分时只扣到上界，高出更多则继续待核。原有教师定价能确定唯一金额时优先入账，例如 `estimated_unique_amount` 的 0.03602500007040 积分沿用教师价。
 
 老师模型 Probe 支持 `chat_completions`、`responses`、`messages`、`embeddings`、`rerank`。每次请求固定先调用同一供应商的 `GET /v1/models`，按大小写不敏感的完整上游模型 ID 精确匹配目录条目。匹配条目的纯文本 `description` 直接写入建议配置的描述；`model_type`、`tags`、`supported_endpoint_types` 与 description 共同映射类别、输入/输出模态和固定能力。容量采用固定优先级：响应中明确命名的结构化字段最高，其次从 description 的“100 万令牌”“1M context”“128K 上下文”“最大输出 16K”等格式提取，再按具体模型族推断，最后使用 128K 上下文、128K 最大输入和 4K 最大输出。更具体的模型族规则先于通用规则，例如 `claude-sonnet-4-5` 不会误匹配 Claude 5，`glm-5` 使用 1000K/16K。之后按请求顺序执行所选真实端点。浏览器响应不包含上游响应 body，只返回各请求的 endpoint、path、HTTP 状态、耗时、截断标志、通用错误和标准化配置。已注册供应商只提交 `provider_id`，凭据不返回浏览器；手写 Key 不持久化。手写 Base URL 只允许公网 HTTP/HTTPS，不跟随重定向，并在连接阶段再次拒绝私网、localhost、链路本地和云元数据地址。单项上游响应最多读取 64 KiB；不把 usage、价格、Content-Length 或 `max_bytes` 当成容量。
 

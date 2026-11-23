@@ -55,16 +55,28 @@ func pendingReserveCredits() int {
 	return studentCallLimit("NEBULA_STUDENT_PENDING_RESERVE_CREDITS", 10)
 }
 
-func checkStudentCallLimits(ctx context.Context, tx *sql.Tx, studentID, ownCallID uuid.UUID) error {
+func unresolvedExposureEnabled() bool {
+	return strings.TrimSpace(os.Getenv("NEBULA_UNRESOLVED_EXPOSURE")) != "0"
+}
+
+func unresolvedCreditLimit() int {
+	return studentCallLimit("NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT", 1000)
+}
+
+func checkStudentCallLimits(ctx context.Context, tx *sql.Tx, studentID, ownCallID uuid.UUID, beichen bool) error {
 	concurrency := studentCallLimit("NEBULA_STUDENT_CONCURRENCY_LIMIT", 2)
-	exposureLimit := studentCallLimit("NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT", 1000)
+	exposure := unresolvedExposureEnabled()
+	reviewLimit := studentCallLimit("NEBULA_STUDENT_PENDING_REVIEW_LIMIT", 20)
 	var concurrentFull, exposureFull bool
 	err := tx.QueryRowContext(ctx, `SELECT
 		EXISTS(SELECT 1 FROM gateway_calls c WHERE c.user_id=$1 AND c.id<>$2
 			AND c.billing_state='pending' AND (`+callDispatchStartedSQL+`) OFFSET $3),
-		(SELECT COALESCE(SUM(c.unresolved_credit_milli),0) + $4::bigint >= $5::bigint
-		 FROM gateway_calls c WHERE c.user_id=$1 AND c.beichen_state='pending_review')`,
-		studentID, ownCallID, concurrency-1, pendingReserveCredits(), exposureLimit).Scan(&concurrentFull, &exposureFull)
+		CASE WHEN NOT $6::boolean THEN EXISTS (
+			SELECT 1 FROM gateway_calls c WHERE c.user_id=$1 AND c.beichen_state='pending_review' OFFSET $7)
+		WHEN $8::boolean THEN (SELECT COALESCE(SUM(c.unresolved_credit_milli),0) + $4::bigint >= $5::bigint
+			FROM gateway_calls c WHERE c.user_id=$1 AND c.beichen_state='pending_review')
+		ELSE false END`, studentID, ownCallID, concurrency-1, pendingReserveCredits(), unresolvedCreditLimit(),
+		exposure, reviewLimit-1, beichen).Scan(&concurrentFull, &exposureFull)
 	if err != nil {
 		return err
 	}
@@ -72,6 +84,9 @@ func checkStudentCallLimits(ctx context.Context, tx *sql.Tx, studentID, ownCallI
 		return &QuotaError{Code: StudentConcurrencyExceeded}
 	}
 	if exposureFull {
+		if !exposure {
+			return &QuotaError{Code: PendingReviewLimit}
+		}
 		return &QuotaError{Code: UnresolvedExposureLimit}
 	}
 	return nil
@@ -89,7 +104,7 @@ func (s *Store) StartAttempt(ctx context.Context, r Reservation, route CallRoute
 	if err = tx.QueryRowContext(ctx, `SELECT u.id `+activeCallAccessSQL, r.APIKeyID, r.ModelID).Scan(&studentID); err != nil {
 		return uuid.Nil, callAccessError(err)
 	}
-	if err = checkStudentCallLimits(ctx, tx, studentID, r.CallID); err != nil {
+	if err = checkStudentCallLimits(ctx, tx, studentID, r.CallID, route.Beichen); err != nil {
 		return uuid.Nil, err
 	}
 	id := uuid.Must(uuid.NewV7())

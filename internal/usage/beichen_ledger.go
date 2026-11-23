@@ -123,10 +123,20 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 	if state == "pending_review" && oldOutcome == "succeeded" && outcome != "succeeded" {
 		outcome = oldOutcome
 	}
+	// Finalize holds the student lock before locking this call. Read the sum
+	// in a later statement so it includes the preceding finalizer's commit.
+	var headroom int64
+	if next == "pending_review" {
+		if err := tx.QueryRowContext(ctx, `SELECT GREATEST(0,$2::bigint-COALESCE(sum(unresolved_credit_milli),0))
+			FROM gateway_calls WHERE user_id=(SELECT user_id FROM gateway_calls WHERE id=$1)
+			AND id<>$1 AND beichen_state='pending_review'`, callID, unresolvedCreditLimit()).Scan(&headroom); err != nil {
+			return err
+		}
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET
 		beichen_state=$2,billing_state=$3,beichen_review_reason=NULLIF($4,''),credit_milli=$5,
 		unresolved_credit_milli=CASE WHEN $2<>'pending_review' THEN 0
-			WHEN beichen_state='pending_review' THEN unresolved_credit_milli ELSE $15::bigint END,
+			ELSE LEAST($16::bigint,CASE WHEN beichen_state='pending_review' THEN unresolved_credit_milli ELSE $15::bigint END) END,
 		outcome=$6,error_category=NULLIF($7,''),error_message=NULLIF($8,''),
 		beichen_price_at=COALESCE($9,beichen_price_at),sent_at=COALESCE($9,sent_at),
 		provider_id=COALESCE($10,provider_id),provider_name=COALESCE(NULLIF($11,''),provider_name),
@@ -135,7 +145,7 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 		finalized_at=now(),lease_expires_at=NULL WHERE id=$1`, callID, next, billing, reason,
 		int64(boolInt(legacyCharge))*multiplier, outcome, category, sanitize(message), priceAt,
 		nullableUUID(route.ProviderID), route.ProviderName, nullableUUID(route.CredentialID),
-		nullableUUID(route.BindingID), route.UpstreamModelName, pendingReserveCredits()); err != nil {
+		nullableUUID(route.BindingID), route.UpstreamModelName, pendingReserveCredits(), headroom); err != nil {
 		return err
 	}
 	if err = postLedgerBuckets(ctx, tx, callID, hold, "0"); err != nil {
@@ -169,7 +179,7 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 			}
 		}
 		if metrics.CanAuditBeichenSplit() {
-			return auditPendingReport(ctx, tx, callID, protocol, metrics)
+			return auditPendingReport(ctx, tx, callID, protocol, metrics, headroom)
 		}
 	}
 	return refreshLedgerTurn(ctx, tx, callID, "0", false)
@@ -381,7 +391,7 @@ func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge
 	), full_price AS (
 		SELECT *,base*school_multiplier AS actual FROM price
 	), amount AS (
-		SELECT *,LEAST(actual,cap) AS student FROM full_price
+		SELECT *,LEAST(actual,cap,$10::numeric) AS student FROM full_price
 	)
 	UPDATE gateway_calls c SET beichen_state='charged',billing_state='charged',unresolved_credit_milli=0,
 		beichen_credit_exact=amount.student,credit_milli=trunc(amount.student*1000)::bigint,
@@ -401,7 +411,7 @@ func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge
 				ELSE '{}'::jsonb END || COALESCE($11::jsonb,'{}'::jsonb)
 			ELSE c.pricing_detail END
 	FROM amount WHERE c.id=$1 AND c.beichen_state='pending_review'
-		AND ($10::numeric IS NULL OR amount.student <= $10::numeric)
+		AND ($10::numeric IS NULL OR LEAST(amount.actual,amount.cap) <= $10::numeric + 0.000000001)
 	RETURNING (amount.student*1000)::text`, callID, charge.base, charge.source,
 		charge.upstreamVersion, charge.multiplierVersion, charge.tier, string(charge.snapshot), string(charge.detail),
 		charge.quoteMultiplier, maxCredits, auditDetail).Scan(&milli)

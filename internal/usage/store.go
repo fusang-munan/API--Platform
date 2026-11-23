@@ -185,7 +185,7 @@ SELECT k.project_id,p.organization_id,k.owner_user_id,k.name,p.name,o.name,u.nam
 	if err != nil {
 		return Reservation{}, callAccessError(err)
 	}
-	if err = checkStudentCallLimits(ctx, tx, r.UserID, uuid.Nil); err != nil {
+	if err = checkStudentCallLimits(ctx, tx, r.UserID, uuid.Nil, len(routes) > 0 && routes[0].Beichen); err != nil {
 		return Reservation{}, err
 	}
 	hasBeichen, hasLegacy := false, len(routes) == 0
@@ -601,6 +601,13 @@ func (s *Store) Finalize(ctx context.Context, r Reservation, success bool, outco
 	}
 	defer func() { _ = tx.Rollback() }()
 	var routed, pending, expired bool
+	// Match StartAttempt's student -> call lock order. Even crash recovery
+	// without a route can turn a dispatched reservation into a review.
+	if _, err = tx.ExecContext(ctx, `SELECT id FROM users WHERE id=(
+		SELECT user_id FROM gateway_calls WHERE id=$1 AND ($2 OR beichen_state IN ('reserved','pending_review'))
+	) FOR NO KEY UPDATE`, r.CallID, route.Beichen); err != nil {
+		return err
+	}
 	err = tx.QueryRowContext(ctx, `SELECT beichen_state IS NOT NULL,billing_state='pending',
 		COALESCE(lease_expires_at<now()-interval '15 minutes',false) FROM gateway_calls WHERE id=$1 FOR UPDATE`, r.CallID).
 		Scan(&routed, &pending, &expired)
