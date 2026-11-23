@@ -725,7 +725,7 @@ describe('北辰模型管理', () => {
     expect(api.beichenOverview).toHaveBeenCalledTimes(2)
   })
 
-  it('展示探活日预算，达到上限后禁用立即探活', async () => {
+  it('展示探活日预算，达到上限后仍可重新探活', async () => {
     const budget = { date: '2026-11-21', used: 500, limit: 500, remaining: 0, exhausted: true }
     api.beichenOverview.mockResolvedValue({
       ...overview([{ model: 'lab/a' }]),
@@ -736,9 +736,9 @@ describe('北辰模型管理', () => {
 
     const text = wrapper.get('[data-testid="probe-budget"]').text()
     expect(text).toContain('500/500')
-    expect(text).toContain('剩余 0 次')
-    expect(text).toContain('已达上限')
-    expect(button(wrapper, '今日已达上限').attributes('disabled')).toBeDefined()
+    expect(text).toContain('剩余 0 条')
+    expect(text).toContain('今日已探线路仍可重探')
+    expect(button(wrapper, '立即探活').attributes('disabled')).toBeUndefined()
   })
 
   it('分别展示四维健康、报价覆盖、线路异常和手动探活结果', async () => {
@@ -792,6 +792,7 @@ describe('北辰模型管理', () => {
     await flushPromises()
     expect(api.beichenProbes).toHaveBeenCalledWith('north')
     expect(wrapper.get('[data-model="lab/tiered"]').text()).toContain('探活失败')
+    expect(wrapper.get('[data-model="lab/tiered"] .model-probe').text()).toContain('11/20 08:01')
     expect(wrapper.get('[data-model="lab/tiered"]').text()).toContain('可启用')
     expect(button(wrapper, '立即探活').attributes('disabled')).toBeUndefined()
   })
@@ -835,6 +836,37 @@ describe('北辰模型管理', () => {
     expect(down.get('[data-testid="recommended-protocol"]').text()).toBe('暂无推荐协议')
     expect(down.get('[data-testid="availability-reason"]').text()).toContain('探活均失败')
     expect(down.get('[data-testid="action-hint"]').text()).toContain('重扫目录')
+  })
+
+  it('把 degraded 显示为可用 · 探活异常，并用最新 checked_at 显示探活失败时间', async () => {
+    api.beichenOverview.mockResolvedValue(overview([{
+      model: 'lab/degraded', active: true,
+      catalog: { activation: 'active', protocols: ['anthropic'], probe_state: 'failed', last_probe_at: '2026-11-22T16:00:00Z' },
+    }]))
+    api.beichenCapabilities.mockResolvedValue({
+      capabilities: [capability('lab/degraded', {
+        supported_protocols: ['anthropic'], available_protocols: [], recommended_protocol: null,
+        probe_state: 'failed', availability: 'degraded',
+        availability_reason: '最近一次探活失败，但该模型此前长期可用；仍可尝试调用，请求可能失败。',
+        protocol_details: [{
+          protocol: 'anthropic', binding_ready: true, probe_state: 'failed',
+          probe: { checked_at: '2026-11-22T16:54:00Z', status_code: 500 },
+        }],
+        action_hint: '请检查渠道是否启用，使用当前 Key 重扫目录。',
+      })],
+      gaps: [],
+    })
+    const wrapper = view()
+    await flushPromises()
+
+    const row = wrapper.get('[data-model="lab/degraded"]')
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('可用 · 探活异常')
+    expect(row.get('[data-testid="model-availability"]').classes()).toContain('pending')
+    expect(row.text()).not.toContain('维护中')
+    expect(row.get('[data-testid="availability-reason"]').text()).toContain('请求可能失败')
+    expect(row.text()).toContain('探活失败')
+    expect(row.text()).toContain('11/23 00:54')
+    expect(row.text()).not.toContain('11/23 00:00')
   })
 
   it('capabilities 读取失败时回退现有线路字段，不按模型名猜推荐', async () => {

@@ -17,7 +17,7 @@ import { formatCredits } from '../../utils/credits'
 import { harnessDialogTitle, keyCanWithdraw, keyHarnessSupport } from '../../utils/studentHarnessConfig'
 import { BINDING_ADAPTER_OPTIONS, bindingAdapterMeta } from '../../utils/bindingAdapters'
 
-type KeyModelAvailability = 'available' | 'unverified' | 'maintenance'
+type KeyModelAvailability = 'available' | 'degraded' | 'unverified' | 'maintenance'
 type KeyHealthState = 'ok' | 'pending' | 'blocked'
 type KeyHealthItem = {
   id: 'credential' | 'catalog' | 'probe'
@@ -76,12 +76,13 @@ const keyUsageByID = computed(() => {
 })
 const keyCards = computed(() => keys.value.map(key => {
   const rows = keyModelList(key).map(model => ({ model, availability: keyModelAvailability(model) }))
-  const availableModels = rows.filter(row => row.availability === 'available').map(row => row.model)
+  const availableModels = rows.filter(row => row.availability === 'available' || row.availability === 'degraded').map(row => row.model)
   const hasUnverified = rows.some(row => row.availability === 'unverified')
+  const degradedCount = key.status === 'active' ? rows.filter(row => row.availability === 'degraded').length : 0
   return {
-    key, rows, availableCount: key.status === 'active' ? availableModels.length : 0,
+    key, rows, availableCount: key.status === 'active' ? availableModels.length : 0, degradedCount,
     protocols: keyProtocols(key),
-    health: keyHealth(key, availableModels, hasUnverified),
+    health: keyHealth(key, availableModels, hasUnverified, degradedCount),
     usage: keyUsageByID.value.get(key.id) ?? null,
   }
 }))
@@ -111,6 +112,7 @@ const keyHealthStateLabels: Record<KeyHealthState, string> = {
 
 const modelAvailabilityLabels: Record<KeyModelAvailability, string> = {
   available: '可用',
+  degraded: '可用 · 探活异常',
   unverified: '待验证',
   maintenance: '维护中',
 }
@@ -155,7 +157,7 @@ function keyModelRecommendedLabel(model: Model) {
 
 function keyModelAvailability(model: Model): KeyModelAvailability {
   const state = model.availability
-  if (state === 'available' || state === 'unverified' || state === 'maintenance') return state
+  if (state === 'available' || state === 'degraded' || state === 'unverified' || state === 'maintenance') return state
   if (state || model.status !== 'active' || !model.route_ready || model.probe_state === 'failed') {
     return 'maintenance'
   }
@@ -173,6 +175,7 @@ function keyModelReason(model: Model, availability: KeyModelAvailability) {
   const reason = model.availability_reason?.trim()
   if (reason) return studentSafeReason(reason, '老师暂未开放该模型。')
   if (availability === 'available') return '已有可调用线路。'
+  if (availability === 'degraded') return '最近一次探活失败，但此前长期可用；可尝试调用，请求可能失败。'
   if (availability === 'unverified') return '已有绑定线路，尚无通过探活的协议。'
   if (model.status === 'inactive') return '老师已停用该模型。'
   if (model.probe_state === 'failed') return '当前线路探活失败。'
@@ -235,7 +238,7 @@ function credentialHealth(key: ApiKey): KeyHealthItem {
   }
 }
 
-function keyHealth(key: ApiKey, availableModels: Model[], hasUnverified: boolean): KeyHealthItem[] {
+function keyHealth(key: ApiKey, availableModels: Model[], hasUnverified: boolean, degradedCount = 0): KeyHealthItem[] {
   const models = keyModelList(key)
   if (!models.length) return [credentialHealth(key)]
 
@@ -252,7 +255,9 @@ function keyHealth(key: ApiKey, availableModels: Model[], hasUnverified: boolean
     : availableModels.length > 0
       ? {
           id: 'probe', title: '探活', state: 'ok', value: '线路已打通',
-          detail: `已确认可调用 ${availableModels.length} 个模型。`, action: '',
+          detail: degradedCount > 0
+            ? `已确认可调用 ${availableModels.length} 个模型，其中 ${degradedCount} 个最近探活异常。`
+            : `已确认可调用 ${availableModels.length} 个模型。`, action: '',
         }
       : hasUnverified
         ? {
@@ -490,7 +495,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
         <section class="panel">
           <h2>我的申请</h2>
           <p v-if="!keys.length" class="muted">暂无进行中的申请，可在左侧提交新申请。</p>
-          <article v-for="{ key, rows, availableCount, protocols, health, usage } in keyCards" :key="key.id" class="key-card">
+          <article v-for="{ key, rows, availableCount, degradedCount, protocols, health, usage } in keyCards" :key="key.id" class="key-card">
             <div class="row">
               <div>
                 <strong>{{ key.name }}</strong>
@@ -526,7 +531,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
             <section v-if="key.status === 'active' || rows.length" class="key-whitelist" data-testid="key-whitelist">
               <h3>Key 白名单</h3>
               <p class="muted" role="status" data-testid="key-whitelist-summary">
-                已登记 {{ rows.length }} · 可调用 {{ availableCount }} · 需处理 {{ rows.length - availableCount }}
+                已登记 {{ rows.length }} · 可调用 {{ availableCount }}<template v-if="degradedCount">（探活异常 {{ degradedCount }}）</template> · 需处理 {{ rows.length - availableCount }}
               </p>
               <ul v-if="rows.length">
                 <li
@@ -658,6 +663,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
 .key-model-header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
 .key-model-name { font-weight: 650; overflow-wrap: anywhere; }
 .key-model-status.available { background: #e8f7ee; color: #1d6b3a; }
+.key-model-status.degraded { background: #fff4e5; color: #9a4d00; }
 .key-model-status.unverified { background: #fff1d6; color: #8a4b00; }
 .key-model-status.maintenance { background: #fdecec; color: #a12828; }
 .key-whitelist small { color: var(--ink-soft); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }

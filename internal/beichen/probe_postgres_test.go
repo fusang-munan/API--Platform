@@ -19,6 +19,137 @@ import (
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 )
 
+func TestManualProbeRefreshesRecentFailureOnItsCatalogKeyPostgres(t *testing.T) {
+	ctx, db, provider, _, keys := newActionsPostgres(t)
+	t.Setenv("BEICHEN_PROBE_DAILY_LIMIT", "2")
+	manager, err := security.NewManager([]byte(strings.Repeat("j", 32)), []byte(strings.Repeat("a", 32)),
+		[]byte(strings.Repeat("k", 32)), []byte(strings.Repeat("e", 32)), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const fixtureKey = "gm1-probe-test-only"
+	gm1, g3 := keys[1], keys[2]
+	entries := []catalog.ProviderEntry{
+		{ID: "deepseek-v4-pro", SupportedProtocols: []string{"openai_compatible"}},
+		{ID: "deepseek-v4.1-flash", SupportedProtocols: []string{"openai_compatible"}},
+	}
+	store := catalog.ProviderCatalogSyncer{DB: db}
+	for key, secret := range map[uuid.UUID]string{gm1: fixtureKey, g3: "g3-probe-test-only"} {
+		cipher, err := manager.EncryptCredential(secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec("UPDATE provider_credentials SET credential_ciphertext = $1 WHERE id = $2", cipher, key)
+		if _, err := store.UpsertCredentialEntries(ctx, provider, key, entries, time.Now().UTC(), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec("UPDATE provider_model_catalog SET catalog_source='website' WHERE provider_id=$1 AND credential_id=$2", provider, g3)
+	exec(`INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,error_code,duration_ms,checked_at)
+SELECT provider_id, credential_id, model_id::text, 'openai_compatible', 400, 'http_error', 0, statement_timestamp()
+FROM provider_model_catalog WHERE provider_id=$1 AND credential_id=$2`, provider, gm1)
+
+	s := New(db, manager)
+	previous := func() ProbesView {
+		t.Helper()
+		view, err := s.LatestProbes(ctx, provider)
+		if err != nil || len(view.Results) != len(entries) {
+			t.Fatalf("expected two GM1 probe results: %+v, %v", view, err)
+		}
+		return view
+	}
+	before := previous()
+	if !before.Run.Budget.Exhausted || before.Results[0].StatusCode != 400 {
+		t.Fatalf("expected same-day failures and exhausted budget: %+v", before)
+	}
+	auto, err := s.claimProbeJob(ctx, true)
+	if err != nil || auto.force {
+		t.Fatalf("automatic claim = %+v, %v", auto, err)
+	}
+	if targets, hasTargets, err := s.listProbeTargets(ctx, auto); err != nil || !hasTargets || len(targets) != 0 {
+		t.Fatalf("automatic sweep should skip the recent failures: %d %t %v", len(targets), hasTargets, err)
+	}
+	if run, err := s.RequestProbes(ctx, provider); err != nil || run.State != "running" {
+		t.Fatalf("manual request should queue during an automatic sweep: %+v %v", run, err)
+	}
+	s.runProbeJob(ctx, auto)
+
+	status := http.StatusOK
+	var requestsMu sync.Mutex
+	requests := 0
+	s.client.Transport = panelTransport(func(req *http.Request) (*http.Response, error) {
+		if req.Header.Get("Authorization") != "Bearer "+fixtureKey {
+			t.Error("DeepSeek probe used a key outside the GM1 catalog")
+		}
+		requestsMu.Lock()
+		requests++
+		requestsMu.Unlock()
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(`{"choices":[{}]}`))}, nil
+	})
+	checkManual := func() ProbesView {
+		t.Helper()
+		job, err := s.claimProbeJob(ctx, false)
+		if err != nil || !job.force {
+			t.Fatalf("manual claim = %+v, %v", job, err)
+		}
+		targets, _, err := s.listProbeTargets(ctx, job)
+		if err != nil || len(targets) != len(entries) {
+			t.Fatalf("manual sweep should select both DeepSeek models: %d %v", len(targets), err)
+		}
+		for _, target := range targets {
+			if target.credential != gm1 {
+				t.Fatalf("unexpected credential for %s: %s", target.model, target.credential)
+			}
+		}
+		s.runProbeJob(ctx, job)
+		view := previous()
+		if view.Run.State != "completed" {
+			t.Fatalf("manual sweep did not complete: %+v", view.Run)
+		}
+		return view
+	}
+	after := checkManual()
+	passes := map[string]time.Time{}
+	for _, result := range after.Results {
+		if result.CredentialID != gm1 || result.StatusCode != 200 || result.LastPassedAt == nil ||
+			!result.LastPassedAt.Equal(result.CheckedAt) || !result.CheckedAt.After(before.Results[0].CheckedAt) {
+			t.Fatalf("GET probes did not return the new success: %+v", result)
+		}
+		passes[result.Model] = result.CheckedAt
+	}
+	requestManual := func() {
+		t.Helper()
+		if run, err := s.RequestProbes(ctx, provider); err != nil || run.State != "queued" {
+			t.Fatalf("manual request = %+v %v", run, err)
+		}
+	}
+	status = http.StatusBadRequest
+	requestManual()
+	for _, result := range checkManual().Results {
+		if result.StatusCode != 400 || result.LastPassedAt == nil ||
+			!result.LastPassedAt.Equal(passes[result.Model]) || !result.CheckedAt.After(passes[result.Model]) {
+			t.Fatalf("failed retry should preserve the same key's success time: %+v", result)
+		}
+	}
+	exec("UPDATE provider_credentials SET updated_at = clock_timestamp() WHERE id = $1", gm1)
+	exec("UPDATE provider_model_catalog SET last_seen_at = clock_timestamp() WHERE credential_id = $1", gm1)
+	requestManual()
+	for _, result := range checkManual().Results {
+		if result.StatusCode != 400 || result.LastPassedAt != nil {
+			t.Fatalf("failure after key rotation inherited old success: %+v", result)
+		}
+	}
+	if requests != 6 {
+		t.Fatalf("manual probe attempts = %d, want 6", requests)
+	}
+}
+
 func TestBeichenProbeAndCatalogPostgres(t *testing.T) {
 	ctx, db, provider, _, keys := newActionsPostgres(t)
 	manager, err := security.NewManager([]byte(strings.Repeat("j", 32)), []byte(strings.Repeat("a", 32)),

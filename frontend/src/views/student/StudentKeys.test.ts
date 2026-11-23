@@ -256,6 +256,26 @@ describe('Key 白名单', () => {
     expect(requests.every(request => request.method === 'GET')).toBe(true)
   })
 
+  it('把 degraded 授权计为可调用并显示探活异常，而不是维护中', async () => {
+    const degraded: Model = {
+      ...readyModel, model_id: 'gpt-degraded', availability: 'degraded', probe_state: 'failed',
+      availability_reason: '最近一次探活失败，但该模型此前长期可用；仍可尝试调用，请求可能失败。',
+    }
+    const models = [readyModel, degraded]
+    mockStudentRequests({ [`GET ${keysPath}`]: [makeKey({ models })] })
+    const { wrapper } = await mountPage()
+
+    expect(wrapper.get('[data-testid="key-whitelist-summary"]').text())
+      .toBe('已登记 2 · 可调用 2（探活异常 1） · 需处理 0')
+    const rows = wrapper.findAll('[data-testid="key-model-row"]')
+    expect(rows.map(row => row.attributes('data-availability'))).toEqual(['available', 'degraded'])
+    const row = rows[1]
+    expect(row.text()).toContain('可用 · 探活异常')
+    expect(row.text()).not.toContain('维护中')
+    expect(row.text()).toContain('请求可能失败')
+    expect(wrapper.get('[data-health="probe"]').text()).toContain('其中 1 个最近探活异常')
+  })
+
   it('只从所选 Key 移除指定模型，移除最后一个时显示待选择模型', async () => {
     const model = { ...readyModel, availability: 'maintenance', probe_state: 'failed' }
     const key = makeKey({ id: 'target-key', models: [model], route_ready: false })

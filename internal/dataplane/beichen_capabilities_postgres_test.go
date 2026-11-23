@@ -260,6 +260,23 @@ func TestBeichenCapabilitiesAndGatewayPostgres(t *testing.T) {
 		if maintenance.Code != "model_unavailable" || !strings.Contains(maintenance.Message, "维护中") {
 			t.Fatalf("missing gateway maintenance reason: %+v", maintenance)
 		}
+		exec(`UPDATE upstream_probes SET last_passed_at=checked_at WHERE credential_id=$1 AND model=$2 AND protocol='openai_compatible'`,
+			claude.id, claude.model)
+		row, model = readLine(claude.model), modelsList("")[claude.model]
+		if row.Availability != catalog.AvailabilityDegraded || model.Availability != catalog.AvailabilityDegraded ||
+			model.ProbeState != "failed" || !strings.Contains(model.AvailabilityReason, "可能请求失败") {
+			t.Fatalf("recently successful model was removed or labeled incorrectly: %+v %+v", row, model)
+		}
+		hasEvidence := false
+		for _, detail := range row.ProtocolDetails {
+			if detail.Protocol == "openai_compatible" && detail.Probe != nil && detail.Probe.LastPassedAt != nil &&
+				detail.Probe.LastPassedAt.Equal(detail.Probe.CheckedAt) {
+				hasEvidence = true
+			}
+		}
+		if !hasEvidence {
+			t.Fatalf("teacher capabilities lost last_passed_at: %+v", row.ProtocolDetails)
+		}
 		exec("UPDATE provider_credentials SET updated_at=clock_timestamp()+interval '1 millisecond' WHERE id=$1", claude.id)
 		row, model = readLine(claude.model), modelsList("?include_unavailable=1")[claude.model]
 		if row.CatalogState != "catalog_unverified" || row.RecommendedProtocol != nil ||

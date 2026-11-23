@@ -232,6 +232,62 @@ describe('StudentModels key model states', () => {
     wrapper.unmount()
   })
 
+  it('treats a degraded model as callable with a warning instead of maintenance', async () => {
+    const degraded = fixture.model('gpt-6.2-astra', true, {
+      availability: 'degraded',
+      availability_reason: '最近一次探活失败，但该模型此前长期可用；仍可尝试调用，请求可能失败。',
+      protocols: ['anthropic'], recommended_protocol: 'anthropic',
+    })
+    vi.mocked(studentAPI.models).mockResolvedValueOnce({ common_models: [degraded], library_models: [] } as never)
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([degraded])] as never)
+    const wrapper = mountPage()
+    await flushPromises()
+
+    const card = wrapper.get('[data-model="gpt-6.2-astra"]')
+    expect(card.get('[data-testid="model-availability"]').text()).toBe('可用 · 探活异常')
+    expect(card.get('[data-testid="model-availability"]').classes()).toContain('warn')
+    expect(card.get('[data-testid="model-availability"]').classes()).not.toContain('unavailable')
+    expect(card.get('[data-testid="model-key-status"]').text()).toBe('已加入 · 探活异常')
+    expect(card.get('[data-testid="model-key-status"]').classes()).toContain('warn')
+    expect(card.get('[data-testid="model-unavailable-reason"]').text()).toContain('请求可能失败')
+    expect(card.get('[data-testid="protocol-alternatives"]').text()).toContain('Anthropic Messages')
+    expect(wrapper.get('[data-testid="model-summary"]').text())
+      .toBe('当前 Key 已授权 1 个 · 可调用 1 · 待验证 0 · 维护中 0 · 可添加 0 · 探活异常 1')
+
+    await showGroup(wrapper, 'maintenance')
+    expect(wrapper.findAll('[data-model]')).toHaveLength(0)
+    wrapper.unmount()
+  })
+
+  it('allows adding a degraded model and keeps the degraded warning after it joins the key', async () => {
+    const degraded = fixture.model('gpt-6.2-astra', true, {
+      availability: 'degraded',
+      availability_reason: '最近一次探活失败，但该模型此前长期可用；仍可尝试调用，请求可能失败。',
+    })
+    vi.mocked(studentAPI.models).mockResolvedValueOnce({ common_models: [degraded], library_models: [] } as never)
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([])] as never)
+    vi.mocked(studentAPI.addKeyModels).mockResolvedValueOnce({ model_ids: ['gpt-6.2-astra'], added_model_ids: ['gpt-6.2-astra'] })
+    const wrapper = mountPage()
+    await flushPromises()
+    await showGroup(wrapper, 'addable')
+
+    const card = wrapper.get('[data-model="gpt-6.2-astra"]')
+    expect(card.get('[data-testid="model-availability"]').text()).toBe('可用 · 探活异常')
+    const add = card.get('[data-testid="sync-key-model"]')
+    expect(add.attributes('disabled')).toBeUndefined()
+    expect(add.text()).toBe('添加到我的 Key')
+    await add.trigger('click')
+    await flushPromises()
+
+    expect(studentAPI.addKeyModels).toHaveBeenLastCalledWith('key-1', ['gpt-6.2-astra'])
+    expect(wrapper.get('[role="status"]').text()).toContain('探活异常')
+    await showGroup(wrapper, 'callable')
+    const joined = wrapper.get('[data-model="gpt-6.2-astra"]')
+    expect(joined.get('[data-testid="model-key-status"]').text()).toBe('已加入 · 探活异常')
+    expect(joined.get('[data-testid="model-key-status"]').classes()).toContain('warn')
+    wrapper.unmount()
+  })
+
   it('marks a maintenance model as joined but not callable and never uses green', async () => {
     const maintenance = fixture.model('gpt-5.3-codex', false, {
       availability: 'maintenance',
@@ -615,6 +671,35 @@ describe('StudentModels catalog dialog', () => {
     expect(studentAPI.addModel).not.toHaveBeenCalled()
     expect(wrapper.find('[role="alert"]').exists()).toBe(false)
     expect(wrapper.get('[data-testid="catalog-key-coverage"]').text()).toBe('可调用')
+    wrapper.unmount()
+  })
+
+  it('labels a degraded catalogue row and keeps the warning after adding it', async () => {
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([])] as never)
+    vi.mocked(studentAPI.modelCatalog).mockResolvedValueOnce({
+      items: [{
+        ...base, model_id: 'gpt-6.2-astra', supported_protocols: ['openai_compatible'],
+        availability: 'degraded', availability_reason: '最近一次探活失败，但该模型此前长期可用；仍可尝试调用，请求可能失败。',
+      }],
+      page: 1, page_size: 20, total: 1,
+    } as never)
+    vi.mocked(studentAPI.addKeyModels).mockResolvedValueOnce({ model_ids: ['gpt-6.2-astra'], added_model_ids: ['gpt-6.2-astra'] })
+    const wrapper = mountPage()
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '检索添加')!.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="catalog-availability"]').text()).toBe('可用 · 探活异常')
+    expect(wrapper.get('[data-testid="catalog-key-coverage"]').text()).toBe('未加入')
+    expect(wrapper.get('[data-testid="catalog-degraded"]').text()).toContain('请求可能失败')
+    const add = wrapper.get('[data-testid="catalog-add"]')
+    expect(add.attributes('disabled')).toBeUndefined()
+    expect(add.text()).toBe('添加到我的 Key')
+    await add.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="catalog-key-coverage"]').text()).toBe('已加入 · 探活异常')
+    expect(wrapper.get('[data-testid="catalog-add"]').text()).toBe('已加入 · 探活异常')
     wrapper.unmount()
   })
 })

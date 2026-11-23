@@ -320,6 +320,9 @@ func (s *Service) ProbeModel(ctx context.Context, input ProbeInput) (ProbeRespon
 		if row.Edges.Provider == nil {
 			return ProbeResponse{}, domain.NewError(domain.CodeNotFound, "provider not found")
 		}
+		if row.Status != providercredential.StatusActive {
+			return ProbeResponse{}, domain.NewError(domain.CodeValidation, "provider credential is inactive")
+		}
 		baseURL = row.Edges.Provider.BaseURL
 		credential, err = s.security.DecryptCredential(row.CredentialCiphertext)
 		if err != nil {

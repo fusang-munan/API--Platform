@@ -330,8 +330,9 @@ func (g *Gateway) proxyHTTPBody(w http.ResponseWriter, original *http.Request, r
 				}
 			}
 			if north && adapter == modelbinding.AdapterOpenaiResponses {
-				status := rawString(jsonObject(prefix)["status"])
-				interrupted = status != "" && status != "completed"
+				payload := jsonObject(prefix)
+				status := rawString(payload["status"])
+				interrupted = status != "" && status != "completed" && !beichenResponsesOutputLimited(payload)
 			}
 			metrics = parseJSONResponseMetrics(adapter, prefix).finished(interrupted)
 			if isCreation {

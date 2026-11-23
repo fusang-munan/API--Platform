@@ -204,7 +204,9 @@ func (g *Gateway) proxyBeichenWebSocket(ctx context.Context, client, upstream *w
 							}
 							active.metrics.applyUsageSnapshot(adapter, payload)
 							status := rawString(response["status"])
-							finish((event == "response.completed" || event == "response.done") && (status == "" || status == "completed"))
+							completed := (event == "response.completed" || event == "response.done") && (status == "" || status == "completed")
+							limited := (event == "response.incomplete" || event == "response.done") && beichenResponsesOutputLimited(response)
+							finish(completed || limited)
 						}
 					}
 					if active != nil && active.review == "" && (responseID == "" || active.responseID == responseID) {

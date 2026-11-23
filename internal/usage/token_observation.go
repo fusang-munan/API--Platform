@@ -61,6 +61,17 @@ func (m CallMetrics) withKnownInputParts(protocol string) CallMetrics {
 		}
 	case "openai_compatible", "openai_responses", "openai_realtime":
 		zero := int64(0)
+		// Nonnegative categories are disjoint. If one covers the entire
+		// input, any omitted category is necessarily zero.
+		exhaustsInput := func(count *int64) bool { return count != nil && *count == input }
+		if input > 0 && (exhaustsInput(read) || exhaustsInput(write) || exhaustsInput(miss)) {
+			if read == nil {
+				m.CacheHitTokens = &zero
+			}
+			if write == nil {
+				m.CacheWriteTokens = &zero
+			}
+		}
 		if read == nil && miss != nil && write != nil && *write >= 0 && *write <= input && *miss == input-*write {
 			m.CacheHitTokens = &zero
 		}
