@@ -43,8 +43,24 @@ var bindingRouteProbeOrder = []BindingRouteProbeEndpoint{
 }
 
 // ProbeUsage contains native protocol counts. Missing counters remain nil.
+// Reason records why reported counters cannot be trusted. Any non-empty reason
+// makes all counters unavailable to callers.
 type ProbeUsage struct {
 	InputTokens, OutputTokens, CacheReadTokens, CacheWriteTokens *int64
+	Reason                                                       string
+}
+
+// AccountingErrorCode distinguishes contradictory upstream evidence from
+// malformed or out-of-range counters. Both cases make the counts unusable.
+func (usage ProbeUsage) AccountingErrorCode() string {
+	switch {
+	case usage.Reason == "":
+		return ""
+	case strings.HasPrefix(usage.Reason, "conflicting_"):
+		return "probe_usage_conflict"
+	default:
+		return "invalid_usage"
+	}
 }
 
 type RouteProbeStep struct {
@@ -274,8 +290,13 @@ func (p *RouteProbe) probeStep(ctx context.Context, upstreamModelID string, endp
 			}
 			var counters usage.CallMetrics
 			counters.MergeProtocolUsage(item.adapter, raw)
-			step.Usage = ProbeUsage{InputTokens: counters.PromptTokens, OutputTokens: counters.CompletionTokens,
-				CacheReadTokens: counters.CacheHitTokens, CacheWriteTokens: counters.CacheWriteTokens}
+			step.Usage = ProbeUsage{Reason: counters.UsageReason}
+			if counters.UsageReason == "" {
+				step.Usage.InputTokens = counters.PromptTokens
+				step.Usage.OutputTokens = counters.CompletionTokens
+				step.Usage.CacheReadTokens = counters.CacheHitTokens
+				step.Usage.CacheWriteTokens = counters.CacheWriteTokens
+			}
 		}
 		if step.OK {
 			switch {

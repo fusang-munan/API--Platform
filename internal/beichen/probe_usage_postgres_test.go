@@ -2,6 +2,8 @@ package beichen
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -74,6 +76,95 @@ func TestProbeUsageDayBoundsPostgres(t *testing.T) {
 	empty, err := s.ProbeUsageForDay(ctx, keys[1], "2026-11-23")
 	if err != nil || empty.Attempts != 0 || empty.Input.Tokens != nil {
 		t.Fatalf("provider filter: %+v %v", empty, err)
+	}
+}
+
+func TestProbeUsageConflictRemainsReachableButUnknownPostgres(t *testing.T) {
+	ctx, db, provider, _, keys := newActionsPostgres(t)
+	t.Setenv("BEICHEN_PROBE_DAILY_LIMIT", "500")
+	key := keys[0]
+	store := catalog.ProviderCatalogSyncer{DB: db}
+	if _, err := store.UpsertCredentialEntries(ctx, provider, key, []catalog.ProviderEntry{
+		{ID: "conflict", SupportedProtocols: []string{"openai_compatible"}},
+		{ID: "agreeing", SupportedProtocols: []string{"openai_compatible"}},
+	}, time.Now(), nil); err != nil {
+		t.Fatal(err)
+	}
+	var revision time.Time
+	if err := db.QueryRowContext(ctx, "SELECT updated_at FROM provider_credentials WHERE id=$1", key).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	s := New(db, nil)
+	job := probeJob{provider: provider, lease: keys[1], id: keys[2]}
+	if _, err := db.ExecContext(ctx, "INSERT INTO beichen_probe_jobs(provider_id,lease_id,lease_until,job_id) VALUES ($1,$2,now()+interval '1 minute',$3)", provider, job.lease, job.id); err != nil {
+		t.Fatal(err)
+	}
+	client := &catalog.RouteProbe{BaseURL: origin, Credential: "fixture", Client: &http.Client{Transport: panelTransport(func(req *http.Request) (*http.Response, error) {
+		var body map[string]json.RawMessage
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			return nil, err
+		}
+		var model string
+		if err := json.Unmarshal(body["model"], &model); err != nil {
+			return nil, err
+		}
+		response := `{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":2},"prompt_cache_hit_tokens":2}}`
+		if model == "conflict" {
+			response = `{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":2},"prompt_cache_hit_tokens":8}}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(response))}, nil
+	})}}
+	targets := []probeTarget{
+		{credential: key, revision: revision, model: "conflict", protocol: "openai_compatible", client: client},
+		{credential: key, revision: revision, model: "agreeing", protocol: "openai_compatible", client: client},
+	}
+	observations, err := s.runProbeRound(ctx, job, targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, observation := range observations {
+		if observation.statusCode != http.StatusOK || observation.errorCode != "" {
+			t.Fatalf("usage conflict changed route availability: %+v", observation)
+		}
+	}
+	if err := s.saveProbeBatch(ctx, job, observations); err != nil {
+		t.Fatal(err)
+	}
+	var conflictStatus int
+	var conflictCode sql.NullString
+	var conflictUnknown bool
+	if err := db.QueryRowContext(ctx, `SELECT status_code,error_code,
+		input_tokens IS NULL AND output_tokens IS NULL AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
+		FROM beichen_probe_usage WHERE job_id=$1 AND model='conflict'`, job.id).Scan(&conflictStatus, &conflictCode, &conflictUnknown); err != nil {
+		t.Fatal(err)
+	}
+	if conflictStatus != http.StatusOK || !conflictCode.Valid || conflictCode.String != "probe_usage_conflict" || !conflictUnknown {
+		t.Fatalf("conflicting usage was recorded as reported: status=%d code=%v unknown=%t", conflictStatus, conflictCode, conflictUnknown)
+	}
+	var agreeingStatus int
+	var agreeingCode sql.NullString
+	var input, output, cacheRead int64
+	var cacheWriteUnknown bool
+	if err := db.QueryRowContext(ctx, `SELECT status_code,error_code,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens IS NULL
+		FROM beichen_probe_usage WHERE job_id=$1 AND model='agreeing'`, job.id).Scan(
+		&agreeingStatus, &agreeingCode, &input, &output, &cacheRead, &cacheWriteUnknown); err != nil {
+		t.Fatal(err)
+	}
+	if agreeingStatus != http.StatusOK || agreeingCode.Valid || input != 10 || output != 1 || cacheRead != 2 || !cacheWriteUnknown {
+		t.Fatalf("agreeing usage not recorded: status=%d code=%v tokens=%d/%d/%d writeUnknown=%t",
+			agreeingStatus, agreeingCode, input, output, cacheRead, cacheWriteUnknown)
+	}
+	var reachable int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM upstream_probes
+		WHERE provider_id=$1 AND credential_id=$2 AND status_code=200 AND error_code IS NULL`,
+		provider, key).Scan(&reachable); err != nil || reachable != 2 {
+		t.Fatalf("route probes reachable=%d err=%v", reachable, err)
+	}
+	day, err := s.ProbeUsageForDay(ctx, provider, time.Now().In(beijing).Format(dayLayout))
+	if err != nil || day.Attempts != 2 || day.Input.Reported != 1 || day.Input.Tokens == nil || *day.Input.Tokens != 10 ||
+		day.Output.Reported != 1 || day.CacheRead.Reported != 1 || day.CacheRead.Tokens == nil || *day.CacheRead.Tokens != 2 ||
+		day.CacheWrite.Reported != 0 || day.CacheWrite.Tokens != nil {
+		t.Fatalf("conflicting usage leaked into daily total: %+v err=%v", day, err)
 	}
 }
 
