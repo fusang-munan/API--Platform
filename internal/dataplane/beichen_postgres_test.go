@@ -380,6 +380,13 @@ func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, ga
 		conflictReason != "conflicting_cache_creation_counts" || !conflictWrite.Valid || conflictWrite.Int64 != 3 || conflictCredits.Valid {
 		t.Fatalf("conflicting Anthropic cache child: reason=%q write=%v credits=%v err=%v", conflictReason, conflictWrite, conflictCredits, err)
 	}
+	var evidence5m, evidence1h, evidenceReported sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT pricing_detail->>'cache_write_5m_tokens',
+		pricing_detail->>'cache_write_1h_tokens',pricing_detail->>'cache_write_reported_tokens'
+		FROM gateway_calls WHERE request_id='messages-cache-child-conflict'`).
+		Scan(&evidence5m, &evidence1h, &evidenceReported); err != nil || evidence5m.String != "3" || evidence1h.Valid || evidenceReported.Valid {
+		t.Fatalf("conflicting cache evidence lost: 5m=%v 1h=%v reported=%v err=%v", evidence5m, evidence1h, evidenceReported, err)
+	}
 	var charged, pending, partial, missing int
 	err := db.QueryRowContext(ctx, `SELECT
 		count(*) FILTER (WHERE beichen_state='charged' AND pricing_detail->>'amount_source'='estimated_unique_amount'

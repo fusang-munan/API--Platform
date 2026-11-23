@@ -151,6 +151,36 @@ func TestJSONWithoutTerminalCannotAuthorizeUsage(t *testing.T) {
 	}
 }
 
+func TestJSONChatStatusAloneIsNotTerminal(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"m","status":"completed","usage":{"prompt_tokens":5,"completion_tokens":1}}`)
+	metrics := parseJSONResponseMetrics(modelbinding.AdapterOpenaiCompatible, body).
+		finishedJSON(modelbinding.AdapterOpenaiCompatible, "/v1/chat/completions", false)
+	if metrics.State != usage.UsageInterrupted || metrics.UsageReason != "terminal_usage_missing" {
+		t.Fatalf("a Responses-style status authorized a Chat debit: %+v", metrics)
+	}
+}
+
+func TestJSONResponsesCompactDoesNotNeedGenerationTerminal(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"id":"cmp_1","object":"response.compaction","usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}`)
+	metrics := parseJSONResponseMetrics(modelbinding.AdapterOpenaiResponses, body).
+		finishedJSON(modelbinding.AdapterOpenaiResponses, "/v1/responses/compact", false)
+	if metrics.State != usage.UsageReported || !tokenIs(metrics.PromptTokens, 5) || !tokenIs(metrics.CompletionTokens, 1) {
+		t.Fatalf("compact usage was treated as an incomplete generation: %+v", metrics)
+	}
+}
+
+func TestJSONOpenAIEmbeddingDoesNotNeedGenerationTerminal(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"embedding-1","usage":{"prompt_tokens":7,"total_tokens":7}}`)
+	metrics := parseJSONResponseMetrics(modelbinding.AdapterOpenaiCompatible, body).
+		finishedJSON(modelbinding.AdapterOpenaiCompatible, "/v1/embeddings", false)
+	if metrics.State != usage.UsageReported || !tokenIs(metrics.PromptTokens, 7) {
+		t.Fatalf("embedding usage was treated as an incomplete generation: %+v", metrics)
+	}
+}
+
 func TestJSONEmbeddingUsageDoesNotNeedGenerationTerminal(t *testing.T) {
 	t.Parallel()
 	body := []byte(`{"usageMetadata":{"promptTokenCount":5,"totalTokenCount":5}}`)
