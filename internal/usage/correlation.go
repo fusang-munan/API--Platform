@@ -32,6 +32,11 @@ type CallMetrics struct {
 	CacheHitTokens     *int64
 	CacheMissTokens    *int64
 	CacheWriteTokens   *int64
+	// These fields retain Anthropic cache-creation evidence across streamed
+	// cumulative usage frames. Only the computed total is persisted.
+	cacheWrite5m       *int64
+	cacheWrite1h       *int64
+	cacheWriteReported *int64
 	ReasoningTokens    *int64
 	ToolPromptTokens   *int64
 	// UpstreamCreditMicros is the explicit upstream credit in millionths.

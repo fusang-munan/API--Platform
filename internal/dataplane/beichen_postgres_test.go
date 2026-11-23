@@ -301,6 +301,7 @@ func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, ga
 	const responsesUsage = `"status":"completed","usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}`
 	const messagesUsage = `"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":3}`
 	const messagesNoWrite = `"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":0}`
+	const messagesChildConflict = `"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":3}}`
 	for _, tc := range []struct {
 		name, adapter, path, input, report string
 		effort, ttl, credits, review       string
@@ -333,6 +334,7 @@ func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, ga
 		{"messages-5m", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[],"cache_control":{"type":"ephemeral"}`, messagesUsage, "medium", "5m", "0.0013", ""},
 		{"messages-unknown-ttl", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[]`, messagesUsage, "medium", "", "", "unknown_cache_ttl"},
 		{"messages-no-writes", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[]`, messagesNoWrite, "medium", "", "0.001", ""},
+		{"messages-cache-child-conflict", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[],"cache_control":{"type":"ephemeral"}`, messagesChildConflict, "medium", "5m", "", "incomplete_token_breakdown"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := db.ExecContext(ctx, "UPDATE model_bindings SET adapter=$2 WHERE id=$1", binding, tc.adapter); err != nil {
@@ -368,6 +370,15 @@ func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, ga
 				t.Fatalf("ledger effort=%q TTL=%q credits=%q review=%q state=%q: %v", effort, ttl, credits, review, state, err)
 			}
 		})
+	}
+	var conflictReason string
+	var conflictWrite sql.NullInt64
+	var conflictCredits sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT coalesce(usage_reason,''),cache_write_tokens,beichen_credit_exact::text
+		FROM gateway_calls WHERE request_id='messages-cache-child-conflict'`).
+		Scan(&conflictReason, &conflictWrite, &conflictCredits); err != nil ||
+		conflictReason != "conflicting_cache_creation_counts" || !conflictWrite.Valid || conflictWrite.Int64 != 3 || conflictCredits.Valid {
+		t.Fatalf("conflicting Anthropic cache child: reason=%q write=%v credits=%v err=%v", conflictReason, conflictWrite, conflictCredits, err)
 	}
 	var charged, pending, partial, missing int
 	err := db.QueryRowContext(ctx, `SELECT
