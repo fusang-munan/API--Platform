@@ -297,10 +297,10 @@ func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, ga
 	FROM multiplier m JOIN provider_credentials c ON c.id=m.credential_id`, credential, upstreamModel); err != nil {
 		t.Fatal(err)
 	}
-	const chatUsage = `"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":2,"prompt_cache_write_tokens":3}`
+	const chatUsage = `"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":2,"prompt_cache_write_tokens":3}`
 	const responsesUsage = `"status":"completed","usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}`
-	const messagesUsage = `"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":3}`
-	const messagesNoWrite = `"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":0}`
+	const messagesUsage = `"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":3}`
+	const messagesNoWrite = `"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":0}`
 	const messagesChildConflict = `"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":3}}`
 	for _, tc := range []struct {
 		name, adapter, path, input, report string

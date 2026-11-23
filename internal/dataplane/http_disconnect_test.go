@@ -255,3 +255,148 @@ func TestBeichenHTTPDisconnectLedger(t *testing.T) {
 		})
 	}
 }
+
+func TestBeichenHTTPNonStreamingTerminalLedger(t *testing.T) {
+	ctx, stop := context.WithTimeout(context.Background(), 20*time.Second)
+	defer stop()
+	f := newBeichenGatewayFixture(t, ctx)
+	if _, err := f.db.ExecContext(ctx, "INSERT INTO beichen_multiplier_versions(credential_id,multiplier) VALUES ($1,0.1)", f.credential); err != nil {
+		t.Fatal(err)
+	}
+	const anthropicRequest = `{"model":"fixture-public","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`
+	const responsesRequest = `{"model":"fixture-public","input":"hello"}`
+	cases := []struct {
+		name, adapter, path, request, responseType, response string
+		cancel, wantCharge                                   bool
+		wantInput, wantOutput, wantTotal                     int64
+	}{
+		{
+			"anthropic-message-start-only", "anthropic", "/v1/messages", anthropicRequest, "application/json",
+			`{"type":"message_start","model":"fixture-g3","message":{"id":"msg_start","stop_reason":null,"usage":{"input_tokens":5,"output_tokens":1}}}`,
+			true, false, 5, 1, -1,
+		},
+		{
+			"anthropic-message-stop", "anthropic", "/v1/messages", anthropicRequest, "application/json",
+			`{"type":"message_stop","model":"fixture-g3","message":{"id":"msg_stop","stop_reason":"end_turn","usage":{"input_tokens":4415,"output_tokens":2326,"total_tokens":6741,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}`,
+			false, true, 4415, 2326, 6741,
+		},
+		{
+			"unexpected-sse", "openai_responses", "/v1/responses", responsesRequest, "text/event-stream",
+			`data: {"type":"response.created","response":{"id":"resp_sse"}}
+
+`,
+			true, false, -1, -1, -1,
+		},
+	}
+	var chargedTotal int64
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := f.db.ExecContext(ctx, "UPDATE model_bindings SET adapter=$2 WHERE id=$1", f.binding, tc.adapter); err != nil {
+				t.Fatal(err)
+			}
+			clientCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			var sends atomic.Int32
+			activeID := make(chan uuid.UUID, 1)
+			upstreamDone := make(chan struct{})
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if sends.Add(1) != 1 {
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
+				defer close(upstreamDone)
+				_, _ = io.Copy(io.Discard, r.Body)
+				var id uuid.UUID
+				if err := f.db.QueryRowContext(ctx, `SELECT id FROM gateway_calls WHERE request_id=$1
+					AND beichen_state='reserved' AND lease_expires_at>now()`, tc.name).Scan(&id); err != nil {
+					t.Errorf("in-flight call/lease: %v", err)
+				}
+				activeID <- id
+				if tc.cancel {
+					cancel()
+					select {
+					case <-r.Context().Done():
+						t.Error("upstream canceled before delayed response")
+						return
+					case <-time.After(20 * time.Millisecond):
+					}
+				}
+				w.Header().Set("Content-Type", tc.responseType)
+				w.Header().Set(beichenReceiptHeader, uuid.New().String())
+				_, _ = io.WriteString(w, tc.response)
+				if tc.responseType == "text/event-stream" {
+					w.(http.Flusher).Flush()
+				}
+			}))
+			defer up.Close()
+			addr, err := url.Parse(up.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.gateway.client.Transport = beichenGatewayTestTransport(func(r *http.Request) (*http.Response, error) {
+				req := r.Clone(r.Context())
+				req.URL.Scheme, req.URL.Host, req.Host = addr.Scheme, addr.Host, addr.Host
+				return up.Client().Transport.RoundTrip(req)
+			})
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.request)).
+				WithContext(usage.WithRequestID(clientCtx, tc.name))
+			req.Header.Set("Authorization", "Bearer "+studentKey)
+			req.Header.Set("Content-Type", "application/json")
+			w := &disconnectWriter{ResponseRecorder: httptest.NewRecorder()}
+			f.gateway.ServeHTTP(w, req)
+			if sends.Load() != 1 {
+				t.Fatalf("upstream dispatched %d times", sends.Load())
+			}
+			<-upstreamDone
+			if tc.cancel && (w.headers != 0 || w.writes != 0) {
+				t.Fatalf("disconnected client received %d headers and %d writes", w.headers, w.writes)
+			}
+			var state string
+			var reviewReason, usageState string
+			var input, output, total sql.NullInt64
+			var attempts, calls int
+			var charged bool
+			var leaseReleased bool
+			err = f.db.QueryRowContext(ctx, `SELECT beichen_state,COALESCE(beichen_review_reason,''),
+				COALESCE(usage_state,''),prompt_tokens,completion_tokens,total_tokens,
+				beichen_credit_exact IS NOT NULL,lease_expires_at IS NULL,
+				(SELECT count(*) FROM gateway_call_attempts WHERE call_id=c.id),
+				(SELECT count(*) FROM gateway_calls WHERE request_id=$2)
+				FROM gateway_calls c WHERE id=$1`, <-activeID, tc.name).
+				Scan(&state, &reviewReason, &usageState, &input, &output, &total, &charged, &leaseReleased, &attempts, &calls)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantUsageState := "interrupted"
+			if tc.wantCharge {
+				wantUsageState = "reported"
+			}
+			if !leaseReleased || calls != 1 || attempts != 1 || charged != tc.wantCharge || usageState != wantUsageState {
+				t.Fatalf("released=%t calls=%d attempts=%d charged=%t usage=%s", leaseReleased, calls, attempts, charged, usageState)
+			}
+			if tc.wantCharge {
+				chargedTotal++
+				if state != "charged" || !input.Valid || input.Int64 != tc.wantInput ||
+					!output.Valid || output.Int64 != tc.wantOutput || !total.Valid || total.Int64 != tc.wantTotal || reviewReason != "" {
+					t.Fatalf("state=%s review=%q input=%v output=%v total=%v", state, reviewReason, input, output, total)
+				}
+			} else if state != "pending_review" {
+				t.Fatalf("state=%s, want pending_review", state)
+			}
+			if tc.name == "anthropic-message-start-only" && reviewReason != "missing_terminal_usage" {
+				t.Fatalf("review reason=%q, want missing_terminal_usage", reviewReason)
+			}
+			if !tc.wantCharge && !tc.cancel && (input.Valid || output.Valid || total.Valid) {
+				t.Fatalf("unexpected retained usage: %v %v %v", input, output, total)
+			}
+			if tc.cancel && (input.Valid != (tc.wantInput >= 0) || (input.Valid && input.Int64 != tc.wantInput)) {
+				t.Fatalf("expected partial input evidence: %v", input)
+			}
+			if tc.cancel && (output.Valid != (tc.wantOutput >= 0) || (output.Valid && output.Int64 != tc.wantOutput)) {
+				t.Fatalf("expected partial output evidence: %v", output)
+			}
+			assertBeichenGatewayMonth(t, ctx, f.db, tc.name,
+				fmt.Sprintf("%d.%04d", chargedTotal*3209/10000, chargedTotal*3209%10000), chargedTotal)
+		})
+	}
+}

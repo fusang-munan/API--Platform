@@ -75,7 +75,7 @@ func TestBeichenPricingAdmitsOnlyConsistentTerminalCounts(t *testing.T) {
 		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cached_tokens":58,"cache_write_tokens":2}}`, beichenIncompleteUsage, true},
 		{`{"input_tokens":59,"output_tokens":3,"total_tokens":100,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}`, beichenIncompleteUsage, true},
 	} {
-		response := parseJSONResponseMetrics(modelbinding.AdapterOpenaiResponses, []byte(`{"usage":`+tc.usage+`}`)).finished(false)
+		response := parseJSONResponseMetrics(modelbinding.AdapterOpenaiResponses, []byte(`{"status":"completed","usage":`+tc.usage+`}`)).finishedJSON(modelbinding.AdapterOpenaiResponses, "/v1/responses", false)
 		metrics, reason := beichenReviewMetrics(modelbinding.AdapterOpenaiResponses, response, "")
 		if reason != tc.reason || (metrics.State == usage.UsagePartial) != tc.partial ||
 			metrics.PromptTokens == nil || *metrics.PromptTokens != 59 {
