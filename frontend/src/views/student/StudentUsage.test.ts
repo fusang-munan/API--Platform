@@ -80,7 +80,53 @@ describe('StudentUsage', () => {
     expect(rows[0].text()).toContain('10')
     expect(rows[0].text()).toContain('1,234')
     expect(rows[0].text()).toContain('25%')
-    expect(rows[1].findAll('td').map(cell => cell.text())).toEqual(['0', '—', '—'])
+    expect(rows[0].findAll('td').map(cell => cell.text())).toEqual(['10', '3 次', '1,234', '25%'])
+    expect(rows[1].findAll('td').map(cell => cell.text())).toEqual(['0', '0 次', '—', '—'])
+    wrapper.unmount()
+  })
+
+  it('merges the same model across projects and keys into one summary row', async () => {
+    const payload = {
+      month: '2026-11',
+      projects: [{
+        project_id: 'project-1',
+        project_name: '项目一',
+        quota: '100.000',
+        used: '12.500',
+        pending: '0.000',
+        available: '87.500',
+        keys: [
+          {
+            id: 'key-1', name: '我的 Key', status: 'active', used: '10.000', pending: '0.000',
+            models: [{ id: 'gpt-5', name: 'GPT-5', credits: '10.000', calls: 3, tokens: 1200, cache_hit_rate: 0.2 }],
+          },
+          {
+            id: 'key-2', name: '第二把 Key', status: 'active', used: '2.500', pending: '0.000',
+            models: [{ id: 'GPT-5', name: 'GPT-5', credits: '2.500', calls: 1, tokens: 300, cache_hit_rate: 0.6 }],
+          },
+        ],
+      }],
+    } as unknown as StudentUsagePayload
+    const wrapper = mountUsage(payload)
+    await flushPromises()
+
+    const rows = wrapper.findAll('[data-testid="student-model-summary"] tbody tr')
+    expect(rows).toHaveLength(1)
+    expect(rows[0].text()).toContain('GPT-5')
+    expect(rows[0].findAll('td').map(cell => cell.text())).toEqual(['12.5', '4 次', '1,500', '30%', '—'])
+    // 原有按 Key 明细保留两行
+    expect(wrapper.findAll('.student-model-table tbody tr')).toHaveLength(2)
+    wrapper.unmount()
+  })
+
+  it('keeps the summary view honest when the selected range is not returned by the API', async () => {
+    const wrapper = mountUsage(baseUsage)
+    await flushPromises()
+
+    await wrapper.get('[data-testid="usage-range-all"]').trigger('click')
+    const rows = wrapper.findAll('[data-testid="student-model-summary"] tbody tr')
+    expect(rows).toHaveLength(2)
+    expect(rows[0].findAll('td').map(cell => cell.text())).toEqual(['—', '—', '—', '—', '—'])
     wrapper.unmount()
   })
 
@@ -127,7 +173,7 @@ describe('StudentUsage', () => {
     await wrapper.get('[data-testid="usage-range-day"]').trigger('click')
     expect(wrapper.text()).toContain('只返回本月汇总')
     expect(row.text()).not.toContain('1,234')
-    expect(row.findAll('td').map(cell => cell.text())).toEqual(['—', '—', '—'])
+    expect(row.findAll('td').map(cell => cell.text())).toEqual(['—', '—', '—', '—'])
 
     await wrapper.get('[data-testid="usage-range-month"]').trigger('click')
     expect(row.text()).toContain('1,234')
