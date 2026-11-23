@@ -336,6 +336,8 @@ go test ./...
 
 执行 `go test ./cmd/beichen-report ./internal/beichen -run TestDashboard -count=1 -v`，验证日期与粒度、Key 过滤、翻页、空数据、401、金额差额和报告保存。设置 `NEBULA_TEST_POSTGRES` 为隔离的本机测试库，可同时验证按北京时间日期、模型和 Key 的对账，以及无回执、待核账和一侧缺记录。全量检查执行 `go build ./...` 和 `go test ./...`。
 
+待核账审计报告出现 `unknown` 时，先看 `missing` 和 `note`，再核对协议的计数口径、原始输入输出总量、缓存计数，以及可产生费用的分项在派发时刻的报价。报告中的金额零值需结合分类阅读。运行 `go test ./internal/usage/pendingaudit -count=1 -v`，在无数据库连接的情况下复查协议拆分、缺项、金额区间、推荐比例和自动结算阈值。
+
 - 网页提示会话过期时，先用本机登录窗口更新会话，再运行 `go run ./cmd/beichen-report --range 7d`。
 - 平台卡片的请求差额在 `platforms.account_minus_platforms`，四把 Key 的差额在 `key_reconciliation.account_minus_sum`。实际金额和 Token 的差额另有字段。
 - `--reconcile` 用 `DATABASE_URL` 连接本机数据库。如果北辰供应商无法唯一确认，加 `--provider <供应商UUID>`。对账行里的 `null` 表示证据缺项，具体查看 `missing_reasons`。[对账字段说明](reports/beichen-crawl-stability.md)

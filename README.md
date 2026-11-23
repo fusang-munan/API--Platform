@@ -100,6 +100,8 @@ Windows 会话保存在 `%LOCALAPPDATA%\Nebula\beichen-session.json`，同目录
 
 `go run ./cmd/beichen-report --range 7d --granularity day` 读取本机加密会话，输出并保存仪表盘、平台、模型、趋势、最近使用和各把 Key 的用量及核对结果。范围可选 `today`、`7d`、`all`。加 `--reconcile` 后，通过 `DATABASE_URL` 只读比较本机网关账本与本轮网页数据，金额按元记账。[接口、用法和实抓记录](docs/reports/beichen-crawl-stability.md)
 
+`go run ./cmd/pending-audit` 通过只读连接生成北辰待核账报告，包含上游金额区间、推荐缓存拆分和自动结算判定。[参数与判定口径](docs/PENDING_AUDIT.md)
+
 ## 技术栈
 
 | 领域 | 现在的实现 |

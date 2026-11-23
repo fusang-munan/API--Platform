@@ -1,6 +1,10 @@
 package pendingaudit
 
-import "math"
+import (
+	"math"
+	"math/big"
+	"strconv"
+)
 
 const (
 	ClassExact   = "exact"
@@ -22,145 +26,277 @@ type Input struct {
 	OutputRate       *float64 `json:"output_rate,omitempty"`
 	CacheReadRate    *float64 `json:"cache_read_rate,omitempty"`
 	CacheWriteRate   *float64 `json:"cache_write_rate,omitempty"`
+	PriorReadShare   *float64 `json:"prior_read_share,omitempty"`
 }
 
 type Result struct {
-	Class         string   `json:"class"`
-	Missing       []string `json:"missing"`
-	UnknownTokens int64    `json:"unknown_tokens"`
-	RateSpread    float64  `json:"rate_spread"`
-	EstimatedYuan float64  `json:"estimated_yuan"`
-	MaxErrorYuan  float64  `json:"max_error_yuan"`
-	RelativeError float64  `json:"relative_error"`
-	Note          string   `json:"note"`
+	Class            string   `json:"class"`
+	Missing          []string `json:"missing"`
+	UnknownTokens    int64    `json:"unknown_tokens"`
+	RateSpread       float64  `json:"rate_spread"`
+	EstimatedYuan    float64  `json:"estimated_yuan"`
+	MaxErrorYuan     float64  `json:"max_error_yuan"`
+	RelativeError    float64  `json:"relative_error"`
+	Note             string   `json:"note"`
+	MinYuan          float64  `json:"min_yuan"`
+	MaxYuan          float64  `json:"max_yuan"`
+	RecommendedYuan  float64  `json:"recommended_yuan"`
+	RecommendedRead  int64    `json:"recommended_read"`
+	RecommendedWrite int64    `json:"recommended_write"`
+	CanAutoSettle    bool     `json:"can_auto_settle"`
 }
 
-func intValue(v *int64) int64 {
-	if v == nil {
-		return 0
-	}
-	return *v
-}
+const (
+	ordinaryInput = iota
+	cacheRead
+	cacheWrite
+	output
+)
 
-func rateValue(v *float64) (float64, bool) {
-	if v == nil || *v < 0 || math.IsNaN(*v) || math.IsInf(*v, 0) {
-		return 0, false
-	}
-	return *v, true
-}
-
-// Analyze gives an upper bound on the money that can be misallocated when the
-// token split is incomplete. It never guesses a split; it only decides whether
-// the remaining uncertainty is small enough to settle automatically.
+// Analyze prices the full range of legal token splits. Its recommendation is
+// one legal integer split and does not affect the eligibility decision.
 func Analyze(in Input, thresholdYuan, relativeThreshold float64) Result {
 	res := Result{Class: ClassUnknown, Missing: []string{}}
-	if in.PromptTokens == nil || in.CompletionTokens == nil {
-		if in.PromptTokens == nil {
-			res.Missing = append(res.Missing, "prompt_tokens")
-		}
-		if in.CompletionTokens == nil {
-			res.Missing = append(res.Missing, "completion_tokens")
-		}
-		res.Note = "缺少输入或输出总量，无法给出金额上界"
+	partTokens, remaining := res.split(in)
+	if res.Note != "" {
 		return res
 	}
-	prompt := *in.PromptTokens
-	completion := *in.CompletionTokens
-	read := in.CacheReadTokens
-	write := in.CacheWriteTokens
-	if read == nil {
-		res.Missing = append(res.Missing, "cache_read_tokens")
+	res.UnknownTokens = remaining
+
+	share := 0.5
+	if in.PriorReadShare != nil {
+		share = *in.PriorReadShare
 	}
-	if write == nil {
-		res.Missing = append(res.Missing, "cache_write_tokens")
+	if !nonnegativeFinite(share) || share > 1 {
+		res.Note = "缓存读推荐比例必须在 0 到 1 之间"
+		return res
 	}
 
-	var unknown int64
-	switch in.Protocol {
-	case "anthropic":
-		if in.TotalTokens == nil && (read == nil || write == nil) {
-			res.Note = "Anthropic 缺少总 Token，无法给缓存缺项定上界"
-			return res
+	passedRates := [4]*float64{in.InputRate, in.CacheReadRate, in.CacheWriteRate, in.OutputRate}
+	rateFields := [4]string{"input_rate", "cache_read_rate", "cache_write_rate", "output_rate"}
+	var rates [4]*big.Rat
+	var fixedCost big.Rat
+	var minRate, maxRate *big.Rat
+	var missingPrice bool
+	for part, tokens := range partTokens {
+		if (tokens == nil && remaining == 0) || (tokens != nil && *tokens == 0) {
+			continue
 		}
-		if in.TotalTokens != nil {
-			known := prompt + completion + intValue(read) + intValue(write)
-			if *in.TotalTokens < known {
-				res.Note = "已知分项之和超过上游总量，证据矛盾"
-				return res
+		rate := passedRates[part]
+		if rate == nil || !nonnegativeFinite(*rate) {
+			res.Missing = append(res.Missing, rateFields[part])
+			missingPrice = true
+			continue
+		}
+		rates[part] = decimal(*rate)
+		if tokens != nil {
+			fixedCost.Add(&fixedCost, tokenCost(*tokens, rates[part]))
+			continue
+		}
+		if minRate == nil || rates[part].Cmp(minRate) < 0 {
+			minRate = rates[part]
+		}
+		if maxRate == nil || rates[part].Cmp(maxRate) > 0 {
+			maxRate = rates[part]
+		}
+	}
+	if missingPrice {
+		res.Note = "缺少可产生费用的有效单价，无法计算金额区间"
+		return res
+	}
+
+	minCost := new(big.Rat).Set(&fixedCost)
+	maxCost := new(big.Rat).Set(&fixedCost)
+	recommendation := new(big.Rat).Set(&fixedCost)
+	var spread big.Rat
+	split := recommend(partTokens, remaining, share)
+	if remaining > 0 {
+		// The sum of all unassigned parts is fixed. Assigning that whole
+		// integer balance to the lowest or highest rate attains each bound.
+		minCost.Add(minCost, tokenCost(remaining, minRate))
+		maxCost.Add(maxCost, tokenCost(remaining, maxRate))
+		spread.Sub(maxRate, minRate)
+		for part, tokens := range partTokens {
+			if tokens == nil && split[part] > 0 {
+				recommendation.Add(recommendation, tokenCost(split[part], rates[part]))
 			}
-			unknown = *in.TotalTokens - known
 		}
-	case "openai_compatible", "openai_responses", "openai_realtime", "google_gemini_v1beta":
-		if in.TotalTokens != nil && *in.TotalTokens != prompt+completion {
-			res.Note = "上游总量与输入输出不相等，无法唯一确定缓存拆分"
-			return res
-		}
-		if read == nil {
-			unknown = prompt
-		} else if write == nil {
-			unknown = prompt - *read
-			if unknown < 0 {
-				res.Note = "缓存读超过输入总量，证据矛盾"
-				return res
-			}
-		}
-	default:
-		res.Note = "未知协议，无法判断缓存口径"
-		return res
-	}
-	res.UnknownTokens = unknown
-	if unknown == 0 {
-		res.Class = ClassExact
-		res.Note = "所有计费分项已知，可直接结算"
-		return res
 	}
 
-	// Only categories that can absorb the unknown tokens count. Output cannot
-	// absorb cache ambiguity, and Anthropic prompt tokens exclude cache reads.
-	eligible := []*float64{in.InputRate, in.CacheReadRate, in.CacheWriteRate}
-	if in.Protocol == "anthropic" {
-		eligible = []*float64{in.CacheReadRate, in.CacheWriteRate}
-	}
-	rates := make([]float64, 0, len(eligible))
-	for _, r := range eligible {
-		if value, ok := rateValue(r); ok {
-			rates = append(rates, value)
-		}
-	}
-	if len(rates) < 2 {
-		res.Note = "缺少足够的价格分项，无法判断拆分对金额的影响"
+	maxYuan, _ := maxCost.Float64()
+	if math.IsInf(maxYuan, 0) {
+		res.Note = "金额超出可输出的数值范围"
 		return res
 	}
-	minRate, maxRate := rates[0], rates[0]
-	for _, r := range rates[1:] {
-		minRate = math.Min(minRate, r)
-		maxRate = math.Max(maxRate, r)
-	}
-	res.RateSpread = maxRate - minRate
+	width := new(big.Rat).Sub(maxCost, minCost)
+	res.MinYuan, _ = minCost.Float64()
+	res.MaxYuan = maxYuan
+	res.RecommendedYuan, _ = recommendation.Float64()
+	res.RecommendedRead, res.RecommendedWrite = split[cacheRead], split[cacheWrite]
+	res.EstimatedYuan = res.RecommendedYuan
+	res.MaxErrorYuan, _ = width.Float64()
+	res.RateSpread, _ = spread.Float64()
 
-	res.EstimatedYuan = float64(prompt)*value(in.InputRate) + float64(completion)*value(in.OutputRate) +
-		float64(intValue(read))*value(in.CacheReadRate) + float64(intValue(write))*value(in.CacheWriteRate)
-	res.MaxErrorYuan = float64(unknown) * res.RateSpread
-	if res.EstimatedYuan > 0 {
-		res.RelativeError = res.MaxErrorYuan / res.EstimatedYuan
-	}
+	var relativeOK bool
 	switch {
-	case res.RateSpread == 0:
-		res.Class = ClassExact
-		res.Note = "拆分不影响金额，可直接结算"
-	case res.MaxErrorYuan <= thresholdYuan || res.RelativeError <= relativeThreshold:
-		res.Class = ClassNarrow
-		res.Note = "金额区间很窄，可按保守值自动结算并标记低置信度"
+	case width.Sign() == 0:
+		res.Class, res.CanAutoSettle = ClassExact, true
+		res.Note = "合法拆分对应的金额唯一，可自动结算"
+		return res
+	case minCost.Sign() > 0:
+		relative := new(big.Rat).Quo(width, minCost)
+		res.RelativeError, _ = relative.Float64()
+		res.RelativeError = math.Min(res.RelativeError, math.MaxFloat64)
+		relativeOK = within(relative, relativeThreshold)
 	default:
+		// A positive width over a zero lower bound has no finite relative
+		// limit. Keep the existing numeric field JSON-encodable.
+		res.RelativeError = math.MaxFloat64
+	}
+	if within(width, thresholdYuan) || relativeOK {
+		res.Class, res.CanAutoSettle = ClassNarrow, true
+		res.Note = "金额区间满足结算阈值，可按推荐金额自动结算"
+	} else {
 		res.Class = ClassWide
-		res.Note = "金额区间较宽，需要历史估计或人工核验"
+		res.Note = "金额区间超过结算阈值，需要补充证据或人工核验"
 	}
 	return res
 }
 
-func value(v *float64) float64 {
-	if v == nil {
-		return 0
+// split returns the evidence for each billed part and the undistributed
+// balance. A nil billed part can absorb any integer share of that balance.
+func (res *Result) split(in Input) ([4]*int64, int64) {
+	parts := [4]*int64{nil, in.CacheReadTokens, in.CacheWriteTokens, in.CompletionTokens}
+	tokenFields := [...]struct {
+		name  string
+		count *int64
+	}{
+		{"prompt_tokens", in.PromptTokens},
+		{"completion_tokens", in.CompletionTokens},
+		{"cache_read_tokens", in.CacheReadTokens},
+		{"cache_write_tokens", in.CacheWriteTokens},
 	}
-	return *v
+	for _, field := range tokenFields {
+		if field.count == nil {
+			res.Missing = append(res.Missing, field.name)
+		}
+	}
+	if in.PromptTokens == nil || in.CompletionTokens == nil {
+		res.Note = "缺少输入或输出总量，无法计算金额区间"
+		return parts, 0
+	}
+	for _, field := range tokenFields {
+		if field.count != nil && *field.count < 0 {
+			res.Note = "Token 数为负，证据矛盾"
+			return parts, 0
+		}
+	}
+	prompt, completion := *in.PromptTokens, *in.CompletionTokens
+	if prompt > math.MaxInt64-completion || (in.TotalTokens != nil && *in.TotalTokens < completion) {
+		res.Note = "输入输出与总 Token 不相符，或超出计数范围"
+		return parts, 0
+	}
+
+	budget := prompt
+	switch in.Protocol {
+	case "anthropic":
+		parts[ordinaryInput] = in.PromptTokens
+		if in.TotalTokens != nil {
+			budget = *in.TotalTokens - completion
+			break
+		}
+		if in.CacheReadTokens == nil || in.CacheWriteTokens == nil {
+			res.Missing = append(res.Missing, "total_tokens")
+			res.Note = "Anthropic 缺少总 Token，无法给缓存缺项定上界"
+			return parts, 0
+		}
+		for _, cache := range []*int64{in.CacheReadTokens, in.CacheWriteTokens} {
+			if *cache > math.MaxInt64-completion-budget {
+				res.Note = "分项之和超出总 Token 的计数范围"
+				return parts, 0
+			}
+			budget += *cache
+		}
+	case "openai_compatible", "openai_responses", "google_gemini_v1beta":
+		if in.TotalTokens != nil && *in.TotalTokens != prompt+completion {
+			res.Note = "上游总量与输入输出之和不相等，证据矛盾"
+			return parts, 0
+		}
+	default:
+		res.Note = "协议缺少适用的纯文本计费口径"
+		return parts, 0
+	}
+	remaining := budget
+	for _, tokens := range parts[:output] {
+		if tokens != nil {
+			if *tokens > remaining {
+				res.Note = "已知计费分项超过可分配的 Token 总量，证据矛盾"
+				return parts, 0
+			}
+			remaining -= *tokens
+		}
+	}
+	if in.CacheReadTokens == nil || in.CacheWriteTokens == nil {
+		return parts, remaining
+	}
+	if parts[ordinaryInput] == nil {
+		parts[ordinaryInput] = &remaining
+	} else if remaining != 0 {
+		res.Note = "分项齐全但仍有未归属的 Token，证据矛盾"
+	}
+	return parts, 0
+}
+
+func recommend(parts [4]*int64, remaining int64, readShare float64) [4]int64 {
+	var split [4]int64
+	for part, tokens := range parts {
+		if tokens != nil {
+			split[part] = *tokens
+		}
+	}
+	if remaining == 0 {
+		return split
+	}
+	if parts[cacheRead] == nil {
+		read := remaining
+		if parts[ordinaryInput] == nil || parts[cacheWrite] == nil {
+			// Round half up in integers, including for counts near MaxInt64.
+			rounded := tokenCost(remaining, decimal(readShare))
+			rounded.Add(rounded, big.NewRat(1, 2))
+			read = new(big.Int).Quo(rounded.Num(), rounded.Denom()).Int64()
+		}
+		split[cacheRead] = read
+		remaining -= read
+	}
+	if parts[cacheWrite] == nil {
+		write := remaining
+		if parts[ordinaryInput] == nil {
+			write /= 2
+		}
+		split[cacheWrite] = write
+		remaining -= write
+	}
+	if parts[ordinaryInput] == nil {
+		split[ordinaryInput] = remaining
+	}
+	return split
+}
+
+func tokenCost(tokens int64, rate *big.Rat) *big.Rat {
+	return new(big.Rat).Mul(big.NewRat(tokens, 1), rate)
+}
+
+// Interpret finite configuration values as round-trippable decimals so a
+// threshold comparison does not depend on binary float subtraction.
+func decimal(value float64) *big.Rat {
+	number, _ := new(big.Rat).SetString(strconv.FormatFloat(value, 'g', -1, 64))
+	return number
+}
+
+func nonnegativeFinite(value float64) bool {
+	return value >= 0 && !math.IsInf(value, 0)
+}
+
+func within(value *big.Rat, threshold float64) bool {
+	return nonnegativeFinite(threshold) && value.Cmp(decimal(threshold)) <= 0
 }

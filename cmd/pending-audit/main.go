@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"time"
@@ -48,16 +49,18 @@ func main() {
 
 func run() error {
 	dsn := flag.String("dsn", os.Getenv("DATABASE_URL"), "PostgreSQL 只读连接串，默认读取 DATABASE_URL")
-	threshold := flag.Float64("threshold", 0.001, "自动结算允许的最大金额误差（元）")
-	relative := flag.Float64("relative", 0.01, "自动结算允许的相对误差，例如 0.01 表示 1%")
+	threshold := flag.Float64("threshold", 0.001, "自动结算允许的最大区间宽度（元）")
+	relative := flag.Float64("relative", 0.01, "自动结算允许的相对区间宽度，例如 0.01 表示 1%")
+	priorReadShare := flag.Float64("prior-read-share", 0.5, "未报告缓存读时的推荐比例，范围 0 到 1")
 	limit := flag.Int("limit", 2000, "最多读取多少笔待核")
 	out := flag.String("out", "pending-audit.json", "JSON 输出路径")
 	flag.Parse()
 	if *dsn == "" {
 		return errors.New("需要 --dsn 或 DATABASE_URL")
 	}
-	if *limit < 1 || *threshold < 0 || *relative < 0 {
-		return errors.New("limit/threshold/relative 参数不合法")
+	if *limit < 1 || !(*threshold >= 0 && *threshold <= math.MaxFloat64) ||
+		!(*relative >= 0 && *relative <= math.MaxFloat64) || !(*priorReadShare >= 0 && *priorReadShare <= 1) {
+		return errors.New("limit/threshold/relative/prior-read-share 参数不合法")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -75,7 +78,12 @@ func run() error {
 SELECT c.id::text,c.user_name,COALESCE(c.upstream_model_name,c.model_name),c.protocol,
   COALESCE(c.usage_state,''),COALESCE(c.usage_reason,''),COALESCE(c.beichen_review_reason,''),
   c.prompt_tokens,c.completion_tokens,c.total_tokens,c.cache_hit_tokens,c.cache_write_tokens,
-  p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write,c.created_at
+  -- Stored rates are millionths of an upstream unit per million tokens.
+  p.upstream_input * 0.000000000001::numeric,
+  p.upstream_output * 0.000000000001::numeric,
+  p.upstream_cache_read * 0.000000000001::numeric,
+  p.upstream_cache_write * 0.000000000001::numeric,
+  c.created_at
 FROM gateway_calls c
 LEFT JOIN LATERAL beichen_price_at(c.beichen_dispatch_credential_id,c.beichen_dispatch_model,
   COALESCE(c.beichen_price_at,c.sent_at)) p ON true
@@ -111,6 +119,7 @@ LIMIT $1`, *limit)
 			TotalTokens: nullableInt(total), CacheReadTokens: nullableInt(hit), CacheWriteTokens: nullableInt(write),
 			InputRate: nullableFloat(inputRate), OutputRate: nullableFloat(outputRate),
 			CacheReadRate: nullableFloat(readRate), CacheWriteRate: nullableFloat(writeRate),
+			PriorReadShare: priorReadShare,
 		}
 		item.Result = pendingaudit.Analyze(item.Input, *threshold, *relative)
 		rep.Rows = append(rep.Rows, item)
