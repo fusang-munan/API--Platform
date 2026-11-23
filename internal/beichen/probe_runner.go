@@ -10,7 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
+
 	"time"
 
 	"github.com/google/uuid"
@@ -23,8 +23,10 @@ const (
 	probeDBTimeout         = 15 * time.Second
 	probeAttemptTimeout    = 8 * time.Second
 	defaultProbeDailyLimit = 500
-	probeFailureRetries    = 2
-	probeRetryDelay        = 2 * time.Second
+	// Includes first attempts and retries, for both manual and automatic sweeps.
+	probeSweepLimit     = 32
+	probeFailureRetries = 2
+	probeRetryDelay     = 2 * time.Second
 )
 
 // probeDailyLimit reads the cap on each call so a changed environment is
@@ -60,9 +62,9 @@ func probeBudget(used, limit int, now time.Time) ProbeBudget {
 }
 
 type probeJob struct {
-	provider, lease uuid.UUID
-	startedAt       time.Time
-	force           bool
+	provider, lease, id uuid.UUID
+	startedAt           time.Time
+	force               bool
 }
 
 type probeTarget struct {
@@ -76,6 +78,7 @@ type probeTarget struct {
 }
 
 type probeObservation struct {
+	usage      catalog.ProbeUsage
 	target     probeTarget
 	statusCode int
 	errorCode  string
@@ -113,7 +116,7 @@ WITH candidate AS (
   SELECT p.id FROM providers p LEFT JOIN beichen_probe_jobs q ON q.provider_id = p.id
   WHERE `+beichenProvider+` AND (q.lease_until IS NULL OR q.lease_until <= statement_timestamp())
     AND (q.requested_at IS NOT NULL OR ($1 AND p.status = 'active' AND `+activeProbeCatalog+`
-      AND (q.finished_at IS NULL OR q.started_at <= statement_timestamp() - interval '1 hour')))
+      AND (q.finished_at IS NULL OR q.finished_at <= statement_timestamp() - interval '1 hour')))
   ORDER BY q.requested_at NULLS LAST, q.started_at NULLS FIRST, p.id
   LIMIT 1
 )
@@ -121,12 +124,13 @@ INSERT INTO beichen_probe_jobs AS q(provider_id, started_at, lease_id, lease_unt
 SELECT id, statement_timestamp(), $2, clock_timestamp() + interval '60 seconds' FROM candidate
 ON CONFLICT (provider_id) DO UPDATE
 SET started_at = CASE WHEN q.finished_at IS NULL AND q.started_at IS NOT NULL THEN q.started_at ELSE EXCLUDED.started_at END,
+    job_id = CASE WHEN q.finished_at IS NULL AND q.started_at IS NOT NULL THEN q.job_id ELSE EXCLUDED.job_id END,
     finished_at = NULL, last_error = NULL, lease_id = EXCLUDED.lease_id, lease_until = EXCLUDED.lease_until
 WHERE (q.lease_until IS NULL OR q.lease_until <= clock_timestamp())
   AND (q.requested_at IS NOT NULL OR ($1 AND
-    (q.finished_at IS NULL OR q.started_at <= clock_timestamp() - interval '1 hour')))
-RETURNING provider_id, started_at, COALESCE(requested_at <= started_at, false)`, automatic, job.lease).
-		Scan(&job.provider, &job.startedAt, &job.force)
+    (q.finished_at IS NULL OR q.finished_at <= clock_timestamp() - interval '1 hour')))
+RETURNING provider_id, started_at, job_id, COALESCE(requested_at <= started_at, false)`, automatic, job.lease).
+		Scan(&job.provider, &job.startedAt, &job.id, &job.force)
 	return job, err
 }
 
@@ -160,50 +164,21 @@ func (s *Service) executeProbeJob(ctx context.Context, job probeJob) (string, er
 	if !hasTargets {
 		return "no_token_protocols", nil
 	}
+	runRound := func(ctx context.Context, batch []probeTarget) ([]probeObservation, error) {
+		return s.runProbeRound(ctx, job, batch)
+	}
 	for len(targets) > 0 {
-		budgetCtx, cancel := context.WithTimeout(ctx, probeDBTimeout)
-		budget, err := readProbeBudget(budgetCtx, s.db)
-		cancel()
+		n := min(len(targets), probeParallelism)
+		observations, err := runRound(ctx, targets[:n])
 		if err != nil {
 			return "", err
 		}
-		batch := make([]probeTarget, 0, probeParallelism)
-		for len(targets) > 0 && len(batch) < probeParallelism {
-			target := targets[0]
-			targets = targets[1:]
-			if target.lastCheck.In(beijing).Format(dayLayout) != budget.Date {
-				if budget.Remaining <= 0 {
-					continue
-				}
-				budget.Remaining--
-			}
-			batch = append(batch, target)
-		}
-		if len(batch) == 0 {
+		if len(observations) == 0 {
 			break
 		}
-		leaseCtx, cancel := context.WithTimeout(ctx, probeDBTimeout)
-		err = renewProbeLease(leaseCtx, s.db, job)
-		cancel()
-		if err != nil {
+		targets = targets[n:]
+		if err := retryFailedProbes(ctx, observations, probeRetryDelay, runRound); err != nil {
 			return "", err
-		}
-		observations := make([]probeObservation, len(batch))
-		var wg sync.WaitGroup
-		for i, target := range batch {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				observations[i] = observeTarget(ctx, target)
-			}()
-		}
-		wg.Wait()
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		retryFailedProbes(ctx, observations, probeRetryDelay)
-		if ctx.Err() != nil {
-			return "", ctx.Err()
 		}
 		saveCtx, cancel := context.WithTimeout(ctx, probeDBTimeout)
 		err = s.saveProbeBatch(saveCtx, job, observations)
@@ -219,7 +194,8 @@ func (s *Service) executeProbeJob(ctx context.Context, job probeJob) (string, er
 // availability verdict, so a short upstream blip cannot hide models until the
 // next hourly sweep. Deterministic failures (auth, missing model, validation)
 // are recorded on the first attempt.
-func retryFailedProbes(ctx context.Context, observations []probeObservation, delay time.Duration) {
+func retryFailedProbes(ctx context.Context, observations []probeObservation, delay time.Duration,
+	runRound func(context.Context, []probeTarget) ([]probeObservation, error)) error {
 	for attempt := 0; attempt < probeFailureRetries; attempt++ {
 		pending := make([]int, 0, len(observations))
 		for i := range observations {
@@ -228,29 +204,32 @@ func retryFailedProbes(ctx context.Context, observations []probeObservation, del
 			}
 		}
 		if len(pending) == 0 {
-			return
+			break
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-time.After(delay * time.Duration(attempt+1)):
 		}
-		if ctx.Err() != nil {
-			return
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		var wg sync.WaitGroup
-		for _, i := range pending {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				observations[i] = observeTarget(ctx, observations[i].target)
-			}(i)
+		targets := make([]probeTarget, len(pending))
+		for i, index := range pending {
+			targets[i] = observations[index].target
 		}
-		wg.Wait()
-		if ctx.Err() != nil {
-			return
+		retried, err := runRound(ctx, targets)
+		if err != nil {
+			return err
+		}
+		for i, result := range retried {
+			observations[pending[i]] = result
+		}
+		if len(retried) < len(targets) {
+			break
 		}
 	}
+	return nil
 }
 
 // probeFailureRetryable reports failures that can heal on their own.
@@ -273,7 +252,8 @@ FROM providers p JOIN provider_credentials c ON c.provider_id = p.id
 JOIN provider_model_catalog m ON m.provider_id = p.id AND m.credential_id = c.id
 CROSS JOIN LATERAL (
   SELECT COALESCE(json_agg(r.protocol) FILTER (WHERE r.checked_at >= c.updated_at
-    AND (r.checked_at >= $2::timestamptz OR (NOT $3::boolean AND r.checked_at >= statement_timestamp() - interval '1 hour'))), '[]') AS done,
+    AND (r.checked_at >= $2::timestamptz OR (NOT $3::boolean AND r.checked_at > statement_timestamp() -
+      CASE WHEN r.status_code BETWEEN 200 AND 299 AND r.error_code IS NULL THEN interval '6 hours' ELSE interval '1 hour' END))), '[]') AS done,
     COALESCE(json_object_agg(r.protocol, r.checked_at), '{}') AS checks
   FROM upstream_probes r
   WHERE r.provider_id = p.id AND r.credential_id = c.id AND r.model = m.model_id::text
@@ -341,6 +321,8 @@ ORDER BY c.id, m.model_id`, job.provider, job.startedAt, job.force)
 			}
 		}
 	}
+	// New and oldest observations get first access to a limited sweep.
+	slices.SortStableFunc(targets, func(a, b probeTarget) int { return a.lastCheck.Compare(b.lastCheck) })
 	return targets, hasTargets, rows.Err()
 }
 
@@ -366,6 +348,7 @@ func observeTarget(ctx context.Context, target probeTarget) probeObservation {
 		result.errorCode = "network_error"
 		return result
 	}
+	result.usage = step.Usage
 	result.statusCode, result.errorCode, result.durationMS = step.HTTPStatus, step.FailureCode, step.DurationMS
 	return result
 }

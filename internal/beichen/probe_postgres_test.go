@@ -21,7 +21,7 @@ import (
 
 func TestManualProbeRefreshesRecentFailureOnItsCatalogKeyPostgres(t *testing.T) {
 	ctx, db, provider, _, keys := newActionsPostgres(t)
-	t.Setenv("BEICHEN_PROBE_DAILY_LIMIT", "2")
+	t.Setenv("BEICHEN_PROBE_DAILY_LIMIT", "6")
 	manager, err := security.NewManager([]byte(strings.Repeat("j", 32)), []byte(strings.Repeat("a", 32)),
 		[]byte(strings.Repeat("k", 32)), []byte(strings.Repeat("e", 32)), time.Minute)
 	if err != nil {
@@ -65,8 +65,8 @@ FROM provider_model_catalog WHERE provider_id=$1 AND credential_id=$2`, provider
 		return view
 	}
 	before := previous()
-	if !before.Run.Budget.Exhausted || before.Results[0].StatusCode != 400 {
-		t.Fatalf("expected same-day failures and exhausted budget: %+v", before)
+	if before.Run.Budget.Used != 0 || before.Results[0].StatusCode != 400 {
+		t.Fatalf("legacy latest rows must not fabricate usage history: %+v", before)
 	}
 	auto, err := s.claimProbeJob(ctx, true)
 	if err != nil || auto.force {
@@ -90,7 +90,11 @@ FROM provider_model_catalog WHERE provider_id=$1 AND credential_id=$2`, provider
 		requestsMu.Lock()
 		requests++
 		requestsMu.Unlock()
-		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(`{"choices":[{}]}`))}, nil
+		body := `{"error":{"type":"bad_request"}}`
+		if status == http.StatusOK {
+			body = `{"choices":[{}],"usage":{"prompt_tokens":20,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":0}}}`
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
 	})
 	checkManual := func() ProbesView {
 		t.Helper()
@@ -144,6 +148,22 @@ FROM provider_model_catalog WHERE provider_id=$1 AND credential_id=$2`, provider
 		if result.StatusCode != 400 || result.LastPassedAt != nil {
 			t.Fatalf("failure after key rotation inherited old success: %+v", result)
 		}
+	}
+	requestManual()
+	if final := checkManual(); !final.Run.Budget.Exhausted || final.Run.Budget.Used != 6 {
+		t.Fatalf("forced sweep exceeded daily limit: %+v", final.Run.Budget)
+	}
+	day := time.Now().In(beijing).Format(dayLayout)
+	totals, err := s.ProbeUsageForDay(ctx, provider, day)
+	if err != nil || totals.Attempts != 6 || totals.Input.Reported != 2 || totals.Input.Tokens == nil || *totals.Input.Tokens != 40 ||
+		totals.Output.Tokens == nil || *totals.Output.Tokens != 2 || totals.CacheRead.Tokens == nil || *totals.CacheRead.Tokens != 0 || totals.CacheWrite.Tokens != nil {
+		t.Fatalf("unexpected probe-only summary: %+v %v", totals, err)
+	}
+	var failures int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM beichen_probe_usage WHERE credential_id=$1 AND job_id IS NOT NULL
+		AND status_code=400 AND error_code='http_error' AND input_tokens IS NULL AND output_tokens IS NULL
+		AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL`, gm1).Scan(&failures); err != nil || failures != 4 {
+		t.Fatalf("failure ledger rows %d, err %v", failures, err)
 	}
 	if requests != 6 {
 		t.Fatalf("manual probe attempts = %d, want 6", requests)
@@ -274,7 +294,7 @@ VALUES(gen_random_uuid(),$1,$2,'inactive-key-model',now(),now(),now(),now())`, p
 	}
 	exec("UPDATE beichen_probe_jobs SET lease_until = now()-interval '1 second' WHERE provider_id=$1", provider)
 	resumed, err := s.claimProbeJob(ctx, false)
-	if err != nil || !resumed.startedAt.Equal(job.startedAt) || resumed.lease == job.lease {
+	if err != nil || !resumed.startedAt.Equal(job.startedAt) || resumed.id != job.id || resumed.lease == job.lease {
 		t.Fatalf("expired probe did not resume: %v", err)
 	}
 	s.runProbeJob(ctx, resumed)
@@ -309,7 +329,7 @@ VALUES(gen_random_uuid(),$1,$2,'inactive-key-model',now(),now(),now(),now())`, p
 	if _, err := s.claimProbeJob(ctx, true); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("early automatic probe scheduled: %v", err)
 	}
-	exec("UPDATE beichen_probe_jobs SET started_at = now()-interval '61 minutes' WHERE provider_id=$1", provider)
+	exec("UPDATE beichen_probe_jobs SET finished_at = now()-interval '61 minutes' WHERE provider_id=$1", provider)
 	hourly, err := s.claimProbeJob(ctx, true)
 	if err != nil || !hourly.startedAt.After(resumed.startedAt) {
 		t.Fatalf("automatic probe did not become due: %v", err)
