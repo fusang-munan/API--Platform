@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/google/uuid"
@@ -49,16 +50,19 @@ func requireLedgerRow(result sql.Result, err error) error {
 // finishRoutedCall runs with the gateway call locked. A review releases the
 // temporary hold once; a later terminal report can settle that same call.
 func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success bool, outcome, category, message string, route CallRoute, metrics CallMetrics) error {
-	var state, kind, model, oldOutcome string
+	var state, kind, model, oldOutcome, protocol string
 	var hold, multiplier int64
 	var dispatchAt sql.NullTime
 	var credential uuid.NullUUID
 	err := tx.QueryRowContext(ctx, `SELECT beichen_state,credit_milli,multiplier_milli,
 		COALESCE(beichen_dispatch_kind,''),beichen_dispatch_at,beichen_dispatch_credential_id,
-		COALESCE(beichen_dispatch_model,''),outcome FROM gateway_calls WHERE id=$1`, callID).
-		Scan(&state, &hold, &multiplier, &kind, &dispatchAt, &credential, &model, &oldOutcome)
+		COALESCE(beichen_dispatch_model,''),outcome,protocol FROM gateway_calls WHERE id=$1`, callID).
+		Scan(&state, &hold, &multiplier, &kind, &dispatchAt, &credential, &model, &oldOutcome, &protocol)
 	if err != nil {
 		return err
+	}
+	if route.Beichen {
+		metrics = metrics.ClassifyBeichenUsage(protocol)
 	}
 	if state == "released" {
 		return nil
@@ -155,7 +159,7 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 	if _, err = tx.ExecContext(ctx, `UPDATE monitored_inputs SET visible=true WHERE call_id=$1`, callID); err != nil {
 		return err
 	}
-	if priceAt.Valid && success && category == "" && metrics.State == UsageReported {
+	if priceAt.Valid && success && category == "" && metrics.CanPriceBeichenUsage(protocol) {
 		return settleBeichenReport(ctx, tx, callID, metrics)
 	}
 	return refreshLedgerTurn(ctx, tx, callID, "0", false)
@@ -199,7 +203,7 @@ const derivedPriceSource = "derived_from_usage"
 func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics) error {
 	var school, upstream, effort sql.NullString
 	var mode, protocol, ttl, missingRate, upstreamSource string
-	var terms []byte
+	var terms, fixedRates []byte
 	var quoteVersion sql.NullInt64
 	var quoteMultiplier sql.NullString
 	var noFixedSchool bool
@@ -208,8 +212,9 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 	err := tx.QueryRowContext(ctx, `SELECT cost.school::text,cost.upstream::text,
 		p.mode,p.upstream_version,p.multiplier_version,COALESCE(version.source,''),
 		num_nonnulls(p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)=0,
+		jsonb_build_array(p.school_input,p.school_output,p.school_cache_read,p.school_cache_write),
 		c.protocol,c.reasoning_effort,COALESCE(c.cache_ttl,''),
-		quote.terms,quote.multiplier_version,quote.multiplier::text,
+		quote.terms,quote.multiplier_version,trim_scale(quote.multiplier)::text,
 		CASE
 		  WHEN COALESCE($4::bigint,0)>0 AND p.upstream_cache_read IS NULL THEN 'missing_cache_read_price'
 		  WHEN COALESCE($6::bigint,0)>0 AND p.upstream_cache_write IS NULL THEN 'missing_cache_write_price'
@@ -229,7 +234,7 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 		FOR UPDATE OF c`, callID, metrics.PromptTokens, metrics.CompletionTokens,
 		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens).Scan(
 		&school, &upstream, &mode, &charge.upstreamVersion, &charge.multiplierVersion, &upstreamSource, &noFixedSchool,
-		&protocol, &effort, &ttl, &terms, &quoteVersion, &quoteMultiplier, &missingRate)
+		&fixedRates, &protocol, &effort, &ttl, &terms, &quoteVersion, &quoteMultiplier, &missingRate)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -245,14 +250,16 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 		base = upstream
 	}
 	reason := ""
-	manualPriced := mode == "manual" && school.Valid
+	metrics = metrics.ClassifyBeichenUsage(protocol)
+	partial := metrics.State == UsagePartial
+	manualPriced := mode == "manual" && (school.Valid || (partial && !noFixedSchool))
 	anthropicWrite := protocol == "anthropic" && metrics.CacheWriteTokens != nil && *metrics.CacheWriteTokens > 0
 	cacheDuration := beichenCacheTTL(ttl)
 	switch {
 	case upstreamSource == derivedPriceSource && !manualPriced:
 		base = sql.NullString{}
 		reason = "derived_price_requires_review"
-	case metrics.ClassifyBeichenUsage(protocol).State != UsageReported:
+	case !metrics.CanPriceBeichenUsage(protocol):
 		base = sql.NullString{}
 		reason = "incomplete_token_breakdown"
 	// A complete teacher-set price has one fixed rate for all cache writes.
@@ -265,7 +272,7 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 			observedEffort = &effort.String
 		}
 		var evaluated beichenConditionalPrice
-		evaluated, reason = evaluateBeichenConditional(terms, metrics, observedEffort, ttl, protocol)
+		evaluated, reason = evaluateBeichenConditional(terms, metrics, observedEffort, ttl, protocol, quoteMultiplier.String == "0")
 		if reason == "" && !quoteMultiplier.Valid {
 			reason = "missing_upstream_multiplier"
 		}
@@ -274,6 +281,45 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 			source: "gateway_usage_price", multiplierVersion: quoteVersion, quoteMultiplier: quoteMultiplier,
 			tier: evaluated.Tier, snapshot: terms, detail: evaluated.Detail,
 		}
+	case partial:
+		// Fixed school rates already include any upstream group multiplier.
+		// Apply the same conversion as beichen_token_credits and the manual
+		// school adjustment above, then book through the ordinary ledger.
+		base = sql.NullString{}
+		tokens, blocker := normalizeBeichenConditionalTokens(metrics, protocol)
+		if blocker != "" {
+			reason = blocker
+			break
+		}
+		var rates [4]*json.Number
+		if err := json.Unmarshal(fixedRates, &rates); err != nil {
+			return err
+		}
+		if noFixedSchool {
+			break
+		}
+		scale := big.NewRat(1, 10_000_000_000)
+		if mode == "manual" {
+			scale = big.NewRat(1, 1_000_000_000_000)
+		} else if protocol == "anthropic" && (tokens.Write == nil || *tokens.Write > 0) && cacheDuration != "5m" {
+			reason = "unknown_cache_ttl"
+			break
+		}
+		credits, prices, blocker := priceBeichenTokenParts(tokens, rates[0], rates[1], rates[2], rates[3], scale)
+		if blocker != "" {
+			reason = blocker
+			break
+		}
+		charge.detail, err = json.Marshal(struct {
+			beichenBillableTokens
+			AmountSource string            `json:"amount_source"`
+			Rates        map[string]string `json:"fixed_rates"`
+			RateScale    string            `json:"credits_per_rate_unit"`
+		}{tokens, tokens.amountSource(), prices, beichenDecimalString(scale)})
+		if err != nil {
+			return err
+		}
+		base = sql.NullString{String: beichenDecimalString(credits), Valid: true}
 	case anthropicWrite && cacheDuration != "5m" && !manualPriced:
 		base = sql.NullString{}
 		reason = "missing_cache_write_price"

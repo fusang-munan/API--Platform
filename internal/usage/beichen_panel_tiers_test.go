@@ -31,7 +31,7 @@ func TestBeichenMultiplierTierBoundaries(t *testing.T) {
 	} {
 		output, read, write := int64(15), int64(60), int64(49)
 		metrics := CallMetrics{PromptTokens: &tc.input, CompletionTokens: &output, CacheHitTokens: &read, CacheWriteTokens: &write}
-		got, blocker := evaluateBeichenConditional(terms, metrics, nil, "", "openai_responses")
+		got, blocker := evaluateBeichenConditional(terms, metrics, nil, "", "openai_responses", false)
 		if blocker != "" || got.Tier != tc.tier || got.Credits != tc.cost {
 			t.Fatalf("%d input: tier %q, credits %q, blocker %q", tc.input, got.Tier, got.Credits, blocker)
 		}

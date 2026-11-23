@@ -93,6 +93,7 @@ func jsonObject(raw json.RawMessage) map[string]json.RawMessage {
 }
 
 func (metrics *CallMetrics) mergeCount(target **int64, maxValue int64, fields ...json.RawMessage) {
+	var observed *int64
 	for _, field := range fields {
 		value := bytes.TrimSpace(field)
 		if len(value) == 0 || bytes.Equal(value, []byte("null")) {
@@ -100,8 +101,13 @@ func (metrics *CallMetrics) mergeCount(target **int64, maxValue int64, fields ..
 		}
 		n, err := strconv.ParseInt(string(value), 10, 64)
 		if err == nil && n >= 0 && n <= maxValue {
-			*target = &n
-			return
+			if observed != nil && *observed != n {
+				metrics.UsageReason = "conflicting_usage_fields"
+			} else {
+				observed = &n
+				*target = observed
+			}
+			continue
 		}
 		if metrics.UsageReason == "" {
 			metrics.UsageReason = "invalid_token_count"

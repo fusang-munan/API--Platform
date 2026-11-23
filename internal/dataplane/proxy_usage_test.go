@@ -489,7 +489,7 @@ func TestGatewayFinalizesAtActualRetrySendTime(t *testing.T) {
 
 func expectLegacyReportReview(mock sqlmock.Sqlmock, callID uuid.UUID) {
 	mock.ExpectQuery("SELECT COALESCE\\(beichen_state='pending_review'.*FOR UPDATE").WithArgs(callID).
-		WillReturnRows(sqlmock.NewRows([]string{"review"}).AddRow(false))
+		WillReturnRows(sqlmock.NewRows([]string{"review", "protocol"}).AddRow(false, "openai_compatible"))
 }
 
 func TestHTTPUsageLimitDoesNotTruncateResponse(t *testing.T) {

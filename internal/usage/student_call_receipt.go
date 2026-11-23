@@ -21,6 +21,8 @@ type StudentCallReceipt struct {
 	BaseSource       *string `json:"base_source"`
 	SchoolMultiplier *string `json:"school_multiplier"`
 	ChargedCredits   *string `json:"charged_credits"`
+	UsageState       *string `json:"usage_state,omitempty"`
+	AmountSource     *string `json:"amount_source,omitempty"`
 	ActualCost       *string `json:"actual_cost"`
 	ReceiptApplied   *bool   `json:"receipt_applied"`
 }
@@ -31,7 +33,7 @@ const studentCallReceiptSQL = `
 	WITH candidates AS MATERIALIZED (
 		SELECT c.id, c.request_id, c.model_id, c.beichen_dispatch_kind,
 		       c.beichen_state,c.beichen_credit_exact,c.beichen_base_credits,c.beichen_base_source,c.beichen_school_multiplier,
-		       c.beichen_receipt_response_id,c.beichen_receipt_conflict,c.pricing_detail
+		       c.beichen_receipt_response_id,c.beichen_receipt_conflict,c.pricing_detail,c.usage_state
 		FROM gateway_calls c
 		JOIN api_keys k ON k.id = c.api_key_id AND k.owner_user_id = c.user_id
 		WHERE c.user_id = $1 AND c.request_id = $2
@@ -42,7 +44,7 @@ const studentCallReceiptSQL = `
 	       trim_scale(c.beichen_credit_exact)::text, trim_scale(r.actual_cost)::text, r.applied,
 	       trim_scale(` + beichenBaseCreditsSQL + `)::text,
 	       coalesce(` + beichenBaseSourceSQL + `,CASE WHEN c.beichen_state='charged' THEN 'legacy' END),
-	       coalesce(c.beichen_school_multiplier,1)::text
+	       coalesce(c.beichen_school_multiplier,1)::text,c.usage_state,c.pricing_detail->>'amount_source'
 	FROM candidates c
 	JOIN models m ON m.id = c.model_id
 	LEFT JOIN beichen_receipt_response_claims claim ON claim.response_id=c.beichen_receipt_response_id
@@ -65,7 +67,7 @@ func (s *Store) StudentCallReceipt(ctx context.Context, userID uuid.UUID, reques
 	err := s.db.QueryRowContext(ctx, studentCallReceiptSQL, userID, requestID).Scan(
 		&receipt.RequestID, &receipt.ModelID, &receipt.BillingState,
 		&receipt.ChargedCredits, &receipt.ActualCost, &receipt.ReceiptApplied,
-		&receipt.BaseCredits, &receipt.BaseSource, &receipt.SchoolMultiplier,
+		&receipt.BaseCredits, &receipt.BaseSource, &receipt.SchoolMultiplier, &receipt.UsageState, &receipt.AmountSource,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return StudentCallReceipt{}, notFound

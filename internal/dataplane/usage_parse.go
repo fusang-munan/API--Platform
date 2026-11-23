@@ -83,11 +83,11 @@ func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, paylo
 }
 
 // OpenAI's final usage is a snapshot. Earlier counters can still explain a
-// partial observation, but only a complete final snapshot can authorize a debit.
+// partial observation. Independently priceable final snapshots stand alone.
 func (metrics *ResponseMetrics) applyUsageSnapshot(adapter modelbinding.Adapter, payload map[string]json.RawMessage) {
 	final := ResponseMetrics{}
 	final.applyPayload(adapter, payload)
-	if metrics.HasUsage() && final.finished(false).ClassifyBeichenUsage(string(adapter)).State != usage.UsageReported {
+	if metrics.HasUsage() && !final.finished(false).ClassifyBeichenUsage(string(adapter)).CanPriceBeichenUsage(string(adapter)) {
 		metrics.applyPayload(adapter, payload)
 		if metrics.UsageReason == "" {
 			metrics.UsageReason = "terminal_usage_incomplete"
