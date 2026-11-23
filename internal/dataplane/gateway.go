@@ -1265,8 +1265,13 @@ func rewriteUpstreamBody(contentType string, replay *replayBody, upstreamModel s
 				return rewriteRealtimeBody(contentType, replay, upstreamModel)
 			}
 		}
-		if adapter == modelbinding.AdapterAnthropic && deepseekHost(baseURL) {
-			adjustments = append(adjustments, repairDeepSeekAnthropicThinking)
+		if adapter == modelbinding.AdapterAnthropic {
+			if isBeichenAPI(baseURL) && requestPath == "/v1/messages" {
+				adjustments = append(adjustments, promoteBeichenAnthropicSystem)
+			}
+			if deepseekHost(baseURL) {
+				adjustments = append(adjustments, repairDeepSeekAnthropicThinking)
+			}
 		} else if adapter == modelbinding.AdapterOpenaiCompatible && requestPath == "/v1/chat/completions" && isBeichenAPI(baseURL) {
 			adjustments = append(adjustments, requestBeichenStreamUsage)
 		}
