@@ -54,17 +54,18 @@ func TestQuotaBudgetJSONRewrite(t *testing.T) {
 	for _, tt := range []struct {
 		path    string
 		adapter modelbinding.Adapter
+		baseURL string
 		body    string
 		field   string
 		want    string
 	}{
-		{"/v1/chat/completions", modelbinding.AdapterOpenaiCompatible,
+		{"/v1/chat/completions", modelbinding.AdapterOpenaiCompatible, "https://api.beichenapi.com",
 			`{"model":"m","messages":[{"role":"user","content":"你好","meta":{"integer":9007199254740993}}],"max_tokens":2000,"stream":false}`,
 			"max_tokens", "1250"},
-		{"/v1/responses", modelbinding.AdapterOpenaiResponses,
+		{"/v1/responses", modelbinding.AdapterOpenaiResponses, "https://api.beichenapi.com",
 			`{"model":"m","input":"你好","metadata":{"user":"u"},"reasoning":{"effort":"low"}}`,
 			"max_output_tokens", "1250"},
-		{"/v1/messages", modelbinding.AdapterAnthropic,
+		{"/v1/messages", modelbinding.AdapterAnthropic, "https://api.anthropic.com",
 			`{"model":"m","messages":[{"role":"user","content":"你好"}],"max_tokens":321,"system":"instructions"}`,
 			"max_tokens", "321"},
 	} {
@@ -74,7 +75,7 @@ func TestQuotaBudgetJSONRewrite(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer replay.Close()
-			body, _, _, cleanup, err := rewriteUpstreamBody("application/json", replay, "m", tt.adapter, "https://api.beichenapi.com", tt.path,
+			body, _, _, cleanup, err := rewriteUpstreamBody("application/json", replay, "m", tt.adapter, tt.baseURL, tt.path,
 				func(payload map[string]json.RawMessage) error {
 					applyOutputBudget(payload, quotaTokenField(tt.path), 1250)
 					return nil
