@@ -264,7 +264,7 @@ func beichenReviewMetrics(adapter modelbinding.Adapter, metrics usage.CallMetric
 		metrics.UsageReason = "conflicting_usage_fields"
 	}
 	metrics = metrics.ClassifyBeichenUsage(string(adapter))
-	if reason == "" && metrics.State == usage.UsagePartial && !metrics.CanPriceBeichenUsage(string(adapter)) {
+	if reason == "" && metrics.State == usage.UsagePartial && !metrics.CanPriceBeichenUsage(string(adapter)) && !metrics.CanAuditBeichenSplit() {
 		reason = beichenIncompleteUsage
 	}
 	return metrics, reason

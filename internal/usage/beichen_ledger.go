@@ -161,8 +161,16 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 	if _, err = tx.ExecContext(ctx, `UPDATE monitored_inputs SET visible=true WHERE call_id=$1`, callID); err != nil {
 		return err
 	}
-	if priceAt.Valid && success && category == "" && metrics.CanPriceBeichenUsage(protocol) {
-		return settleBeichenReport(ctx, tx, callID, metrics)
+	if priceAt.Valid && success && category == "" {
+		if metrics.CanPriceBeichenUsage(protocol) {
+			err := settleBeichenReport(ctx, tx, callID, metrics, nil)
+			if !errors.Is(err, errAuditTokenSplit) {
+				return err
+			}
+		}
+		if metrics.CanAuditBeichenSplit() {
+			return auditPendingReport(ctx, tx, callID, protocol, metrics)
+		}
 	}
 	return refreshLedgerTurn(ctx, tx, callID, "0", false)
 }
@@ -196,13 +204,14 @@ type beichenCharge struct {
 	quoteMultiplier   sql.NullString
 	tier              string
 	snapshot, detail  json.RawMessage
+	audit             *pendingAuditBooking
 }
 
 const beichenBaseCreditsSQL = `coalesce(c.beichen_base_credits,(c.pricing_detail->>'base_credits')::numeric,c.beichen_credit_exact)`
 const beichenBaseSourceSQL = `coalesce(c.beichen_base_source,c.pricing_detail->>'base_source')`
 const derivedPriceSource = "derived_from_usage"
 
-func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics) error {
+func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics, audit *pendingAuditBooking) error {
 	var school, upstream, effort sql.NullString
 	var mode, protocol, ttl, missingRate, upstreamSource string
 	var terms, fixedRates []byte
@@ -338,8 +347,12 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 		if err != nil {
 			return err
 		}
+		if audit == nil && reason == "incomplete_token_breakdown" && metrics.CanAuditBeichenSplit() {
+			return errAuditTokenSplit
+		}
 		return refreshLedgerTurn(ctx, tx, callID, "0", false)
 	}
+	charge.audit = audit
 	charge.base = base.String
 	if !manualPriced && len(terms) != 0 {
 		charge.detail = recordIgnoredBeichenPanelPrices(terms, charge.detail)
@@ -355,6 +368,10 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 // and keep the full price and source in pricing_detail for audit.
 func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge beichenCharge) error {
 	var milli string
+	var maxCredits, auditDetail any
+	if charge.audit != nil {
+		maxCredits, auditDetail = charge.audit.maxCredits, string(charge.audit.detail)
+	}
 	err := tx.QueryRowContext(ctx, `WITH price AS (
 		SELECT $2::numeric * COALESCE($9::numeric,1) AS base,
 			COALESCE(beichen_school_multiplier,1) AS school_multiplier,
@@ -374,18 +391,24 @@ func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge
 		beichen_review_reason=NULL,beichen_upstream_price_version=$4,beichen_multiplier_version=$5,
 		price_tier=COALESCE(NULLIF($6,''),c.price_tier),
 		price_snapshot=COALESCE(NULLIF($7,'')::jsonb,c.price_snapshot),
-		pricing_detail=CASE WHEN $8<>'' OR amount.actual>amount.student THEN
+		pricing_detail=CASE WHEN $8<>'' OR amount.actual>amount.student OR $11::jsonb IS NOT NULL THEN
+			CASE WHEN $11::jsonb IS NOT NULL THEN COALESCE(c.pricing_detail,'{}'::jsonb) ELSE '{}'::jsonb END ||
 			COALESCE(NULLIF($8,'')::jsonb,c.pricing_detail,'{}'::jsonb) ||
 			jsonb_build_object('base_credits',trim_scale(amount.base)::text,'base_source',$3::text,
 				'school_multiplier',trim_scale(amount.school_multiplier)::text) ||
 			CASE WHEN $9::numeric IS NOT NULL
 				THEN jsonb_build_object('upstream_multiplier',trim_scale($9::numeric)::text)
-				ELSE '{}'::jsonb END
+				ELSE '{}'::jsonb END || COALESCE($11::jsonb,'{}'::jsonb)
 			ELSE c.pricing_detail END
 	FROM amount WHERE c.id=$1 AND c.beichen_state='pending_review'
+		AND ($10::numeric IS NULL OR amount.student <= $10::numeric)
 	RETURNING (amount.student*1000)::text`, callID, charge.base, charge.source,
 		charge.upstreamVersion, charge.multiplierVersion, charge.tier, string(charge.snapshot), string(charge.detail),
-		charge.quoteMultiplier).Scan(&milli)
+		charge.quoteMultiplier, maxCredits, auditDetail).Scan(&milli)
+	if charge.audit != nil && errors.Is(err, sql.ErrNoRows) {
+		// The caller holds the pending row lock. The exact student debit exceeded the bound.
+		return refreshLedgerTurn(ctx, tx, callID, "0", false)
+	}
 	if err != nil {
 		return err
 	}

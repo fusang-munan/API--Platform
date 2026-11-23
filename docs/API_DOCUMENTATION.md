@@ -729,6 +729,10 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 上述配置接受正整数，缺省或无效时使用默认值。按默认值，已有 98 笔各 10 积分时，第 99 笔可发出；已有 99 笔各 10 积分时，下一笔正好触顶，须等部分记录完成核账后再试。更换 Key 共用同一上限。
 
+北辰成功调用缺少缓存分项时，`NEBULA_PENDING_AUTO_SETTLE` 默认 `1`，设为 `0` 恢复原待核行为。`NEBULA_PENDING_AUTO_SETTLE_YUAN`（默认 `0.001` 上游元）和 `NEBULA_PENDING_AUTO_SETTLE_RELATIVE`（默认 `0.01`，即 1%）可设为非负有限数，无效值使用默认值。区间宽度满足任一阈值（相对宽度为宽度除以下界）或金额唯一时，按推荐分项交给原定价流程。入账成功后 `pricing_detail.auto_settled=true`，另存上下界、推荐金额、历史比例和策略版本。
+
+待核的学生金额上界为上游 `MaxYuan × 100 × 分组倍率 × 学校倍率`，倍率缺失时合计按 2 倍。可计算上界的待核调用按此数向上取整，单笔 1 至 1000 整积分。例如上界 0.250012 元、倍率 1.25 和 1.10，待核预留 35 积分。首次待核且缺少上界时沿用默认 10 积分。自动扣款校验使用未取整的学生上界。
+
 老师模型 Probe 支持 `chat_completions`、`responses`、`messages`、`embeddings`、`rerank`。每次请求固定先调用同一供应商的 `GET /v1/models`，按大小写不敏感的完整上游模型 ID 精确匹配目录条目。匹配条目的纯文本 `description` 直接写入建议配置的描述；`model_type`、`tags`、`supported_endpoint_types` 与 description 共同映射类别、输入/输出模态和固定能力。容量采用固定优先级：响应中明确命名的结构化字段最高，其次从 description 的“100 万令牌”“1M context”“128K 上下文”“最大输出 16K”等格式提取，再按具体模型族推断，最后使用 128K 上下文、128K 最大输入和 4K 最大输出。更具体的模型族规则先于通用规则，例如 `claude-sonnet-4-5` 不会误匹配 Claude 5，`glm-5` 使用 1000K/16K。之后按请求顺序执行所选真实端点。浏览器响应不包含上游响应 body，只返回各请求的 endpoint、path、HTTP 状态、耗时、截断标志、通用错误和标准化配置。已注册供应商只提交 `provider_id`，凭据不返回浏览器；手写 Key 不持久化。手写 Base URL 只允许公网 HTTP/HTTPS，不跟随重定向，并在连接阶段再次拒绝私网、localhost、链路本地和云元数据地址。单项上游响应最多读取 64 KiB；不把 usage、价格、Content-Length 或 `max_bytes` 当成容量。
 
 ```json

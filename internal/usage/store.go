@@ -738,7 +738,7 @@ func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metri
 	// The late-report recovery path requires a complete replacement report.
 	// Only the successful gateway finalizer can authorize a partial snapshot.
 	if review && metrics.State == UsageReported {
-		if err = settleBeichenReport(ctx, tx, callID, metrics); err != nil {
+		if err = settleBeichenReport(ctx, tx, callID, metrics, nil); err != nil {
 			return err
 		}
 	}
