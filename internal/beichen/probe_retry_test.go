@@ -72,7 +72,16 @@ func TestRetryFailedProbesStopsAfterSuccessOrPermanentFailure(t *testing.T) {
 		{target: probeTarget{client: client, model: "persistent", protocol: "openai_compatible"}, statusCode: 429},
 		{target: probeTarget{client: client, model: "forbidden", protocol: "openai_compatible"}, statusCode: 401},
 	}
-	retryFailedProbes(context.Background(), observations, 0)
+	run := func(ctx context.Context, targets []probeTarget) ([]probeObservation, error) {
+		var results []probeObservation
+		for _, target := range targets {
+			results = append(results, observeTarget(ctx, target))
+		}
+		return results, nil
+	}
+	if err := retryFailedProbes(context.Background(), observations, 0, run); err != nil {
+		t.Fatal(err)
+	}
 	if calls["recovering"] != 1 || calls["persistent"] != 2 || calls["forbidden"] != 0 {
 		t.Fatalf("unexpected retries: %v", calls)
 	}
@@ -82,7 +91,9 @@ func TestRetryFailedProbesStopsAfterSuccessOrPermanentFailure(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	retryFailedProbes(ctx, observations, time.Hour)
+	if err := retryFailedProbes(ctx, observations, time.Hour, run); err != context.Canceled {
+		t.Fatalf("canceled retry: %v", err)
+	}
 	if calls["persistent"] != 2 {
 		t.Fatal("canceled context made another request")
 	}
