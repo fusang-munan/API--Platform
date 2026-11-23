@@ -73,7 +73,7 @@ SELECT gen_random_uuid(), model.id, credential.provider_id, credential.id,
 				t.Helper()
 				var state string
 				if err := conn.QueryRowContext(ctx, `
-SELECT jsonb_build_array(to_jsonb(c), to_jsonb(b))::text
+SELECT jsonb_build_array(to_jsonb(c) - 'retired_at', to_jsonb(b))::text
 FROM model_bindings b JOIN provider_credentials c ON c.id=b.credential_id
 JOIN providers p ON p.id=b.provider_id WHERE p.name='VulcanAPI'`).Scan(&state); err != nil {
 					t.Fatal(err)
@@ -124,6 +124,8 @@ JOIN providers p ON p.id=b.provider_id WHERE p.name='VulcanAPI'`).Scan(&state); 
 					if got := vulcanSnapshot(); got != vulcanBefore {
 						t.Error("VulcanAPI credential or binding changed")
 					}
+					count(`SELECT count(*) FROM provider_credentials c
+JOIN providers p ON p.id=c.provider_id WHERE p.name='VulcanAPI' AND c.retired_at IS NOT NULL`, 0)
 				}
 				count("SELECT count(*) FROM provider_credentials", wantBindings)
 				count("SELECT count(*) FROM model_bindings", wantBindings)
