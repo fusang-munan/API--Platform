@@ -465,7 +465,8 @@ export type BeichenReconcileSide = {
   cache_read_tokens: number
   cache_write_tokens: number
   calls?: number
-  requests?: number
+  requests: number
+  completeness: 'complete' | 'partial' | 'missing'
   billed_micros?: number | null
   estimated_micros?: number | null
   source?: string | null
@@ -476,14 +477,21 @@ export type BeichenReconcileSide = {
   stale?: boolean
   sources?: string[]
 }
+export type BeichenReconcileLocal = BeichenReconcileSide & { tokens_missing: number; charged_tokens_missing_calls: number }
 export type BeichenReconcileMoney = {
   student_yuan: string
   base_yuan: string
   actual_yuan: string | null
   margin_yuan: string | null
   margin_rate: string | null
+  margin_available: boolean
 }
 export type BeichenReconcileCoverage = {
+  comparable: boolean
+  eligible_dates: string[]
+  excluded_days: Array<{ date: string; reasons: string[] }>
+  comparable_days: number
+  verified_matched_complete_token_calls: number
   days_expected: number
   days_present: number
   missing_days: string[]
@@ -498,13 +506,16 @@ export type BeichenReconcileCoverage = {
 }
 export type BeichenReconcileModel = {
   model: string
+  credential_id: string
+  label: string | null
   match_status: 'matched' | 'local_only' | 'upstream_only'
-  local: BeichenReconcileSide
+  local: BeichenReconcileLocal
   upstream: BeichenReconcileSide
   student_yuan: string
   base_yuan: string
   actual_yuan: string | null
   margin_yuan: string | null
+  margin_available: boolean
   local_share: string
   upstream_share: string
   school_absorbed_credits?: string | null
@@ -512,25 +523,36 @@ export type BeichenReconcileModel = {
 }
 export type BeichenReconcileKey = {
   credential_id: string
-  label: string
-  local: BeichenReconcileSide
+  label: string | null
+  local: BeichenReconcileLocal
   upstream: BeichenReconcileSide
   student_yuan: string
   base_yuan: string
   actual_yuan: string | null
   margin_yuan: string | null
+  margin_available: boolean
   school_absorbed_credits?: string | null
   completeness?: 'complete' | 'partial' | 'missing' | null
 }
-export type BeichenReconcile = {
+export type BeichenReconcileView = {
+  coverage: BeichenReconcileCoverage
+  totals: { local: BeichenReconcileLocal; upstream: BeichenReconcileSide; money: BeichenReconcileMoney }
+  models: BeichenReconcileModel[]
+  keys: BeichenReconcileKey[]
+}
+export type BeichenReconcile = BeichenReconcileView & {
   range: BeichenUsageRange
   start: string | null
   end: string
   timezone: string
-  coverage: BeichenReconcileCoverage
-  totals: { local: BeichenReconcileSide; upstream: BeichenReconcileSide; money: BeichenReconcileMoney }
-  models: BeichenReconcileModel[]
-  keys: BeichenReconcileKey[]
+  comparable_only: BeichenReconcileView | null
+  unmatched_upstream: Array<{
+    occurred_at: string; row_id: string; upstream_user_id: string
+    credential_id: string; label: string; model: string
+    input_tokens: number | null; output_tokens: number | null
+    cache_read_tokens: number | null; cache_write_tokens: number | null
+    request_id: string | null; receipt_id: string | null
+  }>
 }
 export type BeichenPriceScope = { scope?: 'all' | 'credentials'; credential_ids?: string[] }
 export type BeichenModelPriceUpdate = { model: string } & BeichenPriceScope & (

@@ -57,8 +57,9 @@ function absentSide() {
 function response(range: BeichenUsageRange = 'all'): ReconcileFixture {
   return {
     range, start: range === 'all' ? null : '2026-11-19T16:00:00Z', end: '2026-11-20T10:00:00Z', timezone: 'Asia/Shanghai',
+    comparable_only: null, unmatched_upstream: [],
     coverage: {
-      days_expected: 2, days_present: 2, comparable_days: 1, missing_days: [],
+      comparable: true, eligible_dates: [], excluded_days: [], days_expected: 2, days_present: 2, comparable_days: 1, missing_days: [],
       pending_calls: 3, unpriced_calls: 2, multiplier_mixed: true, coverage_kind: 'full',
       verified_matched_calls: 0, verified_matched_complete_token_calls: 0,
     },
@@ -98,7 +99,7 @@ function emptyResponse(): ReconcileFixture {
       money: { student_yuan: '0', base_yuan: '0', actual_yuan: null, margin_yuan: null, margin_rate: null, margin_available: false },
     },
     coverage: {
-      days_expected: 0, days_present: 0, missing_days: [], pending_calls: 0, unpriced_calls: 0, multiplier_mixed: false,
+      comparable: false, eligible_dates: [], excluded_days: [], days_expected: 0, days_present: 0, missing_days: [], pending_calls: 0, unpriced_calls: 0, multiplier_mixed: false,
       coverage_kind: 'none', comparable_days: 0, verified_matched_calls: 0, verified_matched_complete_token_calls: 0,
     },
   }
@@ -285,7 +286,7 @@ describe('北辰区间对账', () => {
     expect(coverage).toContain('不能统一按 1.10 倍推算差额')
     const calls = view.get('[aria-label="调用核对"]').text()
     expect(calls).toContain('可逐笔关联 7 笔，其中本地 Token 完整 5 笔')
-    expect(calls).toContain('待核账 3 笔')
+    expect(calls).toContain('待核账请求 3 笔')
     expect(calls).toContain('无报价调用 2 笔')
     expect(view.get('[data-kpi="margin-yuan"] strong').text()).toBe('不可比')
     expect(view.findAll('[data-label="差额"]').map(cell => cell.text())).toEqual(Array(4).fill('不可比'))
@@ -360,7 +361,65 @@ describe('北辰区间对账', () => {
     expect(missing.get('[data-label="本地 Token"]').text()).toBe('—')
     expect(missing.get('[data-label="记录情况"]').text()).toContain('已扣款但 Token 不完整 1 笔')
     expect(view.get('[data-kpi="local-tokens"] strong').text()).toBe('—')
-    expect(view.get('[aria-label="调用核对"]').text()).toContain('另有约 37 Token 待核')
+    expect(view.get('[aria-label="调用核对"]').text()).toContain('已计入本地总量、待归类 37 Token')
+  })
+
+  it('407,505 个待归类 Token 已含在 598,363 中，待核账请求单独计数', async () => {
+    const result = response()
+    result.totals.local = side(598363, '0', {
+      input_tokens: 190858, tokens_missing: 407505, completeness: 'partial',
+    })
+    result.coverage.pending_calls = 15
+    mocks.reconciliation.mockResolvedValueOnce(result)
+    const view = mountView()
+    await flushPromises()
+    expect(view.get('[data-kpi="local-tokens"] strong').text()).toBe('598,363')
+    const calls = view.get('[aria-label="调用核对"]')
+    expect(calls.get('p').text()).toBe('已计入本地总量、待归类 407,505 Token。')
+    expect(calls.get('.coverage-facts').text()).toContain('待核账请求 15 笔')
+  })
+
+  it('按所选账日同时切换汇总、模型和未关联流水，并保留未知与零', async () => {
+    const result = response()
+    const dates = ['2026-11-19']
+    result.coverage.eligible_dates = dates
+    result.comparable_only = {
+      coverage: { ...result.coverage, eligible_dates: dates, pending_calls: 0 },
+      totals: { ...result.totals, local: side(150) }, models: result.models.slice(0, 1), keys: result.keys,
+    }
+    const receipt = {
+      upstream_user_id: '1', row_id: '9', occurred_at: '2026-11-19T23:59:59+08:00', model: '原模型',
+      credential_id: 'channel-1', label: '测试渠道', input_tokens: 123, output_tokens: null,
+      cache_read_tokens: 0, cache_write_tokens: null, request_id: 'client:123', receipt_id: null,
+    }
+    result.unmatched_upstream = [receipt, { ...receipt, row_id: '10', occurred_at: '2026-11-20T00:00:00+08:00' }]
+    mocks.reconciliation.mockResolvedValueOnce(result)
+    const view = mountView()
+    await flushPromises()
+    const card = view.get('[aria-label="北辰有、本地无"]')
+    expect(card.findAll('tbody tr')).toHaveLength(2)
+    await button(view, '仅完整可比账日').trigger('click')
+    expect(card.findAll('tbody tr')).toHaveLength(1)
+    expect(card.get('tbody').text()).toContain('2026-11-19 23:59:59')
+    expect(card.get('[data-label="输出"]').text()).toBe('—')
+    expect(card.get('[data-label="缓存读"]').text()).toBe('0')
+    expect(view.get('[data-kpi="local-tokens"] strong').text()).toBe('150')
+    expect(view.findAll('.model-details tbody tr')).toHaveLength(1)
+    expect(view.get('[aria-label="调用核对"]').text()).toContain('待核账请求 0 笔')
+    await button(view, '全部已观察').trigger('click')
+    expect(card.findAll('tbody tr')).toHaveLength(2)
+  })
+
+  it('严格视图没有入选日期时显示不可比', async () => {
+    const result = response()
+    result.coverage.excluded_days = [{ date: '2026-11-20', reasons: ['open_day', 'incompatible_unit'] }]
+    mocks.reconciliation.mockResolvedValueOnce(result)
+    const view = mountView()
+    await flushPromises()
+    await button(view, '仅完整可比账日').trigger('click')
+    expect(view.text()).toContain('当前范围无完整可比账日，差额不可比')
+    expect(view.get('details').text()).toContain('2026-11-20 · 账日尚未结束、金额单位不可比')
+    expect(view.find('[data-kpi="margin-yuan"]').exists()).toBe(false)
   })
 
   it('小于一积分的扣费正确换算为元，负差额使用红色', async () => {
