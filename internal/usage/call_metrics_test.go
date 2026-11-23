@@ -59,6 +59,8 @@ func TestFinalizeBillsTheReservedMultiplierOnce(t *testing.T) {
 	metrics := CallMetrics{UpstreamCreditMicros: &micros, State: UsageReported}
 	for _, affected := range []int64{1, 0} {
 		mock.ExpectBegin()
+		mock.ExpectExec("SELECT id FROM users .*FOR NO KEY UPDATE").WithArgs(reservation.CallID, false).
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery(`SELECT beichen_state IS NOT NULL,billing_state='pending'`).WithArgs(reservation.CallID).
 			WillReturnRows(sqlmock.NewRows([]string{"routed", "pending", "expired"}).AddRow(false, affected != 0, false))
 		mock.ExpectExec(`UPDATE gateway_calls SET billing_state=.*sent_at=COALESCE\(\$11::timestamptz,sent_at\) WHERE id=\$7 AND billing_state='pending'`).WithArgs(

@@ -185,7 +185,7 @@ SELECT k.project_id,p.organization_id,k.owner_user_id,k.name,p.name,o.name,u.nam
 	if err != nil {
 		return Reservation{}, callAccessError(err)
 	}
-	if err = checkStudentCallLimits(ctx, tx, r.UserID, uuid.Nil); err != nil {
+	if err = checkStudentCallLimits(ctx, tx, r.UserID, uuid.Nil, len(routes) > 0 && routes[0].Beichen); err != nil {
 		return Reservation{}, err
 	}
 	hasBeichen, hasLegacy := false, len(routes) == 0
@@ -601,6 +601,13 @@ func (s *Store) Finalize(ctx context.Context, r Reservation, success bool, outco
 	}
 	defer func() { _ = tx.Rollback() }()
 	var routed, pending, expired bool
+	// Match StartAttempt's student -> call lock order. Even crash recovery
+	// without a route can turn a dispatched reservation into a review.
+	if _, err = tx.ExecContext(ctx, `SELECT id FROM users WHERE id=(
+		SELECT user_id FROM gateway_calls WHERE id=$1 AND ($2 OR beichen_state IN ('reserved','pending_review'))
+	) FOR NO KEY UPDATE`, r.CallID, route.Beichen); err != nil {
+		return err
+	}
 	err = tx.QueryRowContext(ctx, `SELECT beichen_state IS NOT NULL,billing_state='pending',
 		COALESCE(lease_expires_at<now()-interval '15 minutes',false) FROM gateway_calls WHERE id=$1 FOR UPDATE`, r.CallID).
 		Scan(&routed, &pending, &expired)
@@ -633,7 +640,7 @@ func (s *Store) Finalize(ctx context.Context, r Reservation, success bool, outco
 	// atomically with its route and outcome. Failed or unknown outcomes keep it.
 	sentAt := sql.NullTime{Time: route.SentAt, Valid: success && outcome == "succeeded" && !route.SentAt.IsZero()}
 	result, err := tx.ExecContext(ctx, `UPDATE gateway_calls
-	SET billing_state=$1,outcome=$2,error_category=NULLIF($3,''),error_message=NULLIF($4,''),
+	SET billing_state=$1,unresolved_credit_milli=0,outcome=$2,error_category=NULLIF($3,''),error_message=NULLIF($4,''),
 		provider_id=COALESCE($5,provider_id),provider_name=COALESCE(NULLIF($6,''),provider_name),
 		finalized_at=now(),lease_expires_at=NULL,
 		provider_credential_id=COALESCE($8,provider_credential_id),binding_id=COALESCE($9,binding_id),
@@ -738,7 +745,7 @@ func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metri
 	// The late-report recovery path requires a complete replacement report.
 	// Only the successful gateway finalizer can authorize a partial snapshot.
 	if review && metrics.State == UsageReported {
-		if err = settleBeichenReport(ctx, tx, callID, metrics); err != nil {
+		if err = settleBeichenReport(ctx, tx, callID, metrics, nil); err != nil {
 			return err
 		}
 	}

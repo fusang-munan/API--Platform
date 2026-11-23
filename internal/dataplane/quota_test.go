@@ -104,11 +104,19 @@ func TestQuotaBudgetJSONRewrite(t *testing.T) {
 
 func TestQuotaRateLimitCodes(t *testing.T) {
 	for _, path := range []string{"/v1/chat/completions", "/v1/messages"} {
-		for _, code := range []string{usage.StudentConcurrencyExceeded, usage.PendingReviewLimit} {
+		for _, code := range []string{usage.StudentConcurrencyExceeded, usage.PendingReviewLimit, usage.UnresolvedExposureLimit} {
 			w := httptest.NewRecorder()
 			writeModelCallRejection(w, path, &usage.QuotaError{Code: code})
 			if w.Code != http.StatusTooManyRequests || w.Header().Get("X-Nebula-Error-Code") != code {
 				t.Fatalf("%s: quota HTTP error=%d %v", path, w.Code, w.Header())
+			}
+			if path == "/v1/chat/completions" {
+				var body struct {
+					Error struct{ Code string }
+				}
+				if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body.Error.Code != code {
+					t.Fatalf("quota response body=%s, want code %s: %v", w.Body, code, err)
+				}
 			}
 		}
 	}

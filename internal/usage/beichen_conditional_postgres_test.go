@@ -225,6 +225,7 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 	}
 
 	t.Run("fixed quotes retain partial usage and book the unique amount once", func(t *testing.T) {
+		t.Setenv("NEBULA_PENDING_AUTO_SETTLE", "0") // Exercise the exact-only fallback.
 		m := report
 		m.CacheWriteTokens = nil
 		r, route := dispatch("fixed-model", "openai_responses", nil, "", nil)

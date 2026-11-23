@@ -90,6 +90,7 @@ VALUES ($1,$2,'upstream','base','billing',2000000,10000000,100000,2500000)`, cre
 }
 
 func TestBeichenPostgresGatewayReconciliation(t *testing.T) {
+	t.Setenv("NEBULA_PENDING_AUTO_SETTLE", "0") // Exercise pending-to-receipt recovery under the old policy.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	f := newBeichenGatewayFixture(t, ctx)

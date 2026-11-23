@@ -32,6 +32,10 @@ Nebula 是实验室正在使用的 AI API 平台，镜像版本由仓库根目�
 
 官网快照保存各渠道、平台、分组、型号和原始计价条件。部分平台读失败时更新可读平台并保留其余数据，整页失败时保留已有快照，页面标记待更新并按退避间隔重试。教师页保存及续期得到的会话加密写入学校数据库，后端重启后会继续读取。
 
+迁移 `0069` 后，同一学生所有 Key 和项目共用北辰待核额度。默认上限为 1000 整积分（`NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT`），默认每笔预留 10（`NEBULA_STUDENT_PENDING_RESERVE_CREDITS`）。受理和派发北辰请求时，已有预留加上本笔默认预留达到上限即返回 429。结束时只预留学生剩余的额度。其他供应商仍受每学生默认 2 笔的并发限制。
+
+`NEBULA_UNRESOLVED_EXPOSURE` 默认 `1`。设为 `0` 可整体回退，恢复旧的每学生 20 笔待核准入和 `pending_review_limit`，同时关闭缓存分项试算。仅设 `NEBULA_PENDING_AUTO_SETTLE=0` 时继续按金额限流、按上界预留，暂停推荐分项自动扣款。Gemini 仍待核，不自动结算。阈值、倍率和教师定价说明见 [API 文档](docs/API_DOCUMENTATION.md)。
+
 「模型管理 → 北辰」的主表只显示四把 Key 当前 `GET /v1/models` 探测到的模型；官网目录里的其它分组和仅官网可见的型号单独计数，不进主表。每个模型只有一张价格表：五列（输入、输出、缓存写入 5m、缓存写入 1h、缓存读取）两排（上游基础价、学生实价），不再并列展示其它分组。当前 Key 分组缺完整报价时，用公开官网同名模型的基础价作底价，再乘当前 Key 的生效倍率。目录中保留可直接操作的不同 Key 型号 ID。
 
 「Key 实际能力」显示官网分组名、ID、倍率及型号。点「核对这个 Key」打开弹层，可选填目标倍率，再读取该数字 Key ID 当天和前一天的网页流水。弹层只核对倍率目标。每笔核对账号、Key ID 和北京时间账日，再按日和模型汇总四类 Token、原价与实付，保留金额原单位。账单实付比值等于实付除以原价，分组倍率取官网分组字段。公开接口的账号模型、余额和用量从单 Key 核对与对账中排除。
@@ -99,6 +103,8 @@ Windows 会话保存在 `%LOCALAPPDATA%\Nebula\beichen-session.json`，同目录
 ### 导出北辰仪表盘和 Key 用量
 
 `go run ./cmd/beichen-report --range 7d --granularity day` 读取本机加密会话，输出并保存仪表盘、平台、模型、趋势、最近使用和各把 Key 的用量及核对结果。范围可选 `today`、`7d`、`all`。加 `--reconcile` 后，通过 `DATABASE_URL` 只读比较本机网关账本与本轮网页数据，金额按元记账。[接口、用法和实抓记录](docs/reports/beichen-crawl-stability.md)
+
+`go run ./cmd/pending-audit` 通过只读连接生成北辰待核账报告，包含上游金额区间、推荐缓存拆分和自动结算判定。[参数与判定口径](docs/PENDING_AUDIT.md)
 
 ## 技术栈
 

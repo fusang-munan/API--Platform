@@ -336,6 +336,8 @@ go test ./...
 
 执行 `go test ./cmd/beichen-report ./internal/beichen -run TestDashboard -count=1 -v`，验证日期与粒度、Key 过滤、翻页、空数据、401、金额差额和报告保存。设置 `NEBULA_TEST_POSTGRES` 为隔离的本机测试库，可同时验证按北京时间日期、模型和 Key 的对账，以及无回执、待核账和一侧缺记录。全量检查执行 `go build ./...` 和 `go test ./...`。
 
+待核账审计报告出现 `unknown` 时，先看 `missing` 和 `note`，再核对协议的计数口径、原始输入输出总量、缓存计数，以及可产生费用的分项在派发时刻的报价。报告中的金额零值需结合分类阅读。运行 `go test ./internal/usage/pendingaudit -count=1 -v`，在无数据库连接的情况下复查协议拆分、缺项、金额区间、推荐比例和自动结算阈值。
+
 - 网页提示会话过期时，先用本机登录窗口更新会话，再运行 `go run ./cmd/beichen-report --range 7d`。
 - 平台卡片的请求差额在 `platforms.account_minus_platforms`，四把 Key 的差额在 `key_reconciliation.account_minus_sum`。实际金额和 Token 的差额另有字段。
 - `--reconcile` 用 `DATABASE_URL` 连接本机数据库。如果北辰供应商无法唯一确认，加 `--provider <供应商UUID>`。对账行里的 `null` 表示证据缺项，具体查看 `missing_reasons`。[对账字段说明](reports/beichen-crawl-stability.md)
@@ -421,6 +423,9 @@ ORDER BY j.channel;
 | 领取时报 `KEY_ALREADY_CLAIMED` | Key 已是 ACTIVE 或并发请求已有一个成功 | 使用首次响应中的明文 | 检查 `claimed_at` 和 prefix，不要要求后台重显 |
 | 网关返回 invalid API key | Key 不存在、HMAC pepper 变化、状态非 ACTIVE | 使用正确 Key；恢复原 pepper 或重新申请 | 只记录 prefix；检查部署间 `API_KEY_HASH_PEPPER` 是否一致 |
 | 网关返回 model_not_allowed | 请求模型不在该 Key 的规范化白名单 | 使用 `GET /v1/models` 返回的模型 | 核对 `api_key_models`，不要依赖客户端缓存 |
+| 北辰返回 429 `unresolved_exposure_limit` | 同一学生待核预留加本笔默认预留达到上限 | 核对跨项目和 Key 的待核金额 | 按学生 ID 执行 `SELECT count(*), coalesce(sum(unresolved_credit_milli),0) FROM gateway_calls WHERE user_id=$1 AND beichen_state='pending_review'`；同一学生非北辰路由仍可受理 |
+| 回退后返回 429 `pending_review_limit` | `NEBULA_UNRESOLVED_EXPOSURE=0`，待核笔数达到旧上限 | 核对待核行数，默认上限为 20 | 只想关闭推荐分项扣款时，保留额度开关默认值，设置 `NEBULA_PENDING_AUTO_SETTLE=0` |
+| 北辰响应成功但缓存明细缺失，仍显示待核 | 区间过宽、上界未知、定价超过上界容差，或为 Gemini 原生响应 | 用调用 ID 查询 `beichen_review_reason`、`unresolved_credit_milli`、`pricing_detail`，核对派发时费率及开关 | 设置本机测试库 `NEBULA_TEST_POSTGRES`，运行 `go test -p 1 ./internal/dataplane -run TestBeichenPending -count=1 -v`，覆盖并发封顶、倍率、模型身份、开关、教师价与上界 |
 | 网关返回 model unavailable | 模型、binding 或 provider 被停用 | 老师启用完整路由链或添加 binding | 按 model -> binding -> provider 顺序排查状态和 priority |
 | 上游 429/5xx 后没有切换 | 没有下一个 ACTIVE binding，或流已经开始写出 | 添加低优先级候选；流开始后只能返回当前错误 | 查看候选排序、adapter、priority 和首字节是否已发送 |
 | multipart 请求失败 | Content-Type boundary 丢失、文件过大或客户端重复读取 body | 保留原始 Content-Type，调整允许大小 | 检查请求大小和 boundary；不要把文件内容写入日志 |

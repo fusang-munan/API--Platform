@@ -159,6 +159,16 @@ SELECT (SELECT count(*) FROM beichen_multiplier_versions
 
 func openMigrationTestDB(t *testing.T) (context.Context, *sql.DB) {
 	t.Helper()
+	ctx, conn := openIsolatedMigrationSchema(t)
+	empty, err := databaseIsEmpty(ctx, conn)
+	if err != nil || !empty {
+		t.Fatalf("expected a new empty test database, empty=%v, err=%v", empty, err)
+	}
+	return ctx, conn
+}
+
+func openIsolatedMigrationSchema(t *testing.T) (context.Context, *sql.DB) {
+	t.Helper()
 	dsn := os.Getenv("NEBULA_TEST_POSTGRES")
 	if dsn == "" {
 		t.Skip("NEBULA_TEST_POSTGRES requires a disposable local nebula_test database")
@@ -178,10 +188,6 @@ func openMigrationTestDB(t *testing.T) (context.Context, *sql.DB) {
 	conn.SetMaxOpenConns(1)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	t.Cleanup(cancel)
-	empty, err := databaseIsEmpty(ctx, conn)
-	if err != nil || !empty {
-		t.Fatalf("expected a new empty test database, empty=%v, err=%v", empty, err)
-	}
 	schema := pgx.Identifier{"migration_" + strings.ReplaceAll(uuid.NewString(), "-", "")}.Sanitize()
 	if _, err := conn.ExecContext(ctx, "CREATE SCHEMA "+schema); err != nil {
 		t.Fatal(err)

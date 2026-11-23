@@ -137,8 +137,8 @@ func expectProxyAttempt(mock sqlmock.Sqlmock, candidate route, reservation usage
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT u.id .*FOR NO KEY UPDATE OF u`).WithArgs(reservation.APIKeyID, reservation.ModelID).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id"}).AddRow(reservation.UserID))
-	mock.ExpectQuery(`SELECT EXISTS.*OFFSET.*EXISTS.*pending_review`).
-		WillReturnRows(sqlmock.NewRows([]string{"concurrency", "review"}).AddRow(false, false))
+	mock.ExpectQuery(`SELECT EXISTS.*OFFSET.*SUM\(c.unresolved_credit_milli\).*pending_review`).
+		WillReturnRows(sqlmock.NewRows([]string{"concurrency", "exposure"}).AddRow(false, false))
 	mock.ExpectExec(`WITH started AS .*quota_budget_tokens`).WithArgs(
 		sqlmock.AnyArg(), reservation.CallID, candidate.Provider.ID, candidate.Binding.ID, candidate.Provider.Name,
 		candidate.CredentialID, candidate.Binding.UpstreamModelName, int64(0), reservation.UserID, reservation.APIKeyID, reservation.ModelID,
@@ -176,6 +176,8 @@ func expectProxyReservationReleased(mock sqlmock.Sqlmock, candidate route, reser
 }
 
 func expectLegacyLedgerLock(mock sqlmock.Sqlmock, callID uuid.UUID) {
+	mock.ExpectExec("SELECT id FROM users .*FOR NO KEY UPDATE").WithArgs(callID, false).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT beichen_state IS NOT NULL.*FOR UPDATE").WithArgs(callID).
 		WillReturnRows(sqlmock.NewRows([]string{"routed", "pending", "expired"}).AddRow(false, true, false))
 }
