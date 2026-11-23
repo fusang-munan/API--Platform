@@ -133,13 +133,15 @@ func TestProbeUsageConflictRemainsReachableButUnknownPostgres(t *testing.T) {
 	var conflictStatus int
 	var conflictCode sql.NullString
 	var conflictUnknown bool
+	var conflictEvidence bool
 	if err := db.QueryRowContext(ctx, `SELECT status_code,error_code,
-		input_tokens IS NULL AND output_tokens IS NULL AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
-		FROM beichen_probe_usage WHERE job_id=$1 AND model='conflict'`, job.id).Scan(&conflictStatus, &conflictCode, &conflictUnknown); err != nil {
+		input_tokens IS NULL AND output_tokens IS NULL AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL,
+		raw_usage @> '{"prompt_tokens_details":{"cached_tokens":2},"prompt_cache_hit_tokens":8}'::jsonb
+		FROM beichen_probe_usage WHERE job_id=$1 AND model='conflict'`, job.id).Scan(&conflictStatus, &conflictCode, &conflictUnknown, &conflictEvidence); err != nil {
 		t.Fatal(err)
 	}
-	if conflictStatus != http.StatusOK || !conflictCode.Valid || conflictCode.String != "probe_usage_conflict" || !conflictUnknown {
-		t.Fatalf("conflicting usage was recorded as reported: status=%d code=%v unknown=%t", conflictStatus, conflictCode, conflictUnknown)
+	if conflictStatus != http.StatusOK || !conflictCode.Valid || conflictCode.String != "probe_usage_conflict" || !conflictUnknown || !conflictEvidence {
+		t.Fatalf("conflicting usage was recorded as reported: status=%d code=%v unknown=%t evidence=%t", conflictStatus, conflictCode, conflictUnknown, conflictEvidence)
 	}
 	var agreeingStatus int
 	var agreeingCode sql.NullString

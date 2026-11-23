@@ -48,6 +48,23 @@ type CallMetrics struct {
 	ReplyClosed *bool
 }
 
+// CacheWriteEvidence returns the Anthropic cache-creation fields exactly as
+// the upstream reported them. Only the reconciled total is billed; these
+// values let a reviewer reconstruct a conflicting observation.
+func (m CallMetrics) CacheWriteEvidence() map[string]int64 {
+	evidence := map[string]int64{}
+	if m.cacheWrite5m != nil {
+		evidence["cache_write_5m_tokens"] = *m.cacheWrite5m
+	}
+	if m.cacheWrite1h != nil {
+		evidence["cache_write_1h_tokens"] = *m.cacheWrite1h
+	}
+	if m.cacheWriteReported != nil {
+		evidence["cache_write_reported_tokens"] = *m.cacheWriteReported
+	}
+	return evidence
+}
+
 func (m CallMetrics) HasUsage() bool {
 	return m.HasTokenUsage() || m.UpstreamCreditMicros != nil
 }

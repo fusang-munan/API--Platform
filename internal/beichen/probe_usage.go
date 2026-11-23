@@ -75,12 +75,17 @@ func (s *Service) runProbeRound(ctx context.Context, job probeJob, targets []pro
 				usageError = result.usage.AccountingErrorCode()
 				input, output, cacheRead, cacheWrite = nil, nil, nil, nil
 			}
+			var evidence any
+			if len(result.usage.Evidence) != 0 {
+				evidence = string(result.usage.Evidence)
+			}
 			saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), probeDBTimeout)
 			defer cancel()
 			_, errs[i] = s.db.ExecContext(saveCtx, `
 UPDATE beichen_probe_usage SET status_code=NULLIF($2::integer,0), error_code=NULLIF($3,''),
-  input_tokens=$4, output_tokens=$5, cache_read_tokens=$6, cache_write_tokens=$7 WHERE id=$1`,
-				id, result.statusCode, usageError, input, output, cacheRead, cacheWrite)
+  input_tokens=$4, output_tokens=$5, cache_read_tokens=$6, cache_write_tokens=$7,
+  raw_usage=$8::jsonb WHERE id=$1`,
+				id, result.statusCode, usageError, input, output, cacheRead, cacheWrite, evidence)
 		}()
 	}
 	wg.Wait()

@@ -48,6 +48,8 @@ var bindingRouteProbeOrder = []BindingRouteProbeEndpoint{
 type ProbeUsage struct {
 	InputTokens, OutputTokens, CacheReadTokens, CacheWriteTokens *int64
 	Reason                                                       string
+	// Evidence keeps the raw usage object when counters contradict each other.
+	Evidence json.RawMessage
 }
 
 // AccountingErrorCode distinguishes contradictory upstream evidence from
@@ -291,6 +293,9 @@ func (p *RouteProbe) probeStep(ctx context.Context, upstreamModelID string, endp
 			var counters usage.CallMetrics
 			counters.MergeProtocolUsage(item.adapter, raw)
 			step.Usage = ProbeUsage{Reason: counters.UsageReason}
+			if counters.UsageReason != "" {
+				step.Usage.Evidence = append(json.RawMessage(nil), raw...)
+			}
 			if counters.UsageReason == "" {
 				step.Usage.InputTokens = counters.PromptTokens
 				step.Usage.OutputTokens = counters.CompletionTokens

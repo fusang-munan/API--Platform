@@ -759,6 +759,14 @@ func writeCallMetrics(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics
 	if err != nil {
 		return err
 	}
+	var evidence any
+	if payload := metrics.CacheWriteEvidence(); len(payload) > 0 {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		evidence = string(data)
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET upstream_response_id=COALESCE(NULLIF($2,''),upstream_response_id),
 		prompt_tokens=COALESCE($3,prompt_tokens),completion_tokens=COALESCE($4,completion_tokens),
 		truncated_quota=truncated_quota OR COALESCE($4>=quota_budget_tokens,false),
@@ -786,6 +794,12 @@ func writeCallMetrics(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics
 		metrics.CacheWriteTokens, metrics.ReasoningTokens, metrics.UpstreamCreditMicros, string(metrics.State),
 		metrics.UsageReason, metrics.ToolPromptTokens); err != nil {
 		return err
+	}
+	if evidence != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET pricing_detail=COALESCE(pricing_detail,'{}'::jsonb) || $2::jsonb
+WHERE id=$1`, callID, evidence); err != nil {
+			return err
+		}
 	}
 	return applyTurnTokenDelta(ctx, tx, turnID.UUID, tokenDelta(metrics.PromptTokens, oldPrompt),
 		tokenDelta(metrics.CompletionTokens, oldCompletion), tokenDelta(metrics.TotalTokens, oldTotal))
