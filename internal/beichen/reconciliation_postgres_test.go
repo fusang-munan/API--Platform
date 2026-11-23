@@ -73,6 +73,60 @@ VALUES($1,$2,'2026-11-08','corrected',1,300000,'csv',$3)`, provider, credential,
 	checkUsageSource(t, report.Totals.Upstream.Source, "csv")
 }
 
+func TestReconciliationClosedComparableDaysPostgres(t *testing.T) {
+	ctx, tx := reconciliationTestTransaction(t)
+	provider, first, second := uuid.New(), uuid.New(), uuid.New()
+	execTestSQL(t, ctx, tx, "INSERT INTO providers VALUES($1,$2)", provider, origin)
+	execTestSQL(t, ctx, tx, `INSERT INTO provider_credentials(id,provider_id,label,created_at) VALUES
+ ($1,$3,'渠道一','2026-11-15 00:00+08'),($2,$3,'渠道二','2026-11-15 00:00+08')`, first, second, provider)
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, beijing)
+	for _, date := range []string{"2026-11-15", "2026-11-16", "2026-11-17", "2026-11-18", "2026-11-19", "2026-11-20", "2026-11-21"} {
+		call := reportCallFixture{provider: provider, credential: first, project: uuid.New(), user: uuid.New(), key: uuid.New(),
+			model: date, protocol: "anthropic", state: "charged", usage: "reported", credits: "2", multiplier: "1",
+			sent: date + "T23:59:59+08:00", prompt: 9, output: 1, read: 0, write: 0}
+		insertReportCall(t, ctx, tx, call)
+		seedVerifiedKeyDay(t, ctx, tx, first, 41, date, now, "CNY", `{"requests":1,"total_tokens":20,"actual_cost":1}`, `[]`)
+		unit, fetched, daily := "unknown", now, `{"requests":0,"actual_cost":0}`
+		switch date {
+		case "2026-11-16":
+			continue // 缺一个渠道
+		case "2026-11-17":
+			fetched, _ = dayStart(date) // 陈旧
+		case "2026-11-18":
+			unit, daily = "USD", `{"requests":1,"actual_cost":1}`
+		case "2026-11-19":
+			unit, daily = "CNY", `{"requests":1}`
+		}
+		seedVerifiedKeyDay(t, ctx, tx, second, 42, date, fetched, unit, daily, `[]`)
+	}
+	period, _ := reportPeriod("month", now)
+	report, err := readReconciliation(ctx, tx, provider, period, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectExcluded := []ReconciliationExcludedDay{
+		{"2026-11-16", []string{"incomplete_sync"}},
+		{"2026-11-17", []string{"incomplete_sync", "stale"}},
+		{"2026-11-18", []string{"incompatible_unit"}},
+		{"2026-11-19", []string{"missing_cost"}},
+		{"2026-11-21", []string{"open_day"}},
+	}
+	if !reflect.DeepEqual(report.Coverage.ExcludedDays, expectExcluded) {
+		t.Fatalf("排除账日的依据错误: %+v", report.Coverage.ExcludedDays)
+	}
+	strict := report.ComparableOnly
+	if report.Coverage.Comparable || !reflect.DeepEqual(report.Coverage.EligibleDates, []string{"2026-11-15", "2026-11-20"}) ||
+		strict == nil || !strict.Coverage.Comparable || strict.Totals.Local.Tokens != 20 || strict.Totals.Upstream.Tokens != 40 ||
+		len(strict.Models) != 2 || len(strict.Keys) != 2 || reportDecimal(strict.Totals.Money.MarginYuan) != "-1.96" {
+		t.Fatalf("严格视图应使用相同已关闭日期汇总两侧: %+v, %+v", report.Coverage, strict)
+	}
+	period, _ = reportPeriod("day", now)
+	report, err = readReconciliation(ctx, tx, provider, period, now)
+	if err != nil || report.ComparableOnly != nil || len(report.Coverage.EligibleDates) != 0 {
+		t.Fatalf("当天尚未结束: %+v, %v", report, err)
+	}
+}
+
 func TestCatalogQualityAliasAggregationPostgres(t *testing.T) {
 	ctx, tx := reconciliationTestTransaction(t)
 	provider, first, second, actor := uuid.New(), uuid.New(), uuid.New(), uuid.New()
@@ -245,6 +299,9 @@ func TestReconciliationPostgresVerifiedCallsRequireUnconflictedReceipt(t *testin
 		{model: "gateway-conflict", day: "2026-11-20", receipt: true, gatewayConflict: true},
 	} {
 		call.model, call.sent = tc.model, tc.day+"T10:00:00+08:00"
+		if tc.model == "previous-day" {
+			call.sent = tc.day + "T23:59:59+08:00"
+		}
 		call.usage, call.read = "reported", 0
 		if tc.usage != "" {
 			call.usage = tc.usage
@@ -261,10 +318,18 @@ func TestReconciliationPostgresVerifiedCallsRequireUnconflictedReceipt(t *testin
 		}
 		execTestSQL(t, ctx, tx, `INSERT INTO beichen_receipt_response_claims VALUES($1,$2,
  CASE WHEN $3::boolean THEN gen_random_uuid() END, CASE WHEN $3::boolean THEN now() END)`, responseID, callID, tc.claimConflict)
+		occurred := call.sent
+		if tc.model == "previous-day" {
+			occurred = "2026-11-20T00:00:00+08:00" // 前一天的本地发送已在本账日关联
+		}
+		execTestSQL(t, ctx, tx, `INSERT INTO beichen_upstream_usage_rows(upstream_user_id,row_id,upstream_key_id,
+ provider_id,credential_id,channel,model,occurred_at,request_id,cost_details,input_tokens,cache_read_tokens)
+ VALUES(13,$1,1,$2,$3,'test',$4,$5::text::timestamptz,'client:'||$6::text,'{}',10,0)`,
+			index+1, provider, credential, call.model, occurred, responseID.String())
 		if tc.receipt {
 			execTestSQL(t, ctx, tx, `INSERT INTO beichen_call_receipts(row_id,call_id,credential_id,response_id,api_key_id,model,occurred_at,
  actual_cost,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,credits_booked,applied)
- VALUES($1,$2,$3,$4,1,$5,$6::text::timestamptz,0.01,10,0,0,0,1,false)`, index+1, callID, credential, responseID, call.model, call.sent)
+ VALUES($1,$2,$3,$4,1,$5,$6::text::timestamptz,0.01,10,0,0,0,1,false)`, index+1, callID, credential, responseID, call.model, occurred)
 		}
 	}
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, beijing)
@@ -274,7 +339,17 @@ func TestReconciliationPostgresVerifiedCallsRequireUnconflictedReceipt(t *testin
 	}{{"day", 3, 1}, {"month", 4, 2}} {
 		period, _ := reportPeriod(tc.rangeValue, now)
 		view, err := readReconciliation(ctx, tx, provider, period, now)
-		if err != nil || view.Coverage.VerifiedMatchedCalls != tc.wantCount ||
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows := view.UnmatchedUpstream
+		if len(rows) != 3 || rows[0].Model != "gateway-conflict" || rows[1].Model != "claim-conflict" ||
+			rows[2].Model != "claim-without-receipt" || rows[0].ReceiptID == nil || rows[2].ReceiptID != nil ||
+			rows[0].RequestID == nil || rows[0].Output != nil || rows[0].CacheRead == nil || *rows[0].CacheRead != 0 ||
+			rows[0].OccurredAt.Format(time.RFC3339) != "2026-11-20T10:00:00+08:00" {
+			t.Fatalf("未关联归档流水与严格回执认领不一致: %+v", rows)
+		}
+		if view.Coverage.VerifiedMatchedCalls != tc.wantCount ||
 			view.Coverage.VerifiedMatchedCompleteTokenCalls != tc.wantTokens || view.Coverage.ComparableDays != 0 {
 			t.Fatalf("%s 逐笔关联数或本地 Token 完整笔数错误: %+v, err=%v", tc.rangeValue, view.Coverage, err)
 		}

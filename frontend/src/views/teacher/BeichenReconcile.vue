@@ -2,27 +2,15 @@
 import { computed, onBeforeUnmount, ref, shallowRef, useId, watch } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
-import type { BeichenReconcile, BeichenReconcileKey, BeichenReconcileModel, BeichenReconcileSide, BeichenUsageRange } from '../../api/types'
+import type { BeichenReconcile, BeichenReconcileModel, BeichenReconcileSide, BeichenUsageRange } from '../../api/types'
 import CompareBars from '../../components/CompareBars.vue'
 import CreditDonut from '../../components/CreditDonut.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
 import { creditsToYuan, formatCredits, formatPercent, formatTokens, formatYuan, shiftDecimal } from '../../utils/credits'
 
-type TokenCompleteness = 'complete' | 'partial' | 'missing'
-type TokenSide = BeichenReconcileSide & { requests: number; completeness: TokenCompleteness }
-type LocalUsage = TokenSide & { tokens_missing: number; charged_tokens_missing_calls: number }
-type Margin = { margin_available: boolean; margin_yuan: string | null }
-type ReconcileLine = Margin & { local: LocalUsage; upstream: TokenSide }
-type Channel = { credential_id: string; label: string | null }
-type ReconcileModel = BeichenReconcileModel & ReconcileLine & Channel
-type ReconcileKey = Omit<BeichenReconcileKey, 'label'> & ReconcileLine & Channel
-type ReconcileCoverage = BeichenReconcile['coverage'] & { comparable_days: number; verified_matched_complete_token_calls: number }
-type ReconcileData = Omit<BeichenReconcile, 'models' | 'keys'> & {
-  coverage: ReconcileCoverage
-  totals: { local: LocalUsage; upstream: TokenSide; money: BeichenReconcile['totals']['money'] & Margin }
-  models: ReconcileModel[]
-  keys: ReconcileKey[]
-}
+type TokenSide = BeichenReconcileSide
+type Margin = Pick<BeichenReconcile['totals']['money'], 'margin_available' | 'margin_yuan'>
+type Channel = Pick<BeichenReconcileModel, 'credential_id' | 'label'>
 
 const props = defineProps<{ providerId: string }>()
 const titleId = useId()
@@ -31,7 +19,21 @@ const ranges: Array<{ value: BeichenUsageRange; label: string }> = [
   { value: 'day', label: '当天' }, { value: 'month', label: '本月' }, { value: 'all', label: '总计' },
 ]
 const metric = ref<'tokens' | 'money'>('tokens')
-const data = shallowRef<ReconcileData>()
+const report = shallowRef<BeichenReconcile>()
+const strict = ref(false)
+const data = computed(() => strict.value ? report.value?.comparable_only : report.value)
+const unmatched = computed(() => {
+  if (!report.value?.unmatched_upstream) return []
+  const { unmatched_upstream, coverage } = report.value
+  if (!strict.value) return unmatched_upstream
+  const dates = new Set(coverage.eligible_dates)
+  // occurred_at is supplied in Beijing time with an explicit +08:00 offset.
+  return unmatched_upstream.filter(row => dates.has(row.occurred_at.slice(0, 10)))
+})
+const page = ref(1)
+const pageSize = 50
+const pageRows = computed(() => unmatched.value.slice((page.value - 1) * pageSize, page.value * pageSize))
+watch([strict, report], () => { page.value = 1 })
 const currencyMismatch = computed(() => {
   const side = data.value?.totals.upstream
   return !!side && (!!side.mixed_units || (side.unit != null && side.unit !== 'CNY'))
@@ -42,21 +44,25 @@ const loading = ref(true)
 const error = ref('')
 const models = computed(() => data.value?.models ?? [])
 const keys = computed(() => data.value?.keys ?? [])
-const empty = computed(() => !models.value.length && !keys.value.length)
+const empty = computed(() => !models.value.length && !keys.value.length && !unmatched.value.length)
 const palette = ['#0071e3', '#168473', '#b77916', '#b44d76', '#7657b7', '#427886', '#646f80']
 const matchLabels: Record<BeichenReconcileModel['match_status'], string> = {
   matched: '两边均有记录', local_only: '仅本地有记录', upstream_only: '仅北辰有记录',
 }
-const completenessLabels: Record<TokenCompleteness, string> = {
+const completenessLabels: Record<TokenSide['completeness'], string> = {
   complete: 'Token 回报完整', partial: 'Token 部分回报', missing: 'Token 待核',
 }
-const coverageLabels: Record<NonNullable<ReconcileCoverage['coverage_kind']>, string> = {
+const coverageLabels: Record<NonNullable<BeichenReconcile['coverage']['coverage_kind']>, string> = {
   full: '同步完整', partial: '部分同步', none: '暂无已同步账日',
 }
+const exclusionLabels: Record<string, string> = {
+  open_day: '账日尚未结束', incomplete_sync: '渠道未同步完整', stale: '账单已陈旧',
+  missing_cost: '缺少实扣金额', incompatible_unit: '金额单位不可比',
+}
 const period = computed(() => {
-  if (!data.value) return ''
-  const end = beijingDate(data.value.end)
-  return data.value.start ? `${beijingDate(data.value.start)} 起 · 截至 ${end}（北京时间）` : `全部已记录数据 · 截至 ${end}（北京时间）`
+  if (!report.value) return ''
+  const end = beijingDate(report.value.end)
+  return report.value.start ? `${beijingDate(report.value.start)} 起 · 截至 ${end}（北京时间）` : `全部已记录数据 · 截至 ${end}（北京时间）`
 })
 const localSegments = computed(() => models.value.map((row, index) => ({
   name: modelLabel(row), value: row.local.tokens, color: palette[index % palette.length], displayValue: formatPercent(row.local_share),
@@ -76,7 +82,7 @@ function channelLabel(row: Channel) {
   return row.label || `渠道 ${row.credential_id.slice(0, 8)}`
 }
 
-function modelLabel(row: ReconcileModel) {
+function modelLabel(row: BeichenReconcileModel) {
   return `${row.model} · ${channelLabel(row)}`
 }
 
@@ -132,11 +138,11 @@ async function load() {
   const current = ++requestVersion
   loading.value = true
   error.value = ''
-  data.value = undefined
+  report.value = undefined
   try {
-    const result = await teacherAPI.beichenReconciliation(props.providerId, range.value) as ReconcileData
+    const result = await teacherAPI.beichenReconciliation(props.providerId, range.value)
     // 切换范围或供应商后，过期响应不能覆盖当前对账结果。
-    if (current === requestVersion) data.value = result
+    if (current === requestVersion) report.value = result
   } catch (e) {
     if (current === requestVersion) error.value = apiErrorMessage(e, '北辰对账读取失败，请重试。')
   } finally {
@@ -167,13 +173,24 @@ onBeforeUnmount(() => { requestVersion++ })
       <p>{{ error }}</p><button type="button" class="button secondary" @click="load">重试</button>
     </div>
     <LoadingRegion :initial-loading="loading" variant="cards" label="正在读取北辰对账" :rows="2">
-      <div v-if="data" class="beichen-stack">
+      <div v-if="report" class="beichen-stack">
+        <div class="range-switch" role="group" aria-label="账日口径">
+          <button type="button" :aria-pressed="!strict" @click="strict = false">全部已观察</button>
+          <button type="button" :aria-pressed="strict" @click="strict = true">仅完整可比账日</button>
+        </div>
         <p class="beichen-note">{{ period }}</p>
+        <p v-if="strict" class="beichen-note">仅汇总已经结束、所有应同步渠道均有新鲜账单且实扣金额可按元比较的北京时间账日。</p>
+        <p v-if="strict && !data" class="beichen-empty" role="status">当前范围无完整可比账日，差额不可比。</p>
+        <details v-if="report.coverage.excluded_days?.length" class="beichen-note">
+          <summary>未纳入严格汇总的账日（{{ report.coverage.excluded_days.length }} 天）</summary>
+          <ul><li v-for="day in report.coverage.excluded_days" :key="day.date">{{ day.date }} · {{ day.reasons.map(reason => exclusionLabels[reason] ?? reason).join('、') }}</li></ul>
+        </details>
+        <template v-if="data">
         <div class="beichen-summary reconcile-kpis" aria-label="对账汇总">
           <div class="beichen-stat" data-kpi="local-tokens">
             <span>本地 Token 总量</span>
             <strong>{{ formatTokens(data.totals.local.requests === 0 ? 0 : reportedTokens(data.totals.local)) }}</strong>
-            <small>学校网关已回报的分项合计</small>
+            <small>学校网关已知用量，含待归类 Token</small>
           </div>
           <div class="beichen-stat" data-kpi="upstream-tokens">
             <span>北辰 Token 总量</span>
@@ -210,13 +227,14 @@ onBeforeUnmount(() => { requestVersion++ })
               <dd>{{ formatTokens(data.coverage.days_present) }} / {{ formatTokens(data.coverage.days_expected) }} <small>已同步 / 应同步，每渠道每天计一次</small></dd>
             </div>
           </dl>
+          <p v-if="strict" class="beichen-note">纳入账日 {{ data.coverage.eligible_dates.join('、') }}</p>
           <p v-if="data.coverage.key_usage_days" class="beichen-note">
             Key 公开用量覆盖 {{ data.coverage.key_usage_days }} 个渠道账日，模型明细已核对 {{ data.coverage.key_usage_model_days ?? 0 }} / {{ data.coverage.key_usage_days }}（{{ formatPercent(String((data.coverage.key_usage_model_days ?? 0) / data.coverage.key_usage_days)) }}）。
             <template v-if="data.coverage.stale_key_usage_days">{{ data.coverage.stale_key_usage_days }} 个渠道账日保留上次数据（已陈旧）。</template>
           </p>
           <p v-if="data.coverage.missing_days.length" class="coverage-warning">待同步日期 {{ data.coverage.missing_days.join('、') }}。当前区间差额不可比。</p>
           <p v-if="currencyMismatch" class="coverage-warning">校内金额按元折算，北辰实扣保留原单位，当前区间差额不可比。</p>
-          <p v-else-if="data.coverage.coverage_kind === 'full' && !data.totals.money.margin_available" class="coverage-warning">缺少可核对的北辰实扣金额，差额不可比。</p>
+          <p v-else-if="data.coverage.coverage_kind === 'full' && !data.coverage.comparable" class="coverage-warning">缺少可核对的北辰实扣金额，差额不可比。</p>
           <p v-if="data.coverage.multiplier_mixed" class="coverage-warning">当前范围包含不同学校扣费倍率，不能统一按 1.10 倍推算差额。</p>
           <p class="beichen-note">
             基础成本 {{ yuan(data.totals.money.base_yuan) }} {{ moneyUnit }}<template v-if="data.totals.money.margin_available && data.totals.money.margin_rate != null">，差额率 {{ formatPercent(data.totals.money.margin_rate) }}</template>。
@@ -228,10 +246,36 @@ onBeforeUnmount(() => { requestVersion++ })
           <div class="coverage-facts">
             <strong>可逐笔关联 {{ formatTokens(data.coverage.verified_matched_calls) }} 笔，其中本地 Token 完整 {{ formatTokens(data.coverage.verified_matched_complete_token_calls) }} 笔</strong>
             <span :class="{ 'coverage-warning': data.totals.local.charged_tokens_missing_calls > 0 }">已扣款但 Token 不完整 {{ formatTokens(data.totals.local.charged_tokens_missing_calls) }} 笔</span>
-            <span :class="{ 'coverage-warning': data.coverage.pending_calls > 0 }">待核账 {{ formatTokens(data.coverage.pending_calls) }} 笔</span>
+            <span :class="{ 'coverage-warning': data.coverage.pending_calls > 0 }">待核账请求 {{ formatTokens(data.coverage.pending_calls) }} 笔</span>
             <span :class="{ 'coverage-warning': data.coverage.unpriced_calls > 0 }">无报价调用 {{ formatTokens(data.coverage.unpriced_calls) }} 笔</span>
           </div>
-          <p v-if="data.totals.local.tokens_missing > 0" class="beichen-note">另有约 {{ formatTokens(data.totals.local.tokens_missing) }} Token 待核。</p>
+          <p v-if="data.totals.local.tokens_missing > 0" class="beichen-note">已计入本地总量、待归类 {{ formatTokens(data.totals.local.tokens_missing) }} Token。</p>
+        </section>
+
+        <section class="beichen-card reconcile-detail" aria-label="北辰有、本地无">
+          <h3>北辰有、本地无</h3>
+          <p class="beichen-note">以下北辰归档流水尚未关联到已验证的本地扣款。超时或待核的请求仍可能有本地调用记录。</p>
+          <div v-if="unmatched.length" class="reconcile-table-wrap">
+            <table class="beichen-table reconcile-table">
+              <caption>已归档未关联 {{ formatTokens(unmatched.length) }} 笔</caption>
+              <thead><tr><th>北京时间</th><th>模型</th><th>渠道</th><th>普通输入</th><th>输出</th><th>缓存读</th><th>缓存写</th><th>北辰请求号</th><th>回执号</th></tr></thead>
+              <tbody>
+                <tr v-for="row in pageRows" :key="row.upstream_user_id + ':' + row.row_id">
+                  <th scope="row">{{ row.occurred_at.slice(0, 19).replace('T', ' ') }}</th>
+                  <td data-label="模型">{{ row.model }}</td><td data-label="渠道">{{ channelLabel(row) }}</td>
+                  <td data-label="普通输入">{{ formatTokens(row.input_tokens) }}</td><td data-label="输出">{{ formatTokens(row.output_tokens) }}</td>
+                  <td data-label="缓存读">{{ formatTokens(row.cache_read_tokens) }}</td><td data-label="缓存写">{{ formatTokens(row.cache_write_tokens) }}</td>
+                  <td data-label="北辰请求号">{{ row.request_id || '—' }}</td><td data-label="回执号">{{ row.receipt_id || '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <nav v-if="unmatched.length > pageSize" aria-label="未关联流水翻页">
+              <button type="button" :disabled="page === 1" @click="page--">上一页</button>
+              第 {{ page }} / {{ Math.ceil(unmatched.length / pageSize) }} 页
+              <button type="button" :disabled="page * pageSize >= unmatched.length" @click="page++">下一页</button>
+            </nav>
+          </div>
+          <p v-else class="beichen-note">所选账日的已归档流水中暂无未关联记录。仅有日汇总的调用无法逐笔核对。</p>
         </section>
 
         <div v-if="empty" class="beichen-empty" role="status">
@@ -347,6 +391,7 @@ onBeforeUnmount(() => { requestVersion++ })
           </div>
           <p v-else class="beichen-empty">当前范围暂无按渠道 Key 汇总的记录。</p>
         </section>
+        </template>
       </div>
     </LoadingRegion>
   </section>
