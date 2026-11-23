@@ -362,7 +362,7 @@ func (g *Gateway) proxyHTTPBody(attemptCtx context.Context, w http.ResponseWrite
 				status := rawString(payload["status"])
 				interrupted = (status != "" || ctx.Err() != nil) && status != "completed" && !beichenResponsesOutputLimited(payload)
 			}
-			metrics = parseJSONResponseMetrics(adapter, prefix).finished(interrupted)
+			metrics = parseJSONResponseMetrics(adapter, prefix).finishedJSON(adapter, original.URL.Path, interrupted)
 			if isCreation {
 				resourceBody = prefix
 			}
@@ -376,8 +376,8 @@ func (g *Gateway) proxyHTTPBody(attemptCtx context.Context, w http.ResponseWrite
 			category, message = review, "The response requires billing review."
 		}
 	}
-	if north && metrics.State == usage.UsageInterrupted {
-		success, category, message = false, "stream", "Upstream response did not complete."
+	if metrics.State == usage.UsageInterrupted {
+		success, category, message = false, "stream", "Upstream response did not reach a terminal state."
 	}
 	if err := g.finalizeCall(ctx, *reservation, success, category, message, candidate, metrics); err != nil {
 		_ = response.Body.Close()
@@ -423,7 +423,15 @@ func (g *Gateway) proxySSE(w http.ResponseWriter, original *http.Request, respon
 			}
 			charged = err == nil
 		}
+		if ctx.Err() != nil {
+			readErr = ctx.Err()
+			break
+		}
 		if !started && (n > 0 || readErr != nil) {
+			if ctx.Err() != nil {
+				readErr = ctx.Err()
+				break
+			}
 			copyHeaders(w.Header(), response.Header)
 			removeHopByHop(w.Header())
 			w.WriteHeader(response.StatusCode)

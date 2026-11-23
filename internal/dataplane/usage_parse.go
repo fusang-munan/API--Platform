@@ -14,6 +14,7 @@ import (
 type ResponseMetrics struct {
 	usage.CallMetrics
 	stopExplicit bool
+	terminal     bool
 }
 
 func parseJSONResponseMetrics(adapter modelbinding.Adapter, body []byte) ResponseMetrics {
@@ -55,6 +56,35 @@ func (metrics ResponseMetrics) finished(interrupted bool) usage.CallMetrics {
 		}
 	}
 	return result
+}
+
+// Non-streaming generation responses must prove that the server finished the
+// turn. Initial events and preparatory snapshots can contain partial usage.
+func (metrics ResponseMetrics) finishedJSON(adapter modelbinding.Adapter, requestPath string, interrupted bool) usage.CallMetrics {
+	if interrupted {
+		return metrics.finished(true)
+	}
+	if jsonRequiresTerminal(adapter, requestPath) && !metrics.terminal {
+		result := metrics.CallMetrics
+		result.State = usage.UsageInterrupted
+		if result.UsageReason == "" {
+			result.UsageReason = "terminal_usage_missing"
+		}
+		return result
+	}
+	return metrics.finished(false)
+}
+
+func jsonRequiresTerminal(adapter modelbinding.Adapter, requestPath string) bool {
+	switch adapter {
+	case modelbinding.AdapterOpenaiCompatible, modelbinding.AdapterOpenaiResponses, modelbinding.AdapterAnthropic:
+		return true
+	case modelbinding.AdapterGoogleGeminiV1beta:
+		// Gemini embeddings have no generation terminal marker.
+		return !strings.HasSuffix(requestPath, ":embedContent") && !strings.HasSuffix(requestPath, ":batchEmbedContents")
+	default:
+		return false
+	}
 }
 
 func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, payload map[string]json.RawMessage) {
@@ -238,6 +268,19 @@ func applyReplyState(metrics *ResponseMetrics, payload map[string]json.RawMessag
 			noteToolRequest(metrics, deltaRaw)
 		}
 	}
+	if candidatesRaw, ok := payload["candidates"]; ok {
+		var candidates []map[string]json.RawMessage
+		if json.Unmarshal(candidatesRaw, &candidates) == nil {
+			for _, candidate := range candidates {
+				if reason := rawString(candidate["finishReason"]); reason != "" && reason != "FINISH_REASON_UNSPECIFIED" {
+					metrics.terminal = true
+				}
+			}
+		}
+	}
+	if reason := rawString(jsonObject(payload["promptFeedback"])["blockReason"]); reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
+		metrics.terminal = true
+	}
 	noteStopReason(metrics, rawString(payload["stop_reason"]))
 	noteStopReason(metrics, rawString(payload["finish_reason"]))
 	eventType := strings.ToLower(rawString(payload["type"]))
@@ -246,9 +289,15 @@ func applyReplyState(metrics *ResponseMetrics, payload map[string]json.RawMessag
 		closed := true
 		metrics.ReplyClosed = &closed
 	}
+	if eventType == "message_stop" || eventType == "response.completed" || status == "completed" || status == "incomplete" {
+		metrics.terminal = true
+	}
 }
 
 func noteStopReason(metrics *ResponseMetrics, reason string) {
+	if strings.TrimSpace(reason) != "" {
+		metrics.terminal = true
+	}
 	switch strings.ToLower(strings.TrimSpace(reason)) {
 	case "tool_use", "tool_calls", "pause_turn":
 		metrics.stopExplicit = true

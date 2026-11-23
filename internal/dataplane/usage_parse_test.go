@@ -69,6 +69,98 @@ func TestParseAnthropicEndTurnCloses(t *testing.T) {
 	}
 }
 
+func TestJSONUsageRequiresTerminalEvidence(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name, body string
+		adapter    modelbinding.Adapter
+		terminal   bool
+		prompt     int64
+		output     int64
+	}{
+		{
+			"Anthropic message_start is not terminal",
+			`{"type":"message_start","message":{"id":"msg_start","model":"m","stop_reason":null,"usage":{"input_tokens":5,"output_tokens":1}}}`,
+			modelbinding.AdapterAnthropic, false, 5, 1,
+		},
+		{
+			"Anthropic stop_reason is terminal",
+			`{"id":"msg_done","type":"message","model":"m","stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":1}}`,
+			modelbinding.AdapterAnthropic, true, 5, 1,
+		},
+		{
+			"Anthropic message_stop is terminal",
+			`{"type":"message_stop","model":"m","message":{"id":"msg_stop","usage":{"input_tokens":5,"output_tokens":1}}}`,
+			modelbinding.AdapterAnthropic, true, 5, 1,
+		},
+		{
+			"OpenAI finish_reason is terminal",
+			`{"model":"m","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1}}`,
+			modelbinding.AdapterOpenaiCompatible, true, 5, 1,
+		},
+		{
+			"OpenAI missing finish_reason is not terminal",
+			`{"model":"m","choices":[{"message":{"content":"ok"},"finish_reason":null}],"usage":{"prompt_tokens":5,"completion_tokens":1}}`,
+			modelbinding.AdapterOpenaiCompatible, false, 5, 1,
+		},
+		{
+			"Responses completed status is terminal",
+			`{"model":"m","status":"completed","usage":{"input_tokens":5,"output_tokens":1}}`,
+			modelbinding.AdapterOpenaiResponses, true, 5, 1,
+		},
+		{
+			"Responses in_progress status is not terminal",
+			`{"model":"m","status":"in_progress","usage":{"input_tokens":5,"output_tokens":1}}`,
+			modelbinding.AdapterOpenaiResponses, false, 5, 1,
+		},
+		{
+			"Gemini finishReason is terminal",
+			`{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":1}}`,
+			modelbinding.AdapterGoogleGeminiV1beta, true, 5, 1,
+		},
+		{
+			"Gemini missing finishReason is not terminal",
+			`{"candidates":[{"content":{"parts":[]}}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":1}}`,
+			modelbinding.AdapterGoogleGeminiV1beta, false, 5, 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics := parseJSONResponseMetrics(tc.adapter, []byte(tc.body)).finishedJSON(tc.adapter, "", false)
+			if !tc.terminal {
+				if metrics.State != usage.UsageInterrupted || metrics.UsageReason != "terminal_usage_missing" ||
+					!tokenIs(metrics.PromptTokens, tc.prompt) || !tokenIs(metrics.CompletionTokens, tc.output) {
+					t.Fatalf("partial terminal evidence was billable: %+v", metrics)
+				}
+				return
+			}
+			if metrics.State != usage.UsageReported || !tokenIs(metrics.PromptTokens, tc.prompt) ||
+				!tokenIs(metrics.CompletionTokens, tc.output) {
+				t.Fatalf("terminal usage was not reported: %+v", metrics)
+			}
+		})
+	}
+}
+
+func TestJSONWithoutTerminalCannotAuthorizeUsage(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"type":"message_start","message":{"id":"msg_empty","model":"m","stop_reason":null}}`)
+	metrics := parseJSONResponseMetrics(modelbinding.AdapterAnthropic, body).finishedJSON(modelbinding.AdapterAnthropic, "/v1/messages", false)
+	if metrics.State != usage.UsageInterrupted || metrics.UsageReason != "terminal_usage_missing" || metrics.HasUsage() {
+		t.Fatalf("missing terminal evidence authorized usage: %+v", metrics)
+	}
+}
+
+func TestJSONEmbeddingUsageDoesNotNeedGenerationTerminal(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"usageMetadata":{"promptTokenCount":5,"totalTokenCount":5}}`)
+	metrics := parseJSONResponseMetrics(modelbinding.AdapterGoogleGeminiV1beta, body).
+		finishedJSON(modelbinding.AdapterGoogleGeminiV1beta, "/v1beta/models/embed:embedContent", false)
+	if metrics.State != usage.UsageReported || !tokenIs(metrics.PromptTokens, 5) {
+		t.Fatalf("embedding usage was treated as an incomplete generation: %+v", metrics)
+	}
+}
+
 func TestParseSSEStopReasonWinsOverToolBlock(t *testing.T) {
 	t.Parallel()
 	body := []byte("data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\ndata: {\"type\":\"message_stop\"}\n\n")
@@ -91,16 +183,16 @@ func TestParseResponsesFunctionCallStaysOpen(t *testing.T) {
 }
 
 func TestUsageKeepsExplicitZerosAndOverlappingOpenAICache(t *testing.T) {
-	body := []byte(`{"usage":{"prompt_tokens":25,"completion_tokens":0,"credit":0,"prompt_tokens_details":{"cached_tokens":25},"completion_tokens_details":{"reasoning_tokens":0},"debug":"private content"}}`)
-	metrics := parseJSONResponseMetrics(modelbinding.AdapterOpenaiCompatible, body).finished(false)
+	body := []byte(`{"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":25,"completion_tokens":0,"credit":0,"prompt_tokens_details":{"cached_tokens":25},"completion_tokens_details":{"reasoning_tokens":0},"debug":"private content"}}`)
+	metrics := parseJSONResponseMetrics(modelbinding.AdapterOpenaiCompatible, body).finishedJSON(modelbinding.AdapterOpenaiCompatible, "/v1/chat/completions", false)
 	if metrics.State != usage.UsageReported || !tokenIs(metrics.PromptTokens, 25) ||
 		!tokenIs(metrics.CacheHitTokens, 25) || !tokenIs(metrics.CompletionTokens, 0) ||
 		!tokenIs(metrics.ReasoningTokens, 0) || !tokenIs(metrics.UpstreamCreditMicros, 0) ||
 		metrics.TotalTokens != nil || metrics.CacheMissTokens != nil {
 		t.Fatalf("unexpected metrics: %+v", metrics)
 	}
-	bad := []byte(`{"usage":{"prompt_tokens":-1,"completion_tokens":"0","total_tokens":2147483648,"credit":1e100,"debug":"private content"}}`)
-	if metrics := parseJSONResponseMetrics(modelbinding.AdapterOpenaiCompatible, bad).finished(false); metrics.State != usage.UsageMissing {
+	bad := []byte(`{"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":-1,"completion_tokens":"0","total_tokens":2147483648,"credit":1e100,"debug":"private content"}}`)
+	if metrics := parseJSONResponseMetrics(modelbinding.AdapterOpenaiCompatible, bad).finishedJSON(modelbinding.AdapterOpenaiCompatible, "/v1/chat/completions", false); metrics.State != usage.UsageMissing {
 		t.Fatalf("accepted unknown or invalid counters: %+v", metrics)
 	}
 }
@@ -136,13 +228,13 @@ func TestBeichenUsageProtocolMatrix(t *testing.T) {
 		prompt, output, read, write      int64 // -1 is an omitted counter
 		reasoning, tool                  int64
 	}{
-		{"Chat JSON", "json", `{"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":6}}`, "",
+		{"Chat JSON", "json", `{"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":6}}`, "",
 			modelbinding.AdapterOpenaiCompatible, usage.UsageReported, 10, 2, 4, 0, -1, -1},
 		{"Chat SSE", "sse", "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\ndata: [DONE]\n\n",
 			"token_breakdown_unconfirmed", modelbinding.AdapterOpenaiCompatible, usage.UsagePartial, 10, 0, 0, -1, -1, -1},
-		{"Chat invalid cache write", "json", `{"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":6,"prompt_cache_write_tokens":-1}}`,
+		{"Chat invalid cache write", "json", `{"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":6,"prompt_cache_write_tokens":-1}}`,
 			"invalid_token_count", modelbinding.AdapterOpenaiCompatible, usage.UsagePartial, 10, 2, 4, -1, -1, -1},
-		{"Responses JSON", "json", `{"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cached_tokens":4,"cache_write_tokens":1},"output_tokens_details":{"reasoning_tokens":1}}}`, "",
+		{"Responses JSON", "json", `{"status":"completed","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cached_tokens":4,"cache_write_tokens":1},"output_tokens_details":{"reasoning_tokens":1}}}`, "",
 			modelbinding.AdapterOpenaiResponses, usage.UsageReported, 10, 2, 4, 1, 1, -1},
 		{"Responses SSE", "sse", "data: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n",
 			"response_interrupted", modelbinding.AdapterOpenaiResponses, usage.UsageInterrupted, 10, 2, -1, -1, -1, -1},
@@ -152,14 +244,14 @@ func TestBeichenUsageProtocolMatrix(t *testing.T) {
 			"token_breakdown_unconfirmed", modelbinding.AdapterOpenaiResponses, usage.UsagePartial, 33267, 8, 32768, -1, -1, -1},
 		{"Responses WebSocket", "ws", `{"type":"response.done","response":{"id":"ws-1","status":"completed","usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":4,"cache_write_tokens":1}}}}`, "",
 			modelbinding.AdapterOpenaiResponses, usage.UsageReported, 10, 2, 4, 1, -1, -1},
-		{"Anthropic JSON", "json", `{"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":4,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":0}}}`, "",
+		{"Anthropic JSON", "json", `{"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":4,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":0}}}`, "",
 			modelbinding.AdapterAnthropic, usage.UsageReported, 5, 2, 4, 1, -1, -1},
 		{"Anthropic SSE", "sse", "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":1}}}\n\n" +
 			"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\ndata: {\"type\":\"message_stop\"}\n\n", "",
 			modelbinding.AdapterAnthropic, usage.UsageReported, 5, 2, 4, 1, -1, -1},
-		{"Anthropic conflicting writes", "json", `{"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":4,"cache_creation_input_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":3}}}`,
+		{"Anthropic conflicting writes", "json", `{"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":4,"cache_creation_input_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":3}}}`,
 			"conflicting_cache_creation_counts", modelbinding.AdapterAnthropic, usage.UsagePartial, 5, 2, 4, 1, -1, -1},
-		{"Gemini JSON array", "json", `[{"usageMetadata":{"promptTokenCount":10,"cachedContentTokenCount":4}},{"usageMetadata":{"candidatesTokenCount":2,"thoughtsTokenCount":1,"toolUsePromptTokenCount":3,"totalTokenCount":16}}]`,
+		{"Gemini JSON array", "json", `[{"usageMetadata":{"promptTokenCount":10,"cachedContentTokenCount":4}},{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":2,"thoughtsTokenCount":1,"toolUsePromptTokenCount":3,"totalTokenCount":16}}]`,
 			"cache_write_not_in_usage_metadata", modelbinding.AdapterGoogleGeminiV1beta, usage.UsagePartial, 10, 2, 4, -1, 1, 3},
 		{"Gemini SSE", "sse", "data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"cachedContentTokenCount\":4,\"candidatesTokenCount\":2,\"thoughtsTokenCount\":1,\"toolUsePromptTokenCount\":3,\"totalTokenCount\":16}}\n\n",
 			"cache_write_not_in_usage_metadata", modelbinding.AdapterGoogleGeminiV1beta, usage.UsagePartial, 10, 2, 4, -1, 1, 3},
@@ -169,7 +261,7 @@ func TestBeichenUsageProtocolMatrix(t *testing.T) {
 			var metrics usage.CallMetrics
 			switch tc.transport {
 			case "json":
-				metrics = parseJSONResponseMetrics(tc.adapter, []byte(tc.payload)).finished(false)
+				metrics = parseJSONResponseMetrics(tc.adapter, []byte(tc.payload)).finishedJSON(tc.adapter, "", false)
 			case "sse":
 				observer := sseObserver{adapter: tc.adapter, beichen: true}
 				observer.observe([]byte(tc.payload))
