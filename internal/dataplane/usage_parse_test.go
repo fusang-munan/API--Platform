@@ -104,6 +104,11 @@ func TestJSONUsageRequiresTerminalEvidence(t *testing.T) {
 			modelbinding.AdapterOpenaiCompatible, false, 5, 1,
 		},
 		{
+			"OpenAI foreign stop_reason is not terminal",
+			`{"model":"m","stop_reason":"end_turn","usage":{"prompt_tokens":5,"completion_tokens":1}}`,
+			modelbinding.AdapterOpenaiCompatible, false, 5, 1,
+		},
+		{
 			"Responses completed status is terminal",
 			`{"model":"m","status":"completed","usage":{"input_tokens":5,"output_tokens":1}}`,
 			modelbinding.AdapterOpenaiResponses, true, 5, 1,
