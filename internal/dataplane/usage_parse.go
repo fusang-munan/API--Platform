@@ -75,19 +75,27 @@ func (metrics ResponseMetrics) finishedJSON(adapter modelbinding.Adapter, reques
 }
 
 func jsonRequiresTerminal(adapter modelbinding.Adapter, requestPath string) bool {
+	path := strings.ToLower(strings.TrimSuffix(requestPath, "/"))
 	switch adapter {
-	case modelbinding.AdapterOpenaiCompatible, modelbinding.AdapterOpenaiResponses, modelbinding.AdapterAnthropic:
-		return true
+	case modelbinding.AdapterOpenaiCompatible:
+		// Only generation endpoints carry a finish_reason. Embeddings, audio and
+		// other OpenAI-compatible routes report usage without a turn terminal.
+		return path == "" || strings.HasSuffix(path, "/chat/completions") || strings.HasSuffix(path, "/completions")
+	case modelbinding.AdapterOpenaiResponses:
+		// Compaction returns a finished summary that has no generation status.
+		return path == "" || !strings.HasSuffix(path, "/responses/compact")
+	case modelbinding.AdapterAnthropic:
+		return path == "" || strings.HasSuffix(path, "/messages")
 	case modelbinding.AdapterGoogleGeminiV1beta:
 		// Gemini embeddings have no generation terminal marker.
-		return !strings.HasSuffix(requestPath, ":embedContent") && !strings.HasSuffix(requestPath, ":batchEmbedContents")
+		return !strings.HasSuffix(path, ":embedcontent") && !strings.HasSuffix(path, ":batchembedcontents")
 	default:
 		return false
 	}
 }
 
 func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, payload map[string]json.RawMessage) {
-	applyReplyState(metrics, payload)
+	applyReplyState(adapter, metrics, payload)
 	if adapter == modelbinding.AdapterGoogleGeminiV1beta {
 		metrics.noteResponseID(payload["responseId"])
 		metrics.MergeProtocolUsage(adapter, payload["usageMetadata"])
@@ -104,7 +112,7 @@ func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, paylo
 	}
 	if envelope != "" {
 		if nested := jsonObject(payload[envelope]); nested != nil {
-			applyReplyState(metrics, nested)
+			applyReplyState(adapter, metrics, nested)
 			metrics.noteResponseID(nested["id"])
 			metrics.MergeProtocolUsage(adapter, nested["usage"])
 		}
@@ -148,7 +156,7 @@ func jsonObject(raw json.RawMessage) map[string]json.RawMessage {
 	return value
 }
 
-func applyReplyState(metrics *ResponseMetrics, payload map[string]json.RawMessage) {
+func applyReplyState(adapter modelbinding.Adapter, metrics *ResponseMetrics, payload map[string]json.RawMessage) {
 	noteToolRequest(metrics, payload["content"])
 	noteToolRequest(metrics, payload["output"])
 	noteToolRequest(metrics, payload["content_block"])
@@ -175,7 +183,7 @@ func applyReplyState(metrics *ResponseMetrics, payload map[string]json.RawMessag
 			noteToolRequest(metrics, deltaRaw)
 		}
 	}
-	if candidatesRaw, ok := payload["candidates"]; ok {
+	if candidatesRaw, ok := payload["candidates"]; ok && adapter == modelbinding.AdapterGoogleGeminiV1beta {
 		var candidates []map[string]json.RawMessage
 		if json.Unmarshal(candidatesRaw, &candidates) == nil {
 			for _, candidate := range candidates {
@@ -185,18 +193,21 @@ func applyReplyState(metrics *ResponseMetrics, payload map[string]json.RawMessag
 			}
 		}
 	}
-	if reason := rawString(jsonObject(payload["promptFeedback"])["blockReason"]); reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
+	if reason := rawString(jsonObject(payload["promptFeedback"])["blockReason"]); adapter == modelbinding.AdapterGoogleGeminiV1beta && reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
 		metrics.terminal = true
 	}
 	noteStopReason(metrics, rawString(payload["stop_reason"]))
 	noteStopReason(metrics, rawString(payload["finish_reason"]))
 	eventType := strings.ToLower(rawString(payload["type"]))
 	status := strings.ToLower(rawString(payload["status"]))
-	if metrics.ReplyClosed == nil && (eventType == "message_stop" || eventType == "response.completed" || status == "completed" || status == "incomplete") {
+	messageStop := adapter == modelbinding.AdapterAnthropic && eventType == "message_stop"
+	responseCompleted := adapter == modelbinding.AdapterOpenaiResponses && eventType == "response.completed"
+	responseStatus := adapter == modelbinding.AdapterOpenaiResponses && (status == "completed" || status == "incomplete")
+	if metrics.ReplyClosed == nil && (messageStop || responseCompleted || responseStatus) {
 		closed := true
 		metrics.ReplyClosed = &closed
 	}
-	if eventType == "message_stop" || eventType == "response.completed" || status == "completed" || status == "incomplete" {
+	if messageStop || responseCompleted || responseStatus {
 		metrics.terminal = true
 	}
 }
