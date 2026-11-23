@@ -8,9 +8,15 @@ import (
 
 const (
 	AvailabilityAvailable   = "available"
+	AvailabilityDegraded    = "degraded"
 	AvailabilityUnverified  = "unverified"
 	AvailabilityMaintenance = "maintenance"
 )
+
+// stickyAvailabilityWindow keeps a model listed after one failed sweep when it
+// passed a probe recently. A brief upstream outage should not erase a model
+// that has been usable; the UI marks it as risky instead.
+const stickyAvailabilityWindow = 7 * 24 * time.Hour
 
 type ModelAvailability struct {
 	ProtocolSummary
@@ -36,6 +42,9 @@ func SummarizeModelAvailability(modelID string, status entmodel.Status, capabili
 	case status != entmodel.StatusActive:
 		view.Availability = AvailabilityMaintenance
 		view.AvailabilityReason = "维护中。校内模型已停用或还未发布，请联系老师。"
+	case view.ProbeState == probeFailed && recentlyProvenAvailable(capabilities, time.Now()):
+		view.Availability = AvailabilityDegraded
+		view.AvailabilityReason = "最近一次探活失败，过去 7 天内曾探活通过。仍可尝试调用，可能请求失败。"
 	case view.ProbeState == probeFailed:
 		view.Availability = AvailabilityMaintenance
 		view.AvailabilityReason = "维护中。所有已配置线路最近一次探活均失败，请联系老师检查渠道 Key 后重新探活。"
@@ -47,4 +56,18 @@ func SummarizeModelAvailability(modelID string, status entmodel.Status, capabili
 		view.AvailabilityReason = "已有绑定线路，当前还没有通过探活的协议。"
 	}
 	return view
+}
+
+func recentlyProvenAvailable(capabilities []ProtocolCapability, now time.Time) bool {
+	for _, option := range capabilities {
+		if !option.BindingReady || option.Probe == nil || option.Probe.LastPassedAt == nil ||
+			option.Probe.ErrorCode == "credential_unreadable" {
+			continue
+		}
+		age := now.Sub(*option.Probe.LastPassedAt)
+		if age >= 0 && age <= stickyAvailabilityWindow {
+			return true
+		}
+	}
+	return false
 }

@@ -121,9 +121,12 @@ const maintenanceInKeyModels = computed(() => (currentKey.value?.models ?? [])
   .filter(model => modelGroupFor(model) === 'maintenance'))
 const maintenanceInKeyModelIDs = computed(() => maintenanceInKeyModels.value.map(model => model.model_id))
 const keyedModelCount = computed(() => currentKey.value?.models.length ?? 0)
+const degradedModelCount = computed(() => searchModels.value
+  .filter(model => modelAvailability(model).state === 'degraded').length)
 const modelSummaryText = computed(() => {
   const prefix = currentKey.value ? `当前 Key 已授权 ${keyedModelCount.value} 个 · ` : ''
-  return `${prefix}可调用 ${groupCounts.value.callable} · 待验证 ${groupCounts.value.unverified} · 维护中 ${groupCounts.value.maintenance} · 可添加 ${groupCounts.value.addable}`
+  const degraded = degradedModelCount.value ? ` · 探活异常 ${degradedModelCount.value}` : ''
+  return `${prefix}可调用 ${groupCounts.value.callable} · 待验证 ${groupCounts.value.unverified} · 维护中 ${groupCounts.value.maintenance} · 可添加 ${groupCounts.value.addable}${degraded}`
 })
 const currentGroupEmptyTitle = computed(() => {
   if (!searchModels.value.length) return '还没有模型'
@@ -266,6 +269,15 @@ function modelAvailability(model: ModelWithProtocols): ModelAvailability {
     }
     return { state, label: '可用', available: true, addable: true, reason: '' }
   }
+  if (state === 'degraded') {
+    if (!hasConfiguredPrice(model)) {
+      return { state: 'unavailable', label: '暂不可用', available: false, addable: false, reason: '该模型暂未开放，请等待老师开放。' }
+    }
+    return {
+      state, label: '可用 · 探活异常', available: true, addable: true,
+      reason: studentSafeReason(reason, '最近一次探活失败，但模型此前长期可用；仍可尝试调用，可能请求失败。'),
+    }
+  }
   if (state === 'unverified') {
     if (!hasConfiguredPrice(model)) {
       return { state: 'unavailable', label: '暂不可用', available: false, addable: false, reason: '该模型暂未开放，请等待老师开放。' }
@@ -314,6 +326,7 @@ function modelUnavailableReason(model: ModelWithProtocols) {
 function availabilityTone(model: ModelWithProtocols) {
   const state = modelAvailability(model).state
   if (state === 'available') return 'ok'
+  if (state === 'degraded') return 'warn'
   if (state === 'unverified') return 'warn'
   return 'unavailable'
 }
@@ -325,7 +338,7 @@ function keyHasModel(modelID: string) {
 function modelGroupFor(model: ModelWithProtocols): ModelGroup {
   const state = modelAvailability(model).state
   const inKey = keyHasModel(model.model_id)
-  if (state === 'available') return inKey ? 'callable' : 'addable'
+  if (state === 'available' || state === 'degraded') return inKey ? 'callable' : 'addable'
   if (state === 'unverified') return 'unverified'
   return 'maintenance'
 }
@@ -336,6 +349,7 @@ function keyCoverage(model: ModelWithProtocols): KeyCoverage {
   if (!keyHasModel(model.model_id)) return { inKey: false, label: '未加入', tone: 'muted' }
   const state = modelAvailability(model).state
   if (state === 'available') return { inKey: true, label: '可调用', tone: 'ok' }
+  if (state === 'degraded') return { inKey: true, label: '已加入 · 探活异常', tone: 'warn' }
   if (state === 'unverified') return { inKey: true, label: '已加入 · 待验证', tone: 'warn' }
   return { inKey: true, label: '已加入 · 维护中', tone: 'unavailable' }
 }
@@ -399,6 +413,12 @@ function catalogAvailability(item: CatalogWithProtocols): ModelAvailability {
         reason: studentSafeReason(reason, '线路尚未完成探活；可以先加入当前 Key，但调用可能失败。'),
       }
     }
+    if (state === 'degraded') {
+      return {
+        state, label: '可用 · 探活异常', available: true, addable: true,
+        reason: studentSafeReason(reason, '最近一次探活失败，但模型此前长期可用；仍可尝试调用，可能请求失败。'),
+      }
+    }
     return { state, label: '可用', available: true, addable: true, reason: '' }
   }
   const rawStatus = rawCatalogValue(item, 'status')
@@ -428,6 +448,7 @@ function catalogCoverage(item: CatalogWithProtocols): KeyCoverage {
   if (!keyHasModel(item.model_id)) return { inKey: false, label: '未加入', tone: 'muted' }
   const state = catalogAvailability(item).state
   if (state === 'available') return { inKey: true, label: '可调用', tone: 'ok' }
+  if (state === 'degraded') return { inKey: true, label: '已加入 · 探活异常', tone: 'warn' }
   if (state === 'unverified') return { inKey: true, label: '已加入 · 待验证', tone: 'warn' }
   return { inKey: true, label: '已加入 · 维护中', tone: 'unavailable' }
 }
@@ -458,7 +479,7 @@ function catalogAddLabel(item: CatalogWithProtocols) {
 function protocolMismatch(model: ModelWithProtocols) {
   if (!protocol.value) return ''
   const availability = modelAvailability(model)
-  if (availability.state !== 'available' && availability.state !== 'unverified') return ''
+  if (availability.state !== 'available' && availability.state !== 'degraded' && availability.state !== 'unverified') return ''
   const supported = protocolsFor(model)
   if (!supported.length || supported.includes(protocol.value)) return ''
   const alternatives = supported.map(value => protocolMeta(value).label)
@@ -595,6 +616,7 @@ function warningsText(result: KeyModelMutation) {
   return warnings.map(item => {
     if (typeof item === 'string') return studentSafeReason(item, '')
     const code = (item.code ?? '').toLowerCase()
+    if (/degraded|探活异常/.test(code)) return studentSafeReason(item.message ?? '', '该模型最近一次探活异常，已加入当前 Key，调用可能失败。')
     if (/unverified|probe/.test(code)) return studentSafeReason(item.message ?? '', '该模型尚未通过探活，已加入当前 Key，但调用可能失败。')
     if (/price|quote/.test(code)) return '该模型暂未开放。'
     if (/maintenance/.test(code)) return studentSafeReason(item.message ?? '', '该模型正在维护，暂不可调用。')
@@ -639,7 +661,9 @@ async function addModel(modelID: string, catalogItem?: CatalogWithProtocols) {
     }
     const warning = warningsText(result)
     if (warning) actionNotice.value = warning
-    else if (model && modelAvailability(model).state === 'unverified') {
+    else if (model && modelAvailability(model).state === 'degraded') {
+      actionNotice.value = '已加入当前 Key；该模型最近一次探活异常，仍可尝试调用，请求可能失败。'
+    } else if (model && modelAvailability(model).state === 'unverified') {
       actionNotice.value = '已加入当前 Key；该模型尚未通过探活，调用可能失败，等待老师验证后再使用。'
     }
     toast.success('已加入当前 Key')
@@ -886,7 +910,10 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
             <span />
           </div>
           <div v-for="item in catalogItems" :key="item.model_id" class="model-table-row">
-            <span class="model-name">{{ item.model_id }}</span>
+            <span class="model-name">
+              {{ item.model_id }}
+              <span v-if="catalogAvailability(item).state === 'degraded'" class="chip warn" data-testid="catalog-availability">{{ catalogAvailability(item).label }}</span>
+            </span>
             <span>{{ catalogProviderLabel(item) }}</span>
             <span>{{ modelUsageLabel(item.model_id) }}</span>
             <span class="catalog-protocols">
@@ -897,6 +924,7 @@ onBeforeUnmount(() => window.removeEventListener('nebula:refresh', refresh))
             <span>
               <span class="chip" :class="catalogCoverage(item).tone" data-testid="catalog-key-coverage">{{ catalogCoverage(item).label }}</span>
               <small v-if="!catalogAvailability(item).addable" class="muted catalog-unavailable" data-testid="catalog-unavailable">{{ catalogAvailability(item).reason }}</small>
+              <small v-else-if="catalogAvailability(item).state === 'degraded'" class="muted catalog-unavailable" data-testid="catalog-degraded">{{ catalogAvailability(item).reason }}</small>
               <small v-else-if="catalogAvailability(item).state === 'unverified'" class="muted catalog-unavailable" data-testid="catalog-unverified">{{ catalogAvailability(item).reason }}</small>
             </span>
             <button class="button ghost" :disabled="!canAddCatalog(item)" :title="catalogAvailability(item).reason" data-testid="catalog-add" @click="addModel(item.model_id, item)">

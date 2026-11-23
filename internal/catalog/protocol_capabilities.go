@@ -16,9 +16,10 @@ const (
 
 // ProbeEvidence is the latest stored probe for the current Key and protocol.
 type ProbeEvidence struct {
-	CheckedAt  time.Time `json:"checked_at"`
-	StatusCode int       `json:"status_code"`
-	ErrorCode  string    `json:"error_code,omitempty"`
+	CheckedAt    time.Time  `json:"checked_at"`
+	LastPassedAt *time.Time `json:"last_passed_at,omitempty"`
+	StatusCode   int        `json:"status_code"`
+	ErrorCode    string     `json:"error_code,omitempty"`
 }
 
 type ProtocolCapability struct {

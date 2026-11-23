@@ -163,8 +163,8 @@ SELECT (SELECT count(*) FROM model_bindings), (SELECT count(*) FROM provider_mod
 			t.Fatalf("replay round %d: got %+v, want %+v", attempt+1, current, want)
 		}
 	}
-	// The explicit rescan and both billing refreshes read the actual Key catalog.
-	if scans.Load() != 3 || groupReads.Load() != 6 || usageReads.Load() != 4 || messages.Load() != 1 || chat.Load() != 1 {
+	// Both manual sweeps re-probe the protocols without duplicating stored rows.
+	if scans.Load() != 3 || groupReads.Load() != 6 || usageReads.Load() != 4 || messages.Load() != 2 || chat.Load() != 2 {
 		t.Fatalf("unexpected fake requests: catalog=%d group=%d usage=%d messages=%d chat=%d",
 			scans.Load(), groupReads.Load(), usageReads.Load(), messages.Load(), chat.Load())
 	}

@@ -302,9 +302,9 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 	return bookBeichenCharge(ctx, tx, callID, charge)
 }
 
-// Both terminal usage and verified receipts book the student's part once.
-// The legacy base fields require base * school_multiplier = debit. A capped
-// debit keeps its full base and source in pricing_detail for audit.
+// Terminal usage and verified receipts both book the full amount once.
+// Calls reserved under the previous policy retain their stored student cap
+// and keep the full price and source in pricing_detail for audit.
 func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge beichenCharge) error {
 	var milli string
 	err := tx.QueryRowContext(ctx, `WITH price AS (

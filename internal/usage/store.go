@@ -198,6 +198,8 @@ SELECT k.project_id,p.organization_id,k.owner_user_id,k.name,p.name,o.name,u.nam
 	}
 	r.MultiplierMilli = multiplier.Int64
 	hold := r.MultiplierMilli
+	// The Beichen hold is for admission. The final debit uses upstream usage,
+	// even when that debit uses more than the currently available quota.
 	if hasBeichen && (!hasLegacy || hold == 0) {
 		hold = 1
 	}
@@ -258,9 +260,7 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16,'pending','pen
 		return Reservation{}, err
 	}
 	if hasBeichen {
-		const maxStudentCallMilli = 1_000_000 // 1,000 credits
-		studentCap := min(r.MemberAvailableMilli, r.ProjectAvailableMilli, maxStudentCallMilli)
-		if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_state='reserved',credit_milli=$2,student_cap_milli=$3 WHERE id=$1`, r.CallID, hold, studentCap); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_state='reserved',credit_milli=$2 WHERE id=$1`, r.CallID, hold); err != nil {
 			return Reservation{}, err
 		}
 	}

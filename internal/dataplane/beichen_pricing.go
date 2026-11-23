@@ -136,6 +136,13 @@ func beichenModelReported(payload map[string]json.RawMessage, model string) bool
 		rawString(jsonObject(payload[envelope])["model"]) == model)
 }
 
+// An upstream output limit ends generation with final usage. Other
+// incomplete responses still require independent billing evidence.
+func beichenResponsesOutputLimited(response map[string]json.RawMessage) bool {
+	return rawString(response["status"]) == "incomplete" &&
+		rawString(jsonObject(response["incomplete_details"])["reason"]) == "max_output_tokens"
+}
+
 func beichenPayloadReview(data []byte, model string, request bool) string {
 	var payload map[string]any
 	if json.Unmarshal(data, &payload) != nil || payload == nil {

@@ -1,9 +1,37 @@
 package controlplane
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
+	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/domain"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 )
+
+func TestProbeModelRejectsInactiveCredential(t *testing.T) {
+	service, mock, closeService := newIdentityTestService(t)
+	defer closeService()
+	id, providerID := uuid.New(), uuid.New()
+	now := time.Now()
+	mock.ExpectQuery(`FROM "provider_credentials"`).WithArgs(id).
+		WillReturnRows(sqlmock.NewRows(providercredential.Columns).AddRow(
+			id, now, now, providerID, "哈吉米", "5", []byte{1}, "inactive",
+		))
+	mock.ExpectQuery(`FROM "providers"`).WithArgs(providerID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "base_url"}).AddRow(providerID, "https://api.beichenapi.com"))
+
+	_, err := service.ProbeModel(context.Background(), ProbeInput{CredentialID: &id, UpstreamModelName: "gemini-fixture"})
+	if err == nil || domain.ErrorCode(err) != domain.CodeValidation || err.Error() != "provider credential is inactive" {
+		t.Fatalf("expected inactive credential rejection before decryption, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestProbeRequestDefinitions(t *testing.T) {
 	for _, endpoint := range []string{"chat_completions", "responses", "messages", "embeddings", "rerank"} {

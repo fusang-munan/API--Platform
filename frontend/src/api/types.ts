@@ -27,7 +27,7 @@ export type ModelProtocolInfo = {
   recommended_protocol?: string | null
   probe_state?: 'passed' | 'unprobed' | 'failed' | 'not_applicable' | string
   last_probe_at?: string | null
-  availability?: 'available' | 'maintenance' | 'unverified' | 'unavailable' | 'not_published' | string
+  availability?: 'available' | 'degraded' | 'maintenance' | 'unverified' | 'unavailable' | 'not_published' | string
   availability_reason?: string
 }
 export type Model = { model_id: string; display_name: string; description?: string | null; category: ModelCategory; capabilities: ModelCapability[]; input_modalities: string[]; output_modalities: string[]; context_window?: number | null; max_input_tokens?: number | null; max_output_tokens?: number | null; is_common: boolean; status: ModelStatus; route_ready: boolean; credit_multiplier: string | null; upstream_metadata?: Record<string, unknown>; provider_id?: string; provider_name?: string; primary_adapter?: BindingAdapter | null; anthropic_ready?: boolean; responses_ready?: boolean; credential_id?: string; credential_label?: string } & ModelProtocolInfo
@@ -384,6 +384,7 @@ export type BeichenProbeResult = {
   error_code: string | null
   duration_ms: number
   checked_at: string
+  last_passed_at?: string
   detail: { max_output_tokens: number }
 }
 export type BeichenProbes = { run: BeichenProbeRun; results: BeichenProbeResult[] }
@@ -577,7 +578,7 @@ export type BeichenProtocolCapability = {
   protocol: string
   binding_ready: boolean
   probe_state: 'passed' | 'unprobed' | 'failed' | string
-  probe?: { checked_at: string; status_code: number; error_code?: string } | null
+  probe?: { checked_at: string; last_passed_at?: string; status_code: number; error_code?: string } | null
 }
 export type BeichenModelCapability = {
   model: string
@@ -588,7 +589,7 @@ export type BeichenModelCapability = {
   recommended_protocol: string | null
   protocol_details: BeichenProtocolCapability[]
   catalog_state: string
-  availability: 'available' | 'maintenance' | 'unverified' | 'unavailable' | 'not_published' | string
+  availability: 'available' | 'degraded' | 'maintenance' | 'unverified' | 'unavailable' | 'not_published' | string
   availability_reason?: string
   price_state: 'confirmed' | 'conditional' | 'manual' | 'missing' | 'mixed' | string
   price_blocker: { code: string; message: string; action_hint?: string } | null

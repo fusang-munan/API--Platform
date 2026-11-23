@@ -152,6 +152,14 @@ func testSchoolBilling(t *testing.T, ctx context.Context, db *sql.DB, org, stude
 	late, lateRoute, _ := reserve(priced, 714)
 	n = 1000000
 	finish(r, route, report)
+	finish(r, route, report)
+	var fullyCharged bool
+	err = db.QueryRowContext(ctx, `SELECT beichen_state='charged' AND beichen_review_reason IS NULL
+		AND actual_credits=110 AND student_credits=110 AND school_absorbed_credits=0
+		FROM gateway_calls WHERE id=$1`, r.CallID).Scan(&fullyCharged)
+	if err != nil || !fullyCharged {
+		t.Fatalf("large response over the reservation and remaining quota did not settle in full: %v", err)
+	}
 	available("0.000")
 	_, err = store.Reserve(ctx, key, model, uuid.NewString(), "openai_responses", "/v1/responses", "", "", CallCorrelation{}, route)
 	var qerr *QuotaError
@@ -161,6 +169,13 @@ func testSchoolBilling(t *testing.T, ctx context.Context, db *sql.DB, org, stude
 	n = 100000
 	finish(late, lateRoute, report)
 	check(late, "10", "gateway_usage_price", "11", "")
+	var postedOnce bool
+	err = db.QueryRowContext(ctx, `SELECT charged_milli=154000 AND charged_milli_remainder>0 AND pending_milli=0
+		FROM project_member_month_credit_buckets WHERE project_id=$1 AND user_id=$2 AND month=$3`,
+		project, student, r.Month).Scan(&postedOnce)
+	if err != nil || !postedOnce {
+		t.Fatalf("expected completed calls to post once, including overage, and clear the holds: %v", err)
+	}
 
 	t.Run("same label on another account and dispatch before adoption", func(t *testing.T) {
 		if err := store.UpdateStudentQuotaAsTeacher(ctx, teacher, project, student, 199000, "ownership fixture"); err != nil {

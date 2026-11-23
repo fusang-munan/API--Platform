@@ -76,14 +76,15 @@ type CapabilitySummary = {
   availableProtocols: string[]
   recommendedProtocol?: string
   probeState: 'passed' | 'unprobed' | 'failed' | 'not_applicable'
-  availability: 'available' | 'maintenance' | 'unverified' | 'unavailable' | 'not_published'
+  availability: 'available' | 'degraded' | 'maintenance' | 'unverified' | 'unavailable' | 'not_published'
   availabilityReason: string
+  lastProbeAt?: string
   actionHint: string
   priceState?: PriceState
   priceBlocker?: string
   bindingInvalid: boolean
 }
-const availabilityRank: Record<string, number> = { available: 5, unverified: 4, not_published: 3, maintenance: 2, unavailable: 1 }
+const availabilityRank: Record<string, number> = { available: 6, degraded: 5, unverified: 4, not_published: 3, maintenance: 2, unavailable: 1 }
 const capabilityRows = computed(() => {
   const result = new Map<string, BeichenModelCapability[]>()
   for (const row of capabilities.value?.capabilities ?? []) {
@@ -116,6 +117,15 @@ function capabilityPriceState(value?: string): PriceState | undefined {
 function uniqueProtocols(values: Array<string | null | undefined>) {
   return [...new Set(values.filter((value): value is string => Boolean(value)))].sort()
 }
+function latestProbeAt(details: Array<{ probe?: { checked_at?: string | null } | null }>) {
+  let latest = ''
+  for (const detail of details) {
+    const checkedAt = detail.probe?.checked_at
+    if (!checkedAt || !Number.isFinite(new Date(checkedAt).getTime())) continue
+    if (!latest || new Date(checkedAt).getTime() > new Date(latest).getTime()) latest = checkedAt
+  }
+  return latest || undefined
+}
 /** 与后端 catalog.SummarizeProtocols 相同的排序规则，保证教师页与 /v1/models 推荐一致。 */
 function summarizeCapabilities(model: string): CapabilitySummary | undefined {
   const rows = capabilityRows.value.get(model.trim().toLowerCase())
@@ -141,6 +151,7 @@ function summarizeCapabilities(model: string): CapabilitySummary | undefined {
       probeState: (chosen?.probe_state ?? 'not_applicable') as CapabilitySummary['probeState'],
       availability: (chosen?.availability ?? 'not_published') as CapabilitySummary['availability'],
       availabilityReason: chosen?.availability_reason?.trim() ?? '',
+      lastProbeAt: undefined,
       actionHint,
       priceState,
       priceBlocker,
@@ -172,8 +183,11 @@ function summarizeCapabilities(model: string): CapabilitySummary | undefined {
       availability = 'maintenance'
       availabilityReason = reasonFor('maintenance') || '维护中。当前没有可接入的线路，请联系老师核对渠道 Key 和模型绑定。'
     } else if (probeState === 'failed') {
-      availability = 'maintenance'
-      availabilityReason = reasonFor('maintenance') || '维护中。所有已配置线路最近一次探活均失败，请联系老师检查渠道 Key 后重新探活。'
+      const degraded = basis.some(row => row.availability === 'degraded')
+      availability = degraded ? 'degraded' : 'maintenance'
+      availabilityReason = reasonFor(degraded ? 'degraded' : 'maintenance') || (degraded
+        ? '最近一次探活失败，但该模型此前长期可用；仍可尝试调用，请求可能失败。'
+        : '维护中。所有已配置线路最近一次探活均失败，请联系老师检查渠道 Key 后重新探活。')
     } else if (!availableProtocols.length) {
       availability = 'unverified'
       availabilityReason = reasonFor('unverified') || '已有绑定线路，当前还没有通过探活的协议。'
@@ -192,7 +206,7 @@ function summarizeCapabilities(model: string): CapabilitySummary | undefined {
     }
   }
   return {
-    protocols, availableProtocols, recommendedProtocol, probeState, availability, availabilityReason,
+    protocols, availableProtocols, recommendedProtocol, probeState, availability, availabilityReason, lastProbeAt: latestProbeAt(details),
     actionHint, priceState, priceBlocker, bindingInvalid,
   }
 }
@@ -407,7 +421,7 @@ const catalog = computed(() => {
       hasCapability: Boolean(capability),
       bindingInvalid: capability?.bindingInvalid ?? false,
       protocolMissing: capability ? capability.protocols.length === 0 : protocolCount === 0,
-      lastProbeAt: entry?.last_probe_at,
+      lastProbeAt: newestTime([entry?.last_probe_at, capability?.lastProbeAt]),
       bindingIssue: entry?.binding_issue,
     }
   })
@@ -591,7 +605,7 @@ function publicationLabel(row: CatalogRow) {
 }
 
 const availabilityLabels: Record<string, string> = {
-  available: '可用', maintenance: '维护中', unverified: '待验证', unavailable: '不可用', not_published: '未发布', website_only: '仅官网可见',
+  available: '可用', degraded: '可用 · 探活异常', maintenance: '维护中', unverified: '待验证', unavailable: '不可用', not_published: '未发布', website_only: '仅官网可见',
 }
 function rowAvailability(row: CatalogRow) {
   if (row.websiteOnly) return 'website_only'
@@ -605,6 +619,7 @@ function availabilityLabel(row: CatalogRow) {
 }
 function availabilityTone(row: CatalogRow) {
   const state = rowAvailability(row)
+  if (state === 'degraded') return 'pending'
   return state === 'available' ? 'active' : state === 'maintenance' || state === 'unavailable' ? 'danger' : 'pending'
 }
 
@@ -787,14 +802,17 @@ function routeDescription(route: BeichenRebindRoute) {
 }
 
 async function requestProbes() {
-  if (probeSubmitting.value || probeInProgress.value || probeBudget.value?.exhausted) return
+  if (probeSubmitting.value || probeInProgress.value) return
   const providerId = props.providerId
   const current = () => !disposed && props.providerId === providerId
   probeSubmitting.value = true
   probeError.value = ''
   try {
     const run = await teacherAPI.requestBeichenProbes(providerId)
-    if (current()) probeOverride.value = run
+    if (current()) {
+      probeOverride.value = run
+      if (!probeInProgress.value) await load()
+    }
   } catch (e) {
     if (current()) probeError.value = apiErrorMessage(e, '提交探活失败，请稍后重试')
   } finally {
@@ -917,6 +935,14 @@ async function priceSaved() {
 function syncTime(value?: string | null) {
   if (!value || !Number.isFinite(new Date(value).getTime())) return '尚未同步'
   return new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(value))
+}
+function newestTime(values: Array<string | null | undefined>) {
+  let newest: string | undefined
+  for (const value of values) {
+    if (!value || !Number.isFinite(new Date(value).getTime())) continue
+    if (!newest || new Date(value).getTime() > new Date(newest).getTime()) newest = value
+  }
+  return newest
 }
 function hasPriceConditions(quote: SchoolQuote) {
   return quote.status === 'conditional' || /上下文分档|推理强度/u.test((quote.standard ?? '') + (quote.actual ?? ''))
@@ -1141,8 +1167,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
       <div class="beichen-toolbar-group">
         <button type="button" class="button ghost" :disabled="busy" @click="refreshOverview">刷新模型</button>
         <button type="button" class="button secondary" :disabled="busy" @click="syncPrices">{{ syncing ? '同步中…' : '立即同步价格' }}</button>
-        <button v-if="probeRun" type="button" class="button secondary" :disabled="probeSubmitting || probeInProgress || probeBudget?.exhausted || !listedModels.length" @click="requestProbes">
-          {{ probeSubmitting ? '提交中…' : probeBudget?.exhausted ? '今日已达上限' : '立即探活' }}
+        <button v-if="probeRun" type="button" class="button secondary" :disabled="probeSubmitting || probeInProgress || !listedModels.length" @click="requestProbes">
+          {{ probeSubmitting ? '提交中…' : '立即探活' }}
         </button>
         <button type="button" class="button secondary" :disabled="busy" @click="previewRebind">重建绑定</button>
         <button type="button" class="button primary" :disabled="busy || !batchRows.length" @click="previewBatch">一键启用</button>
@@ -1150,7 +1176,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
     </div>
     <p v-if="probeRunLabel" class="beichen-note" role="status">{{ probeRunLabel }}</p>
     <p v-if="probeBudget" class="beichen-note" data-testid="probe-budget" role="status">
-      今日探活 {{ probeBudget.used }}/{{ probeBudget.limit }} 次 · 剩余 {{ probeBudget.remaining }} 次<template v-if="probeBudget.exhausted"> · 已达上限，剩余模型明日继续</template>
+      今日已探线路协议 {{ probeBudget.used }}/{{ probeBudget.limit }} 条 · 剩余 {{ probeBudget.remaining }} 条<template v-if="probeBudget.exhausted"> · 已达上限，今日已探线路仍可重探</template>
     </p>
     <p v-if="probeError" class="error" role="alert">{{ probeError }}</p>
     <div class="model-filters" role="group" aria-label="模型状态筛选"><button v-for="item in filters" :key="item.id" type="button" :aria-pressed="filter === item.id" @click="filter = item.id">{{ item.label }}</button><small>当前筛选 {{ rows.length }} 个模型</small></div>

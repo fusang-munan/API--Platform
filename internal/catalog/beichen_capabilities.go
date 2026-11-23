@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/domain"
+	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
@@ -131,7 +132,7 @@ CROSS JOIN LATERAL (
  SELECT COALESCE(jsonb_object_agg(r.protocol,` + probeEvidenceSQL + `),'{}'::jsonb) AS observations
  FROM upstream_probes r
  WHERE r.provider_id=p.id AND r.credential_id=c.id AND r.model=k.model_id::text AND ` + currentProbeRevisionSQL + `
-  AND p.status='active' AND c.status='active'
+  AND k.catalog_source='key' AND p.status='active' AND c.status='active'
 ) probes
 ORDER BY n.name_key,c.label,c.id`
 
@@ -264,7 +265,8 @@ func (row *capabilityRow) evaluate(view *BeichenCapabilities) error {
 			}
 		}
 	}
-	whole, routed := SummarizeProtocols(row.Model, row.ProtocolDetails), SummarizeProtocols(row.Model, bound)
+	whole := SummarizeProtocols(row.Model, row.ProtocolDetails)
+	routed := SummarizeModelAvailability(row.Model, entmodel.StatusActive, bound)
 	row.SupportedProtocols, row.AvailableProtocols = whole.Protocols, routed.AvailableProtocols
 	row.ProbeState, row.RecommendedProtocol = whole.ProbeState, routed.RecommendedProtocol
 	if row.BindingState == "ready" {
@@ -275,16 +277,14 @@ func (row *capabilityRow) evaluate(view *BeichenCapabilities) error {
 	}
 	row.Availability = "not_published"
 	switch {
-	case routed.ProbeState == probeFailed || whole.ProbeState == probeFailed:
-		row.Availability = "maintenance"
-		row.AvailabilityReason = "维护中。当前线路的协议最近一次探活均失败。"
-	case row.BindingState == "invalid":
-		row.Availability = "maintenance"
-		row.AvailabilityReason = "维护中。校内模型已发布，这条绑定无法使用。"
-	case len(routed.AvailableProtocols) > 0:
-		row.Availability = "available"
 	case row.BindingState == "ready":
-		row.Availability = "unverified"
+		row.Availability, row.AvailabilityReason = routed.Availability, routed.AvailabilityReason
+	case row.BindingState == "invalid":
+		row.Availability = AvailabilityMaintenance
+		row.AvailabilityReason = "维护中。校内模型已发布，这条绑定无法使用。"
+	case whole.ProbeState == probeFailed:
+		row.Availability = AvailabilityMaintenance
+		row.AvailabilityReason = "维护中。当前线路的协议最近一次探活均失败。"
 	case !row.keyListed || !row.keyEnabled:
 		row.Availability = "unavailable"
 	}

@@ -291,6 +291,15 @@ func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, ga
 	}{
 		{"chat-high", "openai_compatible", "/v1/chat/completions", `"messages":[],"reasoning_effort":"high"`, chatUsage, "high", "", "0.0026", ""},
 		{"responses-default", "openai_responses", "/v1/responses", `"input":"fixture"`, responsesUsage, "medium", "", "0.0013", ""},
+		{"responses-large-output-limit", "openai_responses", "/v1/responses", `"input":"fixture","max_output_tokens":8`,
+			`"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":33267,"output_tokens":8,"prompt_cache_miss_tokens":33267}`,
+			"medium", "", "3.3283", ""},
+		{"responses-large-cache-unconfirmed", "openai_responses", "/v1/responses", `"input":"fixture"`,
+			`"status":"completed","usage":{"input_tokens":33267,"output_tokens":8,"input_tokens_details":{"cached_tokens":32768}}`,
+			"medium", "", "", "incomplete_token_breakdown"},
+		{"responses-content-filter", "openai_responses", "/v1/responses", `"input":"fixture"`,
+			`"status":"incomplete","incomplete_details":{"reason":"content_filter"},"usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}`,
+			"medium", "", "", "missing_terminal_usage"},
 		{"responses-absent-tier", "openai_responses", "/v1/responses", `"input":"fixture","reasoning":{"effort":"low"}`, responsesUsage, "low", "", "", "missing_reasoning_effort_multiplier"},
 		{"messages-1h", "anthropic", "/v1/messages", `"max_tokens":10,"thinking":{"effort":"high"},"messages":[{"role":"user","content":[{"type":"text","text":"fixture","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]`, messagesUsage, "high", "1h", "0.0038", ""},
 		{"messages-5m", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[],"cache_control":{"type":"ephemeral"}`, messagesUsage, "medium", "5m", "0.0013", ""},
@@ -413,7 +422,7 @@ func testBeichenRealtimeConnection(t *testing.T, ctx context.Context, db *sql.DB
 		if err != nil || count != 1 || !ok {
 			t.Fatalf("expected one attributed, uncharged Realtime connection: count=%d valid=%t error=%v", count, ok, err)
 		}
-		assertBeichenGatewayMonth(t, ctx, db, requestID, "0.015488", 2)
+		assertBeichenGatewayMonth(t, ctx, db, requestID, "0.016624", 3)
 	})
 }
 
@@ -428,11 +437,18 @@ func useBeichenWebSocketFixture(gateway *Gateway, upstream *httptest.Server) {
 
 func testBeichenResponsesSocket(t *testing.T, ctx context.Context, db *sql.DB, gateway *Gateway, publicModel, upstreamModel, studentKey, upstreamKey string, credential uuid.UUID) {
 	t.Helper()
-	for _, terminal := range []bool{true, false} {
-		id := "ws-interrupted"
-		if terminal {
-			id = "ws-terminal"
-		}
+	for _, tc := range []struct {
+		id, terminal, usage, state, monthly string
+		chargedCount                        int64
+	}{
+		{"ws-terminal", `{"type":"response.completed","response":{"id":"resp_ws","status":"completed","usage":{"input_tokens":59,"output_tokens":3}}}`,
+			"partial", "pending_review", "0.015488", 2},
+		{"ws-interrupted", "", "interrupted", "pending_review", "0.015488", 2},
+		{"ws-output-limit", fmt.Sprintf(`{"type":"response.incomplete","response":{"id":"resp_ws","model":%q,"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":59,"output_tokens":3,"prompt_cache_miss_tokens":59}}}`, upstreamModel),
+			"reported", "charged", "0.016624", 3},
+	} {
+		id := tc.id
+		terminal := tc.terminal != ""
 		t.Run(id, func(t *testing.T) {
 			upstreamErr := make(chan error, 1)
 			upgrader := websocket.Upgrader{}
@@ -457,7 +473,7 @@ func testBeichenResponsesSocket(t *testing.T, ctx context.Context, db *sql.DB, g
 					for _, event := range []string{
 						`{"type":"response.created","response":{"id":"resp_ws"}}`,
 						`{"type":"response.completed","response":{"id":"resp_other","status":"completed","usage":{"input_tokens":100,"output_tokens":100,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}}}`,
-						`{"type":"response.completed","response":{"id":"resp_ws","status":"completed","usage":{"input_tokens":59,"output_tokens":3}}}`,
+						tc.terminal,
 					} {
 						if err = conn.WriteMessage(websocket.TextMessage, []byte(event)); err != nil {
 							break
@@ -503,21 +519,17 @@ func testBeichenResponsesSocket(t *testing.T, ctx context.Context, db *sql.DB, g
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())
 			}
-			want := "interrupted"
-			if terminal {
-				want = "partial"
-			}
 			var ok bool
-			err = db.QueryRowContext(ctx, `SELECT beichen_state='pending_review' AND protocol='openai_responses'
+			err = db.QueryRowContext(ctx, `SELECT beichen_state=$4 AND protocol='openai_responses'
 				AND usage_state=$2 AND sent_at IS NOT NULL AND provider_credential_id=$3
 				AND beichen_receipt_response_id IS NULL
 				AND reasoning_effort='medium'
-				AND ($2 <> 'missing' OR (prompt_tokens=59 AND completion_tokens=3 AND cache_hit_tokens IS NULL))
-				FROM gateway_calls WHERE request_id=$1`, id, want, credential).Scan(&ok)
+				AND ($2 <> 'reported' OR (prompt_tokens=59 AND completion_tokens=3 AND beichen_credit_exact=0.001136))
+				FROM gateway_calls WHERE request_id=$1`, id, tc.usage, credential, tc.state).Scan(&ok)
 			if err != nil || !ok {
-				t.Fatalf("unexpected WS ledger for state %s: %v", want, err)
+				t.Fatalf("unexpected WS ledger for %s/%s: %v", tc.usage, tc.state, err)
 			}
-			assertBeichenGatewayMonth(t, ctx, db, id, "0.015488", 2)
+			assertBeichenGatewayMonth(t, ctx, db, id, tc.monthly, tc.chargedCount)
 		})
 	}
 }

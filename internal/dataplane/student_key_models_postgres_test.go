@@ -463,4 +463,52 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 	if auditCount != 5 || addedAudits != 3 || removedAudits != 2 {
 		t.Fatalf("incorrect per-model audits: total=%d added=%d removed=%d", auditCount, addedAudits, removedAudits)
 	}
+
+	// Credential status alone must hide orphaned models even if their bindings
+	// and publication are still active. Historical key grants stay visible.
+	exec(`UPDATE provider_credentials SET status='inactive' WHERE id=$1`, beichenCredential)
+	for _, path := range []string{"/api/v1/student/models", "/api/v1/student/common-models", "/api/v1/student/model-catalog"} {
+		body := requireStatus(serve("GET", path, studentToken, ""), 200)
+		if strings.Contains(body, verifiedIDs[0]) || !strings.Contains(body, newModel) {
+			t.Fatalf("%s did not hide the retired model while retaining a model on another route: %s", path, body)
+		}
+	}
+	if got := modelList(); !slices.Equal(got, []string{libraryModel}) {
+		t.Fatalf("gateway catalog after credential retirement: %v", got)
+	}
+	keysBody = requireStatus(serve("GET", "/api/v1/student/api-keys", studentToken, ""), 200)
+	if !strings.Contains(keysBody, verifiedIDs[0]) {
+		t.Fatal("credential retirement hid a historical grant from key details")
+	}
+	grant := requireStatus(serve("POST", endpoint, studentToken, `{"model_ids":["gpt-fixture-failed"]}`), 409)
+	if !strings.Contains(grant, "MODEL_NOT_READY") {
+		t.Fatalf("adding a model on the retired credential: %s", grant)
+	}
+
+	exec("UPDATE provider_credentials SET status='active' WHERE id=$1", beichenCredential)
+	exec("UPDATE upstream_probes SET last_passed_at=checked_at WHERE credential_id=$1 AND model=$2", beichenCredential, failedModel)
+	grant = requireStatus(serve("POST", endpoint, studentToken, `{"model_ids":["gpt-fixture-failed"]}`), 200)
+	if !strings.Contains(grant, "MODEL_DEGRADED") || !strings.Contains(grant, "可能请求失败") {
+		t.Fatalf("student grant did not warn about the failing probe: %s", grant)
+	}
+	body = requireStatus(serve("GET", "/api/v1/student/models", studentToken, ""), 200)
+	if err := json.Unmarshal([]byte(body), &plaza); err != nil {
+		t.Fatal(err)
+	}
+	degradedInPlaza := false
+	for _, raw := range plaza.Data.CommonModels {
+		var item struct {
+			ModelID      string `json:"model_id"`
+			Availability string `json:"availability"`
+		}
+		if err := json.Unmarshal(raw, &item); err != nil {
+			t.Fatal(err)
+		}
+		if item.ModelID == failedModel && item.Availability == catalog.AvailabilityDegraded {
+			degradedInPlaza = true
+		}
+	}
+	if !degradedInPlaza || !slices.Contains(modelList(), failedModel) {
+		t.Fatal("degraded model disappeared from the student plaza or default gateway list")
+	}
 }

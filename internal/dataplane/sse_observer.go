@@ -171,8 +171,13 @@ func (s *sseObserver) endEvent() {
 	responsesDone := s.adapter == modelbinding.AdapterOpenaiResponses &&
 		(responsesTerminalEvent(eventType) || responsesTerminalEvent(s.eventName))
 	if s.beichen && responsesDone {
-		status := rawString(jsonObject(payload["response"])["status"])
-		s.incomplete = s.incomplete || (status != "" && status != "completed")
+		response := jsonObject(payload["response"])
+		status := rawString(response["status"])
+		incompleteEvent := eventType == "response.incomplete" || s.eventName == "response.incomplete"
+		limited := eventType != "response.completed" && s.eventName != "response.completed" &&
+			beichenResponsesOutputLimited(response)
+		s.incomplete = s.incomplete || ((incompleteEvent || (status != "" && status != "completed")) &&
+			!limited)
 	}
 	if s.beichen && (responsesDone || (s.adapter == modelbinding.AdapterOpenaiCompatible && jsonObject(payload["usage"]) != nil)) {
 		s.metrics.applyUsageSnapshot(s.adapter, payload)
@@ -203,7 +208,7 @@ func (s *sseObserver) noteTerminal(eventType string) {
 	if s.failed {
 		return
 	}
-	if eventType == "response.incomplete" {
+	if !s.beichen && eventType == "response.incomplete" {
 		s.incomplete = true
 	}
 	if (s.adapter == modelbinding.AdapterAnthropic && eventType == "message_stop") ||

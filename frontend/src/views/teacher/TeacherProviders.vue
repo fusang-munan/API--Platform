@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { teacherAPI } from '../../api/teacher'
-import type { BeichenCatalogDifference, BeichenCredentialSummary, BeichenModelAlias, BeichenModelAliasUpdate, BeichenProbeRun, BeichenRebindPlan, BindingAdapter, Provider, ProviderCredential } from '../../api/types'
+import type { BeichenCatalogDifference, BeichenCredentialSummary, BeichenModelAlias, BeichenModelAliasUpdate, BeichenRebindPlan, BindingAdapter, Provider, ProviderCredential } from '../../api/types'
 import { APIError, get, post } from '../../api/client'
 import StatusBadge from '../../components/StatusBadge.vue'
 import AppDialog from '../../components/AppDialog.vue'
@@ -356,8 +356,8 @@ async function setOriginalChannelStatus() {
 
 async function probeChannels() {
   await runChannelAction(async providerID => {
-    const result: BeichenProbeRun & { budget?: { exhausted: boolean } } = await teacherAPI.requestBeichenProbes(providerID)
-    channelNotice.value = result.budget?.exhausted ? '今日探活额度已用完。' : '探活请求已排队，可稍后刷新查看健康状态。'
+    await teacherAPI.requestBeichenProbes(providerID)
+    channelNotice.value = '探活请求已提交，可稍后刷新查看健康状态。'
   })
 }
 

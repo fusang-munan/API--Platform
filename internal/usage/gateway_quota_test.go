@@ -94,9 +94,9 @@ func TestGatewayQuotaPostgres(t *testing.T) {
 			t.Fatalf("available member/project: first=%d/%d second=%d/%d",
 				first.MemberAvailableMilli, first.ProjectAvailableMilli, second.MemberAvailableMilli, second.ProjectAvailableMilli)
 		}
-		var capMilli int64
-		if err := db.QueryRowContext(ctx, "SELECT student_cap_milli FROM gateway_calls WHERE id=$1", first.CallID).Scan(&capMilli); err != nil || capMilli != 1000 {
-			t.Fatalf("student cap=%d: %v", capMilli, err)
+		var admissionOnly bool
+		if err := db.QueryRowContext(ctx, "SELECT credit_milli=1 AND student_cap_milli IS NULL FROM gateway_calls WHERE id=$1", first.CallID).Scan(&admissionOnly); err != nil || !admissionOnly {
+			t.Fatalf("expected a one milli-credit hold with no settlement cap: %v", err)
 		}
 		release(t, first)
 		release(t, second)
@@ -194,15 +194,21 @@ func TestGatewayQuotaPostgres(t *testing.T) {
 	})
 
 	t.Run("pending review has its own limit", func(t *testing.T) {
+		reviewRoute := route
+		reviewRoute.CredentialID = uuid.New()
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate)
+			VALUES ($1,$2,'upstream','effective','billing',1000000,8000000)`, reviewRoute.CredentialID, reviewRoute.UpstreamModelName)
+		var last Reservation
 		for range 20 {
 			request := mustReserve(t, key)
-			if _, err := store.StartAttempt(ctx, request, route, 0); err != nil {
+			last = request
+			if _, err := store.StartAttempt(ctx, request, reviewRoute, 0); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.PrepareDispatch(ctx, request.CallID, route); err != nil {
+			if err := store.PrepareDispatch(ctx, request.CallID, reviewRoute); err != nil {
 				t.Fatal(err)
 			}
-			sent := route
+			sent := reviewRoute
 			sent.SentAt = time.Now()
 			if err := store.Finalize(ctx, request, true, "succeeded", "", "", sent, CallMetrics{}); err != nil {
 				t.Fatal(err)
@@ -210,7 +216,19 @@ func TestGatewayQuotaPostgres(t *testing.T) {
 		}
 		_, err := reserve(otherKey)
 		expectQuotaRejection(t, err, PendingReviewLimit)
-		t.Setenv("NEBULA_STUDENT_PENDING_REVIEW_LIMIT", "21")
+		input, output, zero := int64(33267), int64(8), int64(0)
+		report := CallMetrics{State: UsageReported, PromptTokens: &input, CompletionTokens: &output, CacheHitTokens: &zero, CacheWriteTokens: &zero}
+		for range 2 {
+			if err := store.CompleteCallMetrics(ctx, last.CallID, report); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var settled bool
+		err = db.QueryRowContext(ctx, `SELECT beichen_state='charged' AND beichen_review_reason IS NULL
+			AND beichen_credit_exact=3.3331 FROM gateway_calls WHERE id=$1`, last.CallID).Scan(&settled)
+		if err != nil || !settled {
+			t.Fatalf("late verified counters should settle and free a review slot: %v", err)
+		}
 		release(t, mustReserve(t, otherKey))
 	})
 }

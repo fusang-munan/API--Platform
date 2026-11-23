@@ -103,9 +103,14 @@ func (s *Service) AddStudentAPIKeyModels(ctx context.Context, studentID, keyID u
 		if issue := studentModelPublicationIssue(row); issue != "" {
 			return StudentAPIKeyModelsView{}, studentKeyModelError(domain.CodeModelNotReady, issue, row.ModelID)
 		}
-		if availability.Availability == catalog.AvailabilityUnverified {
+		switch availability.Availability {
+		case catalog.AvailabilityUnverified:
 			view.Warnings = append(view.Warnings, StudentAPIKeyModelWarning{
 				ModelID: row.ModelID, Code: "MODEL_UNVERIFIED", Message: availability.AvailabilityReason,
+			})
+		case catalog.AvailabilityDegraded:
+			view.Warnings = append(view.Warnings, StudentAPIKeyModelWarning{
+				ModelID: row.ModelID, Code: "MODEL_DEGRADED", Message: availability.AvailabilityReason,
 			})
 		}
 		if err := tx.APIKeyModel.Create().SetAPIKeyID(keyID).SetModelID(row.ID).Exec(ctx); err != nil {
