@@ -56,9 +56,11 @@ function absentSide() {
 
 function response(range: BeichenUsageRange = 'all'): ReconcileFixture {
   return {
-    range, start: range === 'all' ? null : '2026-11-19T16:00:00Z', end: '2026-11-20T10:00:00Z', timezone: 'Asia/Shanghai',
+    range, start: range === 'all' ? null : '2026-11-19T16:00:00Z', end: '2026-11-20T16:00:00Z', timezone: 'Asia/Shanghai',
+    comparable_only: null, unmatched_upstream: [],
+    unmatched_total: 0, unmatched_next_cursor: null, unmatched_scope: 'observed',
     coverage: {
-      days_expected: 2, days_present: 2, comparable_days: 1, missing_days: [],
+      comparable: true, eligible_dates: [], excluded_days: [], days_expected: 2, days_present: 2, comparable_days: 1, missing_days: [],
       pending_calls: 3, unpriced_calls: 2, multiplier_mixed: true, coverage_kind: 'full',
       verified_matched_calls: 0, verified_matched_complete_token_calls: 0,
     },
@@ -90,6 +92,22 @@ function response(range: BeichenUsageRange = 'all'): ReconcileFixture {
   }
 }
 
+function unmatchedRow(index: number): ReconcileData['unmatched_upstream'][number] {
+  return {
+    upstream_user_id: '1', row_id: String(index), occurred_at: '2026-11-20T12:00:00+08:00', model: '分页模型',
+    credential_id: 'channel-1', label: '测试渠道', input_tokens: index, output_tokens: 0,
+    cache_read_tokens: 0, cache_write_tokens: 0, request_id: null, receipt_id: null,
+    local_status: null, local_source: null,
+  }
+}
+
+function firstUnmatchedPage(cursor: string, range?: BeichenUsageRange): ReconcileFixture {
+  return {
+    ...response(range), unmatched_upstream: Array.from({ length: 50 }, (_, index) => unmatchedRow(index + 1)),
+    unmatched_total: 51, unmatched_next_cursor: cursor,
+  }
+}
+
 function emptyResponse(): ReconcileFixture {
   return {
     ...response(), models: [], keys: [],
@@ -98,7 +116,7 @@ function emptyResponse(): ReconcileFixture {
       money: { student_yuan: '0', base_yuan: '0', actual_yuan: null, margin_yuan: null, margin_rate: null, margin_available: false },
     },
     coverage: {
-      days_expected: 0, days_present: 0, missing_days: [], pending_calls: 0, unpriced_calls: 0, multiplier_mixed: false,
+      comparable: false, eligible_dates: [], excluded_days: [], days_expected: 0, days_present: 0, missing_days: [], pending_calls: 0, unpriced_calls: 0, multiplier_mixed: false,
       coverage_kind: 'none', comparable_days: 0, verified_matched_calls: 0, verified_matched_complete_token_calls: 0,
     },
   }
@@ -169,7 +187,7 @@ describe('北辰区间对账', () => {
     const view = mountView()
     expect(view.get('[role="status"]').text()).toContain('正在读取北辰对账')
     await flushPromises()
-    expect(mocks.reconciliation).toHaveBeenCalledWith('beichen', 'all')
+    expect(mocks.reconciliation).toHaveBeenCalledWith('beichen', 'all', { unmatchedScope: 'observed' })
     expect(button(view, '总计').attributes('aria-pressed')).toBe('true')
     expect(view.get('[data-kpi="local-tokens"] strong').text()).toBe('3,000')
     const upstream = view.get('[data-kpi="upstream-tokens"]')
@@ -192,12 +210,13 @@ describe('北辰区间对账', () => {
     await flushPromises()
     await button(view, '当天').trigger('click')
     await flushPromises()
-    expect(mocks.reconciliation).toHaveBeenLastCalledWith('beichen', 'day')
+    expect(mocks.reconciliation).toHaveBeenLastCalledWith('beichen', 'day', { unmatchedScope: 'observed' })
     expect(button(view, '当天').attributes('aria-pressed')).toBe('true')
     expect(view.text()).toContain('2026-11-20 起')
+    expect(view.text()).toContain('截至 2026-11-21 00:00')
     await button(view, '本月').trigger('click')
     await flushPromises()
-    expect(mocks.reconciliation).toHaveBeenLastCalledWith('beichen', 'month')
+    expect(mocks.reconciliation).toHaveBeenLastCalledWith('beichen', 'month', { unmatchedScope: 'observed' })
     expect(button(view, '本月').attributes('aria-pressed')).toBe('true')
   })
 
@@ -227,7 +246,7 @@ describe('北辰区间对账', () => {
     const next = deferred<ReconcileData>()
     mocks.reconciliation.mockReturnValueOnce(next.promise)
     await view.setProps({ providerId: 'another' })
-    expect(mocks.reconciliation).toHaveBeenLastCalledWith('another', 'all')
+    expect(mocks.reconciliation).toHaveBeenLastCalledWith('another', 'all', { unmatchedScope: 'observed' })
     expect(view.find('[data-kpi="local-tokens"]').exists()).toBe(false)
     next.resolve(response())
     await flushPromises()
@@ -285,7 +304,7 @@ describe('北辰区间对账', () => {
     expect(coverage).toContain('不能统一按 1.10 倍推算差额')
     const calls = view.get('[aria-label="调用核对"]').text()
     expect(calls).toContain('可逐笔关联 7 笔，其中本地 Token 完整 5 笔')
-    expect(calls).toContain('待核账 3 笔')
+    expect(calls).toContain('待核账请求 3 笔')
     expect(calls).toContain('无报价调用 2 笔')
     expect(view.get('[data-kpi="margin-yuan"] strong').text()).toBe('不可比')
     expect(view.findAll('[data-label="差额"]').map(cell => cell.text())).toEqual(Array(4).fill('不可比'))
@@ -360,7 +379,169 @@ describe('北辰区间对账', () => {
     expect(missing.get('[data-label="本地 Token"]').text()).toBe('—')
     expect(missing.get('[data-label="记录情况"]').text()).toContain('已扣款但 Token 不完整 1 笔')
     expect(view.get('[data-kpi="local-tokens"] strong').text()).toBe('—')
-    expect(view.get('[aria-label="调用核对"]').text()).toContain('另有约 37 Token 待核')
+    expect(view.get('[aria-label="调用核对"]').text()).toContain('已计入本地总量、待归类 37 Token')
+  })
+
+  it('407,505 个待归类 Token 已含在 598,363 中，待核账请求单独计数', async () => {
+    const result = response()
+    result.totals.local = side(598363, '0', {
+      input_tokens: 190858, tokens_missing: 407505, completeness: 'partial',
+    })
+    result.coverage.pending_calls = 15
+    mocks.reconciliation.mockResolvedValueOnce(result)
+    const view = mountView()
+    await flushPromises()
+    expect(view.get('[data-kpi="local-tokens"] strong').text()).toBe('598,363')
+    const calls = view.get('[aria-label="调用核对"]')
+    expect(calls.get('p').text()).toBe('已计入本地总量、待归类 407,505 Token。')
+    expect(calls.get('.coverage-facts').text()).toContain('待核账请求 15 笔')
+  })
+
+  it('按所选账日同时切换汇总、模型和未关联流水，并保留未知与零', async () => {
+    const result = response()
+    const dates = ['2026-11-19']
+    result.coverage.eligible_dates = dates
+    result.comparable_only = {
+      coverage: { ...result.coverage, eligible_dates: dates, pending_calls: 0 },
+      totals: { ...result.totals, local: side(150) }, models: result.models.slice(0, 1), keys: result.keys,
+    }
+    const receipt: ReconcileData['unmatched_upstream'][number] = {
+      upstream_user_id: '1', row_id: '9', occurred_at: '2026-11-19T23:59:59+08:00', model: '原模型',
+      credential_id: 'channel-1', label: '测试渠道', input_tokens: 123, output_tokens: null,
+      cache_read_tokens: 0, cache_write_tokens: null, request_id: 'client:123', receipt_id: null,
+      local_status: 'pending_review', local_source: 'unique_claim',
+    }
+    result.unmatched_upstream = [receipt, { ...receipt, row_id: '10', occurred_at: '2026-11-20T00:00:00+08:00' }]
+    result.unmatched_total = 2
+    const strictResult = {
+      ...result, unmatched_scope: 'comparable' as const, unmatched_total: 1, unmatched_upstream: [receipt],
+    }
+    mocks.reconciliation.mockResolvedValueOnce(result).mockResolvedValueOnce(strictResult).mockResolvedValueOnce(result)
+    const view = mountView()
+    await flushPromises()
+    const card = view.get('[aria-label="北辰有、本地无"]')
+    expect(card.findAll('tbody tr')).toHaveLength(2)
+    await button(view, '仅完整可比账日').trigger('click')
+    await flushPromises()
+    expect(mocks.reconciliation).toHaveBeenLastCalledWith('beichen', 'all', { unmatchedScope: 'comparable' })
+    expect(card.findAll('tbody tr')).toHaveLength(1)
+    expect(card.get('tbody').text()).toContain('2026-11-19 23:59:59')
+    expect(card.get('[data-label="输出"]').text()).toBe('—')
+    expect(card.get('[data-label="缓存读"]').text()).toBe('0')
+    expect(card.findAll('[data-label="本地关联"]')[0].text()).toBe('唯一认领 · 本地待核')
+    expect(view.get('[data-kpi="local-tokens"] strong').text()).toBe('150')
+    expect(view.findAll('.model-details tbody tr')).toHaveLength(1)
+    expect(view.get('[aria-label="调用核对"]').text()).toContain('待核账请求 0 笔')
+    await button(view, '全部已观察').trigger('click')
+    await flushPromises()
+    expect(card.findAll('tbody tr')).toHaveLength(2)
+  })
+
+  it('未关联流水按服务端游标翻页，前后页不重复', async () => {
+    const first = firstUnmatchedPage('next-page')
+    const second = { ...response(), unmatched_upstream: [unmatchedRow(51)], unmatched_total: 51 }
+    mocks.reconciliation.mockResolvedValueOnce(first).mockResolvedValueOnce(second).mockResolvedValueOnce(first)
+    const view = mountView()
+    await flushPromises()
+    const card = view.get('[aria-label="北辰有、本地无"]')
+    expect(card.findAll('tbody tr')).toHaveLength(50)
+    expect(card.get('caption').text()).toContain('已归档未关联 51 笔')
+    await card.findAll('button').find(item => item.text() === '下一页')!.trigger('click')
+    await flushPromises()
+    expect(mocks.reconciliation).toHaveBeenLastCalledWith('beichen', 'all', {
+      unmatchedScope: 'observed', unmatchedCursor: 'next-page',
+    })
+    expect(card.findAll('tbody tr')).toHaveLength(1)
+    expect(card.get('tbody').text()).toContain('51')
+    await card.findAll('button').find(item => item.text() === '上一页')!.trigger('click')
+    await flushPromises()
+    expect(mocks.reconciliation).toHaveBeenLastCalledWith('beichen', 'all', { unmatchedScope: 'observed' })
+    expect(card.findAll('tbody tr')).toHaveLength(50)
+  })
+
+  it('旧翻页仍在读取时切换账期，新账期仍可翻到下一页', async () => {
+    const oldPage = deferred<ReconcileData>()
+    mocks.reconciliation
+      .mockResolvedValueOnce(firstUnmatchedPage('all-next'))
+      .mockReturnValueOnce(oldPage.promise)
+      .mockResolvedValueOnce(firstUnmatchedPage('month-next', 'month'))
+      .mockResolvedValueOnce({ ...response('month'), unmatched_upstream: [unmatchedRow(51)], unmatched_total: 51 })
+    const view = mountView()
+    await flushPromises()
+    await button(view, '下一页').trigger('click')
+    expect(button(view, '下一页').attributes('disabled')).toBeDefined()
+    await button(view, '本月').trigger('click')
+    await flushPromises()
+    expect(button(view, '下一页').attributes('disabled')).toBeUndefined()
+    await button(view, '下一页').trigger('click')
+    await flushPromises()
+    expect(mocks.reconciliation).toHaveBeenLastCalledWith('beichen', 'month', {
+      unmatchedScope: 'observed', unmatchedCursor: 'month-next',
+    })
+    oldPage.resolve(response())
+    await flushPromises()
+    expect(view.get('[aria-label="未关联流水翻页"]').text()).toContain('第 2 / 2 页')
+    expect(view.get('[aria-label="北辰有、本地无"] tbody').text()).toContain('51')
+  })
+
+  it('下一页失败后重试同一个游标，之后仍可回上一页', async () => {
+    const first = firstUnmatchedPage('next-page')
+    mocks.reconciliation
+      .mockResolvedValueOnce(first)
+      .mockRejectedValueOnce(new Error('测试翻页失败'))
+      .mockResolvedValueOnce({ ...response(), unmatched_upstream: [unmatchedRow(51)], unmatched_total: 51 })
+      .mockResolvedValueOnce(first)
+    const view = mountView()
+    await flushPromises()
+    await button(view, '下一页').trigger('click')
+    await flushPromises()
+    expect(view.get('[aria-label="未关联流水翻页"]').text()).toContain('第 1 / 2 页')
+    await button(view, '重试本页').trigger('click')
+    await flushPromises()
+    expect(mocks.reconciliation).toHaveBeenLastCalledWith('beichen', 'all', {
+      unmatchedScope: 'observed', unmatchedCursor: 'next-page',
+    })
+    expect(view.get('[aria-label="未关联流水翻页"]').text()).toContain('第 2 / 2 页')
+    expect(view.find('[role="alert"]').exists()).toBe(false)
+    await button(view, '上一页').trigger('click')
+    await flushPromises()
+    expect(mocks.reconciliation).toHaveBeenLastCalledWith('beichen', 'all', { unmatchedScope: 'observed' })
+    expect(view.get('[aria-label="未关联流水翻页"]').text()).toContain('第 1 / 2 页')
+  })
+
+  it('严格视图读取中或失败时不显示空态，重试成功后才显示', async () => {
+    const strictPage = deferred<ReconcileData>()
+    mocks.reconciliation
+      .mockResolvedValueOnce(firstUnmatchedPage('next-page'))
+      .mockReturnValueOnce(strictPage.promise)
+      .mockResolvedValueOnce({ ...response(), unmatched_scope: 'comparable' })
+    const view = mountView()
+    await flushPromises()
+    const card = view.get('[aria-label="北辰有、本地无"]')
+    await button(view, '仅完整可比账日').trigger('click')
+    expect(card.get('[role="status"]').text()).toContain('读取未关联流水中')
+    expect(card.text()).not.toContain('暂无未关联记录')
+    strictPage.reject(new Error('测试严格视图失败'))
+    await flushPromises()
+    expect(card.get('[role="alert"]').text()).toContain('北辰未关联流水读取失败')
+    expect(card.text()).not.toContain('暂无未关联记录')
+    await button(view, '重试本页').trigger('click')
+    await flushPromises()
+    expect(mocks.reconciliation).toHaveBeenLastCalledWith('beichen', 'all', { unmatchedScope: 'comparable' })
+    expect(card.text()).toContain('暂无未关联记录')
+  })
+
+  it('严格视图没有入选日期时显示不可比', async () => {
+    const result = response()
+    result.coverage.excluded_days = [{ date: '2026-11-20', reasons: ['open_day', 'incompatible_unit'] }]
+    mocks.reconciliation.mockResolvedValueOnce(result).mockResolvedValueOnce({ ...result, unmatched_scope: 'comparable' })
+    const view = mountView()
+    await flushPromises()
+    await button(view, '仅完整可比账日').trigger('click')
+    await flushPromises()
+    expect(view.text()).toContain('当前范围无完整可比账日，差额不可比')
+    expect(view.get('details').text()).toContain('2026-11-20 · 账日尚未结束、金额单位不可比')
+    expect(view.find('[data-kpi="margin-yuan"]').exists()).toBe(false)
   })
 
   it('小于一积分的扣费正确换算为元，负差额使用红色', async () => {
@@ -470,7 +651,7 @@ describe('供应商行集成', () => {
     await button(view, '北辰对账').trigger('click')
     await flushPromises()
     expect(button(view, '北辰对账').attributes('aria-expanded')).toBe('true')
-    expect(mocks.reconciliation).toHaveBeenCalledWith('beichen', 'all')
+    expect(mocks.reconciliation).toHaveBeenCalledWith('beichen', 'all', { unmatchedScope: 'observed' })
     expect(view.get('.provider-reconciliation').findComponent(BeichenReconcile).exists()).toBe(true)
     await button(view, '查看模型').trigger('click')
     expect(view.text()).toContain('模型面板')

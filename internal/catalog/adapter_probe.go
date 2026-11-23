@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/starprince1234/Nebula-api/internal/usage"
+
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 )
 
@@ -40,7 +42,31 @@ var bindingRouteProbeOrder = []BindingRouteProbeEndpoint{
 	BindingRouteProbeImagesGenerations,
 }
 
+// ProbeUsage contains native protocol counts. Missing counters remain nil.
+// Reason records why reported counters cannot be trusted. Any non-empty reason
+// makes all counters unavailable to callers.
+type ProbeUsage struct {
+	InputTokens, OutputTokens, CacheReadTokens, CacheWriteTokens *int64
+	Reason                                                       string
+	// Evidence keeps the raw usage object when counters contradict each other.
+	Evidence json.RawMessage
+}
+
+// AccountingErrorCode distinguishes contradictory upstream evidence from
+// malformed or out-of-range counters. Both cases make the counts unusable.
+func (usage ProbeUsage) AccountingErrorCode() string {
+	switch {
+	case usage.Reason == "":
+		return ""
+	case strings.HasPrefix(usage.Reason, "conflicting_"):
+		return "probe_usage_conflict"
+	default:
+		return "invalid_usage"
+	}
+}
+
 type RouteProbeStep struct {
+	Usage       ProbeUsage                `json:"-"`
 	Endpoint    BindingRouteProbeEndpoint `json:"endpoint"`
 	Path        string                    `json:"path"`
 	Adapter     modelbinding.Adapter      `json:"adapter"`
@@ -224,6 +250,10 @@ func (p *RouteProbe) probeStep(ctx context.Context, upstreamModelID string, endp
 		return RouteProbeStep{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if validateResponse {
+		req.Header.Set("X-Nebula-Probe", "1")
+		req.Header.Set("User-Agent", "Nebula-Probe/1.0")
+	}
 	if item.anthropic {
 		req.Header.Set("x-api-key", p.Credential)
 		req.Header.Set("anthropic-version", "2023-06-01")
@@ -251,17 +281,38 @@ func (p *RouteProbe) probeStep(ctx context.Context, upstreamModelID string, endp
 		step.FailureCode = "http_error"
 		step.Error = fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
 	}
-	if validateResponse && step.OK {
+	if validateResponse {
 		const maxBody = 64 << 10
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
-		switch {
-		case err != nil:
-			step.FailureCode = probeTransportError(err)
-		case len(body) > maxBody || !validTokenProbeResponse(body, endpoint):
-			step.FailureCode = "invalid_response"
+		var fields map[string]json.RawMessage
+		if err == nil && len(body) <= maxBody && json.Unmarshal(body, &fields) == nil {
+			raw := fields["usage"]
+			if endpoint == BindingRouteProbeGenerateContent {
+				raw = fields["usageMetadata"]
+			}
+			var counters usage.CallMetrics
+			counters.MergeProtocolUsage(item.adapter, raw)
+			step.Usage = ProbeUsage{Reason: counters.UsageReason}
+			if counters.UsageReason != "" {
+				step.Usage.Evidence = append(json.RawMessage(nil), raw...)
+			}
+			if counters.UsageReason == "" {
+				step.Usage.InputTokens = counters.PromptTokens
+				step.Usage.OutputTokens = counters.CompletionTokens
+				step.Usage.CacheReadTokens = counters.CacheHitTokens
+				step.Usage.CacheWriteTokens = counters.CacheWriteTokens
+			}
 		}
-		step.OK = step.FailureCode == ""
-		step.Error = step.FailureCode
+		if step.OK {
+			switch {
+			case err != nil:
+				step.FailureCode = probeTransportError(err)
+			case !validTokenProbeResponse(fields, endpoint):
+				step.FailureCode = "invalid_response"
+			}
+			step.OK = step.FailureCode == ""
+			step.Error = step.FailureCode
+		}
 	} else {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	}
@@ -277,9 +328,8 @@ func probeTransportError(err error) string {
 	return "network_error"
 }
 
-func validTokenProbeResponse(body []byte, endpoint BindingRouteProbeEndpoint) bool {
-	var fields map[string]json.RawMessage
-	if json.Unmarshal(body, &fields) != nil ||
+func validTokenProbeResponse(fields map[string]json.RawMessage, endpoint BindingRouteProbeEndpoint) bool {
+	if fields == nil ||
 		len(fields["error"]) > 0 && string(fields["error"]) != "null" {
 		return false
 	}

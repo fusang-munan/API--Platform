@@ -28,18 +28,22 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
-func TestBeichenPostgresGatewayReconciliation(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	db := openBeichenGatewayTestSchema(t, ctx)
+const (
+	studentKey    = "fixture-student-api-key"
+	upstreamKey   = "fixture-beichen-api-key"
+	publicModel   = "fixture-public"
+	upstreamModel = "fixture-g3"
+)
 
-	const studentKey = "fixture-student-api-key"
-	const upstreamKey = "fixture-beichen-api-key"
-	const publicModel = "fixture-public"
-	const upstreamModel = "fixture-g3"
-	const gmModel = "fixture-gm1"
-	const trustedReceipt = "7482ba6e-0219-4a6a-b935-fde623e9baa5"
-	const forgedReceipt = "706d4cbe-fb65-4839-8f33-7ae5d878b8f6"
+type beichenGatewayFixture struct {
+	db                                     *sql.DB
+	gateway                                *Gateway
+	provider, credential, binding, teacher uuid.UUID
+}
+
+func newBeichenGatewayFixture(t *testing.T, ctx context.Context) beichenGatewayFixture {
+	t.Helper()
+	db := openBeichenGatewayTestSchema(t, ctx)
 	manager, err := security.NewManager(nil, nil, []byte("fixture-key-pepper"), make([]byte, 32), time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -82,6 +86,18 @@ VALUES ($1,$2,'upstream','base','billing',2000000,10000000,100000,2500000)`, cre
 	client := ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db)))
 	store := usage.NewStore(db)
 	gateway := NewGateway(client, store, nil, manager, Config{MaxRequestBytes: 4096})
+	return beichenGatewayFixture{db, gateway, provider, credential, binding, teacher}
+}
+
+func TestBeichenPostgresGatewayReconciliation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	f := newBeichenGatewayFixture(t, ctx)
+	db, gateway, store := f.db, f.gateway, f.gateway.usage
+	provider, credential, binding, teacher := f.provider, f.credential, f.binding, f.teacher
+	const gmModel = "fixture-gm1"
+	const trustedReceipt = "7482ba6e-0219-4a6a-b935-fde623e9baa5"
+	const forgedReceipt = "706d4cbe-fb65-4839-8f33-7ae5d878b8f6"
 	const outputChunk = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"
 	for _, tc := range []struct {
 		id, contentType, body, state, exact, monthly string
@@ -281,10 +297,11 @@ func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, ga
 	FROM multiplier m JOIN provider_credentials c ON c.id=m.credential_id`, credential, upstreamModel); err != nil {
 		t.Fatal(err)
 	}
-	const chatUsage = `"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":2,"prompt_cache_write_tokens":3}`
+	const chatUsage = `"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":2,"prompt_cache_write_tokens":3}`
 	const responsesUsage = `"status":"completed","usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}`
-	const messagesUsage = `"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":3}`
-	const messagesNoWrite = `"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":0}`
+	const messagesUsage = `"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":3}`
+	const messagesNoWrite = `"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":0}`
+	const messagesChildConflict = `"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":3}}`
 	for _, tc := range []struct {
 		name, adapter, path, input, report string
 		effort, ttl, credits, review       string
@@ -296,15 +313,28 @@ func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, ga
 			"medium", "", "3.3283", ""},
 		{"responses-large-cache-unconfirmed", "openai_responses", "/v1/responses", `"input":"fixture"`,
 			`"status":"completed","usage":{"input_tokens":33267,"output_tokens":8,"input_tokens_details":{"cached_tokens":32768}}`,
-			"medium", "", "", "incomplete_token_breakdown"},
+			"medium", "", "1.6899", ""},
 		{"responses-content-filter", "openai_responses", "/v1/responses", `"input":"fixture"`,
 			`"status":"incomplete","incomplete_details":{"reason":"content_filter"},"usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}`,
 			"medium", "", "", "missing_terminal_usage"},
 		{"responses-absent-tier", "openai_responses", "/v1/responses", `"input":"fixture","reasoning":{"effort":"low"}`, responsesUsage, "low", "", "", "missing_reasoning_effort_multiplier"},
+		{"nov23-chat-1", "openai_compatible", "/v1/chat/completions", `"messages":[]`,
+			`"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":4389,"completion_tokens":5,"total_tokens":4394,"prompt_tokens_details":{"cached_tokens":4224}}`, "medium", "", "0.2287", ""},
+		{"nov23-chat-2", "openai_compatible", "/v1/chat/completions", `"messages":[]`,
+			`"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":6587,"completion_tokens":5,"total_tokens":6592,"prompt_tokens_details":{"cached_tokens":4352}}`, "medium", "", "0.4421", ""},
+		{"nov23-chat-3", "openai_compatible", "/v1/chat/completions", `"messages":[]`,
+			`"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":7571,"completion_tokens":5,"total_tokens":7576}`, "medium", "", "", "incomplete_token_breakdown"},
+		{"nov23-chat-4", "openai_compatible", "/v1/chat/completions", `"messages":[]`,
+			`"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":4161,"completion_tokens":5,"total_tokens":4166,"prompt_tokens_details":{"cached_tokens":3968}}`, "medium", "", "0.2187", ""},
+		{"nov23-chat-5", "openai_compatible", "/v1/chat/completions", `"messages":[]`,
+			`"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":58,"completion_tokens":2,"total_tokens":60}`, "medium", "", "", "incomplete_token_breakdown"},
+		{"nov23-chat-6", "openai_compatible", "/v1/chat/completions", `"messages":[]`,
+			`"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":30140,"completion_tokens":6,"total_tokens":30146}`, "medium", "", "", "incomplete_token_breakdown"},
 		{"messages-1h", "anthropic", "/v1/messages", `"max_tokens":10,"thinking":{"effort":"high"},"messages":[{"role":"user","content":[{"type":"text","text":"fixture","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]`, messagesUsage, "high", "1h", "0.0038", ""},
 		{"messages-5m", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[],"cache_control":{"type":"ephemeral"}`, messagesUsage, "medium", "5m", "0.0013", ""},
 		{"messages-unknown-ttl", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[]`, messagesUsage, "medium", "", "", "unknown_cache_ttl"},
 		{"messages-no-writes", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[]`, messagesNoWrite, "medium", "", "0.001", ""},
+		{"messages-cache-child-conflict", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[],"cache_control":{"type":"ephemeral"}`, `"stop_reason":"end_turn",` + messagesChildConflict, "medium", "5m", "", "incomplete_token_breakdown"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := db.ExecContext(ctx, "UPDATE model_bindings SET adapter=$2 WHERE id=$1", binding, tc.adapter); err != nil {
@@ -341,6 +371,35 @@ func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, ga
 			}
 		})
 	}
+	var conflictReason string
+	var conflictWrite sql.NullInt64
+	var conflictCredits sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT coalesce(usage_reason,''),cache_write_tokens,beichen_credit_exact::text
+		FROM gateway_calls WHERE request_id='messages-cache-child-conflict'`).
+		Scan(&conflictReason, &conflictWrite, &conflictCredits); err != nil ||
+		conflictReason != "conflicting_cache_creation_counts" || !conflictWrite.Valid || conflictWrite.Int64 != 3 || conflictCredits.Valid {
+		t.Fatalf("conflicting Anthropic cache child: reason=%q write=%v credits=%v err=%v", conflictReason, conflictWrite, conflictCredits, err)
+	}
+	var evidence5m, evidence1h, evidenceReported sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT pricing_detail->>'cache_write_5m_tokens',
+		pricing_detail->>'cache_write_1h_tokens',pricing_detail->>'cache_write_reported_tokens'
+		FROM gateway_calls WHERE request_id='messages-cache-child-conflict'`).
+		Scan(&evidence5m, &evidence1h, &evidenceReported); err != nil || evidence5m.String != "3" || evidence1h.Valid || evidenceReported.Valid {
+		t.Fatalf("conflicting cache evidence lost: 5m=%v 1h=%v reported=%v err=%v", evidence5m, evidence1h, evidenceReported, err)
+	}
+	var charged, pending, partial, missing int
+	err := db.QueryRowContext(ctx, `SELECT
+		count(*) FILTER (WHERE beichen_state='charged' AND pricing_detail->>'amount_source'='estimated_unique_amount'
+		  AND pricing_detail->'input_tokens'='null'::jsonb AND pricing_detail->'cache_write_tokens'='null'::jsonb
+		  AND (pricing_detail->>'unsplit_input_tokens')::bigint=prompt_tokens-cache_hit_tokens),
+		count(*) FILTER (WHERE beichen_state='pending_review' AND cache_hit_tokens IS NULL AND actual_credits IS NULL),
+		count(*) FILTER (WHERE usage_state='partial' AND cache_miss_tokens IS NULL AND cache_write_tokens IS NULL),
+		sum(prompt_tokens-coalesce(cache_hit_tokens,0))
+		FROM gateway_calls WHERE request_id LIKE 'nov23-chat-%'`).Scan(&charged, &pending, &partial, &missing)
+	if err != nil || charged != 3 || pending != 3 || partial != 6 || missing != 40362 {
+		t.Fatalf("Nov 23 Chat replay: charged=%d pending=%d partial=%d unsplit=%d: %v", charged, pending, partial, missing, err)
+	}
+
 }
 
 func testBeichenRealtimeConnection(t *testing.T, ctx context.Context, db *sql.DB, gateway *Gateway, publicModel, upstreamModel, studentKey, upstreamKey string, credential uuid.UUID) {

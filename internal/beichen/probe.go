@@ -18,11 +18,7 @@ type ProbeRun struct {
 	Budget     *ProbeBudget `json:"budget,omitempty"`
 }
 
-// ProbeBudget is a soft daily cap shared by scheduled and manual sweeps. The
-// used count is the number of distinct key/model/protocol combinations observed
-// today (Asia/Shanghai). Hourly sweeps refresh the same rows and do not consume
-// extra budget; the limit caps how many combinations can be checked for the
-// first time that day.
+// ProbeBudget counts attempts reserved for dispatch across providers, including retries.
 type ProbeBudget struct {
 	Date      string `json:"date"`
 	Used      int    `json:"used"`
@@ -130,7 +126,7 @@ FROM beichen_probe_jobs WHERE provider_id = $1`, providerID).Scan(&run.State, &r
 	if err != nil {
 		return ProbeRun{}, err
 	}
-	budget, err := readProbeBudget(ctx, db)
+	budget, err := readProbeBudget(ctx, db, time.Now())
 	if err != nil {
 		return ProbeRun{}, err
 	}
@@ -138,12 +134,12 @@ FROM beichen_probe_jobs WHERE provider_id = $1`, providerID).Scan(&run.State, &r
 	return run, nil
 }
 
-const probeBudgetUsedSQL = `SELECT count(*) FROM upstream_probes
-WHERE checked_at >= date_trunc('day', $1::timestamptz AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'`
+const probeBudgetUsedSQL = `SELECT count(*) FROM beichen_probe_usage
+WHERE checked_at >= date_trunc('day', $1::timestamptz AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'
+  AND checked_at < (date_trunc('day', $1::timestamptz AT TIME ZONE 'Asia/Shanghai') + interval '1 day') AT TIME ZONE 'Asia/Shanghai'`
 
-func readProbeBudget(ctx context.Context, db rowQueryer) (ProbeBudget, error) {
+func readProbeBudget(ctx context.Context, db rowQueryer, now time.Time) (ProbeBudget, error) {
 	limit := probeDailyLimit()
-	now := time.Now()
 	var used int
 	if err := db.QueryRowContext(ctx, probeBudgetUsedSQL, now).Scan(&used); err != nil {
 		return ProbeBudget{}, err

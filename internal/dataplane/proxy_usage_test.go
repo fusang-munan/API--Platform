@@ -188,6 +188,13 @@ func expectUsageWrite(mock sqlmock.Sqlmock, callID uuid.UUID, responseID string,
 	mock.ExpectCommit()
 }
 
+func expectUsageWriteInTransaction(mock sqlmock.Sqlmock, callID uuid.UUID, responseID string, prompt, completion, total driver.Value, state usage.UsageState) {
+	mock.ExpectQuery(`SELECT turn_id,COALESCE.*FOR UPDATE`).WithArgs(callID).
+		WillReturnRows(sqlmock.NewRows([]string{"turn_id", "prompt", "completion", "total"}).AddRow(nil, 0, 0, 0))
+	mock.ExpectExec(`UPDATE gateway_calls SET upstream_response_id`).WithArgs(callID, responseID, prompt, completion, total,
+		sqlmock.AnyArg(), nil, nil, nil, nil, nil, string(state), sqlmock.AnyArg(), nil).WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
 func TestSSEForwardsFirstReadAndLongEventBeforeTail(t *testing.T) {
 	gateway, mock, candidate, reservation := newProxyUsageTest(t)
 	expectProxyAttempt(mock, candidate, reservation)
@@ -385,8 +392,11 @@ func TestGatewayFinalizesAtActualRetrySendTime(t *testing.T) {
 				mock.ExpectCommit()
 				mock.ExpectBegin()
 				expectLegacyReportReview(mock, reservation.CallID)
+				expectUsageWrite(mock, reservation.CallID, "second", int64(0), nil, nil, usage.UsageReported)
+			} else {
+				expectUsageWriteInTransaction(mock, reservation.CallID, "second", int64(0), nil, nil, usage.UsageReported)
+				mock.ExpectCommit()
 			}
-			expectUsageWrite(mock, reservation.CallID, "second", int64(0), nil, nil, usage.UsageReported)
 			if sse {
 				expectSuccessfulAttempt()
 			}
@@ -414,7 +424,7 @@ func TestGatewayFinalizesAtActualRetrySendTime(t *testing.T) {
 					return
 				}
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, `{"id":"second","usage":{"prompt_tokens":0}}`)
+				_, _ = io.WriteString(w, `{"id":"second","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":0}}`)
 			}))
 			defer upstream.Close()
 			candidate.Provider.BaseURL = upstream.URL
@@ -489,18 +499,19 @@ func TestGatewayFinalizesAtActualRetrySendTime(t *testing.T) {
 
 func expectLegacyReportReview(mock sqlmock.Sqlmock, callID uuid.UUID) {
 	mock.ExpectQuery("SELECT COALESCE\\(beichen_state='pending_review'.*FOR UPDATE").WithArgs(callID).
-		WillReturnRows(sqlmock.NewRows([]string{"review"}).AddRow(false))
+		WillReturnRows(sqlmock.NewRows([]string{"review", "protocol"}).AddRow(false, "openai_compatible"))
 }
 
 func TestHTTPUsageLimitDoesNotTruncateResponse(t *testing.T) {
 	gateway, mock, candidate, reservation := newProxyUsageTest(t)
 	expectSuccessfulProxyCharge(mock, candidate, reservation, nil)
-	expectUsageWrite(mock, reservation.CallID, "", nil, nil, nil, usage.UsageMissing)
+	expectUsageWriteInTransaction(mock, reservation.CallID, "", nil, nil, nil, usage.UsageMissing)
+	mock.ExpectCommit()
 	body := strings.Repeat("x", maxHTTPMetricsBody+80) + "end of body"
 	response := &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
-	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/embeddings", nil)
 	w := httptest.NewRecorder()
-	gateway.proxyHTTPBody(w, request, response, candidate.Binding.Adapter, candidate.callRoute(), &reservation, true, false, "")
+	gateway.proxyHTTPBody(request.Context(), w, request, response, modelbinding.AdapterOpenaiEmbeddings, candidate.callRoute(), &reservation, true, false, "")
 	if w.Code != http.StatusOK || w.Body.String() != body {
 		t.Fatalf("response status %d or length %d differs from upstream", w.Code, w.Body.Len())
 	}
@@ -521,7 +532,8 @@ func TestHTTPAndSSECanSettleAfterClientCancellation(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
-			response := &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(errorReader{})}
+			response := &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(
+				`{"id":"settled","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":0}}`))}
 			w := httptest.NewRecorder()
 			if sse {
 				mock.ExpectCommit()
@@ -531,8 +543,11 @@ func TestHTTPAndSSECanSettleAfterClientCancellation(t *testing.T) {
 				observer := observeSSE(candidate.Binding.Adapter, body)
 				gateway.proxySSE(w, request, response, reservation, candidate.callRoute(), &observer, body, len(body), context.Canceled, false)
 			} else {
+				expectUsageWriteInTransaction(mock, reservation.CallID, "settled", int64(0), nil, nil, usage.UsageReported)
+				mock.ExpectCommit()
+				mock.ExpectBegin()
 				expectUsageWrite(mock, reservation.CallID, "", nil, nil, nil, usage.UsageInterrupted)
-				gateway.proxyHTTPBody(w, request, response, candidate.Binding.Adapter, candidate.callRoute(), &reservation, true, false, "")
+				gateway.proxyHTTPBody(request.Context(), w, request, response, candidate.Binding.Adapter, candidate.callRoute(), &reservation, true, false, "")
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatal(err)

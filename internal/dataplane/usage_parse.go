@@ -3,8 +3,7 @@ package dataplane
 import (
 	"bytes"
 	"encoding/json"
-	"math"
-	"strconv"
+
 	"strings"
 
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
@@ -14,6 +13,7 @@ import (
 type ResponseMetrics struct {
 	usage.CallMetrics
 	stopExplicit bool
+	terminal     bool
 }
 
 func parseJSONResponseMetrics(adapter modelbinding.Adapter, body []byte) ResponseMetrics {
@@ -57,11 +57,48 @@ func (metrics ResponseMetrics) finished(interrupted bool) usage.CallMetrics {
 	return result
 }
 
+// Non-streaming generation responses must prove that the server finished the
+// turn. Initial events and preparatory snapshots can contain partial usage.
+func (metrics ResponseMetrics) finishedJSON(adapter modelbinding.Adapter, requestPath string, interrupted bool) usage.CallMetrics {
+	if interrupted {
+		return metrics.finished(true)
+	}
+	if jsonRequiresTerminal(adapter, requestPath) && !metrics.terminal {
+		result := metrics.CallMetrics
+		result.State = usage.UsageInterrupted
+		if result.UsageReason == "" {
+			result.UsageReason = "terminal_usage_missing"
+		}
+		return result
+	}
+	return metrics.finished(false)
+}
+
+func jsonRequiresTerminal(adapter modelbinding.Adapter, requestPath string) bool {
+	path := strings.ToLower(strings.TrimSuffix(requestPath, "/"))
+	switch adapter {
+	case modelbinding.AdapterOpenaiCompatible:
+		// Only generation endpoints carry a finish_reason. Embeddings, audio and
+		// other OpenAI-compatible routes report usage without a turn terminal.
+		return path == "" || strings.HasSuffix(path, "/chat/completions") || strings.HasSuffix(path, "/completions")
+	case modelbinding.AdapterOpenaiResponses:
+		// Compaction returns a finished summary that has no generation status.
+		return path == "" || !strings.HasSuffix(path, "/responses/compact")
+	case modelbinding.AdapterAnthropic:
+		return path == "" || strings.HasSuffix(path, "/messages")
+	case modelbinding.AdapterGoogleGeminiV1beta:
+		// Gemini embeddings have no generation terminal marker.
+		return !strings.HasSuffix(path, ":embedcontent") && !strings.HasSuffix(path, ":batchembedcontents")
+	default:
+		return false
+	}
+}
+
 func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, payload map[string]json.RawMessage) {
-	applyReplyState(metrics, payload)
+	applyReplyState(adapter, metrics, payload)
 	if adapter == modelbinding.AdapterGoogleGeminiV1beta {
 		metrics.noteResponseID(payload["responseId"])
-		metrics.applyUsage(adapter, payload["usageMetadata"])
+		metrics.MergeProtocolUsage(adapter, payload["usageMetadata"])
 		return
 	}
 	metrics.noteResponseID(payload["id"])
@@ -75,20 +112,20 @@ func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, paylo
 	}
 	if envelope != "" {
 		if nested := jsonObject(payload[envelope]); nested != nil {
-			applyReplyState(metrics, nested)
+			applyReplyState(adapter, metrics, nested)
 			metrics.noteResponseID(nested["id"])
-			metrics.applyUsage(adapter, nested["usage"])
+			metrics.MergeProtocolUsage(adapter, nested["usage"])
 		}
 	}
-	metrics.applyUsage(adapter, payload["usage"])
+	metrics.MergeProtocolUsage(adapter, payload["usage"])
 }
 
 // OpenAI's final usage is a snapshot. Earlier counters can still explain a
-// partial observation, but only a complete final snapshot can authorize a debit.
+// partial observation. Independently priceable final snapshots stand alone.
 func (metrics *ResponseMetrics) applyUsageSnapshot(adapter modelbinding.Adapter, payload map[string]json.RawMessage) {
 	final := ResponseMetrics{}
 	final.applyPayload(adapter, payload)
-	if metrics.HasUsage() && final.finished(false).ClassifyBeichenUsage(string(adapter)).State != usage.UsageReported {
+	if metrics.HasUsage() && !final.finished(false).ClassifyBeichenUsage(string(adapter)).CanPriceBeichenUsage(string(adapter)) {
 		metrics.applyPayload(adapter, payload)
 		if metrics.UsageReason == "" {
 			metrics.UsageReason = "terminal_usage_incomplete"
@@ -111,81 +148,6 @@ func (metrics *ResponseMetrics) noteResponseID(raw json.RawMessage) {
 	}
 }
 
-// Token counts across events are cumulative. A missing field leaves the last
-// explicit value intact, including when that value was zero.
-func (metrics *ResponseMetrics) applyUsage(adapter modelbinding.Adapter, raw json.RawMessage) {
-	values := jsonObject(raw)
-	if values == nil {
-		if field := bytes.TrimSpace(raw); len(field) != 0 && !bytes.Equal(field, []byte("null")) {
-			metrics.UsageReason = "invalid_usage_payload"
-		}
-		return
-	}
-	mergeCount := metrics.mergeCount
-	switch adapter {
-	case modelbinding.AdapterGoogleGeminiV1beta:
-		mergeCount(&metrics.PromptTokens, math.MaxInt32, values["promptTokenCount"])
-		mergeCount(&metrics.CompletionTokens, math.MaxInt32, values["candidatesTokenCount"])
-		mergeCount(&metrics.TotalTokens, math.MaxInt32, values["totalTokenCount"])
-		mergeCount(&metrics.CacheHitTokens, math.MaxInt64, values["cachedContentTokenCount"])
-		mergeCount(&metrics.ReasoningTokens, math.MaxInt64, values["thoughtsTokenCount"])
-		mergeCount(&metrics.ToolPromptTokens, math.MaxInt64, values["toolUsePromptTokenCount"])
-		return
-	case modelbinding.AdapterAnthropic:
-		mergeCount(&metrics.PromptTokens, math.MaxInt32, values["input_tokens"])
-		mergeCount(&metrics.CompletionTokens, math.MaxInt32, values["output_tokens"])
-		mergeCount(&metrics.CacheHitTokens, math.MaxInt64, values["cache_read_input_tokens"])
-		var writes *int64
-		mergeCount(&writes, math.MaxInt64, values["cache_creation_input_tokens"])
-		cache := jsonObject(values["cache_creation"])
-		var short, long *int64
-		mergeCount(&short, math.MaxInt64, cache["ephemeral_5m_input_tokens"])
-		mergeCount(&long, math.MaxInt64, cache["ephemeral_1h_input_tokens"])
-		if short != nil && long != nil && *short <= math.MaxInt64-*long {
-			total := *short + *long
-			if writes == nil {
-				writes = &total
-			} else if *writes != total {
-				metrics.UsageReason = "conflicting_cache_creation_counts"
-			}
-		} else if short != nil && long != nil {
-			metrics.UsageReason = "invalid_token_count"
-		}
-		if writes != nil {
-			metrics.CacheWriteTokens = writes
-		}
-		mergeCount(&metrics.ReasoningTokens, math.MaxInt64, jsonObject(values["output_tokens_details"])["thinking_tokens"])
-	case modelbinding.AdapterOpenaiResponses:
-		input := jsonObject(values["input_tokens_details"])
-		output := jsonObject(values["output_tokens_details"])
-		mergeCount(&metrics.PromptTokens, math.MaxInt32, values["input_tokens"])
-		mergeCount(&metrics.CompletionTokens, math.MaxInt32, values["output_tokens"])
-		mergeCount(&metrics.CacheHitTokens, math.MaxInt64, input["cached_tokens"], values["prompt_cache_hit_tokens"])
-		mergeCount(&metrics.CacheMissTokens, math.MaxInt64, values["prompt_cache_miss_tokens"])
-		mergeCount(&metrics.CacheWriteTokens, math.MaxInt64, input["cache_write_tokens"], values["prompt_cache_write_tokens"])
-		mergeCount(&metrics.ReasoningTokens, math.MaxInt64, output["reasoning_tokens"])
-	default:
-		input := jsonObject(values["prompt_tokens_details"])
-		output := jsonObject(values["completion_tokens_details"])
-		mergeCount(&metrics.PromptTokens, math.MaxInt32, values["prompt_tokens"])
-		mergeCount(&metrics.CompletionTokens, math.MaxInt32, values["completion_tokens"])
-		mergeCount(&metrics.CacheHitTokens, math.MaxInt64, input["cached_tokens"], values["prompt_cache_hit_tokens"])
-		mergeCount(&metrics.CacheMissTokens, math.MaxInt64, values["prompt_cache_miss_tokens"])
-		mergeCount(&metrics.CacheWriteTokens, math.MaxInt64, input["cache_write_tokens"], values["prompt_cache_write_tokens"])
-		mergeCount(&metrics.ReasoningTokens, math.MaxInt64, output["reasoning_tokens"], values["completion_thinking_tokens"])
-	}
-	mergeCount(&metrics.TotalTokens, math.MaxInt32, values["total_tokens"])
-	rawCredit := bytes.TrimSpace(values["credit"])
-	if len(rawCredit) != 0 && rawCredit[0] >= '0' && rawCredit[0] <= '9' {
-		credit, err := strconv.ParseFloat(string(rawCredit), 64)
-		micros := math.Round(credit * 1e6)
-		if err == nil && micros < float64(math.MaxInt64) {
-			value := int64(micros)
-			metrics.UpstreamCreditMicros = &value
-		}
-	}
-}
-
 func jsonObject(raw json.RawMessage) map[string]json.RawMessage {
 	var value map[string]json.RawMessage
 	if json.Unmarshal(raw, &value) != nil {
@@ -194,24 +156,7 @@ func jsonObject(raw json.RawMessage) map[string]json.RawMessage {
 	return value
 }
 
-func (metrics *ResponseMetrics) mergeCount(target **int64, maxValue int64, fields ...json.RawMessage) {
-	for _, field := range fields {
-		value := bytes.TrimSpace(field)
-		if len(value) == 0 || bytes.Equal(value, []byte("null")) {
-			continue
-		}
-		n, err := strconv.ParseInt(string(value), 10, 64)
-		if err == nil && n >= 0 && n <= maxValue {
-			*target = &n
-			return
-		}
-		if metrics.UsageReason == "" {
-			metrics.UsageReason = "invalid_token_count"
-		}
-	}
-}
-
-func applyReplyState(metrics *ResponseMetrics, payload map[string]json.RawMessage) {
+func applyReplyState(adapter modelbinding.Adapter, metrics *ResponseMetrics, payload map[string]json.RawMessage) {
 	noteToolRequest(metrics, payload["content"])
 	noteToolRequest(metrics, payload["output"])
 	noteToolRequest(metrics, payload["content_block"])
@@ -233,22 +178,50 @@ func applyReplyState(metrics *ResponseMetrics, payload map[string]json.RawMessag
 	if deltaRaw, ok := payload["delta"]; ok {
 		var delta map[string]json.RawMessage
 		if json.Unmarshal(deltaRaw, &delta) == nil {
-			noteStopReason(metrics, rawString(delta["stop_reason"]))
-			noteStopReason(metrics, rawString(delta["finish_reason"]))
+			if adapter == modelbinding.AdapterAnthropic {
+				noteStopReason(metrics, rawString(delta["stop_reason"]))
+			} else {
+				noteStopReason(metrics, rawString(delta["finish_reason"]))
+			}
 			noteToolRequest(metrics, deltaRaw)
 		}
 	}
-	noteStopReason(metrics, rawString(payload["stop_reason"]))
-	noteStopReason(metrics, rawString(payload["finish_reason"]))
+	if candidatesRaw, ok := payload["candidates"]; ok && adapter == modelbinding.AdapterGoogleGeminiV1beta {
+		var candidates []map[string]json.RawMessage
+		if json.Unmarshal(candidatesRaw, &candidates) == nil {
+			for _, candidate := range candidates {
+				if reason := rawString(candidate["finishReason"]); reason != "" && reason != "FINISH_REASON_UNSPECIFIED" {
+					metrics.terminal = true
+				}
+			}
+		}
+	}
+	if reason := rawString(jsonObject(payload["promptFeedback"])["blockReason"]); adapter == modelbinding.AdapterGoogleGeminiV1beta && reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
+		metrics.terminal = true
+	}
+	if adapter == modelbinding.AdapterAnthropic {
+		noteStopReason(metrics, rawString(payload["stop_reason"]))
+	} else {
+		noteStopReason(metrics, rawString(payload["finish_reason"]))
+	}
 	eventType := strings.ToLower(rawString(payload["type"]))
 	status := strings.ToLower(rawString(payload["status"]))
-	if metrics.ReplyClosed == nil && (eventType == "message_stop" || eventType == "response.completed" || status == "completed" || status == "incomplete") {
+	messageStop := adapter == modelbinding.AdapterAnthropic && eventType == "message_stop"
+	responseCompleted := adapter == modelbinding.AdapterOpenaiResponses && eventType == "response.completed"
+	responseStatus := adapter == modelbinding.AdapterOpenaiResponses && (status == "completed" || status == "incomplete")
+	if metrics.ReplyClosed == nil && (messageStop || responseCompleted || responseStatus) {
 		closed := true
 		metrics.ReplyClosed = &closed
+	}
+	if messageStop || responseCompleted || responseStatus {
+		metrics.terminal = true
 	}
 }
 
 func noteStopReason(metrics *ResponseMetrics, reason string) {
+	if strings.TrimSpace(reason) != "" {
+		metrics.terminal = true
+	}
 	switch strings.ToLower(strings.TrimSpace(reason)) {
 	case "tool_use", "tool_calls", "pause_turn":
 		metrics.stopExplicit = true

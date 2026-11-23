@@ -715,9 +715,10 @@ func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metri
 	defer func() { _ = tx.Rollback() }()
 	review := false
 	if metrics.State == UsageReported {
+		var protocol string
 		err = tx.QueryRowContext(ctx, `SELECT COALESCE(beichen_state='pending_review' AND beichen_price_at IS NOT NULL
-			AND beichen_review_reason IN ('missing_terminal_usage','incomplete_token_breakdown'),false)
-			FROM gateway_calls WHERE id=$1 FOR UPDATE`, callID).Scan(&review)
+			AND beichen_review_reason IN ('missing_terminal_usage','incomplete_token_breakdown'),false),protocol
+			FROM gateway_calls WHERE id=$1 FOR UPDATE`, callID).Scan(&review, &protocol)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -725,6 +726,7 @@ func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metri
 			return err
 		}
 		if review {
+			metrics = metrics.ClassifyBeichenUsage(protocol)
 			if err = postLedgerBuckets(ctx, tx, callID, 0, "0"); err != nil {
 				return err
 			}
@@ -733,7 +735,9 @@ func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metri
 	if err := writeCallMetrics(ctx, tx, callID, metrics); err != nil {
 		return err
 	}
-	if review {
+	// The late-report recovery path requires a complete replacement report.
+	// Only the successful gateway finalizer can authorize a partial snapshot.
+	if review && metrics.State == UsageReported {
 		if err = settleBeichenReport(ctx, tx, callID, metrics); err != nil {
 			return err
 		}
@@ -754,6 +758,14 @@ func writeCallMetrics(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics
 	}
 	if err != nil {
 		return err
+	}
+	var evidence any
+	if payload := metrics.CacheWriteEvidence(); len(payload) > 0 {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		evidence = string(data)
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET upstream_response_id=COALESCE(NULLIF($2,''),upstream_response_id),
 		prompt_tokens=COALESCE($3,prompt_tokens),completion_tokens=COALESCE($4,completion_tokens),
@@ -782,6 +794,12 @@ func writeCallMetrics(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics
 		metrics.CacheWriteTokens, metrics.ReasoningTokens, metrics.UpstreamCreditMicros, string(metrics.State),
 		metrics.UsageReason, metrics.ToolPromptTokens); err != nil {
 		return err
+	}
+	if evidence != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET pricing_detail=COALESCE(pricing_detail,'{}'::jsonb) || $2::jsonb
+WHERE id=$1`, callID, evidence); err != nil {
+			return err
+		}
 	}
 	return applyTurnTokenDelta(ctx, tx, turnID.UUID, tokenDelta(metrics.PromptTokens, oldPrompt),
 		tokenDelta(metrics.CompletionTokens, oldCompletion), tokenDelta(metrics.TotalTokens, oldTotal))

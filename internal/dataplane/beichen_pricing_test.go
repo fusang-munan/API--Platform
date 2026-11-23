@@ -63,18 +63,21 @@ func TestBeichenRequestPricingEvidence(t *testing.T) {
 	}
 }
 
-func TestBeichenPricingRequiresCompleteCompatibleCounters(t *testing.T) {
-	for _, tc := range []struct{ usage, reason string }{
-		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}`, ""},
-		{`{"input_tokens":59,"output_tokens":3,"prompt_cache_miss_tokens":55,"prompt_cache_hit_tokens":4}`, ""},
-		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cache_write_tokens":0}}`, beichenIncompleteUsage},
-		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cached_tokens":0}}`, beichenIncompleteUsage},
-		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cached_tokens":58,"cache_write_tokens":2}}`, beichenIncompleteUsage},
-		{`{"input_tokens":59,"output_tokens":3,"total_tokens":100,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}`, beichenIncompleteUsage},
+func TestBeichenPricingAdmitsOnlyConsistentTerminalCounts(t *testing.T) {
+	for _, tc := range []struct {
+		usage, reason string
+		partial       bool
+	}{
+		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}`, "", false},
+		{`{"input_tokens":59,"output_tokens":3,"prompt_cache_miss_tokens":55,"prompt_cache_hit_tokens":4}`, "", false},
+		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cache_write_tokens":0}}`, "", true},
+		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cached_tokens":0}}`, "", true},
+		{`{"input_tokens":59,"output_tokens":3,"input_tokens_details":{"cached_tokens":58,"cache_write_tokens":2}}`, beichenIncompleteUsage, true},
+		{`{"input_tokens":59,"output_tokens":3,"total_tokens":100,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}`, beichenIncompleteUsage, true},
 	} {
-		response := parseJSONResponseMetrics(modelbinding.AdapterOpenaiResponses, []byte(`{"usage":`+tc.usage+`}`)).finished(false)
+		response := parseJSONResponseMetrics(modelbinding.AdapterOpenaiResponses, []byte(`{"status":"completed","usage":`+tc.usage+`}`)).finishedJSON(modelbinding.AdapterOpenaiResponses, "/v1/responses", false)
 		metrics, reason := beichenReviewMetrics(modelbinding.AdapterOpenaiResponses, response, "")
-		if reason != tc.reason || (metrics.State == usage.UsageReported) != (tc.reason == "") ||
+		if reason != tc.reason || (metrics.State == usage.UsagePartial) != tc.partial ||
 			metrics.PromptTokens == nil || *metrics.PromptTokens != 59 {
 			t.Fatalf("unexpected pricing eligibility for %s: %q, %+v", tc.usage, reason, metrics)
 		}

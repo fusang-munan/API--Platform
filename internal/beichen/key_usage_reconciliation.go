@@ -1,23 +1,27 @@
 package beichen
 
+// Key totals come from the selected daily summary, even when model_stats is incomplete.
+const reconciliationKeyFactsSQL = `
+, key_facts AS (
+ SELECT credential_id,day,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,
+   total_tokens,source,unit,actual_cost,stale FROM model_usage_rows WHERE source <> 'key_usage'
+ UNION ALL
+ SELECT credential_id,day,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,
+   total_tokens,'key_usage',unit,actual_cost,stale FROM key_usage_days
+)`
+
 // Aggregate the selected source per Key and day at model, Key and provider levels.
 const reconciliationSourcesSQL = `
 , mapped_usage AS (
  SELECT a.*, COALESCE(alias.school_model,a.model) AS school_model
- FROM model_usage_rows a ` + joinModelAliasSQL + `
+ FROM selected_models a ` + joinModelAliasSQL + `
 ), upstream_rows AS (
  SELECT credential_id,school_model AS model,0 AS level,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,
    total_tokens,source,unit,actual_cost,stale FROM mapped_usage
  UNION ALL
  SELECT a.credential_id,NULL,l.level,a.requests,a.input_tokens,a.output_tokens,a.cache_read_tokens,a.cache_write_tokens,
    a.total_tokens,a.source,a.unit,a.actual_cost,a.stale
- FROM (
-   SELECT credential_id,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,
-     total_tokens,source,unit,actual_cost,stale FROM model_usage_rows WHERE source <> 'key_usage'
-   UNION ALL
-   SELECT credential_id,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,
-     total_tokens,'key_usage',unit,actual_cost,stale FROM key_usage_days
- ) a CROSS JOIN (VALUES (1),(3)) l(level)
+ FROM selected_key_facts a CROSS JOIN (VALUES (1),(3)) l(level)
 ), upstream_group_rows AS (
  SELECT CASE WHEN level <> 3 THEN credential_id END AS credential_id,model,level,
    num_nonnulls(input_tokens,output_tokens,cache_read_tokens,cache_write_tokens) AS token_parts,

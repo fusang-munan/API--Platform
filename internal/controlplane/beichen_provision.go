@@ -258,7 +258,10 @@ func (s *Service) provisionChannel(ctx context.Context, tx *sql.Tx, provider uui
 		}
 		// New upstream credentials need their own UUID for historical usage, prices
 		// and receipts. Explicit model bindings retain their original owner.
-		if _, err := tx.ExecContext(ctx, `UPDATE provider_credentials SET label=$2,status='inactive',updated_at=clock_timestamp() WHERE id=$1`,
+		if _, err := tx.ExecContext(ctx, `
+UPDATE provider_credentials
+SET label=$2,status='inactive',updated_at=clock_timestamp(),retired_at=clock_timestamp()
+WHERE id=$1`,
 			current.id, c.archivedLabel(current.id)); err != nil {
 			return false, errors.New("旧凭据归档失败，请检查标签冲突")
 		}

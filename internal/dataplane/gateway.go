@@ -45,13 +45,14 @@ type Config struct {
 }
 
 type Gateway struct {
-	db       *ent.Client
-	cache    *cache.Store
-	security *security.Manager
-	usage    *usage.Store
-	client   *http.Client
-	dialer   *websocket.Dialer
-	config   Config
+	db              *ent.Client
+	cache           *cache.Store
+	security        *security.Manager
+	usage           *usage.Store
+	client          *http.Client
+	dialer          *websocket.Dialer
+	config          Config
+	disconnectGrace time.Duration
 }
 
 type route struct {
@@ -81,7 +82,8 @@ func NewGateway(db *ent.Client, usageStore *usage.Store, cacheStore *cache.Store
 			HandshakeTimeout:  cfg.ResponseHeaderTimeout,
 			EnableCompression: true,
 		},
-		config: cfg,
+		config:          cfg,
+		disconnectGrace: beichenDisconnectGrace,
 	}
 }
 
@@ -1756,8 +1758,11 @@ func joinUpstreamURL(baseURL, requestPath, rawQuery string) (string, error) {
 	return base.String(), nil
 }
 
-func copyUpstreamResponse(w http.ResponseWriter, response *http.Response) error {
+func copyUpstreamResponse(ctx context.Context, w http.ResponseWriter, response *http.Response) error {
 	defer response.Body.Close()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	copyHeaders(w.Header(), response.Header)
 	removeHopByHop(w.Header())
 	w.WriteHeader(response.StatusCode)
@@ -1766,6 +1771,9 @@ func copyUpstreamResponse(w http.ResponseWriter, response *http.Response) error 
 	for {
 		n, err := response.Body.Read(buffer)
 		if n > 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if writeErr := forwardResponseChunk(w, controller, buffer[:n]); writeErr != nil {
 				return writeErr
 			}

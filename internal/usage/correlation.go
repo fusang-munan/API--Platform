@@ -32,6 +32,11 @@ type CallMetrics struct {
 	CacheHitTokens     *int64
 	CacheMissTokens    *int64
 	CacheWriteTokens   *int64
+	// These fields retain Anthropic cache-creation evidence across streamed
+	// cumulative usage frames. Only the computed total is persisted.
+	cacheWrite5m       *int64
+	cacheWrite1h       *int64
+	cacheWriteReported *int64
 	ReasoningTokens    *int64
 	ToolPromptTokens   *int64
 	// UpstreamCreditMicros is the explicit upstream credit in millionths.
@@ -41,6 +46,23 @@ type CallMetrics struct {
 	// ReplyClosed is set when the upstream stop flag is known.
 	// False means the model asked for a tool and the question is still open.
 	ReplyClosed *bool
+}
+
+// CacheWriteEvidence returns the Anthropic cache-creation fields exactly as
+// the upstream reported them. Only the reconciled total is billed; these
+// values let a reviewer reconstruct a conflicting observation.
+func (m CallMetrics) CacheWriteEvidence() map[string]int64 {
+	evidence := map[string]int64{}
+	if m.cacheWrite5m != nil {
+		evidence["cache_write_5m_tokens"] = *m.cacheWrite5m
+	}
+	if m.cacheWrite1h != nil {
+		evidence["cache_write_1h_tokens"] = *m.cacheWrite1h
+	}
+	if m.cacheWriteReported != nil {
+		evidence["cache_write_reported_tokens"] = *m.cacheWriteReported
+	}
+	return evidence
 }
 
 func (m CallMetrics) HasUsage() bool {
