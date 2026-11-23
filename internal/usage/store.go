@@ -633,7 +633,7 @@ func (s *Store) Finalize(ctx context.Context, r Reservation, success bool, outco
 	// atomically with its route and outcome. Failed or unknown outcomes keep it.
 	sentAt := sql.NullTime{Time: route.SentAt, Valid: success && outcome == "succeeded" && !route.SentAt.IsZero()}
 	result, err := tx.ExecContext(ctx, `UPDATE gateway_calls
-	SET billing_state=$1,outcome=$2,error_category=NULLIF($3,''),error_message=NULLIF($4,''),
+	SET billing_state=$1,unresolved_credit_milli=0,outcome=$2,error_category=NULLIF($3,''),error_message=NULLIF($4,''),
 		provider_id=COALESCE($5,provider_id),provider_name=COALESCE(NULLIF($6,''),provider_name),
 		finalized_at=now(),lease_expires_at=NULL,
 		provider_credential_id=COALESCE($8,provider_credential_id),binding_id=COALESCE($9,binding_id),

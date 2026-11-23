@@ -344,6 +344,8 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 迁移 0032 在 `gateway_calls` 记录北辰发件凭据、上游模型、发件时间、报价版本、倍率版本、核账原因和精确积分 `beichen_credit_exact`。状态 `beichen_state` 分为已预留 `reserved`、待核账 `pending_review`、已扣 `charged` 和已释放 `released`。只有已扣行有精确积分，待核账行的精确积分为空。最终结算锁定调用行，在同一事务释放预留并更新项目、成员、Key 月桶、用量汇总和对话轮次。已结算回执可安全重放。月桶、汇总和轮次中的 `charged_milli_remainder` 保存不足千分之一积分的余数，以 PostgreSQL `numeric` 精确累计。北辰待核和已扣记录保留供查账。用量在返回后确定，一次高用量调用的最终费用可能超出发出时的剩余额度。
 
+迁移 0069 为 `gateway_calls` 增加 `unresolved_credit_milli bigint NOT NULL DEFAULT 0`。该字段按**整积分**保存待核金额，只允许非负数。历史 `pending_review` 行每笔回填 10 积分（0.1 元），其他行初始为 0。首次进入待核时保存当时的单笔预留，重放保留原值，确认扣费或释放时在同一事务内清零。索引 `gateway_calls_user_beichen_state (user_id, beichen_state)` 仅收录待核行，用于跨项目、跨月汇总该学生所有 Key 的待核积分。实际扣费与月额度仍使用各自的账本字段。
+
 迁移 0049 为 `gateway_calls.usage_state` 增加 `partial`，用 `usage_reason` 保存网关无法确认完整用量的原因，用 `tool_prompt_tokens` 保存 Gemini 单列的工具提示计数。网关用量字段可空，明确上报的零单独保存。账务待核原因记录在 `beichen_review_reason`。区间与逐笔查询按已有原始分项读取历史数据，迁移无需重写历史调用或金额。
 
 完整且适用派发时费率的用量可以即时结算。待核调用匹配到可信回执后，跟随价以回执实扣乘 100 计算基础积分。可计算的派发时教师价继续适用。学校系数及额度封顶在同一入账事务生效。已结算调用只关联回执证据。原始协议计数和回执计数分别保存在 `gateway_calls`、`beichen_call_receipts`。

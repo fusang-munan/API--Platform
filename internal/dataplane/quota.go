@@ -73,6 +73,8 @@ func modelCallRejection(err error) (status int, kind, code, message string) {
 		message = "Too many model calls are in progress for this student."
 	case usage.PendingReviewLimit:
 		message = "Too many model calls are awaiting billing review for this student."
+	case usage.UnresolvedExposureLimit:
+		message = "This call would reach or exceed the student's credit limit for calls awaiting billing review."
 	default:
 		message = fmt.Sprintf("%s quota is exhausted until %s.", quota.Name,
 			quota.EndsAt.In(time.FixedZone("Asia/Shanghai", 8*60*60)).Format("2006-01-02 15:04 MST"))

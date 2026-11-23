@@ -125,6 +125,8 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET
 		beichen_state=$2,billing_state=$3,beichen_review_reason=NULLIF($4,''),credit_milli=$5,
+		unresolved_credit_milli=CASE WHEN $2<>'pending_review' THEN 0
+			WHEN beichen_state='pending_review' THEN unresolved_credit_milli ELSE $15::bigint END,
 		outcome=$6,error_category=NULLIF($7,''),error_message=NULLIF($8,''),
 		beichen_price_at=COALESCE($9,beichen_price_at),sent_at=COALESCE($9,sent_at),
 		provider_id=COALESCE($10,provider_id),provider_name=COALESCE(NULLIF($11,''),provider_name),
@@ -133,7 +135,7 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 		finalized_at=now(),lease_expires_at=NULL WHERE id=$1`, callID, next, billing, reason,
 		int64(boolInt(legacyCharge))*multiplier, outcome, category, sanitize(message), priceAt,
 		nullableUUID(route.ProviderID), route.ProviderName, nullableUUID(route.CredentialID),
-		nullableUUID(route.BindingID), route.UpstreamModelName); err != nil {
+		nullableUUID(route.BindingID), route.UpstreamModelName, pendingReserveCredits()); err != nil {
 		return err
 	}
 	if err = postLedgerBuckets(ctx, tx, callID, hold, "0"); err != nil {
@@ -364,7 +366,7 @@ func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge
 	), amount AS (
 		SELECT *,LEAST(actual,cap) AS student FROM full_price
 	)
-	UPDATE gateway_calls c SET beichen_state='charged',billing_state='charged',
+	UPDATE gateway_calls c SET beichen_state='charged',billing_state='charged',unresolved_credit_milli=0,
 		beichen_credit_exact=amount.student,credit_milli=trunc(amount.student*1000)::bigint,
 		actual_credits=amount.actual,student_credits=amount.student,school_absorbed_credits=amount.actual-amount.student,
 		beichen_base_credits=CASE WHEN amount.actual=amount.student THEN amount.base END,

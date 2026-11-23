@@ -14,6 +14,11 @@ export const CODEX_MODEL_CATALOG_TOML_PATH = `~/.codex/${CODEX_MODEL_CATALOG_FIL
 
 export const STUDENT_GATEWAY_ERROR_GUIDANCE = [
   {
+    key: 'unresolved_exposure_limit',
+    title: '429 · 待核账积分达到上限',
+    action: '本次请求的预留积分加上已有待核积分会达到或超过上限。本人所有 Key 共用这个额度，请联系老师核对待核记录后再试。',
+  },
+  {
     key: '401',
     title: '401 · Key 无效或已停用',
     action: '打开「申请密钥」页确认 Key 状态，重新领取或重新生成 Key，再更新客户端配置。',

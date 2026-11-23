@@ -12,7 +12,8 @@ import (
 func TestGatewayQuotaPostgres(t *testing.T) {
 	ctx, db := newBeichenLedgerTestDB(t)
 	t.Setenv("NEBULA_STUDENT_CONCURRENCY_LIMIT", "")
-	t.Setenv("NEBULA_STUDENT_PENDING_REVIEW_LIMIT", "")
+	t.Setenv("NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT", "")
+	t.Setenv("NEBULA_STUDENT_PENDING_RESERVE_CREDITS", "")
 	store := NewStore(db)
 	exec := func(stmt string, args ...any) {
 		t.Helper()
@@ -193,15 +194,19 @@ func TestGatewayQuotaPostgres(t *testing.T) {
 		release(t, mustReserve(t, key))
 	})
 
-	t.Run("pending review has its own limit", func(t *testing.T) {
+	t.Run("pending review uses a student credit budget", func(t *testing.T) {
 		reviewRoute := route
 		reviewRoute.CredentialID = uuid.New()
 		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate)
 			VALUES ($1,$2,'upstream','effective','billing',1000000,8000000)`, reviewRoute.CredentialID, reviewRoute.UpstreamModelName)
-		var last Reservation
-		for range 20 {
-			request := mustReserve(t, key)
-			last = request
+		exec(`INSERT INTO gateway_calls(id,request_id,month,organization_id,project_id,user_id,api_key_id,model_id,
+			organization_name,project_name,user_name,api_key_name,model_name,protocol,request_path,multiplier_milli,
+			credit_milli,billing_state,beichen_state,beichen_review_reason,unresolved_credit_milli,created_at)
+			SELECT gen_random_uuid(),i::text,now(),$1,$2,$3,$4,$5,'org','project','student','key','model',
+			'openai_responses','/v1/responses',1000,0,'failed','pending_review','missing_terminal_usage',10,now()
+			FROM generate_series(1,98) i`, org, project, student, key, model)
+		makePending := func(request Reservation) CallRoute {
+			t.Helper()
 			if _, err := store.StartAttempt(ctx, request, reviewRoute, 0); err != nil {
 				t.Fatal(err)
 			}
@@ -213,9 +218,65 @@ func TestGatewayQuotaPostgres(t *testing.T) {
 			if err := store.Finalize(ctx, request, true, "succeeded", "", "", sent, CallMetrics{}); err != nil {
 				t.Fatal(err)
 			}
+			return sent
 		}
-		_, err := reserve(otherKey)
-		expectQuotaRejection(t, err, PendingReviewLimit)
+		waiting := mustReserve(t, otherKey)
+		defer release(t, waiting)
+		last := mustReserve(t, key)
+		sent := makePending(last)
+		_, err := store.StartAttempt(ctx, waiting, reviewRoute, 0)
+		expectQuotaRejection(t, err, UnresolvedExposureLimit) // 99 × 10 + 10 = 1000
+		_, err = reserve(otherKey)
+		expectQuotaRejection(t, err, UnresolvedExposureLimit)
+
+		student2, key2 := uuid.New(), uuid.New()
+		exec(`INSERT INTO users(id,name,email,password_hash,role,created_at,updated_at)
+			VALUES($1,'Student 2','quota-student-2@example.test','fixture','student',now(),now())`, student2)
+		exec(`INSERT INTO project_members(id,project_id,user_id,monthly_credit_quota_milli,created_at)
+			VALUES(gen_random_uuid(),$1,$2,100,now())`, project, student2)
+		exec(`INSERT INTO api_keys(id,project_id,owner_user_id,name,status,key_hash,key_prefix,claimed_at,created_at,updated_at)
+			VALUES($1,$2,$3,'Independent key','active','independent-hash','fixture',now(),now(),now())`, key2, project, student2)
+		exec(`INSERT INTO api_key_models(id,api_key_id,model_id,created_at) VALUES(gen_random_uuid(),$1,$2,now())`, key2, model)
+		release(t, mustReserve(t, key2))
+
+		t.Setenv("NEBULA_STUDENT_PENDING_RESERVE_CREDITS", "9")
+		if err := store.Finalize(ctx, last, true, "succeeded", "", "", sent, CallMetrics{}); err != nil {
+			t.Fatal(err)
+		}
+		checkExposure := func(id uuid.UUID, state string, credits int) {
+			t.Helper()
+			var match bool
+			err := db.QueryRowContext(ctx, `SELECT beichen_state=$2 AND unresolved_credit_milli=$3
+				FROM gateway_calls WHERE id=$1`, id, state, credits).Scan(&match)
+			if err != nil || !match {
+				t.Fatalf("call %s: want %s with %d unresolved credits: %v", id, state, credits, err)
+			}
+		}
+		checkExposure(last.CallID, "pending_review", 10)
+		small := mustReserve(t, otherKey) // 99 existing reviews, 990 + 9 < 1000
+		rejectedRoute := makePending(small)
+		checkExposure(small.CallID, "pending_review", 9)
+		_, err = reserve(key)
+		expectQuotaRejection(t, err, UnresolvedExposureLimit) // 999 + 9 > 1000
+
+		t.Setenv("NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT", "1010")
+		extra := mustReserve(t, key)
+		extraRoute := makePending(extra)
+		t.Setenv("NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT", "")
+		_, err = reserve(otherKey)
+		expectQuotaRejection(t, err, UnresolvedExposureLimit) // already 1008 outstanding
+		extraRoute.UpstreamStatus = 400
+		if err := store.Finalize(ctx, extra, false, "upstream_failed", "", "", extraRoute, CallMetrics{}); err != nil {
+			t.Fatal(err)
+		}
+		rejectedRoute.UpstreamStatus = 400
+		for range 2 {
+			if err := store.Finalize(ctx, small, false, "upstream_failed", "", "", rejectedRoute, CallMetrics{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		checkExposure(small.CallID, "released", 0)
+		t.Setenv("NEBULA_STUDENT_PENDING_RESERVE_CREDITS", "")
 		input, output, zero := int64(33267), int64(8), int64(0)
 		report := CallMetrics{State: UsageReported, PromptTokens: &input, CompletionTokens: &output, CacheHitTokens: &zero, CacheWriteTokens: &zero}
 		for range 2 {
@@ -224,12 +285,19 @@ func TestGatewayQuotaPostgres(t *testing.T) {
 			}
 		}
 		var settled bool
+		checkExposure(last.CallID, "charged", 0)
 		err = db.QueryRowContext(ctx, `SELECT beichen_state='charged' AND beichen_review_reason IS NULL
 			AND beichen_credit_exact=3.3331 FROM gateway_calls WHERE id=$1`, last.CallID).Scan(&settled)
 		if err != nil || !settled {
-			t.Fatalf("late verified counters should settle and free a review slot: %v", err)
+			t.Fatalf("late verified counters should settle and release the pending credits: %v", err)
 		}
 		release(t, mustReserve(t, otherKey))
+
+		// An older, smaller reserve leaves room for a default-size call even with 99 reviews.
+		t.Setenv("NEBULA_STUDENT_PENDING_RESERVE_CREDITS", "1")
+		makePending(mustReserve(t, otherKey))
+		t.Setenv("NEBULA_STUDENT_PENDING_RESERVE_CREDITS", "")
+		makePending(mustReserve(t, otherKey)) // 98 × 10 + 1 + 10 = 991
 	})
 }
 

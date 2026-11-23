@@ -719,6 +719,16 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 网关按模型倍率执行月度 credit 额度检查与调用记录；目录查询、视频状态查询和内容下载不计费。
 
+模型调用在受理和向上游发出前均检查学生额度。同一学生的所有 Key 共用待核金额上限。已有待核记录的 `unresolved_credit_milli` 合计加上本笔预留，达到或超过上限时返回 HTTP 429，响应头 `X-Nebula-Error-Code` 为 `unresolved_exposure_limit`。旧码 `pending_review_limit` 保留兼容。已达并发限制时优先返回 HTTP 429 和 `student_concurrency_exceeded`。
+
+| 后端环境变量 | 默认值 | 含义 |
+| --- | ---: | --- |
+| `NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT` | 1000 | 每学生待核金额上限，整积分，折合 10 元 |
+| `NEBULA_STUDENT_PENDING_RESERVE_CREDITS` | 10 | 每笔新待核调用预留的整积分，折合 0.1 元 |
+| `NEBULA_STUDENT_CONCURRENCY_LIMIT` | 2 | 每学生同时派发的调用数 |
+
+上述配置接受正整数，缺省或无效时使用默认值。按默认值，已有 98 笔各 10 积分时，第 99 笔可发出；已有 99 笔各 10 积分时，下一笔正好触顶，须等部分记录完成核账后再试。更换 Key 共用同一上限。
+
 老师模型 Probe 支持 `chat_completions`、`responses`、`messages`、`embeddings`、`rerank`。每次请求固定先调用同一供应商的 `GET /v1/models`，按大小写不敏感的完整上游模型 ID 精确匹配目录条目。匹配条目的纯文本 `description` 直接写入建议配置的描述；`model_type`、`tags`、`supported_endpoint_types` 与 description 共同映射类别、输入/输出模态和固定能力。容量采用固定优先级：响应中明确命名的结构化字段最高，其次从 description 的“100 万令牌”“1M context”“128K 上下文”“最大输出 16K”等格式提取，再按具体模型族推断，最后使用 128K 上下文、128K 最大输入和 4K 最大输出。更具体的模型族规则先于通用规则，例如 `claude-sonnet-4-5` 不会误匹配 Claude 5，`glm-5` 使用 1000K/16K。之后按请求顺序执行所选真实端点。浏览器响应不包含上游响应 body，只返回各请求的 endpoint、path、HTTP 状态、耗时、截断标志、通用错误和标准化配置。已注册供应商只提交 `provider_id`，凭据不返回浏览器；手写 Key 不持久化。手写 Base URL 只允许公网 HTTP/HTTPS，不跟随重定向，并在连接阶段再次拒绝私网、localhost、链路本地和云元数据地址。单项上游响应最多读取 64 KiB；不把 usage、价格、Content-Length 或 `max_bytes` 当成容量。
 
 ```json

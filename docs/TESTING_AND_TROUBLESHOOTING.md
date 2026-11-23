@@ -421,6 +421,7 @@ ORDER BY j.channel;
 | 领取时报 `KEY_ALREADY_CLAIMED` | Key 已是 ACTIVE 或并发请求已有一个成功 | 使用首次响应中的明文 | 检查 `claimed_at` 和 prefix，不要要求后台重显 |
 | 网关返回 invalid API key | Key 不存在、HMAC pepper 变化、状态非 ACTIVE | 使用正确 Key；恢复原 pepper 或重新申请 | 只记录 prefix；检查部署间 `API_KEY_HASH_PEPPER` 是否一致 |
 | 网关返回 model_not_allowed | 请求模型不在该 Key 的规范化白名单 | 使用 `GET /v1/models` 返回的模型 | 核对 `api_key_models`，不要依赖客户端缓存 |
+| 网关返回 429 `unresolved_exposure_limit` | 学生已有待核积分加上新请求预留达到上限 | 核对该学生跨 Key 的待核记录，处理后重试 | 以学生 ID 绑定 `$1` 执行 `SELECT count(*), coalesce(sum(unresolved_credit_milli),0) FROM gateway_calls WHERE user_id=$1 AND beichen_state='pending_review'`，将合计加上单笔预留与配置上限比较 |
 | 网关返回 model unavailable | 模型、binding 或 provider 被停用 | 老师启用完整路由链或添加 binding | 按 model -> binding -> provider 顺序排查状态和 priority |
 | 上游 429/5xx 后没有切换 | 没有下一个 ACTIVE binding，或流已经开始写出 | 添加低优先级候选；流开始后只能返回当前错误 | 查看候选排序、adapter、priority 和首字节是否已发送 |
 | multipart 请求失败 | Content-Type boundary 丢失、文件过大或客户端重复读取 body | 保留原始 Content-Type，调整允许大小 | 检查请求大小和 boundary；不要把文件内容写入日志 |
