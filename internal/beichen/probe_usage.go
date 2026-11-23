@@ -68,13 +68,19 @@ func (s *Service) runProbeRound(ctx context.Context, job probeJob, targets []pro
 			defer wg.Done()
 			result := observeTarget(ctx, targets[i])
 			results[i] = result
+			usageError := result.errorCode
+			input, output := result.usage.InputTokens, result.usage.OutputTokens
+			cacheRead, cacheWrite := result.usage.CacheReadTokens, result.usage.CacheWriteTokens
+			if result.usage.Reason != "" {
+				usageError = result.usage.AccountingErrorCode()
+				input, output, cacheRead, cacheWrite = nil, nil, nil, nil
+			}
 			saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), probeDBTimeout)
 			defer cancel()
 			_, errs[i] = s.db.ExecContext(saveCtx, `
 UPDATE beichen_probe_usage SET status_code=NULLIF($2::integer,0), error_code=NULLIF($3,''),
   input_tokens=$4, output_tokens=$5, cache_read_tokens=$6, cache_write_tokens=$7 WHERE id=$1`,
-				id, result.statusCode, result.errorCode, result.usage.InputTokens, result.usage.OutputTokens,
-				result.usage.CacheReadTokens, result.usage.CacheWriteTokens)
+				id, result.statusCode, usageError, input, output, cacheRead, cacheWrite)
 		}()
 	}
 	wg.Wait()
