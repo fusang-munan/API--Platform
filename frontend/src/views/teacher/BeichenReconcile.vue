@@ -28,10 +28,9 @@ const unmatchedTotal = ref(0)
 const unmatchedNextCursor = ref<string | null>(null)
 const unmatchedPage = ref(1)
 const unmatchedPageSize = 50
-const unmatchedCursor = ref('')
-const unmatchedCursorStack = ref<string[]>([])
+let unmatchedCursors: string[] = []
 const unmatchedLoading = ref(false)
-const unmatchedError = ref('')
+const unmatchedFailure = ref<{ cursor: string; page: number; message: string } | null>(null)
 let unmatchedRequestVersion = 0
 const currencyMismatch = computed(() => {
   const side = data.value?.totals.upstream
@@ -43,7 +42,8 @@ const loading = ref(true)
 const error = ref('')
 const models = computed(() => data.value?.models ?? [])
 const keys = computed(() => data.value?.keys ?? [])
-const empty = computed(() => !models.value.length && !keys.value.length && unmatchedTotal.value === 0)
+const empty = computed(() => !models.value.length && !keys.value.length && unmatchedTotal.value === 0
+  && !unmatchedLoading.value && !unmatchedFailure.value)
 const palette = ['#0071e3', '#168473', '#b77916', '#b44d76', '#7657b7', '#427886', '#646f80']
 const matchLabels: Record<BeichenReconcileModel['match_status'], string> = {
   matched: '两边均有记录', local_only: '仅本地有记录', upstream_only: '仅北辰有记录',
@@ -60,7 +60,7 @@ const exclusionLabels: Record<string, string> = {
 }
 const period = computed(() => {
   if (!report.value) return ''
-  const end = beijingDate(report.value.end)
+  const end = beijingDate(report.value.end, true)
   return report.value.start ? `${beijingDate(report.value.start)} 起 · 截至 ${end}（北京时间）` : `全部已记录数据 · 截至 ${end}（北京时间）`
 })
 const localSegments = computed(() => models.value.map((row, index) => ({
@@ -119,10 +119,13 @@ function schoolAbsorbed(value: string | null | undefined) {
   return amount === '0' ? '未触顶' : amount
 }
 
-function beijingDate(value: string) {
+function beijingDate(value: string, includeTime = false) {
   const date = new Date(value)
   return Number.isFinite(date.getTime())
-    ? new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date)
+    ? new Intl.DateTimeFormat('sv-SE', {
+      timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+      ...(includeTime ? { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' } : {}),
+    }).format(date)
     : '—'
 }
 
@@ -146,14 +149,16 @@ function applyUnmatchedPage(result: BeichenReconcile, cursor: string, page: numb
   unmatchedRows.value = result.unmatched_upstream
   unmatchedTotal.value = result.unmatched_total
   unmatchedNextCursor.value = result.unmatched_next_cursor
-  unmatchedCursor.value = cursor
+  unmatchedCursors[page - 1] = cursor
   unmatchedPage.value = page
-  unmatchedError.value = ''
+  unmatchedFailure.value = null
 }
 
 async function load() {
   const current = ++requestVersion
   unmatchedRequestVersion++
+  unmatchedLoading.value = false
+  unmatchedFailure.value = null
   loading.value = true
   error.value = ''
   report.value = undefined
@@ -163,7 +168,7 @@ async function load() {
     // 切换范围或供应商后，过期响应不能覆盖当前对账结果。
     if (current === requestVersion) {
       report.value = result
-      unmatchedCursorStack.value = []
+      unmatchedCursors = []
       applyUnmatchedPage(result, '', 1)
     }
   } catch (e) {
@@ -176,7 +181,7 @@ async function load() {
 async function loadUnmatched(cursor: string, targetPage: number) {
   const current = ++unmatchedRequestVersion
   unmatchedLoading.value = true
-  unmatchedError.value = ''
+  unmatchedFailure.value = null
   try {
     const result = await teacherAPI.beichenReconciliation(props.providerId, range.value, {
       unmatchedScope: strict.value ? 'comparable' : 'observed',
@@ -184,7 +189,9 @@ async function loadUnmatched(cursor: string, targetPage: number) {
     })
     if (current === unmatchedRequestVersion) applyUnmatchedPage(result, cursor, targetPage)
   } catch (e) {
-    if (current === unmatchedRequestVersion) unmatchedError.value = apiErrorMessage(e, '北辰未关联流水读取失败，请重试。')
+    if (current === unmatchedRequestVersion) {
+      unmatchedFailure.value = { cursor, page: targetPage, message: apiErrorMessage(e, '北辰未关联流水读取失败，请重试。') }
+    }
   } finally {
     if (current === unmatchedRequestVersion) unmatchedLoading.value = false
   }
@@ -193,7 +200,7 @@ async function loadUnmatched(cursor: string, targetPage: number) {
 function selectStrict(value: boolean) {
   if (strict.value === value) return
   strict.value = value
-  unmatchedCursorStack.value = []
+  unmatchedCursors = []
   unmatchedRows.value = []
   unmatchedTotal.value = 0
   unmatchedNextCursor.value = null
@@ -204,14 +211,19 @@ function selectStrict(value: boolean) {
 function nextUnmatchedPage() {
   const next = unmatchedNextCursor.value
   if (!next || unmatchedLoading.value) return
-  unmatchedCursorStack.value.push(unmatchedCursor.value)
   void loadUnmatched(next, unmatchedPage.value + 1)
 }
 
 function previousUnmatchedPage() {
   if (unmatchedPage.value <= 1 || unmatchedLoading.value) return
-  const cursor = unmatchedCursorStack.value.pop() ?? ''
-  void loadUnmatched(cursor, unmatchedPage.value - 1)
+  const page = unmatchedPage.value - 1
+  const cursor = unmatchedCursors[page - 1]
+  if (cursor !== undefined) void loadUnmatched(cursor, page)
+}
+
+function retryUnmatchedPage() {
+  const failed = unmatchedFailure.value
+  if (failed) void loadUnmatched(failed.cursor, failed.page)
 }
 
 watch([() => props.providerId, range], () => { void load() }, { immediate: true })
@@ -315,13 +327,14 @@ onBeforeUnmount(() => { requestVersion++; unmatchedRequestVersion++ })
           </div>
           <p v-if="data.totals.local.tokens_missing > 0" class="beichen-note">已计入本地总量、待归类 {{ formatTokens(data.totals.local.tokens_missing) }} Token。</p>
         </section>
+        </template>
 
         <section class="beichen-card reconcile-detail" aria-label="北辰有、本地无">
           <h3>北辰有、本地无</h3>
           <p class="beichen-note">以下北辰归档流水尚未关联到已验证的本地扣款。超时或待核的请求仍可能有本地调用记录。</p>
-          <p v-if="unmatchedError" class="coverage-warning" role="alert">
-            {{ unmatchedError }}
-            <button type="button" @click="loadUnmatched(unmatchedCursor, unmatchedPage)">重试本页</button>
+          <p v-if="unmatchedFailure" class="coverage-warning" role="alert">
+            {{ unmatchedFailure.message }}
+            <button type="button" @click="retryUnmatchedPage">重试本页</button>
           </p>
           <div v-if="unmatchedRows.length" class="reconcile-table-wrap" :aria-busy="unmatchedLoading">
             <table class="beichen-table reconcile-table">
@@ -344,9 +357,11 @@ onBeforeUnmount(() => { requestVersion++; unmatchedRequestVersion++ })
               <button type="button" :disabled="!unmatchedNextCursor || unmatchedLoading" @click="nextUnmatchedPage">下一页</button>
             </nav>
           </div>
-          <p v-else class="beichen-note">所选账日的已归档流水中暂无未关联记录。仅有日汇总的调用无法逐笔核对。</p>
+          <p v-else-if="unmatchedLoading" class="beichen-note" role="status">读取未关联流水中…</p>
+          <p v-else-if="!unmatchedFailure" class="beichen-note">所选账日的已归档流水中暂无未关联记录。仅有日汇总的调用无法逐笔核对。</p>
         </section>
 
+        <template v-if="data">
         <div v-if="empty" class="beichen-empty" role="status">
           <strong>当前范围暂无对账记录</strong>
           <span v-if="data.coverage.coverage_kind !== 'full'">先到「查看模型」同步北辰数据，完成后返回并点击「刷新对账」。</span>

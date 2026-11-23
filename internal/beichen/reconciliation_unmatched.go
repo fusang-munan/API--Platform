@@ -119,11 +119,18 @@ SELECT count(*)`+archivedMatchesSQL+`
 	rows, err := tx.QueryContext(ctx, `
 SELECT u.occurred_at,u.upstream_user_id,u.row_id,u.model,u.credential_id,
        COALESCE(NULLIF(pc.label,''),u.channel),u.request_id,r.response_id::text,
-       lc.beichen_state,
-       CASE WHEN claim.response_id IS NOT NULL THEN 'unique_claim'
+       CASE WHEN direct_call.id IS NOT NULL THEN direct_call.beichen_state ELSE lc.beichen_state END,
+       CASE WHEN direct_call.id IS NOT NULL OR claim.response_id IS NOT NULL THEN 'unique_claim'
             WHEN r.response_id IS NOT NULL THEN 'receipt_without_unique_claim' END,
        u.input_tokens,u.output_tokens,u.cache_read_tokens,u.cache_write_tokens`+archivedMatchesSQL+`
  LEFT JOIN gateway_calls lc ON lc.id=claim.first_call_id
+ LEFT JOIN beichen_receipt_response_claims direct_claim ON claim.response_id IS NULL
+   AND direct_claim.conflicted_at IS NULL AND direct_claim.response_id=CASE
+     WHEN u.request_id ~ '^client:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+     THEN substr(u.request_id,8)::uuid END
+ LEFT JOIN gateway_calls direct_call ON direct_call.id=direct_claim.first_call_id
+   AND direct_call.beichen_dispatch_credential_id=u.credential_id
+   AND direct_call.beichen_receipt_response_id=direct_claim.response_id
  LEFT JOIN provider_credentials pc ON pc.id=u.credential_id AND pc.provider_id=u.provider_id
  WHERE u.provider_id=$1 AND ($2::timestamptz IS NULL OR u.occurred_at >= $2)
    AND u.occurred_at < $3 AND c.id IS NULL
