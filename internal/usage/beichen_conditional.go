@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"math/big"
 	"regexp"
 	"sort"
@@ -207,16 +206,17 @@ type beichenConditionalPrice struct {
 }
 
 type beichenBillableTokens struct {
-	Input   int64 `json:"input_tokens"`
-	Output  int64 `json:"output_tokens"`
-	Read    int64 `json:"cache_read_tokens"`
-	Write   int64 `json:"cache_write_tokens"`
-	TotalIn int64 `json:"total_input_tokens"`
+	Input   *int64 `json:"input_tokens"`
+	Output  int64  `json:"output_tokens"`
+	Read    *int64 `json:"cache_read_tokens"`
+	Write   *int64 `json:"cache_write_tokens"`
+	TotalIn int64  `json:"total_input_tokens"`
+	Unsplit int64  `json:"unsplit_input_tokens,omitempty"`
 }
 
 // evaluateBeichenConditional returns base credits before the upstream group
 // and school multipliers. Missing effort uses the default pricing tier.
-func evaluateBeichenConditional(raw json.RawMessage, metrics CallMetrics, effort *string, ttl, protocol string) (beichenConditionalPrice, string) {
+func evaluateBeichenConditional(raw json.RawMessage, metrics CallMetrics, effort *string, ttl, protocol string, zeroGroup bool) (beichenConditionalPrice, string) {
 	terms := decodeBeichenConditions(raw)
 	if terms == nil {
 		return beichenConditionalPrice{}, "invalid_price_conditions"
@@ -252,7 +252,7 @@ func evaluateBeichenConditional(raw json.RawMessage, metrics CallMetrics, effort
 	appliedTTL := ""
 	writePrice := rates.CacheWrite
 	// OpenAI reports implicit cache writes at the base write rate.
-	if tokens.Write > 0 && (protocol == "anthropic" || (protocol == "google_gemini_v1beta" && timedCache)) {
+	if (tokens.Write == nil || *tokens.Write > 0) && (protocol == "anthropic" || (protocol == "google_gemini_v1beta" && timedCache)) {
 		appliedTTL = beichenCacheTTL(ttl)
 		switch appliedTTL {
 		case "5m":
@@ -264,30 +264,16 @@ func evaluateBeichenConditional(raw json.RawMessage, metrics CallMetrics, effort
 			return beichenConditionalPrice{}, "unknown_cache_ttl"
 		}
 	}
-	prices := make(map[string]string, 4)
-	credits := new(big.Rat)
-	for _, part := range []struct {
-		name   string
-		count  int64
-		price  *json.Number
-		reason string
-	}{
-		{"input", tokens.Input, rates.Input, "missing_input_price"},
-		{"output", tokens.Output, rates.Output, "missing_output_price"},
-		{"cache_read", tokens.Read, rates.CacheRead, "missing_cache_read_price"},
-		{"cache_write", tokens.Write, writePrice, "missing_cache_write_price"},
-	} {
-		if part.price == nil && part.count == 0 && (part.name == "cache_read" || part.name == "cache_write") {
-			continue
-		}
-		rate := beichenPriceDecimal(part.price)
-		if rate == nil {
-			return beichenConditionalPrice{}, part.reason
-		}
-		prices[part.name] = beichenDecimalString(rate)
-		credits.Add(credits, rate.Mul(rate, big.NewRat(part.count, 1)))
+	effective := multiplier
+	if zeroGroup && tokens.Unsplit > 0 {
+		// The ledger records base credits after the group multiplier. Its
+		// exact zero erases price differences but cannot supply missing rates.
+		effective = new(big.Rat)
 	}
-	credits.Mul(credits, multiplier)
+	credits, prices, reason := priceBeichenTokenParts(tokens, rates.Input, rates.Output, rates.CacheRead, writePrice, effective)
+	if reason != "" {
+		return beichenConditionalPrice{}, reason
+	}
 	credits.Mul(credits, big.NewRat(100, 1))
 	multiplierText := beichenDecimalString(multiplier)
 	detail, err := json.Marshal(struct {
@@ -295,8 +281,9 @@ func evaluateBeichenConditional(raw json.RawMessage, metrics CallMetrics, effort
 		ReasoningEffort     string            `json:"reasoning_effort,omitempty"`
 		ReasoningMultiplier string            `json:"reasoning_multiplier"`
 		CacheTTL            string            `json:"cache_ttl,omitempty"`
+		AmountSource        string            `json:"amount_source,omitempty"`
 		Prices              map[string]string `json:"upstream_units_per_token"`
-	}{tokens, appliedEffort, multiplierText, appliedTTL, prices})
+	}{tokens, appliedEffort, multiplierText, appliedTTL, tokens.amountSource(), prices})
 	if err != nil {
 		return beichenConditionalPrice{}, "invalid_price_conditions"
 	}
@@ -339,39 +326,50 @@ func (c beichenPriceConditions) ratesFor(total int64) (beichenPanelRates, string
 	return rates, label, timedCache, ""
 }
 
-// Match the fixed ledger's mutually exclusive counts. OpenAI prompt tokens
-// already contain cache reads and writes, while Anthropic reports all three
-// separately. OpenAI's cache_miss counter is uncached input, when provided.
-func normalizeBeichenConditionalTokens(m CallMetrics, protocol string) (beichenBillableTokens, string) {
-	m = m.withKnownInputParts(protocol)
-	for _, count := range []*int64{m.PromptTokens, m.CompletionTokens, m.CacheHitTokens, m.CacheMissTokens, m.CacheWriteTokens} {
-		if count != nil && *count < 0 {
-			return beichenBillableTokens{}, "missing_price_or_token_breakdown"
+func (t beichenBillableTokens) amountSource() string {
+	if t.Unsplit > 0 {
+		return "estimated_unique_amount"
+	}
+	return ""
+}
+
+// Every unknown category can take the entire remainder. With a fixed input
+// tier the price is linear, so equality of their effective rates is necessary
+// and sufficient. Compare exact rationals before any ledger rounding.
+func priceBeichenTokenParts(t beichenBillableTokens, input, output, read, write *json.Number, multiplier *big.Rat) (*big.Rat, map[string]string, string) {
+	prices := make(map[string]string, 4)
+	total := new(big.Rat)
+	var shared *big.Rat
+	for _, part := range []struct {
+		name  string
+		count *int64
+		price *json.Number
+	}{
+		{"input", t.Input, input}, {"output", &t.Output, output},
+		{"cache_read", t.Read, read}, {"cache_write", t.Write, write},
+	} {
+		if part.price == nil && part.count != nil && *part.count == 0 && (part.name == "cache_read" || part.name == "cache_write") {
+			continue
+		}
+		rate := beichenPriceDecimal(part.price)
+		if rate == nil {
+			return nil, nil, "missing_" + part.name + "_price"
+		}
+		prices[part.name] = beichenDecimalString(rate)
+		rate.Mul(rate, multiplier)
+		if part.count == nil {
+			if shared != nil && shared.Cmp(rate) != 0 {
+				return nil, nil, "incomplete_token_breakdown"
+			}
+			shared = rate
+		} else {
+			total.Add(total, rate.Mul(rate, big.NewRat(*part.count, 1)))
 		}
 	}
-	if m.PromptTokens == nil || m.CompletionTokens == nil {
-		return beichenBillableTokens{}, "missing_price_or_token_breakdown"
+	if shared != nil {
+		total.Add(total, shared.Mul(shared, big.NewRat(t.Unsplit, 1)))
 	}
-	input, output := *m.PromptTokens, *m.CompletionTokens
-	read, write, miss := m.CacheHitTokens, m.CacheWriteTokens, m.CacheMissTokens
-	switch protocol {
-	case "openai_compatible", "openai_responses", "openai_realtime", "anthropic", "google_gemini_v1beta":
-	default:
-		return beichenBillableTokens{}, "unsupported_pricing_protocol"
-	}
-	if read == nil || write == nil {
-		return beichenBillableTokens{}, "missing_price_or_token_breakdown"
-	}
-	if protocol == "anthropic" {
-		if *read > math.MaxInt64-input || *write > math.MaxInt64-input-*read {
-			return beichenBillableTokens{}, "missing_price_or_token_breakdown"
-		}
-		return beichenBillableTokens{input, output, *read, *write, input + *read + *write}, ""
-	}
-	if *read > input || *write > input-*read || (miss != nil && *miss != input-*read-*write) {
-		return beichenBillableTokens{}, "missing_price_or_token_breakdown"
-	}
-	return beichenBillableTokens{input - *read - *write, output, *read, *write, input}, ""
+	return total, prices, ""
 }
 
 func beichenCacheTTL(value string) string {

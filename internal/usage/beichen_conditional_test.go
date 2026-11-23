@@ -2,6 +2,7 @@ package usage
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 )
@@ -56,6 +57,52 @@ func TestBeichenTokenQuoteBlocker(t *testing.T) {
 				t.Fatalf("unexpected usability for blocker %q", tc.code)
 			}
 		})
+	}
+}
+
+func TestBeichenUniqueAmountBoundaries(t *testing.T) {
+	const flat = `{"input_price":1,"output_price":2,"cache_read_price":0.5,"cache_write_price":1}`
+	zero, read, prompt, output := int64(0), int64(2), int64(5), int64(1)
+	metrics := CallMetrics{State: UsageReported, PromptTokens: &prompt, CompletionTokens: &output, CacheHitTokens: &read}
+	for _, tc := range []struct {
+		name, terms, credits, blocker string
+		zeroGroup                     bool
+	}{
+		{"equal", flat, "600", "", false},
+		{"zero unknown rates", `{"input_price":0,"output_price":2,"cache_read_price":0.5,"cache_write_price":0}`, "300", "", false},
+		{"different even below ledger precision", `{"input_price":1,"output_price":2,"cache_read_price":0.5,"cache_write_price":1.000000000000000000001}`, "", "incomplete_token_breakdown", false},
+		{"missing write price", `{"input_price":0,"output_price":2,"cache_read_price":0.5}`, "", "missing_cache_write_price", false},
+		{"group zero", `{"input_price":1,"output_price":2,"cache_read_price":0.5,"cache_write_price":2}`, "0", "", true},
+		{"effort zero", `{"input_price":1,"output_price":2,"cache_read_price":0.5,"cache_write_price":2,"reasoning_effort_multipliers":{"medium":0}}`, "0", "", false},
+		{"active tier at boundary", `{"intervals":[{"min_tokens":0,"max_tokens":5,"input_price":1,"output_price":2,"cache_read_price":0.5,"cache_write_price":8},{"min_tokens":5,"input_price":1,"output_price":2,"cache_read_price":0.5,"cache_write_price":1}]}`, "600", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := metrics.ClassifyBeichenUsage("openai_compatible")
+			got, reason := evaluateBeichenConditional(json.RawMessage(tc.terms), m, nil, "", "openai_compatible", tc.zeroGroup)
+			if m.State != UsagePartial || m.CacheMissTokens != nil || m.CacheWriteTokens != nil || got.Credits != tc.credits || reason != tc.blocker {
+				t.Fatalf("metrics=%+v credits=%s reason=%s", m, got.Credits, reason)
+			}
+			if reason == "" && !strings.Contains(string(got.Detail), `"amount_source":"estimated_unique_amount"`) {
+				t.Fatal(string(got.Detail))
+			}
+		})
+	}
+	// A single unknown can be positive. An explicit zero is evidence.
+	metrics.CacheMissTokens = &zero
+	report := metrics.ClassifyBeichenUsage("openai_responses")
+	if report.State != UsageReported || report.CacheWriteTokens == nil || *report.CacheWriteTokens != 3 {
+		t.Fatalf("expected positive write uniquely inferred: %+v", report)
+	}
+	for _, tc := range []struct {
+		p, o, r, w int64
+		protocol   string
+	}{
+		{5444, 469, 0, 0, "openai_responses"}, {24, 9, 0, 572, "anthropic"}, {24, 9, 465, 107, "anthropic"},
+	} {
+		m := CallMetrics{State: UsageReported, PromptTokens: &tc.p, CompletionTokens: &tc.o, CacheHitTokens: &tc.r, CacheWriteTokens: &tc.w}.ClassifyBeichenUsage(tc.protocol)
+		if m.State != UsageReported || m.CacheMissTokens == nil || *m.CacheMissTokens != tc.p {
+			t.Fatalf("real reported usage changed: %+v", m)
+		}
 	}
 }
 
@@ -139,8 +186,8 @@ func TestEvaluateBeichenConditional(t *testing.T) {
 		{name: "unsupported protocol", terms: noCache, usage: metrics(1, 0, 0, 0),
 			protocol: "openai_images", review: "unsupported_pricing_protocol"},
 		{name: "cache write proved zero", terms: noCache, usage: provenZero, credits: "0"},
-		{name: "cache write count unknown", terms: noCache, usage: incomplete, review: "missing_price_or_token_breakdown"},
-		{name: "inconsistent OpenAI counts", terms: rates + "}", usage: metrics(2, 1, 2, 1), review: "missing_price_or_token_breakdown"},
+		{name: "zero prompt proves every input count zero", terms: noCache, usage: incomplete, credits: "0"},
+		{name: "inconsistent OpenAI counts", terms: rates + "}", usage: metrics(2, 1, 2, 1), review: "inconsistent_token_breakdown"},
 		{name: "preserves long decimals", terms: `{"billing_mode":"token","input_price":0.000012000000000000000019,
 			"output_price":0,"reasoning_effort_multipliers":{"high":1.25}}`,
 			usage: metrics(1, 0, 0, 0), effort: &high, credits: "0.001500000000000000002375", multiplier: "1.25"},
@@ -151,7 +198,7 @@ func TestEvaluateBeichenConditional(t *testing.T) {
 			if protocol == "" {
 				protocol = "openai_responses"
 			}
-			got, reason := evaluateBeichenConditional(json.RawMessage(tc.terms), tc.usage, tc.effort, tc.ttl, protocol)
+			got, reason := evaluateBeichenConditional(json.RawMessage(tc.terms), tc.usage, tc.effort, tc.ttl, protocol, false)
 			if reason != tc.review || got.Credits != tc.credits {
 				t.Fatalf("credits=%q, review=%q; want credits=%q, review=%q", got.Credits, reason, tc.credits, tc.review)
 			}
@@ -168,5 +215,37 @@ func TestEvaluateBeichenConditional(t *testing.T) {
 				t.Fatalf("tier=%q multiplier=%q detail=%s; want tier=%q multiplier=%q", got.Tier, got.Multiplier, got.Detail, tc.tier, tc.multiplier)
 			}
 		})
+	}
+}
+
+func TestBeichenUnsplitInputEvidence(t *testing.T) {
+	one, two, three, five := int64(1), int64(2), int64(3), int64(5)
+	max, negative := int64(math.MaxInt64), int64(-1)
+	for _, tc := range []struct {
+		name   string
+		m      CallMetrics
+		reason string
+	}{
+		{"negative write", CallMetrics{CacheWriteTokens: &negative}, "inconsistent_token_breakdown"},
+		{"known categories exceed prompt", CallMetrics{CacheHitTokens: &three, CacheMissTokens: &three}, "inconsistent_token_breakdown"},
+		{"partial total mismatch", CallMetrics{CacheHitTokens: &two, TotalTokens: &five}, "inconsistent_token_total"},
+		{"reasoning exceeds output", CallMetrics{ReasoningTokens: &two}, "inconsistent_token_breakdown"},
+		{"sum overflow", CallMetrics{PromptTokens: &max}, "inconsistent_token_total"},
+		{"interrupted", CallMetrics{UsageReason: "response_interrupted"}, "response_interrupted"},
+	} {
+		m := tc.m
+		if m.PromptTokens == nil {
+			m.PromptTokens = &five
+		}
+		m.CompletionTokens, m.State = &one, UsageReported
+		m = m.ClassifyBeichenUsage("openai_compatible")
+		if m.State != UsagePartial || m.UsageReason != tc.reason || m.CanPriceBeichenUsage("openai_compatible") {
+			t.Fatalf("%s: %+v", tc.name, m)
+		}
+	}
+	m := CallMetrics{PromptTokens: &five, CompletionTokens: &one, State: UsageReported}.ClassifyBeichenUsage("openai_compatible")
+	got, reason := evaluateBeichenConditional(json.RawMessage(`{"input_price":1,"output_price":2,"cache_read_price":1,"cache_write_price":1}`), m, nil, "", "openai_compatible", false)
+	if reason != "" || got.Credits != "700" || m.CacheMissTokens != nil || m.CacheHitTokens != nil || m.CacheWriteTokens != nil {
+		t.Fatalf("all three unknown: %+v, %s, %s", m, got.Credits, reason)
 	}
 }

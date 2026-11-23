@@ -296,11 +296,23 @@ func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, ga
 			"medium", "", "3.3283", ""},
 		{"responses-large-cache-unconfirmed", "openai_responses", "/v1/responses", `"input":"fixture"`,
 			`"status":"completed","usage":{"input_tokens":33267,"output_tokens":8,"input_tokens_details":{"cached_tokens":32768}}`,
-			"medium", "", "", "incomplete_token_breakdown"},
+			"medium", "", "1.6899", ""},
 		{"responses-content-filter", "openai_responses", "/v1/responses", `"input":"fixture"`,
 			`"status":"incomplete","incomplete_details":{"reason":"content_filter"},"usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}`,
 			"medium", "", "", "missing_terminal_usage"},
 		{"responses-absent-tier", "openai_responses", "/v1/responses", `"input":"fixture","reasoning":{"effort":"low"}`, responsesUsage, "low", "", "", "missing_reasoning_effort_multiplier"},
+		{"nov23-chat-1", "openai_compatible", "/v1/chat/completions", `"messages":[]`,
+			`"usage":{"prompt_tokens":4389,"completion_tokens":5,"total_tokens":4394,"prompt_tokens_details":{"cached_tokens":4224}}`, "medium", "", "0.2287", ""},
+		{"nov23-chat-2", "openai_compatible", "/v1/chat/completions", `"messages":[]`,
+			`"usage":{"prompt_tokens":6587,"completion_tokens":5,"total_tokens":6592,"prompt_tokens_details":{"cached_tokens":4352}}`, "medium", "", "0.4421", ""},
+		{"nov23-chat-3", "openai_compatible", "/v1/chat/completions", `"messages":[]`,
+			`"usage":{"prompt_tokens":7571,"completion_tokens":5,"total_tokens":7576}`, "medium", "", "", "incomplete_token_breakdown"},
+		{"nov23-chat-4", "openai_compatible", "/v1/chat/completions", `"messages":[]`,
+			`"usage":{"prompt_tokens":4161,"completion_tokens":5,"total_tokens":4166,"prompt_tokens_details":{"cached_tokens":3968}}`, "medium", "", "0.2187", ""},
+		{"nov23-chat-5", "openai_compatible", "/v1/chat/completions", `"messages":[]`,
+			`"usage":{"prompt_tokens":58,"completion_tokens":2,"total_tokens":60}`, "medium", "", "", "incomplete_token_breakdown"},
+		{"nov23-chat-6", "openai_compatible", "/v1/chat/completions", `"messages":[]`,
+			`"usage":{"prompt_tokens":30140,"completion_tokens":6,"total_tokens":30146}`, "medium", "", "", "incomplete_token_breakdown"},
 		{"messages-1h", "anthropic", "/v1/messages", `"max_tokens":10,"thinking":{"effort":"high"},"messages":[{"role":"user","content":[{"type":"text","text":"fixture","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]`, messagesUsage, "high", "1h", "0.0038", ""},
 		{"messages-5m", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[],"cache_control":{"type":"ephemeral"}`, messagesUsage, "medium", "5m", "0.0013", ""},
 		{"messages-unknown-ttl", "anthropic", "/v1/messages", `"max_tokens":10,"messages":[]`, messagesUsage, "medium", "", "", "unknown_cache_ttl"},
@@ -341,6 +353,19 @@ func testBeichenHTTPConditions(t *testing.T, ctx context.Context, db *sql.DB, ga
 			}
 		})
 	}
+	var charged, pending, partial, missing int
+	err := db.QueryRowContext(ctx, `SELECT
+		count(*) FILTER (WHERE beichen_state='charged' AND pricing_detail->>'amount_source'='estimated_unique_amount'
+		  AND pricing_detail->'input_tokens'='null'::jsonb AND pricing_detail->'cache_write_tokens'='null'::jsonb
+		  AND (pricing_detail->>'unsplit_input_tokens')::bigint=prompt_tokens-cache_hit_tokens),
+		count(*) FILTER (WHERE beichen_state='pending_review' AND cache_hit_tokens IS NULL AND actual_credits IS NULL),
+		count(*) FILTER (WHERE usage_state='partial' AND cache_miss_tokens IS NULL AND cache_write_tokens IS NULL),
+		sum(prompt_tokens-coalesce(cache_hit_tokens,0))
+		FROM gateway_calls WHERE request_id LIKE 'nov23-chat-%'`).Scan(&charged, &pending, &partial, &missing)
+	if err != nil || charged != 3 || pending != 3 || partial != 6 || missing != 40362 {
+		t.Fatalf("Nov 23 Chat replay: charged=%d pending=%d partial=%d unsplit=%d: %v", charged, pending, partial, missing, err)
+	}
+
 }
 
 func testBeichenRealtimeConnection(t *testing.T, ctx context.Context, db *sql.DB, gateway *Gateway, publicModel, upstreamModel, studentKey, upstreamKey string, credential uuid.UUID) {

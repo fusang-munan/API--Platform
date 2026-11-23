@@ -84,11 +84,11 @@ func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, paylo
 }
 
 // OpenAI's final usage is a snapshot. Earlier counters can still explain a
-// partial observation, but only a complete final snapshot can authorize a debit.
+// partial observation. Independently priceable final snapshots stand alone.
 func (metrics *ResponseMetrics) applyUsageSnapshot(adapter modelbinding.Adapter, payload map[string]json.RawMessage) {
 	final := ResponseMetrics{}
 	final.applyPayload(adapter, payload)
-	if metrics.HasUsage() && final.finished(false).ClassifyBeichenUsage(string(adapter)).State != usage.UsageReported {
+	if metrics.HasUsage() && !final.finished(false).ClassifyBeichenUsage(string(adapter)).CanPriceBeichenUsage(string(adapter)) {
 		metrics.applyPayload(adapter, payload)
 		if metrics.UsageReason == "" {
 			metrics.UsageReason = "terminal_usage_incomplete"
@@ -195,6 +195,7 @@ func jsonObject(raw json.RawMessage) map[string]json.RawMessage {
 }
 
 func (metrics *ResponseMetrics) mergeCount(target **int64, maxValue int64, fields ...json.RawMessage) {
+	var observed *int64
 	for _, field := range fields {
 		value := bytes.TrimSpace(field)
 		if len(value) == 0 || bytes.Equal(value, []byte("null")) {
@@ -202,8 +203,13 @@ func (metrics *ResponseMetrics) mergeCount(target **int64, maxValue int64, field
 		}
 		n, err := strconv.ParseInt(string(value), 10, 64)
 		if err == nil && n >= 0 && n <= maxValue {
-			*target = &n
-			return
+			if observed != nil && *observed != n {
+				metrics.UsageReason = "conflicting_usage_fields"
+			} else {
+				observed = &n
+				*target = observed
+			}
+			continue
 		}
 		if metrics.UsageReason == "" {
 			metrics.UsageReason = "invalid_token_count"

@@ -2,86 +2,127 @@ package usage
 
 import "math"
 
-// ClassifyBeichenUsage keeps the native counters even when the four priced
-// categories cannot be established. Omitted cache counts require evidence
-// from the protocol's input equation before we fill them in.
+// ClassifyBeichenUsage preserves nullable native counts even when a terminal
+// observation has enough evidence to price only the input as a group.
 func (m CallMetrics) ClassifyBeichenUsage(protocol string) CallMetrics {
-	if m.UsageReason == "" || m.UsageReason == "response_interrupted" {
-		m = m.withKnownInputParts(protocol)
-	}
-	if m.State != UsageReported {
+	if m.State != UsageReported && !(m.State == UsageInterrupted && m.UsageReason == "response_interrupted") {
 		return m
 	}
-	if !m.HasTokenUsage() {
+	if !m.HasTokenUsage() && m.State == UsageReported {
 		m.State, m.UsageReason = UsageMissing, "usage_not_reported"
 		return m
 	}
-	if m.UsageReason != "" {
+	if m.State == UsageReported && m.UsageReason != "" {
 		m.State = UsagePartial
 		return m
 	}
 	if protocol == "google_gemini_v1beta" {
-		// GenerateContent supplies cached reads and inclusive prompt size.
-		// Its usageMetadata has no separate cache-creation count.
-		m.State, m.UsageReason = UsagePartial, "cache_write_not_in_usage_metadata"
+		// GenerateContent usageMetadata reports inclusive prompt and cached
+		// reads. It supplies no evidence about a Beichen cache-creation charge.
+		if m.PromptTokens != nil && m.CacheHitTokens != nil && *m.CacheHitTokens >= 0 && *m.CacheHitTokens <= *m.PromptTokens {
+			uncached := *m.PromptTokens - *m.CacheHitTokens
+			m.CacheMissTokens = &uncached
+		}
+		if m.State == UsageReported {
+			m.State, m.UsageReason = UsagePartial, "cache_write_not_in_usage_metadata"
+		}
 		return m
 	}
 	tokens, reason := normalizeBeichenConditionalTokens(m, protocol)
-	if reason != "" {
-		m.State, m.UsageReason = UsagePartial, "token_breakdown_unconfirmed"
-		if m.PromptTokens != nil && m.CompletionTokens != nil && m.CacheHitTokens != nil && m.CacheWriteTokens != nil {
-			m.UsageReason = "inconsistent_token_breakdown"
+	if reason == "" {
+		m.CacheMissTokens, m.CacheHitTokens, m.CacheWriteTokens = tokens.Input, tokens.Read, tokens.Write
+	} else if protocol == "anthropic" && m.CacheMissTokens == nil && m.PromptTokens != nil && *m.PromptTokens >= 0 {
+		m.CacheMissTokens = m.PromptTokens
+	}
+	if m.State == UsageReported && (reason != "" || tokens.Unsplit > 0) {
+		m.State = UsagePartial
+		switch reason {
+		case "inconsistent_token_total", "inconsistent_token_breakdown":
+			m.UsageReason = reason
+		default:
+			m.UsageReason = "token_breakdown_unconfirmed"
 		}
-		return m
 	}
-	if tokens.Output > math.MaxInt64-tokens.TotalIn ||
-		(m.TotalTokens != nil && *m.TotalTokens != tokens.TotalIn+tokens.Output) {
-		m.State, m.UsageReason = UsagePartial, "inconsistent_token_total"
-		return m
-	}
-	m.CacheHitTokens, m.CacheWriteTokens, m.CacheMissTokens = &tokens.Read, &tokens.Write, &tokens.Input
 	return m
 }
 
-func (m CallMetrics) withKnownInputParts(protocol string) CallMetrics {
-	if m.PromptTokens == nil || *m.PromptTokens < 0 {
-		return m
+// CanPriceBeichenUsage admits a partial terminal observation only when its
+// sole ambiguity is the allocation of a known number of input tokens.
+func (m CallMetrics) CanPriceBeichenUsage(protocol string) bool {
+	if m.State == UsageReported {
+		return true
 	}
-	input := *m.PromptTokens
-	read, write, miss := m.CacheHitTokens, m.CacheWriteTokens, m.CacheMissTokens
+	if m.State != UsagePartial || m.UsageReason != "token_breakdown_unconfirmed" {
+		return false
+	}
+	tokens, reason := normalizeBeichenConditionalTokens(m, protocol)
+	return reason == "" && tokens.Unsplit > 0
+}
+
+func normalizeBeichenConditionalTokens(m CallMetrics, protocol string) (beichenBillableTokens, string) {
+	var t beichenBillableTokens
+	for _, count := range []*int64{m.PromptTokens, m.CompletionTokens, m.TotalTokens, m.CacheHitTokens, m.CacheMissTokens, m.CacheWriteTokens, m.ReasoningTokens, m.ToolPromptTokens} {
+		if count != nil && *count < 0 {
+			return t, "inconsistent_token_breakdown"
+		}
+	}
+	if m.PromptTokens == nil || m.CompletionTokens == nil {
+		return t, "missing_price_or_token_breakdown"
+	}
+	t.Input, t.Read, t.Write = m.CacheMissTokens, m.CacheHitTokens, m.CacheWriteTokens
+	t.TotalIn, t.Output = *m.PromptTokens, *m.CompletionTokens
+	if m.ReasoningTokens != nil && *m.ReasoningTokens > t.Output {
+		return t, "inconsistent_token_breakdown"
+	}
 	switch protocol {
 	case "anthropic":
-		if miss == nil {
-			m.CacheMissTokens = m.PromptTokens
+		if t.Input != nil && *t.Input != t.TotalIn {
+			return t, "inconsistent_token_breakdown"
 		}
-	case "google_gemini_v1beta":
-		if read != nil && *read >= 0 && *read <= input {
-			uncached := input - *read
-			m.CacheMissTokens = &uncached
+		t.Input = m.PromptTokens
+		if m.TotalTokens != nil && *m.TotalTokens >= t.Output {
+			t.TotalIn = *m.TotalTokens - t.Output
+		} else {
+			for _, cache := range []*int64{t.Read, t.Write} {
+				if cache == nil {
+					return t, "missing_price_or_token_breakdown"
+				}
+				if *cache > math.MaxInt64-t.TotalIn {
+					return t, "inconsistent_token_breakdown"
+				}
+				t.TotalIn += *cache
+			}
 		}
 	case "openai_compatible", "openai_responses", "openai_realtime":
-		zero := int64(0)
-		// Nonnegative categories are disjoint. If one covers the entire
-		// input, any omitted category is necessarily zero.
-		exhaustsInput := func(count *int64) bool { return count != nil && *count == input }
-		if input > 0 && (exhaustsInput(read) || exhaustsInput(write) || exhaustsInput(miss)) {
-			if read == nil {
-				m.CacheHitTokens = &zero
-			}
-			if write == nil {
-				m.CacheWriteTokens = &zero
-			}
-		}
-		if read == nil && miss != nil && write != nil && *write >= 0 && *write <= input && *miss == input-*write {
-			m.CacheHitTokens = &zero
-		}
-		if write == nil && miss != nil && read != nil && *read >= 0 && *read <= input && *miss == input-*read {
-			m.CacheWriteTokens = &zero
-		}
-		if miss == nil && read != nil && write != nil && *read >= 0 && *read <= input && *write >= 0 && *write <= input-*read {
-			uncached := input - *read - *write
-			m.CacheMissTokens = &uncached
-		}
+	default:
+		return t, "unsupported_pricing_protocol"
 	}
-	return m
+	if t.Output > math.MaxInt64-t.TotalIn || (m.TotalTokens != nil && *m.TotalTokens != t.TotalIn+t.Output) {
+		return t, "inconsistent_token_total"
+	}
+	remaining, unknown := t.TotalIn, 0
+	parts := []**int64{&t.Input, &t.Read, &t.Write}
+	for _, part := range parts {
+		if *part == nil {
+			unknown++
+			continue
+		}
+		if **part > remaining {
+			return t, "inconsistent_token_breakdown"
+		}
+		remaining -= **part
+	}
+	if unknown == 0 && remaining != 0 {
+		return t, "inconsistent_token_breakdown"
+	}
+	if unknown <= 1 || remaining == 0 {
+		for _, part := range parts {
+			if *part == nil {
+				*part = &remaining
+			}
+		}
+	} else {
+		t.Unsplit = remaining
+	}
+	return t, ""
 }

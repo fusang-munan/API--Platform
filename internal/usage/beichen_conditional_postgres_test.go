@@ -223,4 +223,39 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 			t.Errorf("%s charge=%s state ok=%t: %v", table.name, total, ok, err)
 		}
 	}
+
+	t.Run("fixed quotes retain partial usage and book the unique amount once", func(t *testing.T) {
+		m := report
+		m.CacheWriteTokens = nil
+		r, route := dispatch("fixed-model", "openai_responses", nil, "", nil)
+		finalize(r, route, m)
+		var state string
+		if err := db.QueryRowContext(ctx, "SELECT beichen_state FROM gateway_calls WHERE id=$1", r.CallID).Scan(&state); err != nil || state != "pending_review" {
+			t.Fatalf("different fixed rates: %s %v", state, err)
+		}
+		// Use a published panel version at the exact snapshot time.
+		exec(`UPDATE beichen_panel_snapshots SET model_pricing=model_pricing || jsonb_build_object('fixed-unique',
+			'{"input_price":0.000001,"cache_write_price":0.000001,"output_price":0.000002,"cache_read_price":0.0000005}'::jsonb)
+			WHERE credential_id=$1 AND effective_at<now()`, credential)
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,effective_at,input_rate,output_rate,cache_read_rate,cache_write_rate)
+			SELECT credential_id,'fixed-unique','upstream','base','panel',effective_at,1000000,2000000,500000,1000000
+			FROM beichen_panel_snapshots WHERE credential_id=$1 AND effective_at<now()`, credential)
+		for _, tc := range []struct{ source, base, actual string }{
+			{"gateway_usage_price", "0.02625", "0.028875"},
+			{"teacher_manual_price", "0.000105", "0.0001155"},
+		} {
+			if tc.source == "teacher_manual_price" {
+				exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,cache_read_rate,cache_write_rate,actor_id)
+					VALUES($1,'fixed-unique','school','manual','teacher',1000000,2000000,500000,1000000,$2)`, credential, student)
+			}
+			r, route := dispatch("fixed-unique", "openai_responses", nil, "", nil)
+			finalize(r, route, m)
+			finalize(r, route, m)
+			checkCharge(r, tc.actual, tc.actual, "0", tc.base, tc.source)
+			receipt, err := store.StudentCallReceipt(ctx, student, r.RequestID)
+			if err != nil || receipt.AmountSource == nil || *receipt.AmountSource != "estimated_unique_amount" || receipt.UsageState == nil || *receipt.UsageState != "partial" {
+				t.Fatalf("receipt missing amount provenance: %+v %v", receipt, err)
+			}
+		}
+	})
 }
