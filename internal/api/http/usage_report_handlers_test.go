@@ -37,6 +37,16 @@ func TestUsageReportHandlersRejectRangeAndInvalidIDs(t *testing.T) {
 		}
 	}
 	for _, path := range []string{
+		"/api/v1/teacher/providers/00000000-0000-4000-8000-000000000001/beichen/reconciliation?range=all&unmatched_scope=all",
+	} {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), `"field":"unmatched_scope"`) ||
+			w.Header().Get("Cache-Control") != "private, no-store" {
+			t.Fatalf("%s: status=%d body=%s", path, w.Code, w.Body)
+		}
+	}
+	for _, path := range []string{
 		"/api/v1/teacher/model-usage?provider_id=invalid",
 		"/api/v1/teacher/providers/invalid/beichen/reconciliation",
 		"/api/v1/teacher/providers/invalid/beichen/reconciliation/calls",

@@ -546,12 +546,16 @@ export type BeichenReconcile = BeichenReconcileView & {
   end: string
   timezone: string
   comparable_only: BeichenReconcileView | null
+  unmatched_total: number
+  unmatched_next_cursor: string | null
+  unmatched_scope: 'observed' | 'comparable'
   unmatched_upstream: Array<{
     occurred_at: string; row_id: string; upstream_user_id: string
     credential_id: string; label: string; model: string
     input_tokens: number | null; output_tokens: number | null
     cache_read_tokens: number | null; cache_write_tokens: number | null
     request_id: string | null; receipt_id: string | null
+    local_status: string | null; local_source: 'unique_claim' | 'receipt_without_unique_claim' | null
   }>
 }
 export type BeichenPriceScope = { scope?: 'all' | 'credentials'; credential_ids?: string[] }

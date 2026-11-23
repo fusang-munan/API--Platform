@@ -99,6 +99,11 @@ func TestReconciliationClosedComparableDaysPostgres(t *testing.T) {
 		}
 		seedVerifiedKeyDay(t, ctx, tx, second, 42, date, fetched, unit, daily, `[]`)
 	}
+	execTestSQL(t, ctx, tx, `INSERT INTO beichen_upstream_usage_rows(upstream_user_id,row_id,upstream_key_id,
+ provider_id,credential_id,channel,model,occurred_at,cost_details,input_tokens)
+ VALUES(13,1,41,$1,$2,'CC1','eligible-15','2026-11-15 12:00+08','{}',1),
+       (13,2,41,$1,$2,'CC1','excluded-16','2026-11-16 12:00+08','{}',1),
+       (13,3,41,$1,$2,'CC1','eligible-20','2026-11-20 12:00+08','{}',1)`, provider, first)
 	period, _ := reportPeriod("month", now)
 	report, err := readReconciliation(ctx, tx, provider, period, now)
 	if err != nil {
@@ -120,10 +125,94 @@ func TestReconciliationClosedComparableDaysPostgres(t *testing.T) {
 		len(strict.Models) != 2 || len(strict.Keys) != 2 || reportDecimal(strict.Totals.Money.MarginYuan) != "-1.96" {
 		t.Fatalf("严格视图应使用相同已关闭日期汇总两侧: %+v, %+v", report.Coverage, strict)
 	}
+	strictPage, err := readReconciliationPage(ctx, tx, provider, period, now, unmatchedScopeComparable, "")
+	if err != nil || strictPage.UnmatchedTotal != 2 || len(strictPage.UnmatchedUpstream) != 2 ||
+		strictPage.UnmatchedUpstream[0].OccurredAt.Format(dayLayout) != "2026-11-20" ||
+		strictPage.UnmatchedUpstream[1].OccurredAt.Format(dayLayout) != "2026-11-15" {
+		t.Fatalf("严格视图的未关联流水应由服务端限定在同一组账日: %+v, %v", strictPage, err)
+	}
 	period, _ = reportPeriod("day", now)
 	report, err = readReconciliation(ctx, tx, provider, period, now)
 	if err != nil || report.ComparableOnly != nil || len(report.Coverage.EligibleDates) != 0 {
 		t.Fatalf("当天尚未结束: %+v, %v", report, err)
+	}
+}
+
+func TestReconciliationRetiredCredentialStopsExpectedDaysPostgres(t *testing.T) {
+	ctx, tx := reconciliationTestTransaction(t)
+	provider, retired, active := uuid.New(), uuid.New(), uuid.New()
+	execTestSQL(t, ctx, tx, "INSERT INTO providers VALUES($1,$2,'active')", provider, origin)
+	execTestSQL(t, ctx, tx, `INSERT INTO provider_credentials(id,provider_id,label,created_at,status,updated_at) VALUES
+ ($1,$3,'旧渠道','2026-11-15 00:00+08','inactive','2026-11-18 12:00+08'),
+ ($2,$3,'在用渠道','2026-11-15 00:00+08','active','2026-11-18 12:00+08')`, retired, active, provider)
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, beijing)
+	for _, date := range []string{"2026-11-15", "2026-11-16", "2026-11-17"} {
+		seedVerifiedKeyDay(t, ctx, tx, retired, 41, date, now, "CNY", `{"requests":1,"actual_cost":1}`, `[]`)
+	}
+	for _, date := range []string{"2026-11-15", "2026-11-16", "2026-11-17", "2026-11-18", "2026-11-19", "2026-11-20"} {
+		seedVerifiedKeyDay(t, ctx, tx, active, 42, date, now, "CNY", `{"requests":1,"actual_cost":1}`, `[]`)
+	}
+	period, _ := reportPeriod("month", now)
+	report, err := readReconciliation(ctx, tx, provider, period, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(report.Coverage.EligibleDates,
+		[]string{"2026-11-15", "2026-11-16", "2026-11-17", "2026-11-19", "2026-11-20"}) {
+		t.Fatalf("停用后的日期不应继续要求旧渠道同步: %+v", report.Coverage)
+	}
+	for _, row := range report.Coverage.Credentials {
+		switch row.CredentialID {
+		case retired:
+			if row.ExpectedDays != 4 || row.SyncedDays != 3 || !reflect.DeepEqual(row.MissingDays, []string{"2026-11-18"}) {
+				t.Fatalf("旧渠道应保留停用日前历史，且停用当天仍需同步: %+v", row)
+			}
+		case active:
+			if row.ExpectedDays != 7 || row.SyncedDays != 6 {
+				t.Fatalf("在用渠道应继续要求后续账日: %+v", row)
+			}
+		}
+	}
+}
+
+func TestReconciliationUnmatchedCursorPostgres(t *testing.T) {
+	ctx, tx := reconciliationTestTransaction(t)
+	provider, credential := uuid.New(), uuid.New()
+	execTestSQL(t, ctx, tx, "INSERT INTO providers VALUES($1,$2,'active')", provider, origin)
+	execTestSQL(t, ctx, tx, `INSERT INTO provider_credentials(id,provider_id,label,created_at,status,updated_at)
+ VALUES($1,$2,'分页渠道','2026-11-20 00:00+08','active','2026-11-20 00:00+08')`, credential, provider)
+	execTestSQL(t, ctx, tx, `INSERT INTO beichen_upstream_usage_rows(upstream_user_id,row_id,upstream_key_id,
+ provider_id,credential_id,channel,model,occurred_at,request_id,cost_details,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens)
+ SELECT 13,g,1,$1,$2,'CC1','paged',timestamptz '2026-11-20 20:00:00+08',
+   'client:'||(100000+g)::text,'{}',10,1,0,0 FROM generate_series(1,201) g`, provider, credential)
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, beijing)
+	period, _ := reportPeriod("all", now)
+	cursor, pages := "", 0
+	seen := make(map[string]bool, 201)
+	for {
+		report, err := readReconciliationPage(ctx, tx, provider, period, now, unmatchedScopeObserved, cursor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages++
+		if report.UnmatchedTotal != 201 || len(report.UnmatchedUpstream) > unmatchedUpstreamPageSize ||
+			len(report.UnmatchedUpstream) == 0 || (cursor == "" && len(report.UnmatchedUpstream) != 50) {
+			t.Fatalf("第 %d 页未按 50 条截断: total=%d rows=%d", pages, report.UnmatchedTotal, len(report.UnmatchedUpstream))
+		}
+		for _, row := range report.UnmatchedUpstream {
+			key := row.UpstreamUserID + ":" + row.RowID
+			if seen[key] {
+				t.Fatalf("跨页重复行 %s", key)
+			}
+			seen[key] = true
+		}
+		if report.UnmatchedNextCursor == nil {
+			break
+		}
+		cursor = *report.UnmatchedNextCursor
+	}
+	if pages != 5 || len(seen) != 201 {
+		t.Fatalf("201 笔应分 5 页无重漏读完: pages=%d rows=%d", pages, len(seen))
 	}
 }
 
@@ -346,6 +435,9 @@ func TestReconciliationPostgresVerifiedCallsRequireUnconflictedReceipt(t *testin
 		if len(rows) != 3 || rows[0].Model != "gateway-conflict" || rows[1].Model != "claim-conflict" ||
 			rows[2].Model != "claim-without-receipt" || rows[0].ReceiptID == nil || rows[2].ReceiptID != nil ||
 			rows[0].RequestID == nil || rows[0].Output != nil || rows[0].CacheRead == nil || *rows[0].CacheRead != 0 ||
+			reportDecimal(rows[0].LocalStatus) != "charged" || reportDecimal(rows[0].LocalSource) != "unique_claim" ||
+			rows[1].LocalStatus != nil || reportDecimal(rows[1].LocalSource) != "receipt_without_unique_claim" ||
+			rows[2].LocalStatus != nil || rows[2].LocalSource != nil ||
 			rows[0].OccurredAt.Format(time.RFC3339) != "2026-11-20T10:00:00+08:00" {
 			t.Fatalf("未关联归档流水与严格回执认领不一致: %+v", rows)
 		}
