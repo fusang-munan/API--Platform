@@ -2,6 +2,7 @@ package usage
 
 import (
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -12,6 +13,9 @@ import (
 func TestGatewayQuotaPostgres(t *testing.T) {
 	ctx, db := newBeichenLedgerTestDB(t)
 	t.Setenv("NEBULA_STUDENT_CONCURRENCY_LIMIT", "")
+	if err := os.Unsetenv("NEBULA_STUDENT_CONCURRENCY_LIMIT"); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT", "")
 	t.Setenv("NEBULA_STUDENT_PENDING_RESERVE_CREDITS", "")
 	store := NewStore(db)
@@ -158,8 +162,27 @@ func TestGatewayQuotaPostgres(t *testing.T) {
 		check("")
 	})
 
+	t.Run("default allows five dispatches", func(t *testing.T) {
+		var requests [6]Reservation
+		for i := range requests {
+			requests[i] = mustReserve(t, key)
+			defer release(t, requests[i])
+		}
+		for i, request := range requests {
+			_, err := store.StartAttempt(ctx, request, route, 0)
+			if i == 5 {
+				expectQuotaRejection(t, err, StudentConcurrencyExceeded)
+			} else if err != nil {
+				t.Fatalf("dispatch %d: %v", i+1, err)
+			}
+		}
+	})
+
 	t.Run("dispatch shares a limit across keys and projects", func(t *testing.T) {
-		requests := []Reservation{mustReserve(t, key), mustReserve(t, otherKey), mustReserve(t, key)}
+		var requests []Reservation
+		for range 3 {
+			requests = append(requests, mustReserve(t, key), mustReserve(t, otherKey))
+		}
 		results := make(chan error, len(requests))
 		for _, request := range requests {
 			go func() {
@@ -175,20 +198,22 @@ func TestGatewayQuotaPostgres(t *testing.T) {
 			}
 		}
 		if rejected != 1 {
-			t.Fatalf("rejected %d dispatches out of 3, want 1", rejected)
+			t.Fatalf("rejected %d dispatches out of %d, want 1", rejected, len(requests))
 		}
 		_, err := reserve(otherKey)
 		expectQuotaRejection(t, err, StudentConcurrencyExceeded)
 		for _, request := range requests {
 			release(t, request)
 		}
+	})
 
+	t.Run("configured limit of one", func(t *testing.T) {
 		t.Setenv("NEBULA_STUDENT_CONCURRENCY_LIMIT", "1")
 		inFlight := mustReserve(t, otherKey)
 		if _, err := store.StartAttempt(ctx, inFlight, route, 0); err != nil {
 			t.Fatal(err)
 		}
-		_, err = reserve(key)
+		_, err := reserve(key)
 		expectQuotaRejection(t, err, StudentConcurrencyExceeded)
 		release(t, inFlight)
 		release(t, mustReserve(t, key))

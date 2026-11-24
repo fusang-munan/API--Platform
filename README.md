@@ -32,7 +32,9 @@ Nebula 是实验室正在使用的 AI API 平台，镜像版本由仓库根目�
 
 官网快照保存各渠道、平台、分组、型号和原始计价条件。部分平台读失败时更新可读平台并保留其余数据，整页失败时保留已有快照，页面标记待更新并按退避间隔重试。教师页保存及续期得到的会话加密写入学校数据库，后端重启后会继续读取。
 
-迁移 `0069` 后，同一学生所有 Key 和项目共用北辰待核额度。默认上限为 1000 整积分（`NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT`），默认每笔预留 10（`NEBULA_STUDENT_PENDING_RESERVE_CREDITS`）。受理和派发北辰请求时，已有预留加上本笔默认预留达到上限即返回 429。结束时只预留学生剩余的额度。其他供应商仍受每学生默认 2 笔的并发限制。
+迁移 `0069` 后，同一学生所有 Key 和项目共用北辰待核额度。默认上限为 1000 整积分（`NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT`），默认每笔预留 10（`NEBULA_STUDENT_PENDING_RESERVE_CREDITS`）。受理和派发北辰请求时，已有预留加上本笔默认预留达到上限即返回 429。结束时只预留学生剩余的额度。
+
+每名学生默认可同时向上游派发 5 笔调用，所有供应商、Key 和项目共用这 5 个名额。直接运行和本地 Compose 可通过环境变量 `NEBULA_STUDENT_CONCURRENCY_LIMIT` 覆盖默认值。生产 Compose 显式指定 5，服务器 `.env` 中的旧值不会生效。
 
 `NEBULA_UNRESOLVED_EXPOSURE` 默认 `1`。设为 `0` 可整体回退，恢复旧的每学生 20 笔待核准入和 `pending_review_limit`，同时关闭缓存分项试算。仅设 `NEBULA_PENDING_AUTO_SETTLE=0` 时继续按金额限流、按上界预留，暂停推荐分项自动扣款。Gemini 仍待核，不自动结算。阈值、倍率和教师定价说明见 [API 文档](docs/API_DOCUMENTATION.md)。
 

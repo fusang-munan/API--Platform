@@ -424,6 +424,7 @@ ORDER BY j.channel;
 | 网关返回 invalid API key | Key 不存在、HMAC pepper 变化、状态非 ACTIVE | 使用正确 Key；恢复原 pepper 或重新申请 | 只记录 prefix；检查部署间 `API_KEY_HASH_PEPPER` 是否一致 |
 | 网关返回 model_not_allowed | 请求模型不在该 Key 的规范化白名单 | 使用 `GET /v1/models` 返回的模型 | 核对 `api_key_models`，不要依赖客户端缓存 |
 | 北辰返回 429 `unresolved_exposure_limit` | 同一学生待核预留加本笔默认预留达到上限 | 核对跨项目和 Key 的待核金额 | 按学生 ID 执行 `SELECT count(*), coalesce(sum(unresolved_credit_milli),0) FROM gateway_calls WHERE user_id=$1 AND beichen_state='pending_review'`；同一学生非北辰路由仍可受理 |
+| 网关返回 429 `student_concurrency_exceeded` | 同一学生派发中的调用已达上限，所有 Key 和项目共用名额 | 等已有调用结束后重试；直接运行或本地 Compose 可设置 `NEBULA_STUDENT_CONCURRENCY_LIMIT` 覆盖默认 5，生产 Compose 显式指定 5 | 设置本机测试库 `NEBULA_TEST_POSTGRES`，运行 `go test -p 1 ./internal/usage ./internal/dataplane -run 'TestGatewayQuotaPostgres\|TestStudentConcurrencyHTTPPostgres' -count=5`，核对第六笔被拒且未计费 |
 | 回退后返回 429 `pending_review_limit` | `NEBULA_UNRESOLVED_EXPOSURE=0`，待核笔数达到旧上限 | 核对待核行数，默认上限为 20 | 只想关闭推荐分项扣款时，保留额度开关默认值，设置 `NEBULA_PENDING_AUTO_SETTLE=0` |
 | 北辰响应成功但缓存明细缺失，仍显示待核 | 区间过宽、上界未知、定价超过上界容差，或为 Gemini 原生响应 | 用调用 ID 查询 `beichen_review_reason`、`unresolved_credit_milli`、`pricing_detail`，核对派发时费率及开关 | 设置本机测试库 `NEBULA_TEST_POSTGRES`，运行 `go test -p 1 ./internal/dataplane -run TestBeichenPending -count=1 -v`，覆盖并发封顶、倍率、模型身份、开关、教师价与上界 |
 | 网关返回 model unavailable | 模型、binding 或 provider 被停用 | 老师启用完整路由链或添加 binding | 按 model -> binding -> provider 顺序排查状态和 priority |

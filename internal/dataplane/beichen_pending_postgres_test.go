@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"net/http/httptrace"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,6 +65,81 @@ func (f pendingGateway) request(id string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	f.gateway.ServeHTTP(w, req)
 	return w
+}
+
+func TestStudentConcurrencyHTTPPostgres(t *testing.T) {
+	f := newPendingGateway(t)
+	t.Setenv("NEBULA_STUDENT_CONCURRENCY_LIMIT", "")
+	t.Setenv("NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT", "10000")
+	f.respond(`,"total_tokens":102`)
+	upstream := f.gateway.client.Transport
+	arrived := make(chan struct{}, 6)
+	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	var dispatches atomic.Int32
+	f.gateway.client.Transport = beichenGatewayTestTransport(func(r *http.Request) (*http.Response, error) {
+		if dispatches.Add(1) > 5 {
+			return upstream.RoundTrip(r)
+		}
+		arrived <- struct{}{}
+		select {
+		case <-release:
+			return upstream.RoundTrip(r)
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	})
+
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	defer unblock()
+	done := make(chan *httptest.ResponseRecorder, 5)
+	var ids [5]string
+	for i := range ids {
+		ids[i] = fmt.Sprintf("in-flight-%d", i+1)
+		workers.Add(1)
+		go func(id string) {
+			defer workers.Done()
+			done <- f.request(id)
+		}(ids[i])
+	}
+	// Hold all five at the upstream until the sixth receives its HTTP response.
+	for range ids {
+		select {
+		case <-arrived:
+		case w := <-done:
+			t.Fatalf("request ended before all five reached upstream: HTTP %d %s", w.Code, w.Body)
+		case <-f.ctx.Done():
+			t.Fatal(f.ctx.Err())
+		}
+	}
+	rejected := f.request("sixth")
+	if rejected.Code != http.StatusTooManyRequests || rejected.Header().Get("X-Nebula-Error-Code") != usage.StudentConcurrencyExceeded {
+		t.Fatalf("sixth request: HTTP %d, code %q", rejected.Code, rejected.Header().Get("X-Nebula-Error-Code"))
+	}
+	unblock()
+	for range ids {
+		if w := <-done; w.Code != http.StatusOK {
+			t.Fatalf("accepted request: HTTP %d %s", w.Code, w.Body)
+		}
+	}
+	if got := dispatches.Load(); got != 5 {
+		t.Fatalf("upstream received %d requests, want 5", got)
+	}
+	var calls int
+	if err := f.db.QueryRowContext(f.ctx, "SELECT count(*) FROM gateway_calls").Scan(&calls); err != nil || calls != len(ids) {
+		t.Fatalf("gateway calls=%d, want only the five accepted requests: %v", calls, err)
+	}
+	for _, id := range ids {
+		var charged bool
+		err := f.db.QueryRowContext(f.ctx, `SELECT billing_state='charged' AND beichen_state='charged'
+			AND student_credits=0.01562 AND unresolved_credit_milli=0 AND pricing_detail @> '{"auto_settled":true}'
+			FROM gateway_calls WHERE request_id=$1`, id).Scan(&charged)
+		if err != nil || !charged {
+			t.Fatalf("%s: expected an automatic charge of 0.01562 credits: %v", id, err)
+		}
+	}
+	assertBeichenGatewayMonth(t, f.ctx, f.db, ids[0], "0.07810", 5)
 }
 
 func TestBeichenPendingSettlementPostgres(t *testing.T) {
