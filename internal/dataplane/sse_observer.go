@@ -149,6 +149,16 @@ func (s *sseObserver) endEvent() {
 	eventType := rawString(payload["type"])
 	eventError := jsonObject(payload["error"])
 	if s.eventName == "error" || s.eventName == "response.failed" || eventType == "error" || eventType == "response.failed" || eventError != nil {
+		// The frame that ends a stream can be the first one to disclose the
+		// actual model or an unsuitable tariff. Review it before marking the
+		// attempt failed; otherwise a substituted no-price model is billed at
+		// the dispatched model's rate.
+		if s.beichen {
+			if s.review == "" {
+				s.review = beichenPayloadReview(data, s.expectedModel, false)
+			}
+			s.modelReported = s.modelReported || beichenModelReported(payload, s.expectedModel)
+		}
 		if !s.failed && s.adapter == modelbinding.AdapterOpenaiResponses &&
 			(s.eventName == "response.failed" || eventType == "response.failed") {
 			s.metrics.applyPayload(s.adapter, payload)

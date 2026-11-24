@@ -38,6 +38,8 @@ type PendingBacklogReport struct {
 	GeneratedAt       time.Time           `json:"generated_at"`
 	Total             int                 `json:"total"`
 	BacklogTotal      int                 `json:"backlog_total"`
+	TerminalMissing   int                 `json:"terminal_missing"`
+	TerminalEnabled   bool                `json:"terminal_enabled"`
 	NextOffset        *int                `json:"next_offset"`
 	Exact             int                 `json:"exact"`
 	Narrow            int                 `json:"narrow"`
@@ -110,7 +112,15 @@ func previewBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, limit
 	defer tx.Rollback()
 	// Stream all IDs into the token. An insertion beyond the batch boundary
 	// must also invalidate confirmation. Only the selected batch needs pricing.
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM gateway_calls WHERE `+backlogFilter+` ORDER BY created_at,id`, providerID)
+	report.TerminalEnabled = terminalPendingEnabled()
+	rows, err := tx.QueryContext(ctx, `SELECT id,beichen_review_reason='missing_terminal_usage'
+		AND COALESCE(usage_reason,'') NOT IN `+terminalBlockedUsageSQL+`,
+		protocol,prompt_tokens,completion_tokens,total_tokens,cache_hit_tokens,cache_miss_tokens,cache_write_tokens,
+		CASE WHEN COALESCE(pricing_detail->>'cache_write_5m_tokens','') ~ '^[0-9]+$'
+			THEN (pricing_detail->>'cache_write_5m_tokens')::bigint END,
+		CASE WHEN COALESCE(pricing_detail->>'cache_write_1h_tokens','') ~ '^[0-9]+$'
+			THEN (pricing_detail->>'cache_write_1h_tokens')::bigint END
+		FROM gateway_calls WHERE `+backlogFilter+` ORDER BY created_at,id`, providerID)
 	if err != nil {
 		return report, err
 	}
@@ -121,8 +131,18 @@ func previewBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, limit
 	ids := make([]uuid.UUID, 0, limit)
 	for rows.Next() {
 		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		var terminalMissing bool
+		var protocol string
+		var m CallMetrics
+		if err := rows.Scan(&id, &terminalMissing, &protocol, &m.PromptTokens, &m.CompletionTokens, &m.TotalTokens,
+			&m.CacheHitTokens, &m.CacheMissTokens, &m.CacheWriteTokens, &m.cacheWrite5m, &m.cacheWrite1h); err != nil {
 			return report, err
+		}
+		if terminalMissing {
+			_, _, reason := knownTerminalMetrics(&m, protocol)
+			if !terminalEvidenceBlocked(reason) {
+				report.TerminalMissing++
+			}
 		}
 		hash.Write(id[:])
 		if report.BacklogTotal >= offset && len(ids) < limit {
@@ -190,6 +210,16 @@ func readBacklogRow(ctx context.Context, tx *sql.Tx, providerID, id uuid.UUID, l
 	var d pendingDecision
 	if err != nil {
 		return row, d, err
+	}
+	if row.Reason == "missing_terminal_usage" {
+		row.Class = pendingaudit.ClassUnknown
+		_, _, reason := knownTerminalMetrics(&metrics, row.Protocol)
+		if terminalEvidenceBlocked(reason) {
+			row.Note = "缓存或计数证据冲突，保留人工待核"
+		} else {
+			row.Note = "缺终态，由缺终态策略处理"
+		}
+		return row, d, nil
 	}
 	if !priced {
 		row.Class, row.Note = pendingaudit.ClassUnknown, "缺少派发价格，保留待核"

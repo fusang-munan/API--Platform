@@ -113,7 +113,12 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 		priceAt = sql.NullTime{Time: route.SentAt, Valid: true}
 		if next == "pending_review" {
 			reason = "missing_terminal_usage"
-			if success && category != "" {
+			if billingReviewCategory(category) {
+				// The response itself proved a pricing problem. Keep that
+				// stronger evidence even when the stream also ended without a
+				// terminal frame.
+				reason = category
+			} else if success && category != "" {
 				reason = category
 			} else if metrics.State == UsagePartial {
 				reason = "incomplete_token_breakdown"
@@ -184,6 +189,14 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 	return refreshLedgerTurn(ctx, tx, callID, "0", false)
 }
 
+func billingReviewCategory(category string) bool {
+	switch category {
+	case "upstream_model_mismatch", "upstream_model_unconfirmed", "unsupported_text_pricing", "incomplete_token_breakdown":
+		return true
+	}
+	return false
+}
+
 func pendingHeadroom(ctx context.Context, tx *sql.Tx, callID uuid.UUID) (int64, error) {
 	var headroom int64
 	err := tx.QueryRowContext(ctx, `SELECT GREATEST(0,$2::bigint-COALESCE(sum(unresolved_credit_milli),0))
@@ -222,6 +235,7 @@ type beichenCharge struct {
 	tier              string
 	snapshot, detail  json.RawMessage
 	audit             *pendingAuditBooking
+	annotation        json.RawMessage
 }
 
 const beichenBaseCreditsSQL = `coalesce(c.beichen_base_credits,(c.pricing_detail->>'base_credits')::numeric,c.beichen_credit_exact)`
@@ -230,6 +244,9 @@ const derivedPriceSource = "derived_from_usage"
 
 func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics, audit *pendingAuditBooking) error {
 	// Callers hold the call row lock through settlement.
+	if metrics.CacheTTL == "" {
+		metrics.CacheTTL = observedCacheTTL(metrics)
+	}
 	charge, reason, missingRate, err := quoteBeichenReport(ctx, tx, callID, metrics)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
@@ -273,7 +290,7 @@ func quoteBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metri
 		p.mode,p.upstream_version,p.multiplier_version,COALESCE(version.source,''),
 		num_nonnulls(p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)=0,
 		jsonb_build_array(p.school_input,p.school_output,p.school_cache_read,p.school_cache_write),
-		c.protocol,c.reasoning_effort,COALESCE(c.cache_ttl,''),
+		c.protocol,c.reasoning_effort,COALESCE(NULLIF($7,''),c.cache_ttl,''),
 		quote.terms,quote.multiplier_version,trim_scale(quote.multiplier)::text,
 		CASE
 		  WHEN COALESCE($4::bigint,0)>0 AND p.upstream_cache_read IS NULL THEN 'missing_cache_read_price'
@@ -291,7 +308,7 @@ func quoteBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metri
 		) cost`+beichenConditionQuoteJoin+`
 		WHERE c.id=$1 AND c.beichen_state='pending_review'
 		  AND c.beichen_price_at IS NOT NULL`, callID, metrics.PromptTokens, metrics.CompletionTokens,
-		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens).Scan(
+		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens, metrics.CacheTTL).Scan(
 		&school, &upstream, &mode, &charge.upstreamVersion, &charge.multiplierVersion, &upstreamSource, &noFixedSchool,
 		&fixedRates, &protocol, &effort, &ttl, &terms, &quoteVersion, &quoteMultiplier, &missingRate)
 
@@ -413,6 +430,9 @@ const auditBoundPredicate = `($4::numeric IS NULL OR LEAST(amount.actual,amount.
 func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge beichenCharge) error {
 	var milli string
 	var maxCredits, auditDetail any
+	if len(charge.annotation) > 0 {
+		auditDetail = string(charge.annotation)
+	}
 	if charge.audit != nil {
 		maxCredits, auditDetail = charge.audit.maxCredits, string(charge.audit.detail)
 	}
@@ -425,7 +445,7 @@ func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge
 		beichen_review_reason=NULL,beichen_upstream_price_version=$6,beichen_multiplier_version=$7,
 		price_tier=COALESCE(NULLIF($8,''),c.price_tier),
 		price_snapshot=COALESCE(NULLIF($9,'')::jsonb,c.price_snapshot),
-		pricing_detail=CASE WHEN $10<>'' OR amount.actual>amount.student OR $11::jsonb IS NOT NULL THEN
+		pricing_detail=(CASE WHEN $10<>'' OR amount.actual>amount.student OR $11::jsonb IS NOT NULL THEN
 			CASE WHEN $11::jsonb IS NOT NULL THEN COALESCE(c.pricing_detail,'{}'::jsonb) ELSE '{}'::jsonb END ||
 			COALESCE(NULLIF($10,'')::jsonb,c.pricing_detail,'{}'::jsonb) ||
 			jsonb_build_object('base_credits',trim_scale(amount.base)::text,'base_source',$5::text,
@@ -433,7 +453,7 @@ func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge
 			CASE WHEN $3::numeric IS NOT NULL
 				THEN jsonb_build_object('upstream_multiplier',trim_scale($3::numeric)::text)
 				ELSE '{}'::jsonb END || COALESCE($11::jsonb,'{}'::jsonb)
-			ELSE c.pricing_detail END
+			ELSE c.pricing_detail END) - 'terminal_retry_epoch' - 'terminal_blocked'
 	FROM amount WHERE c.id=$1 AND c.beichen_state='pending_review'
 		AND `+auditBoundPredicate+`
 	RETURNING (amount.student*1000)::text`, callID, charge.base, charge.quoteMultiplier, maxCredits, charge.source,

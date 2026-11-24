@@ -18,6 +18,8 @@ export interface PendingAuditReport {
   generated_at: string
   total: number
   backlog_total: number
+  terminal_missing: number
+  terminal_enabled: boolean
   next_offset: number | null
   exact: number
   narrow: number

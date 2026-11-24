@@ -83,6 +83,25 @@ func (s *Server) beichenPendingAudit(c *gin.Context) {
 	respond(c, http.StatusOK, result)
 }
 
+func (s *Server) beichenResolveTerminalPending(c *gin.Context) {
+	id, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	var body struct {
+		Confirm bool `json:"confirm" binding:"required"`
+	}
+	if !bindJSON(c, &body) {
+		return
+	}
+	result, err := s.service.Beichen().ResolveTerminalPending(c.Request.Context(), id)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, result)
+}
+
 func unmatchedScopeQuery(c *gin.Context) (string, bool) {
 	value := c.DefaultQuery("unmatched_scope", "observed")
 	if value == "" {

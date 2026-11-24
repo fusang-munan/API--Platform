@@ -142,6 +142,11 @@ func run() error {
 	defer stop()
 	syncContext, cancelSync := context.WithCancel(signalContext)
 	syncDone := make(chan struct{})
+	terminalDone := make(chan struct{})
+	go func() {
+		defer close(terminalDone)
+		usage.RunTerminalPending(syncContext, sqlDB)
+	}()
 	receiptsDone := make(chan struct{})
 	probesDone := make(chan struct{})
 	go func() {
@@ -180,6 +185,7 @@ func run() error {
 	}()
 	defer func() {
 		cancelSync()
+		<-terminalDone
 		<-syncDone
 		<-receiptsDone
 		<-probesDone

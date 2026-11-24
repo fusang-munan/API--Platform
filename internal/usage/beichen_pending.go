@@ -123,12 +123,19 @@ func decidePendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, prot
 	adjusted := metrics
 	adjusted.State, adjusted.UsageReason = UsageReported, ""
 	adjusted.CacheHitTokens, adjusted.CacheWriteTokens = &result.RecommendedRead, &result.RecommendedWrite
+	observedTTL := observedCacheTTL(metrics)
+	if observedTTL == "" {
+		observedTTL = beichenCacheTTL(ttl)
+	}
+	adjusted.CacheTTL = observedTTL
 	adjusted = adjusted.ClassifyBeichenUsage(protocol)
 	if metrics.UsageReason == cacheWriteSubtotalOnlyReason {
 		// A single observed duration is a subtotal. Only use this split if all
-		// recommended writes are accounted for at the request's known duration.
-		matches5m := beichenCacheTTL(ttl) == "5m" && metrics.cacheWrite5m != nil && *metrics.cacheWrite5m == result.RecommendedWrite
-		matches1h := beichenCacheTTL(ttl) == "1h" && metrics.cacheWrite1h != nil && *metrics.cacheWrite1h == result.RecommendedWrite
+		// recommended writes are accounted for at the observed duration.
+		// Prefer the duration the response actually observed; the request TTL
+		// can differ from the child that was reported.
+		matches5m := observedTTL == "5m" && metrics.cacheWrite5m != nil && *metrics.cacheWrite5m == result.RecommendedWrite
+		matches1h := observedTTL == "1h" && metrics.cacheWrite1h != nil && *metrics.cacheWrite1h == result.RecommendedWrite
 		if !matches5m && !matches1h {
 			d.result.CanAutoSettle = false
 			d.result.Note = "推荐分项与原始缓存证据或协议不符"

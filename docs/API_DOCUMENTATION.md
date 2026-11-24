@@ -568,6 +568,10 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 **存量待核回放与结算**
 
+回放响应的 `terminal_missing` 表示该供应商全部待核中可由缺终态策略处理的笔数，包含宽限期内调用，跨页保持全量口径。解析冲突（缓存分项矛盾、计数矛盾等）不计入，保留人工待核。`terminal_enabled` 表示已开启按已知用量结清。此类调用由独立策略处理，排除在回放的缓存拆分可自动项之外。
+
+教师确认后可向 `POST /api/v1/teacher/providers/:provider_id/beichen/resolve-terminal-pending` 发送 `{"confirm":true}`。仅处理该供应商已过宽限期的一批缺终态调用，返回 `resolved`（成功结清笔数，含零元）和 `errors`（单笔事务失败数）。策略关闭或重复执行且无到期记录时两项均为 0。缺少确认返回 400，其他角色返回 403。接口使用教师路由的 private, no-store 缓存策略。
+
 教师专用 `POST /api/v1/teacher/providers/:provider_id/beichen/pending-audit` 的成功和错误响应均返回 `Cache-Control: private, no-store`。发送 `{"apply":false,"limit":200,"offset":0}` 获取预览。按创建时间和 ID 升序，limit 默认 200、上限 500，offset 默认 0，负数返回 422。将 next_offset 用于读取下一批，末批返回 null。确认时发送相同 offset、有效 limit、`apply:true` 和本批 preview_token。
 
 响应 data 含 provider_id、generated_at、backlog_total（该供应商预览时全部待核数，含无派发价格记录）、total（本批笔数）、next_offset、exact/narrow/wide/unknown、auto_settle、max_error_yuan、estimated_auto_yuan、preview_token 和 rows。样本包含 id/student/model/protocol/reason/class/min/max/recommended/note、can_auto_settle 及可结算项的 student_credits。金额区间和推荐金额单位均为上游元。缺少派发价格时 class 为 unknown，note 说明原因，保留待核。

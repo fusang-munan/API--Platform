@@ -190,6 +190,15 @@ func expectUsageWrite(mock sqlmock.Sqlmock, callID uuid.UUID, responseID string,
 	mock.ExpectCommit()
 }
 
+func expectCompleteCallMetrics(mock sqlmock.Sqlmock, callID uuid.UUID, responseID string, prompt, completion, total driver.Value, state usage.UsageState) {
+	mock.ExpectQuery(`SELECT turn_id,COALESCE.*FOR UPDATE`).WithArgs(callID).
+		WillReturnRows(sqlmock.NewRows([]string{"turn_id", "prompt", "completion", "total"}).AddRow(nil, 0, 0, 0))
+	mock.ExpectExec(`UPDATE gateway_calls SET upstream_response_id`).WithArgs(callID, responseID, prompt, completion, total,
+		nil, nil, nil, nil, nil, nil, string(state), sqlmock.AnyArg(), nil).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE gateway_calls SET pricing_detail`).WithArgs(callID).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+}
+
 func expectUsageWriteInTransaction(mock sqlmock.Sqlmock, callID uuid.UUID, responseID string, prompt, completion, total driver.Value, state usage.UsageState) {
 	mock.ExpectQuery(`SELECT turn_id,COALESCE.*FOR UPDATE`).WithArgs(callID).
 		WillReturnRows(sqlmock.NewRows([]string{"turn_id", "prompt", "completion", "total"}).AddRow(nil, 0, 0, 0))
@@ -206,7 +215,7 @@ func TestSSEForwardsFirstReadAndLongEventBeforeTail(t *testing.T) {
 	mock.ExpectCommit()
 	mock.ExpectBegin()
 	expectLegacyReportReview(mock, reservation.CallID)
-	expectUsageWrite(mock, reservation.CallID, "chat_end", int64(0), int64(2), nil, usage.UsageReported)
+	expectCompleteCallMetrics(mock, reservation.CallID, "chat_end", int64(0), int64(2), nil, usage.UsageReported)
 	mock.ExpectExec(`UPDATE gateway_call_attempts SET status=`).WithArgs("succeeded", 200, "", "", sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	first := "data: {\"choices\":["
@@ -394,7 +403,7 @@ func TestGatewayFinalizesAtActualRetrySendTime(t *testing.T) {
 				mock.ExpectCommit()
 				mock.ExpectBegin()
 				expectLegacyReportReview(mock, reservation.CallID)
-				expectUsageWrite(mock, reservation.CallID, "second", int64(0), nil, nil, usage.UsageReported)
+				expectCompleteCallMetrics(mock, reservation.CallID, "second", int64(0), nil, nil, usage.UsageReported)
 			} else {
 				expectUsageWriteInTransaction(mock, reservation.CallID, "second", int64(0), nil, nil, usage.UsageReported)
 				mock.ExpectCommit()
@@ -540,7 +549,7 @@ func TestHTTPAndSSECanSettleAfterClientCancellation(t *testing.T) {
 			if sse {
 				mock.ExpectCommit()
 				mock.ExpectBegin()
-				expectUsageWrite(mock, reservation.CallID, "", int64(0), nil, nil, usage.UsageInterrupted)
+				expectCompleteCallMetrics(mock, reservation.CallID, "", int64(0), nil, nil, usage.UsageInterrupted)
 				body := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}],\"usage\":{\"prompt_tokens\":0}}\n\n")
 				observer := observeSSE(candidate.Binding.Adapter, body)
 				gateway.proxySSE(w, request, response, reservation, candidate.callRoute(), &observer, body, len(body), context.Canceled, false)
@@ -548,7 +557,7 @@ func TestHTTPAndSSECanSettleAfterClientCancellation(t *testing.T) {
 				expectUsageWriteInTransaction(mock, reservation.CallID, "settled", int64(0), nil, nil, usage.UsageReported)
 				mock.ExpectCommit()
 				mock.ExpectBegin()
-				expectUsageWrite(mock, reservation.CallID, "", nil, nil, nil, usage.UsageInterrupted)
+				expectCompleteCallMetrics(mock, reservation.CallID, "", nil, nil, nil, usage.UsageInterrupted)
 				gateway.proxyHTTPBody(request.Context(), w, request, response, candidate.Binding.Adapter, candidate.callRoute(), &reservation, true, false, "")
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {

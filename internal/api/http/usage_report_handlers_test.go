@@ -18,6 +18,7 @@ func reportHandlerRouter(s *Server, role string) *gin.Engine {
 	router.Use(func(c *gin.Context) { c.Set(identityKey, controlplane.Identity{UserID: uuid.New(), Role: role}) })
 	teacher := router.Group("/api/v1/teacher", privateNoStore, requireRole("teacher"))
 	teacher.POST("/providers/:provider_id/beichen/pending-audit", s.beichenPendingAudit)
+	teacher.POST("/providers/:provider_id/beichen/resolve-terminal-pending", s.beichenResolveTerminalPending)
 	teacher.GET("/model-usage", s.teacherModelUsage)
 	teacher.GET("/providers/:provider_id/beichen/reconciliation", s.beichenReconciliation)
 	teacher.GET("/providers/:provider_id/beichen/reconciliation/calls", s.beichenReconciliationCalls)
@@ -133,6 +134,36 @@ func TestModelUsageHandlerDefaultsToAllAndReturnsEnvelope(t *testing.T) {
 	}
 }
 
+func TestResolveTerminalPendingRequiresTeacherConfirmation(t *testing.T) {
+	const path = "/api/v1/teacher/providers/00000000-0000-4000-8000-000000000001/beichen/resolve-terminal-pending"
+	t.Setenv("NEBULA_TERMINAL_PENDING_POLICY", "hold")
+	for _, tc := range []struct {
+		role, body string
+		status     int
+	}{
+		{"student", `{"confirm":true}`, 403}, {"mentor", `{"confirm":true}`, 403},
+		{"teacher", `{}`, 400}, {"teacher", `{"confirm":false}`, 400}, {"teacher", `{"confirm":true}`, 200},
+	} {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if tc.status == 200 {
+			mock.ExpectQuery("SELECT p.id FROM providers").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("00000000-0000-4000-8000-000000000001"))
+		}
+		router := reportHandlerRouter(&Server{service: controlplane.NewService(nil, db, nil, nil, nil, controlplane.Config{})}, tc.role)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(tc.body)))
+		if w.Code != tc.status || w.Header().Get("Cache-Control") != "private, no-store" {
+			t.Fatalf("%s %s: %d %s", tc.role, tc.body, w.Code, w.Body)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestPendingAuditResponseCachePolicy(t *testing.T) {
 	const path = "/api/v1/teacher/providers/00000000-0000-4000-8000-000000000001/beichen/pending-audit"
 	for _, tc := range []struct {
@@ -152,7 +183,7 @@ func TestPendingAuditResponseCachePolicy(t *testing.T) {
 		if tc.status == 200 || tc.status == 409 {
 			mock.ExpectQuery("SELECT p.id FROM providers").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("00000000-0000-4000-8000-000000000001"))
 			mock.ExpectBegin()
-			mock.ExpectQuery("SELECT id FROM gateway_calls").WillReturnRows(sqlmock.NewRows([]string{"id"}))
+			mock.ExpectQuery("SELECT id,beichen_review_reason").WillReturnRows(sqlmock.NewRows([]string{"id", "terminal_missing"}))
 			mock.ExpectCommit()
 		}
 		router := reportHandlerRouter(&Server{service: controlplane.NewService(nil, db, nil, nil, nil, controlplane.Config{})}, tc.role)

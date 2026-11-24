@@ -260,6 +260,20 @@ func evaluateBeichenConditional(raw json.RawMessage, metrics CallMetrics, effort
 			writePrice = rates.CacheWrite1h
 		case "12h":
 			writePrice = rates.CacheWrite12h
+		case "min":
+			five, one := beichenPriceDecimal(rates.CacheWrite), beichenPriceDecimal(rates.CacheWrite1h)
+			if five == nil || one == nil {
+				// Only one duration is priced. The unconfirmed remainder may
+				// belong to the unpriced duration, so the single price cannot
+				// cover all writes.
+				return beichenConditionalPrice{}, "missing_cache_write_price"
+			}
+			switch {
+			case five.Cmp(one) <= 0:
+				writePrice = rates.CacheWrite
+			default:
+				writePrice = rates.CacheWrite1h
+			}
 		default:
 			return beichenConditionalPrice{}, "unknown_cache_ttl"
 		}
@@ -374,6 +388,8 @@ func priceBeichenTokenParts(t beichenBillableTokens, input, output, read, write 
 
 func beichenCacheTTL(value string) string {
 	switch value {
+	case "min":
+		return "min"
 	case "300":
 		return "5m"
 	case "3600":

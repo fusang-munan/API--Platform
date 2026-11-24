@@ -43,6 +43,10 @@ type CallMetrics struct {
 	UpstreamCreditMicros *int64
 	State                UsageState
 	UsageReason          string
+	// CacheTTL is a billing duration directly observed in the response. It
+	// is used only when settling a terminal-missing call; empty falls back to
+	// the request TTL stored on the call.
+	CacheTTL string
 	// ReplyClosed is set when the upstream stop flag is known.
 	// False means the model asked for a tool and the question is still open.
 	ReplyClosed *bool

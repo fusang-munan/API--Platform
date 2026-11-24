@@ -12,19 +12,30 @@ const result = shallowRef<PendingAuditReport>()
 const busy = ref(false)
 const offset = ref(0)
 const confirming = ref(false)
+const confirmingTerminal = ref(false)
+const terminalResult = ref('')
 const error = ref('')
 let active = true
 onBeforeUnmount(() => { active = false })
 
-async function run(apply: boolean, requestedOffset = 0) {
+async function run(apply: boolean, requestedOffset = 0, terminal = false) {
   if (busy.value || (apply && (!confirming.value || !preview.value?.auto_settle))) return
+  if (terminal && (!confirmingTerminal.value || !preview.value?.terminal_enabled)) return
   const token = preview.value?.preview_token
   busy.value = true
   confirming.value = false
+  confirmingTerminal.value = false
+  terminalResult.value = ''
   preview.value = undefined
   error.value = ''
   result.value = undefined
   try {
+    if (terminal) {
+      const booked = await teacherAPI.resolveTerminalPending(props.providerId)
+      if (!active) return
+      terminalResult.value = `本次已结清缺终态 ${booked.resolved} 笔，出错 ${booked.errors} 笔。`
+      emit('settled')
+    }
     if (apply && token) {
       const booked = await teacherAPI.pendingAudit(props.providerId, { apply: true, limit: 200, offset: offset.value, preview_token: token })
       if (!active) return
@@ -60,12 +71,22 @@ const labels = { exact: '金额唯一', narrow: '误差较小', wide: '误差较
         <button type="button" class="button" @click="run(true)">确认扣款</button>
       </AppDialog>
       <span v-if="busy" role="status">正在处理…</span>
+      <AppDialog v-if="preview?.terminal_enabled && preview.terminal_missing" v-model:open="confirmingTerminal" title="确认处理缺终态" description="仅处理本供应商已过宽限期的一批调用。">
+        <template #trigger>
+          <button type="button" class="button secondary" :disabled="busy">立即处理缺终态</button>
+        </template>
+        <p>按已知用量扣款。没有可计费用量或无法定价的调用按 0 积分核销。</p>
+        <button type="button" class="button secondary" @click="confirmingTerminal = false">取消</button>
+        <button type="button" class="button" @click="run(false, 0, true)">确认处理</button>
+      </AppDialog>
     </div>
     <p v-if="error" role="alert">{{ error }}</p>
+    <p v-if="terminalResult" role="status">{{ terminalResult }}</p>
     <p v-if="result" role="status">已结算 {{ result.charged }} 笔，仍待核 {{ result.still_pending }} 笔，跳过 {{ result.skipped }} 笔，出错 {{ result.errors }} 笔。本次实扣 {{ result.credits_charged }} 积分，供应商剩余待核 {{ result.remaining_pending }} 笔。</p>
     <template v-if="preview">
       <p>供应商待核共 {{ preview.backlog_total }} 笔，本批 {{ preview.total }} 笔<span v-if="preview.total">（第 {{ offset + 1 }} 至 {{ offset + preview.total }} 笔）</span>，可自动结算 {{ preview.auto_settle }} 笔。</p>
       <p v-if="preview.auto_settle === 0 && preview.next_offset != null">本批没有可自动结算的调用，请继续查看下一批。</p>
+      <p>其中 {{ preview.terminal_missing }} 笔缺终态，{{ preview.terminal_enabled ? '超过宽限期按已知用量结清' : '缺终态处理已关闭' }}。</p>
       <p>已知区间最大误差 {{ preview.max_error_yuan }} 元，可自动项预计上游金额 {{ preview.estimated_auto_yuan }} 元。</p>
       <p>金额唯一 {{ preview.exact }} · 误差较小 {{ preview.narrow }} · 误差较大 {{ preview.wide }} · 证据不足 {{ preview.unknown }}</p>
       <div v-if="preview.rows.length" class="audit-table">

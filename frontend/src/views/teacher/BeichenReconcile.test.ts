@@ -10,12 +10,14 @@ import TeacherProviders from './TeacherProviders.vue'
 const mocks = vi.hoisted(() => ({
   reconciliation: vi.fn(),
   pendingAudit: vi.fn(),
+  resolveTerminalPending: vi.fn(),
   providers: vi.fn(),
   charts: [] as Array<{ setOption: ReturnType<typeof vi.fn>; resize: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> }>,
 }))
 vi.mock('../../api/teacher', () => ({ teacherAPI: {
   beichenReconciliation: mocks.reconciliation,
   pendingAudit: mocks.pendingAudit,
+  resolveTerminalPending: mocks.resolveTerminalPending,
   providers: mocks.providers,
 } }))
 vi.mock('echarts/core', () => ({
@@ -695,6 +697,7 @@ describe('存量待核回放', () => {
   }
   const preview = {
     provider_id: 'beichen', preview_token: 'preview-one', total: 3, backlog_total: 3,
+    terminal_missing: 2, terminal_enabled: true,
     auto_settle: 1, exact: 0, narrow: 1, wide: 1, unknown: 1, max_error_yuan: 0.25, estimated_auto_yuan: 0.000142,
     rows: [{ id: 'call-1', student: '张同学', model: '示例模型', protocol: 'anthropic', class: 'narrow',
       min: 0.000022, max: 0.000262, recommended: 0.000142, student_credits: '0.01562', note: '符合结算阈值' }],
@@ -717,6 +720,25 @@ describe('存量待核回放', () => {
     expect(mocks.pendingAudit).toHaveBeenNthCalledWith(2, 'beichen', { apply: true, limit: 200, offset: 0, preview_token: 'preview-one' })
     expect(view.text()).toContain('已结算 1 笔，仍待核 2 笔，跳过 0 笔，出错 0 笔。本次实扣 0.01562 积分，供应商剩余待核 2 笔')
     expect(button(view, '批量结算可自动项').attributes('disabled')).toBeDefined()
+  })
+  it('缺终态显示全量计数，确认后只处理当前供应商并刷新', async () => {
+    mocks.pendingAudit.mockResolvedValueOnce(preview).mockResolvedValueOnce({ ...preview, terminal_missing: 0 })
+    mocks.resolveTerminalPending.mockResolvedValueOnce({ resolved: 2, errors: 0 })
+    const view = mountView()
+    await button(view, '只读回放').trigger('click')
+    await flushPromises()
+    expect(view.text()).toContain('其中 2 笔缺终态，超过宽限期按已知用量结清')
+    for (const action of ['取消', '确认处理']) {
+      await button(view, '立即处理缺终态').trigger('click')
+      await vi.waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeTruthy())
+      const dialog = new DOMWrapper(document.querySelector('[role="dialog"]')!)
+      expect(mocks.resolveTerminalPending).not.toHaveBeenCalled()
+      await dialog.findAll('button').find(node => node.text() === action)!.trigger('click')
+      await vi.waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeNull())
+    }
+    expect(mocks.resolveTerminalPending).toHaveBeenCalledExactlyOnceWith('beichen')
+    expect(view.text()).toContain('本次已结清缺终态 2 笔，出错 0 笔')
+    expect(view.text()).not.toContain('立即处理缺终态')
   })
   it('首批无可结算项时提示翻页，末批按自己的令牌确认，409 后要求重新回放', async () => {
     mocks.pendingAudit.mockResolvedValueOnce({ ...preview, total: 200, backlog_total: 201, auto_settle: 0, next_offset: 200 })
