@@ -163,6 +163,28 @@ func TestReworkTransports(t *testing.T) {
 	}
 }
 
+func TestReworkSSEFailureFrame(t *testing.T) {
+	f := reworkGateway(t)
+	f.exec(t, "UPDATE model_bindings SET adapter='openai_responses' WHERE id=$1", f.binding)
+	created := `{"type":"response.created","response":{"id":"resp_probe","model":"` + upstreamModel + `","status":"in_progress","usage":{"input_tokens":11,"output_tokens":2,"prompt_cache_miss_tokens":11,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}}}`
+	failed := `{"type":"response.failed","response":{"id":"resp_probe","model":"different-model-without-price","status":"failed","usage":{"input_tokens":11,"output_tokens":2,"prompt_cache_miss_tokens":11,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}}}`
+	reply := "event: response.created\ndata: " + created + "\n\nevent: response.failed\ndata: " + failed + "\n\n"
+	reviewHTTP(t, f, "sse-failure-mismatch", "text/event-stream", reply, true)
+	before := reviewRead(t, f, "sse-failure-mismatch")
+	if before.state != "pending_review" || before.review != "upstream_model_mismatch" || before.credits != "NULL" {
+		t.Fatalf("before=%+v", before)
+	}
+	reviewAge(t, f, "sse-failure-mismatch")
+	booked, err := usage.ResolveProviderTerminalPending(f.ctx, f.db, f.provider)
+	if err != nil || booked.Resolved != 0 || booked.Errors != 0 {
+		t.Fatalf("booked=%+v err=%v", booked, err)
+	}
+	after := reviewRead(t, f, "sse-failure-mismatch")
+	if after.state != "pending_review" || after.review != "upstream_model_mismatch" || after.credits != "NULL" {
+		t.Fatalf("after=%+v", after)
+	}
+}
+
 func TestReworkPreview(t *testing.T) {
 	f := reworkGateway(t)
 	preview := func(limit int) usage.PendingBacklogReport {
