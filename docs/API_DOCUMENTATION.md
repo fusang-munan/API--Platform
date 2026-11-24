@@ -727,7 +727,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 | `NEBULA_STUDENT_PENDING_REVIEW_LIMIT` | 20 | 整体回退模式的待核笔数上限 |
 | `NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT` | 1000 | 每学生待核预留上限，整积分 |
 | `NEBULA_STUDENT_PENDING_RESERVE_CREDITS` | 10 | 每笔新待核调用预留的整积分，折合 0.1 元 |
-| `NEBULA_STUDENT_CONCURRENCY_LIMIT` | 2 | 每学生同时派发的调用数 |
+| `NEBULA_STUDENT_CONCURRENCY_LIMIT` | 5 | 同一学生的所有 Key 和项目共用。直接运行和本地 Compose 可用环境变量覆盖；生产 Compose 显式指定 5，优先于服务器 `.env` |
 
 笔数、额度和并发数接受正整数，缺省或无效时使用默认值。按默认值，已有 98 笔各 10 积分时，第 99 笔可发出。已有 99 笔各 10 积分时，下一笔北辰请求正好触顶，须等部分记录完成核账后再试。
 

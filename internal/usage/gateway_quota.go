@@ -64,7 +64,7 @@ func unresolvedCreditLimit() int {
 }
 
 func checkStudentCallLimits(ctx context.Context, tx *sql.Tx, studentID, ownCallID uuid.UUID, beichen bool) error {
-	concurrency := studentCallLimit("NEBULA_STUDENT_CONCURRENCY_LIMIT", 2)
+	concurrency := studentCallLimit("NEBULA_STUDENT_CONCURRENCY_LIMIT", 5)
 	exposure := unresolvedExposureEnabled()
 	reviewLimit := studentCallLimit("NEBULA_STUDENT_PENDING_REVIEW_LIMIT", 20)
 	var concurrentFull, exposureFull bool
