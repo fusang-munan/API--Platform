@@ -29,6 +29,8 @@ func TestCompleteCallMetricsAppliesOnlyTheChangeInTurnTokens(t *testing.T) {
 			mock.ExpectExec(`UPDATE gateway_call_turns SET`).WithArgs(turnID, int64(-5), int64(3), int64(0)).
 				WillReturnResult(sqlmock.NewResult(0, 1))
 		}
+		mock.ExpectExec(`UPDATE gateway_calls SET pricing_detail`).WithArgs(callID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
 		if err := store.CompleteCallMetrics(context.Background(), callID, metrics); err != nil {
 			t.Fatal(err)

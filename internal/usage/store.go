@@ -742,6 +742,11 @@ func (s *Store) CompleteCallMetrics(ctx context.Context, callID uuid.UUID, metri
 	if err := writeCallMetrics(ctx, tx, callID, metrics); err != nil {
 		return err
 	}
+	// Late evidence can resolve a contradiction that previously parked the
+	// call. Let the next terminal scan evaluate the row again.
+	if _, err := tx.ExecContext(ctx, `UPDATE gateway_calls SET pricing_detail=COALESCE(pricing_detail,'{}'::jsonb)-'terminal_blocked' WHERE id=$1`, callID); err != nil {
+		return err
+	}
 	// The late-report recovery path requires a complete replacement report.
 	// Only the successful gateway finalizer can authorize a partial snapshot.
 	if review && metrics.State == UsageReported {

@@ -83,9 +83,10 @@ func observedCacheTTL(m CallMetrics) string {
 	}
 	if childCount > 0 && m.CacheWriteTokens != nil && *m.CacheWriteTokens > childSum {
 		// The parent total proves more writes than the timed children. The
-		// remainder has no confirmed duration; use the cheaper 5-minute rate
-		// rather than charging every write at the longer duration.
-		return "5m"
+		// remainder has no confirmed duration; price all writes at the lower
+		// of the two confirmed rates, so an unconfirmed part cannot be charged
+		// at the more expensive duration.
+		return "min"
 	}
 	if five != nil && *five > 0 {
 		return "5m"

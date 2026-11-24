@@ -445,7 +445,7 @@ func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge
 		beichen_review_reason=NULL,beichen_upstream_price_version=$6,beichen_multiplier_version=$7,
 		price_tier=COALESCE(NULLIF($8,''),c.price_tier),
 		price_snapshot=COALESCE(NULLIF($9,'')::jsonb,c.price_snapshot),
-		pricing_detail=CASE WHEN $10<>'' OR amount.actual>amount.student OR $11::jsonb IS NOT NULL THEN
+		pricing_detail=(CASE WHEN $10<>'' OR amount.actual>amount.student OR $11::jsonb IS NOT NULL THEN
 			CASE WHEN $11::jsonb IS NOT NULL THEN COALESCE(c.pricing_detail,'{}'::jsonb) ELSE '{}'::jsonb END ||
 			COALESCE(NULLIF($10,'')::jsonb,c.pricing_detail,'{}'::jsonb) ||
 			jsonb_build_object('base_credits',trim_scale(amount.base)::text,'base_source',$5::text,
@@ -453,7 +453,7 @@ func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge
 			CASE WHEN $3::numeric IS NOT NULL
 				THEN jsonb_build_object('upstream_multiplier',trim_scale($3::numeric)::text)
 				ELSE '{}'::jsonb END || COALESCE($11::jsonb,'{}'::jsonb)
-			ELSE c.pricing_detail END
+			ELSE c.pricing_detail END) - 'terminal_retry_epoch' - 'terminal_blocked'
 	FROM amount WHERE c.id=$1 AND c.beichen_state='pending_review'
 		AND `+auditBoundPredicate+`
 	RETURNING (amount.student*1000)::text`, callID, charge.base, charge.quoteMultiplier, maxCredits, charge.source,
@@ -466,10 +466,6 @@ func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge
 		return err
 	}
 	if err := postLedgerCharge(ctx, tx, callID, milli); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE gateway_calls SET pricing_detail=COALESCE(pricing_detail,'{}'::jsonb)
-		-'terminal_retry_epoch'-'terminal_blocked' WHERE id=$1`, callID); err != nil {
 		return err
 	}
 	return refreshLedgerTurn(ctx, tx, callID, milli, true)
