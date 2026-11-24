@@ -377,7 +377,14 @@ func (g *Gateway) proxyHTTPBody(attemptCtx context.Context, w http.ResponseWrite
 		}
 	}
 	if metrics.State == usage.UsageInterrupted {
-		success, category, message = false, "stream", "Upstream response did not reach a terminal state."
+		success = false
+		if review != "" {
+			// A review reason already established from the response (for
+			// example a substituted model) outranks the transport symptom.
+			category, message = review, "The response requires billing review."
+		} else {
+			category, message = "stream", "Upstream response did not reach a terminal state."
+		}
 	}
 	if err := g.finalizeCall(ctx, *reservation, success, category, message, candidate, metrics); err != nil {
 		_ = response.Body.Close()

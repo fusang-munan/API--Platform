@@ -113,7 +113,9 @@ func previewBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, limit
 	// Stream all IDs into the token. An insertion beyond the batch boundary
 	// must also invalidate confirmation. Only the selected batch needs pricing.
 	report.TerminalEnabled = terminalPendingEnabled()
-	rows, err := tx.QueryContext(ctx, `SELECT id,beichen_review_reason='missing_terminal_usage' FROM gateway_calls WHERE `+backlogFilter+` ORDER BY created_at,id`, providerID)
+	rows, err := tx.QueryContext(ctx, `SELECT id,beichen_review_reason='missing_terminal_usage'
+		AND COALESCE(usage_reason,'') NOT IN `+terminalBlockedUsageSQL+`
+		FROM gateway_calls WHERE `+backlogFilter+` ORDER BY created_at,id`, providerID)
 	if err != nil {
 		return report, err
 	}
@@ -200,6 +202,9 @@ func readBacklogRow(ctx context.Context, tx *sql.Tx, providerID, id uuid.UUID, l
 	}
 	if row.Reason == "missing_terminal_usage" {
 		row.Class, row.Note = pendingaudit.ClassUnknown, "缺终态，由缺终态策略处理"
+		if terminalEvidenceBlocked(metrics.UsageReason) {
+			row.Note = "缓存或计数证据冲突，保留人工待核"
+		}
 		return row, d, nil
 	}
 	if !priced {

@@ -113,7 +113,12 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 		priceAt = sql.NullTime{Time: route.SentAt, Valid: true}
 		if next == "pending_review" {
 			reason = "missing_terminal_usage"
-			if success && category != "" {
+			if billingReviewCategory(category) {
+				// The response itself proved a pricing problem. Keep that
+				// stronger evidence even when the stream also ended without a
+				// terminal frame.
+				reason = category
+			} else if success && category != "" {
 				reason = category
 			} else if metrics.State == UsagePartial {
 				reason = "incomplete_token_breakdown"
@@ -182,6 +187,14 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 		}
 	}
 	return refreshLedgerTurn(ctx, tx, callID, "0", false)
+}
+
+func billingReviewCategory(category string) bool {
+	switch category {
+	case "upstream_model_mismatch", "upstream_model_unconfirmed", "unsupported_text_pricing", "incomplete_token_breakdown":
+		return true
+	}
+	return false
 }
 
 func pendingHeadroom(ctx context.Context, tx *sql.Tx, callID uuid.UUID) (int64, error) {

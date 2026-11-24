@@ -166,13 +166,23 @@ func TestTerminalPendingOpenAIKnownCountersPostgres(t *testing.T) {
 			beichen_dispatch_model=CASE WHEN request_id='no-quote' THEN 'unknown-price' ELSE beichen_dispatch_model END
 			WHERE request_id=$1`, s.id, s.prompt, s.output, s.total, s.hit, s.miss, s.write)
 	}
-	for _, want := range []int{2, 2, 2, 1, 0} {
+	f.exec(t, "UPDATE gateway_calls SET usage_reason='inconsistent_token_total' WHERE request_id='conflicting'")
+	// The contradictory total row is evidence, not "no usage": it must stay
+	// in the manual queue instead of being written off as zero.
+	for _, want := range []int{2, 2, 2, 0} {
 		r, err := usage.ResolveProviderTerminalPending(f.ctx, f.db, f.provider)
 		if err != nil || r.Resolved != want || r.Errors != 0 {
 			t.Fatalf("batch %+v want %d: %v", r, want, err)
 		}
 	}
 	for _, s := range cases {
+		if s.id == "conflicting" {
+			var state, why string
+			if err := f.db.QueryRowContext(f.ctx, `SELECT beichen_state,COALESCE(usage_reason,'') FROM gateway_calls WHERE request_id=$1`, s.id).Scan(&state, &why); err != nil || state != "pending_review" || why != "inconsistent_token_total" {
+				t.Fatalf("%s must remain pending: state=%q reason=%q err=%v", s.id, state, why, err)
+			}
+			continue
+		}
 		var ok bool
 		err := f.db.QueryRowContext(f.ctx, `SELECT COALESCE(student_credits=$2::numeric AND
 			(pricing_detail->>'priced')::bool=$3 AND (pricing_detail ? 'reason')<>$3 AND

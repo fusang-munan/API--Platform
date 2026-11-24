@@ -36,9 +36,24 @@ func terminalSetting(name string, fallback int) int {
 	return value
 }
 
+// Parser conflicts are evidence problems, not "no known usage". They must stay
+// in the manual queue instead of being written off as zero by the terminal
+// policy.
+const terminalBlockedUsageSQL = `('invalid_usage_payload','invalid_token_count','conflicting_usage_fields','conflicting_cache_creation_counts','inconsistent_token_total','inconsistent_token_breakdown')`
+
 const staleTerminalFilter = `beichen_state='pending_review' AND beichen_review_reason='missing_terminal_usage'
+	AND COALESCE(usage_reason,'') NOT IN ` + terminalBlockedUsageSQL + `
 	AND EXTRACT(EPOCH FROM (now()-COALESCE(finalized_at,created_at))) >= $1
 	AND ($2::uuid IS NULL OR provider_id=$2)`
+
+func terminalEvidenceBlocked(reason string) bool {
+	switch reason {
+	case "invalid_usage_payload", "invalid_token_count", "conflicting_usage_fields", cacheWriteConflictReason,
+		"inconsistent_token_total", "inconsistent_token_breakdown":
+		return true
+	}
+	return false
+}
 
 func ResolveStaleTerminalPending(ctx context.Context, db *sql.DB, limit int) (TerminalPendingResult, error) {
 	return resolveTerminalPending(ctx, db, nil, limit)
@@ -57,9 +72,13 @@ func resolveTerminalPending(ctx context.Context, db *sql.DB, provider *uuid.UUID
 	if limit <= 0 || limit > batch {
 		limit = batch
 	}
+	// One persistently failing row must not occupy the whole batch. Read a
+	// wider candidate window and count only successful settlements toward the
+	// batch limit; errors stay in the queue for the next scan.
+	window := min(500, max(50, limit*4))
 	grace := max(60, terminalSetting("NEBULA_TERMINAL_PENDING_GRACE_SECONDS", 300))
 	rows, err := db.QueryContext(ctx, `SELECT id FROM gateway_calls WHERE `+staleTerminalFilter+
-		` ORDER BY COALESCE(finalized_at,created_at),id LIMIT $3`, grace, provider, limit)
+		` ORDER BY COALESCE(finalized_at,created_at),id LIMIT $3`, grace, provider, window)
 	if err != nil {
 		return result, err
 	}
@@ -76,6 +95,9 @@ func resolveTerminalPending(ctx context.Context, db *sql.DB, provider *uuid.UUID
 		return result, err
 	}
 	for _, id := range ids {
+		if result.Resolved >= limit {
+			break
+		}
 		resolved, err := resolveTerminalCall(ctx, db, provider, grace, id)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -101,17 +123,29 @@ func resolveTerminalCall(ctx context.Context, db *sql.DB, provider *uuid.UUID, g
 	}
 	var protocol string
 	var m CallMetrics
-	err = tx.QueryRowContext(ctx, `SELECT protocol,prompt_tokens,completion_tokens,total_tokens,cache_hit_tokens,cache_miss_tokens,cache_write_tokens,COALESCE(usage_reason,'')
+	err = tx.QueryRowContext(ctx, `SELECT protocol,prompt_tokens,completion_tokens,total_tokens,cache_hit_tokens,cache_miss_tokens,cache_write_tokens,COALESCE(usage_reason,''),
+		CASE WHEN COALESCE(pricing_detail->>'cache_write_5m_tokens','') ~ '^[0-9]+$'
+			THEN (pricing_detail->>'cache_write_5m_tokens')::bigint END,
+		CASE WHEN COALESCE(pricing_detail->>'cache_write_1h_tokens','') ~ '^[0-9]+$'
+			THEN (pricing_detail->>'cache_write_1h_tokens')::bigint END
 		FROM gateway_calls WHERE `+staleTerminalFilter+` AND id=$3 FOR UPDATE`, grace, provider, id).
-		Scan(&protocol, &m.PromptTokens, &m.CompletionTokens, &m.TotalTokens, &m.CacheHitTokens, &m.CacheMissTokens, &m.CacheWriteTokens, &m.UsageReason)
+		Scan(&protocol, &m.PromptTokens, &m.CompletionTokens, &m.TotalTokens, &m.CacheHitTokens, &m.CacheMissTokens, &m.CacheWriteTokens, &m.UsageReason,
+			&m.cacheWrite5m, &m.cacheWrite1h)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	inputComplete := m.PromptTokens != nil && (protocol != "anthropic" || (m.CacheHitTokens != nil && m.CacheWriteTokens != nil))
+	// Decide completeness from the stored evidence before knownTerminalMetrics
+	// fills protocol-required zero counters. A filled zero is not an observed
+	// input count and must not unlock a cheaper price tier.
+	inputComplete := m.PromptTokens != nil && (protocol != "anthropic" ||
+		(m.CacheHitTokens != nil && (m.CacheWriteTokens != nil || m.cacheWrite5m != nil || m.cacheWrite1h != nil || m.cacheWriteReported != nil)))
 	input, output, reason := knownTerminalMetrics(&m, protocol)
+	if terminalEvidenceBlocked(reason) {
+		return false, nil
+	}
 	var charge beichenCharge
 	if reason == "" {
 		var missingRate string
@@ -164,6 +198,23 @@ func knownTerminalMetrics(m *CallMetrics, protocol string) (input, output int64,
 		m.CompletionTokens = &zero
 	}
 	output = *m.CompletionTokens
+	// A directly observed 5m/1h cache-creation child is known usage even when
+	// the parent total was not reported. Only use the parent when it exists;
+	// conflicting evidence is rejected below by usage_reason.
+	if protocol == "anthropic" && m.CacheWriteTokens == nil {
+		switch {
+		case m.cacheWriteReported != nil:
+			m.CacheWriteTokens = m.cacheWriteReported
+		case m.cacheWrite5m != nil || m.cacheWrite1h != nil:
+			var sum int64
+			for _, n := range []*int64{m.cacheWrite5m, m.cacheWrite1h} {
+				if n != nil {
+					sum += *n
+				}
+			}
+			m.CacheWriteTokens = &sum
+		}
+	}
 	var parts int64
 	for _, n := range []*int64{m.CacheMissTokens, m.CacheHitTokens, m.CacheWriteTokens} {
 		if n != nil {
