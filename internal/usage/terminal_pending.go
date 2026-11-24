@@ -50,7 +50,7 @@ const terminalRetryEpochSQL = `CASE WHEN COALESCE(pricing_detail->>'terminal_ret
 const staleTerminalFilter = `beichen_state='pending_review' AND beichen_review_reason='missing_terminal_usage'
 	AND COALESCE(usage_reason,'') NOT IN ` + terminalBlockedUsageSQL + `
 	AND (` + terminalRetryEpochSQL + ` IS NULL OR ` + terminalRetryEpochSQL + ` <= $3)
- 	AND COALESCE(pricing_detail->>'terminal_blocked','') <> 'true'
+	AND COALESCE(pricing_detail->>'terminal_blocked','') <> 'true'
 	AND EXTRACT(EPOCH FROM (now()-COALESCE(finalized_at,created_at))) >= $1
 	AND ($2::uuid IS NULL OR provider_id=$2)`
 
