@@ -127,9 +127,8 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 	// in a later statement so it includes the preceding finalizer's commit.
 	var headroom int64
 	if next == "pending_review" {
-		if err := tx.QueryRowContext(ctx, `SELECT GREATEST(0,$2::bigint-COALESCE(sum(unresolved_credit_milli),0))
-			FROM gateway_calls WHERE user_id=(SELECT user_id FROM gateway_calls WHERE id=$1)
-			AND id<>$1 AND beichen_state='pending_review'`, callID, unresolvedCreditLimit()).Scan(&headroom); err != nil {
+		headroom, err = pendingHeadroom(ctx, tx, callID)
+		if err != nil {
 			return err
 		}
 	}
@@ -185,6 +184,14 @@ func finishRoutedCall(ctx context.Context, tx *sql.Tx, callID uuid.UUID, success
 	return refreshLedgerTurn(ctx, tx, callID, "0", false)
 }
 
+func pendingHeadroom(ctx context.Context, tx *sql.Tx, callID uuid.UUID) (int64, error) {
+	var headroom int64
+	err := tx.QueryRowContext(ctx, `SELECT GREATEST(0,$2::bigint-COALESCE(sum(unresolved_credit_milli),0))
+			FROM gateway_calls WHERE user_id=(SELECT user_id FROM gateway_calls WHERE id=$1)
+			AND id<>$1 AND beichen_state='pending_review'`, callID, unresolvedCreditLimit()).Scan(&headroom)
+	return headroom, err
+}
+
 // Use the same dispatch-time snapshot and credential validation as beichen_price_at.
 // Applying the validity checks after LIMIT prevents a fallback to a superseded quote.
 const beichenConditionQuoteJoin = `
@@ -222,13 +229,45 @@ const beichenBaseSourceSQL = `coalesce(c.beichen_base_source,c.pricing_detail->>
 const derivedPriceSource = "derived_from_usage"
 
 func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics, audit *pendingAuditBooking) error {
+	// Callers hold the call row lock through settlement.
+	charge, reason, missingRate, err := quoteBeichenReport(ctx, tx, callID, metrics)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if charge.base == "" {
+		_, err := tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_review_reason=CASE
+			WHEN $4<>'' THEN $4
+			WHEN $2::bigint IS NULL THEN 'missing_upstream_price'
+			WHEN $3::bigint IS NULL AND EXISTS (SELECT 1 FROM beichen_price_versions WHERE id=$2 AND basis='base')
+				THEN 'missing_upstream_multiplier'
+			ELSE $5 END,
+			beichen_upstream_price_version=$2,beichen_multiplier_version=$3 WHERE id=$1`,
+			callID, charge.upstreamVersion, charge.multiplierVersion, reason, missingRate)
+		if err != nil {
+			return err
+		}
+		if audit == nil && reason == "incomplete_token_breakdown" && metrics.CanAuditBeichenSplit() {
+			return errAuditTokenSplit
+		}
+		return refreshLedgerTurn(ctx, tx, callID, "0", false)
+	}
+	charge.audit = audit
+	return bookBeichenCharge(ctx, tx, callID, charge)
+}
+
+// quoteBeichenReport evaluates the same dispatch-time evidence for preview and booking.
+func quoteBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics) (beichenCharge, string, string, error) {
+	var charge beichenCharge
 	var school, upstream, effort sql.NullString
 	var mode, protocol, ttl, missingRate, upstreamSource string
 	var terms, fixedRates []byte
 	var quoteVersion sql.NullInt64
 	var quoteMultiplier sql.NullString
 	var noFixedSchool bool
-	var charge beichenCharge
+
 	// 0042 的跟随费率仍是上游余额单位；仅手动费率已换成积分，须除以 100，避免多扣。
 	err := tx.QueryRowContext(ctx, `SELECT cost.school::text,cost.upstream::text,
 		p.mode,p.upstream_version,p.multiplier_version,COALESCE(version.source,''),
@@ -251,16 +290,13 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 				p.upstream_input,p.upstream_output,p.upstream_cache_read,p.upstream_cache_write) AS upstream
 		) cost`+beichenConditionQuoteJoin+`
 		WHERE c.id=$1 AND c.beichen_state='pending_review'
-		  AND c.beichen_price_at IS NOT NULL
-		FOR UPDATE OF c`, callID, metrics.PromptTokens, metrics.CompletionTokens,
+		  AND c.beichen_price_at IS NOT NULL`, callID, metrics.PromptTokens, metrics.CompletionTokens,
 		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens).Scan(
 		&school, &upstream, &mode, &charge.upstreamVersion, &charge.multiplierVersion, &upstreamSource, &noFixedSchool,
 		&fixedRates, &protocol, &effort, &ttl, &terms, &quoteVersion, &quoteMultiplier, &missingRate)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
+
 	if err != nil {
-		return err
+		return charge, "", "", err
 	}
 	charge.source = "gateway_usage_price"
 	if mode == "manual" {
@@ -314,7 +350,7 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 		}
 		var rates [4]*json.Number
 		if err := json.Unmarshal(fixedRates, &rates); err != nil {
-			return err
+			return charge, "", "", err
 		}
 		if noFixedSchool {
 			break
@@ -338,7 +374,7 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 			RateScale    string            `json:"credits_per_rate_unit"`
 		}{tokens, tokens.amountSource(), prices, beichenDecimalString(scale)})
 		if err != nil {
-			return err
+			return charge, "", "", err
 		}
 		base = sql.NullString{String: beichenDecimalString(credits), Valid: true}
 	case anthropicWrite && cacheDuration != "5m" && !manualPriced:
@@ -346,23 +382,8 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 		reason = "missing_cache_write_price"
 	}
 	if !base.Valid {
-		_, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET beichen_review_reason=CASE
-			WHEN $4<>'' THEN $4
-			WHEN $2::bigint IS NULL THEN 'missing_upstream_price'
-			WHEN $3::bigint IS NULL AND EXISTS (SELECT 1 FROM beichen_price_versions WHERE id=$2 AND basis='base')
-				THEN 'missing_upstream_multiplier'
-			ELSE $5 END,
-			beichen_upstream_price_version=$2,beichen_multiplier_version=$3 WHERE id=$1`,
-			callID, charge.upstreamVersion, charge.multiplierVersion, reason, missingRate)
-		if err != nil {
-			return err
-		}
-		if audit == nil && reason == "incomplete_token_breakdown" && metrics.CanAuditBeichenSplit() {
-			return errAuditTokenSplit
-		}
-		return refreshLedgerTurn(ctx, tx, callID, "0", false)
+		return charge, reason, missingRate, nil
 	}
-	charge.audit = audit
 	charge.base = base.String
 	if !manualPriced && len(terms) != 0 {
 		charge.detail = recordIgnoredBeichenPanelPrices(terms, charge.detail)
@@ -370,8 +391,21 @@ func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metr
 			charge.snapshot = terms
 		}
 	}
-	return bookBeichenCharge(ctx, tx, callID, charge)
+	return charge, "", "", nil
 }
+
+const beichenChargeAmountSQL = `WITH price AS (
+		SELECT $2::numeric * COALESCE($3::numeric,1) AS base,
+			COALESCE(beichen_school_multiplier,1) AS school_multiplier,
+			CASE WHEN student_cap_milli IS NOT NULL
+				THEN GREATEST(student_cap_milli,0)*0.001::numeric END AS cap
+		FROM gateway_calls WHERE id=$1 AND beichen_state='pending_review'
+	), full_price AS (
+		SELECT *,base*school_multiplier AS actual FROM price
+	), amount AS (
+		SELECT *,LEAST(actual,cap,$4::numeric) AS student FROM full_price
+	)`
+const auditBoundPredicate = `($4::numeric IS NULL OR LEAST(amount.actual,amount.cap) <= $4::numeric + 0.000000001)`
 
 // Terminal usage and verified receipts both book the full amount once.
 // Calls reserved under the previous policy retain their stored student cap
@@ -382,39 +416,28 @@ func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge
 	if charge.audit != nil {
 		maxCredits, auditDetail = charge.audit.maxCredits, string(charge.audit.detail)
 	}
-	err := tx.QueryRowContext(ctx, `WITH price AS (
-		SELECT $2::numeric * COALESCE($9::numeric,1) AS base,
-			COALESCE(beichen_school_multiplier,1) AS school_multiplier,
-			CASE WHEN student_cap_milli IS NOT NULL
-				THEN GREATEST(student_cap_milli,0)*0.001::numeric END AS cap
-		FROM gateway_calls WHERE id=$1 AND beichen_state='pending_review'
-	), full_price AS (
-		SELECT *,base*school_multiplier AS actual FROM price
-	), amount AS (
-		SELECT *,LEAST(actual,cap,$10::numeric) AS student FROM full_price
-	)
+	err := tx.QueryRowContext(ctx, beichenChargeAmountSQL+`
 	UPDATE gateway_calls c SET beichen_state='charged',billing_state='charged',unresolved_credit_milli=0,
 		beichen_credit_exact=amount.student,credit_milli=trunc(amount.student*1000)::bigint,
 		actual_credits=amount.actual,student_credits=amount.student,school_absorbed_credits=amount.actual-amount.student,
 		beichen_base_credits=CASE WHEN amount.actual=amount.student THEN amount.base END,
-		beichen_base_source=CASE WHEN amount.actual=amount.student THEN $3::text END,
-		beichen_review_reason=NULL,beichen_upstream_price_version=$4,beichen_multiplier_version=$5,
-		price_tier=COALESCE(NULLIF($6,''),c.price_tier),
-		price_snapshot=COALESCE(NULLIF($7,'')::jsonb,c.price_snapshot),
-		pricing_detail=CASE WHEN $8<>'' OR amount.actual>amount.student OR $11::jsonb IS NOT NULL THEN
+		beichen_base_source=CASE WHEN amount.actual=amount.student THEN $5::text END,
+		beichen_review_reason=NULL,beichen_upstream_price_version=$6,beichen_multiplier_version=$7,
+		price_tier=COALESCE(NULLIF($8,''),c.price_tier),
+		price_snapshot=COALESCE(NULLIF($9,'')::jsonb,c.price_snapshot),
+		pricing_detail=CASE WHEN $10<>'' OR amount.actual>amount.student OR $11::jsonb IS NOT NULL THEN
 			CASE WHEN $11::jsonb IS NOT NULL THEN COALESCE(c.pricing_detail,'{}'::jsonb) ELSE '{}'::jsonb END ||
-			COALESCE(NULLIF($8,'')::jsonb,c.pricing_detail,'{}'::jsonb) ||
-			jsonb_build_object('base_credits',trim_scale(amount.base)::text,'base_source',$3::text,
+			COALESCE(NULLIF($10,'')::jsonb,c.pricing_detail,'{}'::jsonb) ||
+			jsonb_build_object('base_credits',trim_scale(amount.base)::text,'base_source',$5::text,
 				'school_multiplier',trim_scale(amount.school_multiplier)::text) ||
-			CASE WHEN $9::numeric IS NOT NULL
-				THEN jsonb_build_object('upstream_multiplier',trim_scale($9::numeric)::text)
+			CASE WHEN $3::numeric IS NOT NULL
+				THEN jsonb_build_object('upstream_multiplier',trim_scale($3::numeric)::text)
 				ELSE '{}'::jsonb END || COALESCE($11::jsonb,'{}'::jsonb)
 			ELSE c.pricing_detail END
 	FROM amount WHERE c.id=$1 AND c.beichen_state='pending_review'
-		AND ($10::numeric IS NULL OR LEAST(amount.actual,amount.cap) <= $10::numeric + 0.000000001)
-	RETURNING (amount.student*1000)::text`, callID, charge.base, charge.source,
-		charge.upstreamVersion, charge.multiplierVersion, charge.tier, string(charge.snapshot), string(charge.detail),
-		charge.quoteMultiplier, maxCredits, auditDetail).Scan(&milli)
+		AND `+auditBoundPredicate+`
+	RETURNING (amount.student*1000)::text`, callID, charge.base, charge.quoteMultiplier, maxCredits, charge.source,
+		charge.upstreamVersion, charge.multiplierVersion, charge.tier, string(charge.snapshot), string(charge.detail), auditDetail).Scan(&milli)
 	if charge.audit != nil && errors.Is(err, sql.ErrNoRows) {
 		// The caller holds the pending row lock. The exact student debit exceeded the bound.
 		return refreshLedgerTurn(ctx, tx, callID, "0", false)

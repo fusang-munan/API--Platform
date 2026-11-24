@@ -1,6 +1,6 @@
 import { del, get, page, patch, post, request } from './client'
 import type { BeichenModelAlias, BeichenModelAliasUpdate, BeichenRebindPlan } from './types'
-import type { BeichenWebsiteKeyInventory } from './types'
+import type { BeichenWebsiteKeyInventory, PendingAuditReport } from './types'
 import type { BeichenAccount, BeichenAccountLogin, BeichenBatchEnableResult, BeichenCapabilities, BeichenCrawlSummary, BeichenImport, BeichenModelPriceResult, BeichenModelPriceUpdate, BeichenModelUsage, BeichenOverview, BeichenPriceUpdate, BeichenProbeRun, BeichenProbes, BeichenReceiptPage, BeichenReconcile, BeichenUsageRange } from './types'
 import type { Application, Binding, BindingCreate, BindingRouteProbeEndpoint, BindingRouteProbeStep, BindingUpdate, MentorCandidate, Model, ModelCatalogPage, ModelCreate, ModelUpdate, Organization, OrganizationCreate, OrganizationUpdate, ProbeEndpoint, ProbeResponse, Project, ProjectBudget, ProjectBudgetUpdate, ProjectCreate, ProjectUpdate, Provider, ProviderCatalogSyncView, ProviderCreate, ProviderCredential, ProviderCredentialCreate, ProviderCredentialUpdate, ProviderUpdate, ProjectUsage, StudentAccount } from './types'
 interface BeichenPanelStatus { configured: boolean; group_id?: number; upstream_key_id?: number }
@@ -71,6 +71,8 @@ export const teacherAPI = {
     const query = new URLSearchParams({ range, ...(providerID ? { provider_id: providerID } : {}) })
     return get<BeichenModelUsage>(`/api/v1/teacher/model-usage?${query}`)
   },
+  pendingAudit: (id: string, body: { apply: false; limit: number; offset?: number } | { apply: true; limit: number; offset?: number; preview_token: string }) =>
+    post<PendingAuditReport>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/pending-audit`, body),
   beichenReconciliation: (id: string, range: BeichenUsageRange,
     options?: { unmatchedScope?: 'observed' | 'comparable'; unmatchedCursor?: string }) => {
     const query = new URLSearchParams({ range })

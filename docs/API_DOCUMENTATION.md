@@ -566,6 +566,14 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 ### 7.2 学校级北辰用量与区间对账
 
+**存量待核回放与结算**
+
+教师专用 `POST /api/v1/teacher/providers/:provider_id/beichen/pending-audit` 的成功和错误响应均返回 `Cache-Control: private, no-store`。发送 `{"apply":false,"limit":200,"offset":0}` 获取预览。按创建时间和 ID 升序，limit 默认 200、上限 500，offset 默认 0，负数返回 422。将 next_offset 用于读取下一批，末批返回 null。确认时发送相同 offset、有效 limit、`apply:true` 和本批 preview_token。
+
+响应 data 含 provider_id、generated_at、backlog_total（该供应商预览时全部待核数，含无派发价格记录）、total（本批笔数）、next_offset、exact/narrow/wide/unknown、auto_settle、max_error_yuan、estimated_auto_yuan、preview_token 和 rows。样本包含 id/student/model/protocol/reason/class/min/max/recommended/note、can_auto_settle 及可结算项的 student_credits。金额区间和推荐金额单位均为上游元。缺少派发价格时 class 为 unknown，note 说明原因，保留待核。
+
+结算结果 charged/still_pending/skipped/errors 为本批笔数。仍待核的行计入 still_pending。有可计算上界时按学生剩余额度更新该笔预留，没有可靠上界时保留原值。credits_charged 为实际扣除积分的精确十进制字符串，remaining_pending 为结算后该供应商全部待核数，含无派发价格记录。缺少令牌、跨页使用或确认时快照不符均返回 409 pending_audit_changed；批次外新增待核也会使令牌失效。结算后从首页重新回放。
+
 `GET /api/v1/teacher/model-usage` 与 `GET .../beichen/reconciliation` 仅允许教师，均返回 `Cache-Control: private, no-store`。`range` 省略或为空时为 `all`；只接受 `day`、`month`、`all`，其他值返回 **422 `VALIDATION_ERROR`**（`details.field=range`）。无效 UUID 返回 400；显式指定不存在或非北辰供应商返回 404；未登录 401、角色不符 403、数据库不可用 503。
 
 共同顶层字段为 `range`、`start`、`end`、`timezone`。时区固定 `Asia/Shanghai`，时间以 RFC 3339 UTC 返回，区间左闭右开。`day` 是北京时间当天 00:00 至次日 00:00；`month` 是本月 1 日至次月 1 日；`all` 的 `start=null`、`end` 为查询时刻。总计基于当前数据库中仍保存的业务记录，不补造已经清理的历史 Token。

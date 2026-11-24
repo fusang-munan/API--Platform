@@ -40,6 +40,7 @@ func ErrorCode(err error) string {
 }
 
 const (
+	CodePendingAuditChanged        = "pending_audit_changed"
 	CodeValidation                 = "VALIDATION_ERROR"
 	CodeRejectionReasonRequired    = "REJECTION_REASON_REQUIRED"
 	CodeAuthenticationRequired     = "AUTHENTICATION_REQUIRED"

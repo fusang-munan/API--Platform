@@ -9,7 +9,7 @@ const emit = defineEmits<{ 'update:open': [value: boolean] }>()
     <DialogTrigger v-if="$slots.trigger" as-child><slot name="trigger" /></DialogTrigger>
     <DialogPortal>
       <DialogOverlay class="dialog-overlay" />
-      <DialogContent class="dialog-content" :class="{ wide: size === 'wide' || (!size && wide), xwide: size === 'xwide' }">
+      <DialogContent aria-modal="true" class="dialog-content" :class="{ wide: size === 'wide' || (!size && wide), xwide: size === 'xwide' }">
         <DialogTitle class="dialog-title">{{ title }}</DialogTitle>
         <DialogDescription v-if="description" class="sr-only">{{ description }}</DialogDescription>
         <DialogClose class="icon-button dialog-close" aria-label="关闭"><X :size="20" /></DialogClose>

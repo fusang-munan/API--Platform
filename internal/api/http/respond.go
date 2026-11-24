@@ -121,6 +121,11 @@ func (s *Server) authenticate() gin.HandlerFunc {
 	}
 }
 
+func privateNoStore(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	c.Next()
+}
+
 func requireRole(role string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if identity(c).Role != role {
@@ -236,7 +241,7 @@ func errorStatus(code string) int {
 		return http.StatusForbidden
 	case domain.CodeNotFound:
 		return http.StatusNotFound
-	case domain.CodeEmailRegistered, domain.CodeNameConflict, domain.CodeInvalidTransition,
+	case domain.CodePendingAuditChanged, domain.CodeEmailRegistered, domain.CodeNameConflict, domain.CodeInvalidTransition,
 		domain.CodeProjectNoMentor, domain.CodeMentorNotInOrganization, domain.CodeMentorAlreadyProjectMember, domain.CodeMentorNotProjectMember,
 		domain.CodeModelNotReady, domain.CodeModelRoutingRequired,
 		domain.CodeKeyAlreadyClaimed, domain.CodeProjectQuotaAllocation:

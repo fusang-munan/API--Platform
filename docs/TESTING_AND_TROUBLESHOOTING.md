@@ -338,6 +338,8 @@ go test ./...
 
 待核账审计报告出现 `unknown` 时，先看 `missing` 和 `note`，再核对协议的计数口径、原始输入输出总量、缓存计数，以及可产生费用的分项在派发时刻的报价。报告中的金额零值需结合分类阅读。运行 `go test ./internal/usage/pendingaudit -count=1 -v`，在无数据库连接的情况下复查协议拆分、缺项、金额区间、推荐比例和自动结算阈值。
 
+教师批量结算返回 409 pending_audit_changed 时，重新点击「只读回放」核对最新预计扣分，再在弹窗确认。批次外新增待核（含无派发价格的历史行）或跨页使用令牌均会触发冲突。若本批无可结算项但仍有下一批，点击「查看下一批」。核对剩余数量时按供应商及 pending_review 计数，价格时间为空的记录也应计入。设置隔离本机测试库 NEBULA_TEST_POSTGRES 后运行 `go test -p 1 ./internal/dataplane -run TestBeichenPendingBacklog -count=1 -v`，核对只读事务、分页、未定价行、宽区间 1 → 28、重复确认和学生预留封顶、并发确认、单笔回滚和月度实扣。若宽区间仍保留旧值，检查批量确认是否因该行不能自动扣款而跳过了预留写入，并核对同学生其他待核行占用的额度。运行 `go test ./internal/api/http -run TestPendingAudit` 验证权限及缓存头，在 frontend 下运行 `npm test -- src/views/teacher/BeichenReconcile.test.ts` 验证弹窗、翻页及冲突提示。
+
 - 网页提示会话过期时，先用本机登录窗口更新会话，再运行 `go run ./cmd/beichen-report --range 7d`。
 - 平台卡片的请求差额在 `platforms.account_minus_platforms`，四把 Key 的差额在 `key_reconciliation.account_minus_sum`。实际金额和 Token 的差额另有字段。
 - `--reconcile` 用 `DATABASE_URL` 连接本机数据库。如果北辰供应商无法唯一确认，加 `--provider <供应商UUID>`。对账行里的 `null` 表示证据缺项，具体查看 `missing_reasons`。[对账字段说明](reports/beichen-crawl-stability.md)

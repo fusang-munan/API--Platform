@@ -1,3 +1,41 @@
+export interface PendingAuditRow {
+  id: string
+  student: string
+  model: string
+  protocol: string
+  reason: string
+  class: 'exact' | 'narrow' | 'wide' | 'unknown'
+  min: number
+  max: number
+  recommended: number
+  note: string
+  can_auto_settle: boolean
+  student_credits?: string
+}
+
+export interface PendingAuditReport {
+  provider_id: string
+  generated_at: string
+  total: number
+  backlog_total: number
+  next_offset: number | null
+  exact: number
+  narrow: number
+  wide: number
+  unknown: number
+  auto_settle: number
+  max_error_yuan: number
+  estimated_auto_yuan: number
+  preview_token: string
+  rows: PendingAuditRow[]
+  charged: number
+  still_pending: number
+  skipped: number
+  errors: number
+  credits_charged: string
+  remaining_pending: number
+}
+
 export type Role = 'student' | 'mentor' | 'teacher'
 export type UserStatus = 'pending_invite' | 'active' | 'disabled'
 export type ResourceStatus = 'active' | 'inactive'
