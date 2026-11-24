@@ -22,7 +22,7 @@ func TestBeichenPendingBacklogPostgres(t *testing.T) {
 	send("narrow", `,"total_tokens":102`)
 	send("wide", `,"total_tokens":100002`)
 	send("unpriced", `,"total_tokens":102`)
-	f.exec(t, `UPDATE gateway_calls SET beichen_price_at=NULL WHERE request_id='unpriced'`)
+	f.exec(t, `UPDATE gateway_calls SET beichen_price_at=NULL, unresolved_credit_milli=7 WHERE request_id='unpriced'`)
 	send("other", `,"total_tokens":102`)
 	other := uuid.New()
 	f.exec(t, `INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES ($1,'other','https://fixture.invalid',now(),now())`, other)
@@ -84,17 +84,67 @@ func TestBeichenPendingBacklogPostgres(t *testing.T) {
 		t.Fatalf("booked: %+v", booked)
 	}
 	stale(500, latest.PreviewToken)
+	var wideReserve int
+	if err := f.db.QueryRowContext(f.ctx, `SELECT unresolved_credit_milli FROM gateway_calls WHERE request_id='wide'`).Scan(&wideReserve); err != nil || wideReserve != 28 {
+		t.Fatalf("wide reserve after first apply=%d, want 28: %v", wideReserve, err)
+	}
+	pending := audit(false, 500, "")
+	repeated := audit(true, 500, pending.PreviewToken)
+	if repeated.Charged != 0 || repeated.StillPending != 3 || repeated.RemainingPending != 3 || repeated.CreditsCharged != "0" || repeated.Errors != 0 {
+		t.Fatalf("repeat: %+v", repeated)
+	}
 	var ok bool
 	err := f.db.QueryRowContext(f.ctx, `SELECT bool_and(CASE request_id
  WHEN 'narrow' THEN beichen_state='charged' AND student_credits=0.01562 AND unresolved_credit_milli=0
- WHEN 'wide' THEN beichen_state='pending_review' AND unresolved_credit_milli=1
- WHEN 'unpriced' THEN beichen_state='pending_review' AND beichen_price_at IS NULL AND student_credits IS NULL
+ WHEN 'wide' THEN beichen_state='pending_review' AND unresolved_credit_milli=28 AND student_credits IS NULL
+ WHEN 'unpriced' THEN beichen_state='pending_review' AND beichen_price_at IS NULL AND unresolved_credit_milli=7 AND student_credits IS NULL
  WHEN 'other' THEN beichen_state='pending_review' AND unresolved_credit_milli=1
  ELSE beichen_state='pending_review' AND unresolved_credit_milli=10 END) FROM gateway_calls`).Scan(&ok)
 	if err != nil || !ok {
 		t.Fatalf("unexpected balances: %v", err)
 	}
 	assertBeichenGatewayMonth(t, f.ctx, f.db, "narrow", "0.01562", 1)
+}
+
+func TestBeichenPendingBacklogConcurrentReservesPostgres(t *testing.T) {
+	f := newPendingGateway(t)
+	f.db.SetMaxOpenConns(8)
+	f.respond(`,"total_tokens":100002`)
+	for _, id := range []string{"wide", "priced-unknown"} {
+		if w := f.request(id); w.Code != 200 {
+			t.Fatalf("%s: HTTP %d", id, w.Code)
+		}
+	}
+	f.exec(t, `UPDATE gateway_calls SET unresolved_credit_milli=1`)
+	// The recorded usage still bounds the cost, but this call cannot be booked.
+	f.exec(t, `UPDATE gateway_calls SET error_category='upstream_error' WHERE request_id='priced-unknown'`)
+	t.Setenv("NEBULA_STUDENT_UNRESOLVED_CREDIT_LIMIT", "32")
+	type outcome struct {
+		report usage.PendingBacklogReport
+		err    error
+	}
+	done := make(chan outcome, 2)
+	for offset, class := range []string{"wide", "unknown"} {
+		page, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, false, 1, offset, "")
+		if err != nil || len(page.Rows) != 1 || page.Rows[0].Class != class || page.Rows[0].Auto || page.Rows[0].Max != 0.250012 {
+			t.Fatalf("preview: %+v %v", page, err)
+		}
+		go func() {
+			r, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, true, 1, offset, page.PreviewToken)
+			done <- outcome{r, err}
+		}()
+	}
+	for range 2 {
+		got := <-done
+		if got.err != nil || got.report.StillPending != 1 || got.report.RemainingPending != 2 || got.report.CreditsCharged != "0" || got.report.Errors != 0 {
+			t.Fatalf("apply: %+v %v", got.report, got.err)
+		}
+	}
+	var low, high int
+	if err := f.db.QueryRowContext(f.ctx, `SELECT min(unresolved_credit_milli),max(unresolved_credit_milli)
+		FROM gateway_calls WHERE beichen_state='pending_review' AND student_credits IS NULL`).Scan(&low, &high); err != nil || low != 4 || high != 28 {
+		t.Fatalf("concurrent reserves=%d,%d want 4,28: %v", low, high, err)
+	}
 }
 
 func TestBeichenPendingBacklogPagesPostgres(t *testing.T) {

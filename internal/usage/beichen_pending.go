@@ -57,18 +57,21 @@ func auditPendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, proto
 }
 
 func writePendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, d pendingDecision, headroom int64) error {
-	if d.result.Class == pendingaudit.ClassUnknown {
-		return refreshLedgerTurn(ctx, tx, callID, "0", false)
-	}
-	_, err := tx.ExecContext(ctx, `UPDATE gateway_calls SET unresolved_credit_milli=LEAST($3::bigint,1000,GREATEST(1,ceil($2::numeric)))::bigint
-		WHERE id=$1 AND beichen_state='pending_review'`, callID, d.booking.maxCredits, headroom)
-	if err != nil {
-		return err
+	if d.booking.maxCredits != "" {
+		if err := writePendingReserve(ctx, tx, callID, d.booking.maxCredits, headroom); err != nil {
+			return err
+		}
 	}
 	if !d.result.CanAutoSettle {
 		return refreshLedgerTurn(ctx, tx, callID, "0", false)
 	}
 	return settleBeichenReport(ctx, tx, callID, d.adjusted, &d.booking)
+}
+
+func writePendingReserve(ctx context.Context, tx *sql.Tx, callID uuid.UUID, maxCredits string, headroom int64) error {
+	_, err := tx.ExecContext(ctx, `UPDATE gateway_calls SET unresolved_credit_milli=LEAST($3::bigint,1000,GREATEST(1,ceil($2::numeric)))::bigint
+		WHERE id=$1 AND beichen_state='pending_review'`, callID, maxCredits, headroom)
+	return err
 }
 
 func decidePendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, protocol string, metrics CallMetrics) (pendingDecision, error) {

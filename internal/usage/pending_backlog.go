@@ -77,10 +77,6 @@ func PendingAuditBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, 
 	}
 	var sum big.Rat
 	for _, row := range report.Rows {
-		if !row.Auto {
-			report.StillPending++
-			continue
-		}
 		status, debit, err := applyBacklogRow(ctx, db, providerID, row)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -203,7 +199,7 @@ func readBacklogRow(ctx context.Context, tx *sql.Tx, providerID, id uuid.UUID, l
 	// Historical rows may already have complete terminal counters. Recheck the
 	// stored quote and the student's bound before admitting those rows too.
 	complete := metrics.State == UsageReported && unresolvedExposureEnabled()
-	if !terminal || (!complete && !metrics.CanAuditBeichenSplit()) {
+	if !complete && !metrics.CanAuditBeichenSplit() {
 		row.Class, row.Note = pendingaudit.ClassUnknown, "缺少可用于自动结算的终态缓存分项证据，或待核估算已关闭"
 		return row, d, nil
 	}
@@ -213,6 +209,12 @@ func readBacklogRow(ctx context.Context, tx *sql.Tx, providerID, id uuid.UUID, l
 	}
 	row.Class, row.Note = d.result.Class, d.result.Note
 	row.Min, row.Max, row.Recommended = d.result.MinYuan, d.result.MaxYuan, d.result.RecommendedYuan
+	if !terminal {
+		// A separate outcome/review issue rules out booking even when the
+		// recorded counters and dispatch prices give a reserve bound.
+		row.Class, row.Note = pendingaudit.ClassUnknown, "调用终态不满足自动结算条件，保留待核"
+		return row, d, nil
+	}
 	if !d.result.CanAutoSettle {
 		return row, d, nil
 	}
@@ -251,12 +253,22 @@ func applyBacklogRow(ctx context.Context, db *sql.DB, providerID uuid.UUID, conf
 	if err != nil {
 		return "", nil, err
 	}
-	if !row.Auto || row != confirmed {
+	if row != confirmed {
 		return "skipped", nil, nil
+	}
+	if d.booking.maxCredits == "" {
+		// No priced upper bound. Leave the historical reserve untouched.
+		return "pending", nil, nil
 	}
 	headroom, err := pendingHeadroom(ctx, tx, row.ID)
 	if err != nil {
 		return "", nil, err
+	}
+	if !row.Auto {
+		if err := writePendingReserve(ctx, tx, row.ID, d.booking.maxCredits, headroom); err != nil {
+			return "", nil, err
+		}
+		return "pending", nil, tx.Commit()
 	}
 	if err := writePendingReport(ctx, tx, row.ID, d, headroom); err != nil {
 		return "", nil, err
