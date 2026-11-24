@@ -350,6 +350,8 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 已扣调用的 `pricing_detail` 保留原有价格明细，并附加 `auto_settled=true`、`min_yuan`、`max_yuan`、`recommended_yuan`（均为上游元）、`recommended_read_tokens`、`recommended_write_tokens`、`prior_read_share` 和 `policy_version=pending-audit-v1`。推荐分项仅用于定价，调用行保留上游观测。先验用派发前 30 天内同学生、同 `model_id`、同协议且当时已扣款的 Token 加权比例。模型改显示名后仍共用历史。Anthropic 用缓存读除以普通输入、缓存读和缓存写之和，OpenAI 用缓存读除以输入。有效比例限制在 0.05 至 0.95，无有效样本用 0.5。
 
+教师待核回放在 PostgreSQL 可重复读的只读事务中读取同一快照。仅纳入指定供应商有派发价格时间的 pending_review 调用。SHA-256 覆盖该集合全部有序调用 ID、本批逐笔报价和分类计数。确认后每笔独立事务，先锁学生再锁调用，重验报价并扣除其他待核预留计算可用额度。状态或报价变化的行跳过，已结算行清零预留，宽区间按可用额度保留上界，未知区间保留已有预留。调用、月度桶和轮次在同一事务提交。
+
 试算以 `max_yuan × 100 × COALESCE(beichen_school_multiplier, 2)` 为学生积分上界。派发报价已含北辰分组倍率。自动定价候选超过上界 `1e-9` 积分以上则待核，容差内最多扣到上界，月桶按实际学生扣款更新。已有教师价和唯一金额路径保持业务优先级，包括 `estimated_unique_amount`。Gemini 仍待核，不自动结算。
 
 结束事务先锁学生行，再锁调用行，单独查询同学生其他待核行之和，得到剩余额度。默认预留、重放和上界预留均截到剩余额度，额度用完只挂待核状态、预留 0。已知上界先向上取整并限制在 1 至 1000 整积分。`NEBULA_UNRESOLVED_EXPOSURE=0` 将准入回退到旧的每学生待核笔数限制（默认 20），同时停用分项试算。仅 `NEBULA_PENDING_AUTO_SETTLE=0` 时保留新金额准入和上界预留。两种切换均只作用于之后的处理。

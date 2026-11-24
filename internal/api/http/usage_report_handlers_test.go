@@ -17,6 +17,7 @@ func reportHandlerRouter(s *Server, role string) *gin.Engine {
 	router := gin.New()
 	router.Use(func(c *gin.Context) { c.Set(identityKey, controlplane.Identity{UserID: uuid.New(), Role: role}) })
 	teacher := router.Group("/api/v1/teacher", requireRole("teacher"))
+	teacher.POST("/providers/:provider_id/beichen/pending-audit", s.beichenPendingAudit)
 	teacher.GET("/model-usage", s.teacherModelUsage)
 	teacher.GET("/providers/:provider_id/beichen/reconciliation", s.beichenReconciliation)
 	teacher.GET("/providers/:provider_id/beichen/reconciliation/calls", s.beichenReconciliationCalls)
@@ -129,5 +130,35 @@ func TestModelUsageHandlerDefaultsToAllAndReturnsEnvelope(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPendingAuditRoleAndConflict(t *testing.T) {
+	const path = "/api/v1/teacher/providers/00000000-0000-4000-8000-000000000001/beichen/pending-audit"
+	for _, role := range []string{"student", "mentor", "teacher"} {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if role == "teacher" {
+			mock.ExpectQuery("SELECT p.id FROM providers").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("00000000-0000-4000-8000-000000000001"))
+			mock.ExpectBegin()
+			mock.ExpectQuery("SELECT id FROM gateway_calls").WillReturnRows(sqlmock.NewRows([]string{"id"}))
+			mock.ExpectCommit()
+		}
+		router := reportHandlerRouter(&Server{service: controlplane.NewService(nil, db, nil, nil, nil, controlplane.Config{})}, role)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(`{"apply":true,"preview_token":"stale"}`)))
+		if role == "teacher" {
+			if w.Code != 409 || !strings.Contains(w.Body.String(), "pending_audit_changed") || w.Header().Get("Cache-Control") != "private, no-store" {
+				t.Fatalf("teacher HTTP %d %s", w.Code, w.Body)
+			}
+		} else if w.Code != 403 {
+			t.Fatalf("%s HTTP %d", role, w.Code)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

@@ -53,6 +53,28 @@ func (s *Server) beichenReconciliation(c *gin.Context) {
 	respond(c, http.StatusOK, view)
 }
 
+func (s *Server) beichenPendingAudit(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	id, ok := pathID(c, "provider_id")
+	if !ok {
+		return
+	}
+	var body struct {
+		Apply bool   `json:"apply"`
+		Limit int    `json:"limit" binding:"min=0"`
+		Token string `json:"preview_token"`
+	}
+	if !bindJSON(c, &body) {
+		return
+	}
+	result, err := s.service.Beichen().PendingAudit(c.Request.Context(), id, body.Apply, body.Limit, body.Token)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	respond(c, http.StatusOK, result)
+}
+
 func unmatchedScopeQuery(c *gin.Context) (string, bool) {
 	value := c.DefaultQuery("unmatched_scope", "observed")
 	if value == "" {

@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, ref, shallowRef, useId, watch } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
 import type { BeichenReconcile, BeichenReconcileModel, BeichenReconcileSide, BeichenUsageRange } from '../../api/types'
+import PendingAuditCard from './PendingAuditCard.vue'
 import CompareBars from '../../components/CompareBars.vue'
 import CreditDonut from '../../components/CreditDonut.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
@@ -245,6 +246,7 @@ onBeforeUnmount(() => { requestVersion++; unmatchedRequestVersion++ })
       </div>
     </header>
 
+    <PendingAuditCard :key="providerId" :provider-id="providerId" @settled="load" />
     <div v-if="error" class="reconcile-error" role="alert">
       <p>{{ error }}</p><button type="button" class="button secondary" @click="load">重试</button>
     </div>

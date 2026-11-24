@@ -159,6 +159,7 @@ func (s *Server) registerControlPlane() {
 	teacher.DELETE("/providers/:provider_id/credentials/:credential_id", s.deleteProviderCredential)
 	teacher.POST("/providers/:provider_id/reset-catalog", s.resetProviderCatalog)
 	teacher.GET("/providers/:provider_id/beichen", s.beichenOverview)
+	teacher.POST("/providers/:provider_id/beichen/pending-audit", s.beichenPendingAudit)
 	teacher.GET("/providers/:provider_id/beichen/reconciliation", s.beichenReconciliation)
 	teacher.GET("/providers/:provider_id/beichen/reconciliation/calls", s.beichenReconciliationCalls)
 	teacher.GET("/providers/:provider_id/beichen/diagnostics", s.beichenDiagnostics)

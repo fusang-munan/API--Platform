@@ -2,17 +2,20 @@ import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BeichenReconcile as ReconcileData, BeichenReconcileSide, BeichenUsageRange, Provider } from '../../api/types'
 import { creditsToYuan } from '../../utils/credits'
+import { APIError } from '../../api/client'
 import CompareBars from '../../components/CompareBars.vue'
 import BeichenReconcile from './BeichenReconcile.vue'
 import TeacherProviders from './TeacherProviders.vue'
 
 const mocks = vi.hoisted(() => ({
   reconciliation: vi.fn(),
+  pendingAudit: vi.fn(),
   providers: vi.fn(),
   charts: [] as Array<{ setOption: ReturnType<typeof vi.fn>; resize: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> }>,
 }))
 vi.mock('../../api/teacher', () => ({ teacherAPI: {
   beichenReconciliation: mocks.reconciliation,
+  pendingAudit: mocks.pendingAudit,
   providers: mocks.providers,
 } }))
 vi.mock('echarts/core', () => ({
@@ -165,6 +168,7 @@ it('用公开日账对账时保留 USD 金额、来源和模型覆盖率', async
 
 beforeEach(() => {
   mocks.reconciliation.mockReset().mockImplementation(async (_id: string, range: BeichenUsageRange) => response(range))
+  mocks.pendingAudit.mockReset()
   mocks.providers.mockReset().mockResolvedValue([])
   mocks.charts.length = 0
   observers = []
@@ -668,5 +672,47 @@ describe('供应商行集成', () => {
     expect(text).toContain('启用 Key —')
     expect(text).toContain('最近目录同步 —')
     expect(mocks.reconciliation).not.toHaveBeenCalled()
+  })
+})
+
+describe('存量待核回放', () => {
+  const preview = {
+    provider_id: 'beichen', preview_token: 'preview-one', total: 3, backlog_total: 3,
+    auto_settle: 1, exact: 0, narrow: 1, wide: 1, unknown: 1, max_error_yuan: 0.25, estimated_auto_yuan: 0.000142,
+    rows: [{ id: 'call-1', student: '张同学', model: '示例模型', protocol: 'anthropic', class: 'narrow',
+      min: 0.000022, max: 0.000262, recommended: 0.000142, student_credits: '0.01562', note: '符合结算阈值' }],
+  }
+  it('只读回放显示样本，取消不扣款，二次确认带令牌并显示实扣结果', async () => {
+    mocks.pendingAudit.mockResolvedValueOnce(preview).mockResolvedValueOnce({
+      ...preview, charged: 1, still_pending: 2, skipped: 0, errors: 0, credits_charged: '0.01562', remaining_pending: 2,
+    }).mockResolvedValueOnce({ ...preview, total: 2, backlog_total: 2, auto_settle: 0 })
+    const view = mountView()
+    await button(view, '只读回放').trigger('click')
+    await flushPromises()
+    expect(mocks.pendingAudit).toHaveBeenCalledWith('beichen', { apply: false, limit: 200 })
+    expect(view.text()).toContain('张同学')
+    expect(view.text()).toContain('已知区间最大误差 0.25 元')
+    await button(view, '批量结算可自动项').trigger('click')
+    expect(view.text()).toContain('1 笔调用真实扣款')
+    await button(view, '取消').trigger('click')
+    expect(mocks.pendingAudit).toHaveBeenCalledTimes(1)
+    await button(view, '批量结算可自动项').trigger('click')
+    await button(view, '确认扣款').trigger('click')
+    await flushPromises()
+    expect(mocks.pendingAudit).toHaveBeenNthCalledWith(2, 'beichen', { apply: true, limit: 200, preview_token: 'preview-one' })
+    expect(view.text()).toContain('已结算 1 笔，仍待核 2 笔，跳过 0 笔，出错 0 笔。本次实扣 0.01562 积分，供应商剩余待核 2 笔')
+    expect(button(view, '批量结算可自动项').attributes('disabled')).toBeDefined()
+  })
+  it('409 清除令牌并要求重新回放', async () => {
+    mocks.pendingAudit.mockResolvedValueOnce(preview).mockRejectedValueOnce(new APIError('已变化', 409, 'pending_audit_changed'))
+    const view = mountView()
+    await button(view, '只读回放').trigger('click')
+    await flushPromises()
+    await button(view, '批量结算可自动项').trigger('click')
+    await button(view, '确认扣款').trigger('click')
+    await flushPromises()
+    expect(view.get('[role="alert"]').text()).toBe('待核集合已变化，请重新回放')
+    expect(view.text()).not.toContain('批量结算可自动项')
+    expect(button(view, '只读回放').attributes('disabled')).toBeUndefined()
   })
 })

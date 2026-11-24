@@ -42,7 +42,37 @@ func pendingThreshold(name string, fallback float64) float64 {
 	return v
 }
 
+type pendingDecision struct {
+	result   pendingaudit.Result
+	adjusted CallMetrics
+	booking  pendingAuditBooking
+}
+
 func auditPendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, protocol string, metrics CallMetrics, headroom int64) error {
+	d, err := decidePendingReport(ctx, tx, callID, protocol, metrics)
+	if err != nil {
+		return err
+	}
+	return writePendingReport(ctx, tx, callID, d, headroom)
+}
+
+func writePendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, d pendingDecision, headroom int64) error {
+	if d.result.Class == pendingaudit.ClassUnknown {
+		return refreshLedgerTurn(ctx, tx, callID, "0", false)
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE gateway_calls SET unresolved_credit_milli=LEAST($3::bigint,1000,GREATEST(1,ceil($2::numeric)))::bigint
+		WHERE id=$1 AND beichen_state='pending_review'`, callID, d.booking.maxCredits, headroom)
+	if err != nil {
+		return err
+	}
+	if !d.result.CanAutoSettle {
+		return refreshLedgerTurn(ctx, tx, callID, "0", false)
+	}
+	return settleBeichenReport(ctx, tx, callID, d.adjusted, &d.booking)
+}
+
+func decidePendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, protocol string, metrics CallMetrics) (pendingDecision, error) {
+	var d pendingDecision
 	in := pendingaudit.Input{
 		Protocol: protocol, PromptTokens: metrics.PromptTokens, CompletionTokens: metrics.CompletionTokens,
 		TotalTokens: metrics.TotalTokens, CacheReadTokens: metrics.CacheHitTokens, CacheWriteTokens: metrics.CacheWriteTokens,
@@ -65,29 +95,27 @@ func auditPendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, proto
 				AND (g.protocol<>'anthropic' OR g.cache_write_tokens IS NOT NULL)
 		) h WHERE c.id=$1`, callID).Scan(&in.InputRate, &in.OutputRate, &in.CacheReadRate, &in.CacheWriteRate, &prior, &ttl)
 	if err != nil {
-		return err
+		return d, err
 	}
 	in.PriorReadShare = &prior
 	result := pendingaudit.Analyze(in, pendingThreshold("NEBULA_PENDING_AUTO_SETTLE_YUAN", 0.001),
 		pendingThreshold("NEBULA_PENDING_AUTO_SETTLE_RELATIVE", 0.01))
+	d.result = result
 	if result.Class == pendingaudit.ClassUnknown {
-		// Keep the current WP2 reserve, including on replay with weaker evidence.
-		return refreshLedgerTurn(ctx, tx, callID, "0", false)
+		return d, nil
 	}
-
-	var booking pendingAuditBooking
-	err = tx.QueryRowContext(ctx, `WITH bound AS (
-		SELECT $2::numeric*100*COALESCE(beichen_school_multiplier,2)
-			AS credits FROM gateway_calls WHERE id=$1
-	)
-	UPDATE gateway_calls SET unresolved_credit_milli=LEAST($3::bigint,1000,GREATEST(1,ceil(bound.credits)))::bigint
-	FROM bound WHERE id=$1 AND beichen_state='pending_review' RETURNING bound.credits::text`,
-		callID, strconv.FormatFloat(result.MaxYuan, 'g', -1, 64), headroom).Scan(&booking.maxCredits)
+	err = tx.QueryRowContext(ctx, `SELECT ($2::numeric*100*COALESCE(beichen_school_multiplier,2))::text
+		FROM gateway_calls WHERE id=$1`, callID, strconv.FormatFloat(result.MaxYuan, 'g', -1, 64)).Scan(&d.booking.maxCredits)
 	if err != nil {
-		return err
+		return d, err
 	}
-	if !result.CanAutoSettle || strings.TrimSpace(os.Getenv("NEBULA_PENDING_AUTO_SETTLE")) == "0" {
-		return refreshLedgerTurn(ctx, tx, callID, "0", false)
+	if !result.CanAutoSettle {
+		return d, nil
+	}
+	if strings.TrimSpace(os.Getenv("NEBULA_PENDING_AUTO_SETTLE")) == "0" {
+		d.result.CanAutoSettle = false
+		d.result.Note = "自动结算已关闭"
+		return d, nil
 	}
 	adjusted := metrics
 	adjusted.State, adjusted.UsageReason = UsageReported, ""
@@ -99,19 +127,24 @@ func auditPendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, proto
 		matches5m := beichenCacheTTL(ttl) == "5m" && metrics.cacheWrite5m != nil && *metrics.cacheWrite5m == result.RecommendedWrite
 		matches1h := beichenCacheTTL(ttl) == "1h" && metrics.cacheWrite1h != nil && *metrics.cacheWrite1h == result.RecommendedWrite
 		if !matches5m && !matches1h {
-			return refreshLedgerTurn(ctx, tx, callID, "0", false)
+			d.result.CanAutoSettle = false
+			d.result.Note = "推荐分项与原始缓存证据或协议不符"
+			return d, nil
 		}
 	}
 	if !adjusted.CanPriceBeichenUsage(protocol) {
-		return refreshLedgerTurn(ctx, tx, callID, "0", false)
+		d.result.CanAutoSettle = false
+		d.result.Note = "推荐分项与原始缓存证据或协议不符"
+		return d, nil
 	}
-	booking.detail, err = json.Marshal(map[string]any{
+	d.booking.detail, err = json.Marshal(map[string]any{
 		"auto_settled": true, "policy_version": "pending-audit-v1", "prior_read_share": prior,
 		"min_yuan": result.MinYuan, "max_yuan": result.MaxYuan, "recommended_yuan": result.RecommendedYuan,
 		"recommended_read_tokens": result.RecommendedRead, "recommended_write_tokens": result.RecommendedWrite,
 	})
 	if err != nil {
-		return err
+		return d, err
 	}
-	return settleBeichenReport(ctx, tx, callID, adjusted, &booking)
+	d.adjusted = adjusted
+	return d, nil
 }

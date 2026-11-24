@@ -108,6 +108,8 @@ Windows 会话保存在 `%LOCALAPPDATA%\Nebula\beichen-session.json`，同目录
 
 `go run ./cmd/pending-audit` 通过只读连接生成北辰待核账报告，包含上游金额区间、推荐缓存拆分和自动结算判定。[参数与判定口径](docs/PENDING_AUDIT.md)
 
+教师可在供应商的北辰对账页只读回放最早的 200 笔待核调用，查看金额区间及预计扣分，再确认批量结算。列表变化后需重新回放。
+
 ## 技术栈
 
 | 领域 | 现在的实现 |

@@ -236,7 +236,7 @@ func errorStatus(code string) int {
 		return http.StatusForbidden
 	case domain.CodeNotFound:
 		return http.StatusNotFound
-	case domain.CodeEmailRegistered, domain.CodeNameConflict, domain.CodeInvalidTransition,
+	case domain.CodePendingAuditChanged, domain.CodeEmailRegistered, domain.CodeNameConflict, domain.CodeInvalidTransition,
 		domain.CodeProjectNoMentor, domain.CodeMentorNotInOrganization, domain.CodeMentorAlreadyProjectMember, domain.CodeMentorNotProjectMember,
 		domain.CodeModelNotReady, domain.CodeModelRoutingRequired,
 		domain.CodeKeyAlreadyClaimed, domain.CodeProjectQuotaAllocation:
