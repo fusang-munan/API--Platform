@@ -50,6 +50,7 @@ const terminalRetryEpochSQL = `CASE WHEN COALESCE(pricing_detail->>'terminal_ret
 const staleTerminalFilter = `beichen_state='pending_review' AND beichen_review_reason='missing_terminal_usage'
 	AND COALESCE(usage_reason,'') NOT IN ` + terminalBlockedUsageSQL + `
 	AND (` + terminalRetryEpochSQL + ` IS NULL OR ` + terminalRetryEpochSQL + ` <= $3)
+ 	AND COALESCE(pricing_detail->>'terminal_blocked','') <> 'true'
 	AND EXTRACT(EPOCH FROM (now()-COALESCE(finalized_at,created_at))) >= $1
 	AND ($2::uuid IS NULL OR provider_id=$2)`
 
@@ -67,15 +68,42 @@ func terminalEvidenceBlocked(reason string) bool {
 // rate and must not be priced as if they were all one duration.
 func observedCacheTTL(m CallMetrics) string {
 	five, one := m.cacheWrite5m, m.cacheWrite1h
-	switch {
-	case five != nil && *five > 0 && one != nil && *one > 0:
+	if five != nil && *five > 0 && one != nil && *one > 0 {
 		return "mixed"
-	case five != nil && *five > 0:
+	}
+	childSum := int64(0)
+	childCount := 0
+	if five != nil {
+		childCount++
+		childSum += *five
+	}
+	if one != nil {
+		childCount++
+		childSum += *one
+	}
+	if childCount > 0 && m.CacheWriteTokens != nil && *m.CacheWriteTokens > childSum {
+		// The parent total proves more writes than the timed children. The
+		// remainder has no confirmed duration; use the cheaper 5-minute rate
+		// rather than charging every write at the longer duration.
 		return "5m"
-	case one != nil && *one > 0:
+	}
+	if five != nil && *five > 0 {
+		return "5m"
+	}
+	if one != nil && *one > 0 {
 		return "1h"
 	}
 	return ""
+}
+
+func terminalInputComplete(m CallMetrics, protocol string) bool {
+	if m.PromptTokens == nil {
+		return false
+	}
+	if protocol != "anthropic" {
+		return true
+	}
+	return m.CacheHitTokens != nil && (m.CacheWriteTokens != nil || (m.cacheWrite5m != nil && m.cacheWrite1h != nil))
 }
 
 func ResolveStaleTerminalPending(ctx context.Context, db *sql.DB, limit int) (TerminalPendingResult, error) {
@@ -185,11 +213,14 @@ func resolveTerminalCall(ctx context.Context, db *sql.DB, provider *uuid.UUID, g
 	// Decide completeness from the stored evidence before knownTerminalMetrics
 	// fills protocol-required zero counters. A filled zero is not an observed
 	// input count and must not unlock a cheaper price tier.
-	inputComplete := m.PromptTokens != nil && (protocol != "anthropic" ||
-		(m.CacheHitTokens != nil && (m.CacheWriteTokens != nil || (m.cacheWrite5m != nil && m.cacheWrite1h != nil))))
+	inputComplete := terminalInputComplete(m, protocol)
 	input, output, reason := knownTerminalMetrics(&m, protocol)
 	if terminalEvidenceBlocked(reason) {
-		return false, nil
+		if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET pricing_detail=COALESCE(pricing_detail,'{}'::jsonb) ||
+			jsonb_build_object('terminal_blocked',true) WHERE id=$1`, id); err != nil {
+			return false, err
+		}
+		return false, tx.Commit()
 	}
 	if mixedCacheTTL {
 		reason = "unknown_cache_ttl"
@@ -248,6 +279,7 @@ func markTerminalRetry(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 // call row. A total can contradict known parts but never supplies missing output.
 func knownTerminalMetrics(m *CallMetrics, protocol string) (input, output int64, reason string) {
 	zero := int64(0)
+	inputComplete := terminalInputComplete(*m, protocol)
 	outputKnown := m.CompletionTokens != nil
 	if m.CompletionTokens == nil {
 		m.CompletionTokens = &zero
@@ -319,18 +351,18 @@ func knownTerminalMetrics(m *CallMetrics, protocol string) (input, output int64,
 	// billable part proves an unaccounted category. Do not quietly book the
 	// known parts and discard the contradiction. A missing output is different:
 	// the extra total can legitimately be the output we were not told about.
-	if outputKnown && m.TotalTokens != nil && *m.TotalTokens > input+output {
+	if outputKnown && inputComplete && m.TotalTokens != nil && *m.TotalTokens > input+output {
 		switch protocol {
 		case "openai_compatible", "openai_responses", "anthropic":
 			return input, output, "inconsistent_token_total"
 		}
 	}
-	if input == 0 && output == 0 {
-		return input, output, "no_known_billable_tokens"
-	}
 	switch m.UsageReason {
 	case "invalid_usage_payload", "invalid_token_count", "conflicting_usage_fields", cacheWriteConflictReason, "inconsistent_token_total", "inconsistent_token_breakdown":
 		return input, output, m.UsageReason
+	}
+	if input == 0 && output == 0 {
+		return input, output, "no_known_billable_tokens"
 	}
 	m.TotalTokens = nil
 	m.State, m.UsageReason = UsageReported, ""

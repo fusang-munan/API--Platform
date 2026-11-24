@@ -468,6 +468,10 @@ func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge
 	if err := postLedgerCharge(ctx, tx, callID, milli); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE gateway_calls SET pricing_detail=COALESCE(pricing_detail,'{}'::jsonb)
+		-'terminal_retry_epoch'-'terminal_blocked' WHERE id=$1`, callID); err != nil {
+		return err
+	}
 	return refreshLedgerTurn(ctx, tx, callID, milli, true)
 }
 
