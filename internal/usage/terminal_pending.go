@@ -68,6 +68,15 @@ func terminalEvidenceBlocked(reason string) bool {
 // rate and must not be priced as if they were all one duration.
 func observedCacheTTL(m CallMetrics) string {
 	five, one := m.cacheWrite5m, m.cacheWrite1h
+	// An explicitly reported zero rules out that duration. If the parent
+	// total is positive, the writes must belong to the other duration; using
+	// the zero duration's rate would charge the wrong tariff.
+	if five != nil && *five == 0 && (one == nil || *one > 0) {
+		return "1h"
+	}
+	if one != nil && *one == 0 && (five == nil || *five > 0) {
+		return "5m"
+	}
 	if five != nil && *five > 0 && one != nil && *one > 0 {
 		return "mixed"
 	}
