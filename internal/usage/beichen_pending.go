@@ -123,6 +123,7 @@ func decidePendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, prot
 	adjusted := metrics
 	adjusted.State, adjusted.UsageReason = UsageReported, ""
 	adjusted.CacheHitTokens, adjusted.CacheWriteTokens = &result.RecommendedRead, &result.RecommendedWrite
+	adjusted.CacheTTL = observedCacheTTL(metrics)
 	adjusted = adjusted.ClassifyBeichenUsage(protocol)
 	if metrics.UsageReason == cacheWriteSubtotalOnlyReason {
 		// A single observed duration is a subtotal. Only use this split if all

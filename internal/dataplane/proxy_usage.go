@@ -474,7 +474,11 @@ func (g *Gateway) proxySSE(w http.ResponseWriter, original *http.Request, respon
 		}
 		metrics, review := beichenReviewMetrics(observer.adapter, metrics, observer.review)
 		if interrupted {
-			_ = g.finalizeCall(ctx, reservation, false, "stream", "Upstream stream did not complete.", candidate, metrics)
+			category, message := "stream", "Upstream stream did not complete."
+			if review != "" {
+				category, message = review, "The response requires billing review."
+			}
+			_ = g.finalizeCall(ctx, reservation, false, category, message, candidate, metrics)
 		} else {
 			message := ""
 			if review != "" {

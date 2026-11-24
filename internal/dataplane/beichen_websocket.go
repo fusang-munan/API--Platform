@@ -90,7 +90,7 @@ func (g *Gateway) proxyBeichenWebSocket(ctx context.Context, client, upstream *w
 			active.review = beichenModelUnconfirmed
 		}
 		metrics, review := beichenReviewMetrics(adapter, active.metrics.finished(!success), active.review)
-		if success && review != "" {
+		if review != "" {
 			category, message = review, "The response requires billing review."
 		}
 		_ = g.finalizeCall(ctx, active.reservation, success, category, message, active.route, metrics)

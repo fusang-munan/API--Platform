@@ -41,8 +41,15 @@ func terminalSetting(name string, fallback int) int {
 // policy.
 const terminalBlockedUsageSQL = `('invalid_usage_payload','invalid_token_count','conflicting_usage_fields','conflicting_cache_creation_counts','inconsistent_token_total','inconsistent_token_breakdown')`
 
+// A failed booking is parked for just under one worker interval. The marker lives in the
+// existing JSONB evidence column so no migration is needed, and failed rows
+// cannot occupy every candidate window forever.
+const terminalRetryEpochSQL = `CASE WHEN COALESCE(pricing_detail->>'terminal_retry_epoch','') ~ '^[0-9]+$'
+	THEN (pricing_detail->>'terminal_retry_epoch')::bigint END`
+
 const staleTerminalFilter = `beichen_state='pending_review' AND beichen_review_reason='missing_terminal_usage'
 	AND COALESCE(usage_reason,'') NOT IN ` + terminalBlockedUsageSQL + `
+	AND (` + terminalRetryEpochSQL + ` IS NULL OR ` + terminalRetryEpochSQL + ` <= $3)
 	AND EXTRACT(EPOCH FROM (now()-COALESCE(finalized_at,created_at))) >= $1
 	AND ($2::uuid IS NULL OR provider_id=$2)`
 
@@ -53,6 +60,22 @@ func terminalEvidenceBlocked(reason string) bool {
 		return true
 	}
 	return false
+}
+
+// observedCacheTTL turns the response's cache-creation children into the
+// duration that was actually billed. Mixed non-zero durations have no single
+// rate and must not be priced as if they were all one duration.
+func observedCacheTTL(m CallMetrics) string {
+	five, one := m.cacheWrite5m, m.cacheWrite1h
+	switch {
+	case five != nil && *five > 0 && one != nil && *one > 0:
+		return "mixed"
+	case five != nil && *five > 0:
+		return "5m"
+	case one != nil && *one > 0:
+		return "1h"
+	}
+	return ""
 }
 
 func ResolveStaleTerminalPending(ctx context.Context, db *sql.DB, limit int) (TerminalPendingResult, error) {
@@ -75,10 +98,12 @@ func resolveTerminalPending(ctx context.Context, db *sql.DB, provider *uuid.UUID
 	// One persistently failing row must not occupy the whole batch. Read a
 	// wider candidate window and count only successful settlements toward the
 	// batch limit; errors stay in the queue for the next scan.
-	window := min(500, max(50, limit*4))
+	window := min(500, max(200, limit*8))
 	grace := max(60, terminalSetting("NEBULA_TERMINAL_PENDING_GRACE_SECONDS", 300))
+	retryBefore := time.Now().Add(-55 * time.Second).Unix()
 	rows, err := db.QueryContext(ctx, `SELECT id FROM gateway_calls WHERE `+staleTerminalFilter+
-		` ORDER BY COALESCE(finalized_at,created_at),id LIMIT $3`, grace, provider, window)
+		` ORDER BY (`+terminalRetryEpochSQL+` IS NOT NULL),COALESCE(finalized_at,created_at),id LIMIT $4`,
+		grace, provider, retryBefore, window)
 	if err != nil {
 		return result, err
 	}
@@ -98,13 +123,18 @@ func resolveTerminalPending(ctx context.Context, db *sql.DB, provider *uuid.UUID
 		if result.Resolved >= limit {
 			break
 		}
-		resolved, err := resolveTerminalCall(ctx, db, provider, grace, id)
+		resolved, err := resolveTerminalCall(ctx, db, provider, grace, retryBefore, id)
 		if err != nil {
 			if ctx.Err() != nil {
 				return result, ctx.Err()
 			}
 			slog.ErrorContext(ctx, "缺终态结算失败", "call_id", id, "error", err)
 			result.Errors++
+			if ctx.Err() == nil {
+				if markErr := markTerminalRetry(ctx, db, id); markErr != nil {
+					slog.WarnContext(ctx, "记录缺终态重试时间失败", "call_id", id, "error", markErr)
+				}
+			}
 		} else if resolved {
 			result.Resolved++
 		}
@@ -112,7 +142,7 @@ func resolveTerminalPending(ctx context.Context, db *sql.DB, provider *uuid.UUID
 	return result, nil
 }
 
-func resolveTerminalCall(ctx context.Context, db *sql.DB, provider *uuid.UUID, grace int, id uuid.UUID) (bool, error) {
+func resolveTerminalCall(ctx context.Context, db *sql.DB, provider *uuid.UUID, grace int, retryBefore int64, id uuid.UUID) (bool, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -128,7 +158,7 @@ func resolveTerminalCall(ctx context.Context, db *sql.DB, provider *uuid.UUID, g
 			THEN (pricing_detail->>'cache_write_5m_tokens')::bigint END,
 		CASE WHEN COALESCE(pricing_detail->>'cache_write_1h_tokens','') ~ '^[0-9]+$'
 			THEN (pricing_detail->>'cache_write_1h_tokens')::bigint END
-		FROM gateway_calls WHERE `+staleTerminalFilter+` AND id=$3 FOR UPDATE`, grace, provider, id).
+		FROM gateway_calls WHERE `+staleTerminalFilter+` AND id=$4 FOR UPDATE`, grace, provider, retryBefore, id).
 		Scan(&protocol, &m.PromptTokens, &m.CompletionTokens, &m.TotalTokens, &m.CacheHitTokens, &m.CacheMissTokens, &m.CacheWriteTokens, &m.UsageReason,
 			&m.cacheWrite5m, &m.cacheWrite1h)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -137,14 +167,32 @@ func resolveTerminalCall(ctx context.Context, db *sql.DB, provider *uuid.UUID, g
 	if err != nil {
 		return false, err
 	}
+	if _, err = tx.ExecContext(ctx, `UPDATE gateway_calls SET pricing_detail=COALESCE(pricing_detail,'{}'::jsonb)-'terminal_retry_epoch' WHERE id=$1`, id); err != nil {
+		return false, err
+	}
+	// Prefer the cache duration the upstream actually reported. A request can
+	// ask for 1h while the response proves only 5m writes; pricing those writes
+	// at the 1h rate would overcharge. Mixed durations cannot be represented by
+	// one rate, so they are written off with an explicit reason instead.
+	mixedCacheTTL := false
+	if protocol == "anthropic" {
+		m.CacheTTL = observedCacheTTL(m)
+		if m.CacheTTL == "mixed" {
+			mixedCacheTTL = true
+			m.CacheTTL = ""
+		}
+	}
 	// Decide completeness from the stored evidence before knownTerminalMetrics
 	// fills protocol-required zero counters. A filled zero is not an observed
 	// input count and must not unlock a cheaper price tier.
 	inputComplete := m.PromptTokens != nil && (protocol != "anthropic" ||
-		(m.CacheHitTokens != nil && (m.CacheWriteTokens != nil || m.cacheWrite5m != nil || m.cacheWrite1h != nil || m.cacheWriteReported != nil)))
+		(m.CacheHitTokens != nil && (m.CacheWriteTokens != nil || (m.cacheWrite5m != nil && m.cacheWrite1h != nil))))
 	input, output, reason := knownTerminalMetrics(&m, protocol)
 	if terminalEvidenceBlocked(reason) {
 		return false, nil
+	}
+	if mixedCacheTTL {
+		reason = "unknown_cache_ttl"
 	}
 	var charge beichenCharge
 	if reason == "" {
@@ -190,10 +238,17 @@ func resolveTerminalCall(ctx context.Context, db *sql.DB, provider *uuid.UUID, g
 	return true, tx.Commit()
 }
 
+func markTerminalRetry(ctx context.Context, db *sql.DB, id uuid.UUID) error {
+	_, err := db.ExecContext(ctx, `UPDATE gateway_calls SET pricing_detail=COALESCE(pricing_detail,'{}'::jsonb) ||
+		jsonb_build_object('terminal_retry_epoch',$2::bigint) WHERE id=$1 AND beichen_state='pending_review'`, id, time.Now().Unix())
+	return err
+}
+
 // Prepare a pricing-only copy. Keep the original nullable observations in the
 // call row. A total can contradict known parts but never supplies missing output.
 func knownTerminalMetrics(m *CallMetrics, protocol string) (input, output int64, reason string) {
 	zero := int64(0)
+	outputKnown := m.CompletionTokens != nil
 	if m.CompletionTokens == nil {
 		m.CompletionTokens = &zero
 	}
@@ -259,6 +314,16 @@ func knownTerminalMetrics(m *CallMetrics, protocol string) (input, output int64,
 	if *m.PromptTokens < 0 || output < 0 || input > math.MaxInt64-output ||
 		(m.TotalTokens != nil && *m.TotalTokens < input+output) {
 		return input, output, "inconsistent_token_total"
+	}
+	// When output was explicitly reported, a total larger than every known
+	// billable part proves an unaccounted category. Do not quietly book the
+	// known parts and discard the contradiction. A missing output is different:
+	// the extra total can legitimately be the output we were not told about.
+	if outputKnown && m.TotalTokens != nil && *m.TotalTokens > input+output {
+		switch protocol {
+		case "openai_compatible", "openai_responses", "anthropic":
+			return input, output, "inconsistent_token_total"
+		}
 	}
 	if input == 0 && output == 0 {
 		return input, output, "no_known_billable_tokens"

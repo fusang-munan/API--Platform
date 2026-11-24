@@ -244,6 +244,9 @@ const derivedPriceSource = "derived_from_usage"
 
 func settleBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metrics CallMetrics, audit *pendingAuditBooking) error {
 	// Callers hold the call row lock through settlement.
+	if metrics.CacheTTL == "" {
+		metrics.CacheTTL = observedCacheTTL(metrics)
+	}
 	charge, reason, missingRate, err := quoteBeichenReport(ctx, tx, callID, metrics)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
@@ -287,7 +290,7 @@ func quoteBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metri
 		p.mode,p.upstream_version,p.multiplier_version,COALESCE(version.source,''),
 		num_nonnulls(p.school_input,p.school_output,p.school_cache_read,p.school_cache_write)=0,
 		jsonb_build_array(p.school_input,p.school_output,p.school_cache_read,p.school_cache_write),
-		c.protocol,c.reasoning_effort,COALESCE(c.cache_ttl,''),
+		c.protocol,c.reasoning_effort,COALESCE(NULLIF($7,''),c.cache_ttl,''),
 		quote.terms,quote.multiplier_version,trim_scale(quote.multiplier)::text,
 		CASE
 		  WHEN COALESCE($4::bigint,0)>0 AND p.upstream_cache_read IS NULL THEN 'missing_cache_read_price'
@@ -305,7 +308,7 @@ func quoteBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metri
 		) cost`+beichenConditionQuoteJoin+`
 		WHERE c.id=$1 AND c.beichen_state='pending_review'
 		  AND c.beichen_price_at IS NOT NULL`, callID, metrics.PromptTokens, metrics.CompletionTokens,
-		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens).Scan(
+		metrics.CacheHitTokens, metrics.CacheMissTokens, metrics.CacheWriteTokens, metrics.CacheTTL).Scan(
 		&school, &upstream, &mode, &charge.upstreamVersion, &charge.multiplierVersion, &upstreamSource, &noFixedSchool,
 		&fixedRates, &protocol, &effort, &ttl, &terms, &quoteVersion, &quoteMultiplier, &missingRate)
 
