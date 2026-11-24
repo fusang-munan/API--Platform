@@ -54,20 +54,28 @@ func (s *Server) beichenReconciliation(c *gin.Context) {
 }
 
 func (s *Server) beichenPendingAudit(c *gin.Context) {
-	c.Header("Cache-Control", "private, no-store")
 	id, ok := pathID(c, "provider_id")
 	if !ok {
 		return
 	}
 	var body struct {
-		Apply bool   `json:"apply"`
-		Limit int    `json:"limit" binding:"min=0"`
-		Token string `json:"preview_token"`
+		Apply  bool   `json:"apply"`
+		Limit  int    `json:"limit" binding:"min=0"`
+		Offset int    `json:"offset"`
+		Token  string `json:"preview_token"`
 	}
 	if !bindJSON(c, &body) {
 		return
 	}
-	result, err := s.service.Beichen().PendingAudit(c.Request.Context(), id, body.Apply, body.Limit, body.Token)
+	if body.Offset < 0 {
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
+			"error": gin.H{"code": domain.CodeValidation, "message": "offset 须为非负整数",
+				"details": []gin.H{{"field": "offset", "reason": "out_of_range"}}},
+			"request_id": requestID(c),
+		})
+		return
+	}
+	result, err := s.service.Beichen().PendingAudit(c.Request.Context(), id, body.Apply, body.Limit, body.Offset, body.Token)
 	if err != nil {
 		writeError(c, err)
 		return

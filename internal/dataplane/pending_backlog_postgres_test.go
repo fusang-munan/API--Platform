@@ -21,7 +21,8 @@ func TestBeichenPendingBacklogPostgres(t *testing.T) {
 	t.Setenv("NEBULA_PENDING_AUTO_SETTLE", "0")
 	send("narrow", `,"total_tokens":102`)
 	send("wide", `,"total_tokens":100002`)
-	send("unknown", "")
+	send("unpriced", `,"total_tokens":102`)
+	f.exec(t, `UPDATE gateway_calls SET beichen_price_at=NULL WHERE request_id='unpriced'`)
 	send("other", `,"total_tokens":102`)
 	other := uuid.New()
 	f.exec(t, `INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES ($1,'other','https://fixture.invalid',now(),now())`, other)
@@ -30,7 +31,7 @@ func TestBeichenPendingBacklogPostgres(t *testing.T) {
 	t.Setenv("NEBULA_PENDING_AUTO_SETTLE", "1")
 	audit := func(apply bool, limit int, token string) usage.PendingBacklogReport {
 		t.Helper()
-		data, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, apply, limit, token)
+		data, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, apply, limit, 0, token)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -38,7 +39,7 @@ func TestBeichenPendingBacklogPostgres(t *testing.T) {
 	}
 	stale := func(limit int, token string) {
 		t.Helper()
-		_, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, true, limit, token)
+		_, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, true, limit, 0, token)
 		if domain.ErrorCode(err) != domain.CodePendingAuditChanged {
 			t.Fatalf("expected stale token: %v", err)
 		}
@@ -62,6 +63,9 @@ func TestBeichenPendingBacklogPostgres(t *testing.T) {
 	if all.Total != 3 || all.Narrow != 1 || all.Wide != 1 || all.Unknown != 1 || all.AutoSettle != 1 || all.Rows[0].StudentCredits != "0.01562" || all.MaxErrorYuan <= 0 || all.EstimatedAutoYuan != 0.000142 {
 		t.Fatalf("preview: %+v", all)
 	}
+	if all.BacklogTotal != 3 || all.RemainingPending != 3 || len(all.Rows) != 3 || all.Rows[2].Class != "unknown" || all.Rows[2].Auto || !strings.Contains(all.Rows[2].Note, "缺少派发价格") {
+		t.Fatalf("unpriced call missing from backlog: %+v", all)
+	}
 	if first.Total != 1 || first.BacklogTotal != 3 || first.Rows[0].ID != all.Rows[0].ID {
 		t.Fatalf("limit: %+v", first)
 	}
@@ -71,6 +75,7 @@ func TestBeichenPendingBacklogPostgres(t *testing.T) {
 		t.Fatal("preview or invalid token wrote to the ledger")
 	}
 	send("new-unknown", "")
+	f.exec(t, `UPDATE gateway_calls SET beichen_price_at=NULL WHERE request_id='new-unknown'`)
 	stale(1, first.PreviewToken)
 	stale(200, all.PreviewToken)
 	latest := audit(false, 5000, "")
@@ -82,13 +87,57 @@ func TestBeichenPendingBacklogPostgres(t *testing.T) {
 	var ok bool
 	err := f.db.QueryRowContext(f.ctx, `SELECT bool_and(CASE request_id
  WHEN 'narrow' THEN beichen_state='charged' AND student_credits=0.01562 AND unresolved_credit_milli=0
- WHEN 'wide' THEN beichen_state='pending_review' AND unresolved_credit_milli=28
+ WHEN 'wide' THEN beichen_state='pending_review' AND unresolved_credit_milli=1
+ WHEN 'unpriced' THEN beichen_state='pending_review' AND beichen_price_at IS NULL AND student_credits IS NULL
  WHEN 'other' THEN beichen_state='pending_review' AND unresolved_credit_milli=1
  ELSE beichen_state='pending_review' AND unresolved_credit_milli=10 END) FROM gateway_calls`).Scan(&ok)
 	if err != nil || !ok {
 		t.Fatalf("unexpected balances: %v", err)
 	}
 	assertBeichenGatewayMonth(t, f.ctx, f.db, "narrow", "0.01562", 1)
+}
+
+func TestBeichenPendingBacklogPagesPostgres(t *testing.T) {
+	f := newPendingGateway(t)
+	t.Setenv("NEBULA_PENDING_AUTO_SETTLE", "0")
+	f.respond(`,"total_tokens":102`)
+	if w := f.request("last"); w.Code != 200 {
+		t.Fatalf("HTTP %d", w.Code)
+	}
+	// Put 200 unpriced calls before the single eligible call.
+	f.exec(t, `INSERT INTO gateway_calls SELECT (jsonb_populate_record(NULL::gateway_calls,
+ to_jsonb(c) || jsonb_build_object('id',gen_random_uuid(),'request_id','old-'||i,'turn_id',NULL,
+ 'beichen_price_at',NULL,'created_at',c.created_at - interval '1 day'))).*
+ FROM gateway_calls c CROSS JOIN generate_series(1,200) i WHERE request_id='last'`)
+	t.Setenv("NEBULA_PENDING_AUTO_SETTLE", "1")
+	page := func(offset int) usage.PendingBacklogReport {
+		t.Helper()
+		r, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, false, 0, offset, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	first := page(0)
+	if first.Total != 200 || first.Unknown != 200 || first.AutoSettle != 0 || first.BacklogTotal != 201 || first.NextOffset == nil || *first.NextOffset != 200 {
+		t.Fatalf("first page: total=%d unknown=%d backlog=%d next=%v", first.Total, first.Unknown, first.BacklogTotal, first.NextOffset)
+	}
+	last := page(*first.NextOffset)
+	if last.Total != 1 || last.AutoSettle != 1 || last.BacklogTotal != 201 || last.NextOffset != nil || last.PreviewToken == first.PreviewToken {
+		t.Fatalf("last page: %+v", last)
+	}
+	for _, mismatch := range []struct {
+		offset int
+		token  string
+	}{{200, first.PreviewToken}, {0, last.PreviewToken}, {202, page(201).PreviewToken}} {
+		if _, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, true, 200, mismatch.offset, mismatch.token); domain.ErrorCode(err) != domain.CodePendingAuditChanged {
+			t.Fatalf("accepted wrong page at %d: %v", mismatch.offset, err)
+		}
+	}
+	r, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, true, 200, 200, last.PreviewToken)
+	if err != nil || r.Charged != 1 || r.RemainingPending != 200 || r.CreditsCharged != "0.01562" {
+		t.Fatalf("book last page: %+v %v", r, err)
+	}
 }
 
 func TestBeichenPendingBacklogConfirmationPostgres(t *testing.T) {
@@ -112,7 +161,7 @@ func TestBeichenPendingBacklogConfirmationPostgres(t *testing.T) {
 		t.Fatalf("HTTP %d", w.Code)
 	}
 	t.Setenv("NEBULA_PENDING_AUTO_SETTLE", "1")
-	preview, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, false, 200, "")
+	preview, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, false, 200, 0, "")
 	if err != nil || preview.AutoSettle != 1 || preview.Narrow != 2 || preview.Exact != 1 || preview.Rows[0].StudentCredits != "0.01562" {
 		t.Fatalf("preview=%+v err=%v", preview, err)
 	}
@@ -123,7 +172,7 @@ func TestBeichenPendingBacklogConfirmationPostgres(t *testing.T) {
 	done := make(chan outcome, 2)
 	for range 2 {
 		go func() {
-			result, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, true, 200, preview.PreviewToken)
+			result, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, true, 200, 0, preview.PreviewToken)
 			done <- outcome{result, err}
 		}()
 	}
@@ -161,11 +210,11 @@ func TestBeichenPendingBacklogPartialFailurePostgres(t *testing.T) {
 	t.Setenv("NEBULA_PENDING_AUTO_SETTLE", "1")
 	run := func() usage.PendingBacklogReport {
 		t.Helper()
-		preview, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, false, 200, "")
+		preview, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, false, 200, 0, "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		result, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, true, 200, preview.PreviewToken)
+		result, err := usage.PendingAuditBacklog(f.ctx, f.db, f.provider, true, 200, 0, preview.PreviewToken)
 		if err != nil {
 			t.Fatal(err)
 		}

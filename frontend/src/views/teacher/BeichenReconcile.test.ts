@@ -1,4 +1,4 @@
-import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import { DOMWrapper, flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BeichenReconcile as ReconcileData, BeichenReconcileSide, BeichenUsageRange, Provider } from '../../api/types'
 import { creditsToYuan } from '../../utils/credits'
@@ -676,6 +676,23 @@ describe('供应商行集成', () => {
 })
 
 describe('存量待核回放', () => {
+  async function openConfirmation(view: VueWrapper) {
+    await button(view, '批量结算可自动项').trigger('click')
+    const element = await vi.waitFor(() => {
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"][aria-modal="true"]')
+      if (!dialog) throw new Error('未打开确认弹窗')
+      return dialog
+    })
+    return new DOMWrapper(element)
+  }
+  async function closeConfirmation(action: '取消' | '确认扣款' | 'Escape', view: VueWrapper) {
+    const dialog = await openConfirmation(view)
+    expect(dialog.text()).toContain('确认批量结算')
+    expect(dialog.text()).toContain('1 笔调用真实扣款')
+    if (action === 'Escape') await dialog.trigger('keydown', { key: 'Escape' })
+    else await dialog.findAll('button').find(node => node.text() === action)!.trigger('click')
+    await vi.waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeNull())
+  }
   const preview = {
     provider_id: 'beichen', preview_token: 'preview-one', total: 3, backlog_total: 3,
     auto_settle: 1, exact: 0, narrow: 1, wide: 1, unknown: 1, max_error_yuan: 0.25, estimated_auto_yuan: 0.000142,
@@ -689,28 +706,35 @@ describe('存量待核回放', () => {
     const view = mountView()
     await button(view, '只读回放').trigger('click')
     await flushPromises()
-    expect(mocks.pendingAudit).toHaveBeenCalledWith('beichen', { apply: false, limit: 200 })
+    expect(mocks.pendingAudit).toHaveBeenCalledWith('beichen', { apply: false, limit: 200, offset: 0 })
     expect(view.text()).toContain('张同学')
     expect(view.text()).toContain('已知区间最大误差 0.25 元')
-    await button(view, '批量结算可自动项').trigger('click')
-    expect(view.text()).toContain('1 笔调用真实扣款')
-    await button(view, '取消').trigger('click')
+    await closeConfirmation('取消', view)
+    await closeConfirmation('Escape', view)
     expect(mocks.pendingAudit).toHaveBeenCalledTimes(1)
-    await button(view, '批量结算可自动项').trigger('click')
-    await button(view, '确认扣款').trigger('click')
+    await closeConfirmation('确认扣款', view)
     await flushPromises()
-    expect(mocks.pendingAudit).toHaveBeenNthCalledWith(2, 'beichen', { apply: true, limit: 200, preview_token: 'preview-one' })
+    expect(mocks.pendingAudit).toHaveBeenNthCalledWith(2, 'beichen', { apply: true, limit: 200, offset: 0, preview_token: 'preview-one' })
     expect(view.text()).toContain('已结算 1 笔，仍待核 2 笔，跳过 0 笔，出错 0 笔。本次实扣 0.01562 积分，供应商剩余待核 2 笔')
     expect(button(view, '批量结算可自动项').attributes('disabled')).toBeDefined()
   })
-  it('409 清除令牌并要求重新回放', async () => {
-    mocks.pendingAudit.mockResolvedValueOnce(preview).mockRejectedValueOnce(new APIError('已变化', 409, 'pending_audit_changed'))
+  it('首批无可结算项时提示翻页，末批按自己的令牌确认，409 后要求重新回放', async () => {
+    mocks.pendingAudit.mockResolvedValueOnce({ ...preview, total: 200, backlog_total: 201, auto_settle: 0, next_offset: 200 })
+      .mockResolvedValueOnce({ ...preview, total: 1, backlog_total: 201, next_offset: null, preview_token: 'page-two' })
+      .mockRejectedValueOnce(new APIError('已变化', 409, 'pending_audit_changed'))
     const view = mountView()
     await button(view, '只读回放').trigger('click')
     await flushPromises()
-    await button(view, '批量结算可自动项').trigger('click')
-    await button(view, '确认扣款').trigger('click')
+    expect(view.text()).toContain('请继续查看下一批')
+    expect(button(view, '批量结算可自动项').attributes('disabled')).toBeDefined()
+    await button(view, '查看下一批').trigger('click')
     await flushPromises()
+    expect(mocks.pendingAudit).toHaveBeenNthCalledWith(2, 'beichen', { apply: false, limit: 200, offset: 200 })
+    expect(view.text()).toContain('第 201 至 201 笔')
+    expect(view.text()).not.toContain('查看下一批')
+    await closeConfirmation('确认扣款', view)
+    await flushPromises()
+    expect(mocks.pendingAudit).toHaveBeenNthCalledWith(3, 'beichen', { apply: true, limit: 200, offset: 200, preview_token: 'page-two' })
     expect(view.get('[role="alert"]').text()).toBe('待核集合已变化，请重新回放')
     expect(view.text()).not.toContain('批量结算可自动项')
     expect(button(view, '只读回放').attributes('disabled')).toBeUndefined()

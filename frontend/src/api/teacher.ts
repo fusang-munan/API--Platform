@@ -71,7 +71,7 @@ export const teacherAPI = {
     const query = new URLSearchParams({ range, ...(providerID ? { provider_id: providerID } : {}) })
     return get<BeichenModelUsage>(`/api/v1/teacher/model-usage?${query}`)
   },
-  pendingAudit: (id: string, body: { apply: false; limit: number } | { apply: true; limit: number; preview_token: string }) =>
+  pendingAudit: (id: string, body: { apply: false; limit: number; offset?: number } | { apply: true; limit: number; offset?: number; preview_token: string }) =>
     post<PendingAuditReport>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/pending-audit`, body),
   beichenReconciliation: (id: string, range: BeichenUsageRange,
     options?: { unmatchedScope?: 'observed' | 'comparable'; unmatchedCursor?: string }) => {

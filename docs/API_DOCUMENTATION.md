@@ -568,11 +568,11 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 **存量待核回放与结算**
 
-教师专用 `POST /api/v1/teacher/providers/:provider_id/beichen/pending-audit` 返回 `Cache-Control: private, no-store`。发送 `{"apply":false,"limit":200}` 获取预览。确认时发送相同 limit、`apply:true` 和 `preview_token`。默认 200、上限 500，按创建时间和 ID 升序。
+教师专用 `POST /api/v1/teacher/providers/:provider_id/beichen/pending-audit` 的成功和错误响应均返回 `Cache-Control: private, no-store`。发送 `{"apply":false,"limit":200,"offset":0}` 获取预览。按创建时间和 ID 升序，limit 默认 200、上限 500，offset 默认 0，负数返回 422。将 next_offset 用于读取下一批，末批返回 null。确认时发送相同 offset、有效 limit、`apply:true` 和本批 preview_token。
 
-响应 data 含 provider_id、generated_at、backlog_total（全部符合条件的待核数）、total（本批笔数）、exact/narrow/wide/unknown、auto_settle、max_error_yuan、estimated_auto_yuan、preview_token 和 rows。样本包含 id/student/model/protocol/reason/class/min/max/recommended/note、can_auto_settle 及可结算项的 student_credits。金额区间和推荐金额单位均为上游元。unknown 无可用区间。
+响应 data 含 provider_id、generated_at、backlog_total（该供应商预览时全部待核数，含无派发价格记录）、total（本批笔数）、next_offset、exact/narrow/wide/unknown、auto_settle、max_error_yuan、estimated_auto_yuan、preview_token 和 rows。样本包含 id/student/model/protocol/reason/class/min/max/recommended/note、can_auto_settle 及可结算项的 student_credits。金额区间和推荐金额单位均为上游元。缺少派发价格时 class 为 unknown，note 说明原因，保留待核。
 
-结算结果 charged/still_pending/skipped/errors 为本批笔数，credits_charged 为实际扣除积分的精确十进制字符串，remaining_pending 为供应商剩余符合条件的待核总数。缺少令牌或快照不符返回 409 pending_audit_changed。
+结算结果 charged/still_pending/skipped/errors 为本批笔数。无法自动结算的行计入 still_pending。credits_charged 为实际扣除积分的精确十进制字符串，remaining_pending 为结算后该供应商全部待核数，含无派发价格记录。缺少令牌、跨页使用或确认时快照不符均返回 409 pending_audit_changed；批次外新增待核也会使令牌失效。结算后从首页重新回放。
 
 `GET /api/v1/teacher/model-usage` 与 `GET .../beichen/reconciliation` 仅允许教师，均返回 `Cache-Control: private, no-store`。`range` 省略或为空时为 `all`；只接受 `day`、`month`、`all`，其他值返回 **422 `VALIDATION_ERROR`**（`details.field=range`）。无效 UUID 返回 400；显式指定不存在或非北辰供应商返回 404；未登录 401、角色不符 403、数据库不可用 503。
 

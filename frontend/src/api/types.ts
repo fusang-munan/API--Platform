@@ -18,6 +18,7 @@ export interface PendingAuditReport {
   generated_at: string
   total: number
   backlog_total: number
+  next_offset: number | null
   exact: number
   narrow: number
   wide: number

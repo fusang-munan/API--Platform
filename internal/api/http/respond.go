@@ -121,6 +121,11 @@ func (s *Server) authenticate() gin.HandlerFunc {
 	}
 }
 
+func privateNoStore(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	c.Next()
+}
+
 func requireRole(role string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if identity(c).Role != role {

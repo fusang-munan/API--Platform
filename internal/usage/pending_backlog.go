@@ -38,6 +38,7 @@ type PendingBacklogReport struct {
 	GeneratedAt       time.Time           `json:"generated_at"`
 	Total             int                 `json:"total"`
 	BacklogTotal      int                 `json:"backlog_total"`
+	NextOffset        *int                `json:"next_offset"`
 	Exact             int                 `json:"exact"`
 	Narrow            int                 `json:"narrow"`
 	Wide              int                 `json:"wide"`
@@ -55,16 +56,19 @@ type PendingBacklogReport struct {
 	RemainingPending  int                 `json:"remaining_pending"`
 }
 
-const backlogFilter = `provider_id=$1 AND beichen_state='pending_review' AND beichen_price_at IS NOT NULL`
+const backlogFilter = `provider_id=$1 AND beichen_state='pending_review'`
 
 // PendingAuditBacklog confirms one snapshot, then rechecks each confirmed row
 // under the same student-before-call lock order used by gateway finalization.
-func PendingAuditBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, apply bool, limit int, previewToken string) (PendingBacklogReport, error) {
+func PendingAuditBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, apply bool, limit, offset int, previewToken string) (PendingBacklogReport, error) {
+	if offset < 0 {
+		return PendingBacklogReport{}, domain.NewError(domain.CodeValidation, "offset must be non-negative")
+	}
 	if limit <= 0 {
 		limit = 200
 	}
 	limit = min(limit, 500)
-	report, err := previewBacklog(ctx, db, providerID, limit)
+	report, err := previewBacklog(ctx, db, providerID, limit, offset)
 	if err != nil || !apply {
 		return report, err
 	}
@@ -73,6 +77,10 @@ func PendingAuditBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, 
 	}
 	var sum big.Rat
 	for _, row := range report.Rows {
+		if !row.Auto {
+			report.StillPending++
+			continue
+		}
 		status, debit, err := applyBacklogRow(ctx, db, providerID, row)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -97,7 +105,7 @@ func PendingAuditBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, 
 	return report, err
 }
 
-func previewBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, limit int) (PendingBacklogReport, error) {
+func previewBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, limit, offset int) (PendingBacklogReport, error) {
 	report := PendingBacklogReport{ProviderID: providerID, GeneratedAt: time.Now().UTC(), Rows: []PendingBacklogRow{}, CreditsCharged: "0"}
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
 	if err != nil {
@@ -113,6 +121,7 @@ func previewBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, limit
 	defer rows.Close()
 	hash := sha256.New()
 	hash.Write(providerID[:])
+	fmt.Fprintf(hash, "/%d/%d/", offset, limit)
 	ids := make([]uuid.UUID, 0, limit)
 	for rows.Next() {
 		var id uuid.UUID
@@ -120,15 +129,19 @@ func previewBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, limit
 			return report, err
 		}
 		hash.Write(id[:])
-		report.BacklogTotal++
-		if len(ids) < limit {
+		if report.BacklogTotal >= offset && len(ids) < limit {
 			ids = append(ids, id)
 		}
+		report.BacklogTotal++
 	}
 	if err := rows.Err(); err != nil {
 		return report, err
 	}
 	report.Total = len(ids)
+	if report.BacklogTotal-offset > report.Total {
+		next := offset + report.Total
+		report.NextOffset = &next
+	}
 	report.RemainingPending = report.BacklogTotal
 	for _, id := range ids {
 		row, d, err := readBacklogRow(ctx, tx, providerID, id, false)
@@ -164,21 +177,27 @@ func previewBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, limit
 func readBacklogRow(ctx context.Context, tx *sql.Tx, providerID, id uuid.UUID, lock bool) (PendingBacklogRow, pendingDecision, error) {
 	row := PendingBacklogRow{ID: id}
 	var metrics CallMetrics
-	var terminal bool
+	var terminal, priced bool
 	query := `SELECT user_name,COALESCE(beichen_dispatch_model,model_name),protocol,COALESCE(beichen_review_reason,''),
   outcome='succeeded' AND COALESCE(error_category,'')='',COALESCE(usage_state,''),COALESCE(usage_reason,''),
   prompt_tokens,completion_tokens,total_tokens,cache_hit_tokens,cache_miss_tokens,cache_write_tokens,reasoning_tokens,tool_prompt_tokens,
-  (pricing_detail->>'cache_write_5m_tokens')::bigint,(pricing_detail->>'cache_write_1h_tokens')::bigint
+  CASE WHEN beichen_price_at IS NOT NULL THEN (pricing_detail->>'cache_write_5m_tokens')::bigint END,
+  CASE WHEN beichen_price_at IS NOT NULL THEN (pricing_detail->>'cache_write_1h_tokens')::bigint END,
+  beichen_price_at IS NOT NULL
   FROM gateway_calls WHERE ` + backlogFilter + ` AND id=$2`
 	if lock {
 		query += " FOR UPDATE"
 	}
 	err := tx.QueryRowContext(ctx, query, providerID, id).Scan(&row.Student, &row.Model, &row.Protocol, &row.Reason, &terminal, &metrics.State, &metrics.UsageReason,
 		&metrics.PromptTokens, &metrics.CompletionTokens, &metrics.TotalTokens, &metrics.CacheHitTokens, &metrics.CacheMissTokens, &metrics.CacheWriteTokens,
-		&metrics.ReasoningTokens, &metrics.ToolPromptTokens, &metrics.cacheWrite5m, &metrics.cacheWrite1h)
+		&metrics.ReasoningTokens, &metrics.ToolPromptTokens, &metrics.cacheWrite5m, &metrics.cacheWrite1h, &priced)
 	var d pendingDecision
 	if err != nil {
 		return row, d, err
+	}
+	if !priced {
+		row.Class, row.Note = pendingaudit.ClassUnknown, "缺少派发价格，保留待核"
+		return row, d, nil
 	}
 	metrics = metrics.ClassifyBeichenUsage(row.Protocol)
 	// Historical rows may already have complete terminal counters. Recheck the
@@ -232,17 +251,13 @@ func applyBacklogRow(ctx context.Context, db *sql.DB, providerID uuid.UUID, conf
 	if err != nil {
 		return "", nil, err
 	}
-	if row != confirmed {
+	if !row.Auto || row != confirmed {
 		return "skipped", nil, nil
-	}
-	if row.Class == pendingaudit.ClassUnknown {
-		return "pending", nil, nil
 	}
 	headroom, err := pendingHeadroom(ctx, tx, row.ID)
 	if err != nil {
 		return "", nil, err
 	}
-	d.result.CanAutoSettle = row.Auto
 	if err := writePendingReport(ctx, tx, row.ID, d, headroom); err != nil {
 		return "", nil, err
 	}
@@ -255,7 +270,7 @@ func applyBacklogRow(ctx context.Context, db *sql.DB, providerID uuid.UUID, conf
 		return "pending", nil, tx.Commit()
 	}
 	// If pricing evidence changed during booking, roll back this row.
-	if !row.Auto || debit != confirmed.StudentCredits {
+	if debit != confirmed.StudentCredits {
 		return "skipped", nil, nil
 	}
 	amount, ok := new(big.Rat).SetString(debit)

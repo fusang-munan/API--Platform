@@ -16,7 +16,7 @@ import (
 func reportHandlerRouter(s *Server, role string) *gin.Engine {
 	router := gin.New()
 	router.Use(func(c *gin.Context) { c.Set(identityKey, controlplane.Identity{UserID: uuid.New(), Role: role}) })
-	teacher := router.Group("/api/v1/teacher", requireRole("teacher"))
+	teacher := router.Group("/api/v1/teacher", privateNoStore, requireRole("teacher"))
 	teacher.POST("/providers/:provider_id/beichen/pending-audit", s.beichenPendingAudit)
 	teacher.GET("/model-usage", s.teacherModelUsage)
 	teacher.GET("/providers/:provider_id/beichen/reconciliation", s.beichenReconciliation)
@@ -133,29 +133,33 @@ func TestModelUsageHandlerDefaultsToAllAndReturnsEnvelope(t *testing.T) {
 	}
 }
 
-func TestPendingAuditRoleAndConflict(t *testing.T) {
+func TestPendingAuditResponseCachePolicy(t *testing.T) {
 	const path = "/api/v1/teacher/providers/00000000-0000-4000-8000-000000000001/beichen/pending-audit"
-	for _, role := range []string{"student", "mentor", "teacher"} {
+	for _, tc := range []struct {
+		role, body string
+		status     int
+	}{
+		{"student", `{"apply":false}`, 403}, {"student", `{"apply":true}`, 403},
+		{"mentor", `{"apply":false}`, 403}, {"mentor", `{"apply":true}`, 403},
+		{"teacher", `{"apply":false}`, 200}, {"teacher", `{"apply":true,"preview_token":"stale"}`, 409},
+		{"teacher", `{"offset":-1}`, 422},
+	} {
 		db, mock, err := sqlmock.New()
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer db.Close()
-		if role == "teacher" {
+		if tc.status == 200 || tc.status == 409 {
 			mock.ExpectQuery("SELECT p.id FROM providers").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("00000000-0000-4000-8000-000000000001"))
 			mock.ExpectBegin()
 			mock.ExpectQuery("SELECT id FROM gateway_calls").WillReturnRows(sqlmock.NewRows([]string{"id"}))
 			mock.ExpectCommit()
 		}
-		router := reportHandlerRouter(&Server{service: controlplane.NewService(nil, db, nil, nil, nil, controlplane.Config{})}, role)
+		router := reportHandlerRouter(&Server{service: controlplane.NewService(nil, db, nil, nil, nil, controlplane.Config{})}, tc.role)
 		w := httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(`{"apply":true,"preview_token":"stale"}`)))
-		if role == "teacher" {
-			if w.Code != 409 || !strings.Contains(w.Body.String(), "pending_audit_changed") || w.Header().Get("Cache-Control") != "private, no-store" {
-				t.Fatalf("teacher HTTP %d %s", w.Code, w.Body)
-			}
-		} else if w.Code != 403 {
-			t.Fatalf("%s HTTP %d", role, w.Code)
+		router.ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(tc.body)))
+		if w.Code != tc.status || w.Header().Get("Cache-Control") != "private, no-store" || (tc.status == 409 && !strings.Contains(w.Body.String(), "pending_audit_changed")) {
+			t.Fatalf("%s %s: HTTP %d headers=%v body=%s", tc.role, tc.body, w.Code, w.Header(), w.Body)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Fatal(err)

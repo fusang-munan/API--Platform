@@ -124,8 +124,7 @@ func (s *Server) registerControlPlane() {
 	mentor.GET("/input-monitor", s.mentorInputs)
 	mentor.GET("/input-monitor/:call_id", s.mentorInput)
 
-	teacher := protected.Group("/teacher")
-	teacher.Use(requireRole("teacher"))
+	teacher := api.Group("/teacher", privateNoStore, s.authenticate(), requireRole("teacher"))
 	teacher.POST("/invitations", s.inviteTeacher)
 	teacher.GET("/students", s.teacherStudents)
 	teacher.POST("/students/:student_id/mentor-profile", s.grantMentorProfile)
