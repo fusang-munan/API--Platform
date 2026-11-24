@@ -73,6 +73,8 @@ export const teacherAPI = {
   },
   pendingAudit: (id: string, body: { apply: false; limit: number; offset?: number } | { apply: true; limit: number; offset?: number; preview_token: string }) =>
     post<PendingAuditReport>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/pending-audit`, body),
+  resolveTerminalPending: (id: string) =>
+    post<{ resolved: number; errors: number }>(`/api/v1/teacher/providers/${encodeURIComponent(id)}/beichen/resolve-terminal-pending`, { confirm: true }),
   beichenReconciliation: (id: string, range: BeichenUsageRange,
     options?: { unmatchedScope?: 'observed' | 'comparable'; unmatchedCursor?: string }) => {
     const query = new URLSearchParams({ range })

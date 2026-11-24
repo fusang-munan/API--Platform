@@ -222,6 +222,7 @@ type beichenCharge struct {
 	tier              string
 	snapshot, detail  json.RawMessage
 	audit             *pendingAuditBooking
+	annotation        json.RawMessage
 }
 
 const beichenBaseCreditsSQL = `coalesce(c.beichen_base_credits,(c.pricing_detail->>'base_credits')::numeric,c.beichen_credit_exact)`
@@ -413,6 +414,9 @@ const auditBoundPredicate = `($4::numeric IS NULL OR LEAST(amount.actual,amount.
 func bookBeichenCharge(ctx context.Context, tx *sql.Tx, callID uuid.UUID, charge beichenCharge) error {
 	var milli string
 	var maxCredits, auditDetail any
+	if len(charge.annotation) > 0 {
+		auditDetail = string(charge.annotation)
+	}
 	if charge.audit != nil {
 		maxCredits, auditDetail = charge.audit.maxCredits, string(charge.audit.detail)
 	}

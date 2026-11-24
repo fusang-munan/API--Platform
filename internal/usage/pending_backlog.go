@@ -38,6 +38,8 @@ type PendingBacklogReport struct {
 	GeneratedAt       time.Time           `json:"generated_at"`
 	Total             int                 `json:"total"`
 	BacklogTotal      int                 `json:"backlog_total"`
+	TerminalMissing   int                 `json:"terminal_missing"`
+	TerminalEnabled   bool                `json:"terminal_enabled"`
 	NextOffset        *int                `json:"next_offset"`
 	Exact             int                 `json:"exact"`
 	Narrow            int                 `json:"narrow"`
@@ -110,7 +112,8 @@ func previewBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, limit
 	defer tx.Rollback()
 	// Stream all IDs into the token. An insertion beyond the batch boundary
 	// must also invalidate confirmation. Only the selected batch needs pricing.
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM gateway_calls WHERE `+backlogFilter+` ORDER BY created_at,id`, providerID)
+	report.TerminalEnabled = terminalPendingEnabled()
+	rows, err := tx.QueryContext(ctx, `SELECT id,beichen_review_reason='missing_terminal_usage' FROM gateway_calls WHERE `+backlogFilter+` ORDER BY created_at,id`, providerID)
 	if err != nil {
 		return report, err
 	}
@@ -121,8 +124,12 @@ func previewBacklog(ctx context.Context, db *sql.DB, providerID uuid.UUID, limit
 	ids := make([]uuid.UUID, 0, limit)
 	for rows.Next() {
 		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		var terminalMissing bool
+		if err := rows.Scan(&id, &terminalMissing); err != nil {
 			return report, err
+		}
+		if terminalMissing {
+			report.TerminalMissing++
 		}
 		hash.Write(id[:])
 		if report.BacklogTotal >= offset && len(ids) < limit {
@@ -190,6 +197,10 @@ func readBacklogRow(ctx context.Context, tx *sql.Tx, providerID, id uuid.UUID, l
 	var d pendingDecision
 	if err != nil {
 		return row, d, err
+	}
+	if row.Reason == "missing_terminal_usage" {
+		row.Class, row.Note = pendingaudit.ClassUnknown, "缺终态，由缺终态策略处理"
+		return row, d, nil
 	}
 	if !priced {
 		row.Class, row.Note = pendingaudit.ClassUnknown, "缺少派发价格，保留待核"

@@ -435,3 +435,11 @@ Key 账单读取失败时在最近版本写一次 `stale_at`，并结束仍有�
 官方控制台的工作区路由名称仅用于前端导航，并与中文页面标题分离；该路由契约不增加数据库表、字段、索引、枚举或迁移。
 
 官方控制台的页面动效、加载骨架、网络活动计数、提交中状态和启动时的 bootstrap single-flight 全部为浏览器内存 UI 状态，不写入 PostgreSQL 或 Redis；本功能不增加表、字段、索引、枚举、关系、事务或迁移。
+
+### 缺终态调用的最终结算
+
+`pending_review` 且 `beichen_review_reason='missing_terminal_usage'` 的调用按 `COALESCE(finalized_at,created_at), id` 从早到晚处理。宽限期给迟到的上游终态和回执留出时间。每笔独立事务先锁学生，再锁调用并重新核对状态、原因、供应商范围和等待时间。
+
+仅在内存中重建定价用量。保留已知缓存读、未命中和写入，缺失的输出计 0，总数不能用来猜输出。Anthropic 普通输入与缓存分列，OpenAI 输入总数包含缓存。分项矛盾、缓存费率无法唯一确定或输入不足以确定价格档位时按 0 核销。原始计数与中断状态继续保留。按派发时价格和现有学生上限记账，调用、额度桶、月度汇总与轮次一起提交。零元与正额都落为 charged/charged，清空待核原因和预留。已结清的调用不再补扣。
+
+`pricing_detail` 追加 `terminal_missing=true`、`terminal_policy="known_only"`、`known_input_tokens`（含已知缓存）、`known_output_tokens`、`processed_at`（UTC）和 `priced`。无法定价或没有可计费用量时 `priced=false`，`reason` 记录核销原因。历史报价和原始缓存证据随明细保留。

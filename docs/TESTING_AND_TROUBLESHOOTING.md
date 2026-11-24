@@ -521,3 +521,9 @@ ORDER BY j.channel;
 - 排查命令或观察点：
 - 不得记录的敏感信息：
 ```
+
+### 缺终态待核积压
+
+先在供应商对账页回放，查看全量 `terminal_missing` 和策略开关。尚在宽限期的调用继续等待上游；到期后可等下次 60 秒扫描，也可确认「立即处理缺终态」。若仍积压，检查策略是否为 `hold`、调用结束时间、批量上限及服务日志中的调用 ID。数据库错误会回滚该笔，其他调用继续处理。已结清但积分为 0 时查看 `pricing_detail.reason`，并核对保存的计数与派发时报价。
+
+设置本机测试库 `NEBULA_TEST_POSTGRES` 后运行 `go test -p 1 ./internal/dataplane -run TestTerminalPending -count=1 -v`。测试核对 15 笔样本的实扣和零元核销、宽限期、暂停策略、并发、迟到用量和月度账本，并单测 OpenAI 缓存包含在输入总数中的计费口径。教师端确认流程用 `npm test -- src/views/teacher/BeichenReconcile.test.ts` 验证。
