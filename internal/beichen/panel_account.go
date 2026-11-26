@@ -194,8 +194,8 @@ func (s *Service) ClearPanelAccount(ctx context.Context, provider, actor uuid.UU
 		if err != nil {
 			return err
 		}
-		// Keep an empty row so clearing a login does not resume the old
-		// environment or sealed session for this provider.
+		// Keep an empty row to suppress older fallback credentials.
+		// The release-delivered session is configured independently.
 		return s.savePanelAccount(ctx, tx, cleared, actor)
 	})
 	if err != nil {

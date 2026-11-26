@@ -117,8 +117,14 @@ func (s *Service) CheckSharedPanelConnection(ctx context.Context, provider uuid.
 	if s.sharedPanel == nil {
 		return errLocalLoginMissing
 	}
-	_, _, err := s.managedPanelAuthorization(ctx, provider, "")
-	return err
+	authorization, _, err := s.managedPanelAuthorization(ctx, provider, "")
+	if err != nil {
+		return err
+	}
+	if !authorization.shared {
+		return errLocalGrantRejected
+	}
+	return nil
 }
 
 func (s *Service) ExportPanelConfiguration(ctx context.Context, provider, actor uuid.UUID, rawOrigin string) (LocalPanelConfig, error) {

@@ -86,9 +86,10 @@ func (s *Service) syncWebsiteKeyInventories(ctx context.Context) error {
 SELECT p.id FROM providers p
 LEFT JOIN beichen_panel_accounts a ON a.provider_id=p.id
 LEFT JOIN beichen_website_key_sync r ON r.provider_id=p.id
-WHERE `+beichenProvider+` AND p.status='active' AND COALESCE(a.status<>'none',$1)
+WHERE `+beichenProvider+` AND p.status='active' AND (COALESCE(a.status<>'none',$1) OR (a.status='none' AND $2))
   AND COALESCE(r.next_attempt,'-infinity'::timestamptz)<=clock_timestamp()
-ORDER BY p.id`, s.WebSessionConfigured() || s.localLogin != nil || s.panelToken != "" || s.panelFallback != "" || s.sharedPanel != nil)
+ORDER BY p.id`, s.WebSessionConfigured() || s.localLogin != nil || s.panelToken != "" || s.panelFallback != "" || s.sharedPanel != nil,
+		s.deliveredWebSessionConfigured())
 	if err != nil {
 		return err
 	}

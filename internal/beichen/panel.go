@@ -93,7 +93,7 @@ func (s *Service) fetchChannelQuote(ctx context.Context, access priceAccess, key
 	if quote, handled := s.managedChannelQuote(ctx, access, key, group, info, entries); handled {
 		return quote
 	}
-	if err := s.checkLegacyPriceAccount(access); err != nil {
+	if err := s.checkLegacyPriceAccount(access, false); err != nil {
 		return panelQuote{groupID: group, err: err}
 	}
 	webConfigured := s.WebSessionConfigured()

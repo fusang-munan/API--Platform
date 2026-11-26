@@ -66,6 +66,10 @@ func accountDigest(identity string) string {
 	return hex.EncodeToString(digest[:])
 }
 
+func providerPanelAccountDigest(provider uuid.UUID) string {
+	return accountDigest("beichen-provider:" + provider.String())
+}
+
 type priceAccess struct {
 	providerID  uuid.UUID
 	groupID     int64
@@ -112,17 +116,27 @@ WHERE c.id=$1`, credentialID).Scan(&group, &encrypted, &actor, &access.channel, 
 	return access, nil
 }
 
-func (s *Service) checkLegacyPriceAccount(access priceAccess) error {
+func (s *Service) checkLegacyPriceAccount(access priceAccess, allowProviderBinding bool) error {
 	if access.legacyErr != nil {
 		return access.legacyErr
 	}
-	if access.webAccount != "" {
-		if !s.WebSessionConfigured() {
-			return errors.New("未配置北辰学校网页会话")
-		}
-		if access.webAccount != accountDigest(s.webPanelIdentity()) {
-			return errors.New("北辰绑定的学校网页登录身份与本机配置不一致")
-		}
+	return s.checkWebsiteAccount(access.providerID, access.webAccount, allowProviderBinding)
+}
+
+func (s *Service) checkWebsiteAccount(provider uuid.UUID, account string, allowProviderBinding bool) error {
+	if account == "" {
+		return nil
+	}
+	if !s.WebSessionConfigured() {
+		return errors.New("未配置北辰学校网页会话")
+	}
+	// The provider marker means the caller must prove Key ownership with the
+	// selected session. An explicit account identity is still pinned.
+	if allowProviderBinding && account == providerPanelAccountDigest(provider) {
+		return nil
+	}
+	if account != accountDigest(s.webPanelIdentity()) {
+		return errors.New("北辰绑定的学校网页登录身份与本机配置不一致")
 	}
 	return nil
 }
@@ -169,13 +183,22 @@ WHERE a.credential_id = $1 AND a.upstream_key_id IS NOT NULL
 	if err != nil {
 		return panelUsageBinding{}, err
 	}
-	if !managed {
+	if !managed && !auth.delivered {
 		binding.auth.bearer, err = s.resolvePanelToken(ctx, credentialID, encrypted)
 		return binding, err
 	}
+	if auth.delivered {
+		source, err := s.storedPanelAccess(credentialID, encrypted)
+		if err != nil {
+			return panelUsageBinding{}, err
+		}
+		if err := s.checkWebsiteAccount(binding.provider, source.webAccount, true); err != nil {
+			return panelUsageBinding{}, err
+		}
+	}
 	// A legacy binding explicitly authorized with this same environment
 	// bearer has already assigned the Key to that session.
-	if auth.tokenVersion == nil && !auth.shared {
+	if !auth.delivered && auth.tokenVersion == nil && !auth.shared {
 		if legacy, err := s.storedPanelAccess(credentialID, encrypted); err == nil && legacy.Token == auth.bearer {
 			binding.auth, binding.managed = auth, true
 			return binding, nil

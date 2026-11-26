@@ -32,18 +32,13 @@ func TestClearedPanelAccountKeepsDeliveredSession(t *testing.T) {
 		WillReturnRows(clearedPanelAccountRows())
 	service := New(db, nil)
 	service.ConfigurePanelFallback("environment-old-token")
-	if err := service.ConfigureWebSessionTokens("school@example.test", "delivered-access",
-		"delivered-refresh", time.Now().Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	used := ""
-	got, err := readWithWebsiteKeySession(context.Background(), service, provider, "",
-		func(auth panelAuthorization) (string, error) {
-			used = auth.bearer
-			return auth.bearer, nil
+	configureReviewCapture(t, service)
+	used, err := readWithWebsiteKeySession(context.Background(), service, provider, "",
+		func(auth panelAuthorization) (bool, error) {
+			return auth.bearer == reviewCapture, nil
 		})
-	if err != nil || got != "delivered-access" || used != "delivered-access" {
-		t.Fatalf("清除后的空行未改用交付会话: value=%q used=%q err=%v", got, used, err)
+	if err != nil || !used {
+		t.Fatalf("清除后的空行未改用交付会话: err=%v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

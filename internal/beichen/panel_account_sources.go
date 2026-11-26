@@ -3,6 +3,7 @@ package beichen
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/google/uuid"
@@ -17,21 +18,22 @@ func (s *Service) ConfigurePanelFallback(token string) {
 }
 
 func (s *Service) managedPanelAuthorization(ctx context.Context, provider uuid.UUID, fallback string) (panelAuthorization, bool, error) {
+	account, stored, err := s.loadStoredPanelAccount(ctx, provider)
+	if err != nil {
+		return panelAuthorization{}, true, err
+	}
+	if stored && panelAccountCleared(account) {
+		if s.deliveredWebSessionConfigured() {
+			return panelAuthorization{delivered: true}, false, nil
+		}
+		return panelAuthorization{}, true, errPanelAccountMissing
+	}
 	if s.localLogin != nil {
 		authorization, err := s.localLoginAuthorization(ctx, "")
 		return authorization, true, err
 	}
-	authorization, stored, err := s.storedPanelAuthorization(ctx, provider)
-	if stored && errors.Is(err, errPanelAccountCleared) {
-		// The cleared row still blocks the old environment token. The school
-		// session delivered with a release is deployment configuration, so it
-		// remains the price source even after a saved login was cleared.
-		if s.WebSessionConfigured() {
-			return panelAuthorization{}, false, nil
-		}
-		return panelAuthorization{}, true, errPanelAccountMissing
-	}
-	if stored || err != nil {
+	if stored {
+		authorization, err := s.authorizeStoredPanelAccount(ctx, account)
 		return authorization, true, err
 	}
 	if s.sharedPanelErr != nil {
@@ -70,6 +72,25 @@ func readWithPanelAuthorization[T any](ctx context.Context, service *Service, pr
 
 func readWithPanelSession[T any](ctx context.Context, service *Service, provider uuid.UUID,
 	authorization panelAuthorization, retry bool, read func(panelAuthorization) (T, error)) (T, error) {
+	if authorization.delivered {
+		readDelivered := func(bearer string) (T, error) {
+			authorization.bearer = bearer
+			return read(authorization)
+		}
+		if retry {
+			return readWithCapturedWebSession(ctx, service, readDelivered)
+		}
+		bearer, err := service.webPanelToken(ctx)
+		if err != nil {
+			var zero T
+			return zero, err
+		}
+		value, err := readDelivered(bearer)
+		if panelAuthFailed(err) {
+			service.webReadError(bearer, upstreamHTTPStatus(http.StatusUnauthorized))
+		}
+		return value, err
+	}
 	value, err := read(authorization)
 	if err == nil {
 		return value, service.notePanelVerified(ctx, provider, authorization, !retry)
@@ -133,13 +154,28 @@ func (s *Service) managedChannelQuote(ctx context.Context, access priceAccess, k
 	if err != nil {
 		return panelQuote{groupID: group, err: err}, true
 	}
-	if !handled {
+	if !handled && !authorization.delivered {
 		return panelQuote{}, false
 	}
-	quote, err := readWithPanelAuthorization(ctx, s, access.providerID, authorization, true, func(token string) (panelQuote, error) {
+	read := func(token string) (panelQuote, error) {
 		quote := s.fetchPanelQuote(ctx, token, key, group, access, info, entries)
 		return quote, quote.err
-	})
+	}
+	if authorization.delivered {
+		if err := s.checkLegacyPriceAccount(access, true); err != nil {
+			return panelQuote{groupID: group, err: err}, true
+		}
+		read = func(token string) (panelQuote, error) {
+			return readIdentifiedWebsiteKey(ctx, s, access, key, token, func(token string, identity listedKey) (panelQuote, error) {
+				if identity.GroupID == 0 || group != 0 && group != identity.GroupID {
+					return panelQuote{groupID: group}, errPanelGroupUnverified
+				}
+				quote := s.fetchPanelQuote(ctx, token, key, identity.GroupID, access, info, entries)
+				return quote, quote.err
+			})
+		}
+	}
+	quote, err := readWithPanelAuthorization(ctx, s, access.providerID, authorization, true, read)
 	quote.err = err
 	return quote, true
 }
@@ -158,7 +194,7 @@ func (s *Service) CheckPanelAccount(ctx context.Context, provider uuid.UUID) (Pa
 	if err != nil {
 		return PanelCrawlSummary{}, err
 	}
-	if !handled {
+	if !handled && !authorization.delivered {
 		return PanelCrawlSummary{}, errPanelAccountMissing
 	}
 	crawl, err := readWithPanelAuthorization(ctx, s, provider, authorization, false, func(token string) (directoryCrawl, error) {
