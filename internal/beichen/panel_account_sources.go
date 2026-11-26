@@ -22,6 +22,15 @@ func (s *Service) managedPanelAuthorization(ctx context.Context, provider uuid.U
 		return authorization, true, err
 	}
 	authorization, stored, err := s.storedPanelAuthorization(ctx, provider)
+	if stored && errors.Is(err, errPanelAccountCleared) {
+		// The cleared row still blocks the old environment token. The school
+		// session delivered with a release is deployment configuration, so it
+		// remains the price source even after a saved login was cleared.
+		if s.WebSessionConfigured() {
+			return panelAuthorization{}, false, nil
+		}
+		return panelAuthorization{}, true, errPanelAccountMissing
+	}
 	if stored || err != nil {
 		return authorization, true, err
 	}

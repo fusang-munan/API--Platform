@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +21,11 @@ type panelAuthorization struct {
 	local        bool
 }
 
+// A cleared login keeps an empty row so the previous environment token or an
+// older saved session cannot resume. It is not a usable account, so callers
+// must decide whether the deployment-delivered school session may still read.
+var errPanelAccountCleared = fmt.Errorf("%w（网页登录已清除）", errPanelAccountMissing)
+
 func (s *Service) storedPanelAuthorization(ctx context.Context, provider uuid.UUID) (panelAuthorization, bool, error) {
 	if s.db == nil || provider == uuid.Nil {
 		return panelAuthorization{}, false, nil
@@ -27,6 +33,9 @@ func (s *Service) storedPanelAuthorization(ctx context.Context, provider uuid.UU
 	account, found, err := readPanelAccount(ctx, s.db, provider)
 	if err != nil || !found {
 		return panelAuthorization{}, found, err
+	}
+	if panelAccountCleared(account) {
+		return panelAuthorization{}, true, errPanelAccountCleared
 	}
 	if account.status != panelStateActive || account.hasExpired(s.now()) {
 		var sessionErr error
@@ -40,6 +49,10 @@ func (s *Service) storedPanelAuthorization(ctx context.Context, provider uuid.UU
 		return panelAuthorization{}, true, errPanelAccountCrypto
 	}
 	return panelAuthorization{bearer: bearer, tokenVersion: account.token, verified: account.lastVerifiedAt != nil}, true, nil
+}
+
+func panelAccountCleared(account panelAccount) bool {
+	return account.status == panelStateNone && len(account.token) == 0 && len(account.password) == 0
 }
 
 func (s *Service) updatePanelSession(ctx context.Context, provider uuid.UUID, verify bool) (panelAccount, error, error) {

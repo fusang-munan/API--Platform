@@ -257,6 +257,7 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 | 本机会话文件读写失败 | 在 PowerShell 运行 `icacls "$env:LOCALAPPDATA\Nebula\beichen-session.json"` 和 `icacls "$env:LOCALAPPDATA\Nebula\beichen-session.key"`，核对当前账号是唯一的授权主体。会话文件损坏时可重新登录覆盖 |
 | 本机提示重新登录 | 打开本机登录窗口，重新登录后点「测试抓取」。北辰未发续期凭证时，Token 到期需再次登录 |
 | 窗口显示部分抓取失败 | 按失败项中的平台、字段位置和原因核对北辰渠道页。窗口仍会显示本轮可读的平台及去重模型数 |
+| 清除网页登录后所有渠道报价都提示「请先配置北辰网页账号或 Token」 | 清除登录会保留一条空记录，用来阻止旧的环境令牌或旧会话复活；随版本交付的学校网页会话仍应继续读取官网价。先确认教师概览里 `web_session_configured=true` 且 `session_release_sha256` 与本轮交付一致，再刷新官网 Key 与价格同步。仍失败时查看同一把 Key 的错误和「目录来源与分组」 |
 
 #### 核对北辰官网 Key 清单
 
