@@ -1,8 +1,10 @@
 package schoolseal
 
 import (
+	"crypto/sha256"
 	_ "embed"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/mail"
@@ -71,6 +73,11 @@ func (id *Identity) OpenSessionRelease() (*Session, error) {
 }
 
 func HasSessionRelease() bool { return !emptyRelease(sessionRelease) }
+
+func SessionReleaseDigest() string {
+	sum := sha256.Sum256(sessionRelease)
+	return hex.EncodeToString(sum[:])
+}
 
 func sealValue(r Recipient, value any) ([]byte, error) {
 	pub, err := r.decodedKey()

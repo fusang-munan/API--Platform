@@ -25,6 +25,7 @@ func initializeBeichenDelivery(ctx context.Context, service *controlplane.Servic
 	settings, err := loadBeichenSettings()
 	if err != nil {
 		slog.Error("北辰部署配置尚不可用", "error", err)
+		service.Beichen().SetWebSessionError(err)
 		// A box intended for another recipient must be replaced. An empty first
 		// release, however, must not break a school's existing runtime settings.
 		if schoolseal.HasRelease() {
@@ -40,6 +41,7 @@ func initializeBeichenDelivery(ctx context.Context, service *controlplane.Servic
 	if sessionErr != nil {
 		slog.Error("北辰学校账号配置无效", "error", sessionErr)
 	}
+	service.Beichen().SetWebSessionError(sessionErr)
 	if err := configureBeichen(ctx, service, settings.channels, os.Getenv("BEICHEN_PANEL_TOKEN"), os.Getenv("BEICHEN_PANEL_GROUPS")); err != nil {
 		slog.Error("北辰渠道预配置未完成", "error", err)
 	}

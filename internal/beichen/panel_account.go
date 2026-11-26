@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/domain"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/schoolseal"
 )
 
 type PanelAccountLogin struct {
@@ -81,6 +82,8 @@ func (s *Service) describePanelAccount(ctx context.Context, account panelAccount
 		Configured: len(account.token) != 0 || len(account.password) != 0,
 		Mode:       account.mode, Email: email, Status: account.status, ExpiresAt: account.expiresAt,
 		LastVerifiedAt: account.lastVerifiedAt, FailureCount: account.failureCount, Crawl: crawl,
+		WebSessionConfigured: s.WebSessionConfigured(), WebSessionError: s.WebSessionError(),
+		SessionReleaseSHA256: schoolseal.SessionReleaseDigest(),
 	}
 	if view.Status == panelStateActive && account.hasExpired(s.now()) {
 		view.Status = panelStateExpired

@@ -53,6 +53,7 @@ type Service struct {
 	panelFallback  string
 	panelGroups    map[uuid.UUID]int64
 	webAccount     *webSession
+	webSessionErr  error
 	localLogin     *LocalLoginStore
 	sharedPanel    *LocalPanelConfig
 	sharedPanelErr error

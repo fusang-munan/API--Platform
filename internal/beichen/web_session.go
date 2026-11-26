@@ -78,6 +78,15 @@ func (s *Service) ConfigureSavedWebSession(store *schoolseal.SessionStore) error
 
 func (s *Service) WebSessionConfigured() bool { return s.webAccount != nil }
 
+func (s *Service) SetWebSessionError(err error) { s.webSessionErr = err }
+
+func (s *Service) WebSessionError() string {
+	if s.webSessionErr == nil {
+		return ""
+	}
+	return s.webSessionErr.Error()
+}
+
 func readWithCapturedWebSession[T any](ctx context.Context, s *Service, read func(string) (T, error)) (T, error) {
 	var zero T
 	token, err := s.webPanelToken(ctx)
