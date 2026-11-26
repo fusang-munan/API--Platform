@@ -160,6 +160,10 @@ func (key *KeyCapability) applyGroup(billing Dataset) {
 		rate := json.Number(*billing.GroupRate)
 		key.WebsiteGroup.Rate = &rate
 	}
+	if billing.AccountRateSource == keyBillingRateSource {
+		key.WebsiteGroup.AccountRate = billing.AccountRate
+		key.WebsiteGroup.AccountRateSource = billing.AccountRateSource
+	}
 }
 
 func keyDataState(at *time.Time, lastError *string, now time.Time) string {
@@ -203,14 +207,21 @@ func rateFromText(value *string) *big.Rat {
 func usageMetric(c usageCounters, write *int64, saved *big.Rat) (KeyUsageMetric, *big.Rat) {
 	m := KeyUsageMetric{Requests: c.Requests, Input: c.Input, Output: c.Output, CacheRead: c.CacheRead,
 		CacheWrite: write, TotalTokens: c.TotalTokens, Cost: numberText(c.Cost), ActualCost: numberText(c.ActualCost), AccountCost: numberText(c.AccountCost)}
-	cost, actual := rateFromText(m.Cost), rateFromText(m.ActualCost)
-	if cost == nil || cost.Sign() <= 0 || actual == nil {
+	rate := observedUsageMultiplier(c)
+	if rate == nil {
 		return m, nil
 	}
-	rate := new(big.Rat).Quo(actual, cost)
 	text := strings.TrimRight(strings.TrimRight(rate.FloatString(8), "0"), ".")
 	m.ObservedMultiplier, m.MultiplierDiff = &text, rateDiffers(rate, saved)
 	return m, rate
+}
+
+func observedUsageMultiplier(c usageCounters) *big.Rat {
+	cost, actual := rateFromText(numberText(c.Cost)), rateFromText(numberText(c.ActualCost))
+	if cost == nil || cost.Sign() <= 0 || actual == nil {
+		return nil
+	}
+	return new(big.Rat).Quo(actual, cost)
 }
 
 func rateDiffers(observed, reference *big.Rat) bool {

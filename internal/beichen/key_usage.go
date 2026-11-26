@@ -65,7 +65,7 @@ func (s *Service) fetchWebsiteKeyUsage(ctx context.Context, job syncJob, credent
 	if err == nil {
 		check, err = readWebsiteKey(ctx, s, access, key, func(bearer string, identity listedKey) (websiteKeyCheck, error) {
 			check := websiteKeyCheck{key: identity}
-			check.catalog, check.catalogErr = s.fetchBillingCatalog(ctx, job.provider, bearer, key, identity)
+			check.catalog, check.catalogErr = s.fetchBillingCatalog(ctx, job, bearer, key, identity)
 			if panelAuthFailed(check.catalogErr) || errors.Is(check.catalogErr, errKeyGroupMissing) {
 				return check, check.catalogErr
 			}

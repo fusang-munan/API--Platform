@@ -231,6 +231,10 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 网页通过 `GET /api/v1/groups/rates` 在分组默认倍率之外显示当前账号的倍率。核对分组报价时同时比较两项。该请求失败时，目录会提示账户倍率待核实，历史保留上次已核实的版本。回归用例分别改变默认倍率、价格和个人倍率，并验证失败前后不会产生虚假的历史版本。
 
+CC1 的账单提示「北辰官网账户倍率未核实」时，查看后续原因。「官网账户倍率表读取失败」表示这一轮无法确认表中是否缺组。「Key 账单读取失败（HTTP 404）」表示 Key 账单接口未找到。「Key 账单缺少分组号（group_id 未提供或为 0）」表示标准 Key 账单响应缺少回退所需的独立分组证据。分组号、Key 编号、默认倍率、高峰状态和采样时间不符时，页面指出对应的校验项。用量不足时可在教师页点「核对这个 Key」刷新官网用量后再同步。该用量必须在最近 30 分钟内抓取，属于当天同一把 Key 的同一分组，且实付除以原价须与账单生效倍率完全一致。
+
+在隔离的本机 PostgreSQL 上，运行 `go test ./internal/beichen ./internal/infrastructure/db -run 'TestWebsiteKeyBillingAccountRates|TestBeichenCC1AccountRateFallbackPostgres|TestBeichenMigration0070AccountRateSource' -count=1`。覆盖交付会话、官网账户倍率优先、拒绝原因入库、有效报价恢复与失效、同组多 Key 隔离和从 0069 升级。
+
 若北辰有价而教师页显示缺价，运行 `go run ./cmd/beichen-crawl --fixture ./internal/beichen/testdata/website-price-details.json`。以 `sources[].price_complete` 确认官网报价，在 `base_token_prices_per_million` 查每百万 Token 的原价。`cache_write_price` 是 5 分钟缓存写入价，`cache_write_1h_price` 是 1 小时缓存写入价，`cache_read_price` 是缓存读取价。Claude 的 1 小时价为 `null`，对应未列单价。官网分组与 Key 分组不同时，到当前模型的「目录来源与分组」核对两个分组号。运行 `go test ./internal/beichen -run TestBeichenWebsitePriceDetails -count=1 -v` 与 `npm test -- BeichenSchoolModels` 验收原价、同组匹配和教师页展示。
 
 Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反推价，待核对」及观察时间。若报价缺失，先核对 `0058` 是否已应用、Key 是否仍属于 group 16，以及实际型号清单和当前倍率是否核实成功。用隔离的 PostgreSQL 运行 `go test ./internal/beichen -run '^TestBeichenDerivedPricesPostgres$' -count=1 -v`，回归两款 Claude 的自动结算、缓存缺价待核账、手动修正，以及官网固定价和分档价生效后的版本切换。

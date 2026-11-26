@@ -28,13 +28,15 @@ type WebsiteDirectoryStatus struct {
 }
 
 type WebsiteGroup struct {
-	ID          int64        `json:"id,omitempty"`
-	Name        string       `json:"name,omitempty"`
-	Status      string       `json:"status,omitempty"`
-	Rate        *json.Number `json:"rate_multiplier,omitempty"`
-	AccountRate *json.Number `json:"account_rate_multiplier,omitempty"`
-	PeakRate    *json.Number `json:"peak_rate_multiplier,omitempty"`
-	PeakEnabled *bool        `json:"peak_rate_enabled,omitempty"`
+	ID                int64        `json:"id,omitempty"`
+	Name              string       `json:"name,omitempty"`
+	Status            string       `json:"status,omitempty"`
+	Rate              *json.Number `json:"rate_multiplier,omitempty"`
+	AccountRate       *json.Number `json:"account_rate_multiplier,omitempty"`
+	AccountRateSource string       `json:"account_rate_source,omitempty"`
+	AccountRateKeyID  int64        `json:"account_rate_key_id,omitempty"`
+	PeakRate          *json.Number `json:"peak_rate_multiplier,omitempty"`
+	PeakEnabled       *bool        `json:"peak_rate_enabled,omitempty"`
 }
 
 type directoryGroup struct {

@@ -40,16 +40,16 @@ func newCrawlKeyModelComparison(channel string) CrawlKeyModelComparison {
 		OnlyKey: []string{}, OnlyChannel: []string{}}
 }
 
-func (r *CrawlKeyModelComparison) compare(crawl directoryCrawl, entries []catalog.ProviderEntry, groupID int64) {
+func (r *CrawlKeyModelComparison) compare(crawl directoryCrawl, entries []catalog.ProviderEntry, groupID int64) directoryGroup {
 	r.GroupID = &groupID
 	if !crawl.membershipComplete {
 		r.Error = "渠道页型号资料不完整"
-		return
+		return directoryGroup{}
 	}
 	group, err := selectWebsiteKeyCatalog(crawl.platforms, groupID)
 	if err != nil && !errors.Is(err, errPanelGroupNotFound) {
 		r.Error = "渠道页分组资料不完整或有歧义"
-		return
+		return directoryGroup{}
 	}
 	keyNames := crawlModelIDs(entries)
 	channelNames := make([]string, 0, len(group.entries))
@@ -61,6 +61,7 @@ func (r *CrawlKeyModelComparison) compare(crawl directoryCrawl, entries []catalo
 		r.Matched = append(r.Matched, CrawlKeyModelMatch{match, usage.BeichenDirectoryQuoteBlocker(group.prices[match.ChannelModel]) == ""})
 	}
 	r.OnlyKey, r.OnlyChannel, r.State = onlyKey, onlyChannel, "checked"
+	return group.group
 }
 
 func crawlModelIDs(entries []catalog.ProviderEntry) []string {
@@ -95,9 +96,15 @@ func compareCrawlModelNames(keyNames, channelNames []string) ([]CrawlKeyModelPai
 }
 
 type crawlKeyModelTarget struct {
+	credential uuid.UUID
 	ciphertext []byte
 	channel    string
 	verified   bool
+}
+
+type crawlKeyRate struct {
+	groupID int64
+	info    *billingInfo
 }
 
 // The website inventory establishes which provisioned credentials belong to
@@ -108,7 +115,7 @@ func (s *Service) crawlKeyModels(ctx context.Context, provider uuid.UUID, crawl 
 		return results, ""
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT c.credential_ciphertext, p.channel, COALESCE(w.match_status='matched' AND inv.status='current'
+SELECT c.id, c.credential_ciphertext, p.channel, COALESCE(w.match_status='matched' AND inv.status='current'
     AND inv.last_seen > statement_timestamp()-interval '30 minutes', false)
 FROM beichen_provision_channels p JOIN provider_credentials c ON c.id=p.credential_id
 LEFT JOIN beichen_website_keys w ON w.provider_id=c.provider_id AND w.credential_id=c.id
@@ -123,7 +130,7 @@ ORDER BY p.channel`, provider)
 	var targets []crawlKeyModelTarget
 	for rows.Next() {
 		var target crawlKeyModelTarget
-		if err := rows.Scan(&target.ciphertext, &target.channel, &target.verified); err != nil {
+		if err := rows.Scan(&target.credential, &target.ciphertext, &target.channel, &target.verified); err != nil {
 			rows.Close()
 			return results, readFailed
 		}
@@ -141,21 +148,27 @@ ORDER BY p.channel`, provider)
 		}
 		return results, ""
 	}
+	var rates map[int64]json.Number
 	keys, err := readWithWebsiteKeySession(ctx, s, provider, panelToken, func(auth panelAuthorization) ([]listedKey, error) {
 		keys, err := s.accountKeys(ctx, auth.bearer)
 		if err == nil {
-			rates, rateErr := s.fetchWebsiteAccountRates(ctx, auth.bearer)
-			if rateErr != nil {
-				crawl.AccountRateError = "北辰官网账户倍率暂未核实"
-			} else {
-				crawl.applyAccountRates(rates)
-			}
+			rates, _ = s.fetchWebsiteAccountRates(ctx, auth.bearer)
 		}
 		return keys, err
 	})
 	if err != nil {
 		return results, "读取当前官网 Key 分组失败"
 	}
+	if rates == nil {
+		crawl.AccountRateError = "北辰官网账户倍率暂未核实"
+	}
+	keysPerGroup := make(map[int64]int)
+	for _, key := range keys {
+		if key.Status == "" || key.Status == "active" {
+			keysPerGroup[key.GroupID]++
+		}
+	}
+	checkedRates := make([]crawlKeyRate, len(targets))
 	var round sync.WaitGroup
 	for i, target := range targets {
 		if !target.verified {
@@ -165,10 +178,19 @@ ORDER BY p.channel`, provider)
 		round.Add(1)
 		go func() {
 			defer round.Done()
-			s.checkCrawlKeyModels(ctx, &results[i], target, keys, *crawl)
+			checkedRates[i] = s.checkCrawlKeyModels(ctx, &results[i], target, keys, *crawl, rates, keysPerGroup)
 		}()
 	}
 	round.Wait()
+	fallbackRates := make(map[int64]*billingInfo)
+	for _, checked := range checkedRates {
+		if checked.info != nil {
+			fallbackRates[checked.groupID] = checked.info
+		} else if checked.groupID != 0 {
+			crawl.AccountRateError = "部分北辰渠道的账户倍率未核实"
+		}
+	}
+	crawl.applyAccountRates(rates, fallbackRates)
 	return results, ""
 }
 
@@ -206,34 +228,49 @@ func (s *Service) fetchWebsiteAccountRates(ctx context.Context, bearer string) (
 	return rates, nil
 }
 
-func (crawl *directoryCrawl) applyAccountRates(rates map[int64]json.Number) {
+func (crawl *directoryCrawl) applyAccountRates(rates map[int64]json.Number, fallback map[int64]*billingInfo) {
 	for i := range crawl.platforms {
 		for j := range crawl.platforms[i].Groups {
 			group := &crawl.platforms[i].Groups[j]
 			if rate, ok := rates[group.ID]; ok {
 				group.AccountRate = &rate
+			} else if info := fallback[group.ID]; info != nil {
+				group.setKeyAccountRate(*info)
 			}
 		}
 	}
-	crawl.accountRatesVerified = true
+	crawl.accountRatesVerified = rates != nil
 }
 
 func (s *Service) checkCrawlKeyModels(ctx context.Context, result *CrawlKeyModelComparison,
-	target crawlKeyModelTarget, keys []listedKey, crawl directoryCrawl) {
+	target crawlKeyModelTarget, keys []listedKey, crawl directoryCrawl, rates map[int64]json.Number,
+	keysPerGroup map[int64]int) crawlKeyRate {
 	key, err := s.crypto.DecryptCredential(target.ciphertext)
 	if err != nil {
 		result.Error = "北辰凭据解密失败"
-		return
+		return crawlKeyRate{}
 	}
 	identity, err := identifyChannel(key, target.channel, "", keys)
 	if err != nil {
 		result.Error = "当前 Key 分组无法唯一确认"
-		return
+		return crawlKeyRate{}
 	}
 	entries, err := s.fetchKeyCatalog(ctx, key)
 	if err != nil {
 		result.GroupID, result.State, result.Error = &identity.GroupID, "unavailable", err.Error()
-		return
+		return crawlKeyRate{}
 	}
-	result.compare(crawl, entries, identity.GroupID)
+	group := result.compare(crawl, entries, identity.GroupID)
+	if _, listed := rates[group.ID]; rates == nil || listed || group.ID == 0 {
+		return crawlKeyRate{}
+	}
+	checked := crawlKeyRate{groupID: group.ID}
+	// A shared directory rate must not be attributed to multiple Keys.
+	if keysPerGroup[group.ID] == 1 {
+		info, _, err := s.fetchVerifiedKeyAccountRate(ctx, target.credential, key, identity, group)
+		if err == nil {
+			checked.info = &info
+		}
+	}
+	return checked
 }

@@ -16,18 +16,17 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
-var errWebsiteAccountRateUnverified = errors.New("北辰官网账户倍率未核实，分组倍率仅供参考")
-
 type websiteKeyCatalog struct {
-	group         directoryGroup
-	keyGroup      *WebsiteGroup
-	keyGroupAt    time.Time
-	entries       []catalog.ProviderEntry
-	prices        map[string]json.RawMessage
-	at            time.Time
-	keyBilling    *billingInfo // Key-only catalog when the group has no website listing.
-	keyRate       *billingInfo // Rate confirmation for a group listed on the website.
-	websiteModels []string
+	group              directoryGroup
+	keyGroup           *WebsiteGroup
+	keyGroupAt         time.Time
+	entries            []catalog.ProviderEntry
+	prices             map[string]json.RawMessage
+	at                 time.Time
+	keyBilling         *billingInfo // Key-only catalog when the group has no website listing.
+	keyBillingSampleAt time.Time    // Sample used for a verified account-rate fallback.
+	accountRateErr     error
+	websiteModels      []string
 }
 
 func (s *Service) readCredentialWebsiteCatalog(ctx context.Context, credential uuid.UUID, key string) (websiteKeyCatalog, error) {
@@ -258,6 +257,9 @@ func (directory websiteKeyCatalog) billing() (billingInfo, panelQuote, error) {
 	group := directory.group
 	quote := directory.catalogQuote()
 	quote.verifiedKeyModels = directory.keyBilling != nil || directory.websiteModels != nil
+	if directory.accountRateErr != nil {
+		return billingInfo{}, quote, directory.accountRateErr
+	}
 	var info billingInfo
 	if directory.keyBilling != nil {
 		info = *directory.keyBilling
@@ -281,11 +283,11 @@ func (directory websiteKeyCatalog) billing() (billingInfo, panelQuote, error) {
 	if group.AccountRate != nil {
 		info.UserRate, info.ResolvedRate = group.AccountRate, *group.AccountRate
 	}
-	if directory.keyRate != nil {
-		rate := directory.keyRate
-		info.UserRate, info.ResolvedRate = rate.UserRate, rate.ResolvedRate
-		info.ObservedAt, info.Multiplier, info.AppliedPeak = rate.ObservedAt, rate.Multiplier, rate.AppliedPeak
-	} else if directory.keyBilling == nil || group.AccountRate != nil {
+	if !directory.keyBillingSampleAt.IsZero() {
+		info.ObservedAt = directory.keyBillingSampleAt
+		info.accountRateSource = group.AccountRateSource
+	}
+	if directory.keyBilling == nil || group.AccountRate != nil {
 		if err := applyWebsiteBillingRate(&info); err != nil {
 			return info, quote, err
 		}
@@ -311,44 +313,10 @@ func (directory websiteKeyCatalog) billing() (billingInfo, panelQuote, error) {
 	if len(quote.terms) == 0 {
 		quote.err = errPanelEmpty
 	}
-	if directory.keyBilling == nil && group.AccountRate == nil && directory.keyRate == nil {
-		// Preserve the default rate in the observation. Billing must wait for
-		// a verified account or Key rate before publishing a payable snapshot.
+	if directory.keyBilling == nil && group.AccountRate == nil {
 		return info, quote, errWebsiteAccountRateUnverified
 	}
 	return info, quote, nil
-}
-
-func verifyWebsiteKeyRate(group directoryGroup, info *billingInfo) bool {
-	if billingPanelGroup(*info) != group.ID || group.Subscription != "standard" || group.Rate == nil || group.PeakEnabled == nil {
-		return false
-	}
-	if info.GroupRate == "" {
-		info.GroupRate = *group.Rate
-	}
-	if info.PeakEnabled == nil {
-		info.PeakEnabled = group.PeakEnabled
-	}
-	if info.ResolvedRate == "" {
-		if info.UserRate != nil {
-			info.ResolvedRate = *info.UserRate
-		} else if !*group.PeakEnabled {
-			info.ResolvedRate = info.Multiplier
-		}
-	}
-	rules := panelGroup{Rate: *group.Rate, PeakEnabled: group.PeakEnabled, PeakStart: group.PeakStart, PeakEnd: group.PeakEnd}
-	if *group.PeakEnabled {
-		if group.PeakRate == nil || group.Timezone != info.Timezone {
-			return false
-		}
-		rules.PeakRate = *group.PeakRate
-	}
-	comparison := *info
-	if comparison.UserRate == nil {
-		// The authenticated Key can report the resolved override by itself.
-		comparison.UserRate = &comparison.ResolvedRate
-	}
-	return matchesPanelMultiplier(rules, comparison)
 }
 
 func applyWebsiteBillingRate(info *billingInfo) error {

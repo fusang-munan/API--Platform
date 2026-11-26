@@ -47,7 +47,7 @@ VALUES($1,'CC1',sha256('cc1-fixture'::bytea),false)`, key)
 	group, peak := 15, "1"
 	websiteStatus := http.StatusOK
 	ratesStatus := http.StatusOK
-	billingKeyID := 41
+	keyBillingReads := 0
 	directory, err := os.ReadFile("testdata/billing-group-switch.json")
 	if err != nil {
 		t.Fatal(err)
@@ -58,9 +58,10 @@ VALUES($1,'CC1',sha256('cc1-fixture'::bytea),false)`, key)
 		}
 		if req.Method == http.MethodGet && req.URL.Host == "api.beichenapi.com" && req.URL.Path == billingPath &&
 			req.Header.Get("Authorization") == "Bearer "+secret {
+			keyBillingReads++
 			return reply(http.StatusOK, fmt.Sprintf(`{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token",
-				"api_key_id":%d,"group_id":%d,"group_rate_multiplier":0.6,"effective_rate_multiplier":0.6,
-				"peak_rate_enabled":false,"observed_at":%q}`, billingKeyID, group, time.Now().UTC().Format(time.RFC3339Nano)))
+				"api_key_id":41,"group_id":%d,"group_rate_multiplier":0.6,"effective_rate_multiplier":0.6,
+				"peak_rate_enabled":false,"observed_at":%q}`, group, time.Now().UTC().Format(time.RFC3339Nano)))
 		}
 		if req.Method == http.MethodGet && req.URL.Host == "api.beichenapi.com" && req.URL.Path == modelsPath &&
 			req.Header.Get("Authorization") == "Bearer "+secret {
@@ -300,24 +301,16 @@ beichen_multiplier_version,beichen_state FROM gateway_calls WHERE id=$1`, call.C
 	t.Log("stale preserves 0.6 and last_success, alerts at 3 failures, and leaves new costs pending until billing recovers")
 
 	ratesStatus = http.StatusServiceUnavailable
-	if _, err := service.runJob(ctx, syncJob{provider: provider, credential: key, kind: "billing"}, true); err != nil {
-		t.Fatalf("matching Key billing should keep the website quote active during an account rate outage: %v", err)
-	}
-	verified := billing(overview(), "current", "0.6", 60)
-	if verified.LastError != nil || !verified.LastSuccess.After(*recovered.LastSuccess) {
-		t.Fatalf("Key billing should record a successful refresh: %+v", verified)
-	}
-	verifiedCall, verifiedRoute := dispatch()
-	finalize(verifiedCall, verifiedRoute)
-	checkCharge(verifiedCall, recoveredVersion, "1.2", "1.32")
-
-	billingKeyID = 42
+	beforeOutage := keyBillingReads
 	if _, err := service.runJob(ctx, syncJob{provider: provider, credential: key, kind: "billing"}, true); !errors.Is(err, errWebsiteAccountRateUnverified) {
-		t.Fatalf("the account rate outage and mismatched Key should require review: %v", err)
+		t.Fatalf("an account rate outage cannot prove a missing group and should require review: %v", err)
+	}
+	if keyBillingReads != beforeOutage {
+		t.Fatal("an account rate outage must not read Key billing for a listed group")
 	}
 	missingRate := billing(overview(), "stale", "0.6", 60)
 	if missingRate.GroupRate == nil || *missingRate.GroupRate != "0.6" || missingRate.LastError == nil ||
-		*missingRate.LastError != errWebsiteAccountRateUnverified.Error() {
+		*missingRate.LastError != "北辰官网账户倍率未核实，分组倍率仅供参考：官网账户倍率表读取失败（HTTP 503）" {
 		t.Fatalf("account rate failure should preserve the group default and record a billing error: %+v", missingRate)
 	}
 	call, route := dispatch()

@@ -150,6 +150,8 @@ type billingInfo struct {
 	PeakEnd       string          `json:"peak_end"`
 	PeakRate      json.Number     `json:"peak_rate_multiplier"`
 	AppliedPeak   json.Number     `json:"applied_peak_multiplier"`
+
+	accountRateSource string
 }
 
 func parseBilling(body []byte) (billingInfo, error) {

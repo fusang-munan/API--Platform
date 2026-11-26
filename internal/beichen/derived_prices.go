@@ -10,7 +10,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 )
 
@@ -25,11 +24,11 @@ func (s *Service) readBillingCatalog(ctx context.Context, job syncJob, key strin
 		return websiteKeyCatalog{}, err
 	}
 	return readWebsiteKey(ctx, s, access, key, func(token string, identity listedKey) (websiteKeyCatalog, error) {
-		return s.fetchBillingCatalog(ctx, job.provider, token, key, identity)
+		return s.fetchBillingCatalog(ctx, job, token, key, identity)
 	})
 }
 
-func (s *Service) fetchBillingCatalog(ctx context.Context, provider uuid.UUID, token, key string, identity listedKey) (websiteKeyCatalog, error) {
+func (s *Service) fetchBillingCatalog(ctx context.Context, job syncJob, token, key string, identity listedKey) (websiteKeyCatalog, error) {
 	directory, websiteErr := s.fetchWebsiteKeyCatalog(ctx, token, identity)
 	if errors.Is(websiteErr, errPanelGroupNotFound) {
 		fallback, err := s.fetchKeyBillingCatalog(ctx, key, identity)
@@ -48,22 +47,28 @@ func (s *Service) fetchBillingCatalog(ctx context.Context, provider uuid.UUID, t
 	} else if websiteErr != nil {
 		return directory, websiteErr
 	}
-	rates, _ := s.fetchWebsiteAccountRates(ctx, token)
+	rates, rateErr := s.fetchWebsiteAccountRates(ctx, token)
 	if rate, ok := rates[directory.group.ID]; ok {
 		directory.group.AccountRate = &rate
-	} else if directory.keyBilling == nil {
-		info, err := s.fetchKeyBillingInfo(ctx, key, identity)
-		if err == nil && verifyWebsiteKeyRate(directory.group, &info) {
-			if at, err := s.currentKeyBillingAt(ctx, info); err == nil {
-				directory.keyRate, directory.at = &info, at
-			}
-		}
 	}
 	if directory.keyBilling != nil {
 		if directory.group.AccountRate == nil {
-			slog.Warn("北辰官网账户倍率未核实，使用 Key 账单确认的生效倍率", "provider_id", provider, "group_id", directory.group.ID)
+			slog.Warn("北辰官网账户倍率未核实，使用 Key 账单确认的生效倍率", "provider_id", job.provider, "group_id", directory.group.ID)
 		}
 		return directory, nil
+	}
+	if job.kind == "billing" && directory.group.AccountRate == nil {
+		if rateErr != nil {
+			directory.accountRateErr = accountRateReadFailed("官网账户倍率表读取失败", rateErr)
+			return directory, nil
+		}
+		info, at, err := s.fetchVerifiedKeyAccountRate(ctx, job.credential, key, identity, directory.group)
+		if err != nil {
+			directory.accountRateErr = err
+			return directory, nil
+		}
+		directory.group.setKeyAccountRate(info)
+		directory.keyBillingSampleAt, directory.at = info.ObservedAt, at
 	}
 	// Existing evidence can require reconciling legacy model spellings even
 	// after the group is published. Quote terms still come from the website.
@@ -71,7 +76,7 @@ func (s *Service) fetchBillingCatalog(ctx context.Context, provider uuid.UUID, t
 	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (
 SELECT 1 FROM beichen_group_price_observations
 WHERE provider_id=$1 AND group_id=$2 AND source='derived_from_usage' AND observed_at<=statement_timestamp()
-)`, provider, identity.GroupID).Scan(&hasEvidence); err != nil {
+)`, job.provider, identity.GroupID).Scan(&hasEvidence); err != nil {
 		return directory, errPanelAccountDB
 	}
 	if !hasEvidence {
@@ -100,40 +105,52 @@ func matchWebsitePrices(actual []catalog.ProviderEntry, official map[string]json
 	return prices
 }
 
-func (s *Service) fetchKeyBillingInfo(ctx context.Context, key string, identity listedKey) (billingInfo, error) {
+func (s *Service) fetchKeyBillingInfo(ctx context.Context, key string, groupID int64) (billingInfo, error) {
 	body, err := s.fetch(ctx, key, billingPath, nil)
 	if err != nil {
-		return billingInfo{}, keyMetadataError(err, identity.GroupID, "北辰 Key 的当前计费倍率无法读取")
+		if errors.Is(err, errKeyGroupNotAllowed) {
+			return billingInfo{}, deniedKeyGroup(groupID)
+		}
+		return billingInfo{}, keyBillingReadError{err}
 	}
-	info, err := parseBilling(body)
-	if err != nil {
-		return billingInfo{}, err
-	}
+	return parseBilling(body)
+}
+
+func keyBillingIdentityIssue(info billingInfo, identity listedKey) string {
 	if group := billingPanelGroup(info); group != 0 && group != identity.GroupID {
-		return billingInfo{}, errPanelRulesConflict
+		return "Key 账单分组号与官网不一致"
 	}
 	if (info.KeyID != 0 && info.KeyID != identity.ID) || (info.APIKeyID != 0 && info.APIKeyID != identity.ID) {
-		return billingInfo{}, errPanelRulesConflict
+		return "Key 账单中的 Key 编号与官网不一致"
 	}
 	if group := identity.Group; group != nil {
 		if group.SubscriptionType != "" && group.SubscriptionType != "standard" {
-			return billingInfo{}, errPanelRulesConflict
+			return "官网 Key 清单中的分组不是标准余额计费"
 		}
-		if (group.Rate != "" && info.GroupRate != "" && !samePanelRate(group.Rate, info.GroupRate)) ||
-			(group.PeakEnabled != nil && info.PeakEnabled != nil && *group.PeakEnabled != *info.PeakEnabled) {
-			return billingInfo{}, errPanelRulesConflict
+		if group.Rate != "" && info.GroupRate != "" && !samePanelRate(group.Rate, info.GroupRate) {
+			return keyBillingDefaultRateMismatch
 		}
-		if info.GroupRate == "" && websiteGroupRate(group.Rate) != nil {
-			info.GroupRate = group.Rate
+		if group.PeakEnabled != nil && info.PeakEnabled != nil && *group.PeakEnabled != *info.PeakEnabled {
+			return keyBillingPeakMismatch
 		}
 	}
-	return info, nil
+	return ""
 }
 
+type keyBillingReadError struct{ cause error }
+
+func (keyBillingReadError) Error() string { return "北辰 Key 的当前计费倍率无法读取" }
+
 func (s *Service) fetchKeyBillingCatalog(ctx context.Context, key string, identity listedKey) (websiteKeyCatalog, error) {
-	info, err := s.fetchKeyBillingInfo(ctx, key, identity)
+	info, err := s.fetchKeyBillingInfo(ctx, key, identity.GroupID)
 	if err != nil {
 		return websiteKeyCatalog{}, err
+	}
+	if keyBillingIdentityIssue(info, identity) != "" {
+		return websiteKeyCatalog{}, errPanelRulesConflict
+	}
+	if group := identity.Group; group != nil && info.GroupRate == "" && websiteGroupRate(group.Rate) != nil {
+		info.GroupRate = group.Rate
 	}
 	// A separately published Key price table needs its own official-price
 	// verification. Do not select an estimate over those declared terms.
@@ -162,6 +179,8 @@ func (s *Service) fetchKeyBillingCatalog(ctx context.Context, key string, identi
 	return websiteKeyCatalog{group: group, entries: entries, at: at, keyBilling: &info}, nil
 }
 
+var errKeyBillingSampleExpired = errors.New("北辰 Key 倍率的采样时段已结束")
+
 func (s *Service) currentKeyBillingAt(ctx context.Context, info billingInfo) (time.Time, error) {
 	at := s.now().UTC()
 	// The two hosts may differ by a fraction of a second. Wait for a near
@@ -176,12 +195,15 @@ func (s *Service) currentKeyBillingAt(ctx context.Context, info billingInfo) (ti
 			at = s.now().UTC()
 		}
 	}
+	if !info.ObservedAt.IsZero() && info.ObservedAt.Before(at.Add(-jobTimeout)) {
+		return time.Time{}, errKeyBillingSampleExpired
+	}
 	expires, err := panelExpiry(info, at)
 	if err != nil {
 		return time.Time{}, err
 	}
 	if !expires.After(at) {
-		return time.Time{}, errors.New("北辰 Key 倍率的采样时段已结束")
+		return time.Time{}, errKeyBillingSampleExpired
 	}
 	return at, nil
 }
