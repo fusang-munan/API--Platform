@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -51,7 +52,10 @@ func (s *SessionStore) Load() (Session, error) {
 	var saved savedSession
 	if s.identity.openValue(raw, &saved) != nil || saved.Capture != s.digest ||
 		saved.WebEmail != s.capture.WebEmail || saved.Session.Validate() != nil {
-		return Session{}, errors.New("学校北辰续期会话密文校验失败")
+		// A renewal cache is an optimization. A newly delivered capture must
+		// still work when an old cache is corrupt or belongs to another key.
+		slog.Warn("北辰续期会话不可用，改用新交付的会话", "path", s.path)
+		return s.capture, nil
 	}
 	return saved.Session, nil
 }

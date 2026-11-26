@@ -29,15 +29,18 @@ var (
 )
 
 type PanelAccountStatus struct {
-	Configured     bool              `json:"configured"`
-	Mode           string            `json:"mode"`
-	Email          string            `json:"email"`
-	Status         string            `json:"status"`
-	ExpiresAt      *time.Time        `json:"expires_at"`
-	LastVerifiedAt *time.Time        `json:"last_verified_at"`
-	LastError      *string           `json:"last_error"`
-	FailureCount   int               `json:"failure_count"`
-	Crawl          PanelCrawlSummary `json:"crawl"`
+	Configured           bool              `json:"configured"`
+	Mode                 string            `json:"mode"`
+	Email                string            `json:"email"`
+	Status               string            `json:"status"`
+	ExpiresAt            *time.Time        `json:"expires_at"`
+	LastVerifiedAt       *time.Time        `json:"last_verified_at"`
+	LastError            *string           `json:"last_error"`
+	FailureCount         int               `json:"failure_count"`
+	Crawl                PanelCrawlSummary `json:"crawl"`
+	WebSessionConfigured bool              `json:"web_session_configured"`
+	WebSessionError      string            `json:"web_session_error,omitempty"`
+	SessionReleaseSHA256 string            `json:"session_release_sha256,omitempty"`
 }
 
 type PanelCrawlSummary struct {

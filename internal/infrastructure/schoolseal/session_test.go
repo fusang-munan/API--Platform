@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -62,6 +63,29 @@ func TestSessionReleaseIsSeparateAndEncrypted(t *testing.T) {
 	sessionRelease = bad
 	if _, err := id.OpenSessionRelease(); err == nil {
 		t.Fatal("tampered session release accepted")
+	}
+}
+
+func TestSessionStoreFallsBackWhenRenewalCacheInvalid(t *testing.T) {
+	dir := t.TempDir()
+	id, err := LoadOrCreate(filepath.Join(dir, "delivery"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sampleSession()
+	store, err := id.SessionStore(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.path, []byte("corrupt-renewal-cache"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load()
+	if err != nil || got.WebAccess != session.WebAccess || got.WebRefresh != session.WebRefresh {
+		t.Fatalf("fallback failed: %+v, %v", got, err)
+	}
+	if len(SessionReleaseDigest()) != 64 {
+		t.Fatalf("unexpected embedded session digest: %q", SessionReleaseDigest())
 	}
 }
 
