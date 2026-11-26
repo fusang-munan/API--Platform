@@ -444,7 +444,8 @@ WITH observation AS (
     $4::timestamptz AS effective_at, NULLIF($5::bigint, 0) AS group_id,
     NULLIF($6::text, '')::numeric AS group_rate, $7::boolean AS peak_enabled,
     NULLIF($8::text, '')::numeric AS peak_rate, NULLIF($9::text, '') AS peak_start,
-    NULLIF($10::text, '') AS peak_end, $11::timestamptz AS observed_at
+    NULLIF($10::text, '') AS peak_end, $11::timestamptz AS observed_at,
+    NULLIF($12::text, '') AS account_rate_source
 ), reused AS (
   UPDATE beichen_multiplier_versions previous
   SET observed_at = GREATEST(previous.observed_at, observation.observed_at)
@@ -454,17 +455,18 @@ WITH observation AS (
     ORDER BY effective_at DESC, id DESC LIMIT 1
   ) AND previous.stale_at IS NULL AND
     ROW(previous.multiplier, previous.timezone, previous.group_id, previous.group_rate, previous.peak_enabled,
-        previous.peak_rate, previous.peak_start, previous.peak_end)
+        previous.peak_rate, previous.peak_start, previous.peak_end, previous.account_rate_source)
     IS NOT DISTINCT FROM
     ROW(observation.multiplier, observation.timezone, observation.group_id, observation.group_rate, observation.peak_enabled,
-        observation.peak_rate, observation.peak_start, observation.peak_end)
+        observation.peak_rate, observation.peak_start, observation.peak_end, observation.account_rate_source)
   RETURNING previous.id
 )
 INSERT INTO beichen_multiplier_versions
-  (credential_id, multiplier, timezone, effective_at, group_id, group_rate, peak_enabled, peak_rate, peak_start, peak_end, observed_at)
+  (credential_id, multiplier, timezone, effective_at, group_id, group_rate, peak_enabled, peak_rate, peak_start, peak_end, observed_at,
+   account_rate_source)
 SELECT observation.* FROM observation
 WHERE NOT EXISTS (SELECT 1 FROM reused)`, credentialID, info.Multiplier.String(), info.Timezone, effectiveAt, billingPanelGroup(info),
-		info.GroupRate.String(), info.PeakEnabled, info.PeakRate.String(), info.PeakStart, info.PeakEnd, observedAt)
+		info.GroupRate.String(), info.PeakEnabled, info.PeakRate.String(), info.PeakStart, info.PeakEnd, observedAt, info.accountRateSource)
 	return err
 }
 

@@ -139,6 +139,8 @@ export type BeichenDataset = {
   last_error?: string | null
   effective_multiplier: number | string | null
   effective_multiplier_text?: string
+  account_rate_multiplier?: number | string
+  account_rate_source?: 'key_billing'
   billing_state?: 'current' | 'stale' | 'unverified'
   group_id?: number
   group_name?: string
@@ -310,6 +312,8 @@ export type BeichenWebsiteGroup = {
   status?: string
   rate_multiplier?: number | string
   account_rate_multiplier?: number | string
+  account_rate_source?: 'key_billing'
+  account_rate_key_id?: number
   peak_rate_multiplier?: number | string
   peak_rate_enabled?: boolean
 }

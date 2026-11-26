@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/starprince1234/Nebula-api/internal/beichen"
 )
 
@@ -71,6 +73,55 @@ SELECT (SELECT count(*) FROM schema_migrations WHERE split_part(version,'_',1) B
        (SELECT billed_upstream_micros FROM beichen_daily_usage WHERE credential_id=$1 AND model='public-history')`,
 		credential).Scan(&migrations, &group, &micros); err != nil || migrations != 4 || group != 301 || micros != 42 {
 		t.Fatalf("migration records, pricing group or historical usage changed: %d, %d, %d (%v)", migrations, group, micros, err)
+	}
+}
+
+func TestBeichenMigration0070AccountRateSource(t *testing.T) {
+	ctx, conn := openMigrationTestDB(t)
+	applyMigrationTestBaseline(t, ctx, conn, "0070")
+	credential := uuid.New()
+	if _, err := conn.ExecContext(ctx, `
+INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,group_rate,peak_enabled)
+VALUES($1,0.6,16,0.6,true)`, credential); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := Migrate(ctx, conn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var versions, applied int
+	var preserved bool
+	err := conn.QueryRowContext(ctx, `
+SELECT (SELECT count(*) FROM schema_migrations WHERE left(version,4)='0070'),
+       (SELECT count(*) FROM schema_migrations WHERE version='0070_beichen_account_rate_source.sql'),
+       (SELECT multiplier=0.6 AND group_id=16 AND group_rate=0.6 AND peak_enabled IS TRUE
+          AND account_rate_source IS NULL FROM beichen_multiplier_versions WHERE credential_id=$1)`,
+		credential).Scan(&versions, &applied, &preserved)
+	if err != nil || versions != 1 || applied != 1 || !preserved {
+		t.Fatalf("unexpected migration history or legacy rates: %d %d %t (%v)", versions, applied, preserved, err)
+	}
+
+	insert := `
+INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,group_rate,peak_enabled,account_rate_source)
+VALUES($1,0.6,16,0.6,$2,$3)`
+	peakOn, peakOff := true, false
+	for _, test := range []struct {
+		peak   *bool
+		source string
+	}{
+		{&peakOn, "key_billing"},
+		{nil, "key_billing"},
+		{&peakOff, "unknown"},
+	} {
+		_, err := conn.ExecContext(ctx, insert, credential, test.peak, test.source)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+			t.Fatalf("invalid source or peak flag accepted: %v", err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, insert, credential, false, "key_billing"); err != nil {
+		t.Fatalf("could not persist a non-peak Key billing source: %v", err)
 	}
 }
 

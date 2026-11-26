@@ -185,7 +185,7 @@ func decodeDirectoryPlatform(raw json.RawMessage, section directoryPlatform) (di
 			problems.add(fmt.Sprintf("groups[%d] 分组资料无效", i))
 			continue
 		}
-		group.AccountRate = nil
+		group.AccountRate, group.AccountRateSource, group.AccountRateKeyID = nil, "", 0
 		if group.ID > 0 {
 			group.OwnModels = readDirectoryModels(&section, group.websiteModelLists, group.ID,
 				fmt.Sprintf("groups[%d].", i), &sourceNames, &problems)

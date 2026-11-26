@@ -24,6 +24,8 @@ type Dataset struct {
 	LastError               *string      `json:"last_error"`
 	EffectiveMultiplier     *json.Number `json:"effective_multiplier"`
 	EffectiveMultiplierText string       `json:"effective_multiplier_text,omitempty"`
+	AccountRate             *json.Number `json:"account_rate_multiplier,omitempty"`
+	AccountRateSource       string       `json:"account_rate_source,omitempty"`
 	BillingState            string       `json:"billing_state,omitempty"`
 	GroupID                 *int64       `json:"group_id,omitempty"`
 	GroupName               *string      `json:"group_name,omitempty"`
@@ -253,6 +255,7 @@ func readDatasets(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *O
 	rows, err := tx.QueryContext(ctx, `
 SELECT c.id, kinds.kind, d.last_success, d.last_error, trim_scale(m.multiplier)::text,
   m.group_id, trim_scale(m.group_rate)::text, m.peak_enabled, trim_scale(m.peak_rate)::text, m.observed_at,
+  COALESCE(m.account_rate_source, ''),
   CASE WHEN kinds.kind <> 'billing' THEN ''
        WHEN m.id IS NOT NULL AND (m.stale_at IS NOT NULL OR d.last_error IS NOT NULL OR d.last_success < c.updated_at
          OR d.last_success <= statement_timestamp()-interval '16 minutes') THEN 'stale'
@@ -267,7 +270,7 @@ LEFT JOIN beichen_website_keys k ON kinds.kind='billing' AND k.provider_id=c.pro
   AND k.ciphertext_digest=sha256(c.credential_ciphertext)
 LEFT JOIN beichen_website_key_sync inventory ON inventory.provider_id=k.provider_id
 LEFT JOIN LATERAL (
-  SELECT id, multiplier, group_id, group_rate, peak_enabled, peak_rate, observed_at, stale_at
+  SELECT id, multiplier, group_id, group_rate, peak_enabled, peak_rate, observed_at, stale_at, account_rate_source
   FROM beichen_multiplier_versions
   WHERE kinds.kind = 'billing' AND credential_id = c.id AND effective_at <= statement_timestamp()
   ORDER BY effective_at DESC, id DESC LIMIT 1
@@ -281,15 +284,17 @@ ORDER BY c.label, c.id, kinds.kind`, providerID)
 	for rows.Next() {
 		var item Dataset
 		var multiplier *string
+		var rateSource string
 		var observedGroup []byte
 		var revision time.Time
 		var inventory WebsiteKey
 		if err := rows.Scan(&item.CredentialID, &item.Kind, &item.LastSuccess, &item.LastError, &multiplier,
-			&item.GroupID, &item.GroupRate, &item.PeakEnabled, &item.PeakRate, &item.ObservedAt,
+			&item.GroupID, &item.GroupRate, &item.PeakEnabled, &item.PeakRate, &item.ObservedAt, &rateSource,
 			&item.BillingState, &item.FailureCount, &observedGroup, &revision, &inventory.GroupID, &inventory.GroupName,
 			&inventory.Rate, &inventory.LastSeen); err != nil {
 			return err
 		}
+		versionGroup, versionRate := item.GroupID, item.GroupRate
 		if item.Kind == "billing" {
 			if err := item.applyBillingGroup(observedGroup, revision, inventory); err != nil {
 				return err
@@ -301,6 +306,11 @@ ORDER BY c.label, c.id, kinds.kind`, providerID)
 			value := json.Number(*multiplier)
 			item.EffectiveMultiplier = &value
 			item.EffectiveMultiplierText = *multiplier
+			if rateSource == keyBillingRateSource && item.BillingState == "current" && item.GroupStatus == "assigned" &&
+				versionGroup != nil && item.GroupID != nil && *versionGroup == *item.GroupID &&
+				versionRate != nil && item.GroupRate != nil && samePanelRate(json.Number(*versionRate), json.Number(*item.GroupRate)) {
+				item.AccountRate, item.AccountRateSource = &value, rateSource
+			}
 		}
 		if item.LastSuccess != nil {
 			utc := item.LastSuccess.UTC()

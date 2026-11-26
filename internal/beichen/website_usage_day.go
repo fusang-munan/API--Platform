@@ -20,9 +20,14 @@ const (
 
 type websiteUsageDay struct {
 	unit   string
-	daily  dailyUsagePoint
+	daily  websiteDailyUsage
 	models []modelUsagePoint
 	pages  [][]byte
+}
+
+type websiteDailyUsage struct {
+	dailyUsagePoint
+	GroupID int64 `json:"group_id,omitempty"`
 }
 
 func (s *Service) fetchWebsiteUsageDay(ctx context.Context, bearer string, key listedKey, day string) (websiteUsageDay, error) {
@@ -181,7 +186,8 @@ func summarizeWebsiteUsage(rows []receiptRow, day string) (websiteUsageDay, erro
 	if err != nil {
 		return websiteUsageDay{}, err
 	}
-	result := websiteUsageDay{unit: total.unit, daily: dailyUsagePoint{Date: day, usageCounters: counters, CacheWrite: write},
+	result := websiteUsageDay{unit: total.unit, daily: websiteDailyUsage{
+		dailyUsagePoint: dailyUsagePoint{Date: day, usageCounters: counters, CacheWrite: write}, GroupID: websiteUsageGroup(rows)},
 		models: make([]modelUsagePoint, 0, len(byModel))}
 	for _, model := range slices.Sorted(maps.Keys(byModel)) {
 		part, modelWrite, err := byModel[model].counters()
@@ -194,4 +200,18 @@ func summarizeWebsiteUsage(rows []receiptRow, day string) (websiteUsageDay, erro
 		result.models = append(result.models, modelUsagePoint{Model: model, Date: day, usageCounters: part, CacheWrite: modelWrite})
 	}
 	return result, nil
+}
+
+// Only a single, explicit group across the full day can corroborate its rate.
+func websiteUsageGroup(rows []receiptRow) int64 {
+	if len(rows) == 0 || rows[0].GroupID == nil || !validWebsiteGroupID(*rows[0].GroupID) {
+		return 0
+	}
+	group := *rows[0].GroupID
+	for _, row := range rows[1:] {
+		if row.GroupID == nil || *row.GroupID != group {
+			return 0
+		}
+	}
+	return group
 }

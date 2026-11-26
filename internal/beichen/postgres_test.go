@@ -58,7 +58,7 @@ CREATE TABLE gateway_calls (
 		"0034_beichen_panel_access.sql", "0035_beichen_receipts.sql", "0041_beichen_upstream_usage.sql",
 		"0042_beichen_price_credential_identity.sql", "0046_beichen_billing_checks_and_aliases.sql",
 		"0050_beichen_crawl_runs.sql", "0051_beichen_billing_observations.sql",
-		"0052_beichen_key_usage.sql", "0054_beichen_key_website_evidence.sql")
+		"0052_beichen_key_usage.sql", "0054_beichen_key_website_evidence.sql", "0070_beichen_account_rate_source.sql")
 
 	job := syncJob{provider: uuid.New(), credential: uuid.New()}
 	actor := uuid.New()

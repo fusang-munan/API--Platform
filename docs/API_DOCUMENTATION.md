@@ -474,7 +474,9 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `website_directory.last_run` 是最近一次后台抓取的摘要，尚无运行记录时为 `null`。摘要包含 `started_at`、`duration_ms`、`platform_count`、`group_count`、`model_count`、`expected_model_count` 和 `failures`。同一平台出现在不同渠道下时分别计数。模型按去掉首尾空白的官网原名去重，保留大小写及版本差异。分组按照分组 ID 去重，没有 ID 时用渠道内的平台和分组名识别。`expected_model_count` 含原响应中所有 `models` 和 `supported_models` 数组中能辨认的型号。当平台资料损坏时，本轮成功归入平台的模型数可能低于它。失败项提供 `path`、`reason` 以及可读取的 `channel_id`、`channel` 和 `platform`。
 
-`website_directory.last_run.key_model_comparisons` 按学校渠道返回 `/v1/models` 与当前官网分组的对照。`matched` 提供 `key_model`、`channel_model`、匹配方式和 `price_complete`。名称相同优先，其次核对可以双向唯一匹配的写法变体。`only_key` 和 `only_channel` 保留各自的官网或请求原名。`state=unavailable` 表示 Key 目录读取失败，`unverified` 表示分组或渠道证据不足。两种状态都不把未知结果当作已确认差异。整批身份读取失败时摘要提供 `key_model_error`。官网分组的 `account_rate_multiplier` 来自同一网页登录会话的 `GET /api/v1/groups/rates`，`rate_multiplier` 为分组默认值。账户倍率未读到时，`last_run.account_rate_error` 给出状态。页面展示分组倍率 `group_rate`，结算采用账户倍率 `account_rate`；两者不同时以账户倍率为准，分组倍率只作对照。
+`website_directory.last_run.key_model_comparisons` 按学校渠道返回 `/v1/models` 与当前官网分组的对照。`matched` 提供 `key_model`、`channel_model`、匹配方式和 `price_complete`。名称相同优先，其次核对可以双向唯一匹配的写法变体。`only_key` 和 `only_channel` 保留各自的官网或请求原名。`state=unavailable` 表示 Key 目录读取失败，`unverified` 表示分组或渠道证据不足。两种状态都不把未知结果当作已确认差异。整批身份读取失败时摘要提供 `key_model_error`。
+
+官网分组的 `account_rate_multiplier` 优先读取同一网页登录会话的 `GET /api/v1/groups/rates`，`rate_multiplier` 为分组默认值。倍率表缺该组且通过 Key 账单与用量核验时，共用目录可为只有一把活跃 Key 的分组返回 `account_rate_source`（值为 `key_billing`）和证据的数字 Key 编号 `account_rate_key_id`。账户倍率缺少证据时，`last_run.account_rate_error` 提供提示。结算采用该渠道有效的计费与报价快照。
 
 `website_locations` 带官网原名、渠道、平台、分组、采集时间、缓存状态、`price_scope` 和报价存在标记。`price_scope=platform` 表示平台级共享基础价，可用于同一平台同名型号的跨组回退；`price_scope=group` 表示分组专属价，只能用于该分组本身；缺少该字段的旧数据按分组专属价处理。`price_complete` 表示该官网报价具备所声明计价方式的必要单价，`has_price` 表示至少找到一个数值单价。`catalog_keys` 带实际覆盖的 Key 及上游型号，或者给出需要核查的 Key。`state` 可为 `listed`、`missing`、`pending`、`failed` 或 `ambiguous`。已覆盖条目用 `match` 说明原名、名称归一或教师别名，并保留独立的 Key 型号 ID 供教师操作。弱匹配可以识别唯一的日期版本，保留型号数字和具有实际含义的变体。当前 Key 的报价待确认时，官网价栏显示已读到的完整报价及其所属分组。当前 Key 分组没有自己的完整官网价表时（如分组 16），上游基础价取同一平台公开的 `group_id=0` 同名型号报价，再乘当前 Key 生效倍率 0.60；其他分组的专属报价不当作基础价。学生实价继续乘学校 1.10 系数。
 
@@ -495,6 +497,8 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 自动同步和按供应商的手动同步独立刷新完整官网目录，从登录后的 Key 清单核实分组，再读取该分组的模型、报价和倍率规则。教师模型页的「用指定 Key 重扫」向同步接口提交 `credential_id`，同步该 Key 的账单、目录、报价和近期用量。`/beichen/catalog/rescan` 为单独读取 `/v1/models` 的维护接口，只刷新该 Key 的模型清单。学校预配渠道优先使用学校网页会话，网站提前拒绝会话时自动续期后重试一次。手动同步遇到官网目录或采价失败会返回同步未完成。成功保存的结果可在概览查询，价表错误记录在 `datasets`。教师换 Key 进度中的 `sync.usage` 对应单 Key 网页用量同步。
 
 `datasets` 的 `billing` 条目包含 `billing_state` 和 `effective_multiplier`。有对应记录时还包含保留小数精度的 `effective_multiplier_text`、`group_id`、`group_rate`、`peak_enabled`、`peak_rate` 和倍率版本的 `observed_at`。`group_rate` 是官网分组默认倍率，用于展示；`effective_multiplier` 优先取账户倍率 `account_rate`。两者不同时，页面并列提示分组倍率和账号倍率，结算只采用账号倍率。账户倍率未核实时不把分组默认倍率当作可结算倍率，`billing_state` 为 `stale` 或 `unverified`，新调用保持待核。`current` 表示最近一次读取已确认，`stale` 保留上次倍率和 `last_success`，`unverified` 表示还没有可用依据。连续失败记录在 `failure_count`，最多记到六次，达到三次时 `alert` 为真。
+
+通过 Key 账单回退核验的当前计费版本可在 `billing` 和 `key_capabilities[].website_group` 返回 `account_rate_multiplier` 及 `account_rate_source`（值为 `key_billing`）。官网账户倍率表读取失败或回退被拒绝时，`billing.last_error` 以「北辰官网账户倍率未核实」开头，并附核验阶段与安全原因。标准 Key 账单格式允许省略分组号，回退核验仍要求响应明确提供对应的 `group_id`。缺失或为 0 时记录「Key 账单缺少分组号（group_id 未提供或为 0）」。
 
 `catalog_keys[].group_diagnosis` 的 `model_outside_key_group` 表示型号在其他官网分组且当前 Key 的目录未列出，`price_outside_key_group` 表示型号有其他分组报价、当前 Key 分组缺价，`group_rate_mismatch` 表示同一分组的官网与 Key 计费规则不一致。`website_locations[].groups` 返回官网分组倍率和可用的高峰规则。`website_locations[].price_conditions_exact` 以十进制字符串保存可显示的单价数字，供报价对比使用。Key 分组沿用陈旧记录时，`group_stale` 为真。
 
