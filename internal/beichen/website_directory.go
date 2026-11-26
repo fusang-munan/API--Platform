@@ -123,10 +123,11 @@ SELECT p.id FROM providers p
 LEFT JOIN beichen_website_directories d ON d.provider_id=p.id
 LEFT JOIN beichen_panel_accounts a ON a.provider_id=p.id
 WHERE `+beichenProvider+` AND p.status='active' AND ($1::uuid IS NULL OR p.id=$1)
-  AND (COALESCE(a.status <> 'none', $2))
+  AND (COALESCE(a.status <> 'none', $2) OR (a.status = 'none' AND $3))
   AND ($1 IS NOT NULL OR COALESCE(d.next_attempt, '-infinity'::timestamptz)<=statement_timestamp())
 ORDER BY COALESCE(d.next_attempt, '-infinity'::timestamptz), p.id`, provider,
-		s.WebSessionConfigured() || s.panelFallback != "" || s.sharedPanel != nil || s.sharedPanelErr != nil)
+		s.WebSessionConfigured() || s.panelFallback != "" || s.sharedPanel != nil || s.sharedPanelErr != nil,
+		s.deliveredWebSessionConfigured())
 	if err != nil {
 		return unavailable("读取北辰官网目录同步任务失败", err)
 	}

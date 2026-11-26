@@ -78,6 +78,11 @@ func (s *Service) ConfigureSavedWebSession(store *schoolseal.SessionStore) error
 
 func (s *Service) WebSessionConfigured() bool { return s.webAccount != nil }
 
+func (s *Service) deliveredWebSessionConfigured() bool {
+	// Only ConfigureSavedWebSession installs a rotation store for a release capture.
+	return s.webAccount != nil && s.webAccount.save != nil
+}
+
 func (s *Service) SetWebSessionError(err error) { s.webSessionErr = err }
 
 func (s *Service) WebSessionError() string {

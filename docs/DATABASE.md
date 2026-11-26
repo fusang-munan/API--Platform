@@ -386,7 +386,7 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 `0053_beichen_panel_accounts.sql` 以 `provider_id` 为主键记录北辰网页登录配置。邮箱、密码、访问 Token 和含 Cookie 名的续期凭证分别加密为 `bytea`，密文与供应商 ID、字段名绑定。`mode` 为 `password` 或 `token`，`status` 为 `none`、`active`、`expired` 或 `error`。
 
-`created_by` 指向最近一次提交或清除凭证的教师，`updated_at` 记录最近一次状态写入。`last_verified_at` 记录最近一次成功验证时间，`expires_at` 保存已知的访问 Token 到期时间。连续失败次数和中文原因分别保存到 `failure_count` 与 `last_error`。验证或续期成功会清空失败状态。清除保留状态为 `none` 的空凭证记录，防止后台重新使用启动时配置的凭证。
+`created_by` 指向最近一次提交或清除凭证的教师，`updated_at` 记录最近一次状态写入。`last_verified_at` 记录最近一次成功验证时间，`expires_at` 保存已知的访问 Token 到期时间。连续失败次数和中文原因分别保存到 `failure_count` 与 `last_error`。验证或续期成功会清空失败状态。清除保留状态为 `none` 的空凭证记录，阻止旧的环境令牌及本机授权重新进入同步链路。已加载的版本交付会话可继续读取目录、价格及已核对的账单。
 
 同一供应商的登录、续期和清除在同一数据库内按事务锁串行执行。并发请求用访问 Token 的密文版本标识所用会话，迟到的认证失败不会覆盖已经续期或替换的新会话。教师手动抓取与定时抓取共用 `beichen_website_directories` 的租约和 `beichen_crawl_runs` 的最近结果。
 

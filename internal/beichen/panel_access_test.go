@@ -109,7 +109,7 @@ CREATE TABLE gateway_calls (provider_id uuid, provider_credential_id uuid, upstr
 		t.Fatal("panel token was not stored as ciphertext")
 	}
 	exec("INSERT INTO beichen_panel_access (credential_id,group_id,token_ciphertext,updated_by,updated_at) VALUES ($1,11,$2,$3,clock_timestamp())", b, ciphertext, actor)
-	if access, err := s.loadPriceAccess(ctx, b); err != nil || s.checkLegacyPriceAccount(access) == nil || access.legacyToken != "" {
+	if access, err := s.loadPriceAccess(ctx, b); err != nil || s.checkLegacyPriceAccount(access, false) == nil || access.legacyToken != "" {
 		t.Fatal("transplanted ciphertext was accepted or fell back")
 	}
 	status, err := s.PanelStatus(ctx, provider, a)

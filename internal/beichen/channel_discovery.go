@@ -257,11 +257,11 @@ JOIN providers p ON p.id=c.provider_id JOIN beichen_panel_access a ON a.credenti
 LEFT JOIN beichen_panel_accounts session ON session.provider_id=p.id
 WHERE j.discover_ids AND a.updated_by=$1 AND c.status='active' AND p.status='active' AND `+beichenProvider+`
  AND ($2::uuid IS NULL OR c.id=$2)
- AND COALESCE(session.status<>'none',$3)
+ AND (COALESCE(session.status<>'none',$3) OR (session.status='none' AND $4))
  AND (a.group_id IS NULL OR a.updated_at<>c.updated_at OR j.checked_at IS NULL OR j.checked_at < clock_timestamp()-interval '15 minutes'
       OR ($2 IS NOT NULL AND j.discovery_error IS NOT NULL))
 ORDER BY j.checked_at NULLS FIRST,c.id LIMIT 4`, ProvisionActorID, selected,
-		s.WebSessionConfigured() || s.panelFallback != "" || s.sharedPanel != nil)
+		s.WebSessionConfigured() || s.panelFallback != "" || s.sharedPanel != nil, s.deliveredWebSessionConfigured())
 	if err != nil {
 		return err
 	}
@@ -337,11 +337,9 @@ func (s *Service) lookupPanelKeys(ctx context.Context, provider uuid.UUID) ([]li
 		})
 		return keys, true, err
 	}
-	token, err := s.webPanelToken(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	keys, err := s.accountKeys(ctx, token)
+	keys, err := readWithCapturedWebSession(ctx, s, func(token string) ([]listedKey, error) {
+		return s.accountKeys(ctx, token)
+	})
 	return keys, false, err
 }
 
@@ -405,7 +403,7 @@ WHERE a.credential_id=$1 AND a.updated_by=$2 AND c.updated_at=$3 AND c.status='a
 		}
 		if managed {
 			access = PanelAccessInput{Enabled: true, GroupID: k.GroupID, UpstreamKeyID: &k.ID,
-				webAccount: accountDigest("beichen-provider:" + j.provider.String())}
+				webAccount: providerPanelAccountDigest(j.provider)}
 		}
 		same := false
 		if group.Int64 == k.GroupID && id.Int64 == k.ID && current.Equal(j.revision) && (!owner.Valid || owner.Int64 == k.UserID) {

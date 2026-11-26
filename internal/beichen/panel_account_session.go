@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,28 +19,51 @@ type panelAuthorization struct {
 	verified     bool
 	shared       bool
 	local        bool
+	delivered    bool
 }
 
+// A cleared login keeps an empty row so the previous environment token or an
+// older saved session cannot resume. It is not a usable account, so callers
+// must decide whether the deployment-delivered school session may still read.
+var errPanelAccountCleared = fmt.Errorf("%w（网页登录已清除）", errPanelAccountMissing)
+
 func (s *Service) storedPanelAuthorization(ctx context.Context, provider uuid.UUID) (panelAuthorization, bool, error) {
-	if s.db == nil || provider == uuid.Nil {
-		return panelAuthorization{}, false, nil
-	}
-	account, found, err := readPanelAccount(ctx, s.db, provider)
+	account, found, err := s.loadStoredPanelAccount(ctx, provider)
 	if err != nil || !found {
 		return panelAuthorization{}, found, err
 	}
+	authorization, err := s.authorizeStoredPanelAccount(ctx, account)
+	return authorization, true, err
+}
+
+func (s *Service) loadStoredPanelAccount(ctx context.Context, provider uuid.UUID) (panelAccount, bool, error) {
+	if s.db == nil || provider == uuid.Nil {
+		return panelAccount{}, false, nil
+	}
+	return readPanelAccount(ctx, s.db, provider)
+}
+
+func (s *Service) authorizeStoredPanelAccount(ctx context.Context, account panelAccount) (panelAuthorization, error) {
+	if panelAccountCleared(account) {
+		return panelAuthorization{}, errPanelAccountCleared
+	}
+	provider := account.provider
 	if account.status != panelStateActive || account.hasExpired(s.now()) {
-		var sessionErr error
-		account, sessionErr, err = s.updatePanelSession(ctx, provider, false)
+		updated, sessionErr, err := s.updatePanelSession(ctx, provider, false)
 		if err != nil || sessionErr != nil {
-			return panelAuthorization{}, true, errors.Join(err, sessionErr)
+			return panelAuthorization{}, errors.Join(err, sessionErr)
 		}
+		account = updated
 	}
 	bearer, err := s.decryptPanelSecret(provider, "token", account.token)
 	if err != nil || !validPanelBearer(bearer) {
-		return panelAuthorization{}, true, errPanelAccountCrypto
+		return panelAuthorization{}, errPanelAccountCrypto
 	}
-	return panelAuthorization{bearer: bearer, tokenVersion: account.token, verified: account.lastVerifiedAt != nil}, true, nil
+	return panelAuthorization{bearer: bearer, tokenVersion: account.token, verified: account.lastVerifiedAt != nil}, nil
+}
+
+func panelAccountCleared(account panelAccount) bool {
+	return account.status == panelStateNone && len(account.token) == 0 && len(account.password) == 0
 }
 
 func (s *Service) updatePanelSession(ctx context.Context, provider uuid.UUID, verify bool) (panelAccount, error, error) {

@@ -413,7 +413,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 | 保存北辰网页登录 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/account/login` | 提交账号密码或网页 Token |
 | 验证北辰网页会话 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/account/verify` | 在线检查会话状态，必要时续期密码模式的会话 |
 | 生成旧版北辰本机授权 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/account/export` | 供既有脚本使用，提交 `{"confirm":true}` 后返回 `beichen-session.env` |
-| 清除北辰网页登录 | DELETE | `/api/v1/teacher/providers/{provider_id}/beichen/account` | 清除已保存凭证并尝试退出上游会话 |
+| 清除北辰网页登录 | DELETE | `/api/v1/teacher/providers/{provider_id}/beichen/account` | 清除已保存凭证及本机授权，并尝试退出对应的上游会话。已加载的版本交付会话可继续用于学校后台同步 |
 | 抓取北辰官网目录 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/crawl` | 手动更新官网目录，返回本轮抓取摘要 |
 | 北辰校内试算价 | PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/price` | 指定模型手动设价或恢复跟随 |
 | 北辰报价或账单导入 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/import` | 按凭据导入受支持的 CSV |

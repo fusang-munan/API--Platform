@@ -66,18 +66,7 @@ func readWebsiteKey[T any](ctx context.Context, s *Service, access priceAccess, 
 		return zero, errors.New("该渠道的北辰网页读取已停用")
 	}
 	verified := func(token string) (T, error) {
-		if !validPanelBearer(token) || token == key {
-			return zero, errPanelAccountMissing
-		}
-		keys, err := s.accountKeys(ctx, token)
-		if err != nil {
-			return zero, err
-		}
-		match, err := identifyChannel(key, access.channel, access.label, keys)
-		if err != nil && !errors.Is(err, errKeyGroupMissing) {
-			return zero, err
-		}
-		return read(token, match)
+		return readIdentifiedWebsiteKey(ctx, s, access, key, token, read)
 	}
 	auth, managed, err := s.managedPanelAuthorization(ctx, access.providerID, "")
 	if err != nil {
@@ -86,16 +75,33 @@ func readWebsiteKey[T any](ctx context.Context, s *Service, access priceAccess, 
 	if managed {
 		return readWithPanelAuthorization(ctx, s, access.providerID, auth, true, verified)
 	}
-	if err := s.checkLegacyPriceAccount(access); err != nil {
+	if err := s.checkLegacyPriceAccount(access, auth.delivered); err != nil {
 		return zero, err
 	}
-	if access.legacyToken != "" && (access.channel == "" || !s.WebSessionConfigured()) {
+	if !auth.delivered && access.legacyToken != "" && (access.channel == "" || !s.WebSessionConfigured()) {
 		return verified(access.legacyToken)
 	}
 	if !s.WebSessionConfigured() {
 		return zero, errPanelAccountMissing
 	}
 	return readWithCapturedWebSession(ctx, s, verified)
+}
+
+func readIdentifiedWebsiteKey[T any](ctx context.Context, s *Service, access priceAccess, key, token string,
+	read func(string, listedKey) (T, error)) (T, error) {
+	var zero T
+	if !validPanelBearer(token) || token == key {
+		return zero, errPanelAccountMissing
+	}
+	keys, err := s.accountKeys(ctx, token)
+	if err != nil {
+		return zero, err
+	}
+	match, err := identifyChannel(key, access.channel, access.label, keys)
+	if err != nil && !errors.Is(err, errKeyGroupMissing) {
+		return zero, err
+	}
+	return read(token, match)
 }
 
 func (s *Service) fetchWebsiteKeyCatalog(ctx context.Context, token string, key listedKey) (websiteKeyCatalog, error) {
