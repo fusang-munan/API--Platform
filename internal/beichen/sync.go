@@ -8,7 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/url"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,8 +22,8 @@ import (
 const (
 	sweepInterval        = time.Minute
 	sweepTimeout         = time.Minute
-	jobTimeout           = 25 * time.Second
-	leaseSeconds         = 90
+	jobTimeout           = catalog.BeichenScanTimeout
+	leaseSeconds         = catalog.BeichenScanLeaseSeconds
 	billingAlertFailures = 3
 )
 
@@ -45,10 +48,19 @@ type credentialRecord struct {
 }
 
 type fetchResult struct {
-	save        func(context.Context, *sql.Tx) error
-	err         error
-	partialErr  error
-	accountRate *billingAccountRateObservation
+	save                 func(context.Context, *sql.Tx) error
+	err                  error
+	partialErr           error
+	accountRate          *billingAccountRateObservation
+	catalog              *keyCatalogScan
+	usagePages           keyUsageScanTrace
+	billingMissingFields []string
+}
+
+type keyCatalogScan struct {
+	entries []catalog.ProviderEntry
+	at      time.Time
+	err     error
 }
 
 var errBillingKeyBindingChanged = errors.New("同步期间北辰官网 Key 或分组已变化")
@@ -215,19 +227,12 @@ LIMIT CASE WHEN $1 IS NULL THEN 24 ELSE NULL END`, providerID)
 }
 
 func (s *Service) runJob(ctx context.Context, job syncJob, manual bool) (bool, error) {
-	lease := uuid.New()
-	err := s.db.QueryRowContext(ctx, `
-INSERT INTO beichen_datasets (credential_id, kind, lease_id, lease_until)
-VALUES ($1, $2, $3, clock_timestamp() + $4::int * interval '1 second')
-ON CONFLICT (credential_id, kind) DO UPDATE SET lease_id = EXCLUDED.lease_id, lease_until = EXCLUDED.lease_until
-WHERE (beichen_datasets.lease_until IS NULL OR beichen_datasets.lease_until <= clock_timestamp())
-  AND ($5::boolean OR beichen_datasets.next_attempt <= clock_timestamp())
-RETURNING lease_id`, job.credential, job.leaseKind(), lease, leaseSeconds, manual).Scan(&lease)
-	if errors.Is(err, sql.ErrNoRows) {
-		return true, nil
-	}
+	lease, err := catalog.AcquireBeichenDatasetLease(ctx, s.db, job.credential, job.leaseKind(), manual)
 	if err != nil {
 		return false, err
+	}
+	if lease == uuid.Nil {
+		return true, nil
 	}
 	var credential credentialRecord
 	err = s.db.QueryRowContext(ctx, `
@@ -243,10 +248,8 @@ WHERE c.id = $1 AND p.id = $2 AND p.status = 'active' AND c.status = 'active' AN
 	if err != nil {
 		result := fetchResult{err: errors.New("北辰凭据解密失败")}
 		if job.kind == "billing" || job.kind == "catalog" {
+			result.catalog = &keyCatalogScan{err: result.err}
 			result.save = func(ctx context.Context, tx *sql.Tx) error {
-				if err := recordDatasetError(ctx, tx, job.credential, "catalog", result.err.Error()); err != nil {
-					return err
-				}
 				if job.kind == "billing" {
 					return saveBillingObservation(ctx, tx, job.credential, credential.updatedAt, billingInfo{}, result.err, 0, panelQuote{})
 				}
@@ -273,24 +276,25 @@ UPDATE beichen_key_observations SET models_error=$3,usage_error=$3 WHERE credent
 func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credentialRecord, key string, manual bool) fetchResult {
 	switch job.kind {
 	case "catalog":
-		result := s.fetchKeyCatalogJob(ctx, job, key)
+		result := fetchResult{catalog: s.fetchKeyCatalogJob(ctx, key)}
 		if !job.websiteCatalog {
 			return result
 		}
 		directory, websiteErr := s.readCredentialWebsiteCatalog(ctx, job.credential, key)
-		return fetchResult{err: errors.Join(result.err, websiteErr), save: func(ctx context.Context, tx *sql.Tx) error {
-			if err := result.save(ctx, tx); err != nil {
-				return err
+		result.err = websiteErr
+		if websiteErr == nil {
+			result.save = func(ctx context.Context, tx *sql.Tx) error {
+				return saveWebsiteCatalog(ctx, tx, job.credential, credential.updatedAt, directory.catalogQuote())
 			}
-			if websiteErr != nil {
-				return nil
-			}
-			return saveWebsiteCatalog(ctx, tx, job.credential, credential.updatedAt, directory.catalogQuote())
-		}}
+		}
+		return result
 	case "billing":
 		return s.fetchBillingJob(ctx, job, credential.updatedAt, key)
 	case "key_usage":
-		return s.fetchWebsiteKeyUsage(ctx, job, credential, key)
+		pages := keyUsageScanTrace{}
+		result := s.fetchWebsiteKeyUsage(context.WithValue(ctx, keyUsageScanTraceKey{}, pages), job, credential, key)
+		result.usagePages = pages
+		return result
 	default:
 		return fetchResult{err: errors.New("北辰同步任务类型无效")}
 	}
@@ -298,8 +302,8 @@ func (s *Service) fetchJob(ctx context.Context, job syncJob, credential credenti
 
 func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision time.Time, key string) fetchResult {
 	startedAt := s.now().UTC()
-	keyResults := make(chan fetchResult, 1)
-	go func() { keyResults <- s.fetchKeyCatalogJob(ctx, job, key) }()
+	keyResults := make(chan *keyCatalogScan, 1)
+	go func() { keyResults <- s.fetchKeyCatalogJob(ctx, key) }()
 	directory, websiteErr := s.readBillingCatalog(ctx, job, key)
 	var info billingInfo
 	var quote panelQuote
@@ -324,54 +328,35 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 			Source: group.AccountRateSource, KeyChecked: directory.keyGroupAt, Revision: revision,
 		}
 	}
-	return fetchResult{err: billingErr, partialErr: errors.Join(partialErr, keyResult.err), accountRate: evidence, save: func(ctx context.Context, tx *sql.Tx) error {
-		accepted, err := saveBillingGroup(ctx, tx, job.credential, revision, startedAt, directory, billingErr, false)
-		if err != nil {
-			return err
-		}
-		if !accepted {
-			return errBillingKeyBindingChanged
-		}
-		if err := keyResult.save(ctx, tx); err != nil {
-			return err
-		}
-		if websiteErr == nil {
-			if err := saveWebsiteCatalog(ctx, tx, job.credential, revision, directory.catalogQuote()); err != nil {
+	var missing []string
+	if directory.keyBilling != nil {
+		missing = directory.keyBilling.missingKeyBillingFields()
+	}
+	return fetchResult{err: billingErr, partialErr: partialErr, catalog: keyResult, accountRate: evidence,
+		billingMissingFields: missing, save: func(ctx context.Context, tx *sql.Tx) error {
+			accepted, err := saveBillingGroup(ctx, tx, job.credential, revision, startedAt, directory, billingErr, false)
+			if err != nil {
 				return err
 			}
-		}
-		return saveBillingObservation(ctx, tx, job.credential, revision, info, billingErr, quote.groupID, quote)
-	}}
+			if !accepted {
+				return errBillingKeyBindingChanged
+			}
+			if websiteErr == nil {
+				if err := saveWebsiteCatalog(ctx, tx, job.credential, revision, directory.catalogQuote()); err != nil {
+					return err
+				}
+			}
+			return saveBillingObservation(ctx, tx, job.credential, revision, info, billingErr, quote.groupID, quote)
+		}}
 }
 
-func (s *Service) fetchKeyCatalogJob(ctx context.Context, job syncJob, key string) fetchResult {
+func (s *Service) fetchKeyCatalogJob(ctx context.Context, key string) *keyCatalogScan {
 	entries, err := s.fetchKeyCatalog(ctx, key)
-	at := s.now().UTC()
-	return fetchResult{err: err, save: func(ctx context.Context, tx *sql.Tx) error {
-		if err != nil {
-			return recordDatasetError(ctx, tx, job.credential, "catalog", err.Error())
-		}
-		return saveKeyCatalog(ctx, tx, job, entries, at)
-	}}
-}
-
-func saveKeyCatalog(ctx context.Context, tx *sql.Tx, job syncJob, entries []catalog.ProviderEntry, at time.Time) error {
-	if _, err := catalog.ReplaceCredentialEntries(ctx, tx, job.provider, job.credential, entries, at); err != nil {
-		return err
-	}
-	return recordSuccess(ctx, tx, job.credential, "catalog")
+	return &keyCatalogScan{entries: entries, at: s.now().UTC(), err: err}
 }
 
 func (s *Service) fetchKeyCatalog(ctx context.Context, key string) ([]catalog.ProviderEntry, error) {
-	body, err := s.fetch(ctx, key, modelsPath, nil)
-	if err != nil {
-		return nil, err
-	}
-	entries, err := catalog.ParseBeichenModels(body)
-	if err != nil {
-		return nil, errors.New("北辰模型目录格式无效或超过 2000 条")
-	}
-	return entries, nil
+	return catalog.FetchProviderModels(ctx, origin, key, s.client)
 }
 
 func billingPanelGroup(info billingInfo) int64 {
@@ -517,34 +502,22 @@ ON CONFLICT (credential_id, kind) DO UPDATE SET last_error = EXCLUDED.last_error
 }
 
 func (s *Service) finishJob(ctx context.Context, job syncJob, lease uuid.UUID, credential credentialRecord, result fetchResult, manual bool) error {
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var current time.Time
-	err = tx.QueryRowContext(ctx, `
-SELECT c.updated_at FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
-WHERE p.id = $1 AND c.id = $2 AND c.status = 'active' AND p.status = 'active' AND `+beichenProvider+`
-FOR SHARE OF p FOR NO KEY UPDATE OF c`, job.provider, job.credential).Scan(&current)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	current, err := catalog.LockBeichenScan(ctx, tx, job.provider, job.credential, job.leaseKind(), lease, credential.updatedAt)
+	if err != nil {
 		return err
 	}
-	obsolete := err != nil || !credential.updatedAt.Equal(current)
-	var ownsLease bool
-	err = tx.QueryRowContext(ctx, `
-SELECT lease_id = $3 AND lease_until > clock_timestamp() FROM beichen_datasets
-WHERE credential_id = $1 AND kind = $2 AND lease_id IS NOT NULL FOR UPDATE`,
-		job.credential, job.leaseKind(), lease).Scan(&ownsLease)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	if !ownsLease {
-		return errors.New("北辰同步任务租约已失效")
-	}
-	if obsolete {
-		_, err := tx.ExecContext(ctx, `UPDATE beichen_datasets SET lease_id=NULL, lease_until=NULL
-WHERE credential_id=$1 AND kind=$2`, job.credential, job.leaseKind())
+	if !current {
+		err := catalog.ReleaseBeichenDatasetLease(ctx, tx, job.credential, job.leaseKind())
 		if err == nil {
 			err = tx.Commit()
 		}
@@ -555,23 +528,37 @@ WHERE credential_id=$1 AND kind=$2`, job.credential, job.leaseKind())
 			if !errors.Is(err, errBillingKeyBindingChanged) {
 				return err
 			}
-			_, releaseErr := tx.ExecContext(ctx, `UPDATE beichen_datasets SET lease_id=NULL, lease_until=NULL
-WHERE credential_id=$1 AND kind=$2`, job.credential, job.leaseKind())
+			releaseErr := catalog.ReleaseBeichenDatasetLease(ctx, tx, job.credential, job.leaseKind())
 			if releaseErr == nil {
 				releaseErr = tx.Commit()
 			}
 			return errors.Join(err, releaseErr)
 		}
 	}
+	if result.catalog != nil {
+		scan := result.catalog
+		observationErr, err := catalog.SaveBeichenKeyScan(ctx, tx, job.provider, job.credential, credential.updatedAt,
+			scan.at, scan.entries, scan.err)
+		if err != nil {
+			return err
+		}
+		result.partialErr = errors.Join(result.partialErr, observationErr)
+	}
+	if result.err != nil && len(result.usagePages) != 0 {
+		pages, err := recordKeyUsagePageFailures(ctx, tx, job.credential, credential, result.usagePages)
+		if err != nil {
+			return err
+		}
+		result.err = errors.Join(result.err, pages)
+	}
 	if job.kind == "catalog" {
 		// The Key catalog shares the regular billing job's lease. A targeted
 		// scan leaves billing and price results and their schedules intact.
-		_, err := tx.ExecContext(ctx, `UPDATE beichen_datasets SET lease_id=NULL, lease_until=NULL
-WHERE credential_id=$1 AND kind='billing'`, job.credential)
+		err := catalog.ReleaseBeichenDatasetLease(ctx, tx, job.credential, job.leaseKind())
 		if err == nil {
 			err = tx.Commit()
 		}
-		return errors.Join(err, result.err)
+		return errors.Join(err, result.err, result.partialErr)
 	}
 	var message *string
 	if result.err != nil {
@@ -587,6 +574,15 @@ WHERE credential_id=$1 AND kind='billing'`, job.credential)
 		value := string(raw)
 		accountRate = &value
 	}
+	var missingFields *string
+	if len(result.billingMissingFields) != 0 {
+		raw, err := json.Marshal(result.billingMissingFields)
+		if err != nil {
+			return err
+		}
+		value := string(raw)
+		missingFields = &value
+	}
 	var failures int
 	err = tx.QueryRowContext(ctx, `
 WITH completed AS (SELECT clock_timestamp() AS at)
@@ -594,9 +590,10 @@ UPDATE beichen_datasets SET
   last_success = CASE WHEN $3 THEN completed.at ELSE last_success END,
   website_group_observation = CASE
     WHEN kind <> 'billing' THEN website_group_observation
-    WHEN $7::jsonb IS NULL THEN website_group_observation - 'billing_account_rate'
-    ELSE jsonb_set(COALESCE(website_group_observation,'{}'),'{billing_account_rate}',
-      $7::jsonb || jsonb_build_object('last_success',completed.at)) END,
+    WHEN $7::jsonb IS NULL AND $8::jsonb IS NULL THEN website_group_observation - 'billing_account_rate' - 'key_billing_missing_fields'
+    ELSE (COALESCE(website_group_observation,'{}') - 'billing_account_rate' - 'key_billing_missing_fields')
+      || jsonb_strip_nulls(jsonb_build_object('billing_account_rate', $7::jsonb || jsonb_build_object('last_success',completed.at),
+        'key_billing_missing_fields', $8::jsonb)) END,
   last_error = $4, failure_count = CASE WHEN $6 THEN failure_count WHEN $4::text IS NULL THEN 0 ELSE LEAST(failure_count + 1, 6) END,
   next_attempt = CASE
     WHEN $6 THEN next_attempt
@@ -613,7 +610,7 @@ FROM completed
 WHERE credential_id = $1 AND kind = $2
 RETURNING failure_count`, job.credential, job.kind,
 		(result.save != nil && job.kind == "usage") || result.err == nil, message, refreshMinutes(job.kind), manual && job.kind == "usage",
-		accountRate).Scan(&failures)
+		accountRate, missingFields).Scan(&failures)
 	if err != nil {
 		return err
 	}
@@ -624,6 +621,50 @@ RETURNING failure_count`, job.credential, job.kind,
 		slog.Warn("北辰渠道倍率连续读取失败", "provider_id", job.provider, "credential_id", job.credential, "failures", failures)
 	}
 	return errors.Join(result.err, result.partialErr)
+}
+
+func recordKeyUsagePageFailures(ctx context.Context, tx *sql.Tx, id uuid.UUID, credential credentialRecord,
+	pages keyUsageScanTrace) (error, error) {
+	digest := sha256.Sum256(credential.ciphertext)
+	var message sql.NullString
+	var keyID sql.NullInt64
+	err := tx.QueryRowContext(ctx, `
+SELECT usage_error,website_key_id FROM beichen_key_observations WHERE credential_id=$1 AND key_digest=$2`,
+		id, digest[:]).Scan(&message, &keyID)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !message.Valid) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var details []string
+	for _, day := range slices.Sorted(maps.Keys(pages)) {
+		// The existing daily fetch errors identify the affected day. A
+		// successful day in the same job needs no diagnostic.
+		if !strings.Contains(message.String, day+"：") {
+			continue
+		}
+		var previous time.Time
+		err := tx.QueryRowContext(ctx, `
+SELECT fetched_at FROM beichen_key_usage_days
+WHERE credential_id=$1 AND key_digest=$2 AND day=$3::date AND website_key_id=$4`,
+			id, digest[:], day, keyID).Scan(&previous)
+		old := "该日无已核验快照"
+		if err == nil {
+			old = "沿用 " + previous.UTC().Format(time.RFC3339Nano) + " 采集的快照"
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		details = append(details, fmt.Sprintf("%s 第 %d 页不完整，%s", day, pages[day], old))
+	}
+	if len(details) == 0 {
+		return nil, nil
+	}
+	summary := strings.Join(details, "\n")
+	_, err = tx.ExecContext(ctx, `
+UPDATE beichen_key_observations SET usage_error=usage_error||E'\n'||$3
+WHERE credential_id=$1 AND key_digest=$2`, id, digest[:], summary)
+	return errors.New(summary), err
 }
 
 func refreshMinutes(kind string) int {

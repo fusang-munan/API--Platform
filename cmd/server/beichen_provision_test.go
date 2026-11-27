@@ -320,6 +320,18 @@ VALUES ($1,'fixture','fixture@teacher.invalid','!','teacher','active',now(),now(
 	if err := configureBeichen(ctx, otherWeb, rotated, "", ""); err != nil || snapshot() == before {
 		t.Fatal("account change failed to revise the pinned bindings")
 	}
+	exec("UPDATE provider_credentials SET label='retired Gemini fixture',status='inactive',retired_at=clock_timestamp() WHERE id=$1", webID)
+	before = snapshot()
+	for _, raw := range []string{
+		rotated,
+		strings.Replace(rotated, `{"channel":"Gemini","api_key":"sk-fixture-one","group_id":11,"upstream_key_id":51},`, "", 1),
+		strings.Replace(rotated, `{"channel":"Gemini","api_key":"sk-fixture-one","group_id":11,"upstream_key_id":51}`,
+			`{"channel":"Gemini","status":"retired"}`, 1),
+	} {
+		if err := configureBeichen(ctx, otherWeb, raw, "", ""); err != nil || snapshot() != before {
+			t.Fatal("optional or retired Gemini configuration re-provisioned historical credentials", err)
+		}
+	}
 	before = snapshot()
 	exec("UPDATE users SET role='teacher' WHERE status='disabled'")
 	fail(rotated, newToken)

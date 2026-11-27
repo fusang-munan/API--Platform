@@ -283,6 +283,15 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 用 `go test ./cmd/beichen-crawl ./internal/beichen -run 'Test(CrawlCommand|BeichenCrawlWebsiteKey)' -count=1 -v` 验证分页、脱敏、同组去重、部分解析及显式保存。配置隔离的 `NEBULA_TEST_POSTGRES` 后，该命令也覆盖定时到期刷新、基础倍率和高峰倍率分别变更、重复读数去重，以及分页失败保留上次数据。`changed_at` 为空时，检查教师清单的 `observed_at` 是否已有首个版本。`last_seen` 长时间未更新时，检查同步状态、北辰网页登录授权和数据库迁移 `0056`。
 
+#### 核对北辰扫描完整性
+
+设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen ./internal/catalog ./internal/controlplane -run TestBeichenScanRobustness -count=1 -v`。模拟上游覆盖游标和 Link、分页总数变化、第 2 页失败、HTTP 429、超时、旧轮次晚写、官网省略平台、遮罩证据不足及 Key 身份冲突。`go test ./cmd/server -run TestBeichenProvisionPostgres -count=1 -v` 核对已归档凭据的部署升级。
+
+- 若 Key 的型号总数比上一份目录减少至少一半，检查 `catalog.last_error` 中的确认进度。第三次连续返回同一完整型号集合时接受这次变化。不同集合重新从第一次计数，读取失败会清除计数并保留上次目录。HTTP 429 和单次请求超时按剩余时限最多重试一次。超过 2 秒的 `Retry-After` 留待下一轮处理。
+- 若官网目录缺少平台或分组，检查 `website_directory.last_run.failures` 及 `website_directory.groups` 中的采集时间和 `retained`。缺席或缩水的平台需要三个连续完整且一致的观察。整页没有可读型号时保留快照并记录读取失败。`beichen-crawl --match-db` 可查询对照结果，确认轮数由持久化抓取推进。
+- 如果官网 Key 清单未更新，先用 `last_seen` 找最近一次完整成功，再查 `failed_page` 与 `last_error`。分页总数不稳定时自动重读一整轮。`match_issues` 用于区分遮罩或归属证据不足、同强度候选、多个校内渠道认领同一官网 Key。
+- 如果日用量只更新了部分日期，检查 `kind=key_usage` 的 `last_error` 和 Key 用量错误。错误附带失败账日、页码及该日旧快照时间。单日 100 页和 16 MiB 的读取上限、途中失败或总数变化都不会提交当日半份数据。账单缺字段时查 `kind=billing` 的 `website_group_observation.key_billing_missing_fields`，有效价表仍以 `kind=prices` 的状态为准。
+
 #### 改分组后仍显示旧倍率或缺报价
 
 旧模型页的定向重扫只读模型清单，旧概览的分组取自上次采价或预配映射。新版在「用指定 Key 重扫」后读取当前 Key 账单。查看「Key 分组与倍率」中的生效倍率、分组与上次成功时间。若显示「倍率已陈旧」，查看该行的账单错误并重扫。第三次连续失败会同时写入服务告警。待核的跟随价调用可由通过校验的北辰回执补记。

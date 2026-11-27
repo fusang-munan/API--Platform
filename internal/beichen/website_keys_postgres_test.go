@@ -97,7 +97,7 @@ VALUES ($1,'billing',$2,clock_timestamp()+interval '1 minute')`, claude, oldLeas
 	if err != nil || initial.Status != "unsynced" || len(initial.Keys) != 0 || reads.Load() != 0 {
 		t.Fatalf("empty view: %s, %v", initial.Status, err)
 	}
-	refresh := func(want string) WebsiteKeyInventory {
+	refresh := func(want string) WebsiteKeyInventoryReport {
 		t.Helper()
 		view, err := service.RefreshWebsiteKeys(ctx, provider)
 		if err != nil || view.Status != want || len(view.Keys) != 4 {

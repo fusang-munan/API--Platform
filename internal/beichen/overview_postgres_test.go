@@ -159,7 +159,7 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 		if err != nil {
 			t.Fatalf("fetch catalog: %v", err)
 		}
-		if err := saveKeyCatalog(ctx, tx, syncJob{provider: provider, credential: id}, entries, s.now().UTC()); err != nil {
+		if err := saveKeyCatalogFixture(ctx, tx, syncJob{provider: provider, credential: id}, entries, s.now().UTC()); err != nil {
 			t.Fatal(err)
 		}
 	}

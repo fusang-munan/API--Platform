@@ -430,7 +430,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 {"email":"teacher2@example.com"}
 ```
 
-迁移预置北辰供应商。学校部署随后从加密的发布配置建立四条渠道，以官网登录身份关联分组和数字 Key ID。教师模型页读取已同步的可用模型、当前首选线路倍率和启用状态。项目用量按学生、模型汇总。其他供应商可用现有接口配置。
+迁移预置北辰供应商。学校部署随后按发布配置建立启用渠道，以官网登录身份关联分组和数字 Key ID。教师模型页读取已同步的可用模型、当前首选线路倍率和启用状态。项目用量按学生、模型汇总。其他供应商可用现有接口配置。
 
 学校 HTTPS 入口承载控制台、`/api/v1/` 及网关已有的原生协议路由。访问 `GET /teacher/providers`、`GET /student/api-keys` 或 `GET /login` 返回官方 Vue 应用的 HTML；应用使用同源 API 登录、选择身份和检查权限。登录挑战和刷新 Cookie 使用 Secure。读取网页本身不授予教师或学生权限。
 
@@ -486,6 +486,8 @@ Key 证据不足时，标准余额计费、分组默认倍率有效且高峰开�
 
 `catalog_differences` 按启用 Key 返回已知分组、核对时间、`website_only` 和 `key_only`。官网分组与当前 Key 目录均可对比时标为 `compared`。比较使用保留的官网数据时标为 `stale`。缺少一方证据时标为 `unverified`。`website_only_models` 汇总当前 Key 均未匹配的官网型号及候选渠道，`website_only_status` 表示该汇总的核对状态。
 
+`website_directory.groups` 按平台和分组返回 `observed_at` 与 `retained`。`retained=true` 表示整组或组内部分型号沿用以前的快照。`incomplete` 表示该片段本轮未完整解析。`website_directory.last_run.failures` 可记录缺席范围、待核验原因及已连续确认的轮数。覆盖待核验时 `expected_model_count` 纳入前一次保存的覆盖规模。`kind=catalog` 的 `last_error` 会说明目录缩水的确认进度或模型分页失败的页码。对 Key 日用量，`kind=key_usage` 的 `last_error` 及 Key 用量错误可列出失败账日、页码和沿用快照的采集时间。
+
 探活 POST 返回任务对象，GET 返回 `{run, results}`。概览中的 `probe_run` 使用相同任务对象。任务对象含 `state`（`idle`、`queued`、`running`、`completed` 或 `failed`）、`started_at`、`finished_at` 和 `error_code`。同一供应商在排队或执行时收到重复 POST 会合并。没有启用且已同步目录的 Key 时 POST 返回 400，供应商不存在或并非北辰时返回 404。未登录返回 401，角色不符返回 403。两个接口均返回 `Cache-Control: private, no-store`。
 
 `results` 按 `checked_at` 倒序，每个当前组合只保留最新结果。每项包括 `provider_id`、`credential_id`、`model`、`protocol`、`status_code`、`error_code`、`duration_ms`、`checked_at` 和 `detail`。尚未收到 HTTP 状态时 `status_code=0`，通过时 `error_code=null`。`detail` 只记录输出限制 `max_output_tokens: 1`。
@@ -524,9 +526,11 @@ Key 证据不足时，标准余额计费、分组默认倍率有效且高峰开�
 
 #### 北辰官网 Key 清单
 
-清单和刷新接口要求教师登录。GET 只读取学校数据库。POST 使用已配置的网页会话读取北辰 `GET /api/v1/keys?page=1&page_size=100` 并检查分页完整性。密钥页仅给出分组 ID 或分组明细不全时，由 `GET /api/v1/channels/available` 按同一个 ID 补全。
+清单和刷新接口要求教师登录。GET 只读取学校数据库。POST 使用已配置的网页会话读取北辰 `GET /api/v1/keys?page=1&page_size=100` 并检查分页完整性。总数变化、分页结构异常或上游服务错误时最多从第一页重读一次。密钥页仅给出分组 ID 或分组明细不全时，由 `GET /api/v1/channels/available` 按同一个 ID 补全。
 
 `data.status` 为 `unsynced`、`current`、`stale`、`session_expired` 或 `unavailable`。成功时 `last_seen` 更新为读取时间。北辰返回 401 或会话已知过期时返回 `session_expired`，保留最近成功的清单及时间。已保存的清单超过 30 分钟未更新时显示 `stale`。并发刷新返回 `invalid_transition`。
+
+清单读取失败时可返回 `last_error` 及 `failed_page`。`last_seen` 仍表示最近一次完整成功的观察。完整清单存在渠道归属疑问时，`match_issues` 按原因统计渠道数。`insufficient_key_evidence` 表示遮罩证据不足或无匹配项，`tied_website_candidates` 表示多个同强度候选，`multiple_school_credentials` 表示多个校内渠道指向同一官网 Key。
 
 `data.keys` 的每一项包含北辰 `id`、`name`、脱敏后的 `key_prefix`、`group_id`、`group_name`、分组倍率 `rate`、`status`、`enabled`、`created_at`、`last_seen`、匹配的学校 `credential_id` 和 `match_status`。`peak` 包含 `enabled`、`rate`、`start` 和 `end`，取官网 Key 页的 `group.peak_rate_enabled`、`group.peak_rate_multiplier`、`group.peak_start` 和 `group.peak_end`。倍率用十进制字符串传输，未知字段为 `null`。匹配状态为 `matched`、`unmatched` 或 `ambiguous`。
 

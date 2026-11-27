@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -12,8 +13,19 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/domain"
 )
 
-func (s *Service) WebsiteKeys(ctx context.Context, provider uuid.UUID) (WebsiteKeyInventory, error) {
-	view := WebsiteKeyInventory{Status: "unsynced", Keys: []WebsiteKey{}}
+type WebsiteKeyInventoryReport struct {
+	WebsiteKeyInventory
+	WebsiteKeyInventoryDiagnostics
+}
+
+type WebsiteKeyInventoryDiagnostics struct {
+	LastError   string         `json:"last_error,omitempty"`
+	FailedPage  int            `json:"failed_page,omitempty"`
+	MatchIssues map[string]int `json:"match_issues,omitempty"`
+}
+
+func (s *Service) WebsiteKeys(ctx context.Context, provider uuid.UUID) (WebsiteKeyInventoryReport, error) {
+	view := WebsiteKeyInventoryReport{WebsiteKeyInventory: WebsiteKeyInventory{Status: "unsynced", Keys: []WebsiteKey{}}}
 	if s.db == nil {
 		return view, unavailable("北辰 Key 清单未配置", nil)
 	}
@@ -25,13 +37,22 @@ func (s *Service) WebsiteKeys(ctx context.Context, provider uuid.UUID) (WebsiteK
 	if err := checkProvider(ctx, tx, provider); err != nil {
 		return view, err
 	}
+	var diagnostics sql.NullString
 	err = tx.QueryRowContext(ctx, `
-SELECT status,last_seen FROM beichen_website_key_sync WHERE provider_id=$1`, provider).Scan(&view.Status, &view.LastSeen)
+SELECT sync.status,sync.last_seen,state.last_error
+FROM beichen_website_key_sync sync
+LEFT JOIN maintenance_state state ON state.name='beichen_key_inventory/'||sync.provider_id::text
+WHERE sync.provider_id=$1`, provider).Scan(&view.Status, &view.LastSeen, &diagnostics)
 	if errors.Is(err, sql.ErrNoRows) {
 		return view, nil
 	}
 	if err != nil {
 		return view, err
+	}
+	if diagnostics.Valid {
+		if err := json.Unmarshal([]byte(diagnostics.String), &view.WebsiteKeyInventoryDiagnostics); err != nil {
+			return view, err
+		}
 	}
 	if view.Status == "current" && (view.LastSeen == nil || s.now().Sub(*view.LastSeen) > 2*websiteDirectoryInterval) {
 		view.Status = "stale"
@@ -68,15 +89,15 @@ WHERE k.provider_id=$1 ORDER BY k.upstream_key_id`, provider)
 	return view, rows.Err()
 }
 
-func (s *Service) RefreshWebsiteKeys(ctx context.Context, provider uuid.UUID) (WebsiteKeyInventory, error) {
+func (s *Service) RefreshWebsiteKeys(ctx context.Context, provider uuid.UUID) (WebsiteKeyInventoryReport, error) {
 	if s.db == nil || s.crypto == nil {
-		return WebsiteKeyInventory{}, unavailable("北辰 Key 清单同步未配置", nil)
+		return WebsiteKeyInventoryReport{}, unavailable("北辰 Key 清单同步未配置", nil)
 	}
 	if err := checkProvider(ctx, s.db, provider); err != nil {
-		return WebsiteKeyInventory{}, err
+		return WebsiteKeyInventoryReport{}, err
 	}
 	if err := s.refreshWebsiteKeys(ctx, provider, true); err != nil {
-		return WebsiteKeyInventory{}, err
+		return WebsiteKeyInventoryReport{}, err
 	}
 	return s.WebsiteKeys(ctx, provider)
 }
@@ -143,17 +164,24 @@ RETURNING status`, provider, lease, leaseSeconds, manual).Scan(&oldStatus)
 	}
 	observedAt := s.now().UTC().Truncate(time.Microsecond)
 	readCtx, cancel := context.WithTimeout(ctx, jobTimeout)
-	observation, readErr := read(readCtx)
+	var page *keyListPageError
+	observation, readErr := read(context.WithValue(readCtx, keyListReadTraceKey{}, &page))
 	cancel()
 	if readErr != nil {
 		status := "unavailable"
+		report := WebsiteKeyInventoryDiagnostics{LastError: "北辰官网 Key 清单读取未完成，沿用上次清单"}
 		if panelAuthFailed(readErr) || errors.Is(readErr, errEnvironmentPanelToken) ||
 			errors.Is(readErr, errPanelTokenExpired) || errors.Is(readErr, errWebSignIn) {
 			status = "session_expired"
+			report.LastError = "北辰网页会话失效，沿用上次清单"
+		}
+		if page != nil || errors.As(readErr, &page) {
+			report.FailedPage = page.page
+			report.LastError = page.Error() + "，沿用上次清单"
 		}
 		saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
-		return nil, finishWebsiteKeyInventory(saveCtx, s.db, provider, lease, status, nil)
+		return nil, finishWebsiteKeyInventory(saveCtx, s.db, provider, lease, status, nil, report)
 	}
 	keys, err := s.applyWebsiteKeys(ctx, provider, lease, observation, observedAt, oldStatus != "current")
 	if errors.Is(err, errWebsiteKeySessionChanged) {
@@ -166,12 +194,29 @@ type websiteKeyWriter interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
-func finishWebsiteKeyInventory(ctx context.Context, db websiteKeyWriter, provider, lease uuid.UUID, status string, observedAt *time.Time) error {
+func finishWebsiteKeyInventory(ctx context.Context, db websiteKeyWriter, provider, lease uuid.UUID, status string, observedAt *time.Time,
+	diagnostics WebsiteKeyInventoryDiagnostics) error {
+	var details *string
+	if diagnostics.LastError != "" || len(diagnostics.MatchIssues) != 0 {
+		raw, err := json.Marshal(diagnostics)
+		if err != nil {
+			return err
+		}
+		value := string(raw)
+		details = &value
+	}
 	result, err := db.ExecContext(ctx, `
-UPDATE beichen_website_key_sync SET status=$3,last_seen=COALESCE($4,last_seen),
- next_attempt=clock_timestamp()+$5::int*interval '1 minute',lease_id=NULL,lease_until=NULL
-WHERE provider_id=$1 AND lease_id=$2 AND lease_until>clock_timestamp()`,
-		provider, lease, status, observedAt, int(websiteDirectoryInterval/time.Minute))
+WITH saved AS (
+  UPDATE beichen_website_key_sync SET status=$3,last_seen=COALESCE($4,last_seen),
+    next_attempt=clock_timestamp()+$5::int*interval '1 minute',lease_id=NULL,lease_until=NULL
+  WHERE provider_id=$1 AND lease_id=$2 AND lease_until>clock_timestamp()
+  RETURNING provider_id
+)
+INSERT INTO maintenance_state (id,name,last_error,last_success_at,created_at,updated_at)
+SELECT $6,'beichen_key_inventory/'||provider_id::text,$7,$4,clock_timestamp(),clock_timestamp() FROM saved
+ON CONFLICT (name) DO UPDATE SET last_error=EXCLUDED.last_error,
+  last_success_at=COALESCE(EXCLUDED.last_success_at,maintenance_state.last_success_at),updated_at=EXCLUDED.updated_at`,
+		provider, lease, status, observedAt, int(websiteDirectoryInterval/time.Minute), uuid.Must(uuid.NewV7()), details)
 	if err != nil {
 		return err
 	}
@@ -213,7 +258,8 @@ WHERE provider_id=$1 AND status='active' FOR SHARE`, provider).Scan(&current)
 			return nil, err
 		}
 		if !bytes.Equal(current, observation.tokenVersion) {
-			if err := finishWebsiteKeyInventory(ctx, tx, provider, lease, "unavailable", nil); err != nil {
+			if err := finishWebsiteKeyInventory(ctx, tx, provider, lease, "unavailable", nil,
+				WebsiteKeyInventoryDiagnostics{LastError: errWebsiteKeySessionChanged.Error()}); err != nil {
 				return nil, err
 			}
 			if err := tx.Commit(); err != nil {
@@ -232,9 +278,13 @@ WHERE provider_id=$1 AND status='active' FOR SHARE`, provider).Scan(&current)
 		return nil, err
 	}
 	matched := make(map[int]websiteCredentialMatch)
+	issues := make(map[string]int)
 	for _, credential := range credentials {
 		var current WebsiteKey
-		if len(credential.candidates) == 1 {
+		switch len(credential.candidates) {
+		case 0:
+			issues["insufficient_key_evidence"]++
+		case 1:
 			i := credential.candidates[0]
 			if claims[i] == 1 {
 				key := listed[i]
@@ -253,7 +303,11 @@ WHERE provider_id=$1 AND status='active' FOR SHARE`, provider).Scan(&current)
 					continue
 				}
 				matched[i] = credential
+			} else {
+				issues["multiple_school_credentials"]++
 			}
+		default:
+			issues["tied_website_candidates"]++
 		}
 		if err := saveWebsiteKeyVersion(ctx, tx, credential, current, observedAt, recovered); err != nil {
 			return nil, err
@@ -283,7 +337,8 @@ VALUES ($1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12,$13)`, provider, k
 		}
 		keys = append(keys, key)
 	}
-	if err := finishWebsiteKeyInventory(ctx, tx, provider, lease, "current", &observedAt); err != nil {
+	if err := finishWebsiteKeyInventory(ctx, tx, provider, lease, "current", &observedAt,
+		WebsiteKeyInventoryDiagnostics{MatchIssues: issues}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {

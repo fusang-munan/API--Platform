@@ -319,7 +319,8 @@ ORDER BY s.effective_at DESC LIMIT 1`, id).Scan(&group, &base, &observedRevision
 	}
 	current("shared", ids[3], "pending_confirmation", "")
 	var reason string
-	if err := db.QueryRowContext(ctx, `SELECT last_error FROM beichen_datasets WHERE kind='prices' AND credential_id=$1`, ids[3]).Scan(&reason); err != nil || reason != errKeyMatch.Error() {
+	if err := db.QueryRowContext(ctx, `SELECT last_error FROM beichen_datasets WHERE kind='prices' AND credential_id=$1`, ids[3]).Scan(&reason); err != nil ||
+		!strings.HasPrefix(reason, errKeyMatch.Error()) || !strings.Contains(reason, "遮罩证据不足") {
 		t.Fatalf("missing group verification failure: %v", err)
 	}
 	t.Log("three four-channel rounds, deferred model price, and fixed-group rejection verified")

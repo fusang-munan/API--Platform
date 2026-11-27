@@ -23,6 +23,7 @@ var beichenAliases = map[string]string{"Gemini": "哈吉米", "GM1": "国模", "
 
 type provisionChannel struct {
 	Channel       string `json:"channel"`
+	Status        string `json:"status,omitempty"`
 	APIKey        string `json:"api_key"`
 	GroupID       int64  `json:"group_id"`
 	UpstreamKeyID int64  `json:"upstream_key_id"`
@@ -36,7 +37,8 @@ func (c *provisionChannel) UnmarshalJSON(raw []byte) error {
 	if first, err := d.Token(); err != nil || first != json.Delim('{') {
 		return bad
 	}
-	fields := map[string]any{"channel": &c.Channel, "api_key": &c.APIKey, "group_id": &c.GroupID, "upstream_key_id": &c.UpstreamKeyID}
+	fields := map[string]any{"channel": &c.Channel, "status": &c.Status, "api_key": &c.APIKey,
+		"group_id": &c.GroupID, "upstream_key_id": &c.UpstreamKeyID}
 	for d.More() {
 		field, err := d.Token()
 		if err != nil {
@@ -49,23 +51,35 @@ func (c *provisionChannel) UnmarshalJSON(raw []byte) error {
 		delete(fields, key)
 	}
 	groupMissing, idMissing := fields["group_id"] != nil, fields["upstream_key_id"] != nil
-	if end, err := d.Token(); err != nil || end != json.Delim('}') || fields["channel"] != nil || fields["api_key"] != nil ||
+	if end, err := d.Token(); err != nil || end != json.Delim('}') || fields["channel"] != nil ||
+		(!c.skip() && fields["api_key"] != nil) ||
 		groupMissing != idMissing || (!groupMissing && (c.GroupID <= 0 || c.UpstreamKeyID <= 0)) {
 		return bad
 	}
 	return nil
 }
 
+func (c provisionChannel) skip() bool {
+	return c.Status == "disabled" || c.Status == "retired"
+}
+
 func (s *Service) parseProvisionChannels(raw, token string) ([]provisionChannel, error) {
 	var channels []provisionChannel
-	if len(raw) > 64*1024 || json.Unmarshal([]byte(raw), &channels) != nil || len(channels) != len(beichenAliases) {
-		return nil, errors.New("BEICHEN_CHANNELS_JSON 须包含四路完整配置，请检查 JSON 及字段")
+	if len(raw) > 64*1024 || json.Unmarshal([]byte(raw), &channels) != nil || len(channels) < 3 || len(channels) > len(beichenAliases) {
+		return nil, errors.New("BEICHEN_CHANNELS_JSON 须配置 GM1、G3、CC1，Gemini 可省略")
 	}
 	names, keys, ids := map[string]bool{}, map[string]bool{}, map[int64]bool{}
 	for i := range channels {
 		c := &channels[i]
 		if _, ok := beichenAliases[c.Channel]; !ok || names[c.Channel] {
-			return nil, errors.New("Gemini、GM1、G3、CC1 须各配置一次")
+			return nil, errors.New("仅支持 Gemini、GM1、G3、CC1，每个渠道最多配置一次")
+		}
+		names[c.Channel] = true
+		if c.skip() {
+			continue
+		}
+		if c.Status != "" && c.Status != "active" {
+			return nil, fmt.Errorf("%s：状态须为 active、disabled 或 retired", c.Channel)
 		}
 		if c.UpstreamKeyID != 0 {
 			var err error
@@ -78,7 +92,12 @@ func (s *Service) parseProvisionChannels(raw, token string) ([]provisionChannel,
 			c.APIKey == token || keys[c.APIKey] || (c.UpstreamKeyID != 0 && ids[c.UpstreamKeyID]) {
 			return nil, fmt.Errorf("%s：推理 Key 或上游 Key ID 无效、重复或与面板令牌相同", c.Channel)
 		}
-		names[c.Channel], keys[c.APIKey], ids[c.UpstreamKeyID] = true, true, true
+		keys[c.APIKey], ids[c.UpstreamKeyID] = true, true
+	}
+	for _, required := range []string{"GM1", "G3", "CC1"} {
+		if !names[required] {
+			return nil, fmt.Errorf("BEICHEN_CHANNELS_JSON 缺少 %s 渠道", required)
+		}
 	}
 	return channels, nil
 }
@@ -125,6 +144,10 @@ func (s *Service) ProvisionBeichenChannels(ctx context.Context, raw, token strin
 		return result, err
 	}
 	for _, c := range channels {
+		if c.skip() {
+			result.Disabled = append(result.Disabled, c.Channel)
+			continue
+		}
 		disabled, err := s.provisionChannel(ctx, tx, provider, existing, &c)
 		if err != nil {
 			return BeichenProvisionResult{}, fmt.Errorf("%s：%w", c.Channel, err)
@@ -192,7 +215,7 @@ VALUES ($1,'北辰部署审计',$2,'!','student','disabled',now(),now()) ON CONF
 
 type provisionCredential struct {
 	id                     uuid.UUID
-	label, status          string
+	label, status, channel string
 	encrypted, fingerprint []byte
 	revision               time.Time
 	actor                  uuid.NullUUID
@@ -204,7 +227,7 @@ type provisionCredential struct {
 func (s *Service) provisionCredentials(ctx context.Context, tx *sql.Tx, provider uuid.UUID) ([]provisionCredential, error) {
 	rows, err := tx.QueryContext(ctx, `
 SELECT c.id,c.label,c.credential_ciphertext,c.status,c.updated_at,
-       a.updated_by,a.group_id,a.upstream_key_id,a.token_ciphertext,a.updated_at,j.key_fingerprint
+       a.updated_by,a.group_id,a.upstream_key_id,a.token_ciphertext,a.updated_at,j.key_fingerprint,COALESCE(j.channel,'')
 FROM provider_credentials c LEFT JOIN beichen_panel_access a ON a.credential_id=c.id
 LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
 WHERE c.provider_id=$1 ORDER BY c.id FOR UPDATE OF c`, provider)
@@ -215,7 +238,8 @@ WHERE c.provider_id=$1 ORDER BY c.id FOR UPDATE OF c`, provider)
 	var records []provisionCredential
 	for rows.Next() {
 		var row provisionCredential
-		if err := rows.Scan(&row.id, &row.label, &row.encrypted, &row.status, &row.revision, &row.actor, &row.group, &row.upstreamID, &row.panelToken, &row.panelRevision, &row.fingerprint); err != nil {
+		if err := rows.Scan(&row.id, &row.label, &row.encrypted, &row.status, &row.revision, &row.actor, &row.group,
+			&row.upstreamID, &row.panelToken, &row.panelRevision, &row.fingerprint, &row.channel); err != nil {
 			return nil, errors.New("读取北辰现有凭据失败")
 		}
 		records = append(records, row)
@@ -229,6 +253,7 @@ WHERE c.provider_id=$1 ORDER BY c.id FOR UPDATE OF c`, provider)
 func (s *Service) provisionChannel(ctx context.Context, tx *sql.Tx, provider uuid.UUID, records []provisionCredential, c *provisionChannel) (disabled bool, err error) {
 	fingerprint := sha256.Sum256([]byte(c.APIKey))
 	var current *provisionCredential
+	archivedKey := false
 	for i := range records {
 		r := &records[i]
 		label := strings.TrimSpace(r.label)
@@ -237,10 +262,18 @@ func (s *Service) provisionChannel(ctx context.Context, tx *sql.Tx, provider uui
 				return false, errors.New("渠道名称与历史标签命中多条凭据")
 			}
 			current = r
+		} else if r.status != "active" && r.channel == c.Channel && bytes.Equal(r.fingerprint, fingerprint[:]) {
+			archivedKey = true
 		} else if bytes.Equal(r.fingerprint, fingerprint[:]) || (c.UpstreamKeyID != 0 && r.upstreamID.Int64 == c.UpstreamKeyID &&
 			!(r.status == "inactive" && r.actor.UUID == provisionActor && label == c.archivedLabel(r.id))) {
 			return false, errors.New("此推理 Key 或上游 Key ID 已绑定到其他凭据")
 		}
+	}
+	if archivedKey {
+		if current == nil || current.status != "active" {
+			return true, nil
+		}
+		return false, errors.New("旧部署配置引用已归档 Key，请保留当前渠道凭据")
 	}
 	if current != nil {
 		if current.status != "active" || (current.actor.Valid && current.actor.UUID != provisionActor && !current.group.Valid) {

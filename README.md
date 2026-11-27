@@ -108,6 +108,10 @@ Windows 会话保存在 `%LOCALAPPDATA%\Nebula\beichen-session.json`，同目录
 
 后台按约 15 分钟刷新官网目录和分组报价。已核对归属的学校渠道会用各自凭据读取 `GET /v1/models`，按分组对照官网型号，同时记录网页账号可见的个人倍率。教师在「模型管理 → 北辰 → 官网目录 → Key 实际型号核对」查看匹配、仅 Key、仅官网三类及读取失败原因。要立即输出同样的对照，运行 `go run ./cmd/beichen-crawl --compare-models`，使用已配置的数据库、凭据加密密钥和网页授权。重复读取同样的价格和倍率不会增加历史版本。
 
+北辰的模型列表有续页时会先读完所有页。与已保存的目录相比，Key 型号变成空列表或减少至少一半时，后台先保留旧目录。三个连续的完整扫描都返回同一份型号清单后，后台才接受变动。官网目录按平台做覆盖核对，并对缺席平台、缺席分组和型号数量突降采用同样的三轮确认。官网清单的失败页、上次成功时间以及分组沿用情况可在后端同步状态中核对。实时爬虫连着学校数据库时会读取上次平台快照做覆盖核对，离线样本按自身内容解析。[失败排查与验证命令](docs/TESTING_AND_TROUBLESHOOTING.md#核对北辰扫描完整性)
+
+环境变量 `BEICHEN_CHANNELS_JSON` 中 GM1、G3、CC1 各需一项，Gemini 可省略。用 `{"channel":"Gemini","status":"retired"}` 或 `status: "disabled"` 可以明确跳过某个渠道的部署预配。已有数据库中的停用、作废凭据继续遵守其已保存状态。四路旧 JSON 仍可读取。
+
 ### 导出北辰仪表盘和 Key 用量
 
 `go run ./cmd/beichen-report --range 7d --granularity day` 读取本机加密会话，输出并保存仪表盘、平台、模型、趋势、最近使用和各把 Key 的用量及核对结果。范围可选 `today`、`7d`、`all`。加 `--reconcile` 后，通过 `DATABASE_URL` 只读比较本机网关账本与本轮网页数据，金额按元记账。[接口、用法和实抓记录](docs/reports/beichen-crawl-stability.md)
