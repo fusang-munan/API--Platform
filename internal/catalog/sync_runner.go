@@ -163,7 +163,23 @@ RETURNING lease_id`, credential, kind, lease, BeichenScanLeaseSeconds, manual).S
 	return lease, err
 }
 
+const beichenRebindLockKey = `hashtextextended('beichen_datasets'::regclass::oid::text || '/rebind/' || $1::uuid::text, 0)`
+
+// Confirmations take the exclusive side of the lock used by evidence writers.
+func TryLockBeichenRebind(ctx context.Context, tx *sql.Tx, provider uuid.UUID) (bool, error) {
+	var locked bool
+	err := tx.QueryRowContext(ctx, `SELECT pg_try_advisory_xact_lock(`+beichenRebindLockKey+`)`, provider).Scan(&locked)
+	return locked, err
+}
+
 func LockBeichenScan(ctx context.Context, tx *sql.Tx, provider, credential uuid.UUID, kind string, lease uuid.UUID, revision time.Time) (bool, error) {
+	if kind == "billing" || kind == "prices" || kind == "key_usage" {
+		// Take the advisory lock before the provider and credential row locks.
+		// Shared holders can still persist observations for different Keys concurrently.
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock_shared(`+beichenRebindLockKey+`)`, provider); err != nil {
+			return false, err
+		}
+	}
 	var current time.Time
 	err := tx.QueryRowContext(ctx, `
 SELECT c.updated_at FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
@@ -209,6 +225,11 @@ func SaveBeichenKeyScan(ctx context.Context, tx *sql.Tx, provider, credential uu
 	var candidate *beichenShrinkCandidate
 	observationErr := fetchErr
 	if fetchErr == nil {
+		// A successful read establishes access even when its model coverage
+		// needs more observations before we can replace the saved directory.
+		if _, err := tx.ExecContext(ctx, "DELETE FROM maintenance_state WHERE name=$1", beichenGroupDenialKey+credential.String()); err != nil {
+			return nil, err
+		}
 		var previousCount int
 		err := tx.QueryRowContext(ctx, `
 SELECT count(*) FROM provider_model_catalog
@@ -276,9 +297,6 @@ ON CONFLICT (credential_id,kind) DO UPDATE SET last_error=EXCLUDED.last_error`, 
 		return observationErr, err
 	}
 	if _, err := ReplaceCredentialEntries(ctx, tx, provider, credential, entries, at); err != nil {
-		return nil, err
-	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM maintenance_state WHERE name=$1", beichenGroupDenialKey+credential.String()); err != nil {
 		return nil, err
 	}
 	_, err := tx.ExecContext(ctx, `

@@ -254,8 +254,11 @@ VALUES ($1,$5,$8,$9,'old-name','openai_responses','active',9,now(),now()),
 		t.Fatalf("确认结果与预览不一致: %v", err)
 	}
 	if strings.Count(audit.String(), "beichen_bindings_rebuilt") != 1 || !strings.Contains(audit.String(), actor.String()) ||
-		!strings.Contains(audit.String(), provider.String()) || !strings.Contains(audit.String(), preview.PreviewToken) {
-		t.Fatal("重建审计缺少操作人、供应商或变更记录")
+		!strings.Contains(audit.String(), provider.String()) || !strings.Contains(audit.String(), `"change_count":4`) {
+		t.Fatal("重建审计缺少操作人、供应商或变更数量")
+	}
+	if strings.Contains(audit.String(), preview.PreviewToken) || strings.Contains(audit.String(), `"preview_token"`) || strings.Contains(audit.String(), `"changes"`) {
+		t.Fatal("重建审计暴露了预览令牌或变更明细")
 	}
 	var preserved bool
 	err = db.QueryRowContext(ctx, `SELECT

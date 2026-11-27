@@ -311,9 +311,9 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 #### 重建预览过期或绑定 Key 无分组权限
 
-- 换组后确认旧预览应返回 409，并提示重扫后重新预览。对照教师概览的 `bound_catalog_pending`、`ready_count` 与新预览的 `evidence_versions`。成功重扫后，即使拟改动的线路相同，也要使用新预览。
-- 重扫明确返回 `GROUP_NOT_ALLOWED` 时，核对 `bound_routes[].group_status=not_allowed` 和教师行的「分组无权限」。在北辰恢复该 Key 的分组权限，再重扫以清除拒绝。若仅 GM1 备用线路换组，仍就绪的 G3 继续显示可用及报价。两把 Key 都已绑定时，预期 Key 覆盖为 `1/2`。
-- 在隔离测试库运行 `go test ./internal/beichen ./internal/dataplane -run 'Test(RebindRejectsGroupVersionChange|KeyCatalogGroupDenialRecovery|BeichenTeacherCoverage|StudentKeyModelAuthorization)Postgres' -count=1`，并在 `frontend` 运行 `npm test -- BeichenSchoolModels`。测试复现旧预览确认、分组拒绝的写入与清除、备用换组和上游 Key 停用后学生目录的状态。
+- 换组后确认旧预览应返回 409，并提示重新预览。对照教师概览的 `bound_catalog_pending`、`ready_count` 与新预览的 `evidence_versions`。同步持有事务锁时确认同样返回 409。测试使用数据库触发器，在确认已读取分组证据、即将插入 Responses 绑定时暂停，由另一连接提交从分组 10 到 12 的变化。恢复确认后应返回冲突，数据库中的 Responses 绑定数量应为 0。
+- 重扫明确返回 `GROUP_NOT_ALLOWED` 时，核对 `bound_routes[].group_status=not_allowed`、`binding_issue.code=group_not_allowed` 和教师行的恢复权限提示。在北辰恢复该 Key 的分组权限，再重扫。若成功读取的型号从 4 个减少到 2 个，分组拒绝应立即清除，目录显示待复核并保留原清单和 `last_success`。若仅 GM1 备用线路换组，仍就绪的 G3 继续显示可用及报价。两把 Key 都已绑定时，预期 Key 覆盖为 `1/2`。
+- 在隔离测试库运行 `go test ./internal/beichen ./internal/dataplane -run 'Test(RebindRejectsGroupVersionChange|KeyCatalogGroupDenialRecovery|CatalogQualityAliasCRUDAndRebind|BeichenTeacherCoverage|StudentKeyModelAuthorization)Postgres' -count=1`，并在 `frontend` 运行 `npm test -- BeichenSchoolModels`。日志回归检查成功事件的操作人、供应商和变更数量，以及预览令牌和变更明细是否已移除。
 
 #### 核对一把 Key 的实际用量和分组
 

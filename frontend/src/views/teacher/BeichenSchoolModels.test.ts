@@ -1121,6 +1121,8 @@ describe('北辰模型管理', () => {
     } }])
     const denied = { ...data, model_catalog: [{ ...data.model_catalog![0],
       catalog_state: 'published_unavailable' as const, ready_count: 0, covered_bound_key_count: 0,
+      binding_issue: { code: 'group_not_allowed', message: '绑定 Key 分组无权限。' },
+      action_hint: '请在北辰恢复该 Key 的分组权限，再重扫目录。',
       bound_routes: [{ ...route, group_status: 'not_allowed', catalog_state: 'group_blocked',
         binding_ready: false, probe_state: 'unprobed', price_covered: false }],
       route_availability: { ...responsesAvailable, protocols: [], available_protocols: [], recommended_protocol: null,
@@ -1133,6 +1135,12 @@ describe('北辰模型管理', () => {
     const row = wrapper.get('[data-model="gpt-fixture-group-denial"]')
     expect(row.get('[data-testid="group-denied"]').text()).toBe('分组无权限 · 分组 10')
     expect(row.get('[data-testid="model-availability"]').text()).toBe('维护中')
+    expect(row.get('[data-testid="action-hint"]').text()).toContain('恢复该 Key 的分组权限，再重扫目录')
+    expect(row.find('[data-testid="binding-invalid"]').exists()).toBe(false)
+    expect(row.find('[data-testid="protocol-missing"]').exists()).toBe(false)
+    expect(row.find('[data-testid="availability-reason"]').exists()).toBe(false)
+    expect(row.find('small.binding-issue').exists()).toBe(false)
+    expect(row.text()).not.toContain('目录里已找不到')
     expect(row.get('.model-state-summary').text()).not.toContain('目录待复核')
 
     await button(wrapper, '刷新模型').trigger('click')

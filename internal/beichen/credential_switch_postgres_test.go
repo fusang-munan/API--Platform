@@ -1,7 +1,9 @@
 package beichen
 
 import (
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"io"
 	"net/http"
@@ -383,16 +385,19 @@ VALUES($1,1,$2,clock_timestamp())`, g3, id)
 		}
 		return plan
 	}
-	assertRejected := func(plan RebindPlan) {
-		t.Helper()
+	confirm := func(ctx context.Context, plan RebindPlan) error {
 		_, err := service.Rebind(ctx, provider, actor, false, plan.PreviewToken)
+		return err
+	}
+	assertRejected := func(t *testing.T, err error) {
+		t.Helper()
 		if domain.ErrorCode(err) != domain.CodeInvalidTransition || !strings.Contains(err.Error(), "重新预览") {
 			t.Fatalf("expected a stale preview rejection: %v", err)
 		}
 		var written int
 		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM model_bindings
-WHERE provider_id=$1 AND adapter='openai_responses' AND status='active'`, provider).Scan(&written); err != nil || written != 0 {
-			t.Fatalf("stale confirmation wrote %d active bindings (%v)", written, err)
+WHERE provider_id=$1 AND adapter='openai_responses'`, provider).Scan(&written); err != nil || written != 0 {
+			t.Fatalf("stale confirmation wrote %d Responses bindings (%v)", written, err)
 		}
 	}
 
@@ -404,7 +409,32 @@ WHERE provider_id=$1 AND adapter='openai_responses' AND status='active'`, provid
 		evidence.CredentialRevision.IsZero() || evidence.CatalogObservedAt.Before(evidence.CredentialRevision) {
 		t.Fatalf("unexpected preview evidence: %+v", evidence)
 	}
-	setGroup(12)
+	t.Run("scan transaction holds the advisory lock", func(t *testing.T) {
+		lease, err := catalog.AcquireBeichenDatasetLease(ctx, db, g3, "billing", true)
+		if err != nil || lease == uuid.Nil {
+			t.Fatalf("acquire scan lease: %v", err)
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if current, err := catalog.LockBeichenScan(ctx, tx, provider, g3, "billing", lease, evidence.CredentialRevision); err != nil || !current {
+			t.Fatalf("lock current group writer: %v", err)
+		}
+		assertRejected(t, confirm(ctx, old))
+		if err := catalog.ReleaseBeichenDatasetLease(ctx, tx, g3, "billing"); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("group changes after the confirmation reads evidence", func(t *testing.T) {
+		assertRejected(t, moveGroupWhileRebindInserts(t, ctx, db, g3, func(ctx context.Context) error {
+			return confirm(ctx, old)
+		}))
+	})
 	view, err := service.Overview(ctx, provider, "")
 	if err != nil || len(view.ModelCatalog) != 1 || view.ModelCatalog[0].ReadyCount != 0 || !view.ModelCatalog[0].BoundCatalogPending {
 		t.Fatalf("overview must invalidate the old group's directory: %+v (%v)", view.ModelCatalog, err)
@@ -412,7 +442,7 @@ WHERE provider_id=$1 AND adapter='openai_responses' AND status='active'`, provid
 	if _, err := service.Rebind(ctx, provider, actor, true, ""); domain.ErrorCode(err) != domain.CodeInvalidTransition {
 		t.Fatalf("rebuild preview should use the same group evidence: %v", err)
 	}
-	assertRejected(old)
+	assertRejected(t, confirm(ctx, old))
 
 	scan()
 	rescanned := preview()
@@ -420,17 +450,80 @@ WHERE provider_id=$1 AND adapter='openai_responses' AND status='active'`, provid
 		!e.CatalogObservedAt.After(evidence.CatalogObservedAt) {
 		t.Fatalf("rescan did not establish the new evidence version: %+v", e)
 	}
-	assertRejected(old)
+	assertRejected(t, confirm(ctx, old))
 	scan()
-	assertRejected(rescanned)
+	assertRejected(t, confirm(ctx, rescanned))
 	beforeRevision := preview()
 	exec("UPDATE provider_credentials SET updated_at=clock_timestamp() WHERE id=$1", g3)
 	scan()
-	assertRejected(beforeRevision)
+	assertRejected(t, confirm(ctx, beforeRevision))
 	fresh := preview()
 	if _, err := service.Rebind(ctx, provider, actor, false, fresh.PreviewToken); err != nil {
 		t.Fatalf("current preview should write the Responses binding: %v", err)
 	}
+}
+
+func moveGroupWhileRebindInserts(t *testing.T, ctx context.Context, db *sql.DB, credential uuid.UUID, confirm func(context.Context) error) error {
+	t.Helper()
+	const gate = `SELECT pg_advisory_xact_lock(hashtextextended('test/rebind/'||current_schema(),0))`
+	execCatalogTestSQL(t, ctx, db, `
+CREATE FUNCTION pause_rebind_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('test/rebind/'||current_schema(),0));
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER pause_rebind_insert BEFORE INSERT ON model_bindings
+FOR EACH ROW WHEN (NEW.adapter='openai_responses') EXECUTE FUNCTION pause_rebind_insert()`)
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	writer, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Rollback()
+	if _, err := writer.ExecContext(ctx, gate); err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan error, 1)
+	go func() {
+		defer close(finished)
+		finished <- confirm(ctx)
+	}()
+	defer func() {
+		cancel()
+		for range finished {
+		}
+	}()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		if err := writer.QueryRowContext(ctx, `SELECT EXISTS (
+  SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted AND pg_backend_pid()=ANY(pg_blocking_pids(pid))
+)`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case err := <-finished:
+			t.Fatalf("confirmation returned before reaching the Responses insert: %v", err)
+		case <-ctx.Done():
+			t.Fatal("confirmation did not pause at the Responses insert")
+		case <-ticker.C:
+		}
+	}
+	if _, err := writer.ExecContext(ctx, `INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+VALUES($1,1,12,clock_timestamp())`, credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return <-finished
 }
 
 func TestCredentialSwitchInheritsSchoolChannelWithoutCopyingAuthorizationPostgres(t *testing.T) {

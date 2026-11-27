@@ -288,6 +288,8 @@ const catalog = computed(() => {
     const changedGroup = changedGroups.has(model)
     const boundRoutes = entry.bound_routes ?? []
     const readyRoutes = boundRoutes.filter(route => route.binding_ready)
+    const bindingIssue = retired ? undefined : entry.binding_issue
+    const primaryGroupDenial = bindingIssue?.code === 'group_not_allowed'
     const remaining = changedGroup ? remainingRouteAvailability(readyRoutes, entry.route_availability?.recommended_protocol) : undefined
     const legacyBoundIds = preferred.filter(route => route.state === 'ready').map(route => route.credential_id!)
     const boundIds = new Set(entry.bound_routes
@@ -295,7 +297,7 @@ const catalog = computed(() => {
       : legacyBoundIds)
     const catalogKeys = entry.catalog_keys ?? []
     const locations = entry.website_locations ?? []
-    const catalogPending = entry.bound_catalog_pending || changedGroup
+    const catalogPending = !primaryGroupDenial && (entry.bound_catalog_pending || changedGroup)
     const keyCoverage = changedGroup ? new Set(boundRoutes.filter(route =>
       route.key_enabled && route.credential_id && route.catalog_state === 'key_listed').map(route => route.credential_id)).size
       : entry.covered_bound_key_count ?? boundIds.size
@@ -354,7 +356,6 @@ const catalog = computed(() => {
     const groupRateMismatch = groupDiagnoses.has('group_rate_mismatch') ||
       (groupDiagnoses.has('price_outside_key_group') && !priceCovered)
     const availability = remaining?.availability ?? entry.route_availability?.availability
-    const bindingIssue = retired ? undefined : entry.binding_issue
     const anomaly = !retired && !websiteOnly && (Boolean(bindingIssue || groupMismatch || groupRateMismatch || deniedGroups.length || catalogPending) ||
       published && ['maintenance', 'degraded', 'unavailable'].includes(availability ?? ''))
     const active = !retired && !anomaly && published && row.status !== 'pending_configuration' && readyCount > 0
@@ -376,11 +377,11 @@ const catalog = computed(() => {
       probeState: remaining?.probeState ?? entry.probe_state,
       recommendedProtocol: remaining ? remaining.recommendedProtocol : entry.route_availability?.recommended_protocol,
       availability,
-      availabilityReason: remaining?.availabilityReason ?? entry.route_availability?.availability_reason,
+      availabilityReason: primaryGroupDenial ? undefined : remaining?.availabilityReason ?? entry.route_availability?.availability_reason,
       actionHint: remaining?.actionHint ?? entry.action_hint,
-      protocolMissing: (routeCount === 0 || entry.protocols?.length === 0 && !availableProtocols.length) && !catalogPending,
+      protocolMissing: !primaryGroupDenial && !catalogPending && (routeCount === 0 || entry.protocols?.length === 0 && !availableProtocols.length),
       lastProbeAt: remaining ? remaining.lastProbeAt : entry.last_probe_at,
-      bindingIssue,
+      bindingIssue, primaryGroupDenial,
     }
   })
 })
@@ -1185,7 +1186,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
                 <span v-if="row.groupRateMismatch" class="status-pill pending">分组计费规则待核对</span>
                 <span v-if="!row.websiteOnly && row.protocolMissing" class="status-pill pending" data-testid="protocol-missing">缺协议</span>
                 <span v-if="row.priceMissing" class="status-pill pending" data-testid="price-missing">{{ missingPriceLabel(row) }}</span>
-                <span v-if="row.bindingIssue" class="status-pill danger" data-testid="binding-invalid">绑定待核对</span>
+                <span v-if="row.bindingIssue && !row.primaryGroupDenial" class="status-pill danger" data-testid="binding-invalid">绑定待核对</span>
                 <span v-if="!row.websiteOnly" class="chip recommend" data-testid="recommended-protocol">{{ row.recommendedProtocol
                   ? '推荐 ' + protocolLabel(row.recommendedProtocol)
                   : '推荐协议待核实' }}</span>
@@ -1213,7 +1214,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
               </details>
               <small v-if="!row.websiteOnly && row.availabilityReason" class="row-note" data-testid="availability-reason">{{ row.availabilityReason }}</small>
               <small v-if="!row.websiteOnly && row.actionHint" class="row-note" data-testid="action-hint">下一步：{{ row.actionHint }}</small>
-              <small v-if="row.bindingIssue" class="row-note binding-issue">{{ row.bindingIssue.message }}</small>
+              <small v-if="row.bindingIssue && (!row.primaryGroupDenial || !row.deniedGroups.length)" class="row-note binding-issue">{{ row.bindingIssue.message }}</small>
               <small v-if="row.protocolLabels.length" class="row-note">{{ row.protocolLabels.join(' · ') }}</small>
               <div v-if="!row.websiteOnly && row.probeState" class="model-probe">
                 <span class="status-pill" :class="{ active: row.probeState === 'passed', danger: row.probeState === 'failed', pending: row.probeState === 'unprobed' }">{{ probeLabels[row.probeState] }}</span>

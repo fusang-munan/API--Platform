@@ -466,9 +466,9 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `model_catalog[].bound_routes` 按绑定返回 `school_model`、`upstream_model`、`credential_id`、`credential_label`、`key_enabled`、`protocol`、`priority`、`group_id`、`group_status`、`group_checked_at`、`catalog_state`、`price_state`、`price_covered`、`probe_state` 与最近探活 `probe`。`published` 表示校内模型和绑定已启用。`binding_ready` 还要求当前 Key 和分组的目录可核实。`bound_key_count` 按启用的绑定 Key 去重，`covered_bound_key_count` 只计目录当前确实列出绑定上游名的 Key。`bound_catalog_pending=true` 表示至少一条绑定的目录或分组待复核。`ready_count` 按已发布且就绪的 Key 和协议去重。部分已发布线路失去目录证据也会返回 `binding_issue`。
 
-对 `/beichen/rebind` 发送 `{"preview":true}` 生成预览。返回的 `evidence_versions` 按 Key 排序，包含 `credential_id`、`credential_revision`、`group_id`、`catalog_observed_at` 和 `evidence_since`。`preview_token` 同时绑定这些版本和 `changes`。发送 `{"preview":false,"preview_token":"…"}` 确认。目录过期、权限失效或证据及计划改变时返回 `409 INVALID_STATE_TRANSITION`，教师需重新预览。
+对 `/beichen/rebind` 发送 `{"preview":true}` 生成预览。返回的 `evidence_versions` 按 Key 排序，包含 `credential_id`、`credential_revision`、`group_id`、`catalog_observed_at` 和 `evidence_since`。`preview_token` 同时绑定这些版本和 `changes`。发送 `{"preview":false,"preview_token":"…"}` 确认。确认时遇到同步锁冲突、目录过期、权限失效或证据及计划变化，返回 `409 INVALID_STATE_TRANSITION` 并回滚全部绑定变更。教师需重新预览。成功日志记录操作人、供应商与变更数量。
 
-`/v1/models` 明确返回 `GROUP_NOT_ALLOWED` 后，当前凭据版本在 `bound_routes` 和能力记录中返回 `group_status=not_allowed` 和 `catalog_state=group_blocked`。这把 Key 的线路退出推荐及报价覆盖。成功接受该 Key 的新目录时清除本次扫描的拒绝状态。
+`/v1/models` 明确返回 `GROUP_NOT_ALLOWED` 后，当前凭据版本在 `bound_routes` 和能力记录中返回 `group_status=not_allowed` 和 `catalog_state=group_blocked`。这把 Key 的线路退出推荐及报价覆盖。如果已发布模型没有就绪线路，明确的分组拒绝通过 `binding_issue.code=group_not_allowed` 返回，`action_hint` 提示恢复该 Key 的分组权限后重扫。成功读到模型清单就会清除目录扫描的拒绝状态。若清单缩水待核验，教师概览仍会显示目录待复核。
 
 `GET .../beichen/capabilities` 按 Key 和原始上游型号返回 `bindings`、`supported_protocols`、`available_protocols`、`responses_ready`、`recommended_protocol`、`availability` 和报价字段。`responses_ready` 表示存在当前已发布的 Responses 绑定。只有通过当轮探活的协议出现在 `available_protocols`。教师 `/api/v1/teacher/models` 的北辰线路复用同一协议判定。概览的 `route_availability` 汇总已发布线路，缺少当前绑定或探活证据时显示待核实。探活和报价都核对当前凭据版本及已知换组时间。陈旧目录保留供核对，`price_covered` 为 `false`，等待符合当前证据的探活。
 
