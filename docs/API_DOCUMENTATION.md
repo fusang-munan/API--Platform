@@ -822,7 +822,34 @@ Anthropic-compatible 示例：
 
 ## 9. 用量与监控接口
 
-学生使用 `GET /api/v1/student/usage?month=YYYY-MM` 查看每个 API Key 的模型 credit 分解。
+### 学生月度用量
+
+`GET /api/v1/student/usage?month=YYYY-MM` 使用北京时间账月。省略 `month` 时取本月。调用在受理时归入账月，之后补记仍更新原账月。需要学生身份，响应范围为当前学生在所属项目中的 Key。
+
+| 位置 | 字段与类型 | 含义 |
+| --- | --- | --- |
+| `data` | `month: string`、`projects: array`、`models: array`、`totals: object` | `projects` 保留项目 → Key → 模型结构。`models` 按模型 ID 合并本人所有项目和 Key。 |
+| `projects[]` | `project_id`、`project_name`、`quota`、`used`、`pending`、`available`、`in_flight_credits` 均为字符串，另有 `keys: array`、`calls: number` | 额度、已用和可用来自该学生的项目月桶。 |
+| `projects[].keys[]` | `id`、`name`、`status`、`used`、`pending`、`in_flight_credits` 均为字符串，另有 `models: array`、`calls: number`、`pending_calls: number`、`available?: string` | 额度数据取自 Key 月桶。无该月桶时省略 `available`。停用 Key 有该月已结算或零额调用、待核、在途占用或可汇总 Token 时仍显示。 |
+| 两处模型数组项 | `id: string`、`name: string`、`credits: string`、`calls?: number` | 模型 ID 为公开模型标识，名称保留调用时记录的名称。保留原有 `calls` 口径和零值省略行为。 |
+| `totals` | `credits: string`、`calls: number` | 所有可见 Key 的模型账本积分和次数汇总，范围与 `data.models` 一致。空数组返回 `[]`。 |
+
+`calls` 来自月账本，包含已结算的正额与零额调用。金额先在服务端按十进制精确求和，返回字符串并至少保留三位小数，例如 `"0.00040000000000001"`。跨项目或跨 Key 显示同一模型时，可直接使用 `data.models` 中的汇总值。最近调用 `GET /api/v1/student/usage/recent` 是按创建时间查询的分页明细，包含处于不同结算状态的请求。对比月度金额和次数时使用同一账月的 `totals` 与 `models`。
+
+项目、Key、模型及 `totals` 还包含下列字段。
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `tokens` | 对象，`input`、`output`、`cache_read`、`cache_write`、`total` 每项为整数十进制字符串或 `null` | 输入为拆分后的净输入，已归类的缓存读写分别计入对应字段。分项返回已有证据的合计，无证据为 `null`，显式 0 为 `"0"`。已知总量可以包含无法分入四项的 Token。 |
+| `completeness` | `"complete"`、`"partial"` 或 `"unknown"` | 全部样本的四项证据完整且与已报告总量相符时为 `complete`。有证据但存在缺项时为 `partial`。无可用证据时为 `unknown`。 |
+| `token_coverage` | 对象，`calls`、`known_calls`、`complete_calls` 为整数，`unclassified_tokens` 为整数十进制字符串或 `null` | 样本包括已结算、待核以及另有 Token 证据的已结束调用。原始记录已清理的历史已结算调用也计入样本总数。`known_calls` 是有任一项 Token 证据的次数。`unclassified_tokens` 是已知总量中无法拆入四项的数量，无证据为 `null`。 |
+| `cache_hit_rate` | 0 到 1 的数字或 `null` | 在净输入和缓存读均有证据、且两项之和大于零的同一批样本中，以总缓存读除以总净输入加总缓存读。无样本时为 `null`。 |
+| `cache_hit_coverage` | 对象，`sample_calls` 为整数，`cache_read_tokens`、`input_with_cache_read_tokens` 为整数十进制字符串或 `null` | 命中率的样本数、分子及分母。可与 `token_coverage.calls` 对比覆盖情况。无样本时分子和分母为 `null`。 |
+| `pending_review_calls`、`pending_review_credits` | 整数、十进制字符串 | 本账月北辰 `pending_review` 的调用笔数及预留积分合计。预留金额会随核账进度更新，核账完成后退出待核统计。 |
+
+项目和 Key 的 `in_flight_credits` 与旧字段 `pending` 等值，均为受理时在月桶里的在途占用。`available` 沿用额度扣除已用和在途占用的口径。Key 的 `pending_calls` 是 `pending_review_calls` 的兼容别名。项目与 Key 的旧布尔字段 `pending_review` 在有待核调用时为 `true`，无待核调用时省略。待核积分可能为零，此时仍以笔数判断是否有待核调用。
+
+### 学生单笔回执
 
 学生使用 `GET /api/v1/student/usage/calls/{request_id}` 查自己的一笔北辰消费。请求编号取自学校网关响应头 `X-Request-ID`。金额以十进制字符串返回，缺失值为 `null`。
 
@@ -832,12 +859,17 @@ Anthropic-compatible 示例：
 | `school_multiplier`、`charged_credits` | 请求发出时确定的学校系数和学生实际用掉的积分。由学校接管的四条北辰渠道在新请求上使用 1.10。其他凭据及历史派发保留原系数。 |
 | `actual_cost`、`receipt_applied` | 能关联的北辰原始实扣，以及本次是否依据回执完成补记。1 个北辰余额单位折合 1 元人民币或 100 个基础积分。 |
 | `request_id`、`model_id`、`channel`、`billing_state` | 请求归属和当前结算状态。 |
+| `model_name`、`created_at` | 调用时的模型名称和 UTC RFC3339 请求创建时间，均为字符串。 |
+| `input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens`、`total_tokens` | 与月度接口相同的本地逐笔拆分口径，已知值为整数十进制字符串，缺项为 `null`。 |
+| `usage_state`、`usage_reason` | 网关记录的 Token 证据状态及缺项原因。无状态时省略 `usage_state`，无原因时 `usage_reason` 为 `null`。 |
+
+匿名返回 401，其他身份返回 403。在本人范围内找不到唯一、可读的北辰调用时统一返回 404，包含本人请求编号重用、他人的调用和其他供应商的调用。
+
+### 项目用量与监控
 
 教师使用 `PATCH /api/v1/teacher/projects/{project_id}/members/{user_id}/monthly-credit-quota` 调整学生的项目月额度。请求必填积分字符串 `monthly_credits`，可选 `quota_change_reason` 记录原因，成功返回 HTTP 204。学生用完当月个人额度后，新网关请求返回 `member_quota_exceeded`。已发出的请求按实际用量结算。
 
 项目用量的 `members[].pending` 返回月桶中仍预留、尚未结算的积分十进制字符串（`pending_milli × 0.001`），与 `pending_review` 布尔状态区分；教师调整额度时可连同已用金额计算可下调的下限。
-
-匿名返回 401，其他身份返回 403。在本人范围内找不到唯一、可读的北辰调用时统一返回 404，包含本人请求编号重用、他人的调用和其他供应商的调用。
 
 导师使用 `GET /api/v1/mentor/projects/{project_id}/usage` 查看项目额度分配、成员 Key 进度与实际开销；`GET /api/v1/mentor/call-logs` 和 `GET /api/v1/mentor/input-monitor` 使用游标分页与项目范围授权。完整输入仅在详情读取时返回并写访问审计。
 

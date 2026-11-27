@@ -336,6 +336,10 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 `project_month_credit_buckets` 与 `api_key_month_credit_buckets` 按北京时间月份保存额度、分配、charged 和 pending；`monthly_usage_cube` 永久保存项目、用户、Key、模型维度聚合。`gateway_calls`/`gateway_call_attempts` 保存 365 天原始调用与供应商尝试，`monitored_inputs` 保存 90 天完整文本。访问审计、额度调整审计和倍率调整审计永久保留；模型倍率从 NULL 首次设置时不产生倍率调整审计，后续改为不同值时必须记录原因。
 
+学生月度用量的只读汇总在同一个可重复读事务中执行两条查询，分别读取汇总和额度。用量按 `user_id`、`project_id`、`api_key_id`、`model_id` 与账月归属。查询先限定该学生所属项目内的自有 Key，再在每个 Key × 模型上合并月账本和逐笔证据。月账本沿用以 `month` 开头的索引，调用查询可利用 `gateway_calls_student_receipt_lookup (user_id, request_id)` 的用户前缀及 `gateway_calls_key_created (api_key_id, created_at)` 的 Key 前缀。过滤使用调用受理时记录的 `month`，因此跨月派发或补记仍归入原账月。汇总复用现有表和索引。
+
+积分对 `charged_milli + charged_milli_remainder` 以 PostgreSQL `numeric` 求和，再乘以 `0.001` 转为积分字符串。次数取 `charged_count + zero_cost_count`，原始调用过保留期后仍可查询该次数。Token 用 `gateway_calls` 的可空协议计数按教师报表口径拆分，Anthropic 输入单列，OpenAI 含缓存的输入拆成净输入和缓存分项，Gemini 另计工具输入和推理输出。归类不全时保留已有分项与已知总量，清理过的账本调用计入覆盖总数。Key、项目及模型的待核积分直接相加 `pending_review` 行的整积分预留。Key 和成员月桶的 `pending_milli` 除以 1000 得到在途占用。
+
 迁移 0029 增加单次调用的上游凭据、绑定和模型标识，以及缓存读、缓存未命中、缓存写和推理用量。可空列区分显式 0 和缺项。用量状态 `reported`、`missing`、`interrupted` 分别表示已报告、未取到和传输中断。上游 `credit` 的缩放值仅表示供应商原始额度数值，不作为美元成本参与对账。
 
 迁移 0030 增加北辰同步状态、不可变的上游报价和倍率版本、校内手动价版本以及按凭据、模型和北京时间日期保存的北辰账单。试算按调用时刻选择对应的有效版本，日汇总按明示的缓存口径计算；数据缺失的比较项保持为空。同步任务的租约防止多实例重复拉取。
