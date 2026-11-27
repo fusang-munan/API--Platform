@@ -371,6 +371,13 @@ go test ./...
 
 在上述本机测试库运行 `go test ./internal/dataplane -run 'TestBeichenUsageProtocolMatrix|TestBeichenPostgresGatewayReconciliation' -count=1 -v`。假上游的 41 笔调用覆盖完整用量、缺缓存明细及缺用量，且检验逐笔回执补记、回执重放和差额精度。完整检查使用 `go build ./...` 与 `go test ./...`。
 
+### 学生月度用量与待核
+
+在隔离的本机 PostgreSQL 设置 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/usage -run 'TestStudentUsageContractPostgres|TestStudentCallReceipt|TestBeichenLedgerPostgres' -count=1 -v`。测试以真实查询和响应 JSON 验证跨项目和 Key 的精确求和、完整及部分 Token、缺失历史证据、停用 Key 的零额调用、待核补记与回执访问校验。
+
+- Token 总量大于四项之和时，查看 `token_coverage.unclassified_tokens`。分项为 `null` 时，用同一账月的逐笔 `usage_state`、`usage_reason` 和原始协议计数核对。缓存命中率的实际样本数在 `cache_hit_coverage.sample_calls`。
+- 待核与在途金额差异可用同一账月的 `pending_review_calls`、`pending_review_credits` 和 `in_flight_credits` 复核。账页间的已用和次数应比较同一账月的服务端汇总 `data.totals`、`data.models`，最近调用分页可用来查对应的逐笔状态。
+
 ### 北辰网页报价持续为 0/4
 
 先从已核实的学校 HTTPS 入口读 `/.well-known/nebula-release.txt`。学校若显示 0.15.0，采价任务还依赖预配的分组行。同步可以先写入 Key 账单倍率，随后因缺少分组而跳过官网价表。北辰的标准 Key 账单格式可以省略分组 ID，网页价表本身要求登录。价格成功数统计有效的报价快照，流水成功数取决于有效的上游 Key 绑定和已成功读取的流水分页。
