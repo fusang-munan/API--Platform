@@ -1,9 +1,10 @@
 import { DOMWrapper, enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { defineComponent } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { BeichenBatchEnableResult, BeichenCatalogModel, BeichenModelCapability, BeichenModelUsage, BeichenOverview, BeichenPriceConditions, BeichenRebindPlan, BeichenUsageRange, BeichenUsageTotals, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../../api/types'
+import type { BeichenBatchEnableResult, BeichenModelUsage, BeichenPriceConditions, BeichenRebindPlan, BeichenUsageRange, BeichenUsageTotals, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../../api/types'
 import BeichenPriceDrawer from '../../components/BeichenPriceDrawer.vue'
 import BeichenSchoolModels from './BeichenSchoolModels.vue'
+import type { TeacherBoundRoute, TeacherCatalogModel, TeacherOverview } from '../../utils/beichenModels'
 import componentSource from './BeichenSchoolModels.vue?raw'
 
 const api = vi.hoisted(() => ({
@@ -20,8 +21,8 @@ vi.mock('../../composables/useToast', () => ({ useToast: () => toast }))
 const Dialog = defineComponent({ props: ['open', 'title'], template: '<section v-if="open" role="dialog" :aria-label="title"><h2>{{ title }}</h2><slot /></section>' })
 const stubs = { AppDialog: Dialog, BeichenRecentReceipts: true, RouterLink: true }
 enableAutoUnmount(afterEach)
-type Entry = { model: string; active?: boolean; priced?: boolean; canEnable?: boolean; manual?: boolean; catalog?: Partial<BeichenCatalogModel> }
-function overview(entries: Entry[]): BeichenOverview {
+type Entry = { model: string; active?: boolean; priced?: boolean; canEnable?: boolean; manual?: boolean; catalog?: Partial<TeacherCatalogModel> }
+function overview(entries: Entry[]): TeacherOverview {
   return {
     datasets: [], comparison: [],
     models: entries.map(entry => ({
@@ -81,7 +82,7 @@ function pricedLocation(id: number, name: string, rate: string, input: string, o
     ...(priceScope ? { price_scope: priceScope } : {}),
   }
 }
-function view(props: { query?: string; commonIds?: Set<string> } = {}) {
+function view(props: { query?: string; commonIds?: Set<string>; retiredOnly?: boolean } = {}) {
   return mount(BeichenSchoolModels, { props: { providerId: 'north', ...props }, global: { stubs } })
 }
 function button(root: Pick<DOMWrapper<Element>, 'findAll'>, label: string) {
@@ -98,15 +99,17 @@ function deferred<T>() {
   const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail })
   return { promise, resolve, reject }
 }
-function capability(model: string, overrides: Partial<BeichenModelCapability> = {}): BeichenModelCapability {
+function boundRoute(model: string, key: string, group: number, overrides: Partial<TeacherBoundRoute> = {}): TeacherBoundRoute {
   return {
-    model, credential_id: 'key-' + model, credential_label: '渠道一',
-    supported_protocols: ['openai_compatible'], available_protocols: [], recommended_protocol: null,
-    protocol_details: [{ protocol: 'openai_compatible', binding_ready: true, probe_state: 'unprobed' }],
-    catalog_state: 'key_listed', availability: 'unverified', price_state: 'confirmed', price_blocker: null,
-    multiplier_state: 'current', probe_state: 'unprobed', binding_state: 'ready', action_hint: '',
-    ...overrides,
+    school_model: model, upstream_model: model, credential_id: key, credential_label: key,
+    priority: 10, published: true, key_enabled: true, group_id: group, group_status: 'assigned',
+    protocol: 'openai_responses', catalog_state: 'key_listed', price_state: 'confirmed', price_covered: true,
+    binding_ready: true, probe_state: 'passed', ...overrides,
   }
+}
+const responsesAvailable = {
+  availability: 'available', protocols: ['openai_responses'], available_protocols: ['openai_responses'],
+  recommended_protocol: 'openai_responses',
 }
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset()
@@ -146,13 +149,13 @@ describe('北辰模型管理', () => {
     expect(wrapper.get('.model-summary').text()).toContain('0 把已启用 Key 的当前目录')
   })
 
-  it('已作废的历史模型仅在全部模型的全部筛选中只读展示', async () => {
+  it('已作废型号退出当前列表与批量，在历史页只读并可查看用量', async () => {
     const data = overview([{ model: 'lab/pending' }])
+    data.model_catalog![0].school_status = 'pending_configuration'
     const issue = { code: 'catalog_missing', message: '请核查供货渠道' }
-    const history = ['gemini-3.1-flash-lite', 'gemini-4-argon']
+    const history = ['gemini-3.1-flash-lite', 'gemini-4-argon', ...Array.from({ length: 6 }, (_, index) => 'gemini-fixture-' + index)]
     data.model_catalog!.push(
-      { model: history[0], retired: true, school_status: 'active', catalog_state: 'published_unavailable', credential_ids: [] },
-      { model: history[1], retired: true, school_status: 'pending_configuration', catalog_state: 'catalog_missing', credential_ids: [] },
+      ...history.map(model => ({ model, retired: true, historical_channels: ['Gemini'], credential_ids: [] })),
       { model: 'lab/gap', school_status: 'active', catalog_state: 'published_unavailable', credential_ids: [], binding_issue: issue },
       { model: 'lab/website', catalog_state: 'website_only', credential_ids: [] },
     )
@@ -160,12 +163,7 @@ describe('北辰模型管理', () => {
     const wrapper = view()
     await flushPromises()
     const names = () => wrapper.findAll('.model-table > tbody > tr').map(row => row.attributes('data-model'))
-    expect(names()).toEqual(['lab/pending', ...history])
-    for (const model of history) {
-      const row = wrapper.get(`[data-model="${model}"]`)
-      expect(row.get('.status-pill').text()).toBe('已作废')
-      expect(row.findAll('button').map(item => item.attributes('aria-label'))).toEqual([`查看 ${model} 用量`])
-    }
+    expect(names()).toEqual(['lab/pending'])
     expect(wrapper.get('.model-summary').text()).toContain('官网目录1')
     await button(wrapper, '一键启用').trigger('click')
     const batch = wrapper.get('[aria-label="一键启用当前筛选模型"]')
@@ -188,6 +186,84 @@ describe('北辰模型管理', () => {
     expect(names()).toEqual(['lab/pending'])
     await wrapper.setProps({ commonIds: undefined, providerMaintenance: true })
     expect(names()).toEqual(['lab/pending'])
+    await wrapper.setProps({ providerMaintenance: false, retiredOnly: true })
+    expect(wrapper.findAll('[data-retired-model]').map(row => row.attributes('data-retired-model'))).toEqual(history)
+    expect(wrapper.find('[aria-label="模型概况"]').exists()).toBe(false)
+    expect(wrapper.get('[data-retired-model="gemini-4-argon"]').text()).toContain('Gemini0')
+    expect(wrapper.findAll('button').map(item => item.text())).toEqual(history.map(() => '查看历史用量'))
+    await wrapper.setProps({ query: '4-argon' })
+    expect(wrapper.findAll('[data-retired-model]')).toHaveLength(1)
+    await button(wrapper, '查看历史用量').trigger('click')
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true)
+  })
+
+  it('六个生产型号只使用各自绑定的 Key 计算覆盖与分组告警', async () => {
+    const names = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.2-astra', 'gpt-6.2-sol', 'deepseek-v4-pro', 'deepseek-v4-flash']
+    const data = overview([...names, 'fixture-cc1', 'fixture-gm1'].map((model, index) => {
+      const [key, group, other, otherGroup] = index < 4 ? ['G3', 10, 'GM1', 6] as const : ['GM1', 6, 'G3', 10] as const
+      const routes = [boundRoute(model, key, group, { protocol: 'openai_compatible' })]
+      if (index < 4) routes.push(boundRoute(model, key, group))
+      return { model, active: true, catalog: {
+        catalog_state: 'key_listed', activation: 'active', price_state: index === 0 ? 'confirmed' : 'conditional', price_covered: true,
+        ready_count: routes.length, bound_routes: routes, bound_key_count: 1, covered_bound_key_count: 1,
+        route_availability: responsesAvailable,
+        catalog_keys: [
+          { credential_id: key, label: key, group_id: group, state: 'listed', upstream_model: model },
+          { credential_id: other, label: other, group_id: otherGroup, state: 'missing', group_diagnosis: 'model_outside_key_group' },
+        ],
+      } }
+    }))
+    data.credentials = ['G3', 'GM1', 'CC1'].map(key => ({
+      credential_id: key, label: key, status: 'active', model_count: 0, priced_model_count: 0,
+    })) as NonNullable<TeacherOverview['credentials']>
+    api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys(
+      { credential_id: 'G3', group_id: 10, group_name: null, rate: '1' },
+      { credential_id: 'GM1', group_id: 6, group_name: null, rate: '1' },
+      { credential_id: 'CC1', group_id: 24, group_name: null, rate: '1' },
+      { credential_id: null, group_id: 5, group_name: null, rate: '1', match_status: 'unmatched' },
+    ))
+    const wrapper = view()
+    await flushPromises()
+    for (const [index, model] of names.entries()) {
+      const row = wrapper.get('[data-model="' + model + '"]')
+      expect(row.get('.model-state-summary').text()).toContain('Key 覆盖 1/1 · 已发布线路 ' + (index < 4 ? 2 : 1))
+      expect(row.find('[data-testid="group-mismatch"]').exists()).toBe(false)
+      expect(row.get('details [data-testid="key-catalog-gap"]').text()).toContain('该 Key 目录未列出')
+    }
+    expect(wrapper.get('.model-summary').text()).toContain('报价覆盖8 / 8')
+    expect(wrapper.get('.model-diagnostics').attributes('open')).toBeUndefined()
+    expect(wrapper.get('[aria-label="官网 Key 清单"]').text()).toContain('官网仍启用、未匹配校内 Key')
+    expect(wrapper.get('[aria-label="官网 Key 清单"]').text()).not.toContain('待刷新')
+    await button(wrapper, '异常').trigger('click')
+    expect(wrapper.findAll('[data-model]')).toHaveLength(0)
+  })
+
+  it('优先显示实际发布 Key 的价格，另一个有分组的候选 Key 不参与', async () => {
+    const [model, alias] = ['claude-sonnet-5-5', 'claude-sonnet-5.5']
+    const ready = boundRoute(model, 'ready', 24, { school_model: alias, priority: 20 })
+    const other = boundRoute(model, 'candidate', 10, { school_model: alias, binding_ready: false, priority: 1, catalog_state: 'catalog_missing' })
+    const data = overview([{ model, active: true, catalog: {
+      school_model: alias, activation: 'active', binding_issue: { code: 'no_ready_binding', message: '部分线路待核对' },
+      catalog_state: 'key_listed', ready_count: 1, bound_routes: [other, ready], bound_key_count: 2, covered_bound_key_count: 1,
+      price_covered: true, route_availability: responsesAvailable,
+      website_locations: [pricedLocation(24, 'CC1', '1', '0.00001', '0.00002'), pricedLocation(10, 'G3', '1', '0.001', '0.002')],
+    } }])
+    data.models = [
+      { ...data.models![0], credential_id: 'ready', school_rates: { input: '10000000', output: '20000000', cache_read: null, cache_write: null } },
+      { ...data.models![0], credential_id: 'candidate', school_rates: { input: '990000000', output: '990000000', cache_read: null, cache_write: null } },
+    ]
+    api.beichenOverview.mockResolvedValue(data)
+    const wrapper = view({ query: alias })
+    await flushPromises()
+    const row = wrapper.get('[data-model="' + model + '"]')
+    expect(row.get('.model-state-summary').text()).toContain('Key 覆盖 1/2 · 已发布线路 1')
+    expect(row.get('.current-group-prices').text()).toContain('当前 Key 分组 24')
+    expect(currentGroupAmounts(row, 'input')[1]).toBe('11')
+    await button(wrapper, '已启用').trigger('click')
+    expect(wrapper.findAll('[data-model]')).toHaveLength(0)
+    await button(wrapper, '异常').trigger('click')
+    expect(wrapper.get('[data-model="' + model + '"]').text()).toContain('部分线路待核对')
   })
 
   it('刷新后的作废模型退出已打开的定价和批量预览', async () => {
@@ -285,7 +361,7 @@ describe('北辰模型管理', () => {
     expect(currentGroupAmounts(gptRow, 'cache5m')).toEqual(['10', '176'])
     expect(currentGroupAmounts(gptRow, 'cache1h')).toEqual(['12', '211.2'])
     expect(currentGroupAmounts(gptRow, 'cache_read')).toEqual(['0.4', '7.04'])
-    expect(gptRow.find('[data-testid="price-missing"]').exists()).toBe(false)
+    expect(gptRow.get('[data-testid="price-missing"]').text()).toBe('缺价')
     expect(wrapper.text()).toContain('学生扣费 = 结算价 × 1.10；100 积分 = 1 元')
     expect(wrapper.text()).not.toContain('当前 Key 报价待核对')
 
@@ -476,6 +552,14 @@ describe('北辰模型管理', () => {
         group_status: 'assigned', group_id: 16, group_rate: '0.6', observed_at: '2026-11-21T12:14:00Z' },
     ]
     data.model_catalog![0].protocols = []
+    data.model_catalog![0].bound_routes = [boundRoute(gemini, 'key-' + gemini, 5, {
+      published: false, binding_ready: false, group_status: 'not_allowed', probe_state: 'unprobed', price_covered: false,
+    })]
+    data.model_catalog![0].catalog_keys = [{ credential_id: 'key-' + gemini, label: gemini, group_id: 5, state: 'listed' }]
+    data.model_catalog![1].bound_routes = [boundRoute('lab/no-group', 'key-lab/no-group', 0, {
+      published: false, binding_ready: false, group_id: null, group_status: 'not_found', probe_state: 'unprobed', price_covered: false,
+    })]
+    data.model_catalog![1].catalog_keys = [{ credential_id: 'key-lab/no-group', label: '渠道', group_id: null, state: 'listed' }]
     data.model_catalog![0].website_locations = [{
       name: gemini, observed_at: '2026-11-21T12:14:00Z', has_price: true, price_complete: true,
       groups: [{ id: 5, rate_multiplier: '0.3' }],
@@ -517,7 +601,7 @@ describe('北辰模型管理', () => {
     }
     const candidate = { credential_id: 'second', label: 'Claude 接替', school_channel: 'CC1', replacement: true, group_id: 24 }
     const keyOnly = overview([{ model: 'lab/a', catalog: { source: 'key', catalog_state: 'key_listed', key_count: 1 } }])
-    const data: BeichenOverview = {
+    const data: TeacherOverview = {
       ...keyOnly,
       credentials: [
         { credential_id: 'first', label: '渠道一', status: 'active' },
@@ -542,9 +626,6 @@ describe('北辰模型管理', () => {
     }])
     api.beichenOverview.mockResolvedValueOnce(data).mockResolvedValue({
       ...restored, website_only_status: 'stale', credentials: data.credentials,
-    })
-    api.beichenCapabilities.mockResolvedValue({
-      capabilities: [capability(model, { supported_protocols: [], availability: 'maintenance', binding_state: 'invalid' })],
     })
     api.syncBeichen.mockResolvedValue({ synced: true })
     const wrapper = view()
@@ -572,7 +653,7 @@ describe('北辰模型管理', () => {
     const claude = wrapper.get('[data-model="' + model + '"]')
     expect(claude.get('[data-testid="catalog-source"]').text()).toBe('来源 官网和 Key')
     expect(claude.text()).toContain('Claude 渠道 · anthropic · CC1 分组 分组 24')
-    expect(claude.get('.model-state-summary').text()).toContain('Key 覆盖 1/2 · 协议 1')
+    expect(claude.get('.model-state-summary').text()).toContain('Key 覆盖 — · 已发布线路 0')
     expect(claude.find('[data-testid="key-catalog-gap"]').exists()).toBe(false)
     expect(wrapper.find('[aria-label="启用 ' + model + '"]').exists()).toBe(true)
   })
@@ -629,7 +710,7 @@ describe('北辰模型管理', () => {
     expect(modelRow.get('.current-group-prices .group-prices-head strong').text()).toContain('分组 60')
     expect(modelRow.find('.other-groups').exists()).toBe(false)
     const mismatch = wrapper.get('[data-model="' + opus + '"]')
-    expect(mismatch.get('[data-testid="group-mismatch"]').text()).toBe('分组不匹配')
+    expect(mismatch.find('[data-testid="group-mismatch"]').exists()).toBe(false)
     expect(mismatch.find('[data-testid="current-group-missing"]').exists()).toBe(false)
     expect(mismatch.find('.other-groups').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('重扫该 Key')
@@ -729,6 +810,7 @@ describe('北辰模型管理', () => {
     '官网 Key 清单 %s 时，已分配且有效的计费记录也只作上次分组', async matchStatus => {
       const data = overview([{ model: 'lab/a' }])
       const credential_id = 'key-lab/a'
+      data.credentials = [{ credential_id, label: '学校 Key', status: 'active' }]
       data.datasets = [{ credential_id, kind: 'billing', group_id: 2, group_status: 'assigned',
         group_rate: '0.15', billing_state: 'current', effective_multiplier: '0.15' }]
       const inventory = matchStatus === 'missing' ? websiteKeys()
@@ -840,7 +922,7 @@ describe('北辰模型管理', () => {
 
   it('分别展示四维健康、报价覆盖、线路异常和手动探活结果', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
-    const initial: BeichenOverview = {
+    const initial: TeacherOverview = {
       ...overview([
         { model: 'lab/tiered', priced: false, catalog: {
           price_state: 'conditional', price_covered: true, credential_ids: ['first'], activation: 'ready',
@@ -894,31 +976,20 @@ describe('北辰模型管理', () => {
     expect(button(wrapper, '立即探活').attributes('disabled')).toBeUndefined()
   })
 
-  it('优先展示 capabilities 的推荐协议、可用性、下一步和绑定问题', async () => {
+  it('概览直接展示实际线路的推荐协议、可用性和下一步', async () => {
     api.beichenOverview.mockResolvedValue(overview([
-      { model: 'lab/ready', active: true, catalog: { activation: 'active', protocols: ['openai_compatible'], probe_state: 'unprobed' } },
-      { model: 'lab/down', active: true, catalog: { activation: 'active', protocols: ['anthropic'], probe_state: 'failed' } },
+      { model: 'lab/ready', active: true, catalog: {
+        activation: 'active', probe_state: 'passed',
+        route_availability: { ...responsesAvailable, protocols: ['openai_compatible', 'openai_responses'] },
+        action_hint: '可使用推荐协议接入。',
+      } },
+      { model: 'lab/down', active: true, catalog: {
+        activation: 'active', probe_state: 'failed',
+        route_availability: { protocols: ['anthropic'], available_protocols: [], recommended_protocol: null,
+          availability: 'maintenance', availability_reason: '维护中。当前线路的协议最近一次探活均失败。' },
+        action_hint: '请检查渠道是否启用，使用当前 Key 重扫目录。',
+      } },
     ]))
-    api.beichenCapabilities.mockResolvedValue({
-      capabilities: [
-        capability('lab/ready', {
-          supported_protocols: ['openai_compatible', 'openai_responses'], available_protocols: ['openai_responses'],
-          recommended_protocol: 'openai_responses', probe_state: 'passed', availability: 'available',
-          protocol_details: [
-            { protocol: 'openai_compatible', binding_ready: true, probe_state: 'unprobed' },
-            { protocol: 'openai_responses', binding_ready: true, probe_state: 'passed' },
-          ],
-          action_hint: '可使用推荐协议接入。',
-        }),
-        capability('lab/down', {
-          supported_protocols: ['anthropic'], available_protocols: [], recommended_protocol: null, probe_state: 'failed',
-          availability: 'maintenance', availability_reason: '维护中。当前线路的协议最近一次探活均失败。',
-          protocol_details: [{ protocol: 'anthropic', binding_ready: true, probe_state: 'failed' }],
-          action_hint: '请检查渠道是否启用，使用当前 Key 重扫目录。',
-        }),
-      ],
-      gaps: [],
-    })
     const wrapper = view()
     await flushPromises()
 
@@ -930,61 +1001,160 @@ describe('北辰模型管理', () => {
 
     const down = wrapper.get('[data-model="lab/down"]')
     expect(down.get('[data-testid="model-availability"]').text()).toBe('维护中')
-    expect(down.get('[data-testid="recommended-protocol"]').text()).toBe('暂无推荐协议')
+    expect(down.get('[data-testid="recommended-protocol"]').text()).toBe('推荐协议待核实')
     expect(down.get('[data-testid="availability-reason"]').text()).toContain('探活均失败')
     expect(down.get('[data-testid="action-hint"]').text()).toContain('重扫目录')
   })
 
-  it('把 degraded 显示为可用 · 探活异常，并用最新 checked_at 显示探活失败时间', async () => {
+  it('展示探活异常及实际发布线路最近一次探活时间', async () => {
     api.beichenOverview.mockResolvedValue(overview([{
       model: 'lab/degraded', active: true,
-      catalog: { activation: 'active', protocols: ['anthropic'], probe_state: 'failed', last_probe_at: '2026-11-22T16:00:00Z' },
+      catalog: {
+        activation: 'active', probe_state: 'failed', last_probe_at: '2026-11-22T16:54:00Z',
+        route_availability: { protocols: ['anthropic'], available_protocols: [], recommended_protocol: null,
+          availability: 'degraded', availability_reason: '最近一次探活失败，仍可尝试调用，请求可能失败。' },
+      },
     }]))
-    api.beichenCapabilities.mockResolvedValue({
-      capabilities: [capability('lab/degraded', {
-        supported_protocols: ['anthropic'], available_protocols: [], recommended_protocol: null,
-        probe_state: 'failed', availability: 'degraded',
-        availability_reason: '最近一次探活失败，但该模型此前长期可用；仍可尝试调用，请求可能失败。',
-        protocol_details: [{
-          protocol: 'anthropic', binding_ready: true, probe_state: 'failed',
-          probe: { checked_at: '2026-11-22T16:54:00Z', status_code: 500 },
-        }],
-        action_hint: '请检查渠道是否启用，使用当前 Key 重扫目录。',
-      })],
-      gaps: [],
-    })
     const wrapper = view()
     await flushPromises()
 
     const row = wrapper.get('[data-model="lab/degraded"]')
     expect(row.get('[data-testid="model-availability"]').text()).toBe('可用 · 探活异常')
     expect(row.get('[data-testid="model-availability"]').classes()).toContain('pending')
-    expect(row.text()).not.toContain('维护中')
     expect(row.get('[data-testid="availability-reason"]').text()).toContain('请求可能失败')
     expect(row.text()).toContain('探活失败')
     expect(row.text()).toContain('11/23 00:54')
-    expect(row.text()).not.toContain('11/23 00:00')
   })
 
-  it('capabilities 读取失败时回退现有线路字段，不按模型名猜推荐', async () => {
-    api.beichenCapabilities.mockRejectedValueOnce(new Error('404'))
-    api.beichenOverview.mockResolvedValue(overview([{ model: 'lab/a', catalog: {
+  it('能力证据缺失或读取失败时，候选线路只显示待核实', async () => {
+    api.beichenCapabilities.mockRejectedValue(new Error('503'))
+    api.beichenOverview.mockResolvedValueOnce(overview([{ model: 'lab/a', catalog: {
       activation: 'active', protocols: ['anthropic'], probe_state: 'passed',
-    } }]))
+    } }])).mockRejectedValueOnce(new Error('overview unavailable'))
     const wrapper = view()
     await flushPromises()
 
     const row = wrapper.get('[data-model="lab/a"]')
-    expect(row.get('[data-testid="model-availability"]').text()).toBe('可用')
-    expect(row.get('[data-testid="recommended-protocol"]').text()).toBe('推荐协议待同步')
-    expect(row.text()).toContain('Anthropic Messages')
-    expect(row.text()).toContain('探活通过')
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('待核实')
+    expect(row.get('[data-testid="recommended-protocol"]').text()).toBe('推荐协议待核实')
+    expect(api.beichenCapabilities).not.toHaveBeenCalled()
+    await button(wrapper, '刷新模型').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-model="lab/a"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('读取北辰模型失败')
   })
 
-  it('查看档位优先展示 capabilities 的 price_blocker.message 与缺价状态', async () => {
+  it('官网最新分组与模型证据不一致时同时降级目录、探活和报价', async () => {
+    const model = 'deepseek-v4-pro'
+    const data = overview([{ model, active: true, catalog: {
+      catalog_state: 'key_listed', activation: 'active', price_covered: true, probe_state: 'passed',
+      bound_routes: [boundRoute(model, 'GM1', 6)], bound_key_count: 1, covered_bound_key_count: 1, ready_count: 1,
+      route_availability: responsesAvailable,
+    } }])
+    api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys({ credential_id: 'GM1', group_id: 12, group_name: null, rate: '1' }))
+    const wrapper = view()
+    await flushPromises()
+    const row = wrapper.get('[data-model="deepseek-v4-pro"]')
+    expect(row.get('.model-state-summary').text()).toContain('Key 覆盖 0/1 · 已发布线路 0')
+    expect(row.text()).toContain('目录待复核')
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('待核实')
+    expect(row.text()).not.toContain('探活通过')
+    expect(wrapper.get('.model-summary').text()).toContain('报价覆盖0 / 1')
+    data.model_catalog![0].bound_routes![0].group_checked_at = '2026-11-21T13:09:00Z'
+    api.beichenOverview.mockResolvedValue({ ...data })
+    await button(wrapper, '刷新模型').trigger('click')
+    await flushPromises()
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('可用')
+    expect(row.get('.model-state-summary').text()).toContain('Key 覆盖 1/1 · 已发布线路 1')
+  })
+
+  it('备用 GM1 换组后保留 G3 报价、可用性和推荐协议', async () => {
+    const model = 'gpt-fixture-with-backup'
+    const data = overview([{ model, active: true, catalog: {
+      catalog_state: 'key_listed', activation: 'active', price_covered: true, price_state: 'confirmed', probe_state: 'passed',
+      bound_routes: [boundRoute(model, 'G3', 10), boundRoute(model, 'GM1', 6, { protocol: 'openai_compatible', priority: 20 })],
+      bound_key_count: 2, covered_bound_key_count: 2, ready_count: 2,
+      catalog_keys: [
+        { credential_id: 'G3', label: 'G3', group_id: 10, state: 'listed', upstream_model: model },
+        { credential_id: 'GM1', label: 'GM1', group_id: 6, state: 'listed', upstream_model: model },
+      ],
+      route_availability: { ...responsesAvailable, recommended_protocol: 'openai_compatible',
+        protocols: ['openai_compatible', 'openai_responses'], available_protocols: ['openai_compatible', 'openai_responses'] },
+      website_locations: [pricedLocation(10, 'G3', '1', '0.00001', '0.00002'), pricedLocation(6, 'GM1', '1', '0.00005', '0.0001')],
+    } }])
+    data.models = [
+      { ...data.models![0], credential_id: 'G3' },
+      { ...data.models![0], credential_id: 'GM1', school_rates: { input: 500000000, output: 1000000000 } },
+    ]
+    const g3 = { credential_id: 'G3', group_id: 10, group_name: 'G3', rate: '1' }
+    const gm1 = { credential_id: 'GM1', group_id: 6, group_name: 'GM1', rate: '1' }
+    api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys(g3, gm1))
+    const wrapper = view()
+    await flushPromises()
+    const row = wrapper.get('[data-model="gpt-fixture-with-backup"]')
+    expect(row.get('.model-state-summary').text()).toContain('Key 覆盖 2/2 · 已发布线路 2')
+    expect(row.get('.current-group-prices').text()).toContain('当前 Key 分组 10')
+    const originalPrice = currentGroupAmounts(row, 'input')
+    expect(originalPrice.join(' ')).toContain('110')
+
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys(g3, { ...gm1, group_id: 12 }))
+    await button(wrapper, '刷新模型').trigger('click')
+    await flushPromises()
+    expect(row.get('.model-state-summary').text()).toContain('Key 覆盖 1/2 · 已发布线路 1')
+    expect(row.get('[aria-label="实际绑定线路"]').text()).toMatch(/GM1 · OpenAI Chat\s+· 分组 12 · 目录待复核/)
+    expect(row.text()).toContain('GM1 Key 上次目录有')
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('可用')
+    expect(row.get('[data-testid="recommended-protocol"]').text()).toBe('推荐 OpenAI Responses')
+    expect(row.get('.current-group-prices').text()).toContain('当前 Key 分组 10')
+    expect(currentGroupAmounts(row, 'input')).toEqual(originalPrice)
+    expect(wrapper.get('.model-summary').text()).toContain('报价覆盖1 / 1')
+  })
+
+  it('绑定 Key 的明确分组拒绝显示为维护，重扫成功后清除提示', async () => {
+    const model = 'gpt-fixture-group-denial'
+    const route = boundRoute(model, 'G3', 10)
+    const data = overview([{ model, active: true, catalog: {
+      catalog_state: 'key_listed', activation: 'active', bound_routes: [route],
+      bound_key_count: 1, covered_bound_key_count: 1, ready_count: 1, route_availability: responsesAvailable,
+    } }])
+    const denied = { ...data, model_catalog: [{ ...data.model_catalog![0],
+      catalog_state: 'published_unavailable' as const, ready_count: 0, covered_bound_key_count: 0,
+      binding_issue: { code: 'group_not_allowed', message: '绑定 Key 分组无权限。' },
+      action_hint: '请在北辰恢复该 Key 的分组权限，再重扫目录。',
+      bound_routes: [{ ...route, group_status: 'not_allowed', catalog_state: 'group_blocked',
+        binding_ready: false, probe_state: 'unprobed', price_covered: false }],
+      route_availability: { ...responsesAvailable, protocols: [], available_protocols: [], recommended_protocol: null,
+        availability: 'maintenance', availability_reason: '维护中。绑定 Key 分组无权限。' },
+    }] }
+    api.beichenOverview.mockResolvedValueOnce(denied).mockResolvedValue(data)
+    const wrapper = view()
+    await flushPromises()
+    await button(wrapper, '异常').trigger('click')
+    const row = wrapper.get('[data-model="gpt-fixture-group-denial"]')
+    expect(row.get('[data-testid="group-denied"]').text()).toBe('分组无权限 · 分组 10')
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('维护中')
+    expect(row.get('[data-testid="action-hint"]').text()).toContain('恢复该 Key 的分组权限，再重扫目录')
+    expect(row.find('[data-testid="binding-invalid"]').exists()).toBe(false)
+    expect(row.find('[data-testid="protocol-missing"]').exists()).toBe(false)
+    expect(row.find('[data-testid="availability-reason"]').exists()).toBe(false)
+    expect(row.find('small.binding-issue').exists()).toBe(false)
+    expect(row.text()).not.toContain('目录里已找不到')
+    expect(row.get('.model-state-summary').text()).not.toContain('目录待复核')
+
+    await button(wrapper, '刷新模型').trigger('click')
+    await flushPromises()
+    await button(wrapper, '全部').trigger('click')
+    const restored = wrapper.get('[data-model="gpt-fixture-group-denial"]')
+    expect(restored.find('[data-testid="group-denied"]').exists()).toBe(false)
+    expect(restored.get('[data-testid="model-availability"]').text()).toBe('可用')
+  })
+
+  it('查看档位展示服务端的 price_blocker.message 与缺价状态', async () => {
     const data = overview([{ model: 'lab/tiered', catalog: {
       activation: 'blocked', price_state: 'missing', price_covered: false,
-      price_blocker: { code: 'old_blocker', message: '旧报价阻塞原因' },
+      price_blocker: { code: 'price_snapshot_expired', message: '该模型的官网报价快照已过期。' },
     } }])
     const [model] = data.models!
     model.price_status = 'conditional'
@@ -993,13 +1163,6 @@ describe('北辰模型管理', () => {
       { min_tokens: '0', max_tokens: null, input_price: '0.000001', output_price: '0.000002' },
     ] }
     api.beichenOverview.mockResolvedValue(data)
-    api.beichenCapabilities.mockResolvedValue({
-      capabilities: [capability('lab/tiered', {
-        price_state: 'missing', availability: 'available', probe_state: 'passed',
-        price_blocker: { code: 'price_snapshot_expired', message: '该模型的官网报价快照已过期。' },
-      })],
-      gaps: [],
-    })
     const wrapper = view()
     await flushPromises()
 
@@ -1015,7 +1178,7 @@ describe('北辰模型管理', () => {
       { model: 'lab/active', active: true, catalog: { activation: 'ready' } },
       { model: 'lab/active-new', catalog: { activation: 'active' } },
       { model: 'lab/ready', canEnable: false, catalog: { activation: 'ready' } },
-      { model: 'lab/legacy', priced: false, catalog: { activation: null, can_enable: true } },
+      { model: 'lab/legacy', catalog: { activation: null, can_enable: true } },
       { model: 'lab/blocked', catalog: { activation: 'blocked', blockers: [{ code: 'sync_failed', message: '请先同步该渠道报价' }] } },
       { model: 'lab/not-ready', canEnable: false },
       { model: 'lab/not-common' },
@@ -1147,7 +1310,7 @@ describe('北辰模型管理', () => {
   })
 
   it('本月汇总和行用量固定为本月，抽屉切换时段不覆盖本月用量', async () => {
-    const firstOverview = deferred<BeichenOverview>()
+    const firstOverview = deferred<TeacherOverview>()
     const day = deferred<BeichenModelUsage>()
     api.beichenOverview.mockReturnValueOnce(firstOverview.promise)
     api.modelUsage.mockImplementation(async (period: BeichenUsageRange) => {
@@ -1556,11 +1719,10 @@ describe('北辰模型管理', () => {
     await flushPromises()
     const states = wrapper.findAll('.model-state-summary').map(row => row.text())
     expect(states).toEqual([
-      'Key 覆盖 2/3 · 协议 2 · 已发布 2',
-      'Key 覆盖 1/3 · 协议 1 · 已发布 1',
-      'Key 覆盖 1/3 · 协议 0 · 已发布 0',
+      'Key 覆盖 — · 已发布线路 2',
+      'Key 覆盖 1/1 · 已发布线路 1',
+      'Key 覆盖 — · 已发布线路 0',
     ])
-    expect(wrapper.get('.model-state-summary [title]').attributes('title')).toBe('4 条候选线路')
     const empty = wrapper.get('[data-model="lab/empty"]')
     expect(empty.find('[data-testid="model-price-table"]').exists()).toBe(false)
     expect(empty.get('[data-testid="protocol-missing"]').text()).toBe('缺协议')

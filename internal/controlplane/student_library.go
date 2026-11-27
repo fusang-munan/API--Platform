@@ -2,10 +2,13 @@ package controlplane
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/beichen"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
@@ -13,10 +16,6 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/studentmodellibrary"
 )
-
-func modelEnabledForStudents(row *ent.Model) bool {
-	return studentModelPublicationIssue(row) == ""
-}
 
 func studentModelPublicationIssue(row *ent.Model) string {
 	if row.Status != entmodel.StatusActive {
@@ -36,7 +35,6 @@ func modelViewEnabledForStudents(item ModelView) bool {
 }
 
 func modelMatchesStudentQuery(row *ent.Model, query string) bool {
-	query = strings.TrimSpace(strings.ToLower(query))
 	if query == "" {
 		return true
 	}
@@ -60,8 +58,8 @@ func modelCatalogCandidateFromPlatformModel(view ModelView) ModelCatalogCandidat
 		RawEntry: map[string]any{
 			"protocols": view.Protocols, "available_protocols": view.AvailableProtocols,
 			"recommended_protocol": view.RecommendedProtocol, "probe_state": view.ProbeState,
-			"availability": view.Availability, "availability_reason": view.AvailabilityReason,
-			"last_probe_at": view.LastProbeAt,
+			"availability": view.Availability, "availability_state": view.AvailabilityState,
+			"availability_reason": view.AvailabilityReason, "last_probe_at": view.LastProbeAt,
 		},
 	}
 	if view.DisplayName != "" {
@@ -97,11 +95,7 @@ func (s *Service) enrichStudentModelView(ctx context.Context, item ModelView, pl
 	if err != nil && !ent.IsNotFound(err) {
 		return item, domain.WrapError(domain.CodeDependencyUnavailable, "query model binding", err)
 	}
-	if binding != nil && binding.Edges.Provider != nil {
-		item.ProviderID = binding.Edges.Provider.ID.String()
-		item.ProviderName = binding.Edges.Provider.Name
-		item.PrimaryAdapter = string(binding.Adapter)
-	}
+	setStudentModelPrimaryBinding(&item, binding)
 	if item.ModelAvailability == nil {
 		protocols, err := catalog.LoadPublishedProtocols(ctx, s.db, []uuid.UUID{platformModelID}, s.security)
 		if err != nil {
@@ -110,6 +104,38 @@ func (s *Service) enrichStudentModelView(ctx context.Context, item ModelView, pl
 		item.setAvailability(catalog.SummarizeModelAvailability(item.ModelID, entmodel.Status(item.Status), protocols[platformModelID]))
 	}
 	return item, nil
+}
+
+func setStudentModelPrimaryBinding(item *ModelView, binding *ent.ModelBinding) {
+	if binding != nil && binding.Edges.Provider != nil {
+		item.ProviderID = binding.Edges.Provider.ID.String()
+		item.ProviderName = binding.Edges.Provider.Name
+		item.PrimaryAdapter = string(binding.Adapter)
+	}
+}
+
+func (s *Service) setStudentModelStates(ctx context.Context, groups ...[]ModelView) error {
+	ids := make([]string, 0)
+	for _, group := range groups {
+		for _, item := range group {
+			if item.ModelAvailability != nil && item.Status == string(entmodel.StatusActive) {
+				ids = append(ids, item.ModelID)
+			}
+		}
+	}
+	channels, err := beichen.ReadStudentModelCatalog(ctx, s.sqlDB, ids)
+	if err != nil {
+		return domain.WrapError(domain.CodeDependencyUnavailable, "read student model catalog evidence", err)
+	}
+	for _, group := range groups {
+		for i := range group {
+			item := &group[i]
+			if item.ModelAvailability != nil {
+				item.ModelAvailability.SetStudentState(item.ModelID, entmodel.Status(item.Status), channels[item.ModelID])
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Service) StudentModelPlaza(ctx context.Context, studentID uuid.UUID) (StudentModelPlazaView, error) {
@@ -185,7 +211,8 @@ func (s *Service) StudentModelLibrary(ctx context.Context, studentID uuid.UUID) 
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].ModelID < result[j].ModelID
 	})
-	return filterStudentVisibleModels(result), nil
+	result = filterStudentVisibleModels(result)
+	return result, s.setStudentModelStates(ctx, result)
 }
 
 func (s *Service) StudentCommonModels(ctx context.Context) ([]ModelView, error) {
@@ -217,25 +244,34 @@ func (s *Service) StudentCommonModels(ctx context.Context) ([]ModelView, error) 
 		}
 		result = append(result, item)
 	}
-	return filterStudentVisibleModels(result), nil
+	result = filterStudentVisibleModels(result)
+	return result, s.setStudentModelStates(ctx, result)
 }
 
+const (
+	studentCatalogMaxQueryRunes = 128
+	studentCatalogMaxPage       = 10_000
+	studentCatalogMaxPageSize   = 50
+	studentCatalogProtocolBatch = 1_024
+)
+
 func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, pageSize int) (ModelCatalogPage, error) {
+	if !utf8.ValidString(query) || utf8.RuneCountInString(query) > studentCatalogMaxQueryRunes || strings.ContainsRune(query, 0) {
+		return ModelCatalogPage{}, domain.NewError(domain.CodeValidation, "q 须为 128 字以内的有效文本")
+	}
+	if page < 1 || page > studentCatalogMaxPage {
+		return ModelCatalogPage{}, domain.NewError(domain.CodeValidation, "page 须为 1 到 10000 之间的整数")
+	}
+	if pageSize < 1 || pageSize > studentCatalogMaxPageSize {
+		return ModelCatalogPage{}, domain.NewError(domain.CodeValidation, "page_size 须为 1 到 50 之间的整数")
+	}
+	result := ModelCatalogPage{Items: []ModelCatalogCandidate{}, Page: page, PageSize: pageSize}
 	hasProvider, err := s.hasActiveProvider(ctx)
 	if err != nil {
 		return ModelCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "query active providers", err)
 	}
 	if !hasProvider {
-		return ModelCatalogPage{Items: []ModelCatalogCandidate{}, Page: page, PageSize: pageSize, Total: 0}, nil
-	}
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 {
-		pageSize = 20
-	}
-	if pageSize > 50 {
-		pageSize = 50
+		return result, nil
 	}
 	rows, err := s.db.Model.Query().
 		Where(
@@ -248,39 +284,73 @@ func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, 
 	if err != nil {
 		return ModelCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "list enabled models", err)
 	}
-	filtered := make([]ModelCatalogCandidate, 0, len(rows))
-	for _, row := range rows {
-		if !modelMatchesStudentQuery(row, query) {
-			continue
+	query = strings.ToLower(strings.TrimSpace(query))
+	matches := slices.DeleteFunc(rows, func(row *ent.Model) bool {
+		return !modelMatchesStudentQuery(row, query)
+	})
+	type publishedModel struct {
+		id   uuid.UUID
+		view ModelView
+	}
+	published := make([]publishedModel, 0, len(matches))
+	// Route readiness affects the total, so evaluate it before slicing the page.
+	// Keep each batch well within PostgreSQL's bind parameter limit.
+	for batch := range slices.Chunk(matches, studentCatalogProtocolBatch) {
+		ids := make([]uuid.UUID, 0, len(batch))
+		for _, row := range batch {
+			ids = append(ids, row.ID)
 		}
-		if !modelEnabledForStudents(row) {
-			continue
-		}
-		view := modelView(row)
-		view, err = s.enrichStudentModelView(ctx, view, row.ID)
+		protocols, err := catalog.LoadPublishedProtocols(ctx, s.db, ids, s.security)
 		if err != nil {
-			return ModelCatalogPage{}, err
+			return ModelCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "query model availability", err)
 		}
-		if !modelViewEnabledForStudents(view) {
-			continue
+		for _, row := range batch {
+			view := modelView(row)
+			view.setAvailability(catalog.SummarizeModelAvailability(row.ModelID, row.Status, protocols[row.ID]))
+			if modelViewEnabledForStudents(view) {
+				published = append(published, publishedModel{id: row.ID, view: view})
+			}
 		}
-		filtered = append(filtered, modelCatalogCandidateFromPlatformModel(view))
 	}
-	total := len(filtered)
+	result.Total = len(published)
+	// The validated bounds keep this multiplication below 500,000.
 	start := (page - 1) * pageSize
-	if start >= total {
-		return ModelCatalogPage{Items: []ModelCatalogCandidate{}, Page: page, PageSize: pageSize, Total: total}, nil
+	if start >= result.Total {
+		return result, nil
 	}
-	end := start + pageSize
-	if end > total {
-		end = total
+	entries := published[start : start+min(pageSize, result.Total-start)]
+	ids := make([]uuid.UUID, 0, len(entries))
+	for _, entry := range entries {
+		ids = append(ids, entry.id)
 	}
-	return ModelCatalogPage{
-		Items:    filtered[start:end],
-		Page:     page,
-		PageSize: pageSize,
-		Total:    total,
-	}, nil
+	bindings, err := s.db.ModelBinding.Query().
+		Where(modelbinding.ModelIDIn(ids...), modelbinding.StatusEQ(modelbinding.StatusActive)).
+		WithProvider().
+		Order(ent.Asc(modelbinding.FieldPriority), ent.Asc(modelbinding.FieldID)).
+		All(ctx)
+	if err != nil {
+		return ModelCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "query model bindings", err)
+	}
+	primary := make(map[uuid.UUID]*ent.ModelBinding, len(entries))
+	for _, binding := range bindings {
+		if primary[binding.ModelID] == nil {
+			primary[binding.ModelID] = binding
+		}
+	}
+	models := make([]ModelView, 0, len(entries))
+	for _, entry := range entries {
+		view := entry.view
+		setStudentModelPrimaryBinding(&view, primary[entry.id])
+		models = append(models, view)
+	}
+	if err := s.setStudentModelStates(ctx, models); err != nil {
+		return ModelCatalogPage{}, err
+	}
+	result.Items = make([]ModelCatalogCandidate, 0, len(models))
+	for _, model := range models {
+		result.Items = append(result.Items, modelCatalogCandidateFromPlatformModel(model))
+	}
+	return result, nil
 }
 
 func (s *Service) AddStudentModel(ctx context.Context, studentID uuid.UUID, publicModelID string) (ModelView, error) {

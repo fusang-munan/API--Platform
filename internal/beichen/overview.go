@@ -13,7 +13,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
@@ -133,31 +132,52 @@ type CredentialSummary struct {
 }
 
 type CatalogModel struct {
-	CanEnable        bool              `json:"can_enable"`
-	Retired          bool              `json:"retired,omitempty"`
-	SchoolStatus     string            `json:"school_status"`
-	SchoolModel      string            `json:"school_model,omitempty"`
-	Model            string            `json:"model"`
-	CredentialIDs    []uuid.UUID       `json:"credential_ids"`
-	PreferredRoutes  []PreferredRoute  `json:"preferred_routes"`
-	KeyCount         int               `json:"key_count"`
-	CurrentKeyCount  int               `json:"current_key_count,omitempty"`
-	StaleKeyCount    int               `json:"stale_key_count,omitempty"`
-	Source           string            `json:"source,omitempty"`
-	CatalogState     string            `json:"catalog_state"`
-	CatalogKeys      []CatalogKey      `json:"catalog_keys,omitempty"`
-	WebsiteLocations []WebsiteLocation `json:"website_locations,omitempty"`
-	RouteCount       int               `json:"route_count"`
-	ReadyCount       int               `json:"ready_count"`
-	PriceState       string            `json:"price_state"`
-	PriceCovered     bool              `json:"price_covered"`
-	PriceBlocker     *CatalogBlocker   `json:"price_blocker,omitempty"`
-	Blockers         []CatalogBlocker  `json:"blockers"`
-	Activation       string            `json:"activation"`
-	Protocols        []string          `json:"protocols"`
-	ProbeState       string            `json:"probe_state"`
-	LastProbeAt      *time.Time        `json:"last_probe_at"`
-	BindingIssue     *CatalogBlocker   `json:"binding_issue,omitempty"`
+	CanEnable            bool                      `json:"can_enable"`
+	Retired              bool                      `json:"retired,omitempty"`
+	SchoolStatus         string                    `json:"school_status"`
+	SchoolModel          string                    `json:"school_model,omitempty"`
+	Model                string                    `json:"model"`
+	CredentialIDs        []uuid.UUID               `json:"credential_ids"`
+	PreferredRoutes      []PreferredRoute          `json:"preferred_routes"`
+	KeyCount             int                       `json:"key_count"`
+	CurrentKeyCount      int                       `json:"current_key_count,omitempty"`
+	StaleKeyCount        int                       `json:"stale_key_count,omitempty"`
+	Source               string                    `json:"source,omitempty"`
+	CatalogState         string                    `json:"catalog_state"`
+	CatalogKeys          []CatalogKey              `json:"catalog_keys,omitempty"`
+	WebsiteLocations     []WebsiteLocation         `json:"website_locations,omitempty"`
+	RouteCount           int                       `json:"route_count"`
+	ReadyCount           int                       `json:"ready_count"`
+	PriceState           string                    `json:"price_state"`
+	PriceCovered         bool                      `json:"price_covered"`
+	PriceBlocker         *CatalogBlocker           `json:"price_blocker,omitempty"`
+	Blockers             []CatalogBlocker          `json:"blockers"`
+	Activation           string                    `json:"activation"`
+	Protocols            []string                  `json:"protocols"`
+	ProbeState           string                    `json:"probe_state"`
+	LastProbeAt          *time.Time                `json:"last_probe_at"`
+	BindingIssue         *CatalogBlocker           `json:"binding_issue,omitempty"`
+	BoundRoutes          []CatalogBoundRoute       `json:"bound_routes"`
+	BoundKeyCount        int                       `json:"bound_key_count"`
+	CoveredBoundKeyCount int                       `json:"covered_bound_key_count"`
+	BoundCatalogPending  bool                      `json:"bound_catalog_pending"`
+	ModelAvailability    catalog.ModelAvailability `json:"route_availability"`
+	ActionHint           string                    `json:"action_hint,omitempty"`
+	HistoricalChannels   []string                  `json:"historical_channels,omitempty"`
+}
+
+type CatalogBoundRoute struct {
+	catalog.BeichenBinding
+	UpstreamModel   string     `json:"upstream_model"`
+	CredentialID    *uuid.UUID `json:"credential_id"`
+	CredentialLabel string     `json:"credential_label"`
+	KeyEnabled      bool       `json:"key_enabled"`
+	GroupID         *int64     `json:"group_id"`
+	GroupStatus     string     `json:"group_status,omitempty"`
+	GroupCheckedAt  *time.Time `json:"group_checked_at,omitempty"`
+	CatalogState    string     `json:"catalog_state"`
+	PriceState      string     `json:"price_state"`
+	PriceCovered    bool       `json:"price_covered"`
 }
 
 type CatalogBlocker struct {
@@ -234,9 +254,6 @@ func (s *Service) Overview(ctx context.Context, providerID uuid.UUID, day string
 	}
 	if err == nil {
 		err = readCatalogDifferences(ctx, tx, providerID, &view)
-	}
-	if err == nil {
-		err = markRetiredCatalogModels(ctx, tx, providerID, view.ModelCatalog)
 	}
 	if err == nil {
 		view.ProbeRun, err = readProbeRun(ctx, tx, providerID)
@@ -368,43 +385,47 @@ func (view *Overview) billingByCredential() map[uuid.UUID]Dataset {
 
 func readModels(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Overview) error {
 	rows, err := tx.QueryContext(ctx, `
-SELECT m.credential_id, m.model_id::text, m.catalog_source, p.mode,
+WITH `+catalog.BeichenKeyEvidenceCTE+`
+SELECT k.credential_id, k.model_id::text, k.catalog_source, price.mode,
   COALESCE(route.school_status, named.status, 'not_configured'),
-  owner.status = 'active' AND c.status = 'active' AND m.last_seen_at >= c.updated_at AND COALESCE(route.binding_ready, false),
-  CASE WHEN version.source='derived_from_usage' AND p.upstream_input IS NOT NULL THEN
+  owner.status = 'active' AND c.status = 'active' AND k.last_seen_at >= c.updated_at AND key_catalog.current AND `+catalog.BeichenGroupAllowsRouteSQL+` AND COALESCE(route.binding_ready, false),
+  CASE WHEN version.source='derived_from_usage' AND price.upstream_input IS NOT NULL
+        AND `+catalog.BeichenFollowPriceCurrentSQL+` THEN
        jsonb_strip_nulls(jsonb_build_object('billing_mode','token',
         'input_price',trim_scale(version.input_rate * 0.000000000001::numeric),
         'output_price',trim_scale(version.output_rate * 0.000000000001::numeric),
         'cache_read_price',trim_scale(version.cache_read_rate * 0.000000000001::numeric),
         'cache_write_price',trim_scale(version.cache_write_rate * 0.000000000001::numeric)))
-       WHEN snap.expires_at > statement_timestamp()
-         AND COALESCE(snap.credential_ciphertext_sha256 = sha256(c.credential_ciphertext), snap.credential_revision = c.updated_at)
-       THEN snap.model_pricing -> (m.model_id::text) END,
+       WHEN `+catalog.BeichenPanelQuoteCurrentSQL+`
+       THEN snap.model_pricing -> (k.model_id::text) END,
   COALESCE(version.source,''),version.observed_at,
-  trim_scale(p.upstream_input)::text, trim_scale(p.upstream_output)::text,
-  trim_scale(p.upstream_cache_read)::text, trim_scale(p.upstream_cache_write)::text,
-  trim_scale(p.school_input * f.factor)::text, trim_scale(p.school_output * f.factor)::text,
-  trim_scale(p.school_cache_read * f.factor)::text, trim_scale(p.school_cache_write * f.factor)::text,
-  owner.status = 'active' AND c.status = 'active', m.last_seen_at >= c.updated_at,
-  key_catalog.current, m.raw_entry, to_json(m.supported_protocols),
+  CASE WHEN follow.current THEN trim_scale(price.upstream_input)::text END,
+  CASE WHEN follow.current THEN trim_scale(price.upstream_output)::text END,
+  CASE WHEN follow.current THEN trim_scale(price.upstream_cache_read)::text END,
+  CASE WHEN follow.current THEN trim_scale(price.upstream_cache_write)::text END,
+  CASE WHEN follow.current OR price.mode='manual' THEN trim_scale(price.school_input * f.factor)::text END,
+  CASE WHEN follow.current OR price.mode='manual' THEN trim_scale(price.school_output * f.factor)::text END,
+  CASE WHEN follow.current OR price.mode='manual' THEN trim_scale(price.school_cache_read * f.factor)::text END,
+  CASE WHEN follow.current OR price.mode='manual' THEN trim_scale(price.school_cache_write * f.factor)::text END,
+  owner.status = 'active' AND c.status = 'active', k.last_seen_at >= c.updated_at,
+  key_catalog.current, k.raw_entry, to_json(k.supported_protocols),
   probe.checked_at, COALESCE(probe.passed, false), COALESCE(probe.credential_rejected, false),
-  `+activationFixedSchoolPriceSQL+`
-FROM provider_model_catalog m
-JOIN provider_credentials c ON c.id = m.credential_id AND c.provider_id = m.provider_id
+  COALESCE(`+catalog.BeichenFixedPriceSQL+`,false)
+FROM provider_model_catalog k
+JOIN provider_credentials c ON c.id = k.credential_id AND c.provider_id = k.provider_id
 JOIN providers owner ON owner.id = c.provider_id
-LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='catalog'
-CROSS JOIN LATERAL (SELECT m.catalog_source='key' AND m.last_seen_at >= c.updated_at
-  AND `+keyCatalogCurrentSQL+` AS current) key_catalog
-LEFT JOIN models named ON named.model_id = m.model_id
+JOIN beichen_key_evidence e ON e.credential_id=c.id
+CROSS JOIN LATERAL (SELECT `+catalog.BeichenKeyListsModelSQL+` AS current) key_catalog
+LEFT JOIN models named ON named.model_id = k.model_id
 LEFT JOIN LATERAL (
-  SELECT expires_at, credential_revision, credential_ciphertext_sha256, model_pricing FROM beichen_panel_snapshots
+  SELECT effective_at,expires_at,credential_revision,credential_ciphertext_sha256,group_id,model_pricing FROM beichen_panel_snapshots
   WHERE credential_id = c.id AND effective_at <= statement_timestamp() ORDER BY effective_at DESC LIMIT 1
 ) snap ON true
 LEFT JOIN LATERAL (
   SELECT school.status AS school_status, b.status = 'active' AS binding_ready
   FROM model_bindings b JOIN models school ON school.id = b.model_id
-  WHERE b.provider_id = m.provider_id AND b.credential_id = m.credential_id
-    AND lower(btrim(b.upstream_model_name)) = lower(m.model_id::text)
+  WHERE b.provider_id = k.provider_id AND b.credential_id = k.credential_id
+    AND lower(btrim(b.upstream_model_name)) = lower(k.model_id::text)
   ORDER BY (b.status = 'active') DESC, (school.status = 'active') DESC,
     (school.status = 'pending_configuration') DESC, b.priority, b.id
   LIMIT 1
@@ -414,15 +435,16 @@ LEFT JOIN LATERAL (
     bool_and(r.status_code = 401 OR r.error_code IS NOT DISTINCT FROM 'credential_unreadable') AS credential_rejected
   FROM upstream_probes r
   WHERE owner.status = 'active' AND c.status = 'active'
-    AND r.provider_id = m.provider_id AND r.credential_id = m.credential_id AND r.model = m.model_id::text
-    AND r.checked_at >= c.updated_at
-    AND (cardinality(m.supported_protocols) = 0 OR r.protocol = ANY(m.supported_protocols))
+    AND r.provider_id = k.provider_id AND r.credential_id = k.credential_id AND r.model = k.model_id::text
+    AND `+catalog.BeichenCurrentProbeSQL+` AND key_catalog.current AND `+catalog.BeichenGroupAllowsRouteSQL+`
+    AND (cardinality(k.supported_protocols) = 0 OR r.protocol = ANY(k.supported_protocols))
 ) probe ON true
-CROSS JOIN LATERAL beichen_price_at(m.credential_id, m.model_id::text, statement_timestamp()) p
-LEFT JOIN beichen_price_versions version ON version.id=p.upstream_version
-CROSS JOIN LATERAL (SELECT CASE WHEN p.mode = 'follow' THEN 100 ELSE 1 END AS factor) f
-WHERE m.provider_id = $1 AND m.status = 'active'
-ORDER BY m.credential_id, m.model_id`, providerID)
+CROSS JOIN LATERAL beichen_price_at(k.credential_id, k.model_id::text, statement_timestamp()) price
+LEFT JOIN beichen_price_versions version ON version.id=price.upstream_version
+CROSS JOIN LATERAL (SELECT `+catalog.BeichenFollowPriceCurrentSQL+` AS current) follow
+CROSS JOIN LATERAL (SELECT CASE WHEN price.mode = 'follow' THEN 100 ELSE 1 END AS factor) f
+WHERE k.provider_id = $1 AND k.status = 'active'
+ORDER BY k.credential_id, k.model_id`, providerID)
 	if err != nil {
 		return err
 	}
@@ -488,21 +510,6 @@ ORDER BY m.credential_id, m.model_id`, providerID)
 		view.Models = append(view.Models, model)
 	}
 	return rows.Err()
-}
-
-func (m *Model) catalogPriceState() string {
-	switch {
-	case m != nil && m.Mode == "manual":
-		return "manual"
-	case m != nil && m.PriceStatus == "confirmed":
-		return "confirmed"
-	case m != nil && m.PriceStatus == "derived":
-		return "derived"
-	case m != nil && m.PriceStatus == "conditional":
-		return "conditional"
-	default:
-		return "missing"
-	}
 }
 
 func readCredentials(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Overview) error {
@@ -597,10 +604,26 @@ func readPreferredRoutes(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, 
 	if err != nil {
 		return err
 	}
+	snapshot, err := catalog.ReadBeichenCapabilitySnapshot(ctx, tx, providerID)
+	if err != nil {
+		return err
+	}
+	capabilities := make(map[string][]catalog.ModelCapability)
+	for _, row := range snapshot.Capabilities {
+		name := strings.ToLower(row.Model)
+		capabilities[name] = append(capabilities[name], row)
+	}
 	records := make(map[string]map[uuid.UUID]*Model)
 	for i := range view.Models {
 		row := &view.Models[i]
 		name := strings.ToLower(row.Model)
+		row.RouteReady, row.PriceCovered = false, false
+		for _, route := range capabilities[name] {
+			if route.CredentialID != nil && *route.CredentialID == row.CredentialID {
+				row.RouteReady, row.PriceCovered = route.BindingState == "ready", route.PriceCovered
+				break
+			}
+		}
 		if records[name] == nil {
 			records[name] = make(map[uuid.UUID]*Model)
 		}
@@ -614,90 +637,50 @@ func readPreferredRoutes(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, 
 	}
 	view.ModelCatalog = make([]CatalogModel, 0, len(models))
 	for _, model := range models {
-		item, err := model.overviewWithStatus(ctx, tx, records, syncFailed)
+		item, err := model.overviewWithStatus(ctx, tx, records, syncFailed, capabilities[strings.ToLower(model.name)])
 		if err != nil {
 			return err
 		}
 		view.ModelCatalog = append(view.ModelCatalog, item)
 	}
+	markRetiredCatalogModels(view, snapshot.RetiredModels)
 	return nil
 }
 
 func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
-	records map[string]map[uuid.UUID]*Model, syncFailed map[uuid.UUID]bool,
+	records map[string]map[uuid.UUID]*Model, syncFailed map[uuid.UUID]bool, capabilities []catalog.ModelCapability,
 ) (CatalogModel, error) {
 	item := m.overview()
 	item.Blockers = []CatalogBlocker{}
 	item.Protocols = []string{}
-	item.ProbeState = "unprobed"
-	source := strings.ToLower(m.name)
-	type routeKey struct {
-		credential uuid.UUID
-		adapter    modelbinding.Adapter
-	}
-	candidates, published := make(map[routeKey]bool), make(map[routeKey]bool)
-	priceStates := make(map[string]bool)
-	for _, id := range m.keys {
-		row := records[source][id]
-		state := row.catalogPriceState()
-		priceStates[state] = true
-		if row == nil {
-			continue
-		}
-		if !row.available || !row.currentKey {
-			continue
-		}
-		item.PriceCovered = item.PriceCovered || row.PriceCovered
-		for _, protocol := range row.protocols {
-			candidates[routeKey{id, modelbinding.Adapter(protocol)}] = true
-			if !slices.Contains(item.Protocols, protocol) {
-				item.Protocols = append(item.Protocols, protocol)
-			}
-		}
-		if row.lastProbeAt != nil && (item.LastProbeAt == nil || row.lastProbeAt.After(*item.LastProbeAt)) {
-			item.LastProbeAt = row.lastProbeAt
-		}
-		if row.probeState == "passed" || row.probeState == "failed" && item.ProbeState == "unprobed" {
-			item.ProbeState = row.probeState
-		}
-	}
-	slices.Sort(item.Protocols)
-	item.PriceState = "missing"
-	for state := range priceStates {
-		item.PriceState = state
-	}
-	if len(priceStates) > 1 {
-		item.PriceState = "mixed"
-	}
-	// Preferred routes collapse competing routes for the same protocol. Count
-	// every distinct published North protocol and credential, including aliases.
+	item.BoundRoutes = []CatalogBoundRoute{}
 	hasPublishedSchool := false
 	for _, school := range m.schools {
-		if school.status != "active" {
-			continue
+		hasPublishedSchool = hasPublishedSchool || school.status == "active"
+	}
+	priceStates := item.applyRouteEvidence(capabilities, hasPublishedSchool)
+	switch {
+	case len(priceStates) > 1:
+		item.PriceState = "mixed"
+	case len(priceStates) == 1:
+		for state := range priceStates {
+			item.PriceState = state
 		}
-		hasPublishedSchool = true
-		for _, binding := range school.bindings {
-			r := binding.route
-			if binding.active && binding.reachable && r.ProviderID == m.provider && r.CredentialID != nil &&
-				strings.EqualFold(strings.TrimSpace(r.UpstreamModel), m.name) {
-				key := routeKey{*r.CredentialID, modelbinding.Adapter(r.Adapter)}
-				published[key], candidates[key] = true, true
-			}
+	case item.BoundCatalogPending:
+		item.PriceState = "unverified"
+	default:
+		item.PriceState = "missing"
+		if slices.ContainsFunc(capabilities, func(row catalog.ModelCapability) bool {
+			return row.CatalogState == "catalog_stale" || row.CatalogState == "catalog_unverified"
+		}) {
+			item.PriceState = "unverified"
 		}
 	}
-	item.RouteCount, item.ReadyCount = len(candidates), len(published)
+
 	if item.ReadyCount > 0 {
 		item.Activation = "active"
 		return item, nil
 	}
-	if hasPublishedSchool {
-		item.BindingIssue = &CatalogBlocker{"no_ready_binding", "学校已启用该模型，北辰线路不可用。请检查 Key 状态和模型绑定。"}
-		if len(m.keys) == 0 {
-			item.BindingIssue = &CatalogBlocker{"catalog_missing", "学校已启用该模型，当前 Key 目录里已找不到它。请同步目录并核查供货渠道。"}
-		}
-	}
-
 	target := m.target("")
 	var price activationPrice
 	if item.CanEnable {
@@ -718,8 +701,7 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 	}
 	if !item.CanEnable {
 		item.Blockers = append(item.Blockers, CatalogBlocker{"no_ready_route", "没有可启用的北辰线路，请检查渠道状态和线路配置"})
-		// Keep the missing-price summary for the credential coverage view.
-		if priceStates["missing"] {
+		if item.PriceState == "missing" || priceStates["missing"] {
 			item.Blockers = append(item.Blockers, CatalogBlocker{"missing_price", "线路缺少可用报价，请同步官网价或设置手动价"})
 		}
 	}
@@ -738,6 +720,106 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 		}
 	}
 	return item, nil
+}
+
+func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability, publishedSchool bool) map[string]bool {
+	type routeKey struct {
+		credential uuid.UUID
+		protocol   string
+	}
+	candidates, ready := make(map[routeKey]bool), make(map[routeKey]bool)
+	bound, covered := make(map[uuid.UUID]bool), make(map[uuid.UUID]bool)
+	var publishedProtocols, candidateProtocols []catalog.ProtocolCapability
+	priceStates := make(map[string]bool)
+	invalidBinding, groupDenied := false, false
+	for _, row := range rows {
+		current := row.CatalogState == "key_listed" && row.KeyEnabled
+		if current {
+			for _, option := range row.ProtocolDetails {
+				candidates[routeKey{*row.CredentialID, option.Protocol}] = true
+				candidateProtocols = append(candidateProtocols, option)
+			}
+		}
+		priceBasis := !publishedSchool && len(row.Bindings) > 0 && current
+		for _, b := range row.Bindings {
+			item.BoundRoutes = append(item.BoundRoutes, CatalogBoundRoute{
+				BeichenBinding: b, UpstreamModel: row.Model, CredentialID: row.CredentialID, CredentialLabel: row.CredentialLabel,
+				GroupID: row.GroupID, GroupStatus: row.GroupStatus, GroupCheckedAt: row.GroupCheckedAt, KeyEnabled: row.KeyEnabled,
+				CatalogState: row.CatalogState, PriceState: row.PriceState, PriceCovered: row.PriceCovered,
+			})
+			if row.CredentialID != nil && row.KeyEnabled {
+				bound[*row.CredentialID] = true
+				if current {
+					covered[*row.CredentialID] = true
+				}
+				item.BoundCatalogPending = item.BoundCatalogPending || row.CatalogState == "catalog_stale" ||
+					row.CatalogState == "catalog_unverified" || row.GroupStatus == "pending"
+			}
+			invalidBinding = invalidBinding || b.Published && !b.BindingReady
+			groupDenied = groupDenied || b.Published && row.KeyEnabled && row.GroupStatus == "not_allowed"
+			if b.BindingReady {
+				key := routeKey{*row.CredentialID, b.Protocol}
+				ready[key], candidates[key], priceBasis = true, true, true
+				publishedProtocols = append(publishedProtocols, b.ProtocolCapability)
+			}
+		}
+		if priceBasis {
+			item.addPriceEvidence(row, priceStates)
+		}
+	}
+	item.BoundKeyCount, item.CoveredBoundKeyCount = len(bound), len(covered)
+	item.RouteCount, item.ReadyCount = len(candidates), len(ready)
+
+	if publishedSchool {
+		item.ModelAvailability = catalog.SummarizeModelAvailability(item.Model, "active", publishedProtocols)
+		if invalidBinding || item.ReadyCount == 0 {
+			item.BindingIssue = &CatalogBlocker{"no_ready_binding", "请检查已启用的北辰线路和绑定 Key。"}
+			switch {
+			case groupDenied && item.ReadyCount == 0:
+				item.BindingIssue = &CatalogBlocker{"group_not_allowed", "绑定 Key 分组无权限。"}
+				item.ModelAvailability.AvailabilityReason = item.BindingIssue.Message
+				item.ActionHint = "请在北辰恢复该 Key 的分组权限，再重扫目录。"
+			case item.BoundCatalogPending && item.ReadyCount == 0:
+				item.BindingIssue = &CatalogBlocker{"catalog_stale", "绑定 Key 的目录或分组待复核，请重扫目录并重新探活。"}
+				item.ModelAvailability.Availability = catalog.AvailabilityUnverified
+				item.ModelAvailability.AvailabilityReason = item.BindingIssue.Message
+			case item.ReadyCount > 0:
+				item.BindingIssue.Message = "部分已发布线路需要检查绑定 Key 和目录。"
+			case len(candidates) == 0:
+				item.BindingIssue = &CatalogBlocker{"catalog_missing", "学校已启用该模型，当前 Key 目录里已找不到它。请同步目录并核查供货渠道。"}
+			}
+		}
+	} else {
+		item.ModelAvailability = catalog.SummarizeModelAvailability(item.Model, "active", candidateProtocols)
+		item.ModelAvailability.Availability = "not_published"
+		item.ModelAvailability.AvailabilityReason = ""
+		if len(item.BoundRoutes) == 0 {
+			for _, row := range rows {
+				if row.KeyEnabled && row.CatalogState == "key_listed" {
+					item.addPriceEvidence(row, priceStates)
+				}
+			}
+		}
+	}
+	item.ProbeState, item.LastProbeAt = item.ModelAvailability.ProbeState, item.ModelAvailability.LastProbeAt
+	if item.ProbeState == "not_applicable" {
+		item.ProbeState = "unprobed"
+	}
+	switch {
+	case item.ModelAvailability.Availability == "available":
+		item.ActionHint = "可使用推荐协议接入。"
+	case item.ReadyCount > 0 && item.ProbeState == "unprobed":
+		item.ActionHint = "发起探活以确认已发布协议。"
+	}
+	return priceStates
+}
+
+func (item *CatalogModel) addPriceEvidence(row catalog.ModelCapability, states map[string]bool) {
+	states[row.PriceState] = true
+	item.PriceCovered = item.PriceCovered || row.PriceCovered
+	if item.PriceBlocker == nil && row.PriceBlocker != nil {
+		item.PriceBlocker = &CatalogBlocker{Code: row.PriceBlocker.Code, Message: row.PriceBlocker.Message}
+	}
 }
 
 func readComparison(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, start, now time.Time, view *Overview) error {

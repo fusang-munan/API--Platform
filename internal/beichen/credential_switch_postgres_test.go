@@ -1,7 +1,9 @@
 package beichen
 
 import (
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"io"
 	"net/http"
@@ -318,8 +320,15 @@ WHERE credential_id=$1 AND model_id='replacement'`, to, source, rowMinutesAgo)
 		})
 	}
 	setCatalog("key", 0, 0, "")
-	if _, err := service.Rebind(ctx, provider, actor, false, currentRebind.PreviewToken); err != nil {
-		t.Fatalf("rebuild should accept the restored catalog: %v", err)
+	if _, err := service.Rebind(ctx, provider, actor, false, currentRebind.PreviewToken); domain.ErrorCode(err) != domain.CodeInvalidTransition {
+		t.Fatalf("a new scan should invalidate the original preview: %v", err)
+	}
+	restored, err := service.Rebind(ctx, provider, actor, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Rebind(ctx, provider, actor, false, restored.PreviewToken); err != nil {
+		t.Fatalf("rebuild should accept a new preview for the restored catalog: %v", err)
 	}
 	var newRoutes, legacyRoutes int
 	if err := db.QueryRowContext(ctx, `SELECT
@@ -328,6 +337,193 @@ WHERE credential_id=$1 AND model_id='replacement'`, to, source, rowMinutesAgo)
 FROM model_bindings WHERE provider_id=$5 AND status='active'`, moved, legacy, to, from, provider).Scan(&newRoutes, &legacyRoutes); err != nil || newRoutes != 2 || legacyRoutes != 1 {
 		t.Fatalf("rebuilt or legacy bindings are incorrect: new=%d legacy=%d (%v)", newRoutes, legacyRoutes, err)
 	}
+}
+
+func TestRebindRejectsGroupVersionChangePostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	g3 := keys[2]
+	const model = "gpt-fixture-rebind"
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id<>$1", g3)
+	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES(gen_random_uuid(),$1::text,$1::text,'active',1000,now(),now())`, model)
+	exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+SELECT gen_random_uuid(),id,$1,$2,model_id::text,'openai_compatible',10,now(),now() FROM models WHERE model_id=$3`, provider, g3, model)
+	setGroup := func(id int) {
+		t.Helper()
+		exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+VALUES($1,1,$2,clock_timestamp())`, g3, id)
+	}
+	scan := func() {
+		t.Helper()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		var observedAt time.Time
+		if err := tx.QueryRowContext(ctx, "SELECT clock_timestamp()").Scan(&observedAt); err != nil {
+			t.Fatal(err)
+		}
+		entries := []catalog.ProviderEntry{
+			{ID: model, SupportedProtocols: []string{"openai_compatible", "openai_responses"}},
+		}
+		if err := saveKeyCatalogFixture(ctx, tx, syncJob{provider: provider, credential: g3}, entries, observedAt); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(db, nil)
+	preview := func() RebindPlan {
+		t.Helper()
+		plan, err := service.Rebind(ctx, provider, actor, true, "")
+		if err != nil || len(plan.Changes) != 1 || plan.Changes[0].Action != "add" ||
+			plan.Changes[0].Adapter != "openai_responses" || len(plan.EvidenceVersions) != 1 {
+			t.Fatalf("expected one versioned Responses change: %+v (%v)", plan, err)
+		}
+		return plan
+	}
+	confirm := func(ctx context.Context, plan RebindPlan) error {
+		_, err := service.Rebind(ctx, provider, actor, false, plan.PreviewToken)
+		return err
+	}
+	assertRejected := func(t *testing.T, err error) {
+		t.Helper()
+		if domain.ErrorCode(err) != domain.CodeInvalidTransition || !strings.Contains(err.Error(), "重新预览") {
+			t.Fatalf("expected a stale preview rejection: %v", err)
+		}
+		var written int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM model_bindings
+WHERE provider_id=$1 AND adapter='openai_responses'`, provider).Scan(&written); err != nil || written != 0 {
+			t.Fatalf("stale confirmation wrote %d Responses bindings (%v)", written, err)
+		}
+	}
+
+	setGroup(10)
+	scan()
+	old := preview()
+	evidence := old.EvidenceVersions[0]
+	if evidence.CredentialID != g3 || evidence.GroupID == nil || *evidence.GroupID != 10 ||
+		evidence.CredentialRevision.IsZero() || evidence.CatalogObservedAt.Before(evidence.CredentialRevision) {
+		t.Fatalf("unexpected preview evidence: %+v", evidence)
+	}
+	t.Run("scan transaction holds the advisory lock", func(t *testing.T) {
+		lease, err := catalog.AcquireBeichenDatasetLease(ctx, db, g3, "billing", true)
+		if err != nil || lease == uuid.Nil {
+			t.Fatalf("acquire scan lease: %v", err)
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if current, err := catalog.LockBeichenScan(ctx, tx, provider, g3, "billing", lease, evidence.CredentialRevision); err != nil || !current {
+			t.Fatalf("lock current group writer: %v", err)
+		}
+		assertRejected(t, confirm(ctx, old))
+		if err := catalog.ReleaseBeichenDatasetLease(ctx, tx, g3, "billing"); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("group changes after the confirmation reads evidence", func(t *testing.T) {
+		assertRejected(t, moveGroupWhileRebindInserts(t, ctx, db, g3, func(ctx context.Context) error {
+			return confirm(ctx, old)
+		}))
+	})
+	view, err := service.Overview(ctx, provider, "")
+	if err != nil || len(view.ModelCatalog) != 1 || view.ModelCatalog[0].ReadyCount != 0 || !view.ModelCatalog[0].BoundCatalogPending {
+		t.Fatalf("overview must invalidate the old group's directory: %+v (%v)", view.ModelCatalog, err)
+	}
+	if _, err := service.Rebind(ctx, provider, actor, true, ""); domain.ErrorCode(err) != domain.CodeInvalidTransition {
+		t.Fatalf("rebuild preview should use the same group evidence: %v", err)
+	}
+	assertRejected(t, confirm(ctx, old))
+
+	scan()
+	rescanned := preview()
+	if e := rescanned.EvidenceVersions[0]; e.GroupID == nil || *e.GroupID != 12 ||
+		!e.CatalogObservedAt.After(evidence.CatalogObservedAt) {
+		t.Fatalf("rescan did not establish the new evidence version: %+v", e)
+	}
+	assertRejected(t, confirm(ctx, old))
+	scan()
+	assertRejected(t, confirm(ctx, rescanned))
+	beforeRevision := preview()
+	exec("UPDATE provider_credentials SET updated_at=clock_timestamp() WHERE id=$1", g3)
+	scan()
+	assertRejected(t, confirm(ctx, beforeRevision))
+	fresh := preview()
+	if _, err := service.Rebind(ctx, provider, actor, false, fresh.PreviewToken); err != nil {
+		t.Fatalf("current preview should write the Responses binding: %v", err)
+	}
+}
+
+func moveGroupWhileRebindInserts(t *testing.T, ctx context.Context, db *sql.DB, credential uuid.UUID, confirm func(context.Context) error) error {
+	t.Helper()
+	const gate = `SELECT pg_advisory_xact_lock(hashtextextended('test/rebind/'||current_schema(),0))`
+	execCatalogTestSQL(t, ctx, db, `
+CREATE FUNCTION pause_rebind_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('test/rebind/'||current_schema(),0));
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER pause_rebind_insert BEFORE INSERT ON model_bindings
+FOR EACH ROW WHEN (NEW.adapter='openai_responses') EXECUTE FUNCTION pause_rebind_insert()`)
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	writer, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Rollback()
+	if _, err := writer.ExecContext(ctx, gate); err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan error, 1)
+	go func() {
+		defer close(finished)
+		finished <- confirm(ctx)
+	}()
+	defer func() {
+		cancel()
+		for range finished {
+		}
+	}()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		if err := writer.QueryRowContext(ctx, `SELECT EXISTS (
+  SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted AND pg_backend_pid()=ANY(pg_blocking_pids(pid))
+)`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case err := <-finished:
+			t.Fatalf("confirmation returned before reaching the Responses insert: %v", err)
+		case <-ctx.Done():
+			t.Fatal("confirmation did not pause at the Responses insert")
+		case <-ticker.C:
+		}
+	}
+	if _, err := writer.ExecContext(ctx, `INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+VALUES($1,1,12,clock_timestamp())`, credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return <-finished
 }
 
 func TestCredentialSwitchInheritsSchoolChannelWithoutCopyingAuthorizationPostgres(t *testing.T) {

@@ -5,16 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"math"
 	"math/big"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 )
 
 const (
@@ -25,7 +26,7 @@ const (
 )
 
 var decimal = regexp.MustCompile(`^(0|[1-9][0-9]{0,18})(\.[0-9]{1,24})?([eE][+-]?[0-9]{1,2})?$`)
-var errKeyGroupNotAllowed = errors.New("账号无分组权限")
+var errKeyGroupNotAllowed = catalog.ErrBeichenKeyGroupNotAllowed
 
 func newClient() *http.Client {
 	dialer := &net.Dialer{Timeout: 4 * time.Second, KeepAlive: 30 * time.Second}
@@ -70,64 +71,32 @@ func (s *Service) readResponse(req *http.Request) ([]byte, error) {
 	return readBeichenResponse(s.client, req)
 }
 
-type upstreamHTTPStatus int
-
-func (status upstreamHTTPStatus) Error() string {
-	return fmt.Sprintf("北辰接口返回 HTTP %d", int(status))
-}
+type upstreamHTTPStatus = catalog.BeichenHTTPStatus
 
 func readBeichenResponse(client *http.Client, req *http.Request) ([]byte, error) {
-	response, err := client.Do(req)
-	if err != nil {
-		return nil, errors.New("北辰网络请求失败或超时")
+	if trace, ok := req.Context().Value(keyUsageScanTraceKey{}).(keyUsageScanTrace); ok {
+		trace.observeRequest(req)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		if response.StatusCode == http.StatusForbidden && req.URL.Host == "api.beichenapi.com" &&
-			keyGroupNotAllowed(response.Body) {
-			return nil, errKeyGroupNotAllowed
-		}
-		return nil, upstreamHTTPStatus(response.StatusCode)
-	}
-	if response.ContentLength > maxResponseBytes {
-		return nil, errors.New("北辰接口响应超过 2 MiB")
-	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
-	if err != nil {
-		return nil, errors.New("读取北辰接口响应失败")
-	}
-	if len(body) > maxResponseBytes {
-		return nil, errors.New("北辰接口响应超过 2 MiB")
-	}
-	return body, nil
+	body, _, err := catalog.ReadBeichenGET(client, req, maxResponseBytes)
+	return body, err
 }
 
-func keyGroupNotAllowed(reader io.Reader) bool {
-	const maxErrorBytes = 4096
-	body, err := io.ReadAll(io.LimitReader(reader, maxErrorBytes+1))
-	if err != nil || len(body) > maxErrorBytes {
-		return false
+type keyUsageScanTraceKey struct{}
+
+// A Key usage job reads days sequentially. Record the last attempted page of
+// each day, including pages rejected by the caller's aggregate validation.
+type keyUsageScanTrace map[string]int
+
+func (trace keyUsageScanTrace) observeRequest(req *http.Request) {
+	if req.URL.Host != "beichenapi.com" || req.URL.Path != "/api/v1/usage" {
+		return
 	}
-	type errorCode struct {
-		Code   string `json:"code"`
-		Type   string `json:"type"`
-		Reason string `json:"reason"`
+	query := req.URL.Query()
+	day := query.Get("start_date")
+	page, err := strconv.Atoi(query.Get("page"))
+	if err == nil && page > 0 && day == query.Get("end_date") && len(day) == len(dayLayout) {
+		trace[day] = page
 	}
-	var reply struct {
-		errorCode
-		Error json.RawMessage `json:"error"`
-	}
-	if json.Unmarshal(body, &reply) != nil {
-		return false
-	}
-	for _, code := range []string{reply.Code, reply.Type, reply.Reason} {
-		if code == "GROUP_NOT_ALLOWED" {
-			return true
-		}
-	}
-	var nested errorCode
-	return json.Unmarshal(reply.Error, &nested) == nil &&
-		(nested.Code == "GROUP_NOT_ALLOWED" || nested.Type == "GROUP_NOT_ALLOWED" || nested.Reason == "GROUP_NOT_ALLOWED")
 }
 
 type billingInfo struct {
@@ -152,6 +121,7 @@ type billingInfo struct {
 	AppliedPeak   json.Number     `json:"applied_peak_multiplier"`
 
 	accountRateSource string
+	groupIDReported   bool
 }
 
 func parseBilling(body []byte) (billingInfo, error) {
@@ -163,6 +133,10 @@ func parseBilling(body []byte) (billingInfo, error) {
 	multiplier := exactDecimal(info.Multiplier)
 	if multiplier == nil || multiplier.Cmp(big.NewRat(1000, 1)) > 0 {
 		return billingInfo{}, errors.New("北辰账单响应缺少有效倍率")
+	}
+	if info.KeyID < 0 || info.KeyID > 9007199254740991 || info.APIKeyID < 0 || info.APIKeyID > 9007199254740991 ||
+		(info.KeyID != 0 && info.APIKeyID != 0 && info.KeyID != info.APIKeyID) {
+		return billingInfo{}, errors.New("北辰账单响应的 Key 编号无效或互相冲突")
 	}
 	if (info.GroupID != nil && *info.GroupID != 0 && billingPanelGroup(info) == 0) ||
 		(info.GroupRate != "" && exactDecimal(info.GroupRate) == nil) ||
@@ -176,7 +150,22 @@ func parseBilling(body []byte) (billingInfo, error) {
 	if len(info.Timezone) > 64 || strings.ContainsRune(info.Timezone, 0) {
 		info.Timezone = ""
 	}
+	info.groupIDReported = billingPanelGroup(info) > 0
 	return info, nil
+}
+
+func (info billingInfo) missingKeyBillingFields() []string {
+	var missing []string
+	if info.KeyID == 0 && info.APIKeyID == 0 {
+		missing = append(missing, "key_id")
+	}
+	if !info.groupIDReported {
+		missing = append(missing, "group_id")
+	}
+	if websiteMissing(info.Pricing) {
+		missing = append(missing, "pricing")
+	}
+	return missing
 }
 
 // Sub2API v1 provides the multiplier only. A provider pricing extension must

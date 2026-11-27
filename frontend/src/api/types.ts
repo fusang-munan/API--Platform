@@ -84,6 +84,39 @@ export type UsageSlice = BeichenReceiptSpend & { id: string; name: string; credi
 export type KeyUsage = { id: string; name: string; status: ApiKeyStatus; used: string; available?: string; pending: string; pending_review?: boolean; models: UsageSlice[] }
 export type StudentProjectUsage = { project_id: string; project_name: string; quota: string; used: string; pending: string; available: string; pending_review?: boolean; keys: KeyUsage[] }
 export type StudentUsage = { month: string; projects: StudentProjectUsage[] }
+export type StudentUsageMetrics = {
+  tokens: Record<'input' | 'output' | 'cache_read' | 'cache_write' | 'total', string | null>
+  completeness: 'complete' | 'partial' | 'unknown'
+  token_coverage: {
+    calls: number
+    known_calls: number
+    complete_calls: number
+    unclassified_tokens: string | null
+  }
+  cache_hit_rate: number | null
+  cache_hit_coverage: {
+    sample_calls: number
+    cache_read_tokens: string | null
+    input_with_cache_read_tokens: string | null
+  }
+  pending_review_calls: number
+  pending_review_credits: string
+}
+export type StudentUsageModelMetrics = StudentUsageMetrics & { credits: string; calls?: number }
+export type StudentUsageModel = StudentUsageModelMetrics & Pick<UsageSlice, 'id' | 'name'>
+type StudentUsageBalance = StudentUsageMetrics & { calls: number; in_flight_credits: string }
+export type StudentUsageKey = Omit<KeyUsage, 'models'> & StudentUsageBalance & {
+  pending_calls: number
+  models: StudentUsageModel[]
+}
+export type StudentUsageProject = Omit<StudentProjectUsage, 'keys'> & StudentUsageBalance & {
+  keys: StudentUsageKey[]
+}
+export type StudentUsageReport = Omit<StudentUsage, 'projects'> & {
+  projects: StudentUsageProject[]
+  models: StudentUsageModel[]
+  totals: StudentUsageModelMetrics & { calls: number }
+}
 export type ProjectUsage = { month: string; project_id: string; project_name: string; quota: string; allocated: string; charged: string; pending: string; available: string; pending_review?: boolean; members: Array<BeichenReceiptSpend & { is_student?: boolean; user_id: string; user_name: string; quota: string; available: string; credits: string; pending?: string; pending_review?: boolean; keys: Array<{ id: string; name: string; status: ApiKeyStatus; used: string; pending_review?: boolean; models: UsageSlice[] }>; free_models: UsageSlice[] }>; models: UsageSlice[]; free_models: UsageSlice[] }
 export type CallLog = { id: string; request_id: string; turn_id?: string; call_index?: number; project_id: string; project_name: string; user_id: string; user_name: string; api_key_id: string; api_key_name: string; model_id: string; model_name: string; provider_name: string; protocol: string; path: string; multiplier: string; credits: string; prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; billing_state: string; outcome: string; error_category: string; error_message: string; created_at: string; attempts?: Array<{ provider_name: string; status: string; error_category: string; error_message: string; http_status?: number; latency_ms: number }> }
 export type CallTurn = { id: string; project_id: string; project_name: string; user_id: string; user_name: string; api_key_id: string; api_key_name: string; model_id: string; model_name: string; task_key?: string; root_prompt: string; root_prompt_preview: string; root_prompt_bytes: number; call_count: number; credits: string; prompt_tokens: number; completion_tokens: number; total_tokens: number; outcome: string; started_at: string; finished_at?: string; calls?: CallLog[] }

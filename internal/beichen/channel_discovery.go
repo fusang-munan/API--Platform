@@ -6,15 +6,20 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"maps"
 	"net/http"
-	"strconv"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-const accountKeysURL = "https://beichenapi.com/api/v1/keys"
+const (
+	accountKeysURL     = "https://beichenapi.com/api/v1/keys"
+	accountKeyPageSize = 100
+)
 
 type listedKey struct {
 	ID            int64       `json:"id"`
@@ -54,6 +59,19 @@ var errKeyList = errors.New("北辰账号的 Key 列表或分页无法确认")
 var errKeyMatch = errors.New("未能唯一确认本渠道的北辰 Key 和分组")
 var errKeyGroupMissing = errors.New("Key 分组不存在")
 
+type keyListPageError struct {
+	page  int
+	cause error
+}
+
+func (err *keyListPageError) Error() string {
+	return fmt.Sprintf("北辰官网 Key 清单第 %d 页不完整：%v", err.page, err.cause)
+}
+
+func (err *keyListPageError) Unwrap() error { return err.cause }
+
+type keyListReadTraceKey struct{}
+
 func (s *Service) accountKeys(ctx context.Context, token string) ([]listedKey, error) {
 	return s.readAccountKeys(ctx, token, nil)
 }
@@ -64,15 +82,87 @@ func (s *Service) readAccountKeys(ctx context.Context, token string, modelKeys m
 	if !validPanelBearer(token) {
 		return nil, errKeyList
 	}
+	clear(modelKeys)
+	var collected map[int64]string
+	if modelKeys != nil {
+		collected = make(map[int64]string)
+	}
+	keys, err := s.readAccountKeyRound(ctx, token, collected)
+	if err != nil && retryKeyListRound(ctx, err) {
+		clear(collected)
+		keys, err = s.readAccountKeyRound(ctx, token, collected)
+	}
+	// The page-number API has no snapshot identifier. A complete-looking
+	// multi-page response can still mix different inventories.
+	if err == nil && len(keys) > accountKeyPageSize {
+		first := keys
+		clear(collected)
+		keys, err = s.readAccountKeyRound(ctx, token, collected)
+		if err == nil {
+			err = checkAccountKeyRounds(first, keys)
+		}
+	}
+	if trace, ok := ctx.Value(keyListReadTraceKey{}).(**keyListPageError); ok {
+		*trace = nil
+		errors.As(err, trace)
+	}
+	if err != nil {
+		return nil, err
+	}
+	maps.Copy(modelKeys, collected)
+	return keys, nil
+}
+
+func checkAccountKeyRounds(first, second []listedKey) error {
+	drift := fmt.Errorf("%w：两次完整分页的 Key 清单不一致，待核验", errKeyList)
+	if len(first) != len(second) {
+		return &keyListPageError{page: 1, cause: drift}
+	}
+	byID := make(map[int64]listedKey, len(first))
+	for _, key := range first {
+		byID[key.ID] = key
+	}
+	for i, key := range second {
+		previous, found := byID[key.ID]
+		// The observation time is local to each traversal.
+		key.checkedAt, previous.checkedAt = time.Time{}, time.Time{}
+		if !found || !reflect.DeepEqual(key, previous) {
+			return &keyListPageError{page: i/accountKeyPageSize + 1, cause: drift}
+		}
+	}
+	return nil
+}
+
+func retryKeyListRound(ctx context.Context, err error) bool {
+	var status upstreamHTTPStatus
+	if panelAuthFailed(err) || errors.Is(err, context.DeadlineExceeded) ||
+		(errors.As(err, &status) && (status < 500 || status > 599)) {
+		return false
+	}
+	timer := time.NewTimer(200 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (s *Service) readAccountKeyRound(ctx context.Context, token string, modelKeys map[int64]string) ([]listedKey, error) {
 	checkedAt := s.now().UTC().Truncate(time.Microsecond)
 	var keys []listedKey
 	seen := map[int64]bool{}
 	total := -1
 	var owner int64
 	for page := 1; ; page++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, accountKeysURL+"?page_size=100&page="+strconv.Itoa(page), nil)
+		failed := func(cause error) ([]listedKey, error) {
+			return nil, &keyListPageError{page: page, cause: cause}
+		}
+		url := fmt.Sprintf("%s?page_size=%d&page=%d", accountKeysURL, accountKeyPageSize, page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
-			return nil, errKeyList
+			return failed(errKeyList)
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Accept", "application/json")
@@ -80,7 +170,7 @@ func (s *Service) readAccountKeys(ctx context.Context, token string, modelKeys m
 		req.Header.Set("X-User-UI-Request", "1")
 		body, err := s.readResponse(req)
 		if err != nil {
-			return nil, s.webReadError(token, err)
+			return failed(s.webReadError(token, err))
 		}
 		var reply struct {
 			Code *int `json:"code"`
@@ -98,34 +188,42 @@ func (s *Service) readAccountKeys(ctx context.Context, token string, modelKeys m
 		}
 		if json.Unmarshal(body, &reply) != nil || reply.Code == nil || *reply.Code != 0 {
 			if _, err := panelData(body); panelAuthFailed(err) {
-				return nil, s.webReadError(token, upstreamHTTPStatus(http.StatusUnauthorized))
+				return failed(s.webReadError(token, upstreamHTTPStatus(http.StatusUnauthorized)))
 			}
-			return nil, errKeyList
+			return failed(errKeyList)
 		}
 		d := reply.Data
-		if d.Items == nil || d.Total == nil || *d.Total < 0 || *d.Total > 10000 || d.Page != page || d.Size != 100 ||
-			(total >= 0 && *d.Total != total) || len(d.Items) != min(100, *d.Total-len(keys)) {
-			return nil, errKeyList
+		if d.Items == nil || d.Total == nil || *d.Total < 0 || *d.Total > 10000 || d.Page != page || d.Size != accountKeyPageSize {
+			return failed(fmt.Errorf("%w：条目、总数、页码或每页条数无效", errKeyList))
+		}
+		if total >= 0 && *d.Total != total {
+			return failed(fmt.Errorf("%w：总数由 %d 变为 %d", errKeyList, total, *d.Total))
+		}
+		if len(d.Items) != min(accountKeyPageSize, *d.Total-len(keys)) {
+			return failed(fmt.Errorf("%w：条目数与公布总数不一致", errKeyList))
 		}
 		total = *d.Total
-		if d.Pages != (total+99)/100 && !(total == 0 && d.Pages == 1) {
-			return nil, errKeyList
+		if d.Pages != (total+accountKeyPageSize-1)/accountKeyPageSize && !(total == 0 && d.Pages == 1) {
+			return failed(fmt.Errorf("%w：总页数无效", errKeyList))
 		}
 		for _, item := range d.Items {
 			k := item.listedKey
 			k.checkedAt = checkedAt
-			if k.ID <= 0 || k.ID > 9007199254740991 || seen[k.ID] || k.UserID <= 0 || owner != 0 && k.UserID != owner {
-				return nil, errKeyList
+			if k.ID <= 0 || k.ID > 9007199254740991 || k.UserID <= 0 || k.UserID > 9007199254740991 {
+				return failed(fmt.Errorf("%w：Key 或账号编号无效", errKeyList))
+			}
+			if seen[k.ID] || owner != 0 && k.UserID != owner {
+				return failed(fmt.Errorf("%w：Key 编号重复或翻页期间账号变化", errKeyList))
 			}
 			if len(item.GroupID) > 0 {
-				if json.Unmarshal(item.GroupID, &k.GroupID) != nil {
-					return nil, errKeyList
+				if json.Unmarshal(item.GroupID, &k.GroupID) != nil || k.GroupID < 0 || k.GroupID > 9007199254740991 {
+					return failed(fmt.Errorf("%w：Key 分组编号无效", errKeyList))
 				}
 				k.groupIDKnown = true
 			}
 			if k.Group != nil && k.Group.ID != 0 {
-				if k.GroupID != 0 && k.Group.ID != k.GroupID {
-					return nil, errKeyList
+				if !validWebsiteGroupID(k.Group.ID) || k.GroupID != 0 && k.Group.ID != k.GroupID {
+					return failed(fmt.Errorf("%w：Key 的分组编号发生冲突", errKeyList))
 				}
 				k.GroupID = k.Group.ID
 			}
@@ -162,12 +260,15 @@ func (k listedKey) fragments() (prefix, suffix string, valid bool) {
 
 func identifyChannel(secret, channel, label string, keys []listedKey) (listedKey, error) {
 	candidates := websiteKeyCandidates(keys, secret, channel, label)
-	if len(candidates) != 1 {
-		return listedKey{}, errKeyMatch
+	if len(candidates) == 0 {
+		return listedKey{}, fmt.Errorf("%w：遮罩证据不足或未找到匹配项", errKeyMatch)
+	}
+	if len(candidates) > 1 {
+		return listedKey{}, fmt.Errorf("%w：存在多个同等强度的候选 Key", errKeyMatch)
 	}
 	key := keys[candidates[0]]
 	if key.Status != "" && key.Status != "active" {
-		return listedKey{}, errKeyMatch
+		return listedKey{}, fmt.Errorf("%w：候选 Key 已在官网停用", errKeyMatch)
 	}
 	if key.GroupID == 0 && key.groupIDKnown {
 		return key, errKeyGroupMissing
@@ -318,7 +419,7 @@ ORDER BY j.checked_at NULLS FIRST,c.id LIMIT 4`, ProvisionActorID, selected,
 	for i, j := range jobs {
 		m := matches[i]
 		if claims[m.key.ID] > 1 {
-			m.err = errKeyMatch
+			m.err = fmt.Errorf("%w：多个校内渠道匹配到同一官网 Key", errKeyMatch)
 		}
 		if applyErr := s.applyDiscovery(ctx, j, m.key, m.err, m.managed); applyErr != nil {
 			failed = applyErr
@@ -384,14 +485,18 @@ WHERE a.credential_id=$1 AND a.updated_by=$2 AND c.updated_at=$3 AND c.status='a
 			return err
 		}
 		if occupied {
-			lookupErr = errKeyMatch
+			lookupErr = fmt.Errorf("%w：该官网 Key 已绑定其他校内渠道", errKeyMatch)
 		}
 	}
 	var problem *string
 	if lookupErr != nil {
 		message := "北辰官网读取失败，稍后重试"
+		var page *keyListPageError
+		if errors.As(lookupErr, &page) {
+			message = page.Error()
+		}
 		if errors.Is(lookupErr, errKeyMatch) {
-			message = "北辰 Key 或分组无法唯一确认"
+			message = lookupErr.Error()
 			if group.Valid {
 				if err := s.WritePanelAccessTx(ctx, tx, j.credential, actor, PanelAccessInput{}); err != nil {
 					return err

@@ -204,6 +204,25 @@ func TestBeichenCapabilitiesAndGatewayPostgres(t *testing.T) {
 				t.Fatalf("gateway and capabilities disagree: %+v", model)
 			}
 		}
+		var teacherModels struct{ Data []controlplane.ModelView }
+		res := serve("GET", "/api/v1/teacher/models", teacherToken, "", 200)
+		if err := json.Unmarshal(res.Body.Bytes(), &teacherModels); err != nil {
+			t.Fatal(err)
+		}
+		for _, l := range lines {
+			idx := slices.IndexFunc(teacherModels.Data, func(row controlplane.ModelView) bool {
+				return row.ModelID == l.model && row.CredentialID == l.id.String()
+			})
+			if idx < 0 {
+				t.Fatalf("missing teacher model %s", l.model)
+			}
+			info, cap := teacherModels.Data[idx], readLine(l.model)
+			if info.ResponsesReady != cap.ResponsesReady || !slices.Equal(info.SupportedProtocols, cap.SupportedProtocols) ||
+				info.ResponsesReady != slices.Contains(l.protocols, "openai_responses") ||
+				!slices.Equal(info.AvailableProtocols, cap.AvailableProtocols) {
+				t.Fatalf("teacher model and capabilities disagree: %+v %+v", info, cap)
+			}
+		}
 		for _, tc := range []struct {
 			path, body, recommended, endpoint string
 			support                           []string
@@ -279,7 +298,7 @@ func TestBeichenCapabilitiesAndGatewayPostgres(t *testing.T) {
 		}
 		exec("UPDATE provider_credentials SET updated_at=clock_timestamp()+interval '1 millisecond' WHERE id=$1", claude.id)
 		row, model = readLine(claude.model), modelsList("?include_unavailable=1")[claude.model]
-		if row.CatalogState != "catalog_unverified" || row.RecommendedProtocol != nil ||
+		if row.CatalogState != "catalog_stale" || row.Availability != "unverified" || row.RecommendedProtocol != nil ||
 			model.RecommendedProtocol != nil || model.ProbeState != "not_applicable" {
 			t.Fatalf("rotated Key kept previous catalog or probe evidence: %+v %+v", row, model)
 		}

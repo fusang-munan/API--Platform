@@ -39,18 +39,18 @@ type envelope struct {
 }
 
 func (cfg Config) Validate() error {
-	required := map[string]bool{"Gemini": true, "GM1": true, "G3": true, "CC1": true}
+	remaining := map[string]bool{"Gemini": true, "GM1": true, "G3": true, "CC1": true}
 	keys := make(map[string]bool)
 	for _, c := range cfg.Channels {
-		if !required[c.Channel] || keys[c.APIKey] || len(c.APIKey) == 0 || len(c.APIKey) > 4096 ||
+		if !remaining[c.Channel] || keys[c.APIKey] || len(c.APIKey) == 0 || len(c.APIKey) > 4096 ||
 			strings.IndexFunc(c.APIKey, func(r rune) bool { return r < 33 || r > 126 }) >= 0 {
-			return errors.New("学校配置须包含四条不重复的北辰渠道和对应的有效 Key")
+			return errors.New("学校配置的北辰渠道和对应 Key 须有效且不重复")
 		}
-		delete(required, c.Channel)
+		delete(remaining, c.Channel)
 		keys[c.APIKey] = true
 	}
-	if len(required) != 0 {
-		return errors.New("学校配置缺少北辰渠道")
+	if remaining["GM1"] || remaining["G3"] || remaining["CC1"] {
+		return errors.New("学校配置须包含 GM1、G3、CC1 渠道")
 	}
 	if cfg.WebEmail == "" && cfg.WebPassword == "" {
 		return nil

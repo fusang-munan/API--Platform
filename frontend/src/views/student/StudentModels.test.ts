@@ -2,7 +2,9 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { APIError } from '../../api/client'
 import { studentAPI } from '../../api/student'
+import type { StudentModelCatalogPage, StudentUsageSnapshot } from '../../api/student'
 import StudentModels from './StudentModels.vue'
+import studentModelsSource from './StudentModels.vue?raw'
 
 const fixture = vi.hoisted(() => {
   const model = (modelID: string, common = true, overrides: Record<string, unknown> = {}) => ({
@@ -60,6 +62,22 @@ function activeKey(models: unknown[] = []) {
   return fixture.key({ status: 'active', models })
 }
 
+function emptyUsage(): StudentUsageSnapshot {
+  return {
+    month: '2026-11',
+    projects: [],
+    models: [],
+    totals: {
+      credits: '0.000', calls: 0, completeness: 'unknown',
+      tokens: { input: null, output: null, cache_read: null, cache_write: null, total: null },
+      token_coverage: { calls: 0, known_calls: 0, complete_calls: 0, unclassified_tokens: null },
+      cache_hit_rate: null,
+      cache_hit_coverage: { sample_calls: 0, cache_read_tokens: null, input_with_cache_read_tokens: null },
+      pending_review_calls: 0, pending_review_credits: '0.000',
+    },
+  }
+}
+
 function maintainedModel(modelID: string, overrides: Record<string, unknown> = {}) {
   return fixture.model(modelID, false, {
     availability: 'maintenance',
@@ -103,10 +121,11 @@ beforeEach(() => {
   vi.mocked(studentAPI.removeModel).mockReset()
   vi.mocked(studentAPI.withdraw).mockReset().mockResolvedValue({ withdrawn: true } as never)
   vi.mocked(studentAPI.submit).mockReset().mockResolvedValue({} as never)
-  vi.mocked(studentAPI.usage).mockReset().mockResolvedValue({ month: '2026-11', projects: [] } as never)
+  vi.mocked(studentAPI.usage).mockReset().mockResolvedValue(emptyUsage())
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.restoreAllMocks()
   window.history.replaceState({}, '', '/')
 })
@@ -220,15 +239,15 @@ describe('StudentModels key model states', () => {
     await showGroup(wrapper, 'unverified')
 
     const card = wrapper.get('[data-model="claude-sonnet-4-5"]')
-    expect(card.get('[data-testid="model-availability"]').text()).toBe('待验证')
+    expect(card.get('[data-testid="model-availability"]').text()).toBe('待核验')
     expect(card.get('[data-testid="model-availability"]').classes()).toContain('warn')
     await card.get('[data-testid="sync-key-model"]').trigger('click')
     await flushPromises()
 
     expect(studentAPI.addKeyModels).toHaveBeenLastCalledWith('key-1', ['claude-sonnet-4-5'])
-    expect(card.get('[data-testid="model-key-status"]').text()).toBe('已加入 · 待验证')
+    expect(card.get('[data-testid="model-key-status"]').text()).toBe('已加入 · 待核验')
     expect(card.get('[data-testid="model-key-status"]').classes()).toContain('warn')
-    expect(wrapper.get('[role="status"]').text()).toContain('尚未通过探活')
+    expect(wrapper.get('[role="status"]').text()).toContain('还未完成探活')
     wrapper.unmount()
   })
 
@@ -252,7 +271,7 @@ describe('StudentModels key model states', () => {
     expect(card.get('[data-testid="model-unavailable-reason"]').text()).toContain('请求可能失败')
     expect(card.get('[data-testid="protocol-alternatives"]').text()).toContain('Anthropic Messages')
     expect(wrapper.get('[data-testid="model-summary"]').text())
-      .toBe('当前 Key 已授权 1 个 · 可调用 1 · 待验证 0 · 维护中 0 · 可添加 0 · 探活异常 1')
+      .toBe('当前 Key 已授权 1 个模型')
 
     await showGroup(wrapper, 'maintenance')
     expect(wrapper.findAll('[data-model]')).toHaveLength(0)
@@ -304,18 +323,17 @@ describe('StudentModels key model states', () => {
     await showGroup(wrapper, 'maintenance')
 
     const joined = wrapper.get('[data-model="gpt-5.3-codex"]')
-    expect(joined.get('[data-testid="model-key-status"]').text()).toBe('已加入 · 维护中')
-    expect(joined.get('[data-testid="model-key-status"]').classes()).toContain('unavailable')
+    expect(joined.get('[data-testid="model-key-status"]').text()).toBe('已加入')
     expect(joined.get('[data-testid="model-key-status"]').classes()).not.toContain('ok')
     expect(joined.get('[data-testid="model-availability"]').classes()).not.toContain('ok')
     expect(joined.get('[data-testid="remove-key-model"]').text()).toBe('从当前 Key 移除')
     expect(joined.find('[data-testid="sync-key-model"]').exists()).toBe(false)
-    expect(joined.get('[data-testid="model-unavailable-reason"]').text()).toBe('历史授权 · 当前无上游线路')
+    expect(joined.get('[data-testid="model-unavailable-reason"]').text()).toContain('当前没有可接入的线路')
     expect(joined.find('[data-testid="protocol-mismatch"]').exists()).toBe(false)
     expect(joined.text()).not.toContain('请切换协议')
 
     const notJoined = wrapper.get('[data-model="gemini-2.5-pro"]')
-    expect(notJoined.get('[data-testid="sync-key-model"]').text()).toBe('维护中，暂不能加入')
+    expect(notJoined.get('[data-testid="sync-key-model"]').text()).toBe('暂不可加入')
     expect(notJoined.get('[data-testid="sync-key-model"]').attributes('disabled')).toBeDefined()
     wrapper.unmount()
   })
@@ -337,7 +355,7 @@ describe('StudentModels key model states', () => {
     const removed = wrapper.get('[data-model="gpt-5.3-codex"]')
     expect(removed.find('[data-testid="remove-key-model"]').exists()).toBe(false)
     expect(removed.get('[data-testid="sync-key-model"]').text()).toBe('添加到我的 Key')
-    expect(wrapper.text()).toContain('当前 Key 已加入 0 个模型')
+    expect(wrapper.text()).toContain('当前 Key 已授权 0 个模型')
     wrapper.unmount()
   })
 })
@@ -372,14 +390,13 @@ describe('StudentModels availability groups', () => {
     expect(cards).toHaveLength(4)
     expect(cards.map(card => card.attributes('data-model')).sort()).toEqual([...callableIDs].sort())
     expect(wrapper.get('[data-testid="model-summary"]').text())
-      .toBe('当前 Key 已授权 9 个 · 可调用 4 · 待验证 0 · 维护中 5 · 可添加 1')
+      .toBe('当前 Key 已授权 9 个模型')
+    expect(wrapper.get('[data-testid="model-group-callable"]').text()).toBe('可调用4')
 
     await showGroup(wrapper, 'maintenance')
     const maintained = wrapper.findAll('[data-model]')
     expect(maintained).toHaveLength(5)
     expect(maintained.map(card => card.attributes('data-model')).sort()).toEqual([...maintainedIDs].sort())
-    expect(wrapper.findAll('[data-testid="model-unavailable-reason"]').map(item => item.text()))
-      .toEqual(Array(5).fill('历史授权 · 当前无上游线路'))
     expect(wrapper.findAll('[data-testid="protocol-mismatch"]')).toHaveLength(0)
     expect(wrapper.get('.plaza-cards').text()).not.toContain('协议不匹配')
     expect(wrapper.get('.plaza-cards').text()).not.toContain('请切换协议')
@@ -414,7 +431,7 @@ describe('StudentModels availability groups', () => {
     expect([...modelIDs].sort()).toEqual([...maintainedIDs].sort())
     expect(studentAPI.keys).toHaveBeenCalledTimes(2)
     expect(wrapper.get('[data-testid="model-summary"]').text())
-      .toBe('当前 Key 已授权 4 个 · 可调用 4 · 待验证 0 · 维护中 0 · 可添加 1')
+      .toBe('当前 Key 已授权 4 个模型')
     expect(wrapper.findAll('[data-model]')).toHaveLength(0)
     wrapper.unmount()
   })
@@ -438,36 +455,89 @@ describe('StudentModels availability groups', () => {
     expect(wrapper.findAll('[data-model]')).toHaveLength(5)
     wrapper.unmount()
   })
+
+  it('explains historical Terra, probe failure, directory uncertainty and teacher disablement separately', async () => {
+    const terra = maintainedModel('gpt-6.1-terra', {
+      availability_state: 'channel_unavailable', availability_reason: '最近一次成功扫描的渠道目录未列出该模型。',
+    })
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([
+      terra,
+      maintainedModel('probe-failed', { availability_state: 'probe_failed' }),
+      maintainedModel('teacher-disabled', { availability_state: 'disabled', status: 'inactive' }),
+      maintainedModel('directory-failed', { availability_state: 'unverified', route_ready: false }),
+    ])] as never)
+    const wrapper = mountPage()
+    await flushPromises()
+    await showGroup(wrapper, 'maintenance')
+    const card = wrapper.get('[data-model="gpt-6.1-terra"]')
+    expect(card.get('[data-testid="model-availability"]').text()).toBe('当前渠道未开放 · 历史授权')
+    expect(card.get('[data-testid="model-unavailable-reason"]').text()).toContain('成功扫描')
+    expect(card.text()).not.toContain('维护中')
+    await card.findAll('button').find(button => button.text() === '查看详情')!.trigger('click')
+    expect(card.get('dl').text()).toContain('gpt-6.1-terra')
+    expect(wrapper.get('[data-model="probe-failed"] [data-testid="model-availability"]').text()).toBe('暂时维护 · 线路故障')
+    expect(wrapper.get('[data-model="teacher-disabled"] [data-testid="model-availability"]').text()).toBe('老师停用')
+    await showGroup(wrapper, 'unverified')
+    expect(wrapper.get('[data-model="directory-failed"] [data-testid="model-availability"]').text()).toBe('待核验')
+    wrapper.unmount()
+  })
 })
 
 describe('StudentModels usage without prices', () => {
-  it('aggregates model-level used credits and shows the key balance without unit prices', async () => {
-    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([fixture.model('gpt-5.3-codex', false)])] as never)
+  it('reads usage and actual balance from the selected Key while keeping project totals separate', async () => {
+    const models = [fixture.model('gpt-5.3-codex', false)]
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([
+      activeKey(models),
+      fixture.key({ id: 'key-2', name: '第二把 Key', status: 'active', models }),
+      fixture.key({ id: 'other-project-key', name: '另一项目', status: 'active', models,
+        project: { ...fixture.key({}).project, id: 'other-project' } }),
+    ] as never)
+    window.history.replaceState({}, '', '/?key=key-1')
     vi.mocked(studentAPI.usage).mockResolvedValueOnce({
-      month: '2026-11',
+      ...emptyUsage(),
+      models: [{ id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex', credits: '22.50040000000000001', calls: 7 }],
       projects: [{
-        project_id: 'project', project_name: 'Project', quota: '200.000', used: '17.500', pending: '0.000', available: '182.500',
+        project_id: 'project', project_name: 'Project', quota: '200.000', used: '17.50040000000000001', pending: '0.000', available: '182.49959999999999999',
         keys: [
           {
-            id: 'key-1', name: '我的 Key', status: 'active', used: '15.000', pending: '0.000', available: '185.000',
+            id: 'key-1', name: '我的 Key', status: 'active', used: '15.00040000000000001', pending: '0.000', available: '0.000',
+            available_effective: '0.0005', project_member_available: '182.49959999999999999',
             models: [
-              { id: 'gpt-5.3-codex', name: 'gpt-5.3-codex', credits: '10.000', calls: 2 },
+              { id: 'gpt-5.3-codex', name: 'gpt-5.3-codex', credits: '10.00040000000000001', calls: 2 },
               { id: 'claude-sonnet-4-5', name: 'claude-sonnet-4-5', credits: '5.000', calls: 1 },
             ],
           },
           {
-            id: 'key-2', name: '第二把 Key', status: 'active', used: '2.500', pending: '0.000', available: '0.000',
+            id: 'key-2', name: '第二把 Key', status: 'active', used: '2.500', pending: '0.000', available: '80.750',
             models: [{ id: 'gpt-5.3-codex', name: 'gpt-5.3-codex', credits: '2.500', calls: 1 }],
           },
         ],
+      }, {
+        project_id: 'other-project', project_name: '另一项目', quota: '50.000', used: '10.000', pending: '0.000', available: '40.000',
+        keys: [{
+          id: 'other-project-key', name: '另一项目', status: 'active', used: '10.000', pending: '0.000',
+          models: [{ id: 'gpt-5.3-codex', name: 'gpt-5.3-codex', credits: '10.000', calls: 4 }],
+        }],
       }],
-    } as never)
+    })
     const wrapper = mountPage()
     await flushPromises()
 
     const card = wrapper.get('[data-model="gpt-5.3-codex"]')
-    expect(card.get('[data-testid="model-used"]').text()).toBe('本月已用 12.5 积分 · 3 次')
-    expect(card.get('[data-testid="model-balance"]').text()).toBe('余额 185 积分')
+    expect(card.get('[data-testid="model-used"]').text()).toBe('本月已用 10.00040000000000001 积分 · 2 次')
+    expect(wrapper.get('[data-testid="key-balance"]').text()).toBe('本项目个人可用积分 0.0005')
+    expect(wrapper.get('[data-testid="key-project-member-balance"]').text()).toBe('项目内个人余额 182.49959999999999999')
+    expect(wrapper.get('[data-testid="project-balance"]').text()).toBe('各项目个人余额合计 222.49959999999999999')
+    expect(card.text()).not.toContain('余额')
+    const selector = wrapper.get('[data-testid="current-key"]')
+    await selector.setValue('key-2')
+    expect(card.get('[data-testid="model-used"]').text()).toBe('本月已用 2.5 积分 · 1 次')
+    expect(wrapper.get('[data-testid="key-balance"]').text()).toBe('本项目个人可用积分 80.75')
+    expect(wrapper.find('[data-testid="key-project-member-balance"]').exists()).toBe(false)
+    await selector.setValue('other-project-key')
+    expect(card.get('[data-testid="model-used"]').text()).toBe('本月已用 10 积分 · 4 次')
+    expect(wrapper.find('[data-testid="key-balance"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="project-balance"]').text()).toBe('各项目个人余额合计 222.49959999999999999')
     expect(wrapper.get('[data-testid="credit-rate-note"]').text()).toBe('100 积分 = 1 元；金额统一用积分显示。')
     expect(wrapper.text()).not.toContain('点/次')
     expect(wrapper.text()).not.toContain('基础积分')
@@ -477,25 +547,59 @@ describe('StudentModels usage without prices', () => {
 
   it('shows zero credits and zero calls when the usage response has no row for the model', async () => {
     vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([fixture.model('gpt-5.3-codex', false)])] as never)
+    vi.mocked(studentAPI.usage).mockResolvedValueOnce({
+      ...emptyUsage(),
+      projects: [{
+        project_id: 'project', project_name: 'Project', quota: '200.000', used: '0.000', pending: '0.000', available: '200.000',
+        keys: [{ id: 'key-1', name: '我的 Key', status: 'active', used: '0.000', pending: '0.000', models: [] }],
+      }],
+    })
     const wrapper = mountPage()
     await flushPromises()
 
     const card = wrapper.get('[data-model="gpt-5.3-codex"]')
     expect(card.get('[data-testid="model-used"]').text()).toBe('本月 0.000 积分 · 0 次')
-    expect(card.get('[data-testid="model-balance"]').text()).toBe('余额 —')
+    expect(wrapper.find('[data-testid="key-balance"]').exists()).toBe(false)
     expect(card.text()).not.toContain('本月 0 积分 ·')
+    wrapper.unmount()
+  })
+
+  it('shows missing Key usage as unavailable instead of zero', async () => {
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([fixture.model('gpt-5.3-codex')])] as never)
+    const wrapper = mountPage()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="model-used"]').text()).toBe('用量暂不可用')
+    expect(wrapper.find('[data-testid="key-balance"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('keeps a legacy Key balance available when totals and its model usage are missing', async () => {
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([fixture.model('gpt-5.3-codex')])] as never)
+    vi.mocked(studentAPI.usage).mockResolvedValueOnce({
+      month: '2026-11',
+      projects: [{
+        project_id: 'project', project_name: 'Project', quota: '100.000',
+        used: '5.000', pending: '0.500', available: '94.500',
+        keys: [{ id: 'key-1', name: '我的 Key', status: 'active', used: '5.000', pending: '0.500', available: '25.000' }],
+      }],
+    } as unknown as StudentUsageSnapshot)
+    const wrapper = mountPage()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="key-balance"]').text()).toBe('本项目个人可用积分 25')
+    expect(wrapper.get('[data-testid="usage-pending-note"]').text()).toContain('全部项目在途占用 0.5 积分')
+    expect(wrapper.get('[data-testid="model-used"]').text()).toBe('用量暂不可用')
     wrapper.unmount()
   })
 
   it('shows zero charged credits with calls instead of calling the model unused', async () => {
     vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([fixture.model('gpt-5.3-codex', false)])] as never)
     vi.mocked(studentAPI.usage).mockResolvedValueOnce({
-      month: '2026-11',
+      ...emptyUsage(),
       projects: [{
         project_id: 'project', project_name: 'Project', quota: '200.000', used: '0.000', pending: '0.000', available: '200.000',
         keys: [{
           id: 'key-1', name: '我的 Key', status: 'active', used: '0.000', pending: '0.000', available: '200.000',
-          models: [{ id: 'gpt-5.3-codex', name: 'gpt-5.3-codex', credits: '0.000', calls: 3 }],
+          models: [{ id: 'gpt-5.3-codex', name: 'gpt-5.3-codex', credits: '0.000', calls: 3, pending_review_calls: 2 }],
         }],
       }],
     } as never)
@@ -503,24 +607,27 @@ describe('StudentModels usage without prices', () => {
     await flushPromises()
 
     expect(wrapper.get('[data-model="gpt-5.3-codex"] [data-testid="model-used"]').text())
-      .toBe('本月 0 积分 · 3 次（未结算/待核或免费）')
+      .toBe('本月 0 积分 · 3 次 · 待核 2 笔')
     wrapper.unmount()
   })
 
-  it('shows pending credits that are not allocated to a model yet', async () => {
+  it('shows in-flight credits separately from pending review, including zero reservation', async () => {
     vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([fixture.model('gpt-5.3-codex', false)])] as never)
+    const usage = emptyUsage()
     vi.mocked(studentAPI.usage).mockResolvedValueOnce({
-      month: '2026-11',
+      ...usage,
+      totals: { ...usage.totals, pending_review_calls: 2 },
       projects: [
-        { project_id: 'p1', project_name: 'P1', quota: '10.000', used: '0.000', pending: '1.250', available: '8.750', keys: [] },
-        { project_id: 'p2', project_name: 'P2', quota: '10.000', used: '0.000', pending: '0.500', available: '9.500', keys: [] },
+        { project_id: 'p1', project_name: 'P1', quota: '10.000', used: '0.000', pending: '1.250', in_flight_credits: '1.250', available: '8.750', keys: [] },
+        { project_id: 'p2', project_name: 'P2', quota: '10.000', used: '0.000', pending: '0.500', in_flight_credits: '0.500', available: '9.500', keys: [] },
       ],
     } as never)
     const wrapper = mountPage()
     await flushPromises()
 
     const note = wrapper.get('[data-testid="usage-pending-note"]')
-    expect(note.text()).toContain('有 1.75 积分在途/待核，尚未分摊到具体模型')
+    expect(note.text()).toContain('全部项目在途占用 1.75 积分')
+    expect(note.text()).toContain('全部项目待核 2 笔（预留 0 积分）')
     expect(wrapper.text()).not.toContain('本月未使用')
     wrapper.unmount()
   })
@@ -547,7 +654,7 @@ describe('StudentModels protocol guidance', () => {
     let warnings = wrapper.findAll('[data-testid="protocol-alternatives"]')
     expect(warnings).toHaveLength(1)
     expect(warnings[0].text()).toContain('Anthropic Messages')
-    expect(warnings[0].text()).toContain('网关不做协议转换')
+    expect(wrapper.get('[data-testid="protocol-note"]').text()).toContain('网关不做协议转换')
 
     await wrapper.get('[data-testid="protocol-select"]').setValue('anthropic')
     warnings = wrapper.findAll('[data-testid="protocol-alternatives"]')
@@ -557,6 +664,7 @@ describe('StudentModels protocol guidance', () => {
   })
 
   it('reads protocols and the recommended protocol from the model response instead of guessing by name', async () => {
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey()] as never)
     vi.mocked(studentAPI.models).mockResolvedValueOnce({
       common_models: [
         { ...fixture.model('claude-sonnet-4-5'), protocols: ['openai_compatible'], recommended_protocol: 'openai_compatible' },
@@ -574,8 +682,7 @@ describe('StudentModels protocol guidance', () => {
     expect(recommendations.sort()).toEqual(['推荐 Anthropic Messages', '推荐 OpenAI Chat', '推荐 OpenAI Responses'])
     const claude = wrapper.get('[data-model="claude-sonnet-4-5"]')
     expect(claude.findAll('[data-testid="protocol-chip"]').map(chip => chip.text())).toEqual(['Chat'])
-    expect(wrapper.findAll('[data-testid="protocol-note"]')).toHaveLength(4)
-    expect(wrapper.text()).toContain('网关不做协议转换')
+    expect(wrapper.text().match(/网关不做协议转换/g)).toHaveLength(1)
     wrapper.unmount()
   })
 
@@ -589,7 +696,7 @@ describe('StudentModels protocol guidance', () => {
     await flushPromises()
     await showGroup(wrapper, 'maintenance')
 
-    expect(wrapper.get('[data-testid="model-availability"]').text()).toBe('维护中')
+    expect(wrapper.get('[data-testid="model-availability"]').text()).toBe('暂时维护')
     const reason = wrapper.get('[data-testid="model-unavailable-reason"]').text()
     expect(reason).toContain('等待老师恢复线路')
     const sync = wrapper.get('[data-testid="sync-key-model"]')
@@ -612,7 +719,7 @@ describe('StudentModels protocol guidance', () => {
     await showGroup(wrapper, 'maintenance')
 
     const card = wrapper.get('[data-model="claude-sonnet-4-5"]')
-    expect(card.get('[data-testid="model-availability"]').text()).toBe('维护中')
+    expect(card.get('[data-testid="model-availability"]').text()).toBe('暂时维护')
     expect(card.get('[data-testid="model-unavailable-reason"]').text()).toBe('维护中。所有已配置线路最近一次探活均失败。')
     expect(card.find('[data-testid="recommended-protocol"]').exists()).toBe(false)
     expect(card.get('[data-testid="sync-key-model"]').attributes('disabled')).toBeDefined()
@@ -632,6 +739,17 @@ describe('StudentModels catalog dialog', () => {
     raw_entry: {},
   }
 
+  async function openCatalog(wrapper: ReturnType<typeof mountPage>) {
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '检索添加')!.trigger('click')
+    await flushPromises()
+    return wrapper.get('.student-model-catalog')
+  }
+
+  function result(modelIDs: string[], page = 1, total = modelIDs.length): StudentModelCatalogPage {
+    return { items: modelIDs.map(model_id => ({ ...base, model_id })), page, page_size: 20, total }
+  }
+
   it('shows callable, unverified and maintenance coverage plus catalogue warnings', async () => {
     const unverified = fixture.model('claude-opus-4', false, { availability: 'unverified', availability_reason: '还没有通过探活。' })
     const maintenance = fixture.model('gemini-2.5-pro', false, { availability: 'maintenance', availability_reason: '维护中。' })
@@ -642,7 +760,8 @@ describe('StudentModels catalog dialog', () => {
     ])] as never)
     vi.mocked(studentAPI.modelCatalog).mockResolvedValueOnce({
       items: [
-        { ...base, model_id: 'gpt-5.3-codex', supported_protocols: ['openai_compatible', 'openai_responses'] },
+        { ...base, model_id: 'gpt-5.3-codex', supported_protocols: ['openai_compatible', 'openai_responses'],
+          raw_entry: { availability_state: 'available', recommended_protocol: 'openai_responses' } },
         { ...base, model_id: 'deepseek-chat', supported_protocols: ['openai_compatible', 'openai_responses'] },
         { ...base, model_id: 'claude-opus-4', supported_protocols: ['anthropic'], availability: 'unverified', availability_reason: '还没有通过探活。' },
         { ...base, model_id: 'gemini-2.5-pro', availability: 'maintenance', availability_reason: '维护中。' },
@@ -654,32 +773,118 @@ describe('StudentModels catalog dialog', () => {
       total: 6,
     } as never)
     const wrapper = mountPage()
-    await flushPromises()
-    await wrapper.findAll('button').find(button => button.text() === '检索添加')!.trigger('click')
-    await flushPromises()
-
-    expect(wrapper.get('[data-testid="catalog-protocol-note"]').text()).toContain('网关不做协议转换')
-    expect(wrapper.get('[data-testid="catalog-key-note"]').text()).toContain('不再先加入个人模型库')
-    const coverage = wrapper.findAll('[data-testid="catalog-key-coverage"]')
+    const dialog = await openCatalog(wrapper)
+    expect(dialog.get('[data-testid="catalog-key-note"]').text()).toBe('当前 Key 我的 Key')
+    expect(dialog.findAll('table thead th').map(th => th.text()))
+      .toEqual(['模型 / 厂商', '本月用量', '协议', '状态', '操作'])
+    for (const row of dialog.findAll('table tbody tr')) expect(row.findAll('td')).toHaveLength(5)
+    expect(dialog.get('.catalog-protocol .recommend').text()).toBe('Responses · 推荐')
+    const coverage = dialog.findAll('[data-testid="catalog-key-coverage"]')
     expect(coverage.map(chip => chip.text())).toEqual([
-      '可调用', '未加入', '已加入 · 待验证', '已加入 · 维护中', '未加入', '未加入',
+      '可调用', '未加入', '待核验', '暂时维护', '暂时维护', '待核验',
     ])
+    expect(dialog.findAll('[data-testid="catalog-joined"]')).toHaveLength(3)
     expect(coverage[2].classes()).toContain('warn')
     expect(coverage[3].classes()).toContain('unavailable')
-    expect(coverage[3].classes()).not.toContain('ok')
-    expect(wrapper.get('[data-testid="catalog-unverified"]').text()).toContain('还没有通过探活')
-    expect(wrapper.findAll('[data-testid="catalog-unavailable"]').map(item => item.text())).toContain('维护中。')
-
-    const addButtons = wrapper.findAll('[data-testid="catalog-add"]')
-    expect(addButtons.map(button => button.text())).toEqual([
-      '可调用', '添加到我的 Key', '已加入 · 待验证', '已加入 · 维护中', '维护中，暂不能加入', '添加到我的 Key',
+    expect(coverage[2].attributes('title')).toContain('还没有通过探活')
+    const addButtons = dialog.findAll('[data-testid="catalog-add"]')
+    expect(addButtons.map(button => button.attributes('aria-label'))).toEqual([
+      '加入 deepseek-chat 到当前 Key', '加入 unverified-new 到当前 Key',
     ])
-    expect(addButtons[0].attributes('disabled')).toBeDefined()
-    expect(addButtons[1].attributes('disabled')).toBeUndefined()
-    expect(addButtons[2].attributes('disabled')).toBeDefined()
-    expect(addButtons[3].attributes('disabled')).toBeDefined()
-    expect(addButtons[4].attributes('disabled')).toBeDefined()
-    expect(addButtons[5].attributes('disabled')).toBeUndefined()
+    expect(addButtons.every(button => !button.attributes('disabled'))).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('debounces input and discards a late response even when its request ignores cancellation', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey()] as never)
+    let resolveOld!: (value: StudentModelCatalogPage) => void
+    const old = new Promise<StudentModelCatalogPage>(resolve => { resolveOld = resolve })
+    vi.mocked(studentAPI.modelCatalog).mockReturnValueOnce(old).mockResolvedValueOnce(result(['gpt-6.1-terra']))
+    const wrapper = mountPage()
+    const dialog = await openCatalog(wrapper)
+    const input = dialog.get('input[type="search"]')
+    await input.setValue('ter')
+    await vi.advanceTimersByTimeAsync(150)
+    await input.setValue('  terra ')
+    await vi.advanceTimersByTimeAsync(274)
+    expect(studentAPI.modelCatalog).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(studentAPI.modelCatalog).mock.calls[0][3]?.aborted).toBe(true)
+    expect(dialog.get('[aria-busy]').attributes('aria-busy')).toBe('true')
+    await vi.advanceTimersByTimeAsync(1)
+    await flushPromises()
+    expect(studentAPI.modelCatalog).toHaveBeenLastCalledWith('terra', 1, 20, expect.any(AbortSignal))
+    expect(dialog.find('[data-catalog-model="gpt-6.1-terra"]').exists()).toBe(true)
+    resolveOld(result(['obsolete']))
+    await flushPromises()
+    expect(dialog.find('[data-catalog-model="obsolete"]').exists()).toBe(false)
+    expect(dialog.get('nav').text()).toContain('第 1–1 条 / 共 1 条')
+    wrapper.unmount()
+  })
+
+  it('keeps pagination and search outside the scrolling results and resets scroll on page changes', async () => {
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey()] as never)
+    vi.mocked(studentAPI.modelCatalog)
+      .mockResolvedValueOnce(result(Array.from({ length: 20 }, (_, i) => `model-${i + 1}`), 1, 21))
+      .mockResolvedValueOnce(result(['model-21'], 2, 21))
+    const wrapper = mountPage()
+    const dialog = await openCatalog(wrapper)
+    const results = dialog.get('.catalog-results')
+    const nav = dialog.get('nav')
+    expect(results.element.previousElementSibling).toBe(dialog.get('.catalog-search').element)
+    expect(results.element.nextElementSibling).toBe(nav.element)
+    expect(nav.text()).toContain('第 1–20 条 / 共 21 条')
+    const [previousPage, nextPage] = nav.findAll('button')
+    expect(previousPage.text()).toBe('上一页')
+    expect(previousPage.attributes('disabled')).toBeDefined()
+    results.element.scrollTop = 150
+    await nextPage.trigger('click')
+    expect(results.element.scrollTop).toBe(0)
+    await flushPromises()
+    expect(nav.text()).toContain('第 21–21 条 / 共 21 条')
+    expect(nextPage.text()).toBe('下一页')
+    expect(nextPage.attributes('disabled')).toBeDefined()
+    expect(previousPage.attributes('disabled')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('lays out the same result as a card with touch-sized actions at the narrow breakpoint', async () => {
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey()] as never)
+    vi.mocked(studentAPI.modelCatalog).mockResolvedValueOnce(result(['long-model-name']))
+    const wrapper = mountPage()
+    const dialog = await openCatalog(wrapper)
+    const row = dialog.get('tbody tr').element
+    const button = dialog.get('[data-testid="catalog-add"]').element
+    const documentSource = new DOMParser().parseFromString(studentModelsSource, 'text/html')
+    const style = document.createElement('style')
+    style.textContent = documentSource.querySelector('style[scoped]')!.textContent
+    document.head.append(style)
+    try {
+      // jsdom parses media rules but does not apply them at a viewport width.
+      const narrow = Array.from(style.sheet!.cssRules).find((rule): rule is CSSMediaRule =>
+        rule instanceof CSSMediaRule && rule.conditionText === '(max-width: 740px)')
+      expect(narrow).toBeDefined()
+      const rules = Array.from(narrow!.cssRules).filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
+      const card = rules.find(rule => row.matches(rule.selectorText) && rule.style.display === 'grid')
+      expect(card?.style.getPropertyValue('grid-template-areas')).toBe('"model model" "usage protocol" "status action"')
+      expect(rules.some(rule => button.matches(rule.selectorText) && rule.style.getPropertyValue('min-height') === '44px')).toBe(true)
+    } finally {
+      style.remove()
+      wrapper.unmount()
+    }
+  })
+
+  it('shows separate loading, failure and empty states', async () => {
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey()] as never)
+    vi.mocked(studentAPI.modelCatalog).mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce(result([]))
+    const wrapper = mountPage()
+    const dialog = await openCatalog(wrapper)
+    expect(dialog.get('[role="alert"]').text()).toContain('目录读取失败')
+    expect(dialog.text()).not.toContain('暂无匹配模型')
+    await dialog.get('.catalog-message button').trigger('click')
+    await flushPromises()
+    expect(dialog.get('.catalog-results [role="status"]').text()).toBe('暂无匹配模型')
+    expect(dialog.find('[role="alert"]').exists()).toBe(false)
     wrapper.unmount()
   })
 
@@ -727,17 +932,18 @@ describe('StudentModels catalog dialog', () => {
     await wrapper.findAll('button').find(button => button.text() === '检索添加')!.trigger('click')
     await flushPromises()
 
-    expect(wrapper.get('[data-testid="catalog-availability"]').text()).toBe('可用 · 探活异常')
-    expect(wrapper.get('[data-testid="catalog-key-coverage"]').text()).toBe('未加入')
-    expect(wrapper.get('[data-testid="catalog-degraded"]').text()).toContain('请求可能失败')
+    expect(wrapper.get('[data-testid="catalog-key-coverage"]').text()).toBe('可用 · 探活异常')
+    expect(wrapper.find('[data-testid="catalog-joined"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="catalog-key-coverage"]').attributes('title')).toContain('请求可能失败')
     const add = wrapper.get('[data-testid="catalog-add"]')
     expect(add.attributes('disabled')).toBeUndefined()
-    expect(add.text()).toBe('添加到我的 Key')
+    expect(add.text()).toBe('加入当前 Key')
     await add.trigger('click')
     await flushPromises()
 
-    expect(wrapper.get('[data-testid="catalog-key-coverage"]').text()).toBe('已加入 · 探活异常')
-    expect(wrapper.get('[data-testid="catalog-add"]').text()).toBe('已加入 · 探活异常')
+    expect(wrapper.get('[data-testid="catalog-key-coverage"]').text()).toBe('可调用 · 探活异常')
+    expect(wrapper.get('[data-testid="catalog-joined"]').text()).toBe('已加入')
+    expect(wrapper.find('[data-testid="catalog-add"]').exists()).toBe(false)
     wrapper.unmount()
   })
 })

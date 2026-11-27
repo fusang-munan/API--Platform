@@ -213,6 +213,10 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 ### 北辰教师端用量、定价与对账
 
+教师页若显示「目录待复核」，展开「目录来源与分组」，核对实际绑定线路的 Key、分组、目录和探活。目录超过 30 分钟、最近扫描失败或早于已知的换组轮次时，原证据不计入覆盖。重新扫当前 Key 后，报价和探活分别随当轮证据恢复。其他 Key 未列出该型号时只显示目录详情。官网清单待刷新取决于清单时效及校内已启用 Key 是否有匹配，官网仍启用的未匹配 Key 单列。
+
+设置 `NEBULA_TEST_POSTGRES` 后执行 `go test ./internal/beichen ./internal/dataplane -run 'TestBeichenTeacherCoveragePostgres|TestBeichenOverviewRetiredCatalogPostgres|TestBeichenCapabilitiesAndGatewayPostgres' -count=1`。前端执行 `npm run test -- BeichenSchoolModels TeacherModels BeichenPriceDrawer`。回归覆盖 G3 / GM1 六个型号、绑定 Key 去重、原始上游名和校内别名、条件价、换组及目录过期、能力不可读和作废型号历史用量入口。
+
 「北辰对账」默认总计的下一页若返回 503，核对请求是否使用同一账期、口径和供应商。旧版把查询时刻写进游标，同一天的下一次请求也会失效。当前查询把截止固定在北京时间次日 00:00，换账期或跨过零点后从第一页刷新。页面上的「重试本页」会重新请求刚才失败的那一页。
 
 采价配置变更后，若停用渠道又导致后续账日缺同步，检查是否应用迁移 `0067`。在本机隔离测试库对照 `provider_credentials.retired_at` 和 `updated_at`，确认改采价配置只更新版本时间，停用当天继续计入覆盖要求。执行 `go test -p 1 ./internal/beichen -run 'Test(ReconciliationUnmatchedCursorPostgres|ReconciliationRetiredCredentialStopsExpectedDaysPostgres|SaveCredentialRetiredAtPostgres|ReconciliationPostgresVerifiedCallsRequireUnconflictedReceipt)$' -count=1` 可复查分页和停用行为。进入 `frontend` 执行 `npm run test -- --run BeichenReconcile`，复查账期切换、失败重试和严格视图的加载、错误及空态。
@@ -283,6 +287,22 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 用 `go test ./cmd/beichen-crawl ./internal/beichen -run 'Test(CrawlCommand|BeichenCrawlWebsiteKey)' -count=1 -v` 验证分页、脱敏、同组去重、部分解析及显式保存。配置隔离的 `NEBULA_TEST_POSTGRES` 后，该命令也覆盖定时到期刷新、基础倍率和高峰倍率分别变更、重复读数去重，以及分页失败保留上次数据。`changed_at` 为空时，检查教师清单的 `observed_at` 是否已有首个版本。`last_seen` 长时间未更新时，检查同步状态、北辰网页登录授权和数据库迁移 `0056`。
 
+#### 核对北辰扫描完整性
+
+设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen ./internal/catalog ./internal/controlplane -run TestBeichenScanRobustness -count=1 -v`。模拟上游覆盖游标和 Link、分页总数变化、第 2 页失败、HTTP 429、超时、旧轮次晚写、官网省略平台、遮罩证据不足及 Key 身份冲突。`go test ./cmd/server -run TestBeichenProvisionPostgres -count=1 -v` 核对已归档凭据的部署升级。
+
+同一命令还覆盖官网平台交错缺席七轮、坏报价下缺席四轮、101 条 Key 等量增删后的分页漂移，以及旧会话目录响应晚于新会话 Key 清单入库。
+
+设置隔离的本机 `NEBULA_TEST_POSTGRES` 后，运行 `go test ./internal/beichen -run 'Test(WebsiteSnapshotSessionVersionPostgres|CapturedWebSession)' -count=1 -v`。测试暂停目录和 Key 清单的旧请求，覆盖版本交付会话替换、清除教师网页登录后的交付会话续期、数据库网页登录替换。它还核对旧结果被丢弃、新会话可再次保存、刷新失败、轮换文件写入重试和并发 401 共用一次续期。
+
+三路部署配置使用 `scripts/seal-beichen.ps1 -SkipGemini` 加密。如果提示缺少渠道，核对 CC1、GM1 和 G3 是否都已填入且 Key 各自唯一。运行 `go test ./internal/infrastructure/schoolseal ./cmd/seal-beichen -count=1` 核对三路密文往返、旧四路密文读取及证书校验。
+
+- 若 Key 的型号总数比上一份目录减少至少一半，检查 `catalog.last_error` 中的确认进度。第三次连续返回同一完整型号集合时接受这次变化。不同集合重新从第一次计数，读取失败会清除计数并保留上次目录。HTTP 429 和单次请求超时按剩余时限最多重试一次。超过 2 秒的 `Retry-After` 留待下一轮处理。
+- 若官网目录缺少平台或分组，检查 `website_directory.last_run.failures` 及 `website_directory.groups` 中的采集时间和 `retained`。缺席或缩水的平台各需要三个连续一致的完整型号及分组观察。报价错误仍记录在本轮失败项中，清单完整时可以累计确认。平台确认下线后从快照移除，其他待核验平台继续沿用。整页没有可读型号时保留快照并记录读取失败。`beichen-crawl --match-db` 可查询对照结果，确认轮数由持久化抓取推进。
+- 如果官网 Key 清单未更新，先用 `last_seen` 找最近一次完整成功，再查 `failed_page` 与 `last_error`。多页清单完整复读一次，两次结果一致才更新。如果翻页时一删一增导致结果不同，页面保留旧清单并提示待核验，等上游清单稳定后可再点「刷新官网 Key」。`match_issues` 用于区分遮罩或归属证据不足、同强度候选、多个校内渠道认领同一官网 Key。
+- 如果目录或 Key 清单提示「北辰网页会话已更换」，说明本轮完成读取时使用的会话已经被续期或替换。目录可核对 `website_directory.last_run.failures` 的 `path=session` 与 `last_success`。Key 清单显示 `unavailable`，可核对 `last_error` 和 `last_seen`。两处都保留上次成功数据，当前扫描结束后可分别点「测试抓取」和「刷新官网 Key」。
+- 如果日用量只更新了部分日期，检查 `kind=key_usage` 的 `last_error` 和 Key 用量错误。错误附带失败账日、页码及该日旧快照时间。单日 100 页和 16 MiB 的读取上限、途中失败或总数变化都不会提交当日半份数据。账单缺字段时查 `kind=billing` 的 `website_group_observation.key_billing_missing_fields`，有效价表仍以 `kind=prices` 的状态为准。
+
 #### 改分组后仍显示旧倍率或缺报价
 
 旧模型页的定向重扫只读模型清单，旧概览的分组取自上次采价或预配映射。新版在「用指定 Key 重扫」后读取当前 Key 账单。查看「Key 分组与倍率」中的生效倍率、分组与上次成功时间。若显示「倍率已陈旧」，查看该行的账单错误并重扫。第三次连续失败会同时写入服务告警。待核的跟随价调用可由通过校验的北辰回执补记。
@@ -290,6 +310,12 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 行内出现「分组报价需核对」时，对照「官网分组 X 价」与「Key 分组 Y 价」及各自倍率。显示「Key 分组不含该模型」时，可在北辰为该 Key 选对应分组，或从供应商管理换用对应 Key，再重扫该 Key。
 
 设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run TestBeichenBillingGroupRefreshPostgres -count=1 -v`。构造数据覆盖 0.15 到 0.6 的切换、同平台不同分组单价、迟到的旧调用、仅高峰规则变更、官网读取失败、过期账单响应和连续失败告警。教师页运行 `npm test -- BeichenSchoolModels` 核对倍率与分组差异。
+
+#### 重建预览过期或绑定 Key 无分组权限
+
+- 换组后确认旧预览应返回 409，并提示重新预览。对照教师概览的 `bound_catalog_pending`、`ready_count` 与新预览的 `evidence_versions`。同步持有事务锁时确认同样返回 409。测试使用数据库触发器，在确认已读取分组证据、即将插入 Responses 绑定时暂停，由另一连接提交从分组 10 到 12 的变化。恢复确认后应返回冲突，数据库中的 Responses 绑定数量应为 0。
+- 重扫明确返回 `GROUP_NOT_ALLOWED` 时，核对 `bound_routes[].group_status=not_allowed`、`binding_issue.code=group_not_allowed` 和教师行的恢复权限提示。在北辰恢复该 Key 的分组权限，再重扫。若成功读取的型号从 4 个减少到 2 个，分组拒绝应立即清除，目录显示待复核并保留原清单和 `last_success`。若仅 GM1 备用线路换组，仍就绪的 G3 继续显示可用及报价。两把 Key 都已绑定时，预期 Key 覆盖为 `1/2`。
+- 在隔离测试库运行 `go test ./internal/beichen ./internal/dataplane -run 'Test(RebindRejectsGroupVersionChange|KeyCatalogGroupDenialRecovery|CatalogQualityAliasCRUDAndRebind|BeichenTeacherCoverage|StudentKeyModelAuthorization)Postgres' -count=1`，并在 `frontend` 运行 `npm test -- BeichenSchoolModels`。日志回归检查成功事件的操作人、供应商和变更数量，以及预览令牌和变更明细是否已移除。
 
 #### 核对一把 Key 的实际用量和分组
 
@@ -370,6 +396,54 @@ go test ./...
 逐笔核对时用 `base_difference_credits` 比较基础积分与回执实扣，用 `difference_credits` 单独核对独立计价与实扣。学校系数与额度封顶可以另用 `school_multiplier`、`student_credits`、`school_absorbed_credits` 复核。存在差额时结合本地和回执 Token、价格档位、渠道倍率版本、推理强度和缓存费率核对。日账缺失时查看逐笔证据，区间利润保持未知。
 
 在上述本机测试库运行 `go test ./internal/dataplane -run 'TestBeichenUsageProtocolMatrix|TestBeichenPostgresGatewayReconciliation' -count=1 -v`。假上游的 41 笔调用覆盖完整用量、缺缓存明细及缺用量，且检验逐笔回执补记、回执重放和差额精度。完整检查使用 `go build ./...` 与 `go test ./...`。
+
+### 学生月度用量与待核
+
+在隔离的本机 PostgreSQL 设置 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/usage -run 'TestStudentUsageContractPostgres|TestStudentCallReceipt|TestBeichenLedgerPostgres' -count=1 -v`。测试以真实查询和响应 JSON 验证跨项目和 Key 的精确求和、完整及部分 Token、缺失历史证据、停用 Key 的零额调用、待核补记与回执访问校验。
+
+- Token 总量大于四项之和时，查看 `token_coverage.unclassified_tokens`。分项为 `null` 时，用同一账月的逐笔 `usage_state`、`usage_reason` 和原始协议计数核对。缓存命中率的实际样本数在 `cache_hit_coverage.sample_calls`。
+- 待核与在途金额差异可用同一账月的 `pending_review_calls`、`pending_review_credits` 和 `in_flight_credits` 复核。账页间的已用和次数应比较同一账月的服务端汇总 `data.totals`、`data.models`，最近调用分页可用来查对应的逐笔状态。
+- 两把 Key 都能受理请求、旧 `available` 却显示为零时，检查 `available_effective` 和 `project_member_available`。前者还受项目总余额限制，后者等于所属项目的个人余额。运行 `go test ./internal/api/http -run TestStudentUsageEffectiveBalanceHTTPPostgres -count=1 -v`，复现 Key 月桶为零、两把 Key 通过受理和项目总余额不足的场景。
+- 在 `frontend` 执行 `npm test -- StudentModels StudentUsage studentUsage.test.ts`，核对切换 Key 后的模型用量、精确小数余额、零额已结算次数、在途占用和待核笔数。发现跨 Key 数字混入时，核对同一项目下所选 Key 的 `models` 与 `available_effective`。模型仅保留历史授权时，用 `TestStudentKeyModelAuthorizationPostgres` 核对渠道当前目录、扫描失败和探活状态。
+
+### 学生模型目录搜索
+
+运行 `go test ./internal/api/http -run 'TestStudentCatalog(Batch|Bounds)HTTPPostgres' -count=1 -v`。测试记录 PostgreSQL 实际执行的 SQL，比较 1 个匹配和 23 个匹配的第二页，检查排序、候选总数、绑定优先级、协议和探活证据。搜索被拒绝时，检查 `q` 的 128 字符上限、`page` 的 1 至 10000 范围、`page_size` 的 1 至 50 范围及 URL 编码。
+
+### 教师学生用量
+
+配置隔离的本机 `NEBULA_TEST_POSTGRES` 后执行以下检查。
+
+```powershell
+go test ./internal/usage ./internal/controlplane ./internal/api/http -run 'Test(TeacherStudentUsage|StudentUsageContract)' -count=1 -v
+go vet ./internal/usage ./internal/controlplane ./internal/api/http
+cd frontend
+npm test -- TeacherStudentUsage router
+npm run typecheck
+npm run build
+```
+
+PostgreSQL 样例覆盖两位同名学生、共享两个项目、每个项目多把历史 Key 和多模型，核对精确积分、调用和已知 Token 的逐层加总，以及停用或退出项目后的历史、零额、待核、账月边界、归档归属和分页排序。HTTP 测试验证教师鉴权、禁缓存、无效参数和明细为空的状态码。前端测试覆盖查询、翻页、下钻、空态、加载失败重试及切换条件后的过期明细。
+
+- 金额看起来对不上时，使用相同的 `month`、`project_id` 对比学生行的 `credits` 和明细的 `totals.credits`，再核对项目及 Key 的 `used`。用量查询使用受理账月，调用发生时间可能跨自然月。已扣积分与 `pending_review_credits` 各有独立口径。
+- 缺 Token 或最近时间但有已结算记录时，检查 `monthly_usage_cube` 是否仍有对应维度并查看明细 `token_coverage`。原始逐笔记录到期后，账本保留积分和次数。
+- 切换项目后「未确认归属 / 校方使用」仍按整个学校账月汇总。两条流水共用响应编号时，先核对回执的流水行号。回执仅确认对应行。缺少回执时，核对整个派发时间窗口是否只有一条候选。`TestTeacherStudentUsageUnattributedReceiptHTTPPostgres` 覆盖同号不同流水、唯一候选和跨账月歧义。
+- 列表翻页会复用最多 5 秒的报表快照。刚补记的金额可以在明细先显示，随后出现在重新读取的列表。列表读库超过 3 秒时返回 503。使用 `TestTeacherStudentUsageSnapshotHTTPPostgres`、`TestTeacherStudentUsageTimeoutHTTPPostgres` 和 `TestTeacherStudentUsageOverCacheLimitHTTPPostgres` 核对 10 万笔调用下冷热读库次数、到期刷新、超时恢复及超出缓存预算时的精确总数。
+
+#### 10 万笔账月的查询计划
+
+在本机 PostgreSQL 17.12 的隔离 schema 上，以同一份数据对比基线 `21673068` 与修复 SQL。样本含 12 个账月共 21 万次调用，目标账月 10 万次调用、1500 名学生及 49829 条上游归档。下表为 `EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)` 三次的执行时间中位数，查询均使用实际参数的计划。
+
+| 场景 | 主要计划节点或实际执行情况 | 中位数 |
+| --- | --- | ---: |
+| 基线首页 | `Parallel Seq Scan on gateway_calls`，物化 `CTE matches` 后统计和排序 | 277.370 ms |
+| 基线越界页 | 同样并行扫描及物化，仍计算总人数 | 277.058 ms |
+| 修复后未命中缓存 | 同样并行扫描，直接输出 1500 条学生汇总供缓存 | 281.614 ms |
+| 修复后命中缓存的后续页及越界页 | 复用汇总和全校归档统计，执行 0 条报表 SQL | 无数据库报表计划 |
+| 基线归档汇总 | 归档按时间筛选，以响应声明排除已归属数据 | 36.912 ms |
+| 修复后归档汇总 | 按回执流水或唯一派发候选排除，计划额外含一次 `Hash Anti Join` | 44.583 ms |
+
+首次加载仍需汇总该账月，性能收益来自省去后续页面的两条报表查询。执行 `go test ./internal/api/http -run TestTeacherStudentUsageSnapshotHTTPPostgres -count=1 -v` 可以用独立样本复核真实 HTTP 请求的冷热查询次数和耗时。
 
 ### 北辰网页报价持续为 0/4
 

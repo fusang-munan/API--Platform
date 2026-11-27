@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"testing"
 )
@@ -149,6 +150,26 @@ func TestReleaseBindsOnePersistentRecipient(t *testing.T) {
 	}
 	if _, err := LoadOrCreate(dir); err == nil {
 		t.Fatal("zeroed private key accepted")
+	}
+}
+
+func TestSealReleaseWithThreeChannels(t *testing.T) {
+	id, err := LoadOrCreate(filepath.Join(t.TempDir(), "recipient"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := sampleConfig()
+	cfg.Channels = cfg.Channels[1:]
+	raw, err := Seal(id.Recipient(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := id.open(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened == nil || !slices.Equal(opened.Channels, cfg.Channels) {
+		t.Fatal("three-channel configuration did not survive encryption and decryption")
 	}
 }
 

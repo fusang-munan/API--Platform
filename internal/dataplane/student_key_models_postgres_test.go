@@ -135,6 +135,7 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 	beichenCredential := uuid.New()
 	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
 		VALUES($1,$2,'Stored probe fixture',$3,now(),now())`, beichenCredential, beichenProvider, ciphertext)
+	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success) VALUES($1,'catalog',clock_timestamp())`, beichenCredential)
 	seedProbe := func(id uuid.UUID, modelID string, status int, errorCode string) {
 		t.Helper()
 		addBinding(id, beichenProvider, beichenCredential, "openai_responses", modelID)
@@ -277,7 +278,10 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 		if slices.Contains(verifiedIDs, model.ID) {
 			want = catalog.AvailabilityAvailable
 		}
-		if model.Availability != want || !reflect.DeepEqual(detailByID[model.ID], &model.ModelAvailability) {
+		detail := detailByID[model.ID]
+		if detail == nil || model.Availability != want || detail.Availability != want ||
+			!reflect.DeepEqual(detail.ProtocolSummary, model.ProtocolSummary) || !reflect.DeepEqual(detail.LastProbeAt, model.LastProbeAt) ||
+			model.AvailabilityState != "" || detail.AvailabilityState != want {
 			t.Fatalf("%s availability mismatch: gateway=%+v detail=%+v", model.ID, model.ModelAvailability, detailByID[model.ID])
 		}
 	}
@@ -511,4 +515,101 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 	if !degradedInPlaza || !slices.Contains(modelList(), failedModel) {
 		t.Fatal("degraded model disappeared from the student plaza or default gateway list")
 	}
+
+	const terra = "gpt-6.1-terra"
+	terraID := addModel(terra, "active", "", "", true)
+	const terraUpstream = "fixture-terra-upstream"
+	addBinding(terraID, beichenProvider, beichenCredential, "openai_responses", terraUpstream)
+	exec(`UPDATE provider_model_catalog SET status='inactive' WHERE credential_id=$1 AND model_id=$2`, beichenCredential, terraUpstream)
+	exec(`UPDATE model_bindings SET status='inactive' WHERE model_id=$1`, terraID)
+	exec(`INSERT INTO beichen_website_catalogs(credential_id, credential_revision, group_id, checked_at, models)
+		SELECT id, updated_at, 42, clock_timestamp(), ARRAY[$2::text] FROM provider_credentials WHERE id=$1`, beichenCredential, terraUpstream)
+	linkModel(terraID)
+	exec("UPDATE upstream_probes SET last_passed_at=NULL WHERE credential_id=$1 AND model=$2", beichenCredential, failedModel)
+
+	assertKeyState := func(modelID, legacy, state, reason string) {
+		t.Helper()
+		body := requireStatus(serve("GET", "/api/v1/student/api-keys", studentToken, ""), 200)
+		var response struct{ Data []controlplane.APIKeyView }
+		if err := json.Unmarshal([]byte(body), &response); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range response.Data {
+			if key.ID != keyID.String() {
+				continue
+			}
+			for _, model := range key.Models {
+				if model.ModelID == modelID {
+					if model.Availability != legacy || model.AvailabilityState != state || !strings.Contains(model.AvailabilityReason, reason) {
+						t.Fatalf("%s: want %s/%s with reason %q, got %+v", modelID, legacy, state, reason, model.ModelAvailability)
+					}
+					return
+				}
+			}
+		}
+		t.Fatalf("missing authorization for %s", modelID)
+	}
+	assertKeyState(terra, "maintenance", "channel_unavailable", "目录未列出")
+	assertKeyState(failedModel, "maintenance", "probe_failed", "连通测试均失败")
+	assertKeyState(verifiedIDs[0], "available", "available", "")
+	body = requireStatus(serve("GET", "/api/v1/student/model-catalog?q="+verifiedIDs[0], studentToken, ""), 200)
+	var search struct{ Data controlplane.ModelCatalogPage }
+	if err := json.Unmarshal([]byte(body), &search); err != nil {
+		t.Fatal(err)
+	}
+	if len(search.Data.Items) != 1 || search.Data.Items[0].RawEntry["availability_state"] != "available" {
+		t.Fatalf("missing student state in directory: %s", body)
+	}
+
+	exec("UPDATE beichen_datasets SET last_success=NULL WHERE credential_id=$1 AND kind='catalog'", beichenCredential)
+	assertKeyState(verifiedIDs[0], "available", "available", "")
+	assertKeyState(terra, "maintenance", "unverified", "尚未扫描")
+	exec("UPDATE beichen_datasets SET last_success=clock_timestamp() WHERE credential_id=$1 AND kind='catalog'", beichenCredential)
+
+	exec("UPDATE beichen_datasets SET last_error='sensitive fixture detail' WHERE credential_id=$1 AND kind='catalog'", beichenCredential)
+	assertKeyState(terra, "maintenance", "unverified", "渠道目录读取失败")
+	assertKeyState(verifiedIDs[0], "available", "unverified", "渠道目录读取失败")
+	exec("UPDATE beichen_datasets SET last_error=NULL, last_success=clock_timestamp()-interval '31 minutes' WHERE credential_id=$1 AND kind='catalog'", beichenCredential)
+	assertKeyState(terra, "maintenance", "unverified", "过期")
+	exec("UPDATE beichen_datasets SET last_success=clock_timestamp() WHERE credential_id=$1 AND kind='catalog'", beichenCredential)
+	exec("UPDATE provider_model_catalog SET status='active' WHERE credential_id=$1 AND model_id=$2", beichenCredential, terraUpstream)
+	assertKeyState(terra, "maintenance", "maintenance", "当前线路无法接通")
+	exec("UPDATE models SET status='inactive' WHERE id=$1", terraID)
+	assertKeyState(terra, "maintenance", "disabled", "老师已停用")
+
+	t.Run("teacher and student block a disabled upstream Key", func(t *testing.T) {
+		exec(`INSERT INTO beichen_website_key_sync(provider_id,status,last_seen)
+VALUES($1,'current',clock_timestamp())`, beichenProvider)
+		defer exec("DELETE FROM beichen_website_key_sync WHERE provider_id=$1", beichenProvider)
+		exec(`INSERT INTO beichen_website_keys(provider_id,upstream_key_id,name,group_id,status,enabled,
+    credential_id,ciphertext_digest,match_status)
+SELECT provider_id,42,'Fixture Key',42,'inactive',false,id,sha256(credential_ciphertext),'matched'
+FROM provider_credentials WHERE id=$1`, beichenCredential)
+
+		target := verifiedIDs[0]
+		view, err := catalog.ReadBeichenCapabilities(ctx, db, beichenProvider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocked := slices.ContainsFunc(view.Capabilities, func(row catalog.ModelCapability) bool {
+			return row.Model == target && row.CredentialID != nil && *row.CredentialID == beichenCredential &&
+				row.GroupStatus == "not_allowed" && row.Availability == "maintenance" &&
+				len(row.AvailableProtocols) == 0 && row.RecommendedProtocol == nil
+		})
+		if !blocked {
+			t.Fatalf("teacher still offers the denied route for %s: %+v", target, view.Capabilities)
+		}
+		var page struct{ Data controlplane.ModelCatalogPage }
+		body := requireStatus(serve("GET", "/api/v1/student/model-catalog?q="+target, studentToken, ""), 200)
+		if err := json.Unmarshal([]byte(body), &page); err != nil || len(page.Data.Items) != 1 ||
+			page.Data.Items[0].RawEntry["availability_state"] != "channel_unavailable" {
+			t.Fatalf("student catalog should also block the denied route: %s (%v)", body, err)
+		}
+	})
+
+	exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+SELECT id,1,42,updated_at FROM provider_credentials WHERE id=$1`, beichenCredential)
+	exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+VALUES($1,1,43,clock_timestamp())`, beichenCredential)
+	assertKeyState(verifiedIDs[0], "available", "unverified", "渠道目录")
 }

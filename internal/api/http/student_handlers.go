@@ -2,8 +2,9 @@ package httpapi
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/starprince1234/Nebula-api/internal/controlplane"
@@ -51,25 +52,38 @@ func (s *Server) studentCommonModels(c *gin.Context) {
 }
 
 func (s *Server) studentModelCatalog(c *gin.Context) {
-	page, pageSize := 1, 20
-	if raw := c.Query("page"); raw != "" {
-		if _, err := fmt.Sscan(raw, &page); err != nil {
-			writeError(c, domain.NewError(domain.CodeValidation, "invalid page"))
-			return
-		}
+	params, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil {
+		writeError(c, domain.NewError(domain.CodeValidation, "目录查询参数编码无效"))
+		return
 	}
-	if raw := c.Query("page_size"); raw != "" {
-		if _, err := fmt.Sscan(raw, &pageSize); err != nil {
-			writeError(c, domain.NewError(domain.CodeValidation, "invalid page_size"))
-			return
-		}
+	page, err := studentCatalogPageValue(params, "page", 1)
+	if err != nil {
+		writeError(c, err)
+		return
 	}
-	result, err := s.service.StudentCatalogSearch(c.Request.Context(), c.Query("q"), page, pageSize)
+	pageSize, err := studentCatalogPageValue(params, "page_size", 20)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	result, err := s.service.StudentCatalogSearch(c.Request.Context(), params.Get("q"), page, pageSize)
 	if err != nil {
 		writeError(c, err)
 		return
 	}
 	respond(c, http.StatusOK, result)
+}
+
+func studentCatalogPageValue(params url.Values, field string, fallback int) (int, error) {
+	if !params.Has(field) {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(params.Get(field))
+	if err != nil {
+		return 0, domain.NewError(domain.CodeValidation, field+" 须为整数")
+	}
+	return value, nil
 }
 
 func (s *Server) addStudentModel(c *gin.Context) {

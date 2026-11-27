@@ -26,6 +26,13 @@ func execCatalogTestSQL(t *testing.T, ctx context.Context, db *sql.DB, query str
 	}
 }
 
+func saveKeyCatalogFixture(ctx context.Context, tx *sql.Tx, job syncJob, entries []catalog.ProviderEntry, at time.Time) error {
+	if _, err := catalog.ReplaceCredentialEntries(ctx, tx, job.provider, job.credential, entries, at); err != nil {
+		return err
+	}
+	return recordSuccess(ctx, tx, job.credential, "catalog")
+}
+
 func saveCatalogFixture(t *testing.T, ctx context.Context, db *sql.DB, provider, credential uuid.UUID, entries []catalog.ProviderEntry, website []string) {
 	t.Helper()
 	tx, err := db.BeginTx(ctx, nil)
@@ -33,7 +40,7 @@ func saveCatalogFixture(t *testing.T, ctx context.Context, db *sql.DB, provider,
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	if err := saveKeyCatalog(ctx, tx, syncJob{provider: provider, credential: credential, kind: "catalog"}, entries, time.Now().UTC()); err != nil {
+	if err := saveKeyCatalogFixture(ctx, tx, syncJob{provider: provider, credential: credential, kind: "catalog"}, entries, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if website != nil {
@@ -247,8 +254,11 @@ VALUES ($1,$5,$8,$9,'old-name','openai_responses','active',9,now(),now()),
 		t.Fatalf("确认结果与预览不一致: %v", err)
 	}
 	if strings.Count(audit.String(), "beichen_bindings_rebuilt") != 1 || !strings.Contains(audit.String(), actor.String()) ||
-		!strings.Contains(audit.String(), provider.String()) || !strings.Contains(audit.String(), preview.PreviewToken) {
-		t.Fatal("重建审计缺少操作人、供应商或变更记录")
+		!strings.Contains(audit.String(), provider.String()) || !strings.Contains(audit.String(), `"change_count":4`) {
+		t.Fatal("重建审计缺少操作人、供应商或变更数量")
+	}
+	if strings.Contains(audit.String(), preview.PreviewToken) || strings.Contains(audit.String(), `"preview_token"`) || strings.Contains(audit.String(), `"changes"`) {
+		t.Fatal("重建审计暴露了预览令牌或变更明细")
 	}
 	var preserved bool
 	err = db.QueryRowContext(ctx, `SELECT

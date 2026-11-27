@@ -23,4 +23,10 @@ describe('console router', () => {
     expect(router.resolve('/mentor/reviews').meta.title).toBe('密钥管理')
     expect(router.resolve('/teacher/projects').meta.title).toBe('项目管理')
   })
+
+  it('registers student usage as a teacher workspace route', () => {
+    const route = router.resolve('/teacher/student-usage')
+    expect(route.name).toBe('teacher-student-usage')
+    expect(route.meta).toMatchObject({ title: '学生用量', role: 'teacher' })
+  })
 })

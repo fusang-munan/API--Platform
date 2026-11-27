@@ -198,7 +198,7 @@ VALUES(gen_random_uuid(),$1,$2,$3,'gpt-web-published','openai_responses',10,now(
 	checkStale(afterFailure)
 	catalog := datasetForCredential(t, afterFailure, keys[gpt], "catalog")
 	billing := datasetForCredential(t, afterFailure, keys[gpt], "billing")
-	if catalog.LastError == nil || *catalog.LastError != "北辰接口返回 HTTP 403" || catalog.LastSuccess == nil ||
+	if catalog.LastError == nil || !strings.Contains(*catalog.LastError, "第 1 页不完整：北辰接口返回 HTTP 403") || catalog.LastSuccess == nil ||
 		!catalog.LastSuccess.Equal(*datasetForCredential(t, beforeFailure, keys[gpt], "catalog").LastSuccess) ||
 		billing.BillingState != "current" || billing.LastError != nil || billing.LastSuccess == nil ||
 		!billing.LastSuccess.After(*datasetForCredential(t, beforeFailure, keys[gpt], "billing").LastSuccess) {

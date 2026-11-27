@@ -192,7 +192,11 @@ func (key listedKey) websiteGroup() WebsiteGroup {
 }
 
 func selectWebsiteKeyCatalog(platforms []directoryPlatform, groupID int64) (websiteKeyCatalog, error) {
-	if groupID <= 0 {
+	return selectWebsiteGroupCatalog(platforms, groupID, true)
+}
+
+func selectWebsiteGroupCatalog(platforms []directoryPlatform, groupID int64, checkPrices bool) (websiteKeyCatalog, error) {
+	if !validWebsiteGroupID(groupID) {
 		return websiteKeyCatalog{}, errPanelGroupUnverified
 	}
 	directory := websiteKeyCatalog{prices: map[string]json.RawMessage{}}
@@ -205,7 +209,9 @@ func selectWebsiteKeyCatalog(platforms []directoryPlatform, groupID int64) (webs
 			if group.ID != groupID {
 				continue
 			}
-			if section.Incomplete || seenPlatforms[section.Platform] ||
+			platform := strings.ToLower(section.Platform)
+			if section.Retained || group.Retained || section.MembershipIncomplete ||
+				(checkPrices && section.Incomplete) || seenPlatforms[platform] ||
 				(section.ChannelStatus != "" && section.ChannelStatus != "active") ||
 				(group.Status != "" && group.Status != "active") ||
 				(group.Platform != "" && group.Platform != section.Platform && group.Platform != "composite") {
@@ -216,18 +222,29 @@ func selectWebsiteKeyCatalog(platforms []directoryPlatform, groupID int64) (webs
 				return websiteKeyCatalog{}, errPanelGroupUnverified
 			}
 			channelID, channel = section.ChannelID, section.Channel
+			// Group observation timing is not a billing rule.
+			group.ObservedAt = nil
 			directory.group, directory.at = group, section.ObservedAt
-			seenPlatforms[section.Platform] = true
+			seenPlatforms[platform] = true
+			seenHere := map[string]bool{}
 			for _, model := range section.Models {
 				if !namesGroup(directoryModelGroups(section, model), groupID) {
 					continue
 				}
 				name := strings.ToLower(model.Name)
-				if _, duplicate := entries[name]; duplicate ||
-					(model.Platform != "" && model.Platform != section.Platform) {
+				if model.Platform != "" && model.Platform != section.Platform {
+					return websiteKeyCatalog{}, errPanelGroupUnverified
+				}
+				if prior, duplicate := entries[name]; duplicate {
+					// Repeated identical names on the same platform can be
+					// deduplicated for a membership-only comparison.
+					if !checkPrices && prior.ID == model.Name && seenHere[name] {
+						continue
+					}
 					return websiteKeyCatalog{}, errPanelGroupUnverified
 				}
 				raw := map[string]any{"id": model.Name, "source": "beichen_website_group", "group_id": groupID}
+				seenHere[name] = true
 				protocols := model.Protocols
 				if protocols == nil {
 					protocols = []string{}
@@ -255,8 +272,10 @@ func selectWebsiteKeyCatalog(platforms []directoryPlatform, groupID int64) (webs
 }
 
 func sameWebsiteGroup(left, right directoryGroup) bool {
-	// OwnModels is a property of the platform projection.
+	// Membership and observation times belong to the individual projection.
 	left.OwnModels, right.OwnModels = false, false
+	left.ObservedAt, right.ObservedAt = nil, nil
+	left.Retained, right.Retained = false, false
 	a, _ := json.Marshal(left)
 	b, _ := json.Marshal(right)
 	return string(a) == string(b)

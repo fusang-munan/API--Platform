@@ -249,6 +249,7 @@ data: {"revision":"01K2..."}
 | GET | `/api/v1/student/organizations` | 列出平台全部 ACTIVE 组织 |
 | GET | `/api/v1/student/organizations/{organization_id}/projects` | 列出该 ACTIVE 组织全部项目，并返回真实状态与 `has_mentor` |
 | GET | `/api/v1/student/models` | 模型广场 |
+| GET | `/api/v1/student/model-catalog` | 搜索可收藏的学校模型 |
 | POST | `/api/v1/student/api-keys` | 提交 Key 申请 |
 | GET | `/api/v1/student/api-keys` | 列出自己的申请和 Key |
 | GET | `/api/v1/student/api-keys/{api_key_id}` | 查看自己的审核详情与进度 |
@@ -259,6 +260,8 @@ data: {"revision":"01K2..."}
 组织和项目列表可供学生浏览。项目列表返回真实状态和 `has_mentor`。提交申请时组织和项目须为 ACTIVE，项目须属于该组织。
 
 模型广场将预置模型与学生个人模型库去重展示。广场及目录搜索展示启用、有正数倍率且已配置线路的模型。目录搜索选中的非预置模型可通过 `POST /api/v1/student/models` 收藏。
+
+目录搜索的 `q` 可省略，最多接收 128 个 Unicode 字符。查询去除首尾空白并忽略大小写，在模型标识、显示名称和描述中做子串匹配。`page` 取 1 至 10000，缺省 1。`page_size` 取 1 至 50，缺省 20。超限、非法编码和非整数分页返回 `400 VALIDATION_ERROR`。响应的 `data` 包含 `items`、`total`、`page` 与 `page_size`，按模型标识排序。有效页码超出结果时返回空 `items` 和实际匹配总数。
 
 提交申请：
 
@@ -314,7 +317,9 @@ data: {"revision":"01K2..."}
 
 ### 5.1 查看和修改 Key 的模型授权
 
-Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场条目都返回 `protocols`、`available_protocols`、`recommended_protocol`、`probe_state`、`availability`、`availability_reason` 和 `last_probe_at`。`protocols` 是已配置且凭据有效的协议，`available_protocols` 是最近探活通过的协议。`availability` 为 `available`、`unverified` 或 `maintenance`，与网关的判断一致。`last_probe_at` 是当前线路最近一次探活的 UTC 时间，含失败结果，缺少有效探活记录时为 `null`。学生目录搜索在 `raw_entry` 中返回这些状态字段。
+Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场条目都返回 `protocols`、`available_protocols`、`recommended_protocol`、`probe_state`、`availability`、`availability_reason` 和 `last_probe_at`。`protocols` 是已配置且凭据有效的协议，`available_protocols` 是最近探活通过的协议。`availability` 为 `available`、`degraded`、`unverified` 或 `maintenance`，与网关的判断一致。`last_probe_at` 是当前线路最近一次探活的 UTC 时间，含失败结果，缺少有效探活记录时为 `null`。学生目录搜索在 `raw_entry` 中返回这些状态字段。
+
+学生模型广场和 Key 的授权模型返回 `availability_state`，目录搜索在 `raw_entry.availability_state` 返回同一状态。`available` 和 `degraded` 表示可用及近期探活异常仍可尝试，`unverified` 表示证据尚未核验，`maintenance` 和 `probe_failed` 分别表示线路维护和已配置线路的探活均失败。`channel_unavailable` 表示可核实的渠道目录均未开放该型号，包含北辰分组明确拒绝、Key 未分组或成功扫描的目录未列出型号的情况。`disabled` 和 `not_published` 来自校内停用和待配置状态。北辰绑定线路和教师能力接口共用分组权限条件。凭据或分组变化后，旧分组的目录记录等待重新核验。历史导入的新鲜 Key 条目可证明该模型已列出，确认未列出需要当前目录的成功快照。
 
 `POST /api/v1/student/api-keys/{api_key_id}/models` 接受 `{"model_ids":["gpt-4.1-mini"]}`，每批 1 至 100 个公开模型 ID。添加要求本人的 `active` Key、有效的项目访问权限及模型报价。已有线路且待验证的模型可新增授权；维护中的模型返回 `MODEL_NOT_READY`。收藏与授权各自独立。
 
@@ -415,6 +420,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 | 生成旧版北辰本机授权 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/account/export` | 供既有脚本使用，提交 `{"confirm":true}` 后返回 `beichen-session.env` |
 | 清除北辰网页登录 | DELETE | `/api/v1/teacher/providers/{provider_id}/beichen/account` | 清除已保存凭证及本机授权，并尝试退出对应的上游会话。已加载的版本交付会话可继续用于学校后台同步 |
 | 抓取北辰官网目录 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/crawl` | 手动更新官网目录，返回本轮抓取摘要 |
+| 预览或确认北辰绑定重建 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/rebind` | 按当前 Key 目录和别名调整绑定 |
 | 北辰校内试算价 | PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/price` | 指定模型手动设价或恢复跟随 |
 | 北辰报价或账单导入 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/import` | 按凭据导入受支持的 CSV |
 
@@ -430,7 +436,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 {"email":"teacher2@example.com"}
 ```
 
-迁移预置北辰供应商。学校部署随后从加密的发布配置建立四条渠道，以官网登录身份关联分组和数字 Key ID。教师模型页读取已同步的可用模型、当前首选线路倍率和启用状态。项目用量按学生、模型汇总。其他供应商可用现有接口配置。
+迁移预置北辰供应商。学校部署随后按发布配置建立启用渠道，以官网登录身份关联分组和数字 Key ID。教师模型页读取已同步的可用模型、当前首选线路倍率和启用状态。项目用量按学生、模型汇总。其他供应商可用现有接口配置。
 
 学校 HTTPS 入口承载控制台、`/api/v1/` 及网关已有的原生协议路由。访问 `GET /teacher/providers`、`GET /student/api-keys` 或 `GET /login` 返回官方 Vue 应用的 HTML；应用使用同源 API 登录、选择身份和检查权限。登录挑战和刷新 Cookie 使用 Secure。读取网页本身不授予教师或学生权限。
 
@@ -458,7 +464,15 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `credentials[].health` 包含 `credential`、`catalog`、`pricing`、`probe` 四个维度，各返回 `state`（`available`、`unavailable` 或 `pending`）和说明 `message`。`available_dimensions` 统计可用项。报价维度按当前可计算报价数判断。探活维度按有至少一种协议通过的模型占可探活模型的比例判断。
 
-`model_catalog[].protocols` 使用网关绑定的协议枚举。`probe_state` 为 `unprobed`、`passed` 或 `failed`。同一模型任一当前 Key 和协议的最近结果通过即为 `passed`。`last_probe_at` 是所有有效最近结果里的最新时间。只有 `catalog_source=key` 的记录提供 Key 覆盖和探活依据；超过 30 分钟未刷新或扫描失败的目录保留展示，但 `probe_state` 回到 `unprobed`，不计入当前覆盖。官网来源和 `website_only` 型号不参与探活比例，也不显示探活结论。发布可达线路数由 `ready_count` 表示。学校已启用但 `ready_count=0` 时，仍需排查的记录返回 `binding_issue`。`price_covered` 表示至少一条启用 Key 有可计算报价，发布时仍逐条检查实际会使用的线路。
+`model_catalog[].bound_routes` 按绑定返回 `school_model`、`upstream_model`、`credential_id`、`credential_label`、`key_enabled`、`protocol`、`priority`、`group_id`、`group_status`、`group_checked_at`、`catalog_state`、`price_state`、`price_covered`、`probe_state` 与最近探活 `probe`。`published` 表示校内模型和绑定已启用。`binding_ready` 还要求当前 Key 和分组的目录可核实。`bound_key_count` 按启用的绑定 Key 去重，`covered_bound_key_count` 只计目录当前确实列出绑定上游名的 Key。`bound_catalog_pending=true` 表示至少一条绑定的目录或分组待复核。`ready_count` 按已发布且就绪的 Key 和协议去重。部分已发布线路失去目录证据也会返回 `binding_issue`。
+
+对 `/beichen/rebind` 发送 `{"preview":true}` 生成预览。返回的 `evidence_versions` 按 Key 排序，包含 `credential_id`、`credential_revision`、`group_id`、`catalog_observed_at` 和 `evidence_since`。`preview_token` 同时绑定这些版本和 `changes`。发送 `{"preview":false,"preview_token":"…"}` 确认。确认时遇到同步锁冲突、目录过期、权限失效或证据及计划变化，返回 `409 INVALID_STATE_TRANSITION` 并回滚全部绑定变更。教师需重新预览。成功日志记录操作人、供应商与变更数量。
+
+`/v1/models` 明确返回 `GROUP_NOT_ALLOWED` 后，当前凭据版本在 `bound_routes` 和能力记录中返回 `group_status=not_allowed` 和 `catalog_state=group_blocked`。这把 Key 的线路退出推荐及报价覆盖。如果已发布模型没有就绪线路，明确的分组拒绝通过 `binding_issue.code=group_not_allowed` 返回，`action_hint` 提示恢复该 Key 的分组权限后重扫。成功读到模型清单就会清除目录扫描的拒绝状态。若清单缩水待核验，教师概览仍会显示目录待复核。
+
+`GET .../beichen/capabilities` 按 Key 和原始上游型号返回 `bindings`、`supported_protocols`、`available_protocols`、`responses_ready`、`recommended_protocol`、`availability` 和报价字段。`responses_ready` 表示存在当前已发布的 Responses 绑定。只有通过当轮探活的协议出现在 `available_protocols`。教师 `/api/v1/teacher/models` 的北辰线路复用同一协议判定。概览的 `route_availability` 汇总已发布线路，缺少当前绑定或探活证据时显示待核实。探活和报价都核对当前凭据版本及已知换组时间。陈旧目录保留供核对，`price_covered` 为 `false`，等待符合当前证据的探活。
+
+已发布型号的 `price_covered` 表示至少一条当前已发布且就绪的线路有可计算报价。待配置型号按绑定或可用的 Key 目录判断。手动价及可按 Token 计算的 `conditional` 都计入。通过缺价字段可核查反推价和缺字段的档位。批量启用逐条验证启用后的线路。
 
 线路就绪且报价阻止启用时，`model_catalog[].price_blocker` 返回 `{code, message}`，其中 `message` 说明涉及的字段及适用的档位号。常见代码包括 `missing_price`、`billing_mode_non_token`、`price_conditions_invalid`、`tier_missing_input`、`tier_missing_output`、`tier_range_invalid` 和 `effort_multiplier_invalid`。线路未就绪时，查看 `blockers` 中的 `no_ready_route`。
 
@@ -468,11 +482,11 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 带上下文倍率的官网报价保留 `intervals` 中的四项倍率和档位标签。`price_conditions_exact` 将倍率应用到基础单价，并使用下限包含、上限不包含的边界。未命中该类档位时使用基础价。`website_directory.price_unit` 为「元（北辰余额单位）」。官网报价按 1:1 读取，界面上的 `$` 不触发货币换算。
 
-`website_directory` 返回完整官网目录状态、`last_success` 和 `last_error`。`fresh` 表示近期完整采集，`stale` 表示当前使用部分更新或保留的快照，`unverified` 表示等待取得官网目录。`model_catalog` 合并官网与启用 Key 的目录，并保留已发布但失去目录覆盖的模型。`source` 为 `website`、`key` 或 `both`。`catalog_state` 为 `key_listed`、`website_only`、`published_unavailable` 或 `catalog_missing`。`key_count` 等于 `current_key_count`，只统计当前 `/v1/models` 的 Key 目录证据；`current_key_count` 按 `catalog_keys[].state=listed` 且非陈旧的 Key 去重，`stale_key_count` 统计扫描失败或超过 30 分钟未刷新、沿用上次结果的 Key，两者为零时省略。`catalog_keys[].stale` 标记这些保留条目；它们保留展示，但不计入 `current_key_count` 和 `key_count`，`probe_state` 也回到 `unprobed`。目录表 `provider_model_catalog.catalog_source` 区分 `key` 和 `website`，迁移 `0061_provider_catalog_source.sql` 新增非空列并默认 `key`，同时把旧 `raw_entry->>'source'='beichen_website_group'` 的行回填为 `website`。
+`website_directory` 返回完整官网目录状态、`last_success` 和 `last_error`。`fresh` 表示近期完整采集，`stale` 表示当前使用部分更新或保留的快照，`unverified` 表示等待取得官网目录。`model_catalog` 合并官网与启用 Key 的目录，并保留已发布但失去目录覆盖的模型。`source` 为 `website`、`key` 或 `both`。`catalog_state` 为 `key_listed`、`website_only`、`published_unavailable` 或 `catalog_missing`。`key_count` 等于 `current_key_count`，只统计当前 `/v1/models` 的 Key 目录证据；`current_key_count` 按 `catalog_keys[].state=listed` 且非陈旧的 Key 去重，`stale_key_count` 统计扫描失败或超过 30 分钟未刷新、沿用上次结果的 Key，两者为零时省略。`catalog_keys[].stale` 标记这些保留条目；这些条目保留供核对，退出 `current_key_count` 和 `key_count`。每条线路的探活状态取该线路当前有效的证据。目录表 `provider_model_catalog.catalog_source` 区分 `key` 和 `website`，迁移 `0061_provider_catalog_source.sql` 新增非空列并默认 `key`，同时把旧 `raw_entry->>'source'='beichen_website_group'` 的行回填为 `website`。
 
 `catalog_state=published_unavailable` 表示该模型曾发布（校内模型已启用、存在绑定或保留的绑定异常），但当前启用的渠道 Key 都没有在 `/v1/models` 列出它。学校仍需排查的记录保留在主表异常筛选，`binding_issue.code` 通常为 `catalog_missing` 或 `catalog_stale`，后者表示只剩陈旧的 Key 目录记录。`website_only` 型号汇总在 `website_only_models`。
 
-`model_catalog[].retired` 仅在作废时返回 `true`。有校内目录或绑定记录、关联渠道均停用，且同型号的北辰绑定均已停用时，概览可标记该行作废并省略 `binding_issue`。教师只在「模型管理 → 全部模型」的「全部」筛选中看到「已作废」行，并可查看历史用量。启用渠道的目录或绑定、启用供应商上同一校内模型的其他启用绑定、关联型号的启用接替 Key，以及官网归并匹配的启用 Key 均保留原有展示。换 Key 后仍启用的旧绑定继续显示维护提示。陈旧目录仍是关联启用渠道的证据。仅官网可见的型号继续按官网目录展示。
+`model_catalog[].retired=true` 表示校内历史目录和绑定关联的渠道已停用，且没有其他启用线路、启用别名或待核对的接替 Key。`historical_channels` 为去重后的原渠道。仍启用的旧绑定留在异常筛选，便于换绑。概览保留作废型号，独立的 `GET .../beichen/capabilities` 不将同一作废集合列入 `capabilities` 和 `gaps`。批量启用、当前模型计数及筛选均排除作废型号。教师从「模型管理 → 已作废」读取历史用量。
 
 `website_directory.last_run` 是最近一次后台抓取的摘要，尚无运行记录时为 `null`。摘要包含 `started_at`、`duration_ms`、`platform_count`、`group_count`、`model_count`、`expected_model_count` 和 `failures`。同一平台出现在不同渠道下时分别计数。模型按去掉首尾空白的官网原名去重，保留大小写及版本差异。分组按照分组 ID 去重，没有 ID 时用渠道内的平台和分组名识别。`expected_model_count` 含原响应中所有 `models` 和 `supported_models` 数组中能辨认的型号。当平台资料损坏时，本轮成功归入平台的模型数可能低于它。失败项提供 `path`、`reason` 以及可读取的 `channel_id`、`channel` 和 `platform`。
 
@@ -485,6 +499,8 @@ Key 证据不足时，标准余额计费、分组默认倍率有效且高峰开�
 `website_locations` 带官网原名、渠道、平台、分组、采集时间、缓存状态、`price_scope` 和报价存在标记。`price_scope=platform` 表示平台级共享基础价，可用于同一平台同名型号的跨组回退；`price_scope=group` 表示分组专属价，只能用于该分组本身；缺少该字段的旧数据按分组专属价处理。`price_complete` 表示该官网报价具备所声明计价方式的必要单价，`has_price` 表示至少找到一个数值单价。`catalog_keys` 带实际覆盖的 Key 及上游型号，或者给出需要核查的 Key。`state` 可为 `listed`、`missing`、`pending`、`failed` 或 `ambiguous`。已覆盖条目用 `match` 说明原名、名称归一或教师别名，并保留独立的 Key 型号 ID 供教师操作。弱匹配可以识别唯一的日期版本，保留型号数字和具有实际含义的变体。当前 Key 的报价待确认时，官网价栏显示已读到的完整报价及其所属分组。当前 Key 分组没有自己的完整官网价表时（如分组 16），上游基础价取同一平台公开的 `group_id=0` 同名型号报价，再乘当前 Key 生效倍率（测试样例为 0.60）；其他分组的专属报价不当作基础价。学生实价继续乘学校 1.10 系数。
 
 `catalog_differences` 按启用 Key 返回已知分组、核对时间、`website_only` 和 `key_only`。官网分组与当前 Key 目录均可对比时标为 `compared`。比较使用保留的官网数据时标为 `stale`。缺少一方证据时标为 `unverified`。`website_only_models` 汇总当前 Key 均未匹配的官网型号及候选渠道，`website_only_status` 表示该汇总的核对状态。
+
+`website_directory.groups` 按平台和分组返回 `observed_at` 与 `retained`。`retained=true` 表示整组或组内部分型号沿用以前的快照。`incomplete` 表示该片段本轮未完整解析。`website_directory.last_run.failures` 记录待核验的平台及其连续确认轮数，也会单独记录报价错误。覆盖待核验时 `expected_model_count` 纳入前一次保存的覆盖规模，已确认下线的平台退出快照。抓取所用的数据库网页登录或版本交付会话在保存前更换时，`failures` 出现 `path=session`，已保存的目录标记为 `stale`，展示上次成功时间。`kind=catalog` 的 `last_error` 会说明目录缩水的确认进度或模型分页失败的页码。对 Key 日用量，`kind=key_usage` 的 `last_error` 及 Key 用量错误可列出失败账日、页码和沿用快照的采集时间。
 
 探活 POST 返回任务对象，GET 返回 `{run, results}`。概览中的 `probe_run` 使用相同任务对象。任务对象含 `state`（`idle`、`queued`、`running`、`completed` 或 `failed`）、`started_at`、`finished_at` 和 `error_code`。同一供应商在排队或执行时收到重复 POST 会合并。没有启用且已同步目录的 Key 时 POST 返回 400，供应商不存在或并非北辰时返回 404。未登录返回 401，角色不符返回 403。两个接口均返回 `Cache-Control: private, no-store`。
 
@@ -524,11 +540,17 @@ Key 证据不足时，标准余额计费、分组默认倍率有效且高峰开�
 
 #### 北辰官网 Key 清单
 
-清单和刷新接口要求教师登录。GET 只读取学校数据库。POST 使用已配置的网页会话读取北辰 `GET /api/v1/keys?page=1&page_size=100` 并检查分页完整性。密钥页仅给出分组 ID 或分组明细不全时，由 `GET /api/v1/channels/available` 按同一个 ID 补全。
+清单和刷新接口要求教师登录。GET 只读取学校数据库。POST 使用已配置的网页会话读取北辰 `GET /api/v1/keys?page=1&page_size=100` 并检查分页完整性。总数变化、分页结构异常或上游服务错误时最多从第一页重读一次。密钥页仅给出分组 ID 或分组明细不全时，由 `GET /api/v1/channels/available` 按同一个 ID 补全。
 
 `data.status` 为 `unsynced`、`current`、`stale`、`session_expired` 或 `unavailable`。成功时 `last_seen` 更新为读取时间。北辰返回 401 或会话已知过期时返回 `session_expired`，保留最近成功的清单及时间。已保存的清单超过 30 分钟未更新时显示 `stale`。并发刷新返回 `invalid_transition`。
 
-`data.keys` 的每一项包含北辰 `id`、`name`、脱敏后的 `key_prefix`、`group_id`、`group_name`、分组倍率 `rate`、`status`、`enabled`、`created_at`、`last_seen`、匹配的学校 `credential_id` 和 `match_status`。`peak` 包含 `enabled`、`rate`、`start` 和 `end`，取官网 Key 页的 `group.peak_rate_enabled`、`group.peak_rate_multiplier`、`group.peak_start` 和 `group.peak_end`。倍率用十进制字符串传输，未知字段为 `null`。匹配状态为 `matched`、`unmatched` 或 `ambiguous`。
+清单读取失败时可返回 `last_error` 及 `failed_page`。`last_seen` 仍表示最近一次完整成功的观察。完整清单存在渠道归属疑问时，`match_issues` 按原因统计渠道数。`insufficient_key_evidence` 表示遮罩证据不足或无匹配项，`tied_website_candidates` 表示多个同强度候选，`multiple_school_credentials` 表示多个校内渠道指向同一官网 Key。
+
+多页 Key 清单的两次完整读取结果不一致时，同步状态为 `unavailable`，`last_error` 提示待核验，`failed_page` 指向复读时首先发现差异的位置。返回上次已保存的 `keys` 和 `last_seen`。
+
+读取 Key 清单所用的网页会话在保存前更换时，同步状态为 `unavailable`，`last_error` 提示会话已更换，并返回上次已保存的 `keys` 和 `last_seen`。数据库保存的会话和版本交付的会话均采用此规则。
+
+`data.keys` 的每一项包含北辰 `id`、`name`、脱敏后的 `key_prefix`、`group_id`、`group_name`、分组倍率 `rate`、`status`、`enabled`、`created_at`、`last_seen`、匹配的学校 `credential_id` 和 `match_status`。`peak` 包含 `enabled`、`rate`、`start` 和 `end`，取官网 Key 页的 `group.peak_rate_enabled`、`group.peak_rate_multiplier`、`group.peak_start` 和 `group.peak_end`。倍率用十进制字符串传输，未知字段为 `null`。匹配状态为 `matched`、`unmatched` 或 `ambiguous`。教师模型页按清单时效以及校内启用 Key 的匹配状态提示刷新，另列官网仍启用且未匹配校内 Key 的条目。
 
 `observed_at` 是当前分组、倍率和高峰规则版本首次读到的时间。`changed_at` 是当前版本与上一版本发生变化时的抓取时间，首次建立基线或尚未采集版本时为 `null`。`last_seen` 随每次成功读取推进，便于判断数据是否新鲜。两次抓取之间发生的变化以实际读到的时间登记。
 
@@ -822,7 +844,90 @@ Anthropic-compatible 示例：
 
 ## 9. 用量与监控接口
 
-学生使用 `GET /api/v1/student/usage?month=YYYY-MM` 查看每个 API Key 的模型 credit 分解。
+### 学生月度用量
+
+`GET /api/v1/student/usage?month=YYYY-MM` 使用北京时间账月。省略 `month` 时取本月。调用在受理时归入账月，之后补记仍更新原账月。需要学生身份，响应范围为当前学生在所属项目中的 Key。
+
+| 位置 | 字段与类型 | 含义 |
+| --- | --- | --- |
+| `data` | `month: string`、`projects: array`、`models: array`、`totals: object` | `projects` 保留项目 → Key → 模型结构。`models` 按模型 ID 合并本人所有项目和 Key。 |
+| `projects[]` | `project_id`、`project_name`、`quota`、`used`、`pending`、`available`、`in_flight_credits` 均为字符串，另有 `keys: array`、`calls: number` | `available` 为该学生在此项目内的个人余额。 |
+| `projects[].keys[]` | `id`、`name`、`status`、`used`、`pending`、`in_flight_credits`、`available_effective`、`project_member_available` 均为字符串，另有 `models: array`、`calls: number`、`pending_calls: number`、`available?: string` | `available` 为旧 Key 月桶余额，无该月桶时省略。停用 Key 有该月已结算或零额调用、待核、在途占用或可汇总 Token 时仍显示。 |
+| 两处模型数组项 | `id: string`、`name: string`、`credits: string`、`calls?: number` | 模型 ID 为公开模型标识，名称保留调用时记录的名称。保留原有 `calls` 口径和零值省略行为。 |
+| `totals` | `credits: string`、`calls: number` | 所有可见 Key 的模型账本积分和次数汇总，范围与 `data.models` 一致。空数组返回 `[]`。 |
+
+`calls` 来自月账本，包含已结算的正额与零额调用。金额先在服务端按十进制精确求和，返回字符串并至少保留三位小数，例如 `"0.00040000000000001"`。跨项目或跨 Key 显示同一模型时，可直接使用 `data.models` 中的汇总值。最近调用 `GET /api/v1/student/usage/recent` 是按创建时间查询的分页明细，包含处于不同结算状态的请求。对比月度金额和次数时使用同一账月的 `totals` 与 `models`。
+
+展示选定 Key 的有效可用积分时读取 `available_effective`。项目个人额度和项目总额度分别扣除已用与在途占用后，取较小值并以零为下限。`project_member_available` 等于所属项目条目的 `available`。字段描述有费用请求的积分条件。实际调用还要满足 Key 与模型状态、授权及并发等条件。全部项目的在途占用取各项目的 `in_flight_credits`，待核笔数与预留取 `totals` 的待核字段。
+
+项目、Key、模型及 `totals` 还包含下列字段。
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `tokens` | 对象，`input`、`output`、`cache_read`、`cache_write`、`total` 每项为整数十进制字符串或 `null` | 输入为拆分后的净输入，已归类的缓存读写分别计入对应字段。分项返回已有证据的合计，无证据为 `null`，显式 0 为 `"0"`。已知总量可以包含无法分入四项的 Token。 |
+| `completeness` | `"complete"`、`"partial"` 或 `"unknown"` | 全部样本的四项证据完整且与已报告总量相符时为 `complete`。有证据但存在缺项时为 `partial`。无可用证据时为 `unknown`。 |
+| `token_coverage` | 对象，`calls`、`known_calls`、`complete_calls` 为整数，`unclassified_tokens` 为整数十进制字符串或 `null` | 样本包括已结算、待核以及另有 Token 证据的已结束调用。原始记录已清理的历史已结算调用也计入样本总数。`known_calls` 是有任一项 Token 证据的次数。`unclassified_tokens` 是已知总量中无法拆入四项的数量，无证据为 `null`。 |
+| `cache_hit_rate` | 0 到 1 的数字或 `null` | 在净输入和缓存读均有证据、且两项之和大于零的同一批样本中，以总缓存读除以总净输入加总缓存读。无样本时为 `null`。 |
+| `cache_hit_coverage` | 对象，`sample_calls` 为整数，`cache_read_tokens`、`input_with_cache_read_tokens` 为整数十进制字符串或 `null` | 命中率的样本数、分子及分母。可与 `token_coverage.calls` 对比覆盖情况。无样本时分子和分母为 `null`。 |
+| `pending_review_calls`、`pending_review_credits` | 整数、十进制字符串 | 本账月北辰 `pending_review` 的调用笔数及预留积分合计。预留金额会随核账进度更新，核账完成后退出待核统计。 |
+
+项目和 Key 的 `in_flight_credits` 与旧字段 `pending` 等值，均为受理时在月桶里的在途占用。`available` 沿用额度扣除已用和在途占用的口径。Key 的 `pending_calls` 是 `pending_review_calls` 的兼容别名。项目与 Key 的旧布尔字段 `pending_review` 在有待核调用时为 `true`，无待核调用时省略。待核积分可能为零，此时仍以笔数判断是否有待核调用。
+
+### 教师按学生用量
+
+教师在控制台「学生用量」`/teacher/student-usage` 查看每位学生的用量，并展开项目、Key 和模型。两个接口均校验教师登录及当前账号状态，返回 `Cache-Control: private, no-store`。查询只能读取账本和用量证据。
+
+| 路由 | 查询参数 |
+| --- | --- |
+| `GET /api/v1/teacher/usage/students` | `month=YYYY-MM`，`project_id`，`search`（128 字以内，按姓名或邮箱做大小写无关的文字包含匹配），`page`（默认 1），`page_size`（默认 20，最大 100），`sort=credits\|calls\|tokens`（默认 `credits`），`order=asc\|desc`（默认 `desc`）。 |
+| `GET /api/v1/teacher/usage/students/{user_id}` | `month=YYYY-MM`，`project_id`。 |
+
+省略账月时取北京时间本月，省略项目时取所有项目。调用受理时存下的 `user_id` 和账月决定历史归属。停用学生、移出项目或历史 Key 缺少当前资料时，仍按保存的归属统计。项目数和 Key 数只计所选范围内有已结算、零额、待核或可汇总 Token 的项目和 Key。列表先筛选并按原始数值排序，同值按 `user_id` 排序，Token 未知的行排在最后。`total` 是筛选后的总人数，超过末页返回空 `items` 并保留该人数。
+
+列表成功响应示例
+
+```json
+{
+  "data": {
+    "month": "2025-01",
+    "items": [{
+      "user_id": "018a0000-0000-7000-8000-000000000001",
+      "user_name": "学生甲",
+      "user_email": "student@example.test",
+      "project_count": 2,
+      "key_count": 4,
+      "credits": "0.70000000000000007",
+      "calls": 8,
+      "zero_cost_calls": 1,
+      "total_tokens": "1110",
+      "completeness": "partial",
+      "pending_review_calls": 1,
+      "pending_review_credits": "7.000",
+      "last_call_at": "2025-01-31T16:00:01Z"
+    }],
+    "page": 1,
+    "page_size": 20,
+    "total": 1,
+    "unattributed_upstream": {
+      "rows": 4,
+      "debit_rows": 3,
+      "balance_debit": "0.000000000000000003"
+    }
+  },
+  "request_id": "example"
+}
+```
+
+- `calls` 是已结算调用数，包含扣费调用及 `zero_cost_calls`。待核笔数和预留积分由 `pending_review_*` 提供。积分保留实际精度并至少显示三位小数。
+- `total_tokens` 是已知 Token 合计，无证据时为 `null`。最近调用时间是纳入统计的逐笔记录里最晚的 `created_at`，仅存月账本时为 `null`。账号资料缺失时显示历史姓名和 `user_email: null`。
+- `unattributed_upstream` 按上游 `occurred_at` 取同一北京时间账月的**全校**已归档数据，独立于项目、搜索、排序和分页。 `rows` 为暂无可核验学生归属的归档笔数。已核验回执只确认对应的流水行。缺回执时，无冲突的响应编号和派发快照必须能唯一定位一条归档流水。 `debit_rows` 为有可确认的余额扣款笔数，`balance_debit` 为余额单位的十进制合计，无扣款证据时为 `null`。已确认余额扣款为零也计入 `debit_rows`。
+- 列表按账月及所选项目在服务端复用最多 5 秒的快照。学生汇总和全校未归属金额来自同一次读库快照，搜索、排序和翻页可复用快照。超过 10000 名学生的范围由数据库直接精确分页。明细实时读取，列表与明细刷新时间可相差一个缓存窗口。列表读库超过 3 秒返回 `503 DEPENDENCY_UNAVAILABLE`。
+
+明细返回 `data.user_id`、`data.user_name`、`data.user_email`、`month`、`totals`、`projects[].keys[].models[]`、`models[]`，各层提供 `zero_cost_calls`。 `projects[].used` 和 `keys[].used` 取同一范围的月账本合计。额度、在途占用及 `available` 按历史账月的额度桶读取。缺少当前 Key 资料时，使用快照名称及 `status: "unknown"`。接口返回 Key 标识、名称和状态等报表字段。
+
+无登录凭证时返回 `401 AUTHENTICATION_REQUIRED`，非教师和停用账户返回 403。无效月份、UUID、分页值或枚举返回 `400 VALIDATION_ERROR`。明细范围内无用量返回 `404 RESOURCE_NOT_FOUND`，读库异常返回 `503 DEPENDENCY_UNAVAILABLE`。
+
+### 学生单笔回执
 
 学生使用 `GET /api/v1/student/usage/calls/{request_id}` 查自己的一笔北辰消费。请求编号取自学校网关响应头 `X-Request-ID`。金额以十进制字符串返回，缺失值为 `null`。
 
@@ -832,12 +937,17 @@ Anthropic-compatible 示例：
 | `school_multiplier`、`charged_credits` | 请求发出时确定的学校系数和学生实际用掉的积分。由学校接管的四条北辰渠道在新请求上使用 1.10。其他凭据及历史派发保留原系数。 |
 | `actual_cost`、`receipt_applied` | 能关联的北辰原始实扣，以及本次是否依据回执完成补记。1 个北辰余额单位折合 1 元人民币或 100 个基础积分。 |
 | `request_id`、`model_id`、`channel`、`billing_state` | 请求归属和当前结算状态。 |
+| `model_name`、`created_at` | 调用时的模型名称和 UTC RFC3339 请求创建时间，均为字符串。 |
+| `input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens`、`total_tokens` | 与月度接口相同的本地逐笔拆分口径，已知值为整数十进制字符串，缺项为 `null`。 |
+| `usage_state`、`usage_reason` | 网关记录的 Token 证据状态及缺项原因。无状态时省略 `usage_state`，无原因时 `usage_reason` 为 `null`。 |
+
+匿名返回 401，其他身份返回 403。在本人范围内找不到唯一、可读的北辰调用时统一返回 404，包含本人请求编号重用、他人的调用和其他供应商的调用。
+
+### 项目用量与监控
 
 教师使用 `PATCH /api/v1/teacher/projects/{project_id}/members/{user_id}/monthly-credit-quota` 调整学生的项目月额度。请求必填积分字符串 `monthly_credits`，可选 `quota_change_reason` 记录原因，成功返回 HTTP 204。学生用完当月个人额度后，新网关请求返回 `member_quota_exceeded`。已发出的请求按实际用量结算。
 
 项目用量的 `members[].pending` 返回月桶中仍预留、尚未结算的积分十进制字符串（`pending_milli × 0.001`），与 `pending_review` 布尔状态区分；教师调整额度时可连同已用金额计算可下调的下限。
-
-匿名返回 401，其他身份返回 403。在本人范围内找不到唯一、可读的北辰调用时统一返回 404，包含本人请求编号重用、他人的调用和其他供应商的调用。
 
 导师使用 `GET /api/v1/mentor/projects/{project_id}/usage` 查看项目额度分配、成员 Key 进度与实际开销；`GET /api/v1/mentor/call-logs` 和 `GET /api/v1/mentor/input-monitor` 使用游标分页与项目范围授权。完整输入仅在详情读取时返回并写访问审计。
 
@@ -848,7 +958,6 @@ Anthropic-compatible 示例：
 ## 10. 明确排除项
 
 - 不实现余额、RPM、Token 限制、通知中心或模型价格。
-- 不提供老师浏览项目成员或 ACTIVE Key 的接口。
 - 不提供资源删除接口。
 - 不代理 Files、Uploads、Batches、Fine-tuning 或 Assistants/Threads 等有状态资源 API；这些接口没有可在每个请求中稳定取得的公开 model，若未来纳入必须新增资源 ID 到 Binding 的完整归属状态与授权契约，不能按默认 Binding 猜测上游。
 - 不提供旧路由兼容层、别名、双写或 internal usage/monitor 路由。

@@ -2,6 +2,7 @@ package beichen
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net/http"
 	"net/mail"
@@ -20,7 +21,9 @@ type webSession struct {
 	email, password   string
 	mu                sync.Mutex
 	access, refresh   string
+	generation        uint64
 	renewAt           time.Time
+	legacyRejected    bool
 	lastError         error
 	humanVerification atomic.Bool
 	retryAt           time.Time
@@ -48,6 +51,11 @@ func (s *Service) ConfigureWebSession(email, password string) error {
 // normal human verification. The access token is used until its recorded
 // expiry; the refresh token renews it without another password login.
 func (s *Service) ConfigureWebSessionTokens(email, access, refresh string, expiresAt time.Time) error {
+	return s.configureWebSessionTokens(email, access, refresh, expiresAt, nil)
+}
+
+func (s *Service) configureWebSessionTokens(email, access, refresh string, expiresAt time.Time,
+	save func(access, refresh string, expiresAt time.Time) error) error {
 	email = strings.TrimSpace(email)
 	access, refresh = strings.TrimSpace(access), strings.TrimSpace(refresh)
 	addr, err := mail.ParseAddress(email)
@@ -56,31 +64,45 @@ func (s *Service) ConfigureWebSessionTokens(email, access, refresh string, expir
 		return errors.New("北辰网页会话需要有效的账号邮箱、双令牌和到期时间")
 	}
 	renewAt := expiresAt.Add(-time.Minute)
-	if renewAt.Before(s.now()) {
-		renewAt = s.now()
+	if now := s.now(); renewAt.Before(now) {
+		renewAt = now
 	}
-	s.webAccount = &webSession{email: email, access: access, refresh: refresh, renewAt: renewAt}
+	account := s.webAccount
+	if account == nil {
+		// Install the first session before starting workers. Replacements
+		// retain this object and serialize with refresh and snapshot commits.
+		s.webAccount = &webSession{email: email, access: access, refresh: refresh,
+			generation: 1, renewAt: renewAt, expiresAt: expiresAt, save: save}
+		return nil
+	}
+	account.mu.Lock()
+	defer account.mu.Unlock()
+	account.email, account.password = email, ""
+	account.save, account.savePending = save, false
+	account.installTokens(access, refresh, expiresAt, renewAt)
 	return nil
 }
 
-// ConfigureSavedWebSession loads the current session before any workers start.
+// ConfigureSavedWebSession installs the delivered capture or its saved rotation.
 func (s *Service) ConfigureSavedWebSession(store *schoolseal.SessionStore) error {
 	session, err := store.Load()
 	if err != nil {
 		return err
 	}
-	if err := s.ConfigureWebSessionTokens(session.WebEmail, session.WebAccess, session.WebRefresh, session.WebExpiresAt); err != nil {
-		return err
-	}
-	s.webAccount.save = store.Save
-	return nil
+	return s.configureWebSessionTokens(session.WebEmail, session.WebAccess, session.WebRefresh, session.WebExpiresAt, store.Save)
 }
 
 func (s *Service) WebSessionConfigured() bool { return s.webAccount != nil }
 
 func (s *Service) deliveredWebSessionConfigured() bool {
+	account := s.webAccount
+	if account == nil {
+		return false
+	}
+	account.mu.Lock()
+	defer account.mu.Unlock()
 	// Only ConfigureSavedWebSession installs a rotation store for a release capture.
-	return s.webAccount != nil && s.webAccount.save != nil
+	return account.save != nil
 }
 
 func (s *Service) SetWebSessionError(err error) { s.webSessionErr = err }
@@ -92,26 +114,64 @@ func (s *Service) WebSessionError() string {
 	return s.webSessionErr.Error()
 }
 
+// The bearer-only callback used by the fallback path can report the version
+// of its actual read to the snapshot writer, including after a 401 retry.
+type capturedWebVersionKey struct{}
+
 func readWithCapturedWebSession[T any](ctx context.Context, s *Service, read func(string) (T, error)) (T, error) {
-	var zero T
-	token, err := s.webPanelToken(ctx)
-	if err != nil {
-		return zero, err
+	version, _ := ctx.Value(capturedWebVersionKey{}).(*[]byte)
+	return readWithCapturedPanelSession(ctx, s, true, func(auth panelAuthorization) (T, error) {
+		if version != nil {
+			*version = auth.tokenVersion
+		}
+		return read(auth.bearer)
+	})
+}
+
+// Captured sessions use an 8-byte generation in panelAuthorization.tokenVersion.
+// A successfully decrypted database version is AES-GCM ciphertext (at least
+// 28 bytes for its nonce and tag), so the representations cannot overlap.
+const capturedWebVersionSize = 8
+
+func readWithCapturedPanelSession[T any](ctx context.Context, s *Service, retry bool,
+	read func(panelAuthorization) (T, error)) (T, error) {
+	for {
+		bearer, generation, err := s.webPanelAccess(ctx, false)
+		if err != nil {
+			var zero T
+			return zero, err
+		}
+		auth := panelAuthorization{bearer: bearer}
+		if generation != 0 {
+			auth.tokenVersion = binary.BigEndian.AppendUint64(nil, generation)
+		}
+		value, err := read(auth)
+		if !panelAuthFailed(err) {
+			return value, err
+		}
+		s.rejectCapturedWebSession(bearer, generation)
+		if !retry {
+			return value, err
+		}
+		retry = false
 	}
-	value, err := read(token)
-	if !panelAuthFailed(err) {
-		return value, err
+}
+
+func (s *Service) rejectCapturedWebSession(bearer string, generation uint64) {
+	account := s.webAccount
+	if account == nil {
+		return
 	}
-	s.webReadError(token, upstreamHTTPStatus(http.StatusUnauthorized))
-	token, err = s.webPanelToken(ctx)
-	if err != nil {
-		return zero, err
+	account.mu.Lock()
+	defer account.mu.Unlock()
+	if bearer == account.access {
+		// Key reads may also report a bearer-only rejection. Resolve it here
+		// using the generation actually sent with the request.
+		account.legacyRejected = false
+		if generation == account.generation {
+			account.renewAt = time.Time{}
+		}
 	}
-	value, err = read(token)
-	if panelAuthFailed(err) {
-		s.webReadError(token, upstreamHTTPStatus(http.StatusUnauthorized))
-	}
-	return value, err
 }
 
 // A protected endpoint can reject a session before its advertised expiry. Only
@@ -121,7 +181,9 @@ func (s *Service) webReadError(bearer string, err error) error {
 	if account != nil && errors.Is(err, upstreamHTTPStatus(http.StatusUnauthorized)) {
 		account.mu.Lock()
 		if bearer == account.access {
-			account.renewAt = time.Time{}
+			// Bearer-only readers can request renewal for their next attempt.
+			// Versioned readers handle rejections using their own generation.
+			account.legacyRejected = true
 		}
 		account.mu.Unlock()
 	}
@@ -129,31 +191,39 @@ func (s *Service) webReadError(bearer string, err error) error {
 }
 
 func (s *Service) webPanelIdentity() string {
-	if s.webAccount == nil {
+	account := s.webAccount
+	if account == nil {
 		return ""
 	}
-	return s.webAccount.email
+	account.mu.Lock()
+	defer account.mu.Unlock()
+	return account.email
 }
 
 func (s *Service) webPanelToken(ctx context.Context) (string, error) {
+	bearer, _, err := s.webPanelAccess(ctx, true)
+	return bearer, err
+}
+
+func (s *Service) webPanelAccess(ctx context.Context, useLegacyRejection bool) (string, uint64, error) {
 	account := s.webAccount
 	if account == nil {
-		return "", nil
+		return "", 0, nil
 	}
 	account.mu.Lock()
 	defer account.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if err := account.saveRotation(); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	now := s.now()
-	if account.access != "" && now.Before(account.renewAt) {
-		return account.access, nil
+	if account.access != "" && now.Before(account.renewAt) && (!useLegacyRejection || !account.legacyRejected) {
+		return account.access, account.generation, nil
 	}
 	if account.lastError != nil && (account.retryAt.IsZero() || now.Before(account.retryAt)) {
-		return "", account.lastError
+		return "", 0, account.lastError
 	}
 
 	var tokens webTokens
@@ -168,13 +238,13 @@ func (s *Service) webPanelToken(ctx context.Context) (string, error) {
 		if account.password == "" {
 			account.lastError = errWebSignIn
 			account.humanVerification.Store(true)
-			return "", account.lastError
+			return "", 0, account.lastError
 		}
 		tokens, err = s.requestWebTokens(ctx, "login", map[string]string{"email": account.email, "password": account.password})
 	}
 	if err != nil {
 		if ctx.Err() != nil {
-			return "", ctx.Err()
+			return "", 0, ctx.Err()
 		}
 		account.lastError = err
 		account.retryAt = now.Add(2 * time.Minute)
@@ -187,22 +257,30 @@ func (s *Service) webPanelToken(ctx context.Context) (string, error) {
 		case errors.Is(err, upstreamHTTPStatus(http.StatusTooManyRequests)):
 			account.retryAt = now.Add(15 * time.Minute)
 		}
-		return "", account.lastError
+		return "", 0, account.lastError
 	}
 	ttl := webSessionTTL(tokens.Lifetime)
 	if tokens.Refresh == "" {
 		tokens.Refresh = account.refresh
 	}
-	account.access, account.refresh = tokens.Access, tokens.Refresh
-	account.expiresAt = now.Add(ttl)
-	account.renewAt = now.Add(ttl - min(time.Minute, ttl/5))
-	account.lastError = nil
-	account.humanVerification.Store(false)
+	account.installTokens(tokens.Access, tokens.Refresh, now.Add(ttl), now.Add(ttl-min(time.Minute, ttl/5)))
 	account.savePending = account.save != nil
 	if err := account.saveRotation(); err != nil {
-		return "", err
+		return "", 0, err
 	}
-	return account.access, nil
+	return account.access, account.generation, nil
+}
+
+// Called under mu after a successful login, refresh or explicit replacement.
+// A refresh may rotate only its refresh credential, so bearer equality alone
+// is insufficient. Retrying a failed request or durable write never calls this.
+func (account *webSession) installTokens(access, refresh string, expiresAt, renewAt time.Time) {
+	account.access, account.refresh = access, refresh
+	account.expiresAt, account.renewAt = expiresAt, renewAt
+	account.generation++
+	account.lastError, account.retryAt = nil, time.Time{}
+	account.legacyRejected = false
+	account.humanVerification.Store(false)
 }
 
 func (account *webSession) saveRotation() error {

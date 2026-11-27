@@ -85,7 +85,9 @@ func LoadPublishedProtocols(ctx context.Context, client *ent.Client, modelIDs []
 			usable[route.CredentialID] = valid
 		}
 		if valid {
-			result[row.ModelID] = append(result[row.ModelID], protocolCapability(row.Adapter, route.UpstreamModel, true, route.Probe))
+			option := protocolCapability(row.Adapter, route.UpstreamModel, true, route.Probe)
+			option.credentialID = route.CredentialID
+			result[row.ModelID] = append(result[row.ModelID], option)
 		}
 	}
 	return result, nil

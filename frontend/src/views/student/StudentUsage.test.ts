@@ -1,276 +1,638 @@
-import { flushPromises, mount } from '@vue/test-utils'
+import { DOMWrapper, flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { StudentCallReceipt, StudentRecentCall, StudentUsageSnapshot } from '../../api/student'
+import type { StudentUsageMetrics, StudentUsageModel } from '../../api/types'
 import StudentUsage from './StudentUsage.vue'
-import { studentAPI } from '../../api/student'
-import { APIError, get } from '../../api/client'
-import type { StudentUsage as StudentUsagePayload } from '../../api/types'
+import studentUsageSource from './StudentUsage.vue?raw'
 
-vi.mock('../../api/student', () => ({
-  studentAPI: {
-    usage: vi.fn(),
+const blankMetrics: StudentUsageMetrics = {
+  tokens: { input: null, output: null, cache_read: null, cache_write: null, total: null },
+  completeness: 'unknown',
+  token_coverage: { calls: 0, known_calls: 0, complete_calls: 0, unclassified_tokens: null },
+  cache_hit_rate: null,
+  cache_hit_coverage: { sample_calls: 0, cache_read_tokens: null, input_with_cache_read_tokens: null },
+  pending_review_calls: 0,
+  pending_review_credits: '0.000',
+}
+
+const firstModelMetrics: StudentUsageMetrics = {
+  ...blankMetrics,
+  tokens: { input: '70', output: '40', cache_read: '20', cache_write: '10', total: '140' },
+  completeness: 'complete',
+  token_coverage: { calls: 1, known_calls: 1, complete_calls: 1, unclassified_tokens: '0' },
+  cache_hit_rate: 20 / 90,
+  cache_hit_coverage: { sample_calls: 1, cache_read_tokens: '20', input_with_cache_read_tokens: '90' },
+}
+const firstModel: StudentUsageModel = {
+  ...firstModelMetrics,
+  id: 'text',
+  name: '文本模型',
+  credits: '0.00040000000000001',
+  calls: 1,
+}
+const secondModelMetrics: StudentUsageMetrics = {
+  ...firstModelMetrics,
+  tokens: { input: '30', output: '10', cache_read: '40', cache_write: '20', total: '100' },
+  cache_hit_rate: 40 / 70,
+  cache_hit_coverage: { sample_calls: 1, cache_read_tokens: '40', input_with_cache_read_tokens: '70' },
+}
+const secondModel: StudentUsageModel = {
+  ...firstModel,
+  ...secondModelMetrics,
+  credits: '0.00040000000000002',
+}
+const mergedModelMetrics: StudentUsageMetrics = {
+  ...firstModelMetrics,
+  tokens: { input: '100', output: '50', cache_read: '60', cache_write: '30', total: '240' },
+  token_coverage: { calls: 2, known_calls: 2, complete_calls: 2, unclassified_tokens: '0' },
+  cache_hit_rate: 0.375,
+  cache_hit_coverage: { sample_calls: 2, cache_read_tokens: '60', input_with_cache_read_tokens: '160' },
+}
+const mergedModel: StudentUsageModel = {
+  ...firstModel,
+  ...mergedModelMetrics,
+  credits: '0.00080000000000003',
+  calls: 2,
+}
+const pendingModel: StudentUsageModel = {
+  ...blankMetrics,
+  id: 'review',
+  name: '待核模型',
+  credits: '0.000',
+  tokens: { input: null, output: '4', cache_read: null, cache_write: null, total: '130' },
+  completeness: 'partial',
+  token_coverage: { calls: 1, known_calls: 1, complete_calls: 0, unclassified_tokens: '126' },
+  pending_review_calls: 1,
+  pending_review_credits: '10.000',
+}
+const zeroModelMetrics: StudentUsageMetrics = {
+  ...blankMetrics,
+  token_coverage: { calls: 1, known_calls: 0, complete_calls: 0, unclassified_tokens: null },
+}
+const zeroModel: StudentUsageModel = {
+  ...zeroModelMetrics,
+  id: 'archive',
+  name: '历史模型',
+  credits: '0.000',
+  calls: 1,
+}
+const firstKeyMetrics: StudentUsageMetrics = {
+  ...firstModelMetrics,
+  completeness: 'partial',
+  tokens: { ...firstModel.tokens, output: '44', total: '270' },
+  token_coverage: { calls: 2, known_calls: 2, complete_calls: 1, unclassified_tokens: '126' },
+  pending_review_calls: 1,
+  pending_review_credits: pendingModel.pending_review_credits,
+}
+
+const currentUsage: StudentUsageSnapshot = {
+  month: '2026-11',
+  models: [mergedModel, pendingModel, zeroModel],
+  totals: {
+    ...mergedModelMetrics,
+    credits: mergedModel.credits,
+    calls: 3,
+    tokens: { ...mergedModel.tokens, output: '54', total: '370' },
+    completeness: 'partial',
+    token_coverage: { calls: 4, known_calls: 3, complete_calls: 2, unclassified_tokens: '126' },
+    pending_review_calls: 1,
+    pending_review_credits: pendingModel.pending_review_credits,
   },
-}))
+  projects: [
+    {
+      ...firstKeyMetrics,
+      project_id: 'project-a', project_name: '项目一', quota: '100.000',
+      used: firstModel.credits, available: '99.62459999999999999',
+      pending: '0.375', in_flight_credits: '0.375', calls: 1, pending_review: true,
+      keys: [
+        {
+          ...firstKeyMetrics,
+          id: 'key-a', name: '开发 Key', status: 'active', used: firstModel.credits,
+          pending: '0.250', in_flight_credits: '0.250', available: '0.000',
+          available_effective: '49.74959999999999999', project_member_available: '99.62459999999999999',
+          calls: 1, pending_calls: 1, pending_review: true, models: [firstModel, pendingModel],
+        },
+        {
+          ...blankMetrics,
+          id: 'key-idle', name: '在途 Key', status: 'active', used: '0.000',
+          pending: '0.125', in_flight_credits: '0.125',
+          available_effective: '49.74959999999999999', project_member_available: '99.62459999999999999',
+          calls: 0, pending_calls: 0, models: [],
+        },
+      ],
+    },
+    {
+      ...secondModelMetrics,
+      project_id: 'project-b', project_name: '项目二', quota: '100.000',
+      used: secondModel.credits, available: '99.99959999999999998',
+      pending: '0.000', in_flight_credits: '0.000', calls: 2,
+      completeness: 'partial',
+      token_coverage: { calls: 2, known_calls: 1, complete_calls: 1, unclassified_tokens: '0' },
+      keys: [
+        {
+          ...secondModelMetrics,
+          id: 'key-b', name: '测试 Key', status: 'active', used: secondModel.credits,
+          pending: '0.000', in_flight_credits: '0.000', available: '49.99959999999999998',
+          available_effective: '0.000', project_member_available: '99.99959999999999998',
+          calls: 1, pending_calls: 0, models: [secondModel],
+        },
+        {
+          ...zeroModelMetrics,
+          id: 'key-inactive', name: '停用的 Key', status: 'inactive', used: '0.000',
+          pending: '0.000', in_flight_credits: '0.000',
+          available_effective: '0.000', project_member_available: '99.99959999999999998',
+          calls: 1, pending_calls: 0, models: [zeroModel],
+        },
+      ],
+    },
+  ],
+}
 
-vi.mock('../../api/client', async importOriginal => {
-  const actual = await importOriginal<typeof import('../../api/client')>()
-  return { ...actual, get: vi.fn() }
-})
-
-const baseUsage = {
+const legacyUsage: StudentUsageSnapshot = {
   month: '2026-11',
   projects: [{
-    project_id: 'project-1',
-    project_name: '项目一',
-    quota: '100.000',
-    used: '12.500',
-    pending: '1.250',
-    available: '86.250',
+    project_id: 'legacy', project_name: '旧项目', quota: '100.000',
+    used: '7.250', pending: '1.375', available: '91.375', pending_review: true,
     keys: [{
-      id: 'key-1',
-      name: '我的 Key',
-      status: 'active',
-      used: '12.500',
-      pending: '1.250',
-      models: [
-        { id: 'gpt-5', name: 'GPT-5', credits: '10.000', calls: 3, tokens: 1234, cache_hit_rate: 0.25 },
-        { id: 'claude', name: 'Claude', credits: '0.000', calls: 0 },
-      ],
+      id: 'legacy-key', name: '旧版 Key', status: 'active',
+      used: '7.250', pending: '1.375', available: '35.000', pending_review: true,
+      models: [{ id: 'text', name: '旧版模型', credits: '7.250', calls: 3 }],
     }],
   }],
-} as unknown as StudentUsagePayload
+}
 
-function mountUsage(payload: StudentUsagePayload) {
-  vi.mocked(studentAPI.usage).mockResolvedValue(payload)
-  return mount(StudentUsage, {
+const callReceipt = {
+  request_id: 'req+school?11#42',
+  model_id: 'text',
+  model_name: '文本模型',
+  channel: '北辰',
+  billing_state: 'charged',
+  created_at: '2026-10-31T16:08:10Z',
+  charged_credits: '0.00080000000000003',
+  receipt_applied: true,
+  usage_state: 'partial',
+  usage_reason: 'cache_write_subtotal_only',
+  input_tokens: '9007199254740993',
+  output_tokens: '3',
+  cache_read_tokens: '0',
+  cache_write_tokens: null,
+  total_tokens: '9007199254740996',
+} satisfies StudentCallReceipt
+
+const recentCall = {
+  id: '01800000-0000-7000-8000-000000000001',
+  request_id: 'recent-gateway-req',
+  model_id: 'gpt-5',
+  model_name: 'GPT-5',
+  project_name: '项目一',
+  input_tokens: 100,
+  output_tokens: 20,
+  cache_read_tokens: 0,
+  cache_write_tokens: null,
+  credits: '1.250',
+  status: 'succeeded',
+  billing_state: 'charged',
+  created_at: '2026-10-31T16:08:10Z',
+} satisfies StudentRecentCall
+
+const request = vi.fn<typeof fetch>()
+let wrapper: VueWrapper
+
+function response(data: unknown) {
+  return new Response(JSON.stringify({ data, request_id: 'test-http-response' }))
+}
+
+function failure(status = 503) {
+  const code = status === 404 ? 'RESOURCE_NOT_FOUND' : 'DEPENDENCY_UNAVAILABLE'
+  return new Response(JSON.stringify({ error: { code } }), { status })
+}
+
+function emptyUsage(month: string): StudentUsageSnapshot {
+  return { month, projects: [], models: [], totals: { ...blankMetrics, credits: '0.000', calls: 0 } }
+}
+
+function mountUsage(data?: unknown) {
+  if (data !== undefined) request.mockResolvedValueOnce(response(data))
+  wrapper = mount(StudentUsage, {
+    attachTo: document.body,
     global: {
       stubs: {
         CreditDonut: true,
-        RouterLink: { props: ['to'], template: '<a :href="to.name" data-testid="usage-model-plaza-link"><slot/></a>' },
+        RouterLink: { props: ['to'], template: '<a :href="to.name"><slot /></a>' },
       },
     },
   })
+  return wrapper
 }
 
-function stat(wrapper: ReturnType<typeof mountUsage>, name: string) {
+function stat(name: string) {
   return wrapper.get(`[data-testid="usage-total-${name}"] strong`).text()
+}
+
+function dialog() {
+  return new DOMWrapper(document.body).get('[role="dialog"]')
+}
+
+async function openCallDialog(kind: 'recent' | 'receipt') {
+  await wrapper.get(`[data-testid="open-${kind}"]`).trigger('click')
+  await flushPromises()
+  return dialog()
+}
+
+function pendingResponse() {
+  let resolve!: (value: Response) => void
+  const promise = new Promise<Response>(done => { resolve = done })
+  return { promise, resolve }
 }
 
 describe('StudentUsage', () => {
   beforeEach(() => {
-    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
-    vi.mocked(get).mockResolvedValue({ items: [], next_cursor: null })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-01T00:10:00+08:00'))
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+    request.mockReset()
+    vi.stubGlobal('fetch', request)
   })
 
   afterEach(() => {
-    vi.clearAllMocks()
+    wrapper?.unmount()
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
   })
 
-  it('shows monthly totals, explicit zero, and per-model credits, tokens and cache hit rate', async () => {
-    const wrapper = mountUsage(baseUsage)
+  it('renders exact server rollups across projects and Keys and shows real coverage and settlement states', async () => {
+    mountUsage(currentUsage)
     await flushPromises()
 
-    expect(stat(wrapper, 'quota')).toBe('100')
-    expect(stat(wrapper, 'used')).toBe('12.5')
-    expect(stat(wrapper, 'pending')).toBe('1.25')
-    expect(stat(wrapper, 'available')).toBe('86.25')
+    expect(request.mock.calls.map(([url]) => url)).toEqual(['/api/v1/student/usage?month=2026-11'])
+    expect(wrapper.get('h1').text()).toBe('2026 年 11 月个人用量')
+    expect(wrapper.get('input[type="month"]').attributes('max')).toBe('2026-11')
+    expect(wrapper.find('.range-switch').exists()).toBe(false)
+    expect(wrapper.find('.usage-recent-list').exists()).toBe(false)
+    expect(stat('quota')).toBe('200')
+    expect(stat('used')).toBe('0.00080000000000003')
+    expect(stat('pending')).toBe('0.375')
+    expect(stat('available')).toBe('199.62419999999999997')
+    expect(wrapper.get('a[href="student-models"]').text()).toBe('到模型广场添加模型')
 
-    const rows = wrapper.findAll('.student-model-table tbody tr')
-    expect(rows).toHaveLength(2)
-    expect(rows[0].text()).toContain('GPT-5')
-    expect(rows[0].text()).toContain('10')
-    expect(rows[0].text()).toContain('1,234')
-    expect(rows[0].text()).toContain('25%')
-    expect(rows[0].findAll('td').map(cell => cell.text())).toEqual(['10', '3 次', '1,234', '25%'])
-    expect(rows[1].findAll('td').map(cell => cell.text())).toEqual(['0', '0 次', '—', '—'])
-    wrapper.unmount()
-  })
-
-  it('merges the same model across projects and keys into one summary row', async () => {
-    const payload = {
-      month: '2026-11',
-      projects: [{
-        project_id: 'project-1',
-        project_name: '项目一',
-        quota: '100.000',
-        used: '12.500',
-        pending: '0.000',
-        available: '87.500',
-        keys: [
-          {
-            id: 'key-1', name: '我的 Key', status: 'active', used: '10.000', pending: '0.000',
-            models: [{ id: 'gpt-5', name: 'GPT-5', credits: '10.000', calls: 3, tokens: 1200, cache_hit_rate: 0.2 }],
-          },
-          {
-            id: 'key-2', name: '第二把 Key', status: 'active', used: '2.500', pending: '0.000',
-            models: [{ id: 'GPT-5', name: 'GPT-5', credits: '2.500', calls: 1, tokens: 300, cache_hit_rate: 0.6 }],
-          },
-        ],
-      }],
-    } as unknown as StudentUsagePayload
-    const wrapper = mountUsage(payload)
-    await flushPromises()
-
-    const rows = wrapper.findAll('[data-testid="student-model-summary"] tbody tr')
-    expect(rows).toHaveLength(1)
-    expect(rows[0].text()).toContain('GPT-5')
-    expect(rows[0].findAll('td').map(cell => cell.text())).toEqual(['12.5', '4 次', '1,500', '30%', '—'])
-    // 原有按 Key 明细保留两行
-    expect(wrapper.findAll('.student-model-table tbody tr')).toHaveLength(2)
-    wrapper.unmount()
-  })
-
-  it('keeps the summary view honest when the selected range is not returned by the API', async () => {
-    const wrapper = mountUsage(baseUsage)
-    await flushPromises()
-
-    await wrapper.get('[data-testid="usage-range-all"]').trigger('click')
-    const rows = wrapper.findAll('[data-testid="student-model-summary"] tbody tr')
-    expect(rows).toHaveLength(2)
-    expect(rows[0].findAll('td').map(cell => cell.text())).toEqual(['—', '—', '—', '—', '—'])
-    wrapper.unmount()
-  })
-
-  it('points students to the model plaza to add models to the current key', async () => {
-    const wrapper = mountUsage(baseUsage)
-    await flushPromises()
-
-    const link = wrapper.get('[data-testid="usage-model-plaza-link"]')
-    expect(link.attributes('href')).toBe('student-models')
-    expect(link.text()).toBe('到模型广场把模型加入当前 Key')
-    expect(wrapper.text()).not.toContain('重新申领')
-    wrapper.unmount()
-  })
-
-  it('shows a dash for missing data and keeps explicit zero visible', async () => {
-    const payload = {
-      month: '2026-11',
-      projects: [{
-        project_id: 'project-2',
-        project_name: '项目二',
-        quota: '0.000',
-        used: '12.500',
-        pending: '0.000',
-        available: '',
-        keys: [],
-      }],
-    } as unknown as StudentUsagePayload
-    const wrapper = mountUsage(payload)
-    await flushPromises()
-
-    expect(stat(wrapper, 'quota')).toBe('0')
-    expect(stat(wrapper, 'pending')).toBe('0')
-    expect(stat(wrapper, 'available')).toBe('—')
-    expect(stat(wrapper, 'used')).toBe('12.5')
-    wrapper.unmount()
-  })
-
-  it('keeps today/all switches visible but marks the unavailable range', async () => {
-    const wrapper = mountUsage(baseUsage)
-    await flushPromises()
-    const row = wrapper.findAll('.student-model-table tbody tr')[0]
-    expect(row.text()).toContain('1,234')
-
-    await wrapper.get('[data-testid="usage-range-day"]').trigger('click')
-    expect(wrapper.text()).toContain('只返回本月汇总')
-    expect(row.text()).not.toContain('1,234')
-    expect(row.findAll('td').map(cell => cell.text())).toEqual(['—', '—', '—', '—'])
-
-    await wrapper.get('[data-testid="usage-range-month"]').trigger('click')
-    expect(row.text()).toContain('1,234')
-    wrapper.unmount()
-  })
-
-  it('loads recent calls for the selected range and appends the next cursor page', async () => {
-    vi.mocked(get).mockResolvedValueOnce({
-      items: [
-        { id: 'call-2', request_id: 'req-2', model_id: 'gpt-5', model_name: 'GPT-5', project_name: '项目一',
-          input_tokens: 120, output_tokens: 30, cache_read_tokens: 80, cache_write_tokens: 10,
-          credits: '1.250', status: 'succeeded', billing_state: 'charged', created_at: '2026-11-21T10:00:00Z' },
-        { id: 'call-1', request_id: 'req-1', model_id: 'claude', model_name: 'Claude', project_name: '项目一',
-          input_tokens: null, output_tokens: null, cache_read_tokens: null, cache_write_tokens: null,
-          credits: '0.000', status: 'pending_review', billing_state: 'pending_review', created_at: '2026-11-21T09:00:00Z' },
-      ],
-      next_cursor: 'cursor-1',
-    })
-    const wrapper = mountUsage(baseUsage)
-    await flushPromises()
-
-    expect(get).toHaveBeenCalledWith('/api/v1/student/usage/recent?range=today&limit=20')
-    let rows = wrapper.findAll('.student-recent-table tbody tr')
-    expect(rows).toHaveLength(2)
-    expect(rows[0].text()).toContain('GPT-5')
-    expect(rows[0].text()).toContain('120')
-    expect(rows[0].text()).toContain('1.25')
-    expect(rows[1].text()).toContain('待核账')
-    expect(rows[1].findAll('td').map(cell => cell.text()).slice(2, 6)).toEqual(['—', '—', '—', '—'])
-
-    vi.mocked(get).mockResolvedValueOnce({
-      items: [{ id: 'call-0', request_id: 'req-0', model_id: 'gpt-5', model_name: 'GPT-5', project_name: '项目一',
-        input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_write_tokens: 0,
-        credits: '0.010', status: 'upstream_failed', billing_state: 'failed', created_at: '2026-11-21T08:00:00Z' }],
-      next_cursor: null,
-    })
-    await wrapper.get('.student-recent-actions button').trigger('click')
-    await flushPromises()
-    expect(get).toHaveBeenLastCalledWith('/api/v1/student/usage/recent?range=today&limit=20&cursor=cursor-1')
-    rows = wrapper.findAll('.student-recent-table tbody tr')
+    const table = wrapper.get('[data-testid="student-model-summary"]')
+    const rows = table.findAll('tbody tr')
     expect(rows).toHaveLength(3)
-    expect(rows[2].text()).toContain('上游失败')
-    expect(wrapper.text()).toContain('已显示全部')
-
-    vi.mocked(get).mockResolvedValueOnce({ items: [], next_cursor: null })
-    await wrapper.get('[data-testid="recent-range-month"]').trigger('click')
-    await flushPromises()
-    expect(get).toHaveBeenLastCalledWith('/api/v1/student/usage/recent?range=month&limit=20')
-    expect(wrapper.findAll('.student-recent-table tbody tr')).toHaveLength(0)
-    wrapper.unmount()
+    expect(rows[0].get('th').text()).toContain('文本模型')
+    expect(rows[0].findAll('td').slice(0, 3).map(cell => cell.text())).toEqual(['0.00080000000000003', '2', '240'])
+    expect(rows[0].get('td[data-label="缓存命中率"]').text()).toContain('37.5%')
+    expect(rows[0].get('td[data-label="缓存命中率"] small').text()).toBe('覆盖 2/2 笔')
+    expect(rows[1].get('td[data-label="Token"]').text()).toBe('130')
+    expect(rows[1].get('td[data-label="调用次数"]').text()).toBe('0')
+    expect(rows[1].get('td[data-label="说明"]').text()).toContain('部分回报（0/1 笔完整）')
+    expect(rows[1].get('td[data-label="说明"]').text()).toContain('未分类 126 Token')
+    expect(rows[1].get('td[data-label="说明"]').text()).toContain('待核 1 笔（预留 10 积分）')
+    expect(rows[1].get('td[data-label="缓存命中率"]').text()).toContain('—')
+    expect(rows[1].get('td[data-label="缓存命中率"] small').text()).toBe('覆盖 0/1 笔')
+    expect(rows[1].text()).not.toContain('零额已结算')
+    expect(rows[2].get('td[data-label="Token"]').text()).toBe('—')
+    expect(rows[2].get('td[data-label="说明"]').text()).toBe('无回报 · 零额已结算')
+    const total = table.get('tfoot tr')
+    expect(total.get('td[data-label="已扣积分"]').text()).toBe('0.00080000000000003')
+    expect(total.get('td[data-label="调用次数"]').text()).toBe('3')
+    expect(total.get('td[data-label="Token"]').text()).toBe('370')
+    expect(total.get('td[data-label="缓存命中率"] small').text()).toBe('覆盖 2/4 笔')
   })
 
-  it('looks up one receipt by request id and displays the available fields', async () => {
-    const wrapper = mountUsage(baseUsage)
+  it('keeps idle and inactive Keys visible and expands model details independently for each project and Key', async () => {
+    mountUsage(currentUsage)
     await flushPromises()
-    vi.mocked(get).mockResolvedValue({
-      request_id: 'req-123',
-      model_id: 'gpt-5',
-      channel: '北辰',
-      billing_state: 'charged',
-      base_credits: '10.000',
-      base_source: 'gateway_usage_price',
-      school_multiplier: '1.10',
-      charged_credits: '11.000',
-      actual_cost: '0.1100',
-      receipt_applied: true,
+
+    const keys = wrapper.findAll('[data-testid="usage-key-row"]')
+    expect(keys).toHaveLength(4)
+    expect(keys[0].findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual([
+      '0.00040000000000001', '0.25', '49.74959999999999999',
+    ])
+    expect(keys[0].text()).toContain('本项目个人可用积分')
+    expect(keys[0].findAll('.usage-key-metrics dd').map(cell => cell.text())).toEqual(['1', '270', '2'])
+    expect(keys[0].text()).toContain('待核 1 笔')
+    expect(keys[1].text()).toContain('暂无模型记录')
+    expect(keys[1].findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['0', '0.125', '49.74959999999999999'])
+    expect(keys[1].find('button').exists()).toBe(false)
+    expect(keys[2].findAll('.usage-key-credits dd')[2].text()).toBe('0')
+    expect(keys[3].text()).toContain('已停用')
+    expect(keys[3].findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['0', '0', '0'])
+    expect(keys[3].findAll('.usage-key-metrics dd').map(cell => cell.text())).toEqual(['1', '—', '1'])
+
+    const first = keys[0].get('button')
+    const other = keys[2].get('button')
+    expect(first.attributes('aria-expanded')).toBe('false')
+    expect(first.attributes('aria-controls')).not.toBe(other.attributes('aria-controls'))
+    await first.trigger('click')
+    expect(first.attributes('aria-expanded')).toBe('true')
+    expect(other.attributes('aria-expanded')).toBe('false')
+    const details = document.getElementById(first.attributes('aria-controls')!)!
+    expect(details.querySelectorAll('tbody tr')).toHaveLength(2)
+    expect(details.textContent).toContain('22.2%')
+    expect(details.textContent).toContain('部分回报')
+    await first.trigger('click')
+    expect(first.attributes('aria-expanded')).toBe('false')
+    expect(details.querySelector('table')).toBeNull()
+
+    const chart = wrapper.get('.usage-project-heading button')
+    expect(chart.attributes('aria-expanded')).toBe('false')
+    await chart.trigger('click')
+    expect(chart.attributes('aria-expanded')).toBe('true')
+    expect(wrapper.find('credit-donut-stub').exists()).toBe(true)
+  })
+
+  it('loads a different Beijing ledger month immediately and ignores the older response', async () => {
+    const pending = pendingResponse()
+    request.mockReturnValueOnce(pending.promise)
+    request.mockResolvedValueOnce(response(emptyUsage('2026-10')))
+    mountUsage()
+
+    expect(wrapper.find('.skeleton-item').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('所选月暂无模型用量')
+    await wrapper.get('input[type="month"]').setValue('2026-10')
+    await flushPromises()
+    expect(request.mock.calls.map(([url]) => url)).toEqual([
+      '/api/v1/student/usage?month=2026-11',
+      '/api/v1/student/usage?month=2026-10',
+    ])
+    expect(wrapper.get('h1').text()).toBe('2026 年 10 月个人用量')
+    expect(wrapper.text()).toContain('所选月暂无模型用量')
+    expect(wrapper.text()).toContain('所选月暂无项目和 Key 记录')
+
+    pending.resolve(response(currentUsage))
+    await flushPromises()
+    expect(wrapper.find('[data-testid="student-model-summary"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('所选月暂无模型用量')
+  })
+
+  it('renders real legacy project and Key data without the new metrics or model rollup', async () => {
+    mountUsage(legacyUsage)
+    await flushPromises()
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('模型汇总读取失败')
+    expect(wrapper.text()).not.toContain('所选月暂无模型用量')
+    expect(stat('used')).toBe('—')
+    expect(stat('pending')).toBe('1.375')
+    expect(stat('available')).toBe('91.375')
+    const row = wrapper.get('[data-testid="usage-key-row"]')
+    expect(row.findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['7.25', '1.375', '35'])
+    expect(row.findAll('.usage-key-metrics dd').map(cell => cell.text())).toEqual(['—', '—', '1'])
+    expect(row.text()).toContain('有待核账记录')
+
+    await row.get('button').trigger('click')
+    const model = wrapper.get('.usage-key-models tbody tr')
+    expect(model.get('th').text()).toContain('旧版模型')
+    expect(model.findAll('td').map(cell => cell.text())).toEqual(['7.25', '3', '—', '—', '—'])
+  })
+
+  it('handles mistyped optional fields and keeps an available totals amount when models are missing', async () => {
+    const project = legacyUsage.projects[0]
+    const key = project.keys[0]
+    mountUsage({
+      ...legacyUsage,
+      totals: currentUsage.totals,
+      models: { unexpected: true },
+      projects: [{
+        ...project,
+        keys: [{
+          ...key, available_effective: [], tokens: null, token_coverage: null,
+          in_flight_credits: false, calls: true, models: null,
+        }],
+      }],
     })
-
-    await wrapper.get('input[placeholder="输入请求编号"]').setValue('req-123')
-    await wrapper.get('.student-receipt-search').trigger('submit')
     await flushPromises()
 
-    expect(get).toHaveBeenCalledWith('/api/v1/student/usage/calls/req-123')
-    const callRow = wrapper.get('.student-call-table tbody tr')
-    expect(callRow.text()).toContain('gpt-5')
-    expect(callRow.text()).toContain('11')
-    expect(callRow.text()).toContain('已扣')
-    expect(wrapper.text()).toContain('req-123')
-    expect(wrapper.text()).toContain('已回执')
-    expect(wrapper.get('[data-testid="credit-rate-note"]').text()).toBe('100 积分 = 1 元；金额统一用积分显示。')
-    expect(wrapper.text()).not.toContain('基础积分')
-    expect(wrapper.text()).not.toContain('学校倍率')
-    expect(wrapper.text()).not.toContain('实际成本')
-    expect(wrapper.text()).not.toContain('0.1100 元')
-    wrapper.unmount()
+    expect(wrapper.get('[role="alert"]').text()).toContain('模型汇总读取失败')
+    expect(stat('used')).toBe('0.00080000000000003')
+    const row = wrapper.get('[data-testid="usage-key-row"]')
+    expect(row.findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['7.25', '1.375', '35'])
+    expect(row.findAll('.usage-key-metrics dd').map(cell => cell.text())).toEqual(['—', '—', '—'])
+    expect(row.text()).toContain('模型明细暂不可用')
   })
 
-  it('explains a missing receipt instead of showing a stale row', async () => {
-    const wrapper = mountUsage(baseUsage)
+  it('keeps an expanded Key open during and after refreshing the same month', async () => {
+    mountUsage(currentUsage)
     await flushPromises()
-    vi.mocked(get).mockRejectedValueOnce(new APIError('call receipt not found', 404, 'RESOURCE_NOT_FOUND'))
+    const button = wrapper.get('[data-testid="usage-key-row"] button')
+    await button.trigger('click')
+    const detail = document.getElementById(button.attributes('aria-controls')!)!
+    const refresh = pendingResponse()
+    request.mockReturnValueOnce(refresh.promise)
+    window.dispatchEvent(new Event('focus'))
+    await flushPromises()
+    expect(button.attributes('aria-expanded')).toBe('true')
+    expect(detail.querySelectorAll('tbody tr')).toHaveLength(2)
 
-    await wrapper.get('input[placeholder="输入请求编号"]').setValue('missing-request')
-    await wrapper.get('.student-receipt-search').trigger('submit')
+    refresh.resolve(response(currentUsage))
+    await flushPromises()
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(button.attributes('aria-expanded')).toBe('true')
+    expect(detail.querySelectorAll('tbody tr')).toHaveLength(2)
+  })
+
+  it('separates a failed read from an empty month and retries the selected month', async () => {
+    request.mockResolvedValueOnce(failure())
+    mountUsage()
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toBe('读取失败')
+    expect(wrapper.find('.skeleton-item').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('所选月暂无模型用量')
+
+    request.mockResolvedValueOnce(response(emptyUsage('2026-11')))
+    await wrapper.get('.usage-load-error button').trigger('click')
+    await flushPromises()
+    expect(request.mock.calls.map(([url]) => url)).toEqual([
+      '/api/v1/student/usage?month=2026-11',
+      '/api/v1/student/usage?month=2026-11',
+    ])
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('所选月暂无模型用量')
+    expect(stat('used')).toBe('0')
+  })
+
+  it('opens recent calls on demand, expands a record and keeps the current list while retrying pagination', async () => {
+    mountUsage(emptyUsage('2026-11'))
+    await flushPromises()
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+
+    const cursor = 'eyJjcmVhdGVkX2F0IjoiMjAyNi0xMC0zMVQxNjowODoxMFoifQ'
+    request.mockResolvedValueOnce(response({ items: [recentCall], next_cursor: cursor }))
+    const modal = await openCallDialog('recent')
+    expect(modal.get('h2').text()).toBe('最近调用')
+    expect(modal.get('[data-testid="recent-range-today"]').attributes('aria-pressed')).toBe('true')
+    expect(request.mock.lastCall?.[0]).toBe('/api/v1/student/usage/recent?range=today&limit=20')
+
+    const row = modal.get('.usage-recent-row')
+    expect(row.attributes('aria-expanded')).toBe('false')
+    expect(row.text()).toContain('1.25 积分')
+    expect(row.get('time').text()).toContain('00:08:10')
+    await row.trigger('click')
+    expect(row.attributes('aria-expanded')).toBe('true')
+    expect(modal.get('.usage-recent-detail code').text()).toBe(recentCall.request_id)
+    expect(modal.get('.usage-recent-detail').text()).toContain('项目一')
+    expect(modal.get('.usage-recent-detail').text()).toContain('成功')
+    expect(modal.findAll('.usage-receipt-tokens dd').map(cell => cell.text())).toEqual(['100', '20', '0', '—'])
+    expect(request).toHaveBeenCalledTimes(2)
+
+    request.mockResolvedValueOnce(failure())
+    const more = modal.get('.usage-recent-more')
+    await more.trigger('click')
+    await flushPromises()
+    expect(modal.get('[role="alert"]').text()).toBeTruthy()
+    expect(more.text()).toBe('重试')
+    expect(row.attributes('aria-expanded')).toBe('true')
+
+    request.mockResolvedValueOnce(response({
+      items: [{ ...recentCall, id: '01800000-0000-7000-8000-000000000002', request_id: 'older-call' }],
+      next_cursor: null,
+    }))
+    await more.trigger('click')
+    await flushPromises()
+    expect(request.mock.calls.slice(2).map(([url]) => url)).toEqual([
+      `/api/v1/student/usage/recent?range=today&limit=20&cursor=${cursor}`,
+      `/api/v1/student/usage/recent?range=today&limit=20&cursor=${cursor}`,
+    ])
+    expect(modal.findAll('.usage-recent-row')).toHaveLength(2)
+    expect(modal.find('.usage-recent-more').exists()).toBe(false)
+    expect(modal.find('[role="alert"]').exists()).toBe(false)
+  })
+
+  it('resets the cursor on range changes and ignores responses from a former range or a closed dialog', async () => {
+    mountUsage(emptyUsage('2026-11'))
+    await flushPromises()
+    const today = pendingResponse()
+    request.mockReturnValueOnce(today.promise)
+    const modal = await openCallDialog('recent')
+    expect(modal.get('[role="status"]').text()).toBe('正在读取最近调用…')
+
+    request.mockResolvedValueOnce(response({ items: [], next_cursor: null }))
+    await modal.get('[data-testid="recent-range-month"]').trigger('click')
+    await flushPromises()
+    expect(request.mock.calls[1][1]?.signal?.aborted).toBe(true)
+    expect(request.mock.lastCall?.[0]).toBe('/api/v1/student/usage/recent?range=month&limit=20')
+    today.resolve(response({ items: [recentCall], next_cursor: 'old-cursor' }))
+    await flushPromises()
+    expect(modal.get('[role="status"]').text()).toBe('所选范围暂无调用记录')
+    expect(modal.find('.usage-recent-more').exists()).toBe(false)
+
+    const all = pendingResponse()
+    request.mockReturnValueOnce(all.promise)
+    await modal.get('[data-testid="recent-range-all"]').trigger('click')
+    expect(request.mock.lastCall?.[0]).toBe('/api/v1/student/usage/recent?range=all&limit=20')
+    await modal.get('[aria-label="关闭"]').trigger('click')
+    await flushPromises()
+    expect(request.mock.lastCall?.[1]?.signal?.aborted).toBe(true)
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+
+    request.mockResolvedValueOnce(response({ items: [], next_cursor: null }))
+    const reopened = await openCallDialog('recent')
+    all.resolve(response({ items: [recentCall], next_cursor: null }))
+    await flushPromises()
+    expect(reopened.get('[data-testid="recent-range-today"]').attributes('aria-pressed')).toBe('true')
+    expect(reopened.get('[role="status"]').text()).toBe('所选范围暂无调用记录')
+  })
+
+  it('defines a narrow layout for the Key row and receipt form at 360px', () => {
+    const documentSource = new DOMParser().parseFromString(studentUsageSource, 'text/html')
+    const style = document.createElement('style')
+    style.textContent = documentSource.querySelector('style[scoped]')!.textContent
+    document.head.append(style)
+    try {
+      // jsdom exposes the layout rules, but does not calculate viewport geometry.
+      const narrow = Array.from(style.sheet!.cssRules).find((rule): rule is CSSMediaRule =>
+        rule instanceof CSSMediaRule && rule.conditionText === '(max-width: 560px)')
+      expect(narrow).toBeDefined()
+      const rules = Array.from(narrow!.cssRules).filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
+      expect(rules.find(rule => rule.selectorText === '.usage-key-row')?.style.getPropertyValue('grid-template-areas'))
+        .toBe("'identity action' 'credits credits' 'metrics metrics'")
+      expect(rules.find(rule => rule.selectorText === '.usage-receipt-form')?.style.getPropertyValue('grid-template-columns'))
+        .toBe('minmax(0, 1fr)')
+    } finally {
+      style.remove()
+    }
+  })
+
+  it('only looks up a receipt when submitted in the dialog and displays its amount, all Token fields and reason', async () => {
+    mountUsage(currentUsage)
+    await flushPromises()
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    const modal = await openCallDialog('receipt')
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(modal.get('h2').text()).toBe('查单笔调用')
+
+    request.mockResolvedValueOnce(response(callReceipt))
+    await modal.get('input').setValue(` ${callReceipt.request_id} `)
+    await modal.get('form').trigger('submit')
+    await flushPromises()
+    expect(request.mock.lastCall?.[0]).toBe('/api/v1/student/usage/calls/req%2Bschool%3F11%2342')
+    const detail = modal.get('[data-testid="receipt-result"]')
+    expect(detail.get('time').attributes('datetime')).toBe(callReceipt.created_at)
+    expect(detail.get('time').text()).toContain('00:08:10')
+    expect(detail.findAll('.usage-receipt-meta dd').map(cell => cell.text()).filter((_, index) => index !== 2)).toEqual([
+      '文本模型', callReceipt.request_id, '0.00080000000000003', '已结算', '北辰', '已用回执补记',
+    ])
+    expect(detail.findAll('.usage-receipt-tokens dd').map(cell => cell.text())).toEqual([
+      '9,007,199,254,740,993', '3', '0', '—', '9,007,199,254,740,996',
+    ])
+    expect(detail.get('.usage-evidence').text()).toContain('部分回报 · 仅回报了部分缓存写入量')
+
+    request.mockResolvedValueOnce(failure(404))
+    await modal.get('input').setValue('missing-or-ambiguous')
+    await modal.get('form').trigger('submit')
+    await flushPromises()
+    expect(modal.find('[data-testid="receipt-result"]').exists()).toBe(false)
+    expect(modal.get('[role="alert"]').text()).toContain('请核对请求编号，并确认这笔调用经学校网关发往北辰')
+    expect(request).toHaveBeenCalledTimes(3)
+  })
+
+  it('ignores a receipt response after the dialog has been closed and reopened', async () => {
+    mountUsage(emptyUsage('2026-11'))
+    await flushPromises()
+    const modal = await openCallDialog('receipt')
+    const pending = pendingResponse()
+    request.mockReturnValueOnce(pending.promise)
+    await modal.get('input').setValue(callReceipt.request_id)
+    await modal.get('form').trigger('submit')
+    expect(modal.get('[role="status"]').text()).toBe('正在查询调用…')
+
+    await modal.get('[aria-label="关闭"]').trigger('click')
+    await flushPromises()
+    const reopened = await openCallDialog('receipt')
+    pending.resolve(response(callReceipt))
+    await flushPromises()
+    expect(reopened.find('[data-testid="receipt-result"]').exists()).toBe(false)
+    expect(reopened.get<HTMLInputElement>('input').element.value).toBe('')
+    expect(reopened.find('[role="status"]').exists()).toBe(false)
+  })
+
+  it('shows pending settlement and missing evidence separately from reported zeros', async () => {
+    mountUsage(emptyUsage('2026-11'))
+    await flushPromises()
+    const modal = await openCallDialog('receipt')
+    request.mockResolvedValueOnce(response({
+      ...callReceipt,
+      request_id: 'pending-call',
+      billing_state: 'pending_review',
+      charged_credits: null,
+      receipt_applied: null,
+      usage_state: undefined,
+      usage_reason: 'incomplete_token_breakdown',
+      input_tokens: null,
+      output_tokens: '4',
+      cache_read_tokens: null,
+      total_tokens: '130',
+    } satisfies StudentCallReceipt))
+    await modal.get('input').setValue('pending-call')
+    await modal.get('form').trigger('submit')
     await flushPromises()
 
-    expect(wrapper.text()).toContain('未找到该请求编号对应的本人调用')
-    wrapper.unmount()
+    const detail = modal.get('[data-testid="receipt-result"]')
+    expect(detail.text()).toContain('待核账')
+    expect(detail.text()).toContain('暂无匹配回执')
+    expect(detail.get('.usage-evidence').text()).toContain('分项用量不完整')
+    expect(detail.get('.usage-receipt-meta').text()).toContain('已扣积分—')
+    expect(detail.findAll('.usage-receipt-tokens dd').map(cell => cell.text())).toEqual(['—', '4', '—', '—', '130'])
   })
 })

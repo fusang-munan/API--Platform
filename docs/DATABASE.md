@@ -336,6 +336,18 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 `project_month_credit_buckets` 与 `api_key_month_credit_buckets` 按北京时间月份保存额度、分配、charged 和 pending；`monthly_usage_cube` 永久保存项目、用户、Key、模型维度聚合。`gateway_calls`/`gateway_call_attempts` 保存 365 天原始调用与供应商尝试，`monitored_inputs` 保存 90 天完整文本。访问审计、额度调整审计和倍率调整审计永久保留；模型倍率从 NULL 首次设置时不产生倍率调整审计，后续改为不同值时必须记录原因。
 
+学生月度用量的只读汇总在同一个可重复读事务中执行两条查询，分别读取汇总和额度。用量按 `user_id`、`project_id`、`api_key_id`、`model_id` 与账月归属。查询先限定该学生所属项目内的自有 Key，再在每个 Key × 模型上合并月账本和逐笔证据。月账本沿用以 `month` 开头的索引，调用查询可利用 `gateway_calls_student_receipt_lookup (user_id, request_id)` 的用户前缀及 `gateway_calls_key_created (api_key_id, created_at)` 的 Key 前缀。过滤使用调用受理时记录的 `month`，因此跨月派发或补记仍归入原账月。汇总复用现有表和索引。
+
+学生余额查询读取所属项目的 `project_month_credit_buckets` 和个人的 `project_member_month_credit_buckets`，两边均按额度减已扣、千分之一积分以下的余数和在途占用。有效可用额取两边的较小值，最低为零。本月个人额度取 `project_members.monthly_credit_quota_milli`，与网关受理时刷新月桶的来源相同。历史账月优先读该月份的月桶。Key 月桶继续提供旧字段 `available`。
+
+教师学生用量由 `monthly_usage_cube` 与 `gateway_calls` 按调用时记录的学生、项目、Key 和模型全外连接聚合。两个来源先按这四个字段各归为一行，利用精确十进制 `numeric` 汇总已扣积分并避免连接放大计数。学生当前状态和项目成员资格只影响正常业务权限。教师报表从使用事实确定历史范围，当前用户、项目与 Key 资料用于名称、邮箱、状态和额度展示。明细用一条 SQL 按学生整体、项目、Key、模型各层合计，积分、已结算次数、零额次数及待核字段可逐层核对。
+
+列表在同一只读、可重复读事务中读取学生汇总和未确认归属流水。报表进程按数据库、账月和项目范围缓存，最长 5 秒，最多保留 8 份快照，每份最多 10000 名学生。同一范围同时到达的请求共用一次冷读。缓存用精确十进制积分和整数 Token 排序，统计人数后再分页。超出缓存人数预算时由 PostgreSQL 执行精确搜索、排序及分页。列表读库限时 3 秒。账本复用以 `month` 开头的现有索引，指定项目或学生时逐笔底表可利用项目或用户前缀索引。全校账月首次加载仍要汇总该账月的逐笔用量。
+
+北辰未确认归属汇总从 `beichen_upstream_usage_rows` 按北京时间取发生时间。归属证据要求无冲突的响应声明指向同一网关调用。已核验回执用上游流水行号、渠道凭据、上游 Key、模型和发生时间确认归档行。缺少回执时，同一响应编号必须在派发快照限定的渠道凭据、上游 Key、模型和时间窗口内只有一条候选。唯一性检查覆盖跨账月的派发时间窗口，可利用归档的凭据和发生时间索引。满足上述条件的待核调用也有可核验的流水归属。余额扣款采用归档中 `billing_type=0`、无订阅、币种为 USD 或缺省的已知 `actual_cost`。
+
+积分对 `charged_milli + charged_milli_remainder` 以 PostgreSQL `numeric` 求和，再乘以 `0.001` 转为积分字符串。次数取 `charged_count + zero_cost_count`，原始调用过保留期后仍可查询该次数。Token 用 `gateway_calls` 的可空协议计数按教师报表口径拆分，Anthropic 输入单列，OpenAI 含缓存的输入拆成净输入和缓存分项，Gemini 另计工具输入和推理输出。归类不全时保留已有分项与已知总量，清理过的账本调用计入覆盖总数。Key、项目及模型的待核积分直接相加 `pending_review` 行的整积分预留。Key 和成员月桶的 `pending_milli` 除以 1000 得到在途占用。
+
 迁移 0029 增加单次调用的上游凭据、绑定和模型标识，以及缓存读、缓存未命中、缓存写和推理用量。可空列区分显式 0 和缺项。用量状态 `reported`、`missing`、`interrupted` 分别表示已报告、未取到和传输中断。上游 `credit` 的缩放值仅表示供应商原始额度数值，不作为美元成本参与对账。
 
 迁移 0030 增加北辰同步状态、不可变的上游报价和倍率版本、校内手动价版本以及按凭据、模型和北京时间日期保存的北辰账单。试算按调用时刻选择对应的有效版本，日汇总按明示的缓存口径计算；数据缺失的比较项保持为空。同步任务的租约防止多实例重复拉取。
@@ -378,9 +390,19 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 迁移 0045 给 `provider_model_catalog` 添加非空 `supported_protocols text[]`。目录同步写入适配器枚举，保留同一 Key 版本最近探活确认的协议。已有空数组按目录记录推断，下一次目录写入或成功探活时落库。`upstream_probes` 按供应商、凭据、模型和协议存最新结果，记录 HTTP 状态、受限错误代码、耗时、时间和输出 Token 限制。入库时复核 Key 版本和目录归属，成功结果与协议确认在同一事务保存。概览和最近结果接口只使用当前 Key 版本及目录的证据。
 
+教师模型目录和能力接口读取已有 `model_bindings`、`provider_model_catalog`、`beichen_datasets`、分组观测版本、报价快照以及 `upstream_probes`。读取时用当前凭据版本及已知分组变化约束目录、报价和探活。探活同时核对 `beichen_probe_usage` 的派发时间，避免采用换组前发起、换组后才保存的结果。作废判定读取历史目录、绑定状态与关联渠道，历史用量沿用原账本归属。
+
 `beichen_probe_jobs` 为每个供应商保留请求、开始、完成时间、错误代码和可续期的执行租约。手动提交写入排队时间。多实例通过同一租约领取，执行过程中分批保存，恢复被中断的任务时跳过本轮已经记录的组合。`beichen_website_catalogs` 按凭据保存最近核实的官网分组型号清单、Key 版本和时间，供按 Key 核对和能力诊断使用。
 
-迁移 `0048_beichen_website_directory.sql` 新增 `beichen_website_directories`，以 `provider_id` 为主键，外键指向供应商并随其删除。`platforms` 为 JSONB 数组，每项保存渠道编号与名称、渠道状态、平台、分组资料、型号原名、原始计价条件和采集时间。价格未知时保留 JSON `null`。一次完整采集原子替换快照并更新 `last_success`。部分解析失败时按渠道和平台归并，上轮未能重新核实的数据保留原采集时间。超时、授权失败或未返回可读型号时保留快照。`last_error` 记录可公开错误，`failure_count` 和 `next_attempt` 保存退避进度，自动重试间隔从 1 分钟逐步增加到 32 分钟。`lease_id` 和 `lease_until` 防止多实例重复执行和失效任务覆盖新快照。教师目录用快照关联当前启用 Key 的模型条目和教师别名，报价与线路仍由各自的数据记录决定。
+迁移 `0048_beichen_website_directory.sql` 新增 `beichen_website_directories`，以 `provider_id` 为主键，外键指向供应商并随其删除。`platforms` 为 JSONB 数组，每项保存渠道编号与名称、渠道状态、平台、分组资料、型号原名、原始计价条件和采集时间。价格未知时保留 JSON `null`。一次完整采集原子替换快照并更新 `last_success`。部分解析失败或平台覆盖待核验时，按渠道和平台保留未重新核实的片段及原采集时间。分组可带 `observed_at` 和 `retained`，旧快照使用平台的采集时间。`beichen_crawl_runs.failures` 保存片段失败、沿用标记和各疑似缩水平台的确认记录。超时、授权失败或未返回可读型号时保留快照。`last_error` 记录可公开错误，`failure_count` 和 `next_attempt` 保存退避进度，自动重试间隔从 1 分钟逐步增加到 32 分钟。`lease_id` 和 `lease_until` 防止多实例重复执行和失效任务覆盖新快照。
+
+型号和分组列表完整时，每个渠道下的平台独立确认缺席或缩水。连续三轮一致后采用本轮结果，已经确认下线的平台退出快照，仍待核验的平台保留上次数据。报价格式错误通过 `failures` 单独记录。若对应型号与分组仍存在，可以沿用它的历史报价。目录存在部分失败时保留上次 `last_success`。
+
+北辰定时账单扫描、定向目录重扫及 `providercatalog` 共用每把 Key 的 `beichen_datasets.kind='billing'` 90 秒租约。应用将租约 UUID 作为轮次编号，写入前在事务中校验租约和凭据版本。`kind='catalog'` 的 `last_success` 只随接受的目录前进。`maintenance_state` 的 `beichen_catalog_shrink/<credential_uuid>` 记录待核验清单的版本、型号集合指纹和一致次数，完整接受或读取失败后清除。`kind='billing'` 的 `website_group_observation.key_billing_missing_fields` 可记录 Key 账单原始响应缺少的字段。独立官网证据继续决定该 Key 的归属是否可核实。
+
+目录扫描收到明确的 `GROUP_NOT_ALLOWED` 时，在原扫描事务中写入 `maintenance_state` 的 `beichen_group_denial/<credential_uuid>`。其 `last_error` 保存 JSON 字段 `code` 和 `credential_revision`，`updated_at` 为数据库记录拒绝的时间。只采用版本与 `provider_credentials.updated_at` 一致的记录。普通 HTTP 403 和暂时失败沿用已有的拒绝证据。成功读到模型清单时，在同一事务清除目录扫描的拒绝记录。清单缩水待核验时仍保存上次目录和 `last_success`，并记录本轮确认进度。
+
+教师覆盖、绑定重建和学生模型状态共用 Key 版本、分组变化时间、分组权限及目录采集时间校验。历史导入的 Key 条目可提供单模型的列出证据。判断型号缺席和重建绑定需要 `kind='catalog'` 有本凭据及当前分组的完整成功快照。目录、计费和 Key 核对在保存证据前取得按供应商划分的共享咨询事务锁，重建确认尝试取得同一把锁的排他模式。事务提交或回滚时自动释放锁。重建确认还持有供应商行锁，与别名、官网 Key 清单和凭据写入互斥。确认事务在提交前用新语句重读已提交的证据，出现锁冲突或证据变化时回滚本次全部绑定变更并返回 409。
 
 `0050_beichen_crawl_runs.sql` 新增 `beichen_crawl_runs`，按 `provider_id` 只保留每个供应商最近一次后台抓取的摘要，外键随供应商删除。`started_at` 记录发起时间，`duration_ms` 记录读取与解析耗时，`platform_count`、`group_count`、`model_count` 记录本轮读到的数据，`expected_model_count` 记录原响应中可辨认的去重型号数。`failures` 是 JSONB 数组，包含渠道、能辨认的平台、字段位置和错误原因。结果在同一条数据库语句中随快照及退避状态更新，只有持有有效抓取租约的任务可以写入。部分结果的计数基于合并旧快照之前的本轮响应。
 
@@ -390,9 +412,15 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 同一供应商的登录、续期和清除在同一数据库内按事务锁串行执行。并发请求用访问 Token 的密文版本标识所用会话，迟到的认证失败不会覆盖已经续期或替换的新会话。教师手动抓取与定时抓取共用 `beichen_website_directories` 的租约和 `beichen_crawl_runs` 的最近结果。
 
+官网目录与 Key 清单各自在保存事务中复核实际读取所用的会话版本。数据库登录锁定账号行并核对访问令牌密文。随版本交付的会话在当前服务进程内维护版本号。每次成功安装上游续期结果或显式替换令牌对时递增一次，包括只轮换续期令牌。上游续期失败和重试写入轮换文件沿用当前版本号。请求遇到 401 后如需重读，保存检查以重读实际使用的版本为准。交付会话的检查与提交共用续期锁，确保版本在这段时间内一致。
+
+版本已更换时，仍持有有效租约的任务记录会话错误和退避进度。目录保留已存的平台、原始响应、报价历史和 `last_success`。Key 清单保留已存的条目、倍率历史和 `last_seen`，本轮状态记为 `unavailable`。
+
 旧的学校本机授权由服务器随机生成。数据库仅保存 `local_grant_hash`、`local_granted_by` 和 `local_granted_at`。每个供应商保留一份授权，替换或清除网页登录配置会删除它。访问 Token 自动续期时保留授权。本机窗口保存的会话以系统用户目录下的加密文件持久化，由本机爬虫读取。
 
-迁移 `0055_beichen_website_keys.sql` 中的 `beichen_website_key_sync` 按供应商保存最近成功时间、同步状态和租约。`beichen_website_keys` 按供应商和北辰 Key ID 保存名称、最多 10 字符的前缀、官网分组 ID 和名称、精确分组倍率、上游状态及创建时间。唯一匹配的行关联 `provider_credentials.id` 和学校凭据密文的 SHA-256 摘要。密文轮换后，旧的匹配在读取时失效。同一事务替换完整清单、更新同步时间并写入变化的分组倍率版本。401、超时和分页不完整时只更新失败状态。
+迁移 `0055_beichen_website_keys.sql` 中的 `beichen_website_key_sync` 按供应商保存最近成功时间、同步状态和租约。`beichen_website_keys` 按供应商和北辰 Key ID 保存名称、最多 10 字符的前缀、官网分组 ID 和名称、精确分组倍率、上游状态及创建时间。唯一匹配的行关联 `provider_credentials.id` 和学校凭据密文的 SHA-256 摘要。密文轮换后，旧的匹配在读取时失效。同一事务替换完整清单、更新同步时间并写入变化的分组倍率版本。失败更新保留已有清单和最近成功时间，并在 `maintenance_state` 的 `beichen_key_inventory/<provider_uuid>` 记录失败原因或身份冲突。
+
+多页清单以两次完整遍历结果为准，按 Key 编号核对集合、分组、状态与其他已读字段。任一遍历的分页校验失败且未在重读后恢复，或两次完整结果不一致时，记录 `unavailable` 和诊断，沿用上次已保存的清单和 `last_seen`。
 
 迁移 `0056_beichen_website_key_rate_versions.sql` 新增官网 Key 倍率历史。`beichen_website_key_rate_versions` 的索引按供应商、北辰 Key ID 和版本序号倒序定位最新版本。分组 ID、名称、十进制倍率、高峰开关、倍率或时段有变化时，在刷新清单的同一事务内追加 `observed_at` 与 `changed=true`。首次观察的 `changed` 为 `false`。即使学校凭据尚未匹配、Key 从当前清单消失，已记录的官网倍率历史也能按原 Key ID 查阅。升级后首次成功同步会建立基线，已有当前清单在此之前仍可读取。
 

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"time"
@@ -25,17 +26,18 @@ type CrawlOptions struct {
 
 type CrawlReport struct {
 	CrawlRun
-	Source         string       `json:"source"`
-	PriceUnit      string       `json:"price_unit"`
-	Complete       bool         `json:"complete"`
-	KeyMatching    string       `json:"key_matching"`
-	KeyMatchError  string       `json:"key_match_error,omitempty"`
-	Keys           *[]CrawlKey  `json:"keys,omitempty"`
-	KeyReadError   string       `json:"key_read_error,omitempty"`
-	KeyModelsError string       `json:"key_models_error,omitempty"`
-	KeyStorage     string       `json:"key_storage,omitempty"`
-	KeySaveError   string       `json:"key_save_error,omitempty"`
-	Models         []CrawlModel `json:"models"`
+	Source         string                    `json:"source"`
+	PriceUnit      string                    `json:"price_unit"`
+	Complete       bool                      `json:"complete"`
+	KeyMatching    string                    `json:"key_matching"`
+	KeyMatchError  string                    `json:"key_match_error,omitempty"`
+	Keys           *[]CrawlKey               `json:"keys,omitempty"`
+	KeyReadError   string                    `json:"key_read_error,omitempty"`
+	KeyModelsError string                    `json:"key_models_error,omitempty"`
+	KeyStorage     string                    `json:"key_storage,omitempty"`
+	KeySaveError   string                    `json:"key_save_error,omitempty"`
+	Models         []CrawlModel              `json:"models"`
+	Groups         []WebsiteGroupObservation `json:"groups,omitempty"`
 }
 
 type CrawlModel struct {
@@ -74,6 +76,7 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 	source := "website"
 	var crawl directoryCrawl
 	var keyCrawl crawlWebsiteKeys
+	var groupSummary []WebsiteGroupObservation
 	var err error
 	if options.Fixture != nil {
 		source = "fixture"
@@ -84,6 +87,8 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 		provider := options.ProviderID
 		if options.SaveKeys || options.CompareModels || provider == uuid.Nil && s.db != nil && s.crypto != nil {
 			provider, err = s.ResolvePanelProvider(ctx, provider)
+		} else if provider == uuid.Nil && options.MatchDB && s.db != nil {
+			provider, err = findCrawlProvider(ctx, s.db)
 		}
 		if err == nil {
 			if includeKeys {
@@ -91,18 +96,44 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 			} else {
 				crawl, err = s.crawlWebsiteDirectory(ctx, provider, options.PanelToken)
 			}
-			if options.CompareModels && crawl.membershipComplete {
+			groupSummary, err = s.auditCrawlCoverage(ctx, provider, &crawl, err)
+			if options.CompareModels && crawl.membershipComplete && crawl.ModelCount != 0 {
 				crawl.KeyModelComparisons, crawl.KeyModelError = s.crawlKeyModels(ctx, provider, &crawl, options.PanelToken)
 				crawl.DurationMS = time.Since(crawl.StartedAt).Milliseconds()
 			}
 		}
 	}
+	if groupSummary == nil {
+		groupSummary = directoryGroupObservations(crawl.platforms, false)
+	}
+	if err != nil && crawl.ModelCount == 0 {
+		crawl.membershipComplete = false
+	}
 	report := CrawlReport{
 		CrawlRun: crawl.CrawlRun, Source: source, PriceUnit: websitePriceUnit, Complete: err == nil,
-		KeyMatching: "not_checked", Models: make([]CrawlModel, 0, crawl.ModelCount),
+		KeyMatching: "not_checked", Models: make([]CrawlModel, 0, crawl.ModelCount), Groups: groupSummary,
 	}
 	if includeKeys {
 		keys := crawl.checkedKeys(keyCrawl.keys, keyCrawl.models)
+		for i := range keys {
+			key := &keys[i]
+			if key.GroupID == nil {
+				continue
+			}
+			_, groupErr := selectWebsiteGroupCatalog(crawl.platforms, *key.GroupID, false)
+			if crawl.membershipComplete && (groupErr == nil || errors.Is(groupErr, errPanelGroupNotFound)) {
+				continue
+			}
+			key.GroupCheck, key.Message, key.Models = "unverified", "官网分组资料不完整或有歧义", []string{}
+			if key.CrawlKeyModels != nil {
+				key.Matched, key.OnlyKey, key.OnlyGroup = nil, nil, nil
+			}
+			if crawl.membershipComplete {
+				reason := fmt.Sprintf("官网分组 %d 无法唯一核实", *key.GroupID)
+				report.Failures = append(report.Failures, CrawlFailure{GroupID: *key.GroupID, Path: "group", Reason: reason})
+				err = errors.Join(err, errors.New(reason))
+			}
+		}
 		report.Keys = &keys
 		if keyCrawl.readErr != nil {
 			report.KeyReadError = keyCrawl.readErr.Error()
@@ -166,7 +197,41 @@ func (s *Service) CrawlDirectory(ctx context.Context, options CrawlOptions) (Cra
 		model.KeyMatches = append(model.KeyMatches, matches...)
 		report.Models = append(report.Models, *model)
 	}
+	report.Complete = err == nil
 	return report, err
+}
+
+func (s *Service) auditCrawlCoverage(ctx context.Context, provider uuid.UUID, crawl *directoryCrawl, observedErr error) ([]WebsiteGroupObservation, error) {
+	if s.db == nil || provider == uuid.Nil {
+		return nil, observedErr
+	}
+	var raw []byte
+	err := s.db.QueryRowContext(ctx, "SELECT platforms FROM beichen_website_directories WHERE provider_id=$1", provider).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, observedErr
+	}
+	var last []directoryPlatform
+	if err != nil || json.Unmarshal(raw, &last) != nil {
+		problem := errors.New("无法读取上次官网平台快照")
+		crawl.addFailure("coverage", directoryPlatform{}, problem.Error())
+		crawl.membershipComplete = false
+		return nil, errors.Join(observedErr, problem)
+	}
+	if observedErr != nil && !errors.Is(observedErr, errWebsiteDirectoryPartial) {
+		return directoryGroupObservations(last, true), observedErr
+	}
+	retain := crawl.checkCoverage(last, nil, observedErr == nil, false)
+	if len(retain) == 0 && observedErr == nil {
+		return nil, nil
+	}
+	fresh := make([]directoryPlatform, 0, len(crawl.platforms))
+	for _, section := range crawl.platforms {
+		if !retain[section.Scope] {
+			fresh = append(fresh, section)
+		}
+	}
+	platforms := mergeWebsiteDirectory(last, fresh)
+	return directoryGroupObservations(platforms, false), errWebsiteDirectoryPartial
 }
 
 func (s *Service) readCrawlKeys(ctx context.Context, provider uuid.UUID, platforms []directoryPlatform) ([]discoveryKey, error) {
@@ -225,6 +290,15 @@ WHERE m.provider_id=$1 AND m.status='active' AND c.status='active' AND p.status=
 		return nil, readFailed
 	}
 	indexKeyGroups(view.Datasets, keys, platforms)
+	for i := range keys {
+		key := &keys[i]
+		if key.GroupID != nil {
+			_, err := selectWebsiteGroupCatalog(platforms, *key.GroupID, false)
+			if err != nil {
+				key.groupCurrent, key.GroupStale = false, true
+			}
+		}
+	}
 	indexDiscoveryKeys(models, keys, aliases)
 	return keys, nil
 }
