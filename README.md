@@ -12,11 +12,13 @@ Nebula 是实验室正在使用的 AI API 平台，镜像版本由仓库根目�
 | --- | --- |
 | 学生 | `/student/api-keys` 申请密钥，`/student/models` 模型广场，`/student/usage` 个人用量 |
 | 导师 | `/mentor/reviews` 密钥管理，`/mentor/projects` 项目管理，`/mentor/call-review` 调用审查 |
-| 老师 | `/teacher/projects` 项目管理，`/teacher/project-spend` 项目监控，以及学生、组织、供应商、模型管理 |
+| 老师 | `/teacher/projects` 项目管理，`/teacher/project-spend` 项目监控，`/teacher/student-usage` 学生用量，以及学生、组织、供应商、模型管理 |
 
 学生领到的平台密钥前缀是 `neb_sk_`，明文只在首次领取时返回一次。`/mentor/call-logs` 和 `/mentor/input-monitor` 会转到调用审查。调用审查按用户输入的提示词记一行；同一次提问里换模型，仍留在这一行，并按调用顺序列出用过的模型。新的用户提示词才另开一行。
 
 学生填组织、项目、Key 名称和申请额度。负责该项目的导师批准后，学生领取 Key，可随时为原 Key 添加或移除授权模型。个人模型库用于收藏。维护中的模型暂停新增授权，待验证模型可添加，接口会提示探活状态。已有授权保留在 Key 详情中。网关目录默认展示可用和待验证的模型，查询参数 `include_unavailable=1` 可查看维护中的授权。
+
+模型广场按当前 Key 显示模型授权、可用积分和本月账本用量，并单独显示全部项目的在途占用和待核笔数。个人用量按北京时间选月，支持查看跨项目汇总、按模型和 Key 查看 Token 及缓存回报，以及按网关请求编号查询单笔回执。
 
 ## 北辰接入
 

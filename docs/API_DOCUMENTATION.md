@@ -316,6 +316,8 @@ data: {"revision":"01K2..."}
 
 Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场条目都返回 `protocols`、`available_protocols`、`recommended_protocol`、`probe_state`、`availability`、`availability_reason` 和 `last_probe_at`。`protocols` 是已配置且凭据有效的协议，`available_protocols` 是最近探活通过的协议。`availability` 为 `available`、`unverified` 或 `maintenance`，与网关的判断一致。`last_probe_at` 是当前线路最近一次探活的 UTC 时间，含失败结果，缺少有效探活记录时为 `null`。学生目录搜索在 `raw_entry` 中返回这些状态字段。
 
+学生模型广场和 Key 的授权模型返回 `availability_state`，目录搜索在 `raw_entry.availability_state` 返回同一状态。`available` 和 `degraded` 表示可用及近期探活异常仍可尝试，`unverified` 表示证据尚未核验，`maintenance` 和 `probe_failed` 分别表示线路维护和已配置线路的探活均失败。`channel_unavailable` 表示当前成功扫描的渠道目录未列出该模型，`disabled` 和 `not_published` 来自校内停用和待配置状态。状态使用已入库的目录及探活记录。
+
 `POST /api/v1/student/api-keys/{api_key_id}/models` 接受 `{"model_ids":["gpt-4.1-mini"]}`，每批 1 至 100 个公开模型 ID。添加要求本人的 `active` Key、有效的项目访问权限及模型报价。已有线路且待验证的模型可新增授权；维护中的模型返回 `MODEL_NOT_READY`。收藏与授权各自独立。
 
 添加返回 HTTP 200。 `data.model_ids` 是当前完整授权列表，`data.added_model_ids` 是实际新增的模型。每个新加入的待验证模型在 `data.warnings` 中有一项 `{"model_id":"gpt-4.1-mini","code":"MODEL_UNVERIFIED","message":"已有绑定线路，当前还没有通过探活的协议。"}`。
@@ -835,6 +837,8 @@ Anthropic-compatible 示例：
 | `totals` | `credits: string`、`calls: number` | 所有可见 Key 的模型账本积分和次数汇总，范围与 `data.models` 一致。空数组返回 `[]`。 |
 
 `calls` 来自月账本，包含已结算的正额与零额调用。金额先在服务端按十进制精确求和，返回字符串并至少保留三位小数，例如 `"0.00040000000000001"`。跨项目或跨 Key 显示同一模型时，可直接使用 `data.models` 中的汇总值。最近调用 `GET /api/v1/student/usage/recent` 是按创建时间查询的分页明细，包含处于不同结算状态的请求。对比月度金额和次数时使用同一账月的 `totals` 与 `models`。
+
+模型广场读取当前项目和 Key 的 `models` 与 `available` 显示该 Key 的已结算用量及余额。全部项目的在途占用取各项目的 `in_flight_credits`，待核笔数与预留取 `totals` 的待核字段。
 
 项目、Key、模型及 `totals` 还包含下列字段。
 

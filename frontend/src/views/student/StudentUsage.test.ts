@@ -1,6 +1,7 @@
 import { DOMWrapper, flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { StudentCallReceipt, StudentUsageMetrics, StudentUsageModel, StudentUsageReport } from '../../utils/studentUsage'
+import type { StudentUsageMetrics, StudentUsageModel, StudentUsageReport } from '../../api/types'
+import type { StudentCallReceipt } from '../../utils/studentUsage'
 import StudentUsage from './StudentUsage.vue'
 
 const blankMetrics: StudentUsageMetrics = {

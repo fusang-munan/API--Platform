@@ -3,6 +3,7 @@ import { computed, ref, useId } from 'vue'
 import { ChevronDown, Search } from 'lucide-vue-next'
 import { APIError, apiErrorMessage, get } from '../../api/client'
 import { studentAPI } from '../../api/student'
+import type { StudentUsageModelMetrics, StudentUsageProject, StudentUsageReport } from '../../api/types'
 import AppDialog from '../../components/AppDialog.vue'
 import CreditDonut from '../../components/CreditDonut.vue'
 import EmptyState from '../../components/EmptyState.vue'
@@ -18,9 +19,6 @@ import {
   formatUsageTokenCount,
   sumStudentProjectCredits,
   type StudentCallReceipt,
-  type StudentUsageModelMetrics,
-  type StudentUsageProject,
-  type StudentUsageReport,
 } from '../../utils/studentUsage'
 
 const pageId = useId()
@@ -44,8 +42,7 @@ async function load() {
   loading.value = true
   loadFailed.value = false
   try {
-    // 学生用量客户端也供只读取项目和 Key 的页面使用。
-    const data = await studentAPI.usage(requestedMonth) as StudentUsageReport
+    const data = await studentAPI.usage(requestedMonth)
     if (!Array.isArray(data?.projects)) throw new Error('Invalid student usage report')
     if (request === latestRequest) report.value = data
   } catch {

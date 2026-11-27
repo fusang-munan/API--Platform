@@ -194,6 +194,7 @@ func (s *Service) StudentAPIKeys(ctx context.Context, studentID uuid.UUID) ([]AP
 		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list API keys", err)
 	}
 	result := make([]APIKeyView, 0, len(rows))
+	models := make([][]ModelView, 0, len(rows))
 	for _, row := range rows {
 		view, err := s.keyView(ctx, s.db.APIKey.Query().Where(
 			apikey.IDEQ(row.ID),
@@ -207,6 +208,10 @@ func (s *Service) StudentAPIKeys(ctx context.Context, studentID uuid.UUID) ([]AP
 		}
 		// 列表只返回前缀；完整密钥必须通过单把 Key 详情主动查看，避免一次请求解密全部明文。
 		result = append(result, view)
+		models = append(models, view.Models)
+	}
+	if err := s.setStudentModelStates(ctx, models...); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
@@ -220,6 +225,9 @@ func (s *Service) StudentAPIKey(ctx context.Context, studentID, keyID uuid.UUID)
 		return APIKeyView{}, err
 	}
 	if err := s.populateKeyAvailability(ctx, &view); err != nil {
+		return APIKeyView{}, err
+	}
+	if err := s.setStudentModelStates(ctx, view.Models); err != nil {
 		return APIKeyView{}, err
 	}
 	s.populateStudentAPIKeySecret(ctx, keyID, &view)

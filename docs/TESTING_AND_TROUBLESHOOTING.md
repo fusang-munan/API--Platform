@@ -377,6 +377,7 @@ go test ./...
 
 - Token 总量大于四项之和时，查看 `token_coverage.unclassified_tokens`。分项为 `null` 时，用同一账月的逐笔 `usage_state`、`usage_reason` 和原始协议计数核对。缓存命中率的实际样本数在 `cache_hit_coverage.sample_calls`。
 - 待核与在途金额差异可用同一账月的 `pending_review_calls`、`pending_review_credits` 和 `in_flight_credits` 复核。账页间的已用和次数应比较同一账月的服务端汇总 `data.totals`、`data.models`，最近调用分页可用来查对应的逐笔状态。
+- 在 `frontend` 执行 `npm test -- StudentModels StudentUsage studentUsage.test.ts`，核对切换 Key 后的模型用量、精确小数余额、零额已结算次数、在途占用和待核笔数。发现跨 Key 数字混入时，核对同一项目下所选 Key 的 `models` 与 `available`。模型仅保留历史授权时，用 `TestStudentKeyModelAuthorizationPostgres` 核对渠道当前目录、扫描失败和探活状态。
 
 ### 教师学生用量
 
