@@ -400,11 +400,15 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 迁移 `0051_beichen_billing_observations.sql` 在 `beichen_multiplier_versions` 保存当前 Key 的 `group_id`、`group_rate`、高峰开关、倍率及起止时间。版本的 `observed_at` 是首次采样时间，旧格式缺采样时间时记录本地读取时刻。迁移前的版本保留原生效时间，新增字段可为空。同步在核对 Key 版本及租约后，以数据库时刻作为新版本的 `effective_at`。相同计费规则重复读取只推进 `beichen_datasets.last_success`。分组或任一倍率规则变化时，报价快照与同一轮倍率版本关联。
 
-Key 账单读取失败时在最近版本写一次 `stale_at`，并结束仍有效的官网报价快照。倍率值、采样时间与上次成功时间保留。计价使用派发时刻查版本，在该时刻已经陈旧的倍率无法用于跟随价。确认 Key 分组后，跟随价使用该分组的有效报价。成功恢复时重新开立版本，即使数值相同。原有版本的用量仍按此前的派发时刻查询。
+对采用官网报价的渠道，计费同步无法核实有效倍率时（例如官网账户倍率表整张读取失败），在最近版本写一次 `stale_at`，并结束仍有效的官网报价快照。倍率值、采样时间与上次成功时间保留。计价使用派发时刻查版本，在该时刻已经陈旧的倍率无法用于跟随价。确认 Key 分组后，跟随价使用该分组的有效报价。成功恢复时重新开立版本，即使数值相同。原有版本的用量仍按此前的派发时刻查询。
 
-迁移 `0070_beichen_account_rate_source.sql` 给倍率版本增加可空的 `account_rate_source`。通过同一把 Key 的账单和用量共同核验的非高峰倍率版本记为 `key_billing`。来源变化时会开立新版本，报价快照引用对应版本。迁移前的倍率版本来源为空。
+迁移 `0070_beichen_account_rate_source.sql` 给倍率版本增加可空的 `account_rate_source`，原约束对非空来源只允许 `key_billing` 与 `peak_enabled=false`。迁移 `0071_beichen_group_rate_source.sql` 删除旧的来源约束并重建：来源为空时允许任意高峰状态（包括 `peak_enabled` 为空）；`key_billing` 必须明确 `peak_enabled=false`；`group_rate` 必须具有非空 `peak_enabled`，开和关都允许。未知高峰状态不能标记为这两种来源，只能保留空来源并走既有非回退路径。来源变化时会开立新版本，报价快照引用对应版本；0070 之前的倍率版本来源为空，0071 升级会保留 0070 已写入的 `key_billing`。
 
 迁移 `0059_beichen_billing_group_observation.sql` 在 `beichen_datasets` 的 `billing` 行增加 `website_group_observation`。计费同步与单 Key 核对在当前凭据版本与各自租约仍有效时共用该字段，按核对时间保存最新的分组状态。Key 清单确认分组后，即使报价和有效倍率获取失败也可保留分组元数据。身份或分组归属无法确认时可记录 `pending`。概览可采用同凭据的更新清单分组资料，原权限拒绝只随同一组保留。计费仍读取正式倍率版本及其报价快照。
+
+`website_group_observation` 由 `billingGroupObservation` 编码。外层保存 `group_status`、`checked_at`、`credential_revision`、可选的 `website_key_id` 和当前分组字段；`billing_account_rate` 子对象保存 `group_id`、可选 `key_id`、`rate`、`source`、`key_checked_at`、`credential_revision` 和 `last_success`。首次成功计费前，Key 能力页可从该 Key 自己的 `website_group` 官网核对快照读取直接账户倍率；只有 30 分钟内且分组配对时展示，过期清除。只有官网表直接值和 `key_billing` 账户倍率需要子对象的 `credential_revision` 与当前数据集凭据修订一致，且 `last_success` 等于当前 `beichen_datasets.last_success`；`group_rate` 由匹配的当前倍率版本直接提供，不依赖该子对象。账户倍率证据轮次或修订不匹配时只隐藏账户倍率，不撤销报价；确认 Key 编号变化、同 Key 换组或无组时，才失效旧个人倍率和关联报价，历史版本保留。Key 身份刷新会合并上一轮 `billing_account_rate`；计费失败或没有有效来源时移除该子对象。`key_id` 只表示 `key_billing` 的原证据 Key。旧快照不满足绑定条件时不展示，当前 billing 成功轮次写入的官网直接表值优先。这里使用现有 JSON 子对象，`0071` 不新增列。
+
+`confirmed_key_binding` 保存最近确认的 Key 与分组绑定，字段为 `key_id`、`group_id`、`checked_at`、`credential_revision`。`group_id=0` 只表示官网 Key 清单明确返回无组；Key 清单读取失败、网络失败或 `group_id` 字段缺失时不写 0，也不覆盖旧确认绑定。单次独立的 Key 用量核对请求失败时，既有已核实报价仍可为 `current`。官网 Key 清单成功返回但缺少 `group_id` 时保留既有确认绑定，当前报价可能按清单核验规则失效。`applyBillingGroup` 对 JSON 子对象只在凭据修订匹配时采用，当前清单的较新绑定可以覆盖旧绑定；较新的确认绑定用于拒绝在途旧 billing 结果。`saveConfirmedKeyBinding` 仅在确认绑定更新时写入，并触发旧个人倍率和关联报价失效。
 
 迁移 `0052_beichen_key_usage.sql` 添加 `key_usage` 同步任务。迁移 `0054_beichen_key_website_evidence.sql` 增加 `website_key_id` 和 `website_group`。`beichen_key_observations` 以渠道凭据 ID 和密文摘要识别同一把 Key，保存官网身份、分组模型、目标倍率、是否预期含 Claude、抓取时间及最近错误。有效租约和凭据版本一致时才能提交。同组读取失败会保留上次成功内容并标记陈旧。确认切组后，上一组型号退出当前分组展示。迁移前的公开账号观测保留历史行，教师查询只采用有官网身份的 Key 数据。
 
@@ -416,11 +420,11 @@ Key 账单读取失败时在最近版本写一次 `stale_at`，并结束仍有�
 
 `beichen_crawl_runs.raw_website_response` 保存最近一次可解析渠道响应的完整 JSON 字节。分组专属型号及报价在官网目录中带 `group_id`。采价成功时 `beichen_price_versions.group_id` 与同轮 `beichen_panel_snapshots.group_id` 和倍率版本对应。快照只供后台取证，教师接口返回归属和计费字段。
 
-迁移 `0057_beichen_group_price_observations.sql` 按 `provider_id`、`group_id`、模型原名和 `observed_at` 保存官网报价版本。`pricing` 保留原始报价结构，`group_rules` 保存默认倍率、同账号核实的 `account_rate_multiplier` 和高峰规则，`unit` 固定为「元（北辰余额单位）」。目录租约仍有效时，同一事务写入抓取结果和新版本。同一分组和模型的报价或规则改变时新增版本，重复观察只刷新最近抓取结果。部分失败时只记录本轮核实的分组。账户倍率读取失败时，已知账户倍率的上次版本继续保留，失败写入 `beichen_crawl_runs.account_rate_error`。`key_model_comparisons` 保存最近一轮按凭据查到的 `/v1/models` 对照，`key_model_error` 保存整批读取错误。
+迁移 `0057_beichen_group_price_observations.sql` 按 `provider_id`、`group_id`、模型原名和 `observed_at` 保存官网报价版本。`pricing` 保留原始报价结构，`group_rules` 保存分组默认倍率 `rate_multiplier`、账户倍率 `account_rate_multiplier`、来源 `account_rate_source`、Key 编号 `account_rate_key_id` 和高峰规则，`unit` 固定为「元（北辰余额单位）」。目录租约仍有效时，同一事务写入抓取结果和新版本。同一分组和模型的报价或规则改变时新增版本，重复观察只刷新最近抓取结果。部分失败时只记录本轮核实的分组。官网 `GET /api/v1/groups/rates` 直接命中时保存账户倍率，来源和 Key 编号省略。成功读表但缺组时，只有该组仅有一把活跃 Key 且 Key 账单与最近 30 分钟完整用量通过核验，才保存 `key_billing` 和 Key 编号；Key 证据不足时，标准分组在默认倍率有效且高峰开关已知时保存 `group_rate`，开和关都允许，且不带 Key 编号。账户倍率表整张读取失败时不发布新的回退倍率，官网已列分组仍待核，已有历史行保留；`beichen_crawl_runs.account_rate_error`（接口 `last_run.account_rate_error`）记录本轮原因。`key_model_comparisons` 保存最近一轮按凭据查到的 `/v1/models` 对照，`key_model_error` 保存整批读取错误。
 
-共用目录在官网分组只有一把活跃 Key 且该 Key 通过回退核验时，可在 `group_rules` 保存 `account_rate_source` 和 `account_rate_key_id`。
+共用目录发布 `key_billing` 的前提是该组只有一把活跃 Key 且该 Key 通过回退核验；`group_rate` 是分组级来源，不要求单一 Key，也不保存个人 `account_rate_key_id`。官网目录未列出的分组继续使用既有 Key-only 路径，不写入共用 `group_rules` 的回退倍率。
 
-迁移 `0058_beichen_usage_derived_prices.sql` 把 `source` 纳入分组报价观察的主键。官网抓取只追加 `source='website'`，历史流水证据为 `derived_from_usage`。Group 16 两条反推记录各来自 6 笔流水，取复核窗口结束时间 `2026-11-21 20:14 +08:00` 作为 `observed_at`。0.60× 保存为核对时观察到的倍率。输入和输出保存为每 Token 的基础元价，缓存单价缺省。
+迁移 `0058_beichen_usage_derived_prices.sql` 把 `source` 纳入分组报价观察的主键。官网抓取只追加 `source='website'`，历史流水证据为 `derived_from_usage`。Group 16 两条反推记录各来自 6 笔流水，取复核窗口结束时间 `2026-11-21 20:14 +08:00` 作为 `observed_at`。0.60× 保存为核对时观察到的倍率（测试样例）。输入和输出保存为每 Token 的基础元价，缓存单价缺省。
 
 同步在核实当前 Key 分组、实际型号与倍率后，将对应证据写入 `beichen_price_versions`。行的 `source` 和 `observed_at` 保留反推来源及时间，`effective_at` 为这次同步开始生效的时刻。反推费率依附同批分组与倍率快照，新调用优先使用同组官网价，已派发调用仍按当时的版本结算。用反推价结算的调用在 `gateway_calls.beichen_base_source` 标记 `derived_from_usage` 并引用原报价版本。缓存缺价与回执补记沿用现有待核账规则。
 

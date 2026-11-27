@@ -125,6 +125,62 @@ VALUES($1,0.6,16,0.6,$2,$3)`
 	}
 }
 
+func TestBeichenMigration0071GroupRateSource(t *testing.T) {
+	ctx, conn := openMigrationTestDB(t)
+	applyMigrationTestBaseline(t, ctx, conn, "0071")
+	const insert = `
+INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,group_rate,peak_enabled,account_rate_source)
+VALUES($1,0.6,16,0.6,$2,$3)`
+	previous := uuid.New()
+	if _, err := conn.ExecContext(ctx, insert, previous, false, "key_billing"); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := Migrate(ctx, conn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var versions, applied, predecessor int
+	var preserved bool
+	err := conn.QueryRowContext(ctx, `
+SELECT (SELECT count(*) FROM schema_migrations WHERE left(version,4)='0071'),
+       (SELECT count(*) FROM schema_migrations WHERE version='0071_beichen_group_rate_source.sql'),
+       (SELECT count(*) FROM schema_migrations WHERE version='0070_beichen_account_rate_source.sql'),
+       (SELECT multiplier=0.6 AND group_id=16 AND group_rate=0.6 AND peak_enabled IS FALSE AND account_rate_source='key_billing'
+        FROM beichen_multiplier_versions WHERE credential_id=$1)`, previous).Scan(&versions, &applied, &predecessor, &preserved)
+	if err != nil || versions != 1 || applied != 1 || predecessor != 1 || !preserved {
+		t.Fatalf("unexpected migration history or prior Key evidence: 0071=%d full=%d 0070=%d preserved=%t (%v)",
+			versions, applied, predecessor, preserved, err)
+	}
+
+	for _, peak := range []bool{true, false} {
+		if _, err := conn.ExecContext(ctx, insert, uuid.New(), peak, "group_rate"); err != nil {
+			t.Fatalf("group_rate with peak_enabled=%t should be accepted: %v", peak, err)
+		}
+	}
+	peakOn, peakOff := true, false
+	for _, test := range []struct {
+		name   string
+		peak   *bool
+		source string
+	}{
+		{name: "group rate with unknown peak", source: "group_rate"},
+		{name: "Key billing with peak enabled", peak: &peakOn, source: "key_billing"},
+		{name: "Key billing with unknown peak", source: "key_billing"},
+		{name: "unknown source with peak disabled", peak: &peakOff, source: "unknown"},
+		{name: "unknown source with unknown peak", source: "unknown"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := conn.ExecContext(ctx, insert, uuid.New(), test.peak, test.source)
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "23514" ||
+				pgErr.ConstraintName != "beichen_multiplier_versions_rate_source_peak_check" {
+				t.Fatalf("expected the new rate source check to reject the row: %v", err)
+			}
+		})
+	}
+}
+
 func TestBeichenMigration0062ExpiresPre026Prices(t *testing.T) {
 	ctx, conn := openMigrationTestDB(t)
 	applyMigrationTestBaseline(t, ctx, conn, "0062")

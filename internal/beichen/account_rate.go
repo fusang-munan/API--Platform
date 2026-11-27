@@ -12,9 +12,11 @@ import (
 )
 
 const (
-	keyBillingRateSource          = "key_billing"
-	keyBillingDefaultRateMismatch = "Key 账单默认倍率与官网分组不一致"
-	keyBillingPeakMismatch        = "Key 账单高峰状态与官网分组不一致"
+	keyBillingRateSource           = "key_billing"
+	groupRateSource                = "group_rate"
+	websiteAccountRatesReadFailure = "官网账户倍率表读取失败"
+	keyBillingDefaultRateMismatch  = "Key 账单默认倍率与官网分组不一致"
+	keyBillingPeakMismatch         = "Key 账单高峰状态与官网分组不一致"
 )
 
 var errWebsiteAccountRateUnverified = errors.New("北辰官网账户倍率未核实，分组倍率仅供参考")
@@ -36,6 +38,15 @@ func (group *WebsiteGroup) setKeyAccountRate(info billingInfo) {
 	group.AccountRate = &info.Multiplier
 	group.AccountRateSource = keyBillingRateSource
 	group.AccountRateKeyID = info.APIKeyID
+}
+
+func setGroupAccountRate(group *directoryGroup) bool {
+	if group.Subscription != "standard" || group.Rate == nil || websiteGroupRate(*group.Rate) == nil || group.PeakEnabled == nil {
+		return false
+	}
+	rate := *group.Rate
+	group.AccountRate, group.AccountRateSource, group.AccountRateKeyID = &rate, groupRateSource, 0
+	return true
 }
 
 // The caller must have identified the live Key and confirmed that a

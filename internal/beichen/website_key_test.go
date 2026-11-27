@@ -30,9 +30,11 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 		sampleAge   time.Duration
 		usage       string
 		peakGroup   bool
+		unknownPeak bool
 		nonStandard bool
 		wantRate    json.Number
 		wantReason  string
+		rejectKey   string
 		wantKeyRead bool
 	}{
 		{name: "website account rate wins", rates: `{"16":0.50}`, wantRate: "0.50"},
@@ -47,41 +49,43 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 			wantReason: "官网账户倍率表读取失败"},
 		{name: "subscription group skips Key billing", nonStandard: true,
 			wantReason: "官网分组不是标准余额计费"},
-		{name: "peak group skips Key billing", peakGroup: true,
+		{name: "unknown peak state does not allow the default rate", unknownPeak: true,
 			wantReason: "官网分组未确认关闭高峰计费"},
-		{name: "Key billing HTTP 404 is public", keyStatus: http.StatusNotFound, wantKeyRead: true,
-			wantReason: "Key 账单读取失败（HTTP 404）"},
+		{name: "peak group uses the default rate with the active peak multiplier", peakGroup: true, wantRate: "1.2",
+			rejectKey: "官网分组未确认关闭高峰计费"},
+		{name: "Key billing HTTP 404 falls back to the group default", keyStatus: http.StatusNotFound, wantKeyRead: true,
+			rejectKey: "Key 账单读取失败（HTTP 404）"},
 		{name: "omitted group is distinct from a conflicting group", keyFields: strings.TrimPrefix(keyFields, `"group_id":16,`),
-			wantReason: "Key 账单缺少分组号（group_id 未提供或为 0）", wantKeyRead: true},
+			rejectKey: "Key 账单缺少分组号（group_id 未提供或为 0）", wantKeyRead: true},
 		{name: "zero group is missing", keyFields: strings.Replace(keyFields, `"group_id":16`, `"group_id":0`, 1),
-			wantReason: "Key 账单缺少分组号（group_id 未提供或为 0）", wantKeyRead: true},
+			rejectKey: "Key 账单缺少分组号（group_id 未提供或为 0）", wantKeyRead: true},
 		{name: "different group", keyFields: strings.Replace(keyFields, `"group_id":16`, `"group_id":17`, 1),
-			wantReason: "Key 账单分组号与官网不一致", wantKeyRead: true},
+			rejectKey: "Key 账单分组号与官网不一致", wantKeyRead: true},
 		{name: "different API Key", keyFields: strings.Replace(keyFields, `"api_key_id":12094`, `"api_key_id":12093`, 1),
-			wantReason: "Key 账单中的 Key 编号与官网不一致", wantKeyRead: true},
+			rejectKey: "Key 账单中的 Key 编号与官网不一致", wantKeyRead: true},
 		{name: "legacy key_id cannot supply api_key_id", keyFields: strings.Replace(keyFields, "api_key_id", "key_id", 1),
-			wantReason: "Key 账单缺少 Key 编号（api_key_id 未提供或为 0）", wantKeyRead: true},
+			rejectKey: "Key 账单缺少 Key 编号（api_key_id 未提供或为 0）", wantKeyRead: true},
 		{name: "different group default", keyFields: strings.Replace(keyFields, `"group_rate_multiplier":0.60`, `"group_rate_multiplier":0.59`, 1),
-			wantReason: "Key 账单默认倍率与官网分组不一致", wantKeyRead: true},
+			rejectKey: "Key 账单默认倍率与官网分组不一致", wantKeyRead: true},
 		{name: "missing group default is not filled from the Key list", keyFields: strings.Replace(keyFields, `"group_rate_multiplier":0.60,`, "", 1),
-			wantReason: "Key 账单缺少分组默认倍率", wantKeyRead: true},
+			rejectKey: "Key 账单缺少分组默认倍率", wantKeyRead: true},
 		{name: "different peak flag", keyFields: strings.Replace(keyFields, `"peak_rate_enabled":false`, `"peak_rate_enabled":true`, 1),
-			wantReason: "Key 账单高峰状态与官网分组不一致", wantKeyRead: true},
+			rejectKey: "Key 账单高峰状态与官网分组不一致", wantKeyRead: true},
 		{name: "missing peak flag", keyFields: strings.TrimSuffix(keyFields, `,"peak_rate_enabled":false`),
-			wantReason: "Key 账单缺少高峰状态", wantKeyRead: true},
+			rejectKey: "Key 账单缺少高峰状态", wantKeyRead: true},
 		{name: "effective rate out of range", keyFields: strings.Replace(keyFields, `"effective_rate_multiplier":0.6`, `"effective_rate_multiplier":1001`, 1),
-			wantReason: "Key 账单格式或生效倍率无效", wantKeyRead: true},
+			rejectKey: "Key 账单格式或生效倍率无效", wantKeyRead: true},
 		{name: "different resolved rate", keyFields: keyFields + `,"resolved_rate_multiplier":0.59`,
-			wantReason: "Key 账单的账户倍率与生效倍率不一致", wantKeyRead: true},
+			rejectKey: "Key 账单的账户倍率与生效倍率不一致", wantKeyRead: true},
 		{name: "expired sample", sampleAge: panelQuoteTTL + time.Second,
-			wantReason: "Key 账单采样时段已结束", wantKeyRead: true},
+			rejectKey: "Key 账单采样时段已结束", wantKeyRead: true},
 		{name: "future sample", sampleAge: -2 * time.Second,
-			wantReason: "Key 账单采样时间无法核对", wantKeyRead: true},
-		{name: "missing usage", usage: "missing", wantReason: "近 30 分钟用量不足以核对", wantKeyRead: true},
+			rejectKey: "Key 账单采样时间无法核对", wantKeyRead: true},
+		{name: "missing usage", usage: "missing", rejectKey: "近 30 分钟用量不足以核对", wantKeyRead: true},
 		{name: "usage with no explicit group", usage: strings.Replace(usage, `"group_id":16,`, "", 1),
-			wantReason: "近 30 分钟用量不足以核对", wantKeyRead: true},
+			rejectKey: "近 30 分钟用量不足以核对", wantKeyRead: true},
 		{name: "usage cost only matches after rounding", usage: strings.Replace(usage, "0.006", "0.005999999999", 1),
-			wantReason: "近 30 分钟用量的实付与原价比值和 Key 账单倍率不一致", wantKeyRead: true},
+			rejectKey: "近 30 分钟用量的实付与原价比值和 Key 账单倍率不一致", wantKeyRead: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db, mock, err := sqlmock.New()
@@ -94,7 +98,10 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 			service := New(db, nil)
 			at := time.Date(2026, 11, 22, 12, 15, 0, 0, time.UTC)
 			service.now = func() time.Time { return at }
-			if test.usage != "" {
+			expectUsage := func() {
+				if test.usage == "" {
+					return
+				}
 				rows := sqlmock.NewRows([]string{"daily_usage"})
 				if test.usage != "missing" {
 					rows.AddRow(test.usage)
@@ -102,6 +109,7 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 				mock.ExpectQuery("FROM beichen_key_usage_days").WithArgs(job.credential, keyID, "2026-11-22",
 					at.Add(-keyUsageFreshness), at).WillReturnRows(rows)
 			}
+			expectUsage()
 			if test.wantReason == "" {
 				mock.ExpectQuery("SELECT EXISTS").WithArgs(job.provider, groupID).
 					WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
@@ -113,6 +121,9 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 			if test.peakGroup {
 				groupBody = strings.Replace(groupBody, `"peak_rate_enabled":false`, `"peak_rate_enabled":true,
 					"peak_start":"12:00","peak_end":"12:20","peak_rate_multiplier":2,"timezone":"UTC"`, 1)
+			}
+			if test.unknownPeak {
+				groupBody = strings.Replace(groupBody, `,"peak_rate_enabled":false`, "", 1)
 			}
 			rates := test.rates
 			if rates == "" {
@@ -156,8 +167,9 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 				t.Errorf("unexpected fixture endpoint or authorization for %s", req.URL.Path)
 				return nil, errors.New("unexpected fixture request")
 			})
-			directory, err := service.fetchBillingCatalog(context.Background(), job, bearer, key, listedKey{
-				ID: keyID, GroupID: groupID, Group: &panelGroup{Rate: "0.6"}})
+			ctx := context.Background()
+			identity := listedKey{ID: keyID, GroupID: groupID, Group: &panelGroup{Rate: "0.6"}}
+			directory, err := service.fetchBillingCatalog(ctx, job, bearer, key, identity)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -169,21 +181,32 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 					t.Fatalf("unexpected rejected account rate: info=%+v error=%v", info, err)
 				}
 			} else {
+				wantRate, wantSource, wantID := test.wantRate, "", int64(0)
+				wantObservation := at
+				switch {
+				case test.rejectKey != "":
+					wantSource = groupRateSource
+					if wantRate == "" {
+						wantRate = "0.60"
+					}
+				case test.wantKeyRead:
+					wantSource, wantID, wantObservation = keyBillingRateSource, keyID, keyAt
+				}
 				if err != nil || quote.err != nil || len(quote.terms) != 1 || info.GroupRate != "0.60" ||
-					info.Multiplier != test.wantRate || info.UserRate == nil {
+					info.Multiplier != wantRate || info.UserRate == nil || info.accountRateSource != wantSource ||
+					directory.group.AccountRateSource != wantSource || directory.group.AccountRateKeyID != wantID ||
+					!info.ObservedAt.Equal(wantObservation) {
 					t.Fatalf("unexpected billing info=%+v, quote error=%v, billing error=%v", info, quote.err, err)
 				}
-				if test.wantKeyRead {
-					if info.accountRateSource != keyBillingRateSource || directory.group.AccountRateSource != keyBillingRateSource ||
-						directory.group.AccountRateKeyID != keyID || !info.ObservedAt.Equal(keyAt) ||
-						!quote.expiresAt.Equal(keyAt.Add(panelQuoteTTL)) {
-						t.Fatalf("unexpected Key billing evidence: %+v", info)
-					}
-				} else if info.accountRateSource != "" {
-					t.Fatal("website rate was attributed to Key billing")
+				if wantSource == groupRateSource && *info.UserRate != "0.60" {
+					t.Fatalf("unexpected default rate before applying peak rules: %s", *info.UserRate)
 				}
-				if test.peakGroup && !quote.expiresAt.Equal(at.Add(5*time.Minute)) {
-					t.Fatalf("quote should expire at the next peak change, got %v", quote.expiresAt)
+				wantExpiry := wantObservation.Add(panelQuoteTTL)
+				if test.peakGroup {
+					wantExpiry = at.Add(5 * time.Minute)
+				}
+				if !quote.expiresAt.Equal(wantExpiry) {
+					t.Fatalf("unexpected quote expiry: got %v, want %v", quote.expiresAt, wantExpiry)
 				}
 			}
 			wantKeyReads := 0
@@ -193,8 +216,78 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 			if rateReads != 1 || keyReads != wantKeyReads || !slices.Equal(directory.catalogQuote().websiteModels, []string{"fixture"}) {
 				t.Fatalf("unexpected reads or website models: rates=%d Key=%d models=%v", rateReads, keyReads, directory.catalogQuote().websiteModels)
 			}
+			if test.rejectKey != "" {
+				// Keep the stricter evidence requirements covered independently of the group default.
+				expectUsage()
+				_, _, err := service.fetchVerifiedKeyAccountRate(ctx, job.credential, key, identity, directory.group)
+				want := "北辰官网账户倍率未核实，分组倍率仅供参考：" + test.rejectKey
+				if !errors.Is(err, errWebsiteAccountRateUnverified) || err.Error() != want {
+					t.Fatalf("expected Key evidence rejection %q, got %v", want, err)
+				}
+			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDirectoryAccountRateCoverage(t *testing.T) {
+	defaultRate := json.Number("0.6")
+	peakOff, peakOn := false, true
+	crawl := directoryCrawl{platforms: []directoryPlatform{{Groups: []directoryGroup{
+		{WebsiteGroup: WebsiteGroup{ID: 1, Rate: &defaultRate, PeakEnabled: &peakOff}, Subscription: "standard"},
+		{WebsiteGroup: WebsiteGroup{ID: 2, Rate: &defaultRate, PeakEnabled: &peakOff}, Subscription: "standard"},
+		{WebsiteGroup: WebsiteGroup{ID: 3, Rate: &defaultRate, PeakEnabled: &peakOn}, Subscription: "standard"},
+		{WebsiteGroup: WebsiteGroup{ID: 4, Rate: &defaultRate}, Subscription: "standard"},
+	}}}}
+	rates := map[int64]json.Number{1: "0.4"}
+	fallback := map[int64]*billingInfo{1: nil, 2: {Multiplier: "0.5", APIKeyID: 42}, 3: nil}
+	crawl.applyAccountRates(rates, fallback)
+	groups := crawl.platforms[0].Groups
+	if crawl.AccountRateError != "" || !matchesAccountRate(&groups[0].WebsiteGroup, "0.4", "", 0) ||
+		!matchesAccountRate(&groups[1].WebsiteGroup, "0.5", keyBillingRateSource, 42) ||
+		!matchesAccountRate(&groups[2].WebsiteGroup, "0.6", groupRateSource, 0) ||
+		!matchesAccountRate(&groups[3].WebsiteGroup, "", "", 0) {
+		t.Fatalf("unexpected directory coverage: %s %+v", crawl.AccountRateError, groups)
+	}
+	*groups[2].AccountRate = "0.9"
+	if *groups[2].Rate != "0.6" {
+		t.Fatal("the fallback rate must be independent of the default rate")
+	}
+
+	fallback[4] = nil
+	crawl.applyAccountRates(rates, fallback)
+	if crawl.AccountRateError != "部分北辰渠道的账户倍率未核实" ||
+		!matchesAccountRate(&groups[3].WebsiteGroup, "", "", 0) {
+		t.Fatalf("directory did not report a checked group without verified evidence: %s", crawl.AccountRateError)
+	}
+}
+
+func TestKeyCapabilityAccountRateEvidence(t *testing.T) {
+	rate, inherited := json.Number("0.6"), json.Number("0.5")
+	const otherKey = 99
+	keyID, groupID := int64(42), int64(16)
+	for _, test := range []struct {
+		name   string
+		source string
+		rate   *json.Number
+		keyID  int64
+	}{
+		{name: "current group default clears the inherited personal Key ID", source: groupRateSource, rate: &rate},
+		{name: "current personal rate uses its own Key ID", source: keyBillingRateSource, rate: &rate, keyID: keyID},
+		{name: "pending billing clears the inherited fallback"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			key := KeyCapability{WebsiteKeyID: &keyID, WebsiteGroup: &WebsiteGroup{
+				ID: groupID, AccountRate: &inherited, AccountRateSource: keyBillingRateSource, AccountRateKeyID: otherKey,
+			}}
+			key.applyGroup(Dataset{
+				GroupID: &groupID, GroupStatus: "assigned", AccountRate: test.rate, AccountRateSource: test.source, accountRateKeyID: test.keyID,
+			})
+			if key.WebsiteGroup.AccountRate != test.rate || key.WebsiteGroup.AccountRateSource != test.source ||
+				key.WebsiteGroup.AccountRateKeyID != test.keyID {
+				t.Fatalf("wrong account rate evidence: %+v", key.WebsiteGroup)
 			}
 		})
 	}

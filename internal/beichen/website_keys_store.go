@@ -238,6 +238,18 @@ WHERE provider_id=$1 AND status='active' FOR SHARE`, provider).Scan(&current)
 			if claims[i] == 1 {
 				matched[i] = credential
 				current = websiteKeyView(listed[i])
+				key := listed[i]
+				if current.GroupID != nil || (key.GroupID == 0 && key.groupIDKnown) {
+					saved, err := saveConfirmedKeyBinding(ctx, tx, credential.id, websiteKeyBindingObservation{
+						KeyID: key.ID, GroupID: key.GroupID, CheckedAt: observedAt, Revision: credential.revision,
+					})
+					if err != nil {
+						return nil, err
+					}
+					if !saved {
+						continue
+					}
+				}
 			}
 		}
 		if err := saveWebsiteKeyVersion(ctx, tx, credential, current, observedAt, recovered); err != nil {

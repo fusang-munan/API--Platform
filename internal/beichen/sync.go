@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -44,10 +45,13 @@ type credentialRecord struct {
 }
 
 type fetchResult struct {
-	save       func(context.Context, *sql.Tx) error
-	err        error
-	partialErr error
+	save        func(context.Context, *sql.Tx) error
+	err         error
+	partialErr  error
+	accountRate *billingAccountRateObservation
 }
+
+var errBillingKeyBindingChanged = errors.New("同步期间北辰官网 Key 或分组已变化")
 
 func (s *Service) Run(ctx context.Context) {
 	if s.db == nil || s.crypto == nil {
@@ -296,8 +300,27 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 		// website quote remains unavailable and is reported separately.
 		partialErr = nil
 	}
+	var evidence *billingAccountRateObservation
+	if group := directory.group; billingErr == nil && group.AccountRate != nil {
+		evidence = &billingAccountRateObservation{
+			GroupID: group.ID, KeyID: group.AccountRateKeyID, Rate: *group.AccountRate,
+			Source: group.AccountRateSource, KeyChecked: directory.keyGroupAt, Revision: revision,
+		}
+	}
 	keyResult := <-keyResults
-	return fetchResult{err: billingErr, partialErr: errors.Join(partialErr, keyResult.err), save: func(ctx context.Context, tx *sql.Tx) error {
+	return fetchResult{err: billingErr, partialErr: errors.Join(partialErr, keyResult.err), accountRate: evidence, save: func(ctx context.Context, tx *sql.Tx) error {
+		if evidence != nil && evidence.Source == keyBillingRateSource {
+			changed, err := personalRateBindingChanged(ctx, tx, job.credential, evidence)
+			if err != nil {
+				return err
+			}
+			if changed {
+				if err := saveBillingObservation(ctx, tx, job.credential, revision, info, errBillingKeyBindingChanged, quote.groupID, quote); err != nil {
+					return err
+				}
+				return errBillingKeyBindingChanged
+			}
+		}
 		if err := saveBillingGroup(ctx, tx, job.credential, revision, startedAt, directory, billingErr); err != nil {
 			return err
 		}
@@ -521,7 +544,10 @@ WHERE credential_id=$1 AND kind=$2`, job.credential, job.leaseKind())
 	}
 	if result.save != nil {
 		if err := result.save(ctx, tx); err != nil {
-			return err
+			if !errors.Is(err, errBillingKeyBindingChanged) {
+				return err
+			}
+			result.err, result.accountRate = err, nil
 		}
 	}
 	if job.kind == "catalog" {
@@ -539,10 +565,25 @@ WHERE credential_id=$1 AND kind='billing'`, job.credential)
 		value := result.err.Error()
 		message = &value
 	}
+	var accountRate *string
+	if result.accountRate != nil {
+		raw, err := json.Marshal(result.accountRate)
+		if err != nil {
+			return err
+		}
+		value := string(raw)
+		accountRate = &value
+	}
 	var failures int
 	err = tx.QueryRowContext(ctx, `
+WITH completed AS (SELECT clock_timestamp() AS at)
 UPDATE beichen_datasets SET
-  last_success = CASE WHEN $3 THEN clock_timestamp() ELSE last_success END,
+  last_success = CASE WHEN $3 THEN completed.at ELSE last_success END,
+  website_group_observation = CASE
+    WHEN kind <> 'billing' THEN website_group_observation
+    WHEN $7::jsonb IS NULL THEN website_group_observation - 'billing_account_rate'
+    ELSE jsonb_set(COALESCE(website_group_observation,'{}'),'{billing_account_rate}',
+      $7::jsonb || jsonb_build_object('last_success',completed.at)) END,
   last_error = $4, failure_count = CASE WHEN $6 THEN failure_count WHEN $4::text IS NULL THEN 0 ELSE LEAST(failure_count + 1, 6) END,
   next_attempt = CASE
     WHEN $6 THEN next_attempt
@@ -555,9 +596,11 @@ UPDATE beichen_datasets SET
     WHEN $4 IS NULL OR kind = 'usage' THEN clock_timestamp() + $5::int * interval '1 minute'
     ELSE clock_timestamp() + power(2, LEAST(failure_count, 6)) * interval '1 minute' END,
   lease_id = NULL, lease_until = NULL
+FROM completed
 WHERE credential_id = $1 AND kind = $2
 RETURNING failure_count`, job.credential, job.kind,
-		(result.save != nil && job.kind == "usage") || result.err == nil, message, refreshMinutes(job.kind), manual && job.kind == "usage").Scan(&failures)
+		(result.save != nil && job.kind == "usage") || result.err == nil, message, refreshMinutes(job.kind), manual && job.kind == "usage",
+		accountRate).Scan(&failures)
 	if err != nil {
 		return err
 	}

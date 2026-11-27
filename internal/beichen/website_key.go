@@ -20,6 +20,7 @@ type websiteKeyCatalog struct {
 	group              directoryGroup
 	keyGroup           *WebsiteGroup
 	keyGroupAt         time.Time
+	keyID              int64
 	entries            []catalog.ProviderEntry
 	prices             map[string]json.RawMessage
 	at                 time.Time
@@ -106,7 +107,7 @@ func readIdentifiedWebsiteKey[T any](ctx context.Context, s *Service, access pri
 func (s *Service) fetchWebsiteKeyCatalog(ctx context.Context, token string, key listedKey) (websiteKeyCatalog, error) {
 	group := key.websiteGroup()
 	groupAt := s.now().UTC()
-	observed := websiteKeyCatalog{keyGroup: &group, keyGroupAt: groupAt}
+	observed := websiteKeyCatalog{keyGroup: &group, keyGroupAt: groupAt, keyID: key.ID}
 	if group.ID == 0 {
 		return observed, errKeyGroupMissing
 	}
@@ -134,7 +135,7 @@ func (s *Service) fetchWebsiteKeyCatalog(ctx context.Context, token string, key 
 	if group.Rate == nil {
 		group.Rate = directory.group.Rate
 	}
-	directory.keyGroup, directory.keyGroupAt = &group, groupAt
+	directory.keyGroup, directory.keyGroupAt, directory.keyID = &group, groupAt, key.ID
 	return directory, nil
 }
 
@@ -282,10 +283,10 @@ func (directory websiteKeyCatalog) billing() (billingInfo, panelQuote, error) {
 	}
 	if group.AccountRate != nil {
 		info.UserRate, info.ResolvedRate = group.AccountRate, *group.AccountRate
+		info.accountRateSource = group.AccountRateSource
 	}
 	if !directory.keyBillingSampleAt.IsZero() {
 		info.ObservedAt = directory.keyBillingSampleAt
-		info.accountRateSource = group.AccountRateSource
 	}
 	if directory.keyBilling == nil || group.AccountRate != nil {
 		if err := applyWebsiteBillingRate(&info); err != nil {
