@@ -159,6 +159,19 @@ func readCatalogDifferences(ctx context.Context, tx *sql.Tx, provider uuid.UUID,
 	}
 	view.WebsiteDirectory = status
 	indexKeyGroups(view.Datasets, keys, platforms)
+	// A fresh raw Key list can predate the dataset marker. Keep this fallback
+	// in the teacher read model so crawl reports keep their original inputs.
+	currentKeys := make(map[uuid.UUID]bool)
+	for _, model := range view.Models {
+		if model.available && model.catalogCurrent {
+			currentKeys[model.CredentialID] = true
+		}
+	}
+	for i := range keys {
+		if currentKeys[keys[i].CredentialID] && keys[i].State == "pending" && !keys[i].Stale {
+			keys[i].State = "missing"
+		}
+	}
 	indexDiscoveryKeys(view.Models, keys, aliases)
 	web := map[string][]WebsiteLocation{}
 	stale := status.State == "stale"

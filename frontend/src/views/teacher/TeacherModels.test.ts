@@ -14,6 +14,8 @@ vi.mock('../../api/teacher', () => ({
     updateModel: vi.fn(),
     createBinding: vi.fn(),
     updateBinding: vi.fn(),
+    beichenOverview: vi.fn(),
+    modelUsage: vi.fn(),
   },
 }))
 
@@ -44,6 +46,27 @@ describe('TeacherModels', () => {
     expect(wrapper.text()).not.toContain('基础配置已有默认值')
     expect(wrapper.text()).not.toContain('输入模态')
     expect(wrapper.text()).not.toContain('一键配置')
+  })
+
+  it('把搜索命中的作废型号链接到顶层历史页', async () => {
+    vi.mocked(teacherAPI.providers).mockResolvedValue([{
+      id: 'north', name: '北辰', base_url: 'https://api.beichenapi.com', status: 'active',
+      credential_configured: true, created_at: '', updated_at: '',
+    }])
+    vi.mocked(teacherAPI.beichenOverview).mockResolvedValue({
+      models: [], datasets: [], comparison: [], model_catalog: [
+        { model: 'gemini-old-a', retired: true }, { model: 'gemini-old-b', retired: true },
+      ],
+    })
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.findAll('.segmented button').map(button => button.text())).toEqual(['常用模型', '全部模型', '已作废（2）'])
+    expect(wrapper.find('[data-retired-model]').exists()).toBe(false)
+    await wrapper.get('input[placeholder="名称或 model_id"]').setValue('old-b')
+    await wrapper.findAll('button').find(button => button.text() === '查看匹配的已作废型号（1）')!.trigger('click')
+    expect(wrapper.findAll('[data-retired-model]').map(row => row.attributes('data-retired-model'))).toEqual(['gemini-old-b'])
+    expect(wrapper.text()).not.toContain('新增模型')
+    wrapper.unmount()
   })
 
   it('opens route editor from governance step', async () => {

@@ -308,7 +308,6 @@ it('教师从目录直接启用未配置模型，失败后可重试，后台成�
     ['POST', '/api/v1/teacher/providers/north/beichen/models/enable'],
     ['GET', '/api/v1/teacher/providers/north/beichen'],
     ['GET', '/api/v1/teacher/providers/north/beichen/keys'],
-    ['GET', '/api/v1/teacher/providers/north/beichen/capabilities'],
   ])
   expect(writes).toHaveBeenCalledExactlyOnceWith('/api/v1/teacher/providers/north/beichen/models/enable', { model: 'lab/new-model' })
   expect(row.text()).toContain('已启用')
@@ -405,7 +404,6 @@ it('教师页自动发现目录里的新模型，等待当前 Key 的报价并�
     Array.from({ length: 4 }, () => [
       ['GET', '/api/v1/teacher/providers/north/beichen'],
       ['GET', '/api/v1/teacher/providers/north/beichen/keys'],
-      ['GET', '/api/v1/teacher/providers/north/beichen/capabilities'],
     ]).flat(),
   )
   expect(writes).not.toHaveBeenCalled()
@@ -559,7 +557,7 @@ it('教师从维护抽屉打开校方工作区，授权提示和网页时间仍�
   expect(dialog.text()).toContain('北辰官网需要学校后台重新授权。')
   expect(readPaths()).toEqual([
     ['GET', overviewPath], ['GET', overviewPath + '/keys'], ['GET', '/api/v1/teacher/model-usage'],
-    ['GET', overviewPath + '/capabilities'], ['GET', overviewPath + '/receipts'],
+    ['GET', overviewPath + '/receipts'],
   ])
   expect(panel.findAll('dl > div').map(field => [field.get('dt').text(), field.get('dd').text()])).toEqual([
     ['当前有有效网页报价', '3 / 4 个渠道'], ['成功读取过流水页', '4 / 4 个渠道'], ['最近一次扫描已到末页', '1 / 4 个渠道'],
@@ -572,11 +570,11 @@ it('教师从维护抽屉打开校方工作区，授权提示和网页时间仍�
   await panel.get('input').setValue('2026-11-02')
   await flushPromises()
   expect(panel.text()).toContain('学校尚未归档所选日期的北辰流水')
-  expect(readPaths().slice(5)).toEqual([['GET', overviewPath + '/receipts']])
+  expect(readPaths().slice(4)).toEqual([['GET', overviewPath + '/receipts']])
   await button('刷新对账', panel).trigger('click')
   await flushPromises()
-  expect(readPaths().slice(6)).toEqual([
-    ['GET', overviewPath], ['GET', overviewPath + '/keys'], ['GET', overviewPath + '/receipts'], ['GET', overviewPath + '/capabilities'],
+  expect(readPaths().slice(5)).toEqual([
+    ['GET', overviewPath], ['GET', overviewPath + '/keys'], ['GET', overviewPath + '/receipts'],
   ])
   await page().get('button[aria-label="关闭"]').trigger('click')
   const beforeCatalog = request.mock.calls.length

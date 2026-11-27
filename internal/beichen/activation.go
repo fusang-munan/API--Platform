@@ -52,20 +52,21 @@ type activationPlan struct {
 }
 
 func loadActivationCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID, source string) ([]*activationModel, error) {
-	// Legacy website membership can sustain an existing published route until the first Key scan.
 	query := `
+WITH ` + catalog.BeichenKeyEvidenceCTE + `
 SELECT k.model_id::text,k.raw_entry,p.name::text,c.id,c.label::text,k.catalog_source='key',
  p.status='active' AND c.status='active' AND k.last_seen_at>=c.updated_at,
- ` + keyCatalogCurrentSQL + `,
+ ` + catalog.BeichenKeyListsModelSQL + ` AND ` + catalog.BeichenGroupAllowsRouteSQL + ` AND octet_length(c.credential_ciphertext)>0,
  CASE WHEN billing.last_error IS NULL AND billing.last_success>=c.updated_at
    AND billing.last_success>statement_timestamp()-interval '16 minutes'
-   AND mv.stale_at IS NULL
+   AND billing.last_success>=e.evidence_since AND mv.stale_at IS NULL
+   AND (e.group_id IS NULL OR mv.group_id=e.group_id)
  THEN mv.multiplier::text END, to_json(k.supported_protocols)
 FROM provider_model_catalog k JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
 JOIN providers p ON p.id=c.provider_id
-LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='catalog'
+JOIN beichen_key_evidence e ON e.credential_id=c.id
 LEFT JOIN beichen_datasets billing ON billing.credential_id=c.id AND billing.kind='billing'
-LEFT JOIN LATERAL (SELECT multiplier,stale_at FROM beichen_multiplier_versions WHERE credential_id=c.id
+LEFT JOIN LATERAL (SELECT multiplier,stale_at,group_id FROM beichen_multiplier_versions WHERE credential_id=c.id
  AND effective_at<=statement_timestamp()
  ORDER BY effective_at DESC,id DESC LIMIT 1) mv ON true
 WHERE p.id=$1 AND ` + beichenProvider + ` AND k.status='active'
@@ -142,7 +143,7 @@ ORDER BY lower(k.model_id::text),c.id`
 	// An unpinned binding can still display a reachable Key during transition.
 	// Publication requires evidence for the first Key the gateway will pick.
 	bound, err := tx.QueryContext(ctx, `
-WITH north AS (
+WITH `+catalog.BeichenKeyEvidenceCTE+`, north AS (
  SELECT DISTINCT k.model_id FROM provider_model_catalog k
  WHERE k.provider_id=$1 AND ($2::text='' OR k.model_id=$2::citext)
    AND ((k.status='active' AND k.catalog_source='key')
@@ -158,7 +159,8 @@ WITH north AS (
 )
 SELECT n.upstream::text,m.id,m.model_id::text,m.status,m.credit_multiplier_milli,b.id,b.adapter,b.upstream_model_name,
  b.provider_id,p.name::text,b.priority,b.status='active',
- p.status='active' AND COALESCE(picked.reachable,false),p.status='active' AND picked.id IS NOT NULL,
+ p.status='active' AND COALESCE(picked.reachable AND (b.provider_id<>$1 OR picked.catalog_current),false),
+ p.status='active' AND picked.id IS NOT NULL,
  COALESCE(picked.catalog_current,false),
  CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.id END,
  CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.label::text END
@@ -167,14 +169,14 @@ LEFT JOIN model_bindings b ON b.model_id=m.id LEFT JOIN providers p ON p.id=b.pr
 LEFT JOIN LATERAL (
  SELECT c.id,c.label,count(*) OVER() AS count,
    (b.provider_id<>$1 OR k.last_seen_at>=c.updated_at) AS reachable,
-   k.catalog_source='key' AND k.last_seen_at>=c.updated_at AND `+keyCatalogCurrentSQL+`
-     AND c.id=first_value(c.id) OVER (ORDER BY c.id) AS catalog_current
+   (`+catalog.BeichenKeyListsModelSQL+` AND `+catalog.BeichenGroupAllowsRouteSQL+`
+     AND octet_length(c.credential_ciphertext)>0) AS catalog_current
  FROM provider_model_catalog k
  JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
- LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='catalog'
+ LEFT JOIN beichen_key_evidence e ON e.credential_id=c.id
  WHERE k.provider_id=b.provider_id AND k.model_id=btrim(b.upstream_model_name)::citext AND k.status='active' AND c.status='active'
    AND (b.credential_id IS NULL OR c.id=b.credential_id)
- ORDER BY reachable DESC,c.id LIMIT 1
+ ORDER BY c.id LIMIT 1
 ) picked ON true
 ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source)
 	if err != nil {
@@ -249,6 +251,12 @@ func (s *activationSchool) published() bool {
 	return s.status == "active" && s.multiplier != nil && *s.multiplier > 0
 }
 
+func (m *activationModel) alreadyPublished(s *activationSchool, plan activationPlan) bool {
+	return s.published() && len(plan.writes) == 0 && slices.ContainsFunc(s.bindings, func(b activationBinding) bool {
+		return b.active && b.route.ProviderID == m.provider && strings.EqualFold(strings.TrimSpace(b.route.UpstreamModel), m.name)
+	})
+}
+
 func (m *activationModel) plan(s *activationSchool) activationPlan {
 	var plan activationPlan
 	// The first publication uses the same default protocols shown in the preview.
@@ -294,7 +302,7 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 			if ours {
 				plan.northReady = true
 			}
-		case ours && b.active:
+		case ours && b.active && !b.gatewayReachable:
 			if next, ok := m.defaults[r.Adapter]; ok {
 				next.SchoolModel = s.name
 				next.Priority = r.Priority
@@ -430,7 +438,7 @@ func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx, observed
 		} else {
 			var fixed bool
 			var terms []byte
-			if err := tx.QueryRowContext(ctx, activationPriceSQL, key.credential, key.model).Scan(&fixed, &terms); err != nil {
+			if err := tx.QueryRowContext(ctx, activationPriceSQL, route.ProviderID, key.credential, key.model).Scan(&fixed, &terms); err != nil {
 				return activationPrice{}, err
 			}
 			price = routePriceReadiness(fixed, terms)
@@ -445,27 +453,23 @@ func (p activationPlan) priceReadiness(ctx context.Context, tx *sql.Tx, observed
 	return readiness, nil
 }
 
-// Read the original terms without converting any prices to floating point.
-const activationFixedSchoolPriceSQL = `p.school_input IS NOT NULL AND p.school_output IS NOT NULL
-  AND (p.mode = 'manual' OR (version.source IS DISTINCT FROM '` + derivedPriceSource + `'
-       AND p.school_cache_read IS NOT NULL AND p.school_cache_write IS NOT NULL))`
-
 const activationPriceSQL = `
-SELECT ` + activationFixedSchoolPriceSQL + `,
+WITH ` + catalog.BeichenKeyEvidenceCTE + `
+SELECT COALESCE(` + catalog.BeichenFixedPriceSQL + `,false),
   CASE WHEN version.source IS DISTINCT FROM '` + derivedPriceSource + `'
-       AND snap.expires_at > statement_timestamp()
-       AND COALESCE(snap.credential_ciphertext_sha256 = sha256(c.credential_ciphertext), snap.credential_revision = c.updated_at)
-       THEN snap.model_pricing -> ($2::text) END
+       AND ` + catalog.BeichenPanelQuoteCurrentSQL + `
+       THEN snap.model_pricing -> ($3::text) END
 FROM provider_credentials c
-CROSS JOIN LATERAL beichen_price_at(c.id,$2,statement_timestamp()) p
-LEFT JOIN beichen_price_versions version ON version.id=p.upstream_version
+JOIN beichen_key_evidence e ON e.credential_id=c.id
+CROSS JOIN LATERAL beichen_price_at(c.id,$3,statement_timestamp()) price
+LEFT JOIN beichen_price_versions version ON version.id=price.upstream_version
 LEFT JOIN LATERAL (
-  SELECT expires_at,credential_ciphertext_sha256,credential_revision,model_pricing
+  SELECT effective_at,expires_at,credential_ciphertext_sha256,credential_revision,group_id,model_pricing
   FROM beichen_panel_snapshots
   WHERE credential_id=c.id AND effective_at<=statement_timestamp()
   ORDER BY effective_at DESC LIMIT 1
 ) snap ON true
-WHERE c.id=$1`
+WHERE c.id=$2`
 
 func (m *activationModel) overview() CatalogModel {
 	result := CatalogModel{Model: m.name, CredentialIDs: append([]uuid.UUID{}, m.keys...), SchoolStatus: "not_configured", PreferredRoutes: []PreferredRoute{}}
@@ -607,11 +611,11 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 		return skip("route_not_ready", "存在多个校内模型，请先明确该模型的线路")
 	}
 	plan := m.plan(target)
+	if m.alreadyPublished(target, plan) {
+		return skip("already_active", "模型已启用")
+	}
 	if !plan.allowed(target) {
 		return skip("route_not_ready", "当前北辰 Key 目录、已配置的线路或其他供应商计价尚未就绪")
-	}
-	if target.published() && len(plan.writes) == 0 {
-		return skip("already_active", "模型已启用")
 	}
 	price, err := plan.priceReadiness(ctx, tx, nil)
 	if err != nil {
@@ -674,11 +678,11 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 		return uuid.Nil, invalid("请指定与该北辰目录对应的校内模型")
 	}
 	plan := m.plan(target)
+	if m.alreadyPublished(target, plan) {
+		return target.id, nil
+	}
 	if !plan.allowed(target) {
 		return uuid.Nil, invalid("当前北辰 Key 目录、已配置的路线或其他供应商计价不支持直接启用")
-	}
-	if target.published() && len(plan.writes) == 0 {
-		return target.id, nil
 	}
 	price, err := plan.priceReadiness(ctx, tx, nil)
 	if err != nil {

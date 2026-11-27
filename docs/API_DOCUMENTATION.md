@@ -460,7 +460,11 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `credentials[].health` 包含 `credential`、`catalog`、`pricing`、`probe` 四个维度，各返回 `state`（`available`、`unavailable` 或 `pending`）和说明 `message`。`available_dimensions` 统计可用项。报价维度按当前可计算报价数判断。探活维度按有至少一种协议通过的模型占可探活模型的比例判断。
 
-`model_catalog[].protocols` 使用网关绑定的协议枚举。`probe_state` 为 `unprobed`、`passed` 或 `failed`。同一模型任一当前 Key 和协议的最近结果通过即为 `passed`。`last_probe_at` 是所有有效最近结果里的最新时间。只有 `catalog_source=key` 的记录提供 Key 覆盖和探活依据；超过 30 分钟未刷新或扫描失败的目录保留展示，但 `probe_state` 回到 `unprobed`，不计入当前覆盖。官网来源和 `website_only` 型号不参与探活比例，也不显示探活结论。发布可达线路数由 `ready_count` 表示。学校已启用但 `ready_count=0` 时，仍需排查的记录返回 `binding_issue`。`price_covered` 表示至少一条启用 Key 有可计算报价，发布时仍逐条检查实际会使用的线路。
+`model_catalog[].bound_routes` 按绑定返回 `school_model`、`upstream_model`、`credential_id`、`credential_label`、`key_enabled`、`protocol`、`priority`、`group_id`、`group_status`、`group_checked_at`、`catalog_state`、`price_state`、`price_covered`、`probe_state` 与最近探活 `probe`。`published` 表示校内模型和绑定已启用。`binding_ready` 还要求当前 Key 和分组的目录可核实。`bound_key_count` 按启用的绑定 Key 去重，`covered_bound_key_count` 只计目录当前确实列出绑定上游名的 Key。`bound_catalog_pending=true` 表示至少一条绑定的目录或分组待复核。`ready_count` 按已发布且就绪的 Key 和协议去重。部分已发布线路失去目录证据也会返回 `binding_issue`。
+
+`GET .../beichen/capabilities` 按 Key 和原始上游型号返回 `bindings`、`supported_protocols`、`available_protocols`、`responses_ready`、`recommended_protocol`、`availability` 和报价字段。`responses_ready` 表示存在当前已发布的 Responses 绑定。只有通过当轮探活的协议出现在 `available_protocols`。教师 `/api/v1/teacher/models` 的北辰线路复用同一协议判定。概览的 `route_availability` 汇总已发布线路，缺少当前绑定或探活证据时显示待核实。探活和报价都核对当前凭据版本及已知换组时间。陈旧目录保留供核对，`price_covered` 为 `false`，等待符合当前证据的探活。
+
+已发布型号的 `price_covered` 表示至少一条当前已发布且就绪的线路有可计算报价。待配置型号按绑定或可用的 Key 目录判断。手动价及可按 Token 计算的 `conditional` 都计入。通过缺价字段可核查反推价和缺字段的档位。批量启用逐条验证启用后的线路。
 
 线路就绪且报价阻止启用时，`model_catalog[].price_blocker` 返回 `{code, message}`，其中 `message` 说明涉及的字段及适用的档位号。常见代码包括 `missing_price`、`billing_mode_non_token`、`price_conditions_invalid`、`tier_missing_input`、`tier_missing_output`、`tier_range_invalid` 和 `effort_multiplier_invalid`。线路未就绪时，查看 `blockers` 中的 `no_ready_route`。
 
@@ -470,11 +474,11 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 带上下文倍率的官网报价保留 `intervals` 中的四项倍率和档位标签。`price_conditions_exact` 将倍率应用到基础单价，并使用下限包含、上限不包含的边界。未命中该类档位时使用基础价。`website_directory.price_unit` 为「元（北辰余额单位）」。官网报价按 1:1 读取，界面上的 `$` 不触发货币换算。
 
-`website_directory` 返回完整官网目录状态、`last_success` 和 `last_error`。`fresh` 表示近期完整采集，`stale` 表示当前使用部分更新或保留的快照，`unverified` 表示等待取得官网目录。`model_catalog` 合并官网与启用 Key 的目录，并保留已发布但失去目录覆盖的模型。`source` 为 `website`、`key` 或 `both`。`catalog_state` 为 `key_listed`、`website_only`、`published_unavailable` 或 `catalog_missing`。`key_count` 等于 `current_key_count`，只统计当前 `/v1/models` 的 Key 目录证据；`current_key_count` 按 `catalog_keys[].state=listed` 且非陈旧的 Key 去重，`stale_key_count` 统计扫描失败或超过 30 分钟未刷新、沿用上次结果的 Key，两者为零时省略。`catalog_keys[].stale` 标记这些保留条目；它们保留展示，但不计入 `current_key_count` 和 `key_count`，`probe_state` 也回到 `unprobed`。目录表 `provider_model_catalog.catalog_source` 区分 `key` 和 `website`，迁移 `0061_provider_catalog_source.sql` 新增非空列并默认 `key`，同时把旧 `raw_entry->>'source'='beichen_website_group'` 的行回填为 `website`。
+`website_directory` 返回完整官网目录状态、`last_success` 和 `last_error`。`fresh` 表示近期完整采集，`stale` 表示当前使用部分更新或保留的快照，`unverified` 表示等待取得官网目录。`model_catalog` 合并官网与启用 Key 的目录，并保留已发布但失去目录覆盖的模型。`source` 为 `website`、`key` 或 `both`。`catalog_state` 为 `key_listed`、`website_only`、`published_unavailable` 或 `catalog_missing`。`key_count` 等于 `current_key_count`，只统计当前 `/v1/models` 的 Key 目录证据；`current_key_count` 按 `catalog_keys[].state=listed` 且非陈旧的 Key 去重，`stale_key_count` 统计扫描失败或超过 30 分钟未刷新、沿用上次结果的 Key，两者为零时省略。`catalog_keys[].stale` 标记这些保留条目；这些条目保留供核对，退出 `current_key_count` 和 `key_count`。每条线路的探活状态取该线路当前有效的证据。目录表 `provider_model_catalog.catalog_source` 区分 `key` 和 `website`，迁移 `0061_provider_catalog_source.sql` 新增非空列并默认 `key`，同时把旧 `raw_entry->>'source'='beichen_website_group'` 的行回填为 `website`。
 
 `catalog_state=published_unavailable` 表示该模型曾发布（校内模型已启用、存在绑定或保留的绑定异常），但当前启用的渠道 Key 都没有在 `/v1/models` 列出它。学校仍需排查的记录保留在主表异常筛选，`binding_issue.code` 通常为 `catalog_missing` 或 `catalog_stale`，后者表示只剩陈旧的 Key 目录记录。`website_only` 型号汇总在 `website_only_models`。
 
-`model_catalog[].retired` 仅在作废时返回 `true`。有校内目录或绑定记录、关联渠道均停用，且同型号的北辰绑定均已停用时，概览可标记该行作废并省略 `binding_issue`。教师只在「模型管理 → 全部模型」的「全部」筛选中看到「已作废」行，并可查看历史用量。启用渠道的目录或绑定、启用供应商上同一校内模型的其他启用绑定、关联型号的启用接替 Key，以及官网归并匹配的启用 Key 均保留原有展示。换 Key 后仍启用的旧绑定继续显示维护提示。陈旧目录仍是关联启用渠道的证据。仅官网可见的型号继续按官网目录展示。
+`model_catalog[].retired=true` 表示校内历史目录和绑定关联的渠道已停用，且没有其他启用线路、启用别名或待核对的接替 Key。`historical_channels` 为去重后的原渠道。仍启用的旧绑定留在异常筛选，便于换绑。概览保留作废型号，独立的 `GET .../beichen/capabilities` 不将同一作废集合列入 `capabilities` 和 `gaps`。批量启用、当前模型计数及筛选均排除作废型号。教师从「模型管理 → 已作废」读取历史用量。
 
 `website_directory.last_run` 是最近一次后台抓取的摘要，尚无运行记录时为 `null`。摘要包含 `started_at`、`duration_ms`、`platform_count`、`group_count`、`model_count`、`expected_model_count` 和 `failures`。同一平台出现在不同渠道下时分别计数。模型按去掉首尾空白的官网原名去重，保留大小写及版本差异。分组按照分组 ID 去重，没有 ID 时用渠道内的平台和分组名识别。`expected_model_count` 含原响应中所有 `models` 和 `supported_models` 数组中能辨认的型号。当平台资料损坏时，本轮成功归入平台的模型数可能低于它。失败项提供 `path`、`reason` 以及可读取的 `channel_id`、`channel` 和 `platform`。
 
@@ -530,7 +534,7 @@ Key 证据不足时，标准余额计费、分组默认倍率有效且高峰开�
 
 `data.status` 为 `unsynced`、`current`、`stale`、`session_expired` 或 `unavailable`。成功时 `last_seen` 更新为读取时间。北辰返回 401 或会话已知过期时返回 `session_expired`，保留最近成功的清单及时间。已保存的清单超过 30 分钟未更新时显示 `stale`。并发刷新返回 `invalid_transition`。
 
-`data.keys` 的每一项包含北辰 `id`、`name`、脱敏后的 `key_prefix`、`group_id`、`group_name`、分组倍率 `rate`、`status`、`enabled`、`created_at`、`last_seen`、匹配的学校 `credential_id` 和 `match_status`。`peak` 包含 `enabled`、`rate`、`start` 和 `end`，取官网 Key 页的 `group.peak_rate_enabled`、`group.peak_rate_multiplier`、`group.peak_start` 和 `group.peak_end`。倍率用十进制字符串传输，未知字段为 `null`。匹配状态为 `matched`、`unmatched` 或 `ambiguous`。
+`data.keys` 的每一项包含北辰 `id`、`name`、脱敏后的 `key_prefix`、`group_id`、`group_name`、分组倍率 `rate`、`status`、`enabled`、`created_at`、`last_seen`、匹配的学校 `credential_id` 和 `match_status`。`peak` 包含 `enabled`、`rate`、`start` 和 `end`，取官网 Key 页的 `group.peak_rate_enabled`、`group.peak_rate_multiplier`、`group.peak_start` 和 `group.peak_end`。倍率用十进制字符串传输，未知字段为 `null`。匹配状态为 `matched`、`unmatched` 或 `ambiguous`。教师模型页按清单时效以及校内启用 Key 的匹配状态提示刷新，另列官网仍启用且未匹配校内 Key 的条目。
 
 `observed_at` 是当前分组、倍率和高峰规则版本首次读到的时间。`changed_at` 是当前版本与上一版本发生变化时的抓取时间，首次建立基线或尚未采集版本时为 `null`。`last_seen` 随每次成功读取推进，便于判断数据是否新鲜。两次抓取之间发生的变化以实际读到的时间登记。
 

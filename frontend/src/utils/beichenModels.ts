@@ -1,4 +1,4 @@
-import type { BeichenCatalogModel, BeichenDataset, BeichenModel, BeichenOverview, BeichenPriceConditions, BeichenPriceTier, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../api/types'
+import type { BeichenCatalogModel, BeichenDataset, BeichenModel, BeichenOverview, BeichenPreferredRoute, BeichenPriceConditions, BeichenPriceTier, BeichenProtocolCapability, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../api/types'
 import { shiftDecimal } from './credits'
 
 export function isBeichenProvider(baseUrl: string) {
@@ -106,6 +106,41 @@ export type SchoolCatalogRow = {
   quotes: SchoolQuote[]
 }
 
+export type TeacherBoundRoute = BeichenProtocolCapability & {
+  school_model: string
+  upstream_model: string
+  credential_id: string | null
+  credential_label: string
+  priority: number
+  published: boolean
+  key_enabled: boolean
+  group_id: number | null
+  group_status?: string
+  group_checked_at?: string
+  catalog_state: string
+  price_state: string
+  price_covered: boolean
+}
+
+export type TeacherCatalogModel = Omit<BeichenCatalogModel, 'price_state'> & {
+  price_state?: BeichenCatalogModel['price_state'] | 'unverified'
+  bound_routes?: TeacherBoundRoute[]
+  bound_key_count?: number
+  covered_bound_key_count?: number
+  bound_catalog_pending?: boolean
+  route_availability?: {
+    protocols: string[]
+    available_protocols: string[]
+    recommended_protocol: string | null
+    availability: string
+    availability_reason?: string
+  }
+  action_hint?: string
+  historical_channels?: string[]
+}
+
+export type TeacherOverview = Omit<BeichenOverview, 'model_catalog'> & { model_catalog?: TeacherCatalogModel[] | null }
+
 type WebsiteKeyRateVersion = BeichenWebsiteKey & { observed_at?: string | null }
 type WebsiteKeyGroups = {
   current: boolean
@@ -154,12 +189,28 @@ export function websiteKeyEffectiveRate(key: WebsiteKeyRateVersion, billing?: Be
 }
 
 export function priceBelongsToWebsiteKeyGroup(key: WebsiteKeyRateVersion, observedAt?: string | null, groupId?: number | null) {
-  if (key.group_id == null) return false
+  if (key.group_id == null || groupId != null && groupId !== key.group_id) return false
   if (key.observed_at) return Boolean(observedAt && Date.parse(observedAt) >= Date.parse(key.observed_at))
-  return groupId == null || groupId === key.group_id
+  return true
 }
 
-export function schoolCatalog(overview: BeichenOverview, providerId: string, websiteGroups?: WebsiteKeyGroups): SchoolCatalogRow[] {
+export function schoolPriceRoutes(entry: TeacherCatalogModel, providerId: string, school: string): BeichenPreferredRoute[] {
+  const preferred = (entry.preferred_routes ?? []).filter(route => route.provider_id === providerId &&
+    route.school_model.toLowerCase() === school.toLowerCase() && route.credential_id)
+  const bindings = entry.bound_routes
+  if (!bindings) return preferred
+  const published = entry.school_status === 'active' || bindings.some(route => route.published)
+  const allowed = bindings.filter(route => route.credential_id && (published ? route.binding_ready :
+    route.key_enabled && route.catalog_state === 'key_listed' && !['pending', 'not_allowed', 'not_found'].includes(route.group_status ?? '')))
+  if (!bindings.length && !published) return preferred
+  return allowed.map(route => ({
+    school_model: route.school_model, upstream_model: route.upstream_model, adapter: route.protocol,
+    provider_id: providerId, credential_id: route.credential_id, credential_label: route.credential_label,
+    priority: route.priority, state: route.binding_ready ? 'ready' : 'candidate',
+  }))
+}
+
+export function schoolCatalog(overview: TeacherOverview, providerId: string, websiteGroups?: WebsiteKeyGroups): SchoolCatalogRow[] {
   const records = new Map<string, BeichenModel[]>()
   const prices = new Map<string, BeichenModel>()
   for (const row of overview.models ?? []) {
@@ -170,7 +221,7 @@ export function schoolCatalog(overview: BeichenOverview, providerId: string, web
     else records.set(key, [row])
   }
   const datasets = new Map(overview.datasets?.map(row => [row.kind + ':' + row.credential_id, row]))
-  const catalog: BeichenCatalogModel[] = overview.model_catalog ??
+  const catalog: TeacherCatalogModel[] = overview.model_catalog ??
     Array.from(records.values(), rows => ({ model: rows[0].model }))
   return catalog.map(entry => {
     const rows = records.get(entry.model.toLowerCase()) ?? []
@@ -188,8 +239,8 @@ export function schoolCatalog(overview: BeichenOverview, providerId: string, web
     const quotes = new Map<string, ReturnType<typeof schoolQuote>>()
     const credentials = new Map<string, { credential_id: string; label: string; mode: 'follow' | 'manual'; priceReady: boolean }>()
     const catalogGroups = new Map(entry.catalog_keys?.map(key => [key.credential_id, key.group_id]))
-    for (const route of selected) {
-      if (route.provider_id !== providerId || !route.credential_id) continue
+    for (const route of schoolPriceRoutes(entry, providerId, school)) {
+      if (!route.credential_id) continue
       const upstreamName = (route.upstream_model ?? entry.model).toLowerCase()
       const record = prices.get(route.credential_id + ':' + upstreamName)
       const billing = datasets.get('billing:' + route.credential_id)

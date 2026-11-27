@@ -173,13 +173,14 @@ WHERE credential_id=$1 AND kind='catalog'`, key)
 	if err := json.Unmarshal([]byte(request("GET", path, teacherToken, "", 200)), &overview); err != nil {
 		t.Fatal(err)
 	}
-	if len(overview.Data.Models) != 1 || !overview.Data.Models[0].RouteReady {
-		t.Fatalf("an expired catalogue changed the published route: %+v", overview.Data.Models)
+	if len(overview.Data.Models) != 1 || overview.Data.Models[0].RouteReady || overview.Data.Models[0].SchoolStatus != "active" {
+		t.Fatalf("the teacher should see an enabled model awaiting current route evidence: %+v", overview.Data.Models)
 	}
 	stale := status()
 	if stale.CatalogState != "published_unavailable" || stale.BindingIssue == nil || stale.BindingIssue.Code != "catalog_stale" ||
 		stale.KeyCount != 0 || stale.CurrentKeyCount != 0 || stale.StaleKeyCount != 1 ||
-		stale.ProbeState != "unprobed" || stale.LastProbeAt != nil || stale.ReadyCount == 0 || stale.Activation != "active" {
+		stale.ProbeState != "unprobed" || stale.LastProbeAt != nil || stale.ReadyCount != 0 ||
+		stale.ModelAvailability.Availability != "unverified" || !stale.BoundCatalogPending {
 		t.Fatalf("expired Key evidence should need a refresh while the published route stays active: %+v", stale)
 	}
 	if !strings.Contains(request("GET", "/v1/models", studentKey, "", 200), model) {
@@ -202,9 +203,9 @@ VALUES(gen_random_uuid(),$1,$2,$3,'website','{"source":"beichen_website_group"}'
 		legacy := status()
 		if legacy.CatalogState != "published_unavailable" || legacy.KeyCount != 0 || legacy.CurrentKeyCount != 0 ||
 			len(legacy.CredentialIDs) != 0 || len(legacy.Protocols) != 0 || legacy.ProbeState != "unprobed" || legacy.LastProbeAt != nil ||
-			legacy.ReadyCount == 0 || legacy.Activation != "active" || len(legacy.PreferredRoutes) == 0 ||
-			legacy.PreferredRoutes[0].State != "ready" || legacy.PreferredRoutes[0].EffectiveMultiplierText != "0.250000000000000000000019" {
-			t.Fatalf("legacy membership should keep the published route without claiming Key evidence: %+v", legacy)
+			legacy.ReadyCount != 0 || legacy.SchoolStatus != "active" || len(legacy.PreferredRoutes) == 0 ||
+			legacy.PreferredRoutes[0].State != "candidate" || legacy.ModelAvailability.Availability != "unverified" {
+			t.Fatalf("the teacher should wait for key evidence for the retained legacy route: %+v", legacy)
 		}
 		if enable() != id {
 			t.Fatal("the published legacy route must keep its original model")

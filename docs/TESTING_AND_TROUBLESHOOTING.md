@@ -213,6 +213,10 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 ### 北辰教师端用量、定价与对账
 
+教师页若显示「目录待复核」，展开「目录来源与分组」，核对实际绑定线路的 Key、分组、目录和探活。目录超过 30 分钟、最近扫描失败或早于已知的换组轮次时，原证据不计入覆盖。重新扫当前 Key 后，报价和探活分别随当轮证据恢复。其他 Key 未列出该型号时只显示目录详情。官网清单待刷新取决于清单时效及校内已启用 Key 是否有匹配，官网仍启用的未匹配 Key 单列。
+
+设置 `NEBULA_TEST_POSTGRES` 后执行 `go test ./internal/beichen ./internal/dataplane -run 'TestBeichenTeacherCoveragePostgres|TestBeichenOverviewRetiredCatalogPostgres|TestBeichenCapabilitiesAndGatewayPostgres' -count=1`。前端执行 `npm run test -- BeichenSchoolModels TeacherModels BeichenPriceDrawer`。回归覆盖 G3 / GM1 六个型号、绑定 Key 去重、原始上游名和校内别名、条件价、换组及目录过期、能力不可读和作废型号历史用量入口。
+
 「北辰对账」默认总计的下一页若返回 503，核对请求是否使用同一账期、口径和供应商。旧版把查询时刻写进游标，同一天的下一次请求也会失效。当前查询把截止固定在北京时间次日 00:00，换账期或跨过零点后从第一页刷新。页面上的「重试本页」会重新请求刚才失败的那一页。
 
 采价配置变更后，若停用渠道又导致后续账日缺同步，检查是否应用迁移 `0067`。在本机隔离测试库对照 `provider_credentials.retired_at` 和 `updated_at`，确认改采价配置只更新版本时间，停用当天继续计入覆盖要求。执行 `go test -p 1 ./internal/beichen -run 'Test(ReconciliationUnmatchedCursorPostgres|ReconciliationRetiredCredentialStopsExpectedDaysPostgres|SaveCredentialRetiredAtPostgres|ReconciliationPostgresVerifiedCallsRequireUnconflictedReceipt)$' -count=1` 可复查分页和停用行为。进入 `frontend` 执行 `npm run test -- --run BeichenReconcile`，复查账期切换、失败重试和严格视图的加载、错误及空态。

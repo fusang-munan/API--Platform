@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,10 +15,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 )
 
 func TestBeichenOverviewRetiredCatalogPostgres(t *testing.T) {
-	ctx, db, provider, _, keys := newActionsPostgres(t)
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
 	retired, current := keys[0], keys[1]
 	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
 	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", retired)
@@ -60,9 +62,32 @@ JOIN models m ON m.model_id=b.school::citext`, provider, retired, current)
 	rows := read()
 	for name, status := range map[string]string{"retired-binding": "active", "retired-website-record": "pending_configuration"} {
 		row := rows[name]
-		if !row.Retired || row.BindingIssue != nil || row.SchoolStatus != status || row.CanEnable {
+		if !row.Retired || row.BindingIssue != nil || row.SchoolStatus != status || row.CanEnable ||
+			!slices.Equal(row.HistoricalChannels, []string{"Gemini"}) {
 			t.Errorf("%s 应保留校内状态并退出当前异常: %+v", name, row)
 		}
+	}
+	checkRetired := func(names ...string) {
+		t.Helper()
+		view, err := catalog.ReadBeichenCapabilities(ctx, db, provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(view.RetiredModels) != len(names) {
+			t.Fatalf("能力目录的作废集合有误: %+v", view.RetiredModels)
+		}
+		for _, name := range names {
+			if _, retired := view.RetiredModels[name]; !retired ||
+				slices.ContainsFunc(view.Capabilities, func(row catalog.ModelCapability) bool { return row.Model == name }) ||
+				slices.ContainsFunc(view.Gaps, func(gap catalog.CapabilityGap) bool { return gap.Model == name }) {
+				t.Fatalf("历史型号仍进入当前能力或缺口: %s", name)
+			}
+		}
+	}
+	checkRetired("retired-binding", "retired-website-record")
+	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{"retired-binding", "retired-website-record"})
+	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 2 {
+		t.Fatalf("批量接口应拒绝历史型号: %+v %v", result, err)
 	}
 	for _, name := range []string{"stale-active-key", "active-binding", "inactive-binding-active-key", "active-binding-retired-key"} {
 		row := rows[name]
@@ -78,6 +103,175 @@ VALUES (gen_random_uuid(),$1,$2,'retired-binding',ARRAY['openai_compatible'],now
 	row := read()["retired-binding"]
 	if row.Retired || row.CatalogState != "key_listed" || row.CurrentKeyCount != 1 {
 		t.Fatalf("同型号被启用 Key 重新列出后应按当前目录展示: %+v", row)
+	}
+	checkRetired("retired-website-record")
+
+	exec(`INSERT INTO upstream_model_aliases(provider_id,credential_id,upstream_model,school_model,created_by)
+VALUES($1,$2,'retired-binding','retired-website-record',$3)`, provider, current, actor)
+	checkRetired()
+	if read()["retired-website-record"].Retired {
+		t.Fatal("已启用 Key 的接替别名保护了原型号")
+	}
+	exec("DELETE FROM upstream_model_aliases WHERE provider_id=$1", provider)
+	other := uuid.New()
+	exec(`INSERT INTO providers(id,name,base_url,created_at,updated_at) VALUES($1,'Other','https://example.test',now(),now())`, other)
+	exec(`INSERT INTO model_bindings(id,model_id,provider_id,upstream_model_name,adapter,status,priority,created_at,updated_at)
+SELECT gen_random_uuid(),id,$1,'retired-website-record','openai_responses','active',10,now(),now()
+FROM models WHERE model_id='active-binding'`, other)
+	checkRetired()
+}
+
+func TestBeichenTeacherCoveragePostgres(t *testing.T) {
+	ctx, db, provider, _, keys := newActionsPostgres(t)
+	gm1, g3, cc1 := keys[1], keys[2], keys[3]
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	chat, responses := "openai_compatible", "openai_responses"
+	gpt := []string{"gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"}
+	deepseek := []string{"deepseek-v4-pro", "deepseek-v4-flash"}
+	bind := func(school, upstream string, key uuid.UUID, protocol string) {
+		t.Helper()
+		exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES(gen_random_uuid(),$1::text,$1::text,'active',1000,now(),now()) ON CONFLICT(model_id) DO NOTHING`, school)
+		exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,status,priority,created_at,updated_at)
+SELECT gen_random_uuid(),id,$1,$2,$4,$5,'active',10,now(),now() FROM models WHERE model_id=$3`, provider, key, school, upstream, protocol)
+	}
+	group := func(key uuid.UUID, id int) {
+		t.Helper()
+		exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at) VALUES($1,1,$2,clock_timestamp())`, key, id)
+	}
+	probe := func(key uuid.UUID, name, protocol string) {
+		t.Helper()
+		exec(`INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,duration_ms,checked_at,last_passed_at)
+VALUES($1,$2,$3,$4,200,1,clock_timestamp(),clock_timestamp())
+ON CONFLICT(provider_id,credential_id,model,protocol) DO UPDATE SET checked_at=excluded.checked_at,last_passed_at=excluded.last_passed_at`,
+			provider, key, name, protocol)
+	}
+	scan := func(key uuid.UUID, names []string, protocols ...string) {
+		t.Helper()
+		entries := make([]catalog.ProviderEntry, 0, len(names))
+		for _, name := range names {
+			entries = append(entries, catalog.ProviderEntry{ID: name, SupportedProtocols: protocols})
+		}
+		saveCatalogFixture(t, ctx, db, provider, key, entries, nil)
+	}
+	group(g3, 10)
+	group(gm1, 6)
+	group(cc1, 24)
+	scan(g3, gpt, chat, responses)
+	scan(gm1, deepseek, chat)
+	for _, name := range gpt {
+		bind(name, name, g3, chat)
+		bind(name, name, g3, responses)
+		probe(g3, name, responses)
+	}
+	for _, name := range deepseek {
+		bind(name, name, gm1, chat)
+		probe(gm1, name, chat)
+	}
+	exec(`INSERT INTO beichen_panel_snapshots(credential_id,effective_at,credential_revision,group_id,expires_at,multiplier_version,model_pricing)
+SELECT c.id,clock_timestamp(),c.updated_at,6,now()+interval '1 hour',mv.id,
+ '{"deepseek-v4-pro":{"billing_mode":"token","intervals":[{"min_tokens":0,"input_price":0,"output_price":0.000001}]}}'
+FROM provider_credentials c JOIN beichen_multiplier_versions mv ON mv.credential_id=c.id WHERE c.id=$1`, gm1)
+
+	read := func(name string) CatalogModel {
+		t.Helper()
+		view, err := New(db, nil).Overview(ctx, provider, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range view.ModelCatalog {
+			if row.Model == name {
+				return row
+			}
+		}
+		t.Fatalf("未找到概览型号 %s", name)
+		return CatalogModel{}
+	}
+	capability := func(name string, key uuid.UUID) catalog.ModelCapability {
+		t.Helper()
+		view, err := catalog.ReadBeichenCapabilities(ctx, db, provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range view.Capabilities {
+			if row.Model == name && row.CredentialID != nil && *row.CredentialID == key {
+				return row
+			}
+		}
+		t.Fatalf("未找到渠道能力 %s", name)
+		return catalog.ModelCapability{}
+	}
+	for _, name := range append(slices.Clone(gpt), deepseek...) {
+		row := read(name)
+		owner, groupID, routes := g3, int64(10), 2
+		if slices.Contains(deepseek, name) {
+			owner, groupID, routes = gm1, 6, 1
+		}
+		if row.BoundKeyCount != 1 || row.CoveredBoundKeyCount != 1 || row.ReadyCount != routes || len(row.BoundRoutes) != routes ||
+			row.ModelAvailability.Availability != "available" || row.BindingIssue != nil ||
+			*row.BoundRoutes[0].CredentialID != owner || *row.BoundRoutes[0].GroupID != groupID {
+			t.Fatalf("绑定证据不应混入其他 Key: %+v", row)
+		}
+	}
+	if row, cap := read(deepseek[0]), capability(deepseek[0], gm1); !row.PriceCovered || !cap.PriceCovered ||
+		row.PriceState != "conditional" || cap.PriceState != row.PriceState {
+		t.Fatalf("可计算的条件价应同时计入两个入口: %+v %+v", row, cap)
+	}
+	if row := read(deepseek[1]); row.PriceCovered || row.PriceState != "missing" {
+		t.Fatalf("缺价应保留: %+v", row)
+	}
+
+	const raw, school = "claude-sonnet-5-5", "claude-sonnet-5.5"
+	saveCatalogFixture(t, ctx, db, provider, cc1, []catalog.ProviderEntry{{
+		ID: raw, SupportedProtocols: []string{"anthropic", responses},
+	}}, []string{school})
+	exec("UPDATE beichen_website_catalogs SET group_id=24 WHERE credential_id=$1", cc1)
+	scan(g3, append(gpt, raw), responses)
+	bind(school, raw, cc1, "anthropic")
+	bind(school, raw, cc1, responses)
+	bind(school+"-fallback", raw, g3, responses)
+	probe(cc1, raw, responses)
+	if row, cap := read(raw), capability(raw, cc1); row.BoundKeyCount != 2 || row.CoveredBoundKeyCount != 2 ||
+		row.ReadyCount != 3 || len(row.BoundRoutes) != 3 || !cap.ResponsesReady || cap.Bindings[0].SchoolModel != school {
+		t.Fatalf("别名与同协议备用绑定应保留: %+v %+v", row, cap)
+	}
+	caps, err := catalog.ReadBeichenCapabilities(ctx, db, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(caps.Capabilities, func(row catalog.ModelCapability) bool { return row.Model == school }) {
+		t.Fatal("官网拼写不应给同一 Key 留下重复能力记录")
+	}
+
+	probeAttempt := func() {
+		exec(`INSERT INTO beichen_probe_usage(id,provider_id,credential_id,model,protocol,checked_at)
+VALUES(gen_random_uuid(),$1,$2,$3,$4,clock_timestamp())`, provider, gm1, deepseek[0], chat)
+	}
+	probeAttempt()
+	group(gm1, 12)
+	if row, cap := read(deepseek[0]), capability(deepseek[0], gm1); row.ReadyCount != 0 || row.CoveredBoundKeyCount != 0 ||
+		row.BoundKeyCount != 1 || !row.BoundCatalogPending || row.LastProbeAt != nil || row.PriceCovered || cap.PriceCovered ||
+		row.ModelAvailability.Availability != "unverified" || cap.Availability != "unverified" || len(cap.AvailableProtocols) != 0 {
+		t.Fatalf("换组应废止原组证据: %+v %+v", row, cap)
+	}
+	scan(gm1, deepseek, chat)
+	if row := read(deepseek[0]); row.CoveredBoundKeyCount != 1 || row.ReadyCount != 1 || row.LastProbeAt != nil || row.PriceCovered ||
+		row.ModelAvailability.Availability != "unverified" {
+		t.Fatalf("新目录不应恢复旧探活或报价: %+v", row)
+	}
+	probe(gm1, deepseek[0], chat)
+	if row := read(deepseek[0]); row.LastProbeAt != nil || row.ModelAvailability.Availability != "unverified" {
+		t.Fatalf("换组前发起的探活即使随后保存通过，也应等待当前组复核: %+v", row)
+	}
+	probeAttempt()
+	probe(gm1, deepseek[0], chat)
+	if row := read(deepseek[0]); row.ModelAvailability.Availability != "available" || row.PriceCovered {
+		t.Fatalf("同组新探活只恢复可用性: %+v", row)
+	}
+	exec("UPDATE beichen_datasets SET last_success=now()-interval '31 minutes' WHERE credential_id=$1 AND kind='catalog'", gm1)
+	if row, cap := read(deepseek[0]), capability(deepseek[0], gm1); !row.BoundCatalogPending || row.CoveredBoundKeyCount != 0 ||
+		row.ModelAvailability.Availability != "unverified" || row.LastProbeAt != nil || cap.CatalogState != "catalog_stale" || cap.PriceCovered {
+		t.Fatalf("过期目录应同时撤销两端的证据: %+v %+v", row, cap)
 	}
 }
 
@@ -272,10 +466,10 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 			if upstream == "shared" && len(m.CredentialIDs) != 2 {
 				t.Fatal("lost shared credential")
 			}
-			if upstream == "shared" && (m.PriceState != "confirmed" || m.ReadyCount != 1 || m.Activation != "active") {
+			if upstream == "shared" && (m.PriceState != "missing" || m.PriceCovered || m.ReadyCount != 1 || m.Activation != "active") {
 				t.Fatalf("共享模型的已发布北辰线路或报价状态不正确: %+v", m)
 			}
-			if upstream == "special" && (m.PriceState != "conditional" || m.Activation != "blocked" ||
+			if upstream == "special" && (m.PriceState != "missing" || m.Activation != "blocked" ||
 				len(m.Blockers) != 1 || m.Blockers[0].Code != "conditional_price" ||
 				m.PriceBlocker == nil || m.PriceBlocker.Code != "tier_missing_output" ||
 				m.PriceBlocker.Message != m.Blockers[0].Message) {
@@ -395,7 +589,7 @@ VALUES($1,'catalog',$3,NULL,0,'-infinity'),
 	if manual.PriceState != "manual" || manual.Activation != "ready" {
 		t.Errorf("仅手动价的模型应可启用: %+v", manual)
 	}
-	for name, want := range map[string]string{"unpriced": "not_configured,missing_price,sync_failed", "offline": "not_configured,no_ready_route,missing_price"} {
+	for name, want := range map[string]string{"unpriced": "not_configured,missing_price,sync_failed"} {
 		model := models[name]
 		var codes []string
 		for _, blocker := range model.Blockers {
@@ -407,6 +601,9 @@ VALUES($1,'catalog',$3,NULL,0,'-infinity'),
 		if model.Activation != "blocked" || model.PriceState != "missing" || strings.Join(codes, ",") != want {
 			t.Errorf("%s 的阻塞原因有误: %+v", name, model)
 		}
+	}
+	if offline := models["offline"]; !offline.Retired || offline.CanEnable || len(offline.Blockers) != 0 {
+		t.Fatalf("仅关联停用渠道的历史型号应退出启用预览: %+v", offline)
 	}
 	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{mixed.Model, manual.Model})
 	if err != nil || len(result.Enabled) != 2 || len(result.Skipped) != 0 {
