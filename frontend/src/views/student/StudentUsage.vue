@@ -1,748 +1,826 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref, useId } from 'vue'
+import { ChevronDown, Search } from 'lucide-vue-next'
+import { APIError, apiErrorMessage, get } from '../../api/client'
 import { studentAPI } from '../../api/student'
-import { APIError, get } from '../../api/client'
-import type { KeyUsage, StudentProjectUsage, StudentUsage, UsageSlice } from '../../api/types'
+import AppDialog from '../../components/AppDialog.vue'
 import CreditDonut from '../../components/CreditDonut.vue'
 import EmptyState from '../../components/EmptyState.vue'
+import LoadingRegion from '../../components/LoadingRegion.vue'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
-import { formatPercent, formatTokens, shiftDecimal } from '../../utils/credits'
-import { calculateCredits, fullTime, quotaBalance, schoolMonth, statusLabel } from '../../utils/format'
-import { summarizeStudentModels, type StudentModelUsageRow } from '../../utils/studentUsage'
+import { formatPercent, formatTokens } from '../../utils/credits'
+import { quotaBalance, schoolMonth, statusLabel } from '../../utils/format'
+import {
+  formatUsageCacheCoverage,
+  formatUsageCredits,
+  formatUsageModelNotes,
+  formatUsagePendingReview,
+  formatUsageTokenCount,
+  sumStudentProjectCredits,
+  type StudentCallReceipt,
+  type StudentUsageModelMetrics,
+  type StudentUsageProject,
+  type StudentUsageReport,
+} from '../../utils/studentUsage'
 
-type UsageRange = 'day' | 'month' | 'all'
-type RecentRange = 'today' | 'month' | 'all'
-type ModelUsageSlice = UsageSlice & {
-  tokens?: number | null
-  input_tokens?: number | null
-  output_tokens?: number | null
-  cache_read_tokens?: number | null
-  cache_write_tokens?: number | null
-  cache_hit_rate?: number | null
-  tokens_missing?: number | null
-  completeness?: 'complete' | 'partial' | 'missing' | null
-}
-type StudentKeyUsage = Omit<KeyUsage, 'models'> & { models: ModelUsageSlice[] }
-type StudentProjectUsageView = Omit<StudentProjectUsage, 'keys'> & { keys: StudentKeyUsage[] }
-type StudentUsageView = Omit<StudentUsage, 'projects'> & { projects: StudentProjectUsageView[] }
-type StudentCallReceipt = {
-  request_id: string
-  model_id: string
-  channel: string
-  billing_state: string
-  charged_credits: string | null
-  receipt_applied: boolean | null
-  created_at?: string | null
-  input_tokens?: number | null
-  output_tokens?: number | null
-  cache_read_tokens?: number | null
-  cache_write_tokens?: number | null
-}
-type ModelRow = {
-  id: string
-  modelName: string
-  modelId: string
-  projectName: string
-  keyName: string
-  model: ModelUsageSlice
-}
-type StudentRecentCall = {
-  id: string
-  request_id: string
-  model_id: string
-  model_name: string
-  project_name: string
-  input_tokens: number | null
-  output_tokens: number | null
-  cache_read_tokens: number | null
-  cache_write_tokens: number | null
-  credits: string
-  status: string
-  billing_state: string
-  created_at: string
-}
-type StudentRecentPage = { items: StudentRecentCall[]; next_cursor: string | null }
-
-const ranges: Array<{ id: UsageRange; label: string }> = [
-  { id: 'day', label: '今天' },
-  { id: 'month', label: '本月' },
-  { id: 'all', label: '全部' },
-]
-const creditRateNote = '100 积分 = 1 元；金额统一用积分显示。'
-const recentRanges: Array<{ id: RecentRange; label: string }> = [
-  { id: 'today', label: '今天' },
-  { id: 'month', label: '本月' },
-  { id: 'all', label: '全部' },
-]
-
-const usage = ref<StudentUsageView | null>(null)
+const pageId = useId()
 const month = ref(schoolMonth())
-const range = ref<UsageRange>('month')
-const loading = ref(false)
-const loaded = ref(false)
-const error = ref('')
+const monthTitle = computed(() => {
+  const [year, monthNumber] = month.value.split('-')
+  return `${year} 年 ${Number(monthNumber)} 月个人用量`
+})
+const report = ref<StudentUsageReport | null>(null)
+const loading = ref(true)
+const loadFailed = ref(false)
+const expandedSections = ref(new Set<string>())
+let latestRequest = 0
+let loadingMonth: string | null = null
+
+async function load() {
+  const requestedMonth = month.value
+  if (loadingMonth === requestedMonth) return
+  const request = ++latestRequest
+  loadingMonth = requestedMonth
+  loading.value = true
+  loadFailed.value = false
+  try {
+    // 学生用量客户端也供只读取项目和 Key 的页面使用。
+    const data = await studentAPI.usage(requestedMonth) as StudentUsageReport
+    if (!Array.isArray(data?.projects)) throw new Error('Invalid student usage report')
+    if (request === latestRequest) report.value = data
+  } catch {
+    if (request === latestRequest) {
+      report.value = null
+      loadFailed.value = true
+    }
+  } finally {
+    if (request === latestRequest) {
+      loadingMonth = null
+      loading.value = false
+    }
+  }
+}
+
+function changeMonth(event: Event) {
+  const input = event.target as HTMLInputElement
+  if (!input.validity.valid || !/^\d{4}-(0[1-9]|1[0-2])$/.test(input.value) || input.value > schoolMonth()) {
+    input.value = month.value
+    return
+  }
+  if (input.value === month.value) return
+  month.value = input.value
+  report.value = null
+  expandedSections.value.clear()
+  void load()
+}
+
+useVisibilityPolling(load)
+
+const modelSummary = computed(() => {
+  const data = report.value
+  // 项目月桶与模型账本是独立的，缺少模型汇总时仍可查看额度。
+  if (!data?.totals || !Array.isArray(data.models)) return null
+  return { models: data.models, totals: data.totals }
+})
+
+const creditStats = computed(() => {
+  if (!report.value) return []
+  const { projects } = report.value
+  return [
+    { id: 'quota', label: '月额度', amount: sumStudentProjectCredits(projects, 'quota') },
+    { id: 'used', label: '已扣积分', amount: modelSummary.value?.totals.credits },
+    { id: 'pending', label: '在途积分', amount: sumStudentProjectCredits(projects, 'in_flight_credits') },
+    { id: 'available', label: '可用积分', amount: sumStudentProjectCredits(projects, 'available') },
+  ]
+})
+
+const projectSummaries = computed(() => (report.value?.projects ?? []).map(project => ({
+  project,
+  balance: quotaBalance(project.quota, project.used, project.available),
+})))
+
+const modelColumns: Array<{
+  label: string
+  value: (model: StudentUsageModelMetrics) => string
+  detail?: (model: StudentUsageModelMetrics) => string
+  numeric?: boolean
+}> = [
+  { label: '已扣积分', value: model => formatUsageCredits(model.credits), numeric: true },
+  { label: '调用次数', value: model => formatTokens(model.calls ?? 0), numeric: true },
+  { label: 'Token', value: model => formatUsageTokenCount(model.tokens.total), numeric: true },
+  {
+    label: '缓存命中率',
+    value: model => formatPercent(model.cache_hit_rate),
+    detail: formatUsageCacheCoverage,
+    numeric: true,
+  },
+  { label: '说明', value: formatUsageModelNotes },
+]
+
+function keySectionId(projectId: string, keyId: string) {
+  return `${pageId}-key-${projectId}-${keyId}`
+}
+
+function chartSectionId(projectId: string) {
+  return `${pageId}-quota-${projectId}`
+}
+
+function toggleSection(id: string) {
+  if (expandedSections.value.has(id)) expandedSections.value.delete(id)
+  else expandedSections.value.add(id)
+}
+
+function projectSegments(project: StudentUsageProject) {
+  return [
+    ...project.keys.map(key => ({ name: key.name, value: Number(key.used), displayValue: formatUsageCredits(key.used) })),
+    {
+      name: '在途积分', value: Number(project.in_flight_credits),
+      displayValue: formatUsageCredits(project.in_flight_credits), color: '#e5a93f',
+    },
+    {
+      name: '可用积分', value: Number(project.available),
+      displayValue: formatUsageCredits(project.available), color: '#dfe3ec',
+    },
+  ]
+}
+
+const receiptOpen = ref(false)
 const receiptQuery = ref('')
 const receipt = ref<StudentCallReceipt | null>(null)
 const receiptLoading = ref(false)
 const receiptError = ref('')
-const recentRange = ref<RecentRange>('today')
-const recentItems = ref<StudentRecentCall[]>([])
-const recentCursor = ref<string | null>(null)
-const recentLoading = ref(false)
-const recentLoaded = ref(false)
-const recentError = ref('')
-let recentRequest = 0
+const receiptNotFound = '未找到可查询的本人调用。请核对请求编号，并确认这笔调用经学校网关发往北辰。'
+let latestLookup = 0
 
-async function load() {
-  loading.value = true
-  try {
-    usage.value = await studentAPI.usage(month.value) as StudentUsageView
-    error.value = ''
-  } catch (caught) {
-    error.value = caught instanceof APIError ? caught.message : '加载个人用量失败'
-  } finally {
-    loading.value = false
-    loaded.value = true
-  }
-}
-
-const { refresh } = useVisibilityPolling(load)
-
-async function loadRecent(reset = false) {
-  const request = ++recentRequest
-  recentLoading.value = true
-  if (reset) {
-    recentItems.value = []
-    recentCursor.value = null
-    recentLoaded.value = false
-  }
-  try {
-    const params = new URLSearchParams({ range: recentRange.value, limit: '20' })
-    if (!reset && recentCursor.value) params.set('cursor', recentCursor.value)
-    const page = await get<StudentRecentPage>(`/api/v1/student/usage/recent?${params.toString()}`)
-    if (request !== recentRequest) return
-    const items = page.items ?? []
-    recentItems.value = reset ? items : [...recentItems.value, ...items]
-    recentCursor.value = page.next_cursor ?? null
-    recentError.value = ''
-  } catch (caught) {
-    if (request === recentRequest) {
-      recentError.value = caught instanceof APIError ? caught.message : '加载最近调用失败'
-    }
-  } finally {
-    if (request === recentRequest) {
-      recentLoading.value = false
-      recentLoaded.value = true
-    }
-  }
-}
-
-function changeRecentRange(value: RecentRange) {
-  if (recentRange.value === value) return
-  recentRange.value = value
-  void loadRecent(true)
-}
-
-const selectedRange = computed(() => ranges.find(item => item.id === range.value) ?? ranges[1])
-
-function creditText(value?: string | number | null) {
-  if (value == null || value === '') return '—'
-  const text = String(value).trim()
-  if (!/^[+-]?\d+(?:\.\d+)?$/.test(text)) return '—'
-  if (/^[+-]?0+(?:\.0+)?$/.test(text)) return '0'
-  return shiftDecimal(text, 0)
-}
-
-function sumProjectField(field: 'quota' | 'used' | 'pending' | 'available') {
-  const projects = usage.value?.projects ?? []
-  if (!projects.length) return null
-  let total = '0.000'
-  for (const project of projects) {
-    const raw = project[field]
-    if (typeof raw !== 'string' || !/^\d+(?:\.\d+)?$/.test(raw.trim())) return null
-    total = calculateCredits(total, raw.trim(), 'add')
-  }
-  return total
-}
-
-const summary = computed(() => ({
-  quota: creditText(sumProjectField('quota')),
-  used: creditText(sumProjectField('used')),
-  pending: creditText(sumProjectField('pending')),
-  available: creditText(sumProjectField('available')),
-}))
-
-const modelRows = computed<ModelRow[]>(() => {
-  const rows: ModelRow[] = []
-  for (const project of usage.value?.projects ?? []) {
-    for (const key of project.keys ?? []) {
-      for (const model of key.models ?? []) {
-        rows.push({
-          id: `${project.project_id}:${key.id}:${model.id || model.name}`,
-          modelName: model.name || model.id,
-          modelId: model.id,
-          projectName: project.project_name,
-          keyName: key.name,
-          model,
-        })
-      }
-    }
-  }
-  return rows
-})
-
-const modelSummaryRows = computed(() => summarizeStudentModels(usage.value?.projects ?? []))
-
-const rangeNote = computed(() => range.value === 'month'
-  ? ''
-  : `学生用量接口当前只返回本月汇总；「${selectedRange.value.label}」范围暂未接入，积分、调用次数、Token 与缓存命中率显示为「—」。`)
-
-function modelCredits(row: ModelRow) {
-  return range.value === 'month' ? creditText(row.model.credits) : '—'
-}
-
-function modelTokens(row: ModelRow) {
-  if (range.value !== 'month') return '—'
-  if (row.model.tokens != null) return formatTokens(row.model.tokens)
-  if (row.model.input_tokens != null && row.model.output_tokens != null) {
-    return formatTokens(row.model.input_tokens + row.model.output_tokens)
-  }
-  return '—'
-}
-
-function modelCacheHitRate(row: ModelRow) {
-  return range.value === 'month' ? formatPercent(row.model.cache_hit_rate, 1) : '—'
-}
-
-function modelCalls(row: ModelRow) {
-  return range.value === 'month' ? `${formatTokens(row.model.calls ?? 0)} 次` : '—'
-}
-
-function modelDetail(row: ModelRow) {
-  return [
-    row.modelId && row.modelId !== row.modelName ? row.modelId : '',
-    row.projectName,
-    row.keyName,
-  ].filter(Boolean).join(' · ')
-}
-
-function summaryCredits(row: StudentModelUsageRow) {
-  return range.value === 'month' ? creditText(row.credits) : '—'
-}
-
-function summaryCalls(row: StudentModelUsageRow) {
-  return range.value === 'month' ? `${formatTokens(row.calls)} 次` : '—'
-}
-
-function summaryTokens(row: StudentModelUsageRow) {
-  return range.value === 'month' ? formatTokens(row.tokens) : '—'
-}
-
-function summaryCacheHitRate(row: StudentModelUsageRow) {
-  return range.value === 'month' ? formatPercent(row.cacheHitRate, 1) : '—'
-}
-
-function summaryNote(row: StudentModelUsageRow) {
-  return range.value === 'month' && row.zeroCost ? '0 积分但有调用（未结算/待核或免费）' : '—'
-}
-
-const billingStateLabels: Record<string, string> = {
-  reserved: '已预留',
-  pending: '待核',
-  pending_review: '待核账',
-  charged: '已扣',
-  released: '已释放',
-}
-
-function receiptStatusLabel(value?: string | null) {
-  if (!value) return '—'
-  return billingStateLabels[value] ?? (statusLabel(value) || value)
-}
-
-function receiptStatusClass(value?: string | null) {
-  if (value === 'charged') return 'active'
-  if (value && ['reserved', 'pending', 'pending_review'].includes(value)) return 'pending'
-  return 'muted'
-}
-
-function receiptAppliedText(value?: boolean | null) {
-  return value == null ? '—' : value ? '已回执' : '未回执'
-}
-
-const recentStatusLabels: Record<string, string> = {
-  succeeded: '成功',
-  upstream_failed: '上游失败',
-  quota_rejected: '额度不足',
-  outcome_unknown: '结果未知',
-  pending_review: '待核账',
-  pending: '处理中',
-}
-
-function recentStatusLabel(value?: string | null) {
-  if (!value) return '—'
-  return recentStatusLabels[value] ?? statusLabel(value) ?? value
-}
-
-function recentStatusClass(value?: string | null) {
-  if (value === 'succeeded') return 'active'
-  if (value === 'upstream_failed') return 'danger'
-  if (value && ['pending_review', 'pending', 'outcome_unknown'].includes(value)) return 'pending'
-  return 'muted'
+function setReceiptOpen(open: boolean) {
+  receiptOpen.value = open
+  if (open) return
+  ++latestLookup
+  receiptQuery.value = ''
+  receipt.value = null
+  receiptLoading.value = false
+  receiptError.value = ''
 }
 
 async function lookupReceipt() {
   const query = receiptQuery.value.trim()
-  if (!query) {
-    receipt.value = null
-    receiptError.value = '请输入请求编号'
+  if (!receiptOpen.value || !query || receiptLoading.value) return
+  receipt.value = null
+  receiptError.value = ''
+  // 浏览器会把这两种路径段解析为目录，无法作为请求编号发送。
+  if (query === '.' || query === '..') {
+    receiptError.value = receiptNotFound
     return
   }
+  const lookup = ++latestLookup
   receiptLoading.value = true
-  receiptError.value = ''
   try {
-    receipt.value = await get<StudentCallReceipt>(`/api/v1/student/usage/calls/${encodeURIComponent(query)}`)
-  } catch (caught) {
-    receipt.value = null
-    receiptError.value = caught instanceof APIError
-      ? (caught.status === 404 ? '未找到该请求编号对应的本人调用，请核对编号。' : caught.message)
-      : '查询单笔明细失败，请稍后重试'
+    const data = await get<StudentCallReceipt>(`/api/v1/student/usage/calls/${encodeURIComponent(query)}`)
+    if (data?.request_id !== query || !Number.isFinite(Date.parse(data.created_at))) {
+      throw new Error('Invalid student call receipt')
+    }
+    if (lookup === latestLookup) receipt.value = data
+  } catch (error) {
+    if (lookup !== latestLookup) return
+    receiptError.value = error instanceof APIError && error.status === 404
+      ? receiptNotFound
+      : apiErrorMessage(error, '查询失败，请稍后重试')
   } finally {
-    receiptLoading.value = false
+    if (lookup === latestLookup) receiptLoading.value = false
   }
 }
 
-function percent(used: string, quota: string) {
-  const quotaValue = Number(quota)
-  const usedValue = Number(used)
-  return !Number.isFinite(quotaValue) || quotaValue === 0 || !Number.isFinite(usedValue)
-    ? null
-    : usedValue / quotaValue * 100
+const billingStateLabels: Record<string, string> = {
+  reserved: '处理中',
+  pending: '处理中',
+  pending_review: '待核账',
+  charged: '已结算',
+  released: '已释放',
+  failed: '结算失败',
+}
+const receiptTime = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai', dateStyle: 'medium', timeStyle: 'medium',
+})
+const receiptTokenFields = [
+  { field: 'input_tokens', label: '输入' },
+  { field: 'output_tokens', label: '输出' },
+  { field: 'cache_read_tokens', label: '缓存读' },
+  { field: 'cache_write_tokens', label: '缓存写' },
+  { field: 'total_tokens', label: '总 Token' },
+] as const
+const usageStateLabels: Record<string, string> = {
+  reported: '已回报', partial: '部分回报', missing: '无回报', interrupted: '响应中断',
+}
+const usageReasonLabels: Record<string, string> = {
+  usage_not_reported: '上游未提供用量',
+  terminal_usage_missing: '上游结束时未返回最终用量',
+  response_interrupted: '响应中断',
+  upstream_http_error: '上游返回错误',
+  usage_observation_limit: '响应超出用量记录范围',
+  token_breakdown_unconfirmed: '分项用量未确认',
+  incomplete_token_breakdown: '分项用量不完整',
+  cache_write_subtotal_only: '仅回报了部分缓存写入量',
+  cache_write_not_in_usage_metadata: '上游未提供缓存写入量',
+  inconsistent_token_breakdown: '分项用量不一致',
+  inconsistent_token_total: '总量与分项不一致',
 }
 
-function percentLabel(used: string, quota: string) {
-  const value = percent(used, quota)
-  return value === null ? 'N/A' : `${value.toFixed(1)}%`
+function receiptAppliedLabel(applied: boolean | null) {
+  if (applied === null) return '暂无匹配回执'
+  return applied ? '已用回执补记' : '已匹配回执，未用于补记'
 }
-
-function projectSegments(project: StudentProjectUsageView) {
-  return [
-    ...project.keys.map(key => ({ name: key.name, value: Number(key.used), displayValue: key.used })),
-    { name: '剩余额度', value: Number(project.available), displayValue: project.available, color: '#dfe3ec' },
-  ]
-}
-
-onMounted(() => { void loadRecent(true) })
 </script>
 
 <template>
-  <section class="page">
-    <div class="page-heading">
+  <section class="page student-usage">
+    <header class="page-heading usage-heading">
       <div>
-        <p class="eyebrow">STUDENT</p>
-        <h1>个人用量</h1>
+        <h1>{{ monthTitle }}</h1>
+        <p class="muted" data-testid="credit-rate-note">100 积分 = 1 元；金额统一用积分显示。</p>
       </div>
-      <label>月份<input v-model="month" type="month" @change="refresh"></label>
-    </div>
-    <p v-if="error" class="error banner">{{ error }}</p>
-    <p class="muted" data-testid="credit-rate-note">{{ creditRateNote }}</p>
+      <div class="usage-toolbar">
+        <label>月份（北京时间）
+          <input :value="month" type="month" :max="schoolMonth()" required @change="changeMonth">
+        </label>
+        <AppDialog
+          :open="receiptOpen"
+          title="查单笔调用"
+          description="输入学校网关返回的请求编号，查询发往北辰的本人调用。"
+          @update:open="setReceiptOpen">
+          <template #trigger>
+            <button class="button secondary usage-disclosure" type="button" data-testid="open-receipt">
+              <Search :size="15" aria-hidden="true" />查单笔调用
+            </button>
+          </template>
+          <form class="usage-receipt-form" @submit.prevent="lookupReceipt">
+            <label>请求编号
+              <input v-model="receiptQuery" placeholder="学校网关返回的 X-Request-ID" :readonly="receiptLoading" required>
+            </label>
+            <button class="button primary" type="submit" :disabled="receiptLoading || !receiptQuery.trim()">
+              {{ receiptLoading ? '查询中…' : '查询' }}
+            </button>
+          </form>
+          <p v-if="receiptError" class="error banner usage-receipt-feedback" role="alert">{{ receiptError }}</p>
+          <p v-else-if="receiptLoading" class="muted usage-receipt-feedback" role="status">正在查询调用…</p>
+          <div v-else-if="receipt" class="usage-receipt-result" data-testid="receipt-result">
+            <p class="sr-only" role="status">已找到调用</p>
+            <dl class="usage-receipt-meta">
+              <div><dt>模型</dt><dd>{{ receipt.model_name || receipt.model_id }}</dd></div>
+              <div><dt>请求编号</dt><dd><code>{{ receipt.request_id }}</code></dd></div>
+              <div>
+                <dt>时间（北京时间）</dt>
+                <dd><time :datetime="receipt.created_at">{{ receiptTime.format(new Date(receipt.created_at)) }}</time></dd>
+              </div>
+              <div><dt>已扣积分</dt><dd>{{ formatUsageCredits(receipt.charged_credits) }}</dd></div>
+              <div><dt>结算状态</dt><dd>{{ billingStateLabels[receipt.billing_state] ?? statusLabel(receipt.billing_state) }}</dd></div>
+              <div><dt>渠道</dt><dd>{{ receipt.channel }}</dd></div>
+              <div class="usage-receipt-status"><dt>回执状态</dt><dd>{{ receiptAppliedLabel(receipt.receipt_applied) }}</dd></div>
+            </dl>
+            <dl class="usage-receipt-tokens" aria-label="Token 明细">
+              <div v-for="{ field, label } in receiptTokenFields" :key="field">
+                <dt>{{ label }}</dt><dd>{{ formatUsageTokenCount(receipt[field]) }}</dd>
+              </div>
+            </dl>
+            <p v-if="receipt.usage_state || receipt.usage_reason" class="muted usage-evidence">
+              Token 回报
+              <template v-if="receipt.usage_state">{{ usageStateLabels[receipt.usage_state] ?? receipt.usage_state }}</template>
+              <template v-if="receipt.usage_reason"> · {{ usageReasonLabels[receipt.usage_reason] ?? receipt.usage_reason }}</template>
+            </p>
+          </div>
+        </AppDialog>
+      </div>
+    </header>
 
-    <section class="panel student-usage-summary-panel">
-      <div class="beichen-section-head">
-        <div>
-          <h2>本月概览</h2>
-          <p class="muted">{{ usage?.month ?? '—' }} · {{ loading ? '正在加载' : '全部项目合计' }}</p>
-        </div>
+    <LoadingRegion :initial-loading="loading && !report" :refreshing="loading && Boolean(report)"
+      label="正在读取个人用量" variant="list" :rows="3">
+      <div v-if="loadFailed" class="panel usage-load-error">
+        <p class="error" role="alert">读取失败</p>
+        <button class="button secondary" type="button" @click="load">重试</button>
       </div>
-      <div class="beichen-summary" aria-label="本月额度概览">
-        <div class="beichen-stat" data-testid="usage-total-quota">
-          <span>本月额度</span><strong>{{ summary.quota }}</strong><small>老师分配的月额度</small>
-        </div>
-        <div class="beichen-stat" data-testid="usage-total-used">
-          <span>已用</span><strong>{{ summary.used }}</strong><small>学校已记账积分</small>
-        </div>
-        <div class="beichen-stat" data-testid="usage-total-pending">
-          <span>待核</span><strong>{{ summary.pending }}</strong><small>上游未回报，尚未结算</small>
-        </div>
-        <div class="beichen-stat" data-testid="usage-total-available">
-          <span>剩余</span><strong>{{ summary.available }}</strong><small>扣除已用与待核后可用</small>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel student-model-panel">
-      <div class="beichen-section-head">
-        <div>
-          <h2>按模型用量</h2>
-          <p class="muted">积分按学校记账；Token 与缓存命中率来自上游回报。</p>
-          <p class="muted">需要别的模型？<RouterLink :to="{ name: 'student-models' }" data-testid="usage-model-plaza-link">到模型广场把模型加入当前 Key</RouterLink>。</p>
-        </div>
-        <div class="range-switch" role="group" aria-label="用量范围">
-          <button v-for="item in ranges" :key="item.id" type="button"
-            :aria-pressed="range === item.id" :data-testid="`usage-range-${item.id}`"
-            @click="range = item.id">{{ item.label }}</button>
-        </div>
-      </div>
-      <p v-if="rangeNote" class="beichen-note" role="status">{{ rangeNote }}</p>
-
-      <h3 class="student-model-subhead">按模型合计</h3>
-      <p class="muted student-model-hint">同一模型跨项目、跨 Key 合并；在途/待核按 Key 汇总，尚未分摊到模型。</p>
-      <div v-if="modelSummaryRows.length" class="beichen-table-wrap">
-        <table class="beichen-table student-model-summary-table" data-testid="student-model-summary">
-          <caption class="sr-only">{{ selectedRange.label }}按模型合计</caption>
-          <thead>
-            <tr>
-              <th scope="col">模型</th>
-              <th scope="col" class="numeric-cell">已扣积分</th>
-              <th scope="col" class="numeric-cell">调用次数</th>
-              <th scope="col" class="numeric-cell">Token</th>
-              <th scope="col" class="numeric-cell">缓存命中率</th>
-              <th scope="col">说明</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="row in modelSummaryRows" :key="row.id">
-              <th scope="row">
-                <strong>{{ row.name }}</strong>
-                <small v-if="row.name !== row.id">{{ row.id }}</small>
-              </th>
-              <td class="numeric-cell" data-label="已扣积分">{{ summaryCredits(row) }}</td>
-              <td class="numeric-cell" data-label="调用次数">{{ summaryCalls(row) }}</td>
-              <td class="numeric-cell" data-label="Token">{{ summaryTokens(row) }}</td>
-              <td class="numeric-cell" data-label="缓存命中率">{{ summaryCacheHitRate(row) }}</td>
-              <td data-label="说明">{{ summaryNote(row) }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <EmptyState v-else-if="loaded" title="所选范围暂无模型用量" />
-      <p v-else class="muted" role="status">正在加载模型用量…</p>
-
-      <h3 class="student-model-subhead">按 Key 明细</h3>
-      <div v-if="modelRows.length" class="beichen-table-wrap">
-        <table class="beichen-table student-model-table">
-          <caption class="sr-only">{{ selectedRange.label }}按模型用量</caption>
-          <thead>
-            <tr>
-              <th scope="col">模型</th>
-              <th scope="col" class="numeric-cell">积分</th>
-              <th scope="col" class="numeric-cell">调用次数</th>
-              <th scope="col" class="numeric-cell">Token</th>
-              <th scope="col" class="numeric-cell">缓存命中率</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="row in modelRows" :key="row.id">
-              <th scope="row">
-                <strong>{{ row.modelName }}</strong>
-                <small>{{ modelDetail(row) }}</small>
-              </th>
-              <td class="numeric-cell" data-label="积分">{{ modelCredits(row) }}</td>
-              <td class="numeric-cell" data-label="调用次数">{{ modelCalls(row) }}</td>
-              <td class="numeric-cell" data-label="Token">{{ modelTokens(row) }}</td>
-              <td class="numeric-cell" data-label="缓存命中率">{{ modelCacheHitRate(row) }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <EmptyState v-else-if="loaded && modelSummaryRows.length" title="所选范围暂无按 Key 明细" />
-    </section>
-
-    <section class="panel student-recent-panel">
-      <div class="beichen-section-head">
-        <div>
-          <h2>最近调用</h2>
-          <p class="muted">只显示本人经学校网关发起的调用；Token 与缓存数据来自上游回报。</p>
-        </div>
-        <div class="range-switch" role="group" aria-label="最近调用范围">
-          <button v-for="item in recentRanges" :key="item.id" type="button"
-            :aria-pressed="recentRange === item.id" :data-testid="`recent-range-${item.id}`"
-            @click="changeRecentRange(item.id)">{{ item.label }}</button>
-        </div>
-      </div>
-      <p v-if="recentError" class="error banner" role="alert">{{ recentError }}</p>
-      <div v-if="recentItems.length" class="beichen-table-wrap">
-        <table class="beichen-table student-recent-table" data-testid="recent-calls-table">
-          <caption class="sr-only">最近调用</caption>
-          <thead>
-            <tr>
-              <th scope="col">时间</th>
-              <th scope="col">模型</th>
-              <th scope="col" class="numeric-cell">输入</th>
-              <th scope="col" class="numeric-cell">输出</th>
-              <th scope="col" class="numeric-cell">缓存读</th>
-              <th scope="col" class="numeric-cell">缓存写</th>
-              <th scope="col" class="numeric-cell">扣分</th>
-              <th scope="col">状态</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="item in recentItems" :key="item.id">
-              <td data-label="时间">{{ fullTime(item.created_at) }}</td>
-              <td data-label="模型">
-                <strong>{{ item.model_name || item.model_id }}</strong>
-                <small class="recent-request">{{ item.model_id }} · {{ item.request_id }}</small>
-              </td>
-              <td class="numeric-cell" data-label="输入">{{ formatTokens(item.input_tokens) }}</td>
-              <td class="numeric-cell" data-label="输出">{{ formatTokens(item.output_tokens) }}</td>
-              <td class="numeric-cell" data-label="缓存读">{{ formatTokens(item.cache_read_tokens) }}</td>
-              <td class="numeric-cell" data-label="缓存写">{{ formatTokens(item.cache_write_tokens) }}</td>
-              <td class="numeric-cell" data-label="扣分">{{ creditText(item.credits) }}</td>
-              <td data-label="状态"><span class="status-pill" :class="recentStatusClass(item.status)">{{ recentStatusLabel(item.status) }}</span></td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <EmptyState v-else-if="recentLoaded && !recentLoading" title="所选范围暂无调用记录" />
-      <p v-else class="muted" role="status">正在加载最近调用…</p>
-      <div class="student-recent-actions">
-        <button v-if="recentCursor" class="button ghost" :disabled="recentLoading" @click="loadRecent()">
-          {{ recentLoading ? '加载中…' : '加载更多' }}
-        </button>
-        <span v-else-if="recentLoaded && recentItems.length" class="muted">已显示全部</span>
-        <button class="button ghost" :disabled="recentLoading" @click="loadRecent(true)">刷新</button>
-      </div>
-    </section>
-
-    <section class="panel student-receipt-panel">
-      <div class="beichen-section-head">
-        <div>
-          <h2>单笔明细</h2>
-          <p class="muted">输入学校网关返回的请求编号，查询本人一笔调用。</p>
-        </div>
-        <form class="student-receipt-search" @submit.prevent="lookupReceipt">
-          <input v-model="receiptQuery" aria-label="请求编号" placeholder="输入请求编号" :disabled="receiptLoading">
-          <button class="button primary" :disabled="receiptLoading || !receiptQuery.trim()">{{ receiptLoading ? '查询中…' : '查询' }}</button>
-        </form>
-      </div>
-      <p v-if="receiptError" class="error banner" role="alert">{{ receiptError }}</p>
-      <p class="beichen-note">可按请求编号查询单笔明细；时间、输入/输出与缓存 Token 以学校网关和上游回报为准。</p>
-      <div class="beichen-table-wrap">
-        <table class="beichen-table student-call-table">
-          <caption class="sr-only">单笔调用明细</caption>
-          <thead>
-            <tr>
-              <th scope="col">时间</th>
-              <th scope="col">模型</th>
-              <th scope="col" class="numeric-cell">输入</th>
-              <th scope="col" class="numeric-cell">输出</th>
-              <th scope="col" class="numeric-cell">缓存读</th>
-              <th scope="col" class="numeric-cell">缓存写</th>
-              <th scope="col" class="numeric-cell">扣分</th>
-              <th scope="col">状态</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-if="receipt">
-              <td data-label="时间">{{ fullTime(receipt.created_at) }}</td>
-              <td data-label="模型">{{ receipt.model_id }}</td>
-              <td class="numeric-cell" data-label="输入">{{ formatTokens(receipt.input_tokens) }}</td>
-              <td class="numeric-cell" data-label="输出">{{ formatTokens(receipt.output_tokens) }}</td>
-              <td class="numeric-cell" data-label="缓存读">{{ formatTokens(receipt.cache_read_tokens) }}</td>
-              <td class="numeric-cell" data-label="缓存写">{{ formatTokens(receipt.cache_write_tokens) }}</td>
-              <td class="numeric-cell" data-label="扣分">{{ creditText(receipt.charged_credits) }}</td>
-              <td data-label="状态"><span class="status-pill" :class="receiptStatusClass(receipt.billing_state)">{{ receiptStatusLabel(receipt.billing_state) }}</span></td>
-            </tr>
-            <tr v-else>
-              <td colspan="8" class="beichen-note">{{ receiptLoading ? '正在查询…' : '输入请求编号后显示单笔明细。' }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <div v-if="receipt" class="student-receipt-meta">
-        <span>请求编号 <code>{{ receipt.request_id }}</code></span>
-        <span>渠道 {{ receipt.channel }}</span>
-        <span>回执 {{ receiptAppliedText(receipt.receipt_applied) }}</span>
-      </div>
-    </section>
-
-    <section v-if="usage?.projects.length" class="student-project-section">
-      <div class="beichen-section-head">
-        <div>
-          <h2>项目与 Key 用量</h2>
-          <p class="muted">保留原有分项目、分 Key 的环图与额度明细。</p>
-        </div>
-      </div>
-      <div class="grid two">
-        <article v-for="project in usage.projects" :key="project.project_id" class="panel">
-          <div class="row">
-            <div>
-              <h2>{{ project.project_name }}</h2>
-              <p class="muted">已分配 {{ project.quota }} 积分 · 学校已用 {{ project.used }} · 在途 {{ project.pending }}<template v-if="project.pending_review"> · 有调用待核账</template></p>
+      <div v-else-if="report" class="usage-report">
+        <section class="panel usage-panel" :aria-labelledby="`${pageId}-overview`">
+          <h2 :id="`${pageId}-overview`">月度概览</h2>
+          <div class="beichen-summary usage-stats">
+            <div v-for="stat in creditStats" :key="stat.id" class="beichen-stat" :data-testid="`usage-total-${stat.id}`">
+              <span>{{ stat.label }}</span><strong>{{ formatUsageCredits(stat.amount) }}</strong>
             </div>
-            <strong>{{ percentLabel(project.used, project.quota) }}</strong>
           </div>
-          <div class="usage-chart-card">
-            <CreditDonut
-              :segments="projectSegments(project)"
-              :total="Number(project.quota)"
-              :label="`${project.project_name} 各 Key 用量与剩余额度`"
-            />
+        </section>
+
+        <section class="panel usage-panel" :aria-labelledby="`${pageId}-models`">
+          <header class="beichen-section-head">
+            <h2 :id="`${pageId}-models`">按模型合计</h2>
+            <RouterLink class="usage-model-link" :to="{ name: 'student-models' }">到模型广场添加模型</RouterLink>
+          </header>
+          <div v-if="!modelSummary" class="usage-load-error">
+            <p class="error" role="alert">模型汇总读取失败。返回数据缺少汇总字段。</p>
+            <button class="button secondary" type="button" @click="load">重试</button>
           </div>
-          <div class="usage-summary">
-            <div class="usage-stat">已用<strong>{{ project.used }}</strong></div>
-            <div class="usage-stat">在途<strong>{{ project.pending }}</strong></div>
-            <div class="usage-stat">{{ quotaBalance(project.quota, project.used, project.available).label }}<strong>{{ quotaBalance(project.quota, project.used, project.available).amount }}</strong></div>
-          </div>
-          <section v-if="project.keys.length" class="member-key-stack">
-            <article v-for="key in project.keys" :key="key.id" class="member-key-row">
-              <strong>{{ key.name }}</strong>
-              <span class="muted">{{ statusLabel(key.status) }} · 学校已用 {{ key.used }} 积分 · 在途 {{ key.pending }}<template v-if="key.pending_review"> · 有调用待核账</template></span>
-              <ul v-if="key.models.length" class="key-models">
-                <li v-for="model in key.models" :key="model.id">{{ model.name }} · 学校已用 {{ model.credits }} 积分 · {{ formatTokens(model.calls ?? 0) }} 次</li>
-              </ul>
-            </article>
-          </section>
-        </article>
+          <template v-else-if="modelSummary.models.length">
+            <p class="muted usage-table-note">调用次数只统计已结算调用，含零额结算。待核笔数单独显示。</p>
+            <div class="beichen-table-wrap">
+              <table class="beichen-table usage-model-table" data-testid="student-model-summary">
+                <caption class="sr-only">所选月按模型合计</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">模型</th>
+                    <th v-for="column in modelColumns" :key="column.label" scope="col"
+                      :class="{ 'numeric-cell': column.numeric }">{{ column.label }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="model in modelSummary.models" :key="model.id">
+                    <th scope="row">
+                      <strong>{{ model.name || model.id }}</strong>
+                      <small v-if="model.name && model.name !== model.id">{{ model.id }}</small>
+                    </th>
+                    <td v-for="column in modelColumns" :key="column.label" :data-label="column.label"
+                      :class="{ 'numeric-cell': column.numeric }">
+                      {{ column.value(model) }}
+                      <small v-if="column.detail">{{ column.detail(model) }}</small>
+                    </td>
+                  </tr>
+                </tbody>
+                <tfoot>
+                  <tr>
+                    <th scope="row">合计</th>
+                    <td v-for="column in modelColumns" :key="column.label" :data-label="column.label"
+                      :class="{ 'numeric-cell': column.numeric }">
+                      {{ column.value(modelSummary.totals) }}
+                      <small v-if="column.detail">{{ column.detail(modelSummary.totals) }}</small>
+                    </td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </template>
+          <EmptyState v-else title="所选月暂无模型用量" />
+        </section>
+
+        <section class="panel usage-panel" :aria-labelledby="`${pageId}-keys`">
+          <h2 :id="`${pageId}-keys`">按 Key 明细</h2>
+          <EmptyState v-if="!projectSummaries.length" title="所选月暂无项目和 Key 记录" />
+          <article v-for="{ project, balance } in projectSummaries" :key="project.project_id" class="usage-project">
+            <header class="usage-project-heading">
+              <div>
+                <h3>{{ project.project_name }}</h3>
+                <div class="usage-summary">
+                  <span>月额度 <strong>{{ formatUsageCredits(project.quota) }}</strong></span>
+                  <span>学校已用 <strong>{{ formatUsageCredits(project.used) }}</strong></span>
+                  <span>在途 <strong>{{ formatUsageCredits(project.in_flight_credits) }}</strong></span>
+                  <span class="usage-project-balance">{{ balance.label }}<strong>{{ formatUsageCredits(balance.amount) }}</strong></span>
+                  <span>已结算 {{ formatTokens(project.calls) }} 次</span>
+                </div>
+                <p v-if="project.pending_review_calls > 0" class="usage-review">{{ formatUsagePendingReview(project) }}</p>
+              </div>
+              <button class="button ghost usage-disclosure" type="button"
+                :aria-expanded="expandedSections.has(chartSectionId(project.project_id))"
+                :aria-controls="chartSectionId(project.project_id)"
+                @click="toggleSection(chartSectionId(project.project_id))">
+                额度图<ChevronDown :size="14" aria-hidden="true" />
+              </button>
+            </header>
+            <div v-show="expandedSections.has(chartSectionId(project.project_id))"
+              :id="chartSectionId(project.project_id)" class="usage-chart">
+              <CreditDonut v-if="expandedSections.has(chartSectionId(project.project_id))"
+                :segments="projectSegments(project)" :total="Number(project.quota)" unit="积分"
+                :label="`${project.project_name} 各 Key 已扣积分与额度`" />
+            </div>
+
+            <p v-if="!project.keys.length" class="muted usage-no-keys">暂无 Key 记录</p>
+            <template v-for="key in project.keys" :key="keySectionId(project.project_id, key.id)">
+              <div class="usage-key-row" data-testid="usage-key-row">
+                <div class="usage-key-identity">
+                  <div class="usage-key-name">
+                    <strong>{{ key.name }}</strong>
+                    <span class="status-badge" :class="key.status">{{ statusLabel(key.status) }}</span>
+                  </div>
+                  <small v-if="key.pending_review_calls > 0" class="usage-review">{{ formatUsagePendingReview(key) }}</small>
+                </div>
+                <dl class="usage-key-credits">
+                  <div><dt>已扣积分</dt><dd>{{ formatUsageCredits(key.used) }}</dd></div>
+                  <div><dt>在途积分</dt><dd>{{ formatUsageCredits(key.in_flight_credits) }}</dd></div>
+                  <div><dt>可用积分</dt><dd>{{ formatUsageCredits(key.available) }}</dd></div>
+                </dl>
+                <dl class="usage-key-metrics">
+                  <div><dt>调用次数</dt><dd>{{ formatTokens(key.calls) }}</dd></div>
+                  <div>
+                    <dt>Token</dt><dd>{{ formatUsageTokenCount(key.tokens.total) }}</dd>
+                    <small v-if="key.token_coverage.calls && key.completeness !== 'complete'">
+                      {{ key.completeness === 'partial' ? '部分回报' : '无回报' }}
+                    </small>
+                  </div>
+                  <div><dt>模型数</dt><dd>{{ formatTokens(key.models.length) }}</dd></div>
+                </dl>
+                <div class="usage-key-action">
+                  <button v-if="key.models.length" class="button ghost usage-disclosure" type="button"
+                    :aria-expanded="expandedSections.has(keySectionId(project.project_id, key.id))"
+                    :aria-controls="keySectionId(project.project_id, key.id)"
+                    :aria-label="`${expandedSections.has(keySectionId(project.project_id, key.id)) ? '收起' : '展开'} ${key.name} 的模型明细`"
+                    @click="toggleSection(keySectionId(project.project_id, key.id))">
+                    {{ expandedSections.has(keySectionId(project.project_id, key.id)) ? '收起明细' : '展开明细' }}
+                    <ChevronDown :size="14" aria-hidden="true" />
+                  </button>
+                  <span v-else class="muted">暂无模型记录</span>
+                </div>
+              </div>
+              <div v-if="key.models.length" v-show="expandedSections.has(keySectionId(project.project_id, key.id))"
+                :id="keySectionId(project.project_id, key.id)" class="beichen-table-wrap usage-key-models">
+                <table v-if="expandedSections.has(keySectionId(project.project_id, key.id))" class="beichen-table usage-model-table">
+                  <caption class="sr-only">{{ key.name }} 的模型用量</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">模型</th>
+                      <th v-for="column in modelColumns" :key="column.label" scope="col"
+                        :class="{ 'numeric-cell': column.numeric }">{{ column.label }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="model in key.models" :key="model.id">
+                      <th scope="row">
+                        <strong>{{ model.name || model.id }}</strong>
+                        <small v-if="model.name && model.name !== model.id">{{ model.id }}</small>
+                      </th>
+                      <td v-for="column in modelColumns" :key="column.label" :data-label="column.label"
+                        :class="{ 'numeric-cell': column.numeric }">
+                        {{ column.value(model) }}
+                        <small v-if="column.detail">{{ column.detail(model) }}</small>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </template>
+          </article>
+        </section>
       </div>
-    </section>
-    <EmptyState v-else-if="loaded" title="本月暂无可展示的额度" />
-    <p v-else class="muted" role="status">正在加载项目用量…</p>
+    </LoadingRegion>
   </section>
 </template>
 
 <style scoped>
-.student-usage-summary-panel,
-.student-model-panel,
-.student-recent-panel,
-.student-receipt-panel,
-.student-project-section {
-  display: grid;
-  gap: 16px;
-  min-width: 0;
+.usage-heading {
+  flex-wrap: wrap;
+  gap: 14px 24px;
+  margin-bottom: 20px;
 }
 
-.student-usage-summary-panel .beichen-stat strong {
-  overflow-wrap: anywhere;
-}
-
-.student-model-subhead {
-  margin: 8px 0 0;
-  font-size: 14px;
-}
-
-.student-model-hint {
+.usage-heading p,
+.usage-panel h2,
+.usage-table-note,
+.usage-load-error p {
   margin: 0;
 }
 
-.student-model-table th small,
-.student-model-summary-table th small {
-  display: block;
-  margin-top: 4px;
-  color: var(--ink-soft);
-  font-size: 11px;
-  font-weight: 400;
-  line-height: 1.5;
-  overflow-wrap: anywhere;
-}
-
-.student-model-table th[scope="row"],
-.student-model-summary-table th[scope="row"] {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.student-model-table td[data-label],
-.student-model-summary-table td[data-label],
-.student-recent-table td[data-label],
-.student-call-table td[data-label] {
-  overflow-wrap: anywhere;
-}
-
-.student-recent-table th small,
-.student-recent-table td small {
-  display: block;
-  margin-top: 4px;
-  color: var(--ink-soft);
-  font-size: 11px;
-  font-weight: 400;
-  line-height: 1.5;
-  overflow-wrap: anywhere;
-}
-
-.student-recent-actions {
+.usage-toolbar,
+.usage-load-error {
   display: flex;
-  align-items: center;
+  flex-wrap: wrap;
+  align-items: flex-end;
   gap: 10px;
-  flex-wrap: wrap;
 }
 
-.student-receipt-search {
-  display: flex;
+.usage-toolbar label {
+  min-width: 138px;
+}
+
+.usage-toolbar input {
+  margin-top: 5px;
+}
+
+.usage-load-error {
   align-items: center;
-  gap: 8px;
+}
+
+.usage-report,
+.usage-panel {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.usage-panel {
+  padding: clamp(14px, 2.1vw, 24px);
+}
+
+.usage-stats {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.usage-stats strong,
+.usage-model-table th,
+.usage-model-table td,
+.usage-project,
+.usage-receipt-result {
+  overflow-wrap: anywhere;
+}
+
+.usage-model-link {
+  color: var(--primary);
+  font-size: 13px;
+}
+
+.usage-model-table {
+  table-layout: fixed;
+}
+
+.usage-model-table thead th,
+.usage-model-table .numeric-cell {
+  white-space: normal;
+}
+
+.usage-model-table thead th:first-child {
+  width: 22%;
+}
+
+.usage-model-table thead th:last-child {
+  width: 25%;
+}
+
+.usage-model-table tfoot {
+  background: rgba(108, 76, 232, .045);
+  font-weight: 650;
+}
+
+.usage-model-table tfoot th,
+.usage-model-table tfoot td {
+  border-bottom: 0;
+}
+
+.usage-model-table small,
+.usage-key-row small {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--ink-soft);
+  line-height: 1.45;
+}
+
+.usage-model-table small {
+  margin-top: 3px;
+}
+
+.usage-project {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+.usage-project-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 16px;
   flex-wrap: wrap;
+  padding: 14px;
+  background: var(--surface);
+  border-radius: 14px 14px 0 0;
+}
+
+.usage-project-heading h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+}
+
+.usage-project-heading > div {
   min-width: 0;
 }
 
-.student-receipt-search input {
-  flex: 1 1 240px;
-  min-width: 0;
-}
-
-.student-receipt-meta {
+.usage-summary {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 18px;
+  gap: 4px 12px;
+  margin: 0;
   color: var(--ink-soft);
   font-size: 12px;
 }
 
-.student-receipt-meta code {
+.usage-summary strong {
   color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-project-balance strong {
+  margin-inline-start: .25em;
+}
+
+.usage-review,
+.usage-key-row .usage-review {
+  margin: 4px 0 0;
+  color: #835615;
+  font-size: 12px;
+}
+
+.usage-no-keys {
+  margin: 0;
+  padding: 10px 14px 14px;
+}
+
+.usage-key-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 2.45fr) minmax(0, 1.65fr) auto;
+  grid-template-areas: 'identity credits metrics action';
+  align-items: start;
+  gap: 10px 14px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.usage-key-identity { grid-area: identity; }
+.usage-key-credits { grid-area: credits; }
+.usage-key-metrics { grid-area: metrics; }
+.usage-key-action { grid-area: action; }
+
+.usage-key-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.usage-key-name strong {
+  min-width: 0;
   overflow-wrap: anywhere;
 }
 
-@media (max-width: 560px) {
-  .student-receipt-search,
-  .student-receipt-search input {
-    width: 100%;
+.usage-key-credits,
+.usage-key-metrics,
+.usage-receipt-meta,
+.usage-receipt-tokens {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  min-width: 0;
+}
+
+.usage-key-credits,
+.usage-key-metrics {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.usage-key-row dt,
+.usage-receipt-result dt {
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+
+.usage-key-row dd,
+.usage-receipt-result dd {
+  margin: 3px 0 0;
+  font-size: 13px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-key-action > span {
+  font-size: 12px;
+}
+
+.usage-disclosure {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 36px;
+  white-space: nowrap;
+}
+
+.usage-disclosure:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.usage-disclosure[aria-expanded="true"] svg {
+  transform: rotate(180deg);
+}
+
+.usage-key-models,
+.usage-chart {
+  margin: 0 14px 12px;
+}
+
+.usage-chart :deep(.credit-legend-name) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.usage-receipt-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
+.usage-receipt-feedback {
+  margin: 12px 0 0;
+}
+
+.usage-receipt-result {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.usage-receipt-meta {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.usage-receipt-status {
+  grid-column: 1 / -1;
+}
+
+.usage-receipt-tokens {
+  grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
+  padding: 10px;
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.usage-evidence {
+  margin: 0;
+  font-size: 12px;
+}
+
+@media (max-width: 1100px) {
+  .usage-key-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: 'identity identity' 'credits credits' 'metrics action';
+    align-items: center;
   }
 }
 
 @media (max-width: 900px) {
-  .student-model-table tbody tr,
-  .student-model-summary-table tbody tr,
-  .student-recent-table tbody tr,
-  .student-call-table tbody tr {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 6px 10px;
-    padding: 10px 0;
+  .usage-model-table thead {
+    display: table-header-group;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    clip-path: inset(50%);
+    overflow: hidden;
   }
 
-  .student-model-table tbody th,
-  .student-model-summary-table tbody th,
-  .student-recent-table tbody th,
-  .student-call-table td[colspan] {
+  .usage-model-table tfoot {
+    display: block;
+  }
+
+  .usage-model-table tbody tr,
+  .usage-model-table tfoot tr {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 8px 0;
+  }
+
+  .usage-model-table th[scope="row"],
+  .usage-model-table td:last-child {
     grid-column: 1 / -1;
   }
 
-  .student-model-table th,
-  .student-model-table td,
-  .student-model-summary-table th,
-  .student-model-summary-table td,
-  .student-recent-table th,
-  .student-recent-table td,
-  .student-call-table th,
-  .student-call-table td {
-    padding: 4px 8px;
-  }
-
-  .student-model-table td[data-label]::before,
-  .student-model-summary-table td[data-label]::before,
-  .student-recent-table td[data-label]::before,
-  .student-call-table td[data-label]::before {
+  .usage-model-table td::before {
     content: attr(data-label);
     display: block;
     color: var(--ink-soft);
     font-size: 11px;
+    font-weight: 500;
+  }
+}
+
+@media (max-width: 560px) {
+  .usage-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .student-model-table .numeric-cell,
-  .student-model-summary-table .numeric-cell,
-  .student-recent-table .numeric-cell,
-  .student-call-table .numeric-cell {
-    text-align: left;
+  .usage-key-credits {
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: var(--surface);
+  }
+
+  .usage-key-row {
+    grid-template-areas: 'identity action' 'credits credits' 'metrics metrics';
+    gap: 8px 6px;
+  }
+
+  .usage-key-row dt,
+  .usage-key-row dd {
+    font-size: 11px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* 保留弹窗的静态居中定位，减少动态效果时仍只过渡透明度。 */
+  :global(.dialog-content:has(> .usage-receipt-form)) {
+    transform: translate(-50%, -50%) !important;
+  }
+}
+
+@media (max-width: 900px) and (prefers-reduced-motion: reduce) {
+  /* 侧栏不滑出屏幕时，隐藏它的点击区域和焦点入口。 */
+  :global(.app-shell:has(.student-usage) > .sidebar:not(.open)) {
+    visibility: hidden;
   }
 }
 </style>
