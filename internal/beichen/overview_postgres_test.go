@@ -266,14 +266,21 @@ FROM provider_credentials c JOIN beichen_multiplier_versions mv ON mv.credential
 	}
 	for _, row := range rawRows {
 		wantID := fallbackID
+		wantKey := g3
 		wantRoutes := 1
 		if row.SchoolModel == school {
-			wantID, wantRoutes = schoolID, 2
+			wantID, wantKey, wantRoutes = schoolID, cc1, 2
 		} else if row.SchoolModel != school+"-fallback" {
 			t.Fatalf("意外的校内模型身份: %+v", row)
 		}
 		if *row.SchoolModelID != wantID || len(row.PreferredRoutes) != wantRoutes {
 			t.Fatalf("校内模型 UUID 或专属线路错误: %+v", row)
+		}
+		if row.CatalogState != "key_listed" || row.CurrentKeyCount != 1 ||
+			len(row.CatalogKeys) != 1 || row.CatalogKeys[0].CredentialID != wantKey ||
+			len(row.CredentialIDs) != 1 || row.CredentialIDs[0] != wantKey ||
+			len(row.WebsiteLocations) == 0 {
+			t.Fatalf("同上游目录行未保留自己的 Key 和官网证据: %+v", row)
 		}
 		for _, route := range row.PreferredRoutes {
 			if !strings.EqualFold(route.SchoolModel, row.SchoolModel) {

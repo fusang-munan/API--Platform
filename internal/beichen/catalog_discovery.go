@@ -12,10 +12,11 @@ import (
 // The merged directory is a teacher read model. Raw Key IDs and each row's
 // existing publication plan remain the authority for routing and mutations.
 func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][]WebsiteLocation) {
-	rows := make(map[string]int, len(view.ModelCatalog)+len(web))
+	rows := make(map[string][]int, len(view.ModelCatalog)+len(web))
 	var published []string
 	for i, model := range view.ModelCatalog {
-		rows[strings.ToLower(model.Model)] = i
+		name := strings.ToLower(model.Model)
+		rows[name] = append(rows[name], i)
 		if model.published() {
 			published = append(published, model.Model)
 		}
@@ -28,15 +29,25 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 	websiteNames := newCatalogNameMatcher(names, nil)
 	for _, key := range keys {
 		for name := range key.models {
-			if i, ok := rows[strings.ToLower(name)]; ok {
-				setCatalogKey(&view.ModelCatalog[i], key.listed(name, ""))
+			indices := rows[strings.ToLower(name)]
+			evidence := key.listed(name, "")
+			for _, i := range indices {
+				row := &view.ModelCatalog[i]
+				if catalogRowAcceptsKey(row, evidence, len(indices) > 1) {
+					setCatalogKey(row, evidence)
+				}
 			}
 		}
 		for _, name := range key.staleModels {
-			if i, ok := rows[strings.ToLower(name)]; ok {
+			indices := rows[strings.ToLower(name)]
+			for _, i := range indices {
+				row := &view.ModelCatalog[i]
 				evidence := key.listed(name, "")
 				evidence.Stale = true
-				setCatalogKey(&view.ModelCatalog[i], evidence)
+				if !catalogRowAcceptsKey(row, evidence, len(indices) > 1) {
+					continue
+				}
+				setCatalogKey(row, evidence)
 			}
 		}
 	}
@@ -50,10 +61,11 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 			targets[name] = true
 		}
 		for target := range targets {
-			i, exists := rows[target]
-			if !exists {
-				i = len(view.ModelCatalog)
-				rows[target] = i
+			indices := rows[target]
+			if len(indices) == 0 {
+				i := len(view.ModelCatalog)
+				indices = []int{i}
+				rows[target] = indices
 				view.ModelCatalog = append(view.ModelCatalog, CatalogModel{
 					Model: locations[0].Name, SchoolStatus: "not_configured", Activation: "blocked",
 					CredentialIDs: []uuid.UUID{}, PreferredRoutes: []PreferredRoute{}, Protocols: []string{},
@@ -61,10 +73,14 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 					Blockers: []CatalogBlocker{{Code: "website_only", Message: "官网已列出此模型，请核对分组和当前渠道 Key 的目录。"}},
 				})
 			}
-			row := &view.ModelCatalog[i]
-			row.WebsiteLocations = append(row.WebsiteLocations, locations...)
-			for _, item := range evidence {
-				setCatalogKey(row, item)
+			for _, i := range indices {
+				row := &view.ModelCatalog[i]
+				row.WebsiteLocations = append(row.WebsiteLocations, locations...)
+				for _, item := range evidence {
+					if catalogRowAcceptsKey(row, item, len(indices) > 1) {
+						setCatalogKey(row, item)
+					}
+				}
 			}
 		}
 	}
@@ -82,6 +98,7 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 			}
 			continue
 		}
+		row.CredentialIDs = catalogCredentialIDs(row.CatalogKeys)
 		row.CurrentKeyCount, row.StaleKeyCount = 0, 0
 		protocols := map[string]bool{}
 		for j := range row.CatalogKeys {
@@ -143,6 +160,54 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 	slices.SortFunc(view.WebsiteOnlyModels, func(a, b WebsiteOnlyModel) int {
 		return strings.Compare(strings.ToLower(a.Model), strings.ToLower(b.Model))
 	})
+}
+
+// Only split upstream identities need strict evidence filtering. A replacement
+// Key remains attributable through the old route's channel label.
+func catalogRowAcceptsKey(row *CatalogModel, key CatalogKey, split bool) bool {
+	if !split || row.SchoolModelID == nil {
+		return true
+	}
+	matches := func(routeCredential *uuid.UUID) bool {
+		return routeCredential != nil && *routeCredential == key.CredentialID
+	}
+	for _, route := range row.PreferredRoutes {
+		if matches(route.CredentialID) {
+			return true
+		}
+	}
+	for _, route := range row.BoundRoutes {
+		if matches(route.CredentialID) {
+			return true
+		}
+	}
+	if key.Replacement && strings.TrimSpace(key.SchoolChannel) != "" {
+		for _, route := range row.PreferredRoutes {
+			if route.CredentialLabel != nil &&
+				strings.EqualFold(strings.TrimSpace(*route.CredentialLabel), strings.TrimSpace(key.SchoolChannel)) {
+				return true
+			}
+		}
+		for _, route := range row.BoundRoutes {
+			if strings.EqualFold(strings.TrimSpace(route.CredentialLabel), strings.TrimSpace(key.SchoolChannel)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func catalogCredentialIDs(keys []CatalogKey) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(keys))
+	seen := make(map[uuid.UUID]bool, len(keys))
+	for _, key := range keys {
+		if key.CredentialID == uuid.Nil || seen[key.CredentialID] {
+			continue
+		}
+		seen[key.CredentialID] = true
+		ids = append(ids, key.CredentialID)
+	}
+	return ids
 }
 
 func (row CatalogModel) published() bool {

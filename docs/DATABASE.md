@@ -398,7 +398,7 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 教师模型目录和能力接口读取已有 `model_bindings`、`provider_model_catalog`、`beichen_datasets`、分组观测版本、报价快照以及 `upstream_probes`。读取时用当前凭据版本及已知分组变化约束目录、报价和探活。探活同时核对 `beichen_probe_usage` 的派发时间，避免采用换组前发起、换组后才保存的结果。作废判定读取历史目录、绑定状态与关联渠道，历史用量沿用原账本归属。
 
-教师概览的目录身份来自 `model_bindings.model_id` 对应的 `models.id`。同一原始上游名分别绑定多个校内模型时，概览按 `models.id` 拆成多行，返回各自的 `school_model` 与同名 UUID 字段 `school_model_id`；绑定证据和启用预览仍按原始上游名聚合，以保持单个启用动作和 Key 线路检查。没有绑定或别名证据的官网目录没有可确认的校内 UUID，该字段省略。库存、价格和 Key 证据查询不新增表或列。
+教师概览的目录身份来自 `model_bindings.model_id` 对应的 `models.id`。同一原始上游名分别绑定多个校内模型时，概览按 `models.id` 拆成多行，返回各自的 `school_model` 与同名 UUID 字段 `school_model_id`；绑定证据和启用预览仍按原始上游名聚合，以保持单个启用动作和 Key 线路检查。目录合并以原始上游名到行号数组建立关联，把同一 Key 和官网证据分发给所有同名校内行。各行再按 `preferred_routes`、`bound_routes` 的渠道集合过滤 `catalog_keys`，并从剩余 Key 证据生成 `credential_ids`，避免把其他校内模型的 Key 混入。没有绑定或别名证据的官网目录没有可确认的校内 UUID，该字段省略。库存、价格和 Key 证据查询不新增表或列。
 
 `beichen_probe_jobs` 为每个供应商保留请求、开始、完成时间、错误代码和可续期的执行租约。手动提交写入排队时间。多实例通过同一租约领取，执行过程中分批保存，恢复被中断的任务时跳过本轮已经记录的组合。`beichen_website_catalogs` 按凭据保存最近核实的官网分组型号清单、Key 版本和时间，供按 Key 核对和能力诊断使用。
 
