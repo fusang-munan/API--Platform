@@ -107,7 +107,9 @@ func TestBeichenScanRobustnessKeySnapshotPostgres(t *testing.T) {
 func TestKeyCatalogGroupDenialRecoveryPostgres(t *testing.T) {
 	ctx, db, service, job := newKeyScanFixture(t)
 	const model = "gpt-fixture-group-denial"
-	const listed = `{"data":[{"id":"gpt-fixture-group-denial","supported_protocols":["openai_responses"]}]}`
+	const route = `{"id":"gpt-fixture-group-denial","supported_protocols":["openai_responses"]}`
+	const listed = `{"data":[` + route + `,{"id":"m2"},{"id":"m3"},{"id":"m4"}]}`
+	const shrunk = `{"data":[` + route + `,{"id":"m2"}]}`
 	const denied = `{"error":{"type":"GROUP_NOT_ALLOWED","message":"private upstream detail"}}`
 	const other = `{"error":{"type":"IP_NOT_ALLOWED","message":"GROUP_NOT_ALLOWED"}}`
 	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
@@ -132,10 +134,38 @@ SELECT gen_random_uuid(),id,$1,$2,model_id::text,'openai_responses',10,now(),now
 	groupState := func() catalog.ModelCapability {
 		t.Helper()
 		view, err := catalog.ReadBeichenCapabilities(ctx, db, job.provider)
-		if err != nil || len(view.Capabilities) != 1 {
-			t.Fatalf("expected the bound teacher model: %+v (%v)", view, err)
+		if err != nil {
+			t.Fatal(err)
 		}
-		return view.Capabilities[0]
+		for _, row := range view.Capabilities {
+			if row.Model == model {
+				return row
+			}
+		}
+		t.Fatal("bound model is missing from the teacher capabilities")
+		return catalog.ModelCapability{}
+	}
+	overviewRow := func() CatalogModel {
+		t.Helper()
+		view, err := service.Overview(ctx, job.provider, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range view.ModelCatalog {
+			if row.Model == model {
+				return row
+			}
+		}
+		t.Fatal("bound model is missing from the teacher overview")
+		return CatalogModel{}
+	}
+	lastSuccess := func() time.Time {
+		t.Helper()
+		var at time.Time
+		if err := db.QueryRowContext(ctx, "SELECT last_success FROM beichen_datasets WHERE credential_id=$1 AND kind='catalog'", job.credential).Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		return at
 	}
 	assertDenialStored := func(want bool) {
 		t.Helper()
@@ -154,6 +184,7 @@ SELECT EXISTS (
 	if err := rescan(); err != nil {
 		t.Fatal(err)
 	}
+	savedAt := lastSuccess()
 	status, body = http.StatusForbidden, other
 	if err := rescan(); err == nil || errors.Is(err, catalog.ErrBeichenKeyGroupNotAllowed) {
 		t.Fatalf("generic 403 should keep its own meaning: %v", err)
@@ -169,13 +200,10 @@ SELECT EXISTS (
 		row.Availability != "maintenance" || len(row.AvailableProtocols) != 0 {
 		t.Fatalf("teacher capability must explain the denied route: %+v", row)
 	}
-	overview, err := service.Overview(ctx, job.provider, "")
-	if err != nil || len(overview.ModelCatalog) != 1 {
-		t.Fatalf("expected the bound model in the teacher overview: %+v (%v)", overview.ModelCatalog, err)
-	}
-	row := overview.ModelCatalog[0]
+	row := overviewRow()
 	if row.ReadyCount != 0 || row.BoundCatalogPending || len(row.BoundRoutes) != 1 ||
-		row.BoundRoutes[0].GroupStatus != "not_allowed" || row.ModelAvailability.Availability != "maintenance" {
+		row.BoundRoutes[0].GroupStatus != "not_allowed" || row.ModelAvailability.Availability != "maintenance" ||
+		row.BindingIssue == nil || row.BindingIssue.Code != "group_not_allowed" || !strings.Contains(row.ActionHint, "恢复该 Key 的分组权限") {
 		t.Fatalf("teacher overview did not use the explicit group denial: %+v", row)
 	}
 	body = other
@@ -183,6 +211,23 @@ SELECT EXISTS (
 		t.Fatal("generic 403 unexpectedly succeeded")
 	}
 	assertDenialStored(true)
+	status, body = http.StatusOK, shrunk
+	if err := rescan(); err == nil || !strings.Contains(err.Error(), "1/3") {
+		t.Fatalf("expected a successful response with shrink confirmation pending: %v", err)
+	}
+	assertDenialStored(false)
+	if row := groupState(); row.GroupStatus != "assigned" || row.CatalogState != "catalog_stale" || row.BindingState != "unverified" {
+		t.Fatalf("recovered group should retain the pending catalog separately: %+v", row)
+	}
+	row = overviewRow()
+	if !row.BoundCatalogPending || len(row.BoundRoutes) != 1 || row.BoundRoutes[0].GroupStatus != "assigned" ||
+		row.BindingIssue == nil || row.BindingIssue.Code != "catalog_stale" {
+		t.Fatalf("teacher overview should now show pending catalog verification: %+v", row)
+	}
+	if !lastSuccess().Equal(savedAt) || readScanModels(t, ctx, db, job.credential) != model+",m2,m3,m4" {
+		t.Fatal("pending shrink changed the accepted directory or its success time")
+	}
+
 	status, body = http.StatusOK, listed
 	if err := rescan(); err != nil {
 		t.Fatal(err)

@@ -731,7 +731,7 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability, pub
 	bound, covered := make(map[uuid.UUID]bool), make(map[uuid.UUID]bool)
 	var publishedProtocols, candidateProtocols []catalog.ProtocolCapability
 	priceStates := make(map[string]bool)
-	invalidBinding := false
+	invalidBinding, groupDenied := false, false
 	for _, row := range rows {
 		current := row.CatalogState == "key_listed" && row.KeyEnabled
 		if current {
@@ -756,6 +756,7 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability, pub
 					row.CatalogState == "catalog_unverified" || row.GroupStatus == "pending"
 			}
 			invalidBinding = invalidBinding || b.Published && !b.BindingReady
+			groupDenied = groupDenied || b.Published && row.KeyEnabled && row.GroupStatus == "not_allowed"
 			if b.BindingReady {
 				key := routeKey{*row.CredentialID, b.Protocol}
 				ready[key], candidates[key], priceBasis = true, true, true
@@ -774,6 +775,10 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability, pub
 		if invalidBinding || item.ReadyCount == 0 {
 			item.BindingIssue = &CatalogBlocker{"no_ready_binding", "请检查已启用的北辰线路和绑定 Key。"}
 			switch {
+			case groupDenied && item.ReadyCount == 0:
+				item.BindingIssue = &CatalogBlocker{"group_not_allowed", "绑定 Key 分组无权限。"}
+				item.ModelAvailability.AvailabilityReason = item.BindingIssue.Message
+				item.ActionHint = "请在北辰恢复该 Key 的分组权限，再重扫目录。"
 			case item.BoundCatalogPending && item.ReadyCount == 0:
 				item.BindingIssue = &CatalogBlocker{"catalog_stale", "绑定 Key 的目录或分组待复核，请重扫目录并重新探活。"}
 				item.ModelAvailability.Availability = catalog.AvailabilityUnverified

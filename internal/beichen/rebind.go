@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -80,9 +81,17 @@ func (s *Service) Rebind(ctx context.Context, provider, actor uuid.UUID, preview
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	plan, err := s.rebind(ctx, provider, actor, preview, token)
+	if !preview && activationRetryable(err) {
+		return RebindPlan{}, domain.WrapError(domain.CodeInvalidTransition, "北辰目录或绑定正在更新，请重新预览", err)
+	}
+	return plan, err
+}
+
+func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview bool, token string) (RebindPlan, error) {
 	options := &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
 	if !preview {
-		options = nil
+		options = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 	}
 	tx, err := s.db.BeginTx(ctx, options)
 	if err != nil {
@@ -93,8 +102,18 @@ func (s *Service) Rebind(ctx context.Context, provider, actor uuid.UUID, preview
 		if err := checkProvider(ctx, tx, provider); err != nil {
 			return RebindPlan{}, err
 		}
-	} else if err := lockAliasProvider(ctx, tx, provider); err != nil {
-		return RebindPlan{}, err
+	} else {
+		locked, err := catalog.TryLockBeichenRebind(ctx, tx, provider)
+		if err != nil {
+			return RebindPlan{}, unavailable("锁定北辰绑定重建证据失败", err)
+		}
+		if !locked {
+			return RebindPlan{}, domain.NewError(domain.CodeInvalidTransition, "北辰目录或绑定正在更新，请重新预览")
+		}
+		// Website Key inventory and alias writers also lock this provider row.
+		if err := lockAliasProvider(ctx, tx, provider); err != nil {
+			return RebindPlan{}, err
+		}
 	}
 	bindings, priorities, err := readRebindBindings(ctx, tx, provider, !preview)
 	if err != nil {
@@ -113,14 +132,10 @@ func (s *Service) Rebind(ctx context.Context, provider, actor uuid.UUID, preview
 			"目录或分组待复核，请核对启用渠道的分组权限并重扫目录后重新预览")
 	}
 	changes := planRebind(bindings, entries, priorities)
-	rawChanges, err := json.Marshal(changes)
-	if err != nil {
-		return RebindPlan{}, unavailable("生成北辰重建预览失败", err)
-	}
 	raw, err := json.Marshal(struct {
 		EvidenceVersions []RebindEvidenceVersion
-		Changes          json.RawMessage
-	}{versions, rawChanges})
+		Changes          []RebindChange
+	}{versions, changes})
 	if err != nil {
 		return RebindPlan{}, unavailable("生成北辰重建预览失败", err)
 	}
@@ -133,13 +148,22 @@ func (s *Service) Rebind(ctx context.Context, provider, actor uuid.UUID, preview
 		if err := applyRebind(ctx, tx, provider, changes); err != nil {
 			return RebindPlan{}, err
 		}
+		// A fresh statement also catches evidence committed by a writer outside
+		// the application locks while the binding statements were running.
+		current, ready, err := readRebindEvidence(ctx, tx, provider)
+		if err != nil {
+			return RebindPlan{}, unavailable("重新核对北辰渠道目录失败", err)
+		}
+		if !ready || !reflect.DeepEqual(versions, current) {
+			return RebindPlan{}, domain.NewError(domain.CodeInvalidTransition, "凭据、分组或目录已变化，请重新预览")
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return RebindPlan{}, unavailable("完成北辰绑定重建失败", err)
 	}
 	if !preview && len(changes) > 0 {
 		slog.InfoContext(ctx, "北辰绑定重建", "event", "beichen_bindings_rebuilt", "actor_user_id", actor,
-			"provider_id", provider, "change_count", len(changes), "preview_token", fingerprint, "changes", string(rawChanges))
+			"provider_id", provider, "change_count", len(changes))
 	}
 	return view, nil
 }
@@ -223,7 +247,7 @@ func (s *Service) ConfirmCredentialSwitch(ctx context.Context, provider, actor u
 	}
 	plan.Preview = false
 	slog.InfoContext(ctx, "北辰渠道切换", "event", "beichen_credential_switched", "actor_user_id", actor, "provider_id", provider,
-		"from_credential_id", scope.From, "to_credential_id", scope.To, "preview_token", token, "change_count", len(plan.Changes))
+		"from_credential_id", scope.From, "to_credential_id", scope.To, "change_count", len(plan.Changes))
 	return plan, nil
 }
 
