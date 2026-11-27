@@ -1,6 +1,7 @@
 package beichen
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -20,8 +21,9 @@ import (
 const websiteDirectoryInterval = 15 * time.Minute
 
 var (
-	errWebsiteDirectoryEmpty   = errors.New("北辰官网目录未返回可读取的模型")
-	errWebsiteDirectoryPartial = errors.New("北辰官网部分平台目录无法读取")
+	errWebsiteDirectoryEmpty          = errors.New("北辰官网目录未返回可读取的模型")
+	errWebsiteDirectoryPartial        = errors.New("北辰官网部分平台目录无法读取")
+	errWebsiteDirectorySessionChanged = errors.New("读取官网目录期间北辰网页会话已更换，请重新同步")
 )
 
 type WebsiteDirectoryStatus struct {
@@ -108,9 +110,18 @@ func directoryGroupObservations(platforms []directoryPlatform, allRetained bool)
 	return items
 }
 
-// Coverage is checked against retained scopes as well as this run's fresh
-// scopes. A partial read cannot advance any omission confirmation.
+type directoryCoverage struct {
+	retain map[string]bool
+	remove map[string]bool
+}
+
+// The read-only audit reports the scopes that would retain their previous data.
 func (crawl *directoryCrawl) checkCoverage(previous []directoryPlatform, lastFailures []CrawlFailure, clean, advance bool) map[string]bool {
+	return crawl.reviewCoverage(previous, lastFailures, clean, advance).retain
+}
+
+// Only a complete list of models and groups can advance coverage confirmation.
+func (crawl *directoryCrawl) reviewCoverage(previous []directoryPlatform, lastFailures []CrawlFailure, complete, advance bool) directoryCoverage {
 	current := make(map[string]directoryPlatform, len(crawl.platforms))
 	for _, section := range crawl.platforms {
 		current[section.Scope] = section
@@ -121,14 +132,14 @@ func (crawl *directoryCrawl) checkCoverage(previous []directoryPlatform, lastFai
 			prior[failure.Scope] = failure
 		}
 	}
-	retain := map[string]bool{}
+	coverage := directoryCoverage{retain: map[string]bool{}, remove: map[string]bool{}}
 	for _, old := range previous {
 		section, present := current[old.Scope]
-		if !present && !clean && crawl.markUnreadableScope(old) {
-			retain[old.Scope] = true
+		if !present && !complete && crawl.markUnreadableScope(old) {
+			coverage.retain[old.Scope] = true
 			continue
 		}
-		if present && section.Incomplete {
+		if present && section.MembershipIncomplete {
 			continue
 		}
 		reason, fingerprint := directoryCoverageDrop(old, section, present)
@@ -136,35 +147,41 @@ func (crawl *directoryCrawl) checkCoverage(previous []directoryPlatform, lastFai
 			continue
 		}
 		rounds := 0
-		if clean && advance {
+		if complete && advance {
 			rounds = 1
 			if last := prior[old.Scope]; last.SnapshotHash == fingerprint && last.ConfirmationRounds > 0 &&
 				last.ConfirmationRounds < catalog.BeichenShrinkRounds {
 				rounds = last.ConfirmationRounds + 1
 			}
 			if rounds >= catalog.BeichenShrinkRounds {
+				if !present {
+					coverage.remove[old.Scope] = true
+				}
 				continue
 			}
 			reason += fmt.Sprintf("，连续一致 %d/%d", rounds, catalog.BeichenShrinkRounds)
 		}
-		retain[old.Scope] = true
+		coverage.retain[old.Scope] = true
 		crawl.Failures = append(crawl.Failures, CrawlFailure{
 			ChannelID: old.ChannelID, Channel: old.Channel, Platform: old.Platform, Scope: old.Scope,
 			Path: "coverage", Reason: reason + "，沿用上次平台目录", Retained: true,
 			SnapshotHash: fingerprint, ConfirmationRounds: rounds,
 		})
 	}
-	if len(retain) != 0 {
+	if len(coverage.retain) != 0 {
 		crawl.membershipComplete = false
 		previousNames := map[string]bool{}
 		for _, section := range previous {
+			if coverage.remove[section.Scope] {
+				continue
+			}
 			for _, model := range section.Models {
 				previousNames[model.Name] = true
 			}
 		}
 		crawl.ExpectedModelCount = max(crawl.ExpectedModelCount, len(previousNames))
 	}
-	return retain
+	return coverage
 }
 
 func (crawl *directoryCrawl) markUnreadableScope(old directoryPlatform) bool {
@@ -239,14 +256,20 @@ func directoryCoverageDrop(old, current directoryPlatform, present bool) (string
 	return "北辰官网目录待核验：" + strings.Join(reasons, "，"), fmt.Sprintf("%x", sha256.Sum256(raw))
 }
 
-// On partial reads, replace complete scopes and preserve observations that were
-// obscured by a bad channel, platform or model record.
 func mergeWebsiteDirectory(previous, current []directoryPlatform) []directoryPlatform {
+	return mergePartialWebsiteDirectory(previous, current, nil)
+}
+
+// Preserve unreadable and unconfirmed scopes while applying confirmed removals.
+func mergePartialWebsiteDirectory(previous, current []directoryPlatform, removed map[string]bool) []directoryPlatform {
 	seen := make(map[string]int, len(current))
 	for i, section := range current {
 		seen[section.Scope] = i
 	}
 	for _, old := range previous {
+		if removed[old.Scope] {
+			continue
+		}
 		i, found := seen[old.Scope]
 		if !found {
 			old.Retained = true
@@ -259,16 +282,18 @@ func mergeWebsiteDirectory(previous, current []directoryPlatform) []directoryPla
 		}
 		section.Groups = slices.Clone(section.Groups)
 		section.Models = slices.Clone(section.Models)
-		for _, group := range old.Groups {
-			if !slices.ContainsFunc(section.Groups, func(candidate directoryGroup) bool {
-				return group.ID == candidate.ID && (group.ID != 0 || group.Name == candidate.Name)
-			}) {
-				group.Retained = true
-				if group.ObservedAt == nil {
-					at := old.ObservedAt
-					group.ObservedAt = &at
+		if section.MembershipIncomplete {
+			for _, group := range old.Groups {
+				if !slices.ContainsFunc(section.Groups, func(candidate directoryGroup) bool {
+					return group.ID == candidate.ID && (group.ID != 0 || group.Name == candidate.Name)
+				}) {
+					group.Retained = true
+					if group.ObservedAt == nil {
+						at := old.ObservedAt
+						group.ObservedAt = &at
+					}
+					section.Groups = append(section.Groups, group)
 				}
-				section.Groups = append(section.Groups, group)
 			}
 		}
 		type modelScope struct {
@@ -279,15 +304,22 @@ func mergeWebsiteDirectory(previous, current []directoryPlatform) []directoryPla
 		for _, model := range old.Models {
 			oldModels[modelScope{model.GroupID, model.Name}] = true
 		}
+		invalidPrices := map[modelScope]bool{}
 		section.Models = slices.DeleteFunc(section.Models, func(model directoryModel) bool {
-			return model.priceBlocker == crawlPriceInvalid && oldModels[modelScope{model.GroupID, model.Name}]
+			id := modelScope{model.GroupID, model.Name}
+			if model.priceBlocker == crawlPriceInvalid && oldModels[id] {
+				invalidPrices[id] = true
+				return true
+			}
+			return false
 		})
 		models := make(map[modelScope]bool, len(section.Models))
 		for _, model := range section.Models {
 			models[modelScope{model.GroupID, model.Name}] = true
 		}
 		for _, model := range old.Models {
-			if !models[modelScope{model.GroupID, model.Name}] {
+			id := modelScope{model.GroupID, model.Name}
+			if !models[id] && (section.MembershipIncomplete || invalidPrices[id]) {
 				section.Models = append(section.Models, model)
 				for _, affected := range directoryModelGroups(*section, model) {
 					for j := range section.Groups {
@@ -368,18 +400,27 @@ RETURNING platforms, (SELECT failures FROM beichen_crawl_runs WHERE provider_id=
 		return PanelCrawlSummary{}, errPanelAccountDB
 	}
 	fetch, cancel := context.WithTimeout(ctx, jobTimeout)
-	crawl, observedErr := s.crawlWebsiteDirectory(fetch, provider, "")
+	start := time.Now()
+	var tokenVersion []byte
+	crawl, observedErr := readWithWebsiteKeySession(fetch, s, provider, "", func(session panelAuthorization) (directoryCrawl, error) {
+		tokenVersion = session.tokenVersion
+		return s.fetchWebsiteCrawl(fetch, session.bearer)
+	})
+	if observedErr != nil && !errors.Is(observedErr, errWebsiteDirectoryPartial) && !errors.Is(observedErr, errWebsiteDirectoryEmpty) {
+		crawl, _ = failedDirectoryCrawl(observedErr)
+	}
+	crawl.StartedAt, crawl.DurationMS = start.UTC(), time.Since(start).Milliseconds()
 	var old []directoryPlatform
 	var lastFailures []CrawlFailure
 	if json.Unmarshal(previous, &old) != nil || (len(previousFailures) != 0 && json.Unmarshal(previousFailures, &lastFailures) != nil) {
 		cancel()
 		return PanelCrawlSummary{}, errPanelAccountDB
 	}
-	retain := map[string]bool{}
+	var coverage directoryCoverage
 	if observedErr == nil || errors.Is(observedErr, errWebsiteDirectoryPartial) {
-		retain = crawl.checkCoverage(old, lastFailures, observedErr == nil, true)
-		if len(retain) != 0 {
-			crawl.platforms = slices.DeleteFunc(crawl.platforms, func(section directoryPlatform) bool { return retain[section.Scope] })
+		coverage = crawl.reviewCoverage(old, lastFailures, crawl.membershipComplete, true)
+		if len(coverage.retain) != 0 {
+			crawl.platforms = slices.DeleteFunc(crawl.platforms, func(section directoryPlatform) bool { return coverage.retain[section.Scope] })
 			observedErr = errWebsiteDirectoryPartial
 		}
 		for _, section := range crawl.platforms {
@@ -401,10 +442,33 @@ RETURNING platforms, (SELECT failures FROM beichen_crawl_runs WHERE provider_id=
 		crawl.DurationMS = time.Since(crawl.StartedAt).Milliseconds()
 	}
 	cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PanelCrawlSummary{}, errPanelAccountDB
+	}
+	defer tx.Rollback()
+	if tokenVersion != nil && crawl.rawResponse != nil {
+		// Use the same ciphertext version and row lock as the Key inventory.
+		// The check and all directory writes belong to the same transaction.
+		var current []byte
+		err := tx.QueryRowContext(ctx, `
+SELECT token_ciphertext FROM beichen_panel_accounts
+WHERE provider_id=$1 AND status='active' FOR SHARE`, provider).Scan(&current)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return PanelCrawlSummary{}, errPanelAccountDB
+		}
+		if !bytes.Equal(current, tokenVersion) {
+			observedErr = errWebsiteDirectorySessionChanged
+			crawl = directoryCrawl{CrawlRun: CrawlRun{
+				StartedAt: crawl.StartedAt, DurationMS: crawl.DurationMS,
+				Failures: []CrawlFailure{{Path: "session", Reason: observedErr.Error(), Retained: len(old) != 0}},
+			}}
+		}
+	}
 	// Capture fresh records before restoring older data in a partial merge.
 	blockedGroups := map[int64]bool{}
 	for _, section := range old {
-		if retain[section.Scope] {
+		if coverage.retain[section.Scope] {
 			for _, group := range section.Groups {
 				blockedGroups[group.ID] = true
 			}
@@ -419,7 +483,7 @@ RETURNING platforms, (SELECT failures FROM beichen_crawl_runs WHERE provider_id=
 	}
 	platforms := crawl.platforms
 	if errors.Is(observedErr, errWebsiteDirectoryPartial) {
-		platforms = mergeWebsiteDirectory(old, platforms)
+		platforms = mergePartialWebsiteDirectory(old, platforms, coverage.remove)
 	} else if observedErr != nil {
 		platforms = nil
 	}
@@ -454,7 +518,7 @@ RETURNING platforms, (SELECT failures FROM beichen_crawl_runs WHERE provider_id=
 		}
 	}
 	var saved uuid.UUID
-	err = s.db.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 WITH saved AS (
   UPDATE beichen_website_directories SET platforms=COALESCE($3::jsonb,platforms),
     last_success=CASE WHEN $4::text IS NULL THEN clock_timestamp() ELSE last_success END,
@@ -494,6 +558,9 @@ RETURNING provider_id`, provider, lease, snapshot, message, int(websiteDirectory
 		crawl.StartedAt, crawl.DurationMS, crawl.PlatformCount, crawl.GroupCount, crawl.ModelCount,
 		crawl.ExpectedModelCount, string(failures), crawl.rawResponse, string(prices), string(comparisons), crawl.KeyModelError, crawl.AccountRateError).Scan(&saved)
 	if err != nil {
+		return PanelCrawlSummary{}, errPanelAccountDB
+	}
+	if err := tx.Commit(); err != nil {
 		return PanelCrawlSummary{}, errPanelAccountDB
 	}
 	return crawl.panelSummary(), observedErr

@@ -396,6 +396,8 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 迁移 `0048_beichen_website_directory.sql` 新增 `beichen_website_directories`，以 `provider_id` 为主键，外键指向供应商并随其删除。`platforms` 为 JSONB 数组，每项保存渠道编号与名称、渠道状态、平台、分组资料、型号原名、原始计价条件和采集时间。价格未知时保留 JSON `null`。一次完整采集原子替换快照并更新 `last_success`。部分解析失败或平台覆盖待核验时，按渠道和平台保留未重新核实的片段及原采集时间。分组可带 `observed_at` 和 `retained`，旧快照使用平台的采集时间。`beichen_crawl_runs.failures` 保存片段失败、沿用标记和各疑似缩水平台的确认记录。超时、授权失败或未返回可读型号时保留快照。`last_error` 记录可公开错误，`failure_count` 和 `next_attempt` 保存退避进度，自动重试间隔从 1 分钟逐步增加到 32 分钟。`lease_id` 和 `lease_until` 防止多实例重复执行和失效任务覆盖新快照。
 
+型号和分组列表完整时，每个渠道下的平台独立确认缺席或缩水。连续三轮一致后采用本轮结果，已经确认下线的平台退出快照，仍待核验的平台保留上次数据。报价格式错误通过 `failures` 单独记录。若对应型号与分组仍存在，可以沿用它的历史报价。目录存在部分失败时保留上次 `last_success`。
+
 北辰定时账单扫描、定向目录重扫及 `providercatalog` 共用每把 Key 的 `beichen_datasets.kind='billing'` 90 秒租约。应用将租约 UUID 作为轮次编号，写入前在事务中校验租约和凭据版本。`kind='catalog'` 的 `last_success` 只随接受的目录前进。`maintenance_state` 的 `beichen_catalog_shrink/<credential_uuid>` 记录待核验清单的版本、型号集合指纹和一致次数，完整接受或读取失败后清除。`kind='billing'` 的 `website_group_observation.key_billing_missing_fields` 可记录 Key 账单原始响应缺少的字段。独立官网证据继续决定该 Key 的归属是否可核实。
 
 目录扫描收到明确的 `GROUP_NOT_ALLOWED` 时，在原扫描事务中写入 `maintenance_state` 的 `beichen_group_denial/<credential_uuid>`。其 `last_error` 保存 JSON 字段 `code` 和 `credential_revision`，`updated_at` 为数据库记录拒绝的时间。只采用版本与 `provider_credentials.updated_at` 一致的记录。普通 HTTP 403 和暂时失败沿用已有的拒绝证据，接受一份新的目录时在同一事务清除记录。
@@ -410,9 +412,13 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 同一供应商的登录、续期和清除在同一数据库内按事务锁串行执行。并发请求用访问 Token 的密文版本标识所用会话，迟到的认证失败不会覆盖已经续期或替换的新会话。教师手动抓取与定时抓取共用 `beichen_website_directories` 的租约和 `beichen_crawl_runs` 的最近结果。
 
+使用数据库登录的目录和 Key 清单都在各自的提交事务中锁定并复核所用的会话密文版本。若目录版本已经更换，当前租约只用于记录会话错误和退避进度，保留已存的平台、原始响应、报价历史和最近成功时间。
+
 旧的学校本机授权由服务器随机生成。数据库仅保存 `local_grant_hash`、`local_granted_by` 和 `local_granted_at`。每个供应商保留一份授权，替换或清除网页登录配置会删除它。访问 Token 自动续期时保留授权。本机窗口保存的会话以系统用户目录下的加密文件持久化，由本机爬虫读取。
 
 迁移 `0055_beichen_website_keys.sql` 中的 `beichen_website_key_sync` 按供应商保存最近成功时间、同步状态和租约。`beichen_website_keys` 按供应商和北辰 Key ID 保存名称、最多 10 字符的前缀、官网分组 ID 和名称、精确分组倍率、上游状态及创建时间。唯一匹配的行关联 `provider_credentials.id` 和学校凭据密文的 SHA-256 摘要。密文轮换后，旧的匹配在读取时失效。同一事务替换完整清单、更新同步时间并写入变化的分组倍率版本。失败更新保留已有清单和最近成功时间，并在 `maintenance_state` 的 `beichen_key_inventory/<provider_uuid>` 记录失败原因或身份冲突。
+
+多页清单以两次完整遍历结果为准，按 Key 编号核对集合、分组、状态与其他已读字段。任一遍历的分页校验失败且未在重读后恢复，或两次完整结果不一致时，记录 `unavailable` 和诊断，沿用上次已保存的清单和 `last_seen`。
 
 迁移 `0056_beichen_website_key_rate_versions.sql` 新增官网 Key 倍率历史。`beichen_website_key_rate_versions` 的索引按供应商、北辰 Key ID 和版本序号倒序定位最新版本。分组 ID、名称、十进制倍率、高峰开关、倍率或时段有变化时，在刷新清单的同一事务内追加 `observed_at` 与 `changed=true`。首次观察的 `changed` 为 `false`。即使学校凭据尚未匹配、Key 从当前清单消失，已记录的官网倍率历史也能按原 Key ID 查阅。升级后首次成功同步会建立基线，已有当前清单在此之前仍可读取。
 

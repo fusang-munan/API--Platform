@@ -1,6 +1,7 @@
 package beichen
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"io"
@@ -290,4 +291,118 @@ WHERE d.provider_id=$1 GROUP BY d.platforms`, provider).Scan(&platformCount, &oc
 		t.Fatal("官网恢复后应更新快照时间并清空退避状态")
 	}
 	t.Log("官网 9 个平台范围、21 条记录、20 个不同型号，合并后 22 个原始型号行（14 个仅官网），Claude 覆盖 1/4 → 0/4 → 1/4")
+}
+
+func TestBeichenScanRobustnessWebsiteDirectorySessionVersionPostgres(t *testing.T) {
+	ctx, db, provider, actor, _ := newActionsPostgres(t)
+	s := New(db, switchTestManager(t))
+	const oldSession = "old-fixture-panel-session"
+	const newSession = "new-fixture-panel-session"
+	const baseline = `[{"id":1,"name":"channel-1","platforms":[{"platform":"openai","groups":[{"id":11,"name":"group-11"}],
+		"models":[{"name":"model-baseline","pricing":{"billing_mode":"token","input_price":0.00001,"output_price":0.00002}}]}]}]`
+	late := strings.Replace(baseline, "model-baseline", "model-late", 1)
+	current := strings.Replace(baseline, "model-baseline", "model-current", 1)
+	oldStarted, releaseOld := make(chan struct{}), make(chan struct{})
+	pauseOld := false
+	s.client.Transport = panelTransport(func(r *http.Request) (*http.Response, error) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		switch {
+		case r.URL.String() == panelURL && token == oldSession:
+			if pauseOld {
+				close(oldStarted)
+				select {
+				case <-releaseOld:
+					return scanResponse(http.StatusOK, late), nil
+				case <-r.Context().Done():
+					return nil, r.Context().Err()
+				}
+			}
+			return scanResponse(http.StatusOK, baseline), nil
+		case r.URL.String() == panelURL && token == newSession:
+			return scanResponse(http.StatusOK, current), nil
+		case r.URL.Path == "/api/v1/keys" && token == newSession:
+			return scanResponse(http.StatusOK, `{"code":0,"data":{"items":[{"id":51,"user_id":7,"name":"new-key","status":"active"}],
+				"total":1,"page":1,"page_size":100,"pages":1}}`), nil
+		default:
+			return nil, errors.New("unexpected fixture request")
+		}
+	})
+	login := func(token string) {
+		t.Helper()
+		if _, err := s.LoginPanelAccount(ctx, provider, actor, PanelAccountLogin{Mode: panelModeToken, Token: token}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertEvidence := func(wantRaw, wantHistory string) {
+		t.Helper()
+		var raw []byte
+		var history string
+		err := db.QueryRowContext(ctx, `
+SELECT r.raw_website_response,COALESCE((
+  SELECT string_agg(model,',' ORDER BY model) FROM beichen_group_price_observations
+  WHERE provider_id=r.provider_id AND group_id=11 AND source='website'
+),'')
+FROM beichen_crawl_runs r WHERE r.provider_id=$1`, provider).Scan(&raw, &history)
+		if err != nil || string(raw) != wantRaw || history != wantHistory {
+			t.Fatalf("unexpected directory evidence: raw matches=%t history=%q err=%v", string(raw) == wantRaw, history, err)
+		}
+	}
+	login(oldSession)
+	if _, err := s.syncWebsiteDirectory(ctx, provider, true); err != nil {
+		t.Fatal(err)
+	}
+	initial, _ := readScanWebsiteDirectory(t, ctx, db, provider)
+	if initial.LastSuccess == nil {
+		t.Fatal("missing initial directory success")
+	}
+	assertEvidence(baseline, "model-baseline")
+
+	pauseOld = true
+	scanCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.syncWebsiteDirectory(scanCtx, provider, true)
+		done <- err
+	}()
+	select {
+	case <-oldStarted:
+	case <-ctx.Done():
+		t.Fatal("old session did not start the directory request")
+	}
+	login(newSession)
+	keys, err := s.RefreshWebsiteKeys(ctx, provider)
+	if err != nil || keys.Status != "current" || keys.LastSeen == nil || len(keys.Keys) != 1 || keys.Keys[0].ID != 51 {
+		t.Fatalf("new session did not publish its Key list: %+v, %v", keys, err)
+	}
+	close(releaseOld)
+	select {
+	case err := <-done:
+		if !errors.Is(err, errWebsiteDirectorySessionChanged) {
+			t.Fatalf("old directory session was not rejected: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("old directory request did not finish")
+	}
+	view, platforms := readScanWebsiteDirectory(t, ctx, db, provider)
+	if view.State != "stale" || view.LastSuccess == nil || !view.LastSuccess.Equal(*initial.LastSuccess) ||
+		view.LastRun == nil || len(view.LastRun.Failures) != 1 || view.LastRun.Failures[0].Path != "session" ||
+		len(platforms) != 1 || len(platforms[0].Models) != 1 || platforms[0].Models[0].Name != "model-baseline" {
+		t.Fatalf("late session changed the saved directory: %+v, %+v", view, platforms)
+	}
+	assertEvidence(baseline, "model-baseline")
+	keysAfter, err := s.WebsiteKeys(ctx, provider)
+	if err != nil || keysAfter.Status != "current" || keysAfter.LastSeen == nil || !keysAfter.LastSeen.Equal(*keys.LastSeen) ||
+		len(keysAfter.Keys) != 1 || keysAfter.Keys[0].ID != 51 {
+		t.Fatalf("late directory changed the new Key list: %+v, %v", keysAfter, err)
+	}
+	if _, err := s.syncWebsiteDirectory(ctx, provider, true); err != nil {
+		t.Fatalf("old session did not release the directory lease: %v", err)
+	}
+	recovered, platforms := readScanWebsiteDirectory(t, ctx, db, provider)
+	if recovered.State != "fresh" || recovered.LastSuccess == nil || !recovered.LastSuccess.After(*initial.LastSuccess) ||
+		len(platforms) != 1 || len(platforms[0].Models) != 1 || platforms[0].Models[0].Name != "model-current" {
+		t.Fatalf("new session did not publish its directory: %+v, %+v", recovered, platforms)
+	}
+	assertEvidence(current, "model-baseline,model-current")
 }
