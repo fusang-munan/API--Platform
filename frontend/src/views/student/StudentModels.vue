@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { studentAPI } from '../../api/student'
-import type { StudentAvailabilityState, StudentModel, StudentModelCandidate, StudentModelCatalogPage } from '../../api/student'
-import type { ApiKey, BindingAdapter, ModelCategory, ModelStatus, StudentUsageReport } from '../../api/types'
+import type {
+  StudentAvailabilityState, StudentModel, StudentModelCandidate, StudentModelCatalogPage, StudentUsageSnapshot,
+} from '../../api/student'
+import type { ApiKey, BindingAdapter, ModelCategory, ModelStatus } from '../../api/types'
 import { BINDING_ADAPTER_OPTIONS, bindingAdapterMeta } from '../../utils/bindingAdapters'
 import { capabilityLabel, formatTokenK } from '../../utils/modelCatalog'
 import { selectCurrentStudentKey } from '../../utils/studentHarnessConfig'
@@ -14,6 +16,8 @@ import {
   formatStudentModelUsageParts,
   formatUsageCredits,
   formatUsagePendingReview,
+  hasStudentUsageModels,
+  studentKeyAvailable,
   sumStudentProjectCredits,
 } from '../../utils/studentUsage'
 import EmptyState from '../../components/EmptyState.vue'
@@ -44,7 +48,7 @@ const catalogResult = ref<StudentModelCatalogPage | null>(null)
 const catalogLoading = ref(false)
 const catalogError = ref('')
 const catalogScroll = ref<HTMLElement | null>(null)
-const usage = ref<StudentUsageReport | null>(null)
+const usage = ref<StudentUsageSnapshot | null>(null)
 const usageLoaded = ref(false)
 const usageFailed = ref(false)
 const query = ref('')
@@ -148,27 +152,33 @@ watch([currentKey, modelGroupChosen], () => {
   if (!modelGroupChosen.value) modelGroup.value = currentKey.value ? 'callable' : 'addable'
 }, { immediate: true })
 const currentKeyModelIDs = computed(() => new Set((currentKey.value?.models ?? []).map(model => modelKey(model.model_id))))
-const currentKeyUsage = computed(() => usage.value?.projects
-  .find(project => project.project_id === currentKey.value?.project.id)?.keys
-  ?.find(key => key.id === currentKeyID.value))
+const currentKeyUsage = computed(() => {
+  const keys = usage.value?.projects.find(project => project.project_id === currentKey.value?.project.id)?.keys
+  return Array.isArray(keys) ? keys.find(key => key.id === currentKeyID.value) : undefined
+})
 const keyAvailableCredits = computed(() => {
-  const available = currentKeyUsage.value?.available?.trim()
-  return available && /^\d+(?:\.\d+)?$/.test(available) ? formatUsageCredits(available) : null
+  const available = studentKeyAvailable(currentKeyUsage.value)
+  return available === null ? null : formatUsageCredits(available)
+})
+const keyProjectMemberCredits = computed(() => {
+  const key = currentKeyUsage.value
+  const effective = formatUsageCredits(key?.available_effective)
+  const member = formatUsageCredits(key?.project_member_available)
+  return effective !== '—' && member !== '—' && effective !== member ? member : null
 })
 const projectAvailableCredits = computed(() => {
   const total = sumStudentProjectCredits(usage.value?.projects ?? [], 'available')
   return total === null ? null : formatUsageCredits(total)
 })
-const modelUsageByID = computed(() => new Map(
-  (currentKeyUsage.value?.models ?? []).map(row => [modelKey(row.id), row]),
-))
+const modelUsageByID = computed(() => {
+  const models = currentKeyUsage.value?.models
+  return hasStudentUsageModels(models) ? new Map(models.map(row => [modelKey(row.id), row])) : null
+})
 const inFlightCredits = computed(() => {
   const total = sumStudentProjectCredits(usage.value?.projects ?? [], 'in_flight_credits')
   return total === null || total === '0.000' ? '' : formatUsageCredits(total)
 })
-const pendingReview = computed(() => usage.value
-  ? formatUsagePendingReview(usage.value.totals)
-  : '')
+const pendingReview = computed(() => formatUsagePendingReview(usage.value?.totals))
 const protocolOptions = BINDING_ADAPTER_OPTIONS.filter(item =>
   ['openai_compatible', 'openai_responses', 'anthropic', 'google_gemini_v1beta'].includes(item.value))
 const selectedProtocolLabel = computed(() => protocol.value ? protocolMeta(protocol.value).label : '')
@@ -176,12 +186,12 @@ const busy = computed(() => Boolean(syncingModelID.value || removingModelID.valu
 
 function usagePlaceholder() {
   if (!currentKey.value) return '暂无生效 Key'
-  if (usageFailed.value || (usageLoaded.value && !currentKeyUsage.value)) return '用量暂不可用'
+  if (usageFailed.value || (usageLoaded.value && !modelUsageByID.value)) return '用量暂不可用'
   return usageLoaded.value ? '' : '用量读取中…'
 }
 
 function modelUsageLabel(modelID: string) {
-  return usagePlaceholder() || formatStudentModelUsage(modelUsageByID.value.get(modelKey(modelID)))
+  return usagePlaceholder() || formatStudentModelUsage(modelUsageByID.value?.get(modelKey(modelID)))
 }
 
 function studentSafeReason(reason: string, fallback: string) {
@@ -357,7 +367,7 @@ const catalogRows = computed(() => (catalogResult.value?.items ?? []).map(item =
   const joined = keyHasModel(model.model_id)
   const placeholder = usagePlaceholder()
   const usage = placeholder ? { credits: placeholder, calls: '' }
-    : formatStudentModelUsageParts(modelUsageByID.value.get(modelKey(model.model_id)))
+    : formatStudentModelUsageParts(modelUsageByID.value?.get(modelKey(model.model_id)))
   return {
     item, model, availability, joined, usage,
     protocols: protocolsFor(model),
@@ -428,6 +438,7 @@ async function load() {
         ? studentAPI.usage()
           .then(payload => {
             if (revision !== keyListRevision) return
+            if (!Array.isArray(payload?.projects)) throw new Error('Invalid student usage report')
             usage.value = payload
             usageLoaded.value = true
             usageFailed.value = false
@@ -685,11 +696,14 @@ onBeforeUnmount(() => {
           </label>
           <div class="key-balances">
             <p v-if="keyAvailableCredits !== null" data-testid="key-balance">
-              此 Key 可用积分 <strong>{{ keyAvailableCredits }}</strong>
+              本项目个人可用积分 <strong>{{ keyAvailableCredits }}</strong>
             </p>
-            <p v-else class="muted">{{ usageLoaded || usageFailed ? '此 Key 余额暂不可用' : '正在读取 Key 余额…' }}</p>
+            <p v-else class="muted">{{ usageLoaded || usageFailed ? '本项目个人可用积分暂不可用' : '正在读取本项目个人可用积分…' }}</p>
+            <p v-if="keyProjectMemberCredits !== null" class="muted" data-testid="key-project-member-balance">
+              项目内个人余额 <strong>{{ keyProjectMemberCredits }}</strong>
+            </p>
             <p v-if="projectAvailableCredits !== null" class="muted" data-testid="project-balance">
-              全部项目可用积分 <strong>{{ projectAvailableCredits }}</strong>
+              各项目个人余额合计 <strong>{{ projectAvailableCredits }}</strong>
             </p>
           </div>
         </div>
@@ -709,7 +723,7 @@ onBeforeUnmount(() => {
       </template>
       <p v-else class="muted">正在加载 Key…</p>
       <p v-if="!currentKey && projectAvailableCredits !== null" class="muted" data-testid="project-balance">
-        全部项目可用积分 <strong>{{ projectAvailableCredits }}</strong>
+        各项目个人余额合计 <strong>{{ projectAvailableCredits }}</strong>
       </p>
     </section>
 

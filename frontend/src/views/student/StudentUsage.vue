@@ -1,24 +1,31 @@
 <script setup lang="ts">
-import { computed, ref, useId } from 'vue'
-import { ChevronDown, Search } from 'lucide-vue-next'
-import { APIError, apiErrorMessage, get } from '../../api/client'
+import { computed, onBeforeUnmount, ref, useId } from 'vue'
+import { ChevronDown, History, Search } from 'lucide-vue-next'
+import { APIError, apiErrorMessage } from '../../api/client'
 import { studentAPI } from '../../api/student'
-import type { StudentUsageModelMetrics, StudentUsageProject, StudentUsageReport } from '../../api/types'
+import type {
+  StudentCallReceipt, StudentKeyUsage, StudentModelUsageFields, StudentProjectUsageRow,
+  StudentRecentCall, StudentRecentRange, StudentUsageSnapshot,
+} from '../../api/student'
 import AppDialog from '../../components/AppDialog.vue'
 import CreditDonut from '../../components/CreditDonut.vue'
 import EmptyState from '../../components/EmptyState.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
-import { formatPercent, formatTokens } from '../../utils/credits'
 import { quotaBalance, schoolMonth, statusLabel } from '../../utils/format'
 import {
   formatUsageCacheCoverage,
+  formatUsageCacheRate,
+  formatUsageCount,
   formatUsageCredits,
   formatUsageModelNotes,
   formatUsagePendingReview,
   formatUsageTokenCount,
+  hasStudentUsageModels,
+  isUsageCount,
+  studentInFlightCredits,
+  studentKeyAvailable,
   sumStudentProjectCredits,
-  type StudentCallReceipt,
 } from '../../utils/studentUsage'
 
 const pageId = useId()
@@ -27,7 +34,7 @@ const monthTitle = computed(() => {
   const [year, monthNumber] = month.value.split('-')
   return `${year} 年 ${Number(monthNumber)} 月个人用量`
 })
-const report = ref<StudentUsageReport | null>(null)
+const report = ref<StudentUsageSnapshot | null>(null)
 const loading = ref(true)
 const loadFailed = ref(false)
 const expandedSections = ref(new Set<string>())
@@ -73,41 +80,49 @@ function changeMonth(event: Event) {
 
 useVisibilityPolling(load)
 
-const modelSummary = computed(() => {
-  const data = report.value
-  // 项目月桶与模型账本是独立的，缺少模型汇总时仍可查看额度。
-  if (!data?.totals || !Array.isArray(data.models)) return null
-  return { models: data.models, totals: data.totals }
+const totals = computed(() => {
+  const total = report.value?.totals
+  return typeof total?.credits === 'string' && isUsageCount(total.calls) ? total : null
 })
+const models = computed(() => hasStudentUsageModels(report.value?.models) ? report.value.models : null)
 
 const creditStats = computed(() => {
   if (!report.value) return []
   const { projects } = report.value
   return [
     { id: 'quota', label: '月额度', amount: sumStudentProjectCredits(projects, 'quota') },
-    { id: 'used', label: '已扣积分', amount: modelSummary.value?.totals.credits },
+    { id: 'used', label: '已扣积分', amount: totals.value?.credits },
     { id: 'pending', label: '在途积分', amount: sumStudentProjectCredits(projects, 'in_flight_credits') },
-    { id: 'available', label: '可用积分', amount: sumStudentProjectCredits(projects, 'available') },
+    { id: 'available', label: '各项目个人余额合计', amount: sumStudentProjectCredits(projects, 'available') },
   ]
 })
 
-const projectSummaries = computed(() => (report.value?.projects ?? []).map(project => ({
-  project,
-  balance: quotaBalance(project.quota, project.used, project.available),
-})))
+const projectSummaries = computed(() => (report.value?.projects ?? []).map(project => {
+  const keys = Array.isArray(project.keys) ? project.keys : []
+  return {
+    project,
+    balance: quotaBalance(project.quota, project.used, project.available),
+    pendingReview: formatUsagePendingReview(project),
+    keyRows: keys.map(key => ({
+      key,
+      models: hasStudentUsageModels(key.models) ? key.models : null,
+      pendingReview: formatUsagePendingReview(key),
+    })),
+  }
+}))
 
 const modelColumns: Array<{
   label: string
-  value: (model: StudentUsageModelMetrics) => string
-  detail?: (model: StudentUsageModelMetrics) => string
+  value: (model: StudentModelUsageFields) => string
+  detail?: (model: StudentModelUsageFields) => string
   numeric?: boolean
 }> = [
   { label: '已扣积分', value: model => formatUsageCredits(model.credits), numeric: true },
-  { label: '调用次数', value: model => formatTokens(model.calls ?? 0), numeric: true },
-  { label: 'Token', value: model => formatUsageTokenCount(model.tokens.total), numeric: true },
+  { label: '调用次数', value: model => formatUsageCount(model.calls ?? 0), numeric: true },
+  { label: 'Token', value: model => formatUsageTokenCount(model.tokens?.total), numeric: true },
   {
     label: '缓存命中率',
-    value: model => formatPercent(model.cache_hit_rate),
+    value: model => formatUsageCacheRate(model.cache_hit_rate),
     detail: formatUsageCacheCoverage,
     numeric: true,
   },
@@ -127,15 +142,16 @@ function toggleSection(id: string) {
   else expandedSections.value.add(id)
 }
 
-function projectSegments(project: StudentUsageProject) {
+function projectSegments(project: StudentProjectUsageRow, keyRows: { key: StudentKeyUsage }[]) {
+  const inFlight = studentInFlightCredits(project)
   return [
-    ...project.keys.map(key => ({ name: key.name, value: Number(key.used), displayValue: formatUsageCredits(key.used) })),
+    ...keyRows.map(({ key }) => ({ name: key.name, value: Number(key.used), displayValue: formatUsageCredits(key.used) })),
     {
-      name: '在途积分', value: Number(project.in_flight_credits),
-      displayValue: formatUsageCredits(project.in_flight_credits), color: '#e5a93f',
+      name: '在途积分', value: Number(inFlight),
+      displayValue: formatUsageCredits(inFlight), color: '#e5a93f',
     },
     {
-      name: '可用积分', value: Number(project.available),
+      name: '项目内个人余额', value: Number(project.available),
       displayValue: formatUsageCredits(project.available), color: '#dfe3ec',
     },
   ]
@@ -172,7 +188,7 @@ async function lookupReceipt() {
   const lookup = ++latestLookup
   receiptLoading.value = true
   try {
-    const data = await get<StudentCallReceipt>(`/api/v1/student/usage/calls/${encodeURIComponent(query)}`)
+    const data = await studentAPI.callReceipt(query)
     if (data?.request_id !== query || !Number.isFinite(Date.parse(data.created_at))) {
       throw new Error('Invalid student call receipt')
     }
@@ -195,14 +211,17 @@ const billingStateLabels: Record<string, string> = {
   released: '已释放',
   failed: '结算失败',
 }
-const receiptTime = new Intl.DateTimeFormat('zh-CN', {
+const callTime = new Intl.DateTimeFormat('zh-CN', {
   timeZone: 'Asia/Shanghai', dateStyle: 'medium', timeStyle: 'medium',
 })
-const receiptTokenFields = [
+const callTokenFields = [
   { field: 'input_tokens', label: '输入' },
   { field: 'output_tokens', label: '输出' },
   { field: 'cache_read_tokens', label: '缓存读' },
   { field: 'cache_write_tokens', label: '缓存写' },
+] as const
+const receiptTokenFields = [
+  ...callTokenFields,
   { field: 'total_tokens', label: '总 Token' },
 ] as const
 const usageStateLabels: Record<string, string> = {
@@ -223,9 +242,69 @@ const usageReasonLabels: Record<string, string> = {
 }
 
 function receiptAppliedLabel(applied: boolean | null) {
-  if (applied === null) return '暂无匹配回执'
+  if (typeof applied !== 'boolean') return '暂无匹配回执'
   return applied ? '已用回执补记' : '已匹配回执，未用于补记'
 }
+
+const recentRanges: { value: StudentRecentRange; label: string }[] = [
+  { value: 'today', label: '今天' },
+  { value: 'month', label: '本月' },
+  { value: 'all', label: '全部' },
+]
+const recentStatusLabels: Record<string, string> = {
+  succeeded: '成功', failed: '失败', pending_review: '待核账',
+}
+const recentOpen = ref(false)
+const recentRange = ref<StudentRecentRange>('today')
+const recentCalls = ref<StudentRecentCall[]>([])
+const recentCursor = ref<string | null>(null)
+const recentLoading = ref(false)
+const recentError = ref('')
+const expandedCallID = ref('')
+let recentRequest: AbortController | undefined
+
+async function loadRecent() {
+  if (!recentOpen.value || recentRequest) return
+  const request = new AbortController()
+  recentRequest = request
+  recentLoading.value = true
+  recentError.value = ''
+  try {
+    const page = await studentAPI.recentCalls(recentRange.value, recentCursor.value, request.signal)
+    if (request.signal.aborted) return
+    if (!Array.isArray(page?.items) || !page.items.every(call =>
+      typeof call?.id === 'string' && typeof call.created_at === 'string' && Number.isFinite(Date.parse(call.created_at)),
+    )) throw new Error('Invalid student recent calls')
+    recentCalls.value = [...recentCalls.value, ...page.items]
+    recentCursor.value = typeof page.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
+  } catch (error) {
+    if (!request.signal.aborted) recentError.value = apiErrorMessage(error, '最近调用读取失败，请重试')
+  } finally {
+    if (!request.signal.aborted) {
+      recentRequest = undefined
+      recentLoading.value = false
+    }
+  }
+}
+
+function setRecentRange(range: StudentRecentRange) {
+  recentRequest?.abort()
+  recentRequest = undefined
+  recentRange.value = range
+  recentCalls.value = []
+  recentCursor.value = null
+  recentLoading.value = false
+  recentError.value = ''
+  expandedCallID.value = ''
+  void loadRecent()
+}
+
+function setRecentOpen(open: boolean) {
+  recentOpen.value = open
+  setRecentRange('today')
+}
+
+onBeforeUnmount(() => recentRequest?.abort())
 </script>
 
 <template>
@@ -239,6 +318,58 @@ function receiptAppliedLabel(applied: boolean | null) {
         <label>月份（北京时间）
           <input :value="month" type="month" :max="schoolMonth()" required @change="changeMonth">
         </label>
+        <AppDialog :open="recentOpen" title="最近调用" description="按北京时间筛选，点开一条调用查看详情。"
+          @update:open="setRecentOpen">
+          <template #trigger>
+            <button class="button secondary usage-disclosure" type="button" data-testid="open-recent">
+              <History :size="15" aria-hidden="true" />最近调用
+            </button>
+          </template>
+          <div class="usage-recent">
+            <div class="range-switch" role="group" aria-label="最近调用范围（北京时间）">
+              <button v-for="range in recentRanges" :key="range.value" type="button"
+                :aria-pressed="recentRange === range.value" :data-testid="`recent-range-${range.value}`"
+                @click="range.value !== recentRange && setRecentRange(range.value)">{{ range.label }}</button>
+            </div>
+            <ul v-if="recentCalls.length" class="usage-recent-list" aria-label="最近调用记录">
+              <li v-for="call in recentCalls" :key="call.id">
+                <button class="usage-recent-row" type="button" :aria-expanded="expandedCallID === call.id"
+                  :aria-controls="`${pageId}-recent-${call.id}`"
+                  @click="expandedCallID = expandedCallID === call.id ? '' : call.id">
+                  <span>
+                    <strong>{{ call.model_name || call.model_id || '—' }}</strong>
+                    <time class="muted" :datetime="call.created_at">{{ callTime.format(new Date(call.created_at)) }}</time>
+                  </span>
+                  <span class="usage-recent-amount">
+                    <strong>{{ formatUsageCredits(call.credits) }} 积分</strong>
+                    <small class="muted">{{ billingStateLabels[call.billing_state] ?? statusLabel(call.billing_state) }}</small>
+                  </span>
+                  <ChevronDown :size="16" aria-hidden="true" />
+                </button>
+                <div v-show="expandedCallID === call.id" :id="`${pageId}-recent-${call.id}`">
+                  <div v-if="expandedCallID === call.id" class="usage-receipt-result usage-recent-detail">
+                    <dl class="usage-receipt-meta">
+                      <div><dt>项目</dt><dd>{{ call.project_name || '—' }}</dd></div>
+                      <div><dt>调用结果</dt><dd>{{ recentStatusLabels[call.status] ?? statusLabel(call.status) }}</dd></div>
+                      <div><dt>模型标识</dt><dd>{{ call.model_id || '—' }}</dd></div>
+                      <div class="usage-receipt-status"><dt>请求编号</dt><dd><code>{{ call.request_id || '—' }}</code></dd></div>
+                    </dl>
+                    <dl class="usage-receipt-tokens" aria-label="Token 明细">
+                      <div v-for="{ field, label } in callTokenFields" :key="field">
+                        <dt>{{ label }}</dt><dd>{{ formatUsageTokenCount(call[field]) }}</dd>
+                      </div>
+                    </dl>
+                  </div>
+                </div>
+              </li>
+            </ul>
+            <p v-if="recentError" class="error banner" role="alert">{{ recentError }}</p>
+            <p v-else-if="recentLoading" class="muted" role="status">正在读取最近调用…</p>
+            <p v-else-if="!recentCalls.length" class="muted" role="status">所选范围暂无调用记录</p>
+            <button v-if="recentError || recentCursor" class="button ghost usage-recent-more" type="button"
+              :disabled="recentLoading" @click="loadRecent">{{ recentError ? '重试' : '加载更多' }}</button>
+          </div>
+        </AppDialog>
         <AppDialog
           :open="receiptOpen"
           title="查单笔调用"
@@ -266,7 +397,7 @@ function receiptAppliedLabel(applied: boolean | null) {
               <div><dt>请求编号</dt><dd><code>{{ receipt.request_id }}</code></dd></div>
               <div>
                 <dt>时间（北京时间）</dt>
-                <dd><time :datetime="receipt.created_at">{{ receiptTime.format(new Date(receipt.created_at)) }}</time></dd>
+                <dd><time :datetime="receipt.created_at">{{ callTime.format(new Date(receipt.created_at)) }}</time></dd>
               </div>
               <div><dt>已扣积分</dt><dd>{{ formatUsageCredits(receipt.charged_credits) }}</dd></div>
               <div><dt>结算状态</dt><dd>{{ billingStateLabels[receipt.billing_state] ?? statusLabel(receipt.billing_state) }}</dd></div>
@@ -309,11 +440,11 @@ function receiptAppliedLabel(applied: boolean | null) {
             <h2 :id="`${pageId}-models`">按模型合计</h2>
             <RouterLink class="usage-model-link" :to="{ name: 'student-models' }">到模型广场添加模型</RouterLink>
           </header>
-          <div v-if="!modelSummary" class="usage-load-error">
+          <div v-if="!totals || !models" class="usage-load-error">
             <p class="error" role="alert">模型汇总读取失败。返回数据缺少汇总字段。</p>
             <button class="button secondary" type="button" @click="load">重试</button>
           </div>
-          <template v-else-if="modelSummary.models.length">
+          <template v-if="models?.length">
             <p class="muted usage-table-note">调用次数只统计已结算调用，含零额结算。待核笔数单独显示。</p>
             <div class="beichen-table-wrap">
               <table class="beichen-table usage-model-table" data-testid="student-model-summary">
@@ -326,7 +457,7 @@ function receiptAppliedLabel(applied: boolean | null) {
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="model in modelSummary.models" :key="model.id">
+                  <tr v-for="model in models" :key="model.id">
                     <th scope="row">
                       <strong>{{ model.name || model.id }}</strong>
                       <small v-if="model.name && model.name !== model.id">{{ model.id }}</small>
@@ -338,37 +469,38 @@ function receiptAppliedLabel(applied: boolean | null) {
                     </td>
                   </tr>
                 </tbody>
-                <tfoot>
+                <tfoot v-if="totals">
                   <tr>
                     <th scope="row">合计</th>
                     <td v-for="column in modelColumns" :key="column.label" :data-label="column.label"
                       :class="{ 'numeric-cell': column.numeric }">
-                      {{ column.value(modelSummary.totals) }}
-                      <small v-if="column.detail">{{ column.detail(modelSummary.totals) }}</small>
+                      {{ column.value(totals) }}
+                      <small v-if="column.detail">{{ column.detail(totals) }}</small>
                     </td>
                   </tr>
                 </tfoot>
               </table>
             </div>
           </template>
-          <EmptyState v-else title="所选月暂无模型用量" />
+          <EmptyState v-else-if="models && totals" title="所选月暂无模型用量" />
         </section>
 
         <section class="panel usage-panel" :aria-labelledby="`${pageId}-keys`">
           <h2 :id="`${pageId}-keys`">按 Key 明细</h2>
           <EmptyState v-if="!projectSummaries.length" title="所选月暂无项目和 Key 记录" />
-          <article v-for="{ project, balance } in projectSummaries" :key="project.project_id" class="usage-project">
+          <article v-for="{ project, balance, keyRows, pendingReview } in projectSummaries" :key="project.project_id"
+            class="usage-project">
             <header class="usage-project-heading">
               <div>
                 <h3>{{ project.project_name }}</h3>
                 <div class="usage-summary">
                   <span>月额度 <strong>{{ formatUsageCredits(project.quota) }}</strong></span>
                   <span>学校已用 <strong>{{ formatUsageCredits(project.used) }}</strong></span>
-                  <span>在途 <strong>{{ formatUsageCredits(project.in_flight_credits) }}</strong></span>
+                  <span>在途 <strong>{{ formatUsageCredits(studentInFlightCredits(project)) }}</strong></span>
                   <span class="usage-project-balance">{{ balance.label }}<strong>{{ formatUsageCredits(balance.amount) }}</strong></span>
-                  <span>已结算 {{ formatTokens(project.calls) }} 次</span>
+                  <span v-if="isUsageCount(project.calls)">已结算 {{ formatUsageCount(project.calls) }} 次</span>
                 </div>
-                <p v-if="project.pending_review_calls > 0" class="usage-review">{{ formatUsagePendingReview(project) }}</p>
+                <p v-if="pendingReview" class="usage-review">{{ pendingReview }}</p>
               </div>
               <button class="button ghost usage-disclosure" type="button"
                 :aria-expanded="expandedSections.has(chartSectionId(project.project_id))"
@@ -380,37 +512,39 @@ function receiptAppliedLabel(applied: boolean | null) {
             <div v-show="expandedSections.has(chartSectionId(project.project_id))"
               :id="chartSectionId(project.project_id)" class="usage-chart">
               <CreditDonut v-if="expandedSections.has(chartSectionId(project.project_id))"
-                :segments="projectSegments(project)" :total="Number(project.quota)" unit="积分"
+                :segments="projectSegments(project, keyRows)" :total="Number(project.quota)" unit="积分"
                 :label="`${project.project_name} 各 Key 已扣积分与额度`" />
             </div>
 
-            <p v-if="!project.keys.length" class="muted usage-no-keys">暂无 Key 记录</p>
-            <template v-for="key in project.keys" :key="keySectionId(project.project_id, key.id)">
+            <p v-if="!keyRows.length" class="muted usage-no-keys">暂无 Key 记录</p>
+            <template v-for="{ key, models: keyModels, pendingReview: keyReview } in keyRows"
+              :key="keySectionId(project.project_id, key.id)">
               <div class="usage-key-row" data-testid="usage-key-row">
                 <div class="usage-key-identity">
                   <div class="usage-key-name">
                     <strong>{{ key.name }}</strong>
                     <span class="status-badge" :class="key.status">{{ statusLabel(key.status) }}</span>
                   </div>
-                  <small v-if="key.pending_review_calls > 0" class="usage-review">{{ formatUsagePendingReview(key) }}</small>
+                  <small v-if="keyReview" class="usage-review">{{ keyReview }}</small>
                 </div>
                 <dl class="usage-key-credits">
                   <div><dt>已扣积分</dt><dd>{{ formatUsageCredits(key.used) }}</dd></div>
-                  <div><dt>在途积分</dt><dd>{{ formatUsageCredits(key.in_flight_credits) }}</dd></div>
-                  <div><dt>可用积分</dt><dd>{{ formatUsageCredits(key.available) }}</dd></div>
+                  <div><dt>在途积分</dt><dd>{{ formatUsageCredits(studentInFlightCredits(key)) }}</dd></div>
+                  <div><dt>本项目个人可用积分</dt><dd>{{ formatUsageCredits(studentKeyAvailable(key)) }}</dd></div>
                 </dl>
                 <dl class="usage-key-metrics">
-                  <div><dt>调用次数</dt><dd>{{ formatTokens(key.calls) }}</dd></div>
+                  <div><dt>调用次数</dt><dd>{{ formatUsageCount(key.calls) }}</dd></div>
                   <div>
-                    <dt>Token</dt><dd>{{ formatUsageTokenCount(key.tokens.total) }}</dd>
-                    <small v-if="key.token_coverage.calls && key.completeness !== 'complete'">
+                    <dt>Token</dt><dd>{{ formatUsageTokenCount(key.tokens?.total) }}</dd>
+                    <small v-if="isUsageCount(key.token_coverage?.calls) && key.token_coverage.calls > 0
+                      && (key.completeness === 'partial' || key.completeness === 'unknown')">
                       {{ key.completeness === 'partial' ? '部分回报' : '无回报' }}
                     </small>
                   </div>
-                  <div><dt>模型数</dt><dd>{{ formatTokens(key.models.length) }}</dd></div>
+                  <div><dt>模型数</dt><dd>{{ formatUsageCount(keyModels?.length) }}</dd></div>
                 </dl>
                 <div class="usage-key-action">
-                  <button v-if="key.models.length" class="button ghost usage-disclosure" type="button"
+                  <button v-if="keyModels?.length" class="button ghost usage-disclosure" type="button"
                     :aria-expanded="expandedSections.has(keySectionId(project.project_id, key.id))"
                     :aria-controls="keySectionId(project.project_id, key.id)"
                     :aria-label="`${expandedSections.has(keySectionId(project.project_id, key.id)) ? '收起' : '展开'} ${key.name} 的模型明细`"
@@ -418,10 +552,10 @@ function receiptAppliedLabel(applied: boolean | null) {
                     {{ expandedSections.has(keySectionId(project.project_id, key.id)) ? '收起明细' : '展开明细' }}
                     <ChevronDown :size="14" aria-hidden="true" />
                   </button>
-                  <span v-else class="muted">暂无模型记录</span>
+                  <span v-else class="muted">{{ keyModels ? '暂无模型记录' : '模型明细暂不可用' }}</span>
                 </div>
               </div>
-              <div v-if="key.models.length" v-show="expandedSections.has(keySectionId(project.project_id, key.id))"
+              <div v-if="keyModels?.length" v-show="expandedSections.has(keySectionId(project.project_id, key.id))"
                 :id="keySectionId(project.project_id, key.id)" class="beichen-table-wrap usage-key-models">
                 <table v-if="expandedSections.has(keySectionId(project.project_id, key.id))" class="beichen-table usage-model-table">
                   <caption class="sr-only">{{ key.name }} 的模型用量</caption>
@@ -433,7 +567,7 @@ function receiptAppliedLabel(applied: boolean | null) {
                     </tr>
                   </thead>
                   <tbody>
-                    <tr v-for="model in key.models" :key="model.id">
+                    <tr v-for="model in keyModels" :key="model.id">
                       <th scope="row">
                         <strong>{{ model.name || model.id }}</strong>
                         <small v-if="model.name && model.name !== model.id">{{ model.id }}</small>
@@ -555,6 +689,10 @@ function receiptAppliedLabel(applied: boolean | null) {
 
 .usage-model-table small {
   margin-top: 3px;
+}
+
+.usage-model-table small:empty {
+  display: none;
 }
 
 .usage-project {
@@ -703,6 +841,90 @@ function receiptAppliedLabel(applied: boolean | null) {
   overflow-wrap: anywhere;
 }
 
+.usage-recent {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.usage-recent p {
+  margin: 0;
+}
+
+.usage-recent-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.usage-recent-list li {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.usage-recent-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, .75fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 12px;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+
+.usage-recent-row:hover {
+  background: var(--surface);
+}
+
+.usage-recent-row:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+.usage-recent-row time,
+.usage-recent-row small {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+.usage-recent-amount {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-recent-row[aria-expanded="true"] svg {
+  transform: rotate(180deg);
+}
+
+.usage-recent-detail {
+  margin: 0 12px 12px;
+  padding-top: 12px;
+}
+
+.usage-recent-more {
+  justify-self: end;
+}
+
+.usage-recent-more,
+.usage-recent .range-switch button,
+.usage-receipt-form .button {
+  min-height: 44px;
+}
+
+:global(.dialog-content:has(> .usage-recent, > .usage-receipt-form)) {
+  max-height: calc(100dvh - 28px);
+}
+
 .usage-receipt-form {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -805,11 +1027,29 @@ function receiptAppliedLabel(applied: boolean | null) {
   .usage-key-row dd {
     font-size: 11px;
   }
+
+  .usage-key-action {
+    max-width: 112px;
+  }
+
+  .usage-heading .usage-disclosure,
+  .usage-key-action .usage-disclosure,
+  .usage-receipt-form input {
+    min-height: 44px;
+  }
+
+  .usage-receipt-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .usage-receipt-form .button {
+    justify-self: end;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   /* 保留弹窗的静态居中定位，减少动态效果时仍只过渡透明度。 */
-  :global(.dialog-content:has(> .usage-receipt-form)) {
+  :global(.dialog-content:has(> .usage-recent, > .usage-receipt-form)) {
     transform: translate(-50%, -50%) !important;
   }
 }
