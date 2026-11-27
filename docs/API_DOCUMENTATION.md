@@ -249,6 +249,7 @@ data: {"revision":"01K2..."}
 | GET | `/api/v1/student/organizations` | 列出平台全部 ACTIVE 组织 |
 | GET | `/api/v1/student/organizations/{organization_id}/projects` | 列出该 ACTIVE 组织全部项目，并返回真实状态与 `has_mentor` |
 | GET | `/api/v1/student/models` | 模型广场 |
+| GET | `/api/v1/student/model-catalog` | 搜索可收藏的学校模型 |
 | POST | `/api/v1/student/api-keys` | 提交 Key 申请 |
 | GET | `/api/v1/student/api-keys` | 列出自己的申请和 Key |
 | GET | `/api/v1/student/api-keys/{api_key_id}` | 查看自己的审核详情与进度 |
@@ -259,6 +260,8 @@ data: {"revision":"01K2..."}
 组织和项目列表可供学生浏览。项目列表返回真实状态和 `has_mentor`。提交申请时组织和项目须为 ACTIVE，项目须属于该组织。
 
 模型广场将预置模型与学生个人模型库去重展示。广场及目录搜索展示启用、有正数倍率且已配置线路的模型。目录搜索选中的非预置模型可通过 `POST /api/v1/student/models` 收藏。
+
+目录搜索的 `q` 可省略，最多接收 128 个 Unicode 字符。查询去除首尾空白并忽略大小写，在模型标识、显示名称和描述中做子串匹配。`page` 取 1 至 10000，缺省 1。`page_size` 取 1 至 50，缺省 20。超限、非法编码和非整数分页返回 `400 VALIDATION_ERROR`。响应的 `data` 包含 `items`、`total`、`page` 与 `page_size`，按模型标识排序。有效页码超出结果时返回空 `items` 和实际匹配总数。
 
 提交申请：
 
@@ -839,14 +842,14 @@ Anthropic-compatible 示例：
 | 位置 | 字段与类型 | 含义 |
 | --- | --- | --- |
 | `data` | `month: string`、`projects: array`、`models: array`、`totals: object` | `projects` 保留项目 → Key → 模型结构。`models` 按模型 ID 合并本人所有项目和 Key。 |
-| `projects[]` | `project_id`、`project_name`、`quota`、`used`、`pending`、`available`、`in_flight_credits` 均为字符串，另有 `keys: array`、`calls: number` | 额度、已用和可用来自该学生的项目月桶。 |
-| `projects[].keys[]` | `id`、`name`、`status`、`used`、`pending`、`in_flight_credits` 均为字符串，另有 `models: array`、`calls: number`、`pending_calls: number`、`available?: string` | 额度数据取自 Key 月桶。无该月桶时省略 `available`。停用 Key 有该月已结算或零额调用、待核、在途占用或可汇总 Token 时仍显示。 |
+| `projects[]` | `project_id`、`project_name`、`quota`、`used`、`pending`、`available`、`in_flight_credits` 均为字符串，另有 `keys: array`、`calls: number` | `available` 为该学生在此项目内的个人余额。 |
+| `projects[].keys[]` | `id`、`name`、`status`、`used`、`pending`、`in_flight_credits`、`available_effective`、`project_member_available` 均为字符串，另有 `models: array`、`calls: number`、`pending_calls: number`、`available?: string` | `available` 为旧 Key 月桶余额，无该月桶时省略。停用 Key 有该月已结算或零额调用、待核、在途占用或可汇总 Token 时仍显示。 |
 | 两处模型数组项 | `id: string`、`name: string`、`credits: string`、`calls?: number` | 模型 ID 为公开模型标识，名称保留调用时记录的名称。保留原有 `calls` 口径和零值省略行为。 |
 | `totals` | `credits: string`、`calls: number` | 所有可见 Key 的模型账本积分和次数汇总，范围与 `data.models` 一致。空数组返回 `[]`。 |
 
 `calls` 来自月账本，包含已结算的正额与零额调用。金额先在服务端按十进制精确求和，返回字符串并至少保留三位小数，例如 `"0.00040000000000001"`。跨项目或跨 Key 显示同一模型时，可直接使用 `data.models` 中的汇总值。最近调用 `GET /api/v1/student/usage/recent` 是按创建时间查询的分页明细，包含处于不同结算状态的请求。对比月度金额和次数时使用同一账月的 `totals` 与 `models`。
 
-模型广场读取当前项目和 Key 的 `models` 与 `available` 显示该 Key 的已结算用量及余额。全部项目的在途占用取各项目的 `in_flight_credits`，待核笔数与预留取 `totals` 的待核字段。
+展示选定 Key 的有效可用积分时读取 `available_effective`。项目个人额度和项目总额度分别扣除已用与在途占用后，取较小值并以零为下限。`project_member_available` 等于所属项目条目的 `available`。字段描述有费用请求的积分条件。实际调用还要满足 Key 与模型状态、授权及并发等条件。全部项目的在途占用取各项目的 `in_flight_credits`，待核笔数与预留取 `totals` 的待核字段。
 
 项目、Key、模型及 `totals` 还包含下列字段。
 
@@ -908,9 +911,10 @@ Anthropic-compatible 示例：
 
 - `calls` 是已结算调用数，包含扣费调用及 `zero_cost_calls`。待核笔数和预留积分由 `pending_review_*` 提供。积分保留实际精度并至少显示三位小数。
 - `total_tokens` 是已知 Token 合计，无证据时为 `null`。最近调用时间是纳入统计的逐笔记录里最晚的 `created_at`，仅存月账本时为 `null`。账号资料缺失时显示历史姓名和 `user_email: null`。
-- `unattributed_upstream` 按上游 `occurred_at` 取同一北京时间账月的**全校**已归档数据，独立于项目、搜索、排序和分页。 `rows` 为暂无可核验学生归属的归档笔数。 `debit_rows` 为有可确认的余额扣款笔数，`balance_debit` 为余额单位的十进制合计，无扣款证据时为 `null`。已确认余额扣款为零也计入 `debit_rows`。
+- `unattributed_upstream` 按上游 `occurred_at` 取同一北京时间账月的**全校**已归档数据，独立于项目、搜索、排序和分页。 `rows` 为暂无可核验学生归属的归档笔数。已核验回执只确认对应的流水行。缺回执时，无冲突的响应编号和派发快照必须能唯一定位一条归档流水。 `debit_rows` 为有可确认的余额扣款笔数，`balance_debit` 为余额单位的十进制合计，无扣款证据时为 `null`。已确认余额扣款为零也计入 `debit_rows`。
+- 列表按账月及所选项目在服务端复用最多 5 秒的快照。学生汇总和全校未归属金额来自同一次读库快照，搜索、排序和翻页可复用快照。超过 10000 名学生的范围由数据库直接精确分页。明细实时读取，列表与明细刷新时间可相差一个缓存窗口。列表读库超过 3 秒返回 `503 DEPENDENCY_UNAVAILABLE`。
 
-明细返回 `data.user_id`、`data.user_name`、`data.user_email` 和与学生月度用量相同结构的 `month`、`totals`、`projects[].keys[].models[]`、`models[]`，并在每层增加 `zero_cost_calls`。 `projects[].used` 和 `keys[].used` 取同一范围的月账本合计。额度、在途占用及可用额度按历史账月的额度桶读取。缺少当前 Key 资料时，使用快照名称及 `status: "unknown"`。接口返回 Key 标识、名称和状态等报表字段。
+明细返回 `data.user_id`、`data.user_name`、`data.user_email`、`month`、`totals`、`projects[].keys[].models[]`、`models[]`，各层提供 `zero_cost_calls`。 `projects[].used` 和 `keys[].used` 取同一范围的月账本合计。额度、在途占用及 `available` 按历史账月的额度桶读取。缺少当前 Key 资料时，使用快照名称及 `status: "unknown"`。接口返回 Key 标识、名称和状态等报表字段。
 
 无登录凭证时返回 `401 AUTHENTICATION_REQUIRED`，非教师和停用账户返回 403。无效月份、UUID、分页值或枚举返回 `400 VALIDATION_ERROR`。明细范围内无用量返回 `404 RESOURCE_NOT_FOUND`，读库异常返回 `503 DEPENDENCY_UNAVAILABLE`。
 

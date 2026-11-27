@@ -52,17 +52,19 @@ type StudentUsageTotals struct {
 }
 
 type KeyUsage struct {
-	ID              string              `json:"id"`
-	Name            string              `json:"name"`
-	Status          string              `json:"status"`
-	Used            string              `json:"used"`
-	Pending         string              `json:"pending"`
-	Available       string              `json:"available,omitempty"`
-	PendingReview   bool                `json:"pending_review,omitempty"`
-	InFlightCredits string              `json:"in_flight_credits"`
-	Calls           int64               `json:"calls"`
-	PendingCalls    int64               `json:"pending_calls"`
-	Models          []StudentModelUsage `json:"models"`
+	ID                     string              `json:"id"`
+	Name                   string              `json:"name"`
+	Status                 string              `json:"status"`
+	Used                   string              `json:"used"`
+	Pending                string              `json:"pending"`
+	Available              string              `json:"available,omitempty"`
+	AvailableEffective     string              `json:"available_effective"`
+	ProjectMemberAvailable string              `json:"project_member_available"`
+	PendingReview          bool                `json:"pending_review,omitempty"`
+	InFlightCredits        string              `json:"in_flight_credits"`
+	Calls                  int64               `json:"calls"`
+	PendingCalls           int64               `json:"pending_calls"`
+	Models                 []StudentModelUsage `json:"models"`
 	StudentUsageMetrics
 }
 
@@ -216,11 +218,13 @@ func (m StudentUsageMetrics) forDisplay() StudentUsageMetrics {
 	return m
 }
 
+// Reserve refreshes the current member bucket's quota from project_members.
+// Historical balances keep the quota recorded for that month.
 const studentUsageBalancesSQL = `
-SELECT p.id,p.name,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0),COALESCE(mb.pending_milli,0),
+SELECT p.id,p.name,quota.member_milli,COALESCE(mb.pending_milli,0),
    trim_scale((COALESCE(mb.charged_milli,0)+COALESCE(mb.charged_milli_remainder,0))*0.001)::text,
-   trim_scale(GREATEST(0,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0)::numeric-
-     COALESCE(mb.charged_milli,0)-COALESCE(mb.pending_milli,0)-COALESCE(mb.charged_milli_remainder,0))*0.001)::text,
+   trim_scale(GREATEST(0,balance.member_milli)*0.001)::text,
+   trim_scale(GREATEST(0,LEAST(balance.member_milli,balance.project_milli))*0.001)::text,
    pm.monthly_credit_quota_milli>0 OR mb.id IS NOT NULL,
    k.id,k.name,k.status,COALESCE(b.pending_milli,0),
    trim_scale((COALESCE(b.charged_milli,0)+COALESCE(b.charged_milli_remainder,0))*0.001)::text,
@@ -228,13 +232,23 @@ SELECT p.id,p.name,COALESCE(mb.quota_milli,pm.monthly_credit_quota_milli,0),COAL
      trim_scale(GREATEST(0,b.quota_milli::numeric-b.charged_milli-b.pending_milli-b.charged_milli_remainder)*0.001)::text END
 FROM project_members pm JOIN projects p ON p.id=pm.project_id
 LEFT JOIN project_member_month_credit_buckets mb ON mb.project_id=p.id AND mb.user_id=pm.user_id AND mb.month=$2
+LEFT JOIN project_month_credit_buckets pb ON pb.project_id=p.id AND pb.month=$2
 LEFT JOIN api_keys k ON k.project_id=p.id AND k.owner_user_id=pm.user_id
 LEFT JOIN api_key_month_credit_buckets b ON b.api_key_id=k.id AND b.month=$2
+CROSS JOIN LATERAL (
+ SELECT COALESCE(CASE WHEN NOT $3::boolean THEN mb.quota_milli END,pm.monthly_credit_quota_milli) AS member_milli
+) quota
+CROSS JOIN LATERAL (
+ SELECT quota.member_milli::numeric-COALESCE(mb.charged_milli,0)-COALESCE(mb.pending_milli,0)
+   -COALESCE(mb.charged_milli_remainder,0) AS member_milli,
+   COALESCE(pb.quota_milli,p.monthly_credit_quota_milli)::numeric-COALESCE(pb.charged_milli,0)
+   -COALESCE(pb.pending_milli,0)-COALESCE(pb.charged_milli_remainder,0) AS project_milli
+) balance
 WHERE pm.user_id=$1
 ORDER BY p.name,p.id,k.created_at DESC,k.id`
 
 func (v *StudentUsage) loadBalances(ctx context.Context, tx *sql.Tx, userID uuid.UUID, month time.Time, rollups studentRollups) error {
-	rows, err := tx.QueryContext(ctx, studentUsageBalancesSQL, userID, month)
+	rows, err := tx.QueryContext(ctx, studentUsageBalancesSQL, userID, month, month.Equal(Month(time.Now())))
 	if err != nil {
 		return err
 	}
@@ -245,11 +259,11 @@ func (v *StudentUsage) loadBalances(ctx context.Context, tx *sql.Tx, userID uuid
 	for rows.Next() {
 		var projectID uuid.UUID
 		var keyID uuid.NullUUID
-		var projectName, projectUsed, projectAvailable, keyUsed string
+		var projectName, projectUsed, memberAvailable, availableEffective, keyUsed string
 		var keyName, keyStatus, keyAvailable sql.NullString
 		var projectQuota, projectPending, keyPending int64
 		var hasProjectQuota bool
-		if err := rows.Scan(&projectID, &projectName, &projectQuota, &projectPending, &projectUsed, &projectAvailable,
+		if err := rows.Scan(&projectID, &projectName, &projectQuota, &projectPending, &projectUsed, &memberAvailable, &availableEffective,
 			&hasProjectQuota, &keyID, &keyName, &keyStatus, &keyPending, &keyUsed, &keyAvailable); err != nil {
 			return err
 		}
@@ -260,7 +274,7 @@ func (v *StudentUsage) loadBalances(ctx context.Context, tx *sql.Tx, userID uuid
 			stats := rollups.projects[projectID]
 			project = StudentProjectUsage{
 				ProjectID: projectID.String(), ProjectName: projectName,
-				Quota: domain.FormatCredits(projectQuota), Used: displayCredits(projectUsed), Available: displayCredits(projectAvailable),
+				Quota: domain.FormatCredits(projectQuota), Used: displayCredits(projectUsed), Available: displayCredits(memberAvailable),
 				Pending: domain.FormatCredits(projectPending), InFlightCredits: domain.FormatCredits(projectPending),
 				Calls: stats.Calls, PendingReview: stats.PendingReviewCalls > 0, Keys: []KeyUsage{},
 				StudentUsageMetrics: stats.StudentUsageMetrics.forDisplay(),
@@ -280,6 +294,7 @@ func (v *StudentUsage) loadBalances(ctx context.Context, tx *sql.Tx, userID uuid
 		}
 		key := KeyUsage{
 			ID: keyID.UUID.String(), Name: keyName.String, Status: status,
+			AvailableEffective: displayCredits(availableEffective), ProjectMemberAvailable: project.Available,
 			Used: displayCredits(keyUsed), Pending: domain.FormatCredits(keyPending), InFlightCredits: domain.FormatCredits(keyPending),
 			Calls: stats.Calls, PendingCalls: stats.PendingReviewCalls, PendingReview: stats.PendingReviewCalls > 0,
 			Models: rollups.models[keyID.UUID], StudentUsageMetrics: stats.StudentUsageMetrics.forDisplay(),

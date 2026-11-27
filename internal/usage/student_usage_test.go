@@ -135,7 +135,10 @@ func TestStudentUsageContractPostgres(t *testing.T) {
 			"calls": 1.0, "pending_review_calls": 1.0, "pending_review_credits": "10.000",
 		})
 	}
-	checkStudentUsageFields(t, keyA, map[string]any{"pending_calls": 1.0})
+	checkStudentUsageFields(t, keyA, map[string]any{
+		"pending_calls": 1.0, "available_effective": "99.74959999999999999",
+		"project_member_available": "99.74959999999999999",
+	})
 	modelA := studentUsageRow(t, keyA["models"], "id", "text")
 	checkStudentUsageFields(t, modelA, map[string]any{
 		"completeness": "complete", "calls": 1.0,
