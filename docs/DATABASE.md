@@ -398,6 +398,8 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 教师模型目录和能力接口读取已有 `model_bindings`、`provider_model_catalog`、`beichen_datasets`、分组观测版本、报价快照以及 `upstream_probes`。读取时用当前凭据版本及已知分组变化约束目录、报价和探活。探活同时核对 `beichen_probe_usage` 的派发时间，避免采用换组前发起、换组后才保存的结果。作废判定读取历史目录、绑定状态与关联渠道，历史用量沿用原账本归属。
 
+教师概览的目录身份来自 `model_bindings.model_id` 对应的 `models.id`。同一原始上游名分别绑定多个校内模型时，概览按 `models.id` 拆成多行，返回各自的 `school_model` 与同名 UUID 字段 `school_model_id`；绑定证据和启用预览仍按原始上游名聚合，以保持单个启用动作和 Key 线路检查。没有绑定或别名证据的官网目录没有可确认的校内 UUID，该字段省略。库存、价格和 Key 证据查询不新增表或列。
+
 `beichen_probe_jobs` 为每个供应商保留请求、开始、完成时间、错误代码和可续期的执行租约。手动提交写入排队时间。多实例通过同一租约领取，执行过程中分批保存，恢复被中断的任务时跳过本轮已经记录的组合。`beichen_website_catalogs` 按凭据保存最近核实的官网分组型号清单、Key 版本和时间，供按 Key 核对和能力诊断使用。
 
 迁移 `0048_beichen_website_directory.sql` 新增 `beichen_website_directories`，以 `provider_id` 为主键，外键指向供应商并随其删除。`platforms` 为 JSONB 数组，每项保存渠道编号与名称、渠道状态、平台、分组资料、型号原名、原始计价条件和采集时间。价格未知时保留 JSON `null`。一次完整采集原子替换快照并更新 `last_success`。部分解析失败或平台覆盖待核验时，按渠道和平台保留未重新核实的片段及原采集时间。分组可带 `observed_at` 和 `retained`，旧快照使用平台的采集时间。`beichen_crawl_runs.failures` 保存片段失败、沿用标记和各疑似缩水平台的确认记录。超时、授权失败或未返回可读型号时保留快照。`last_error` 记录可公开错误，`failure_count` 和 `next_attempt` 保存退避进度，自动重试间隔从 1 分钟逐步增加到 32 分钟。`lease_id` 和 `lease_until` 防止多实例重复执行和失效任务覆盖新快照。

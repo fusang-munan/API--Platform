@@ -257,6 +257,22 @@ func (m *activationModel) alreadyPublished(s *activationSchool, plan activationP
 	})
 }
 
+// Overview presents one directory row per confirmed school identity. Keeping
+// the activation model grouped by upstream name preserves preview actions.
+func (m *activationModel) catalogViews() []*activationModel {
+	if len(m.schools) <= 1 {
+		return []*activationModel{m}
+	}
+	views := make([]*activationModel, 0, len(m.schools))
+	for _, name := range slices.Sorted(maps.Keys(m.schools)) {
+		school := m.schools[name]
+		view := *m
+		view.schools = map[string]*activationSchool{name: school}
+		views = append(views, &view)
+	}
+	return views
+}
+
 func (m *activationModel) plan(s *activationSchool) activationPlan {
 	var plan activationPlan
 	// The first publication uses the same default protocols shown in the preview.
@@ -479,6 +495,8 @@ func (m *activationModel) overview() CatalogModel {
 		result.SchoolStatus = target.status
 		if target.id != uuid.Nil {
 			result.SchoolModel = target.name
+			id := target.id
+			result.SchoolModelID = &id
 		}
 		result.CanEnable = plan.allowed(target) && (!target.published() || len(plan.writes) > 0)
 		if len(m.schools) == 0 {

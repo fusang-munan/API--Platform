@@ -343,6 +343,12 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 用 `go test ./internal/usage -run 'TestBeichenTokenQuoteBlocker|TestEvaluateBeichenConditional' -count=1` 验证空计价模式、非 Token 报价、分档缺价及结算。为本机测试库设置 `NEBULA_TEST_POSTGRES` 后，上面的启用测试还会核对概览、单个启用和批量启用的报价提示是否一致，以及线路不可用时是否优先显示线路原因。
 
+#### 教师目录的校内模型身份
+
+教师概览的同上游型号必须按校内模型分别显示。设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test -p 1 ./internal/beichen -run TestBeichenTeacherCoveragePostgres -count=1 -v`。用例构造 8 个目录行，断言每行都有非空且唯一的 `school_model_id`；其中同一上游名绑定两个校内模型时返回两行，两个 UUID 不同，专属 `preferred_routes` 不混入另一校内模型。
+
+在 `frontend` 下运行 `npm test -- BeichenSchoolModels BeichenModelUsageDrawer`。现有用例核对目录按 `school_model_id` 精确取用同名上游的校内费用，也核对旧响应缺少该字段时使用校内名称和唯一线路回退，无法唯一确认时显示待确认。字段是新增的可空属性，旧接口响应仍可消费。
+
 纯文本模型探活通过后仍显示「官网报价格式无效」或「非 Token 计价」时，先看 `price_blocker.message` 的字段名。旧解析会拒绝空字符串，并把非 Token 字段的零值当作有费用。运行 `go test ./internal/beichen -run 'TestPanelMixedPriceFixture|TestPanelMixedPricesActivationAndSettlementPostgres' -count=1 -v`，用构造的面板 JSON 和隔离的本机数据库复查。测试覆盖 gpt-6.1-sol 的固定价、gpt-6.2-sol 的两个 Token 档位、缺价档的提示与待核账、两种启用入口及扣分明细中被忽略的字段。
 
 #### 作废渠道的历史型号
