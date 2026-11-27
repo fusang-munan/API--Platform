@@ -113,8 +113,8 @@ func (s *Service) SyncCredential(ctx context.Context, providerID, credentialID u
 	discoveryErr := s.discoverChannelKeys(discovery, &credentialID)
 	finish()
 	if err := s.executeSyncJobs(ctx, []syncJob{
-		{provider: providerID, credential: credentialID, kind: "billing"},
 		{provider: providerID, credential: credentialID, kind: "key_usage"},
+		{provider: providerID, credential: credentialID, kind: "billing"},
 	}, true); err != nil {
 		return err
 	}
@@ -189,7 +189,7 @@ func (s *Service) listJobs(ctx context.Context, providerID *uuid.UUID) ([]syncJo
 	rows, err := s.db.QueryContext(ctx, `
 SELECT p.id, c.id, job.kind
 FROM providers p JOIN provider_credentials c ON c.provider_id = p.id
-CROSS JOIN (VALUES ('billing', 1), ('key_usage', 2)) AS job(kind, priority)
+CROSS JOIN (VALUES ('key_usage', 1), ('billing', 2)) AS job(kind, priority)
 LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = job.kind
 WHERE `+beichenProvider+` AND p.status = 'active' AND c.status = 'active'
   AND ($1::uuid IS NULL OR p.id = $1)
