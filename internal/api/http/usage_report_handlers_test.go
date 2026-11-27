@@ -115,14 +115,22 @@ func TestModelUsageHandlerDefaultsToAllAndReturnsEnvelope(t *testing.T) {
 	defer db.Close()
 	mock.ExpectBegin()
 	mock.ExpectQuery(`WITH attributed AS`).WithArgs(nil, nil, sqlmock.AnyArg()).WillReturnRows(sqlmock.NewRows([]string{"report"}).
-		AddRow(`{"totals":{"credits":"1.00000000000000001","tokens":20,"calls":2,"cache_hit_rate":0.25,"tokens_missing":7,"completeness":"partial"},
-		"models":[{"model":"model","cache_hit_rate":null,"tokens_missing":7,"completeness":"missing"}],
+		AddRow(`{"totals":{"credits":"1.00000000000000001","tokens":20,"calls":2,"dispatched_calls":2,"settled_calls":1,"zero_cost_calls":0,
+		"pending_calls":1,"pending_review_calls":1,"pending_review_credits":"17","token_missing_calls":1,
+		"cache_hit_rate":0.25,"tokens_missing":7,"completeness":"partial"},
+		"models":[{"model":"model","model_key":"school:00000000-0000-4000-8000-000000000001",
+		"school_model_id":"00000000-0000-4000-8000-000000000001","school_model":"model","upstream_models":["model"],
+		"identity_sources":["call_model_id"],"cache_hit_rate":null,"tokens_missing":7,"completeness":"missing"}],
 		"students":[{"cache_hit_rate":0,"tokens_missing":0,"completeness":"complete"}],"keys":[]}`))
 	mock.ExpectCommit()
 	router := reportHandlerRouter(&Server{service: controlplane.NewService(nil, db, nil, nil, nil, controlplane.Config{})}, "teacher")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/teacher/model-usage", nil))
 	for _, part := range []string{`"data":`, `"range":"all"`, `"start":null`, `"timezone":"Asia/Shanghai"`, `"credits":"1.00000000000000001"`, `"tokens":20`,
+		`"calls":2,"dispatched_calls":2,"settled_calls":1,"zero_cost_calls":0`,
+		`"pending_calls":1,"pending_review_calls":1,"pending_review_credits":"17","token_missing_calls":1`,
+		`"model_key":"school:00000000-0000-4000-8000-000000000001"`, `"school_model_id":"00000000-0000-4000-8000-000000000001"`,
+		`"school_model":"model","upstream_models":["model"],"identity_sources":["call_model_id"]`,
 		`"cache_hit_rate":0.25,"tokens_missing":7,"completeness":"partial"`,
 		`"cache_hit_rate":null,"tokens_missing":7,"completeness":"missing"`, `"cache_hit_rate":0,"tokens_missing":0,"completeness":"complete"`} {
 		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), part) {

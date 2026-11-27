@@ -53,9 +53,11 @@ func reportTestSetup(t *testing.T) (context.Context, *sql.DB, *sql.Tx) {
 	}
 	t.Cleanup(func() { _ = tx.Rollback() })
 	execTestSQL(t, ctx, tx, `
+CREATE EXTENSION IF NOT EXISTS citext;
 CREATE TABLE providers(id uuid PRIMARY KEY, base_url text NOT NULL);
 CREATE TABLE provider_credentials(id uuid PRIMARY KEY, provider_id uuid NOT NULL, label text, created_at timestamptz NOT NULL);
 CREATE TABLE users(id uuid PRIMARY KEY);
+CREATE TABLE models(id uuid PRIMARY KEY, model_id citext NOT NULL UNIQUE);
 CREATE TABLE gateway_calls(
  provider_id uuid, provider_credential_id uuid, binding_id uuid, upstream_model_name text,
  created_at timestamptz, sent_at timestamptz, outcome text, protocol text, usage_state text,
@@ -64,13 +66,10 @@ CREATE TABLE gateway_calls(
  beichen_state text, beichen_credit_exact numeric, beichen_dispatch_kind text, beichen_dispatch_at timestamptz,
  beichen_dispatch_credential_id uuid, beichen_dispatch_model text, beichen_price_at timestamptz,
  project_id uuid, project_name text, user_id uuid, user_name text, api_key_id uuid, api_key_name text,
- beichen_base_credits numeric, beichen_school_multiplier numeric
+ beichen_base_credits numeric, beichen_school_multiplier numeric,
+ model_id uuid, billing_state text, credit_milli bigint, unresolved_credit_milli bigint NOT NULL DEFAULT 0
 )`)
-	migration, err := os.ReadFile("../infrastructure/db/migrations/0030_beichen.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	execTestSQL(t, ctx, tx, string(migration))
+	applyBeichenTestMigrations(t, ctx, tx, "0030_beichen.sql", "0046_beichen_billing_checks_and_aliases.sql")
 	return ctx, isolated, tx
 }
 
@@ -156,7 +155,7 @@ func TestModelUsageCompletenessPostgres(t *testing.T) {
 	totalRate, mixedRate, zero := 50.0/200, 25.0/95, 0.0
 	check("总计", report.Totals, 343, 62, "partial", &totalRate)
 	if got := report.Totals; got.InputTokens != 159 || got.OutputTokens != 48 ||
-		got.CacheReadTokens != 60 || got.CacheWriteTokens != 14 || got.ChargedTokensMissingCalls != 2 {
+		got.CacheReadTokens != 60 || got.CacheWriteTokens != 14 || got.ChargedTokensMissingCalls != 2 || got.TokenMissingCalls != 1 {
 		t.Errorf("已回报的分项累计或缺项笔数有误: %+v", got)
 	}
 	models := make(map[string]ModelUsageMetrics)
@@ -228,6 +227,31 @@ func TestModelUsagePostgresRangeAndAttribution(t *testing.T) {
 				t.Fatalf("%s: %+v", tc.value, got)
 			}
 		}
+	}
+}
+
+func TestModelUsageLegacySettlementPostgres(t *testing.T) {
+	ctx, tx := reportTestTransaction(t)
+	provider, credential := uuid.New(), uuid.New()
+	execTestSQL(t, ctx, tx, "INSERT INTO providers VALUES($1,$2)", provider, origin)
+	execTestSQL(t, ctx, tx, "INSERT INTO provider_credentials VALUES($1,$2,'旧渠道','2026-10-01 00:00+08')", credential, provider)
+	call := reportCallFixture{provider: provider, credential: credential, project: uuid.New(), user: uuid.New(), key: uuid.New(),
+		model: "legacy-free", protocol: "anthropic", state: "charged", usage: "reported", credits: "0", multiplier: "1", legacy: true,
+		sent: "2026-11-20T00:00:00+08:00", read: 0, write: 0}
+	insertReportCall(t, ctx, tx, call)
+	call.model = "legacy-paid"
+	insertReportCall(t, ctx, tx, call)
+	execTestSQL(t, ctx, tx, `UPDATE gateway_calls SET beichen_state=NULL,beichen_credit_exact=NULL,billing_state='charged',
+ credit_milli=CASE WHEN upstream_model_name='legacy-free' THEN 0 ELSE 400 END`)
+	period, _ := reportPeriod("month", time.Date(2026, 11, 20, 4, 0, 0, 0, beijing))
+	report, err := readModelUsage(ctx, tx, &provider, period)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := report.Totals
+	if got.DispatchedCalls != 2 || got.SettledCalls != 2 || got.ZeroCostCalls != 1 || got.Credits != "0" ||
+		got.TokenMissingCalls != 0 || got.Completeness != "complete" {
+		t.Fatalf("旧账本状态或精确积分兼容口径错误: %+v", got)
 	}
 }
 
@@ -396,8 +420,9 @@ func TestReportsPostgresEmptyResults(t *testing.T) {
 	now := time.Date(2026, 11, 20, 0, 0, 0, 0, beijing)
 	period, _ := reportPeriod("all", now)
 	usage, err := readModelUsage(ctx, tx, &provider, period)
-	if err != nil || usage.Totals.Credits != "0" || usage.Models == nil || usage.Students == nil || usage.Keys == nil ||
-		usage.Totals.CacheHitRate != nil || usage.Totals.TokensMissing != 0 || usage.Totals.Completeness != "missing" {
+	if err != nil || usage.Totals.Credits != "0" || usage.Totals.PendingReviewCredits != "0" ||
+		usage.Models == nil || usage.Students == nil || usage.Keys == nil || usage.Totals.CacheHitRate != nil ||
+		usage.Totals.TokensMissing != 0 || usage.Totals.TokenMissingCalls != 0 || usage.Totals.Completeness != "missing" {
 		t.Fatalf("空用量应返回零和空数组: %+v, err=%v", usage, err)
 	}
 	view, err := readReconciliation(ctx, tx, provider, period, now)

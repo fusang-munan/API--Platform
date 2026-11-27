@@ -338,6 +338,12 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 学生月度用量的只读汇总在同一个可重复读事务中执行两条查询，分别读取汇总和额度。用量按 `user_id`、`project_id`、`api_key_id`、`model_id` 与账月归属。查询先限定该学生所属项目内的自有 Key，再在每个 Key × 模型上合并月账本和逐笔证据。月账本沿用以 `month` 开头的索引，调用查询可利用 `gateway_calls_student_receipt_lookup (user_id, request_id)` 的用户前缀及 `gateway_calls_key_created (api_key_id, created_at)` 的 Key 前缀。过滤使用调用受理时记录的 `month`，因此跨月派发或补记仍归入原账月。汇总复用现有表和索引。
 
+教师北辰模型用量读取 `gateway_calls` 的派发快照。用 `COALESCE(beichen_price_at, beichen_dispatch_at)`，旧行用 `sent_at`，按北京时间左闭右开的区间选取有派发渠道和上游型号、`outcome <> 'pending'` 的调用。教师报表使用派发月，学生账本使用受理时写入 `monthly_usage_cube.month` 的账月。跨月派发及之后的结算会在两个时间口径下落入不同月份。
+
+教师模型用量的 `calls` 和 `dispatched_calls` 是同一范围中的行数。`settled_calls` 计 `beichen_state='charged'` 及无北辰账务状态时 `billing_state='charged'` 的旧调用，精确扣分为零（旧调用的 `credit_milli=0`）仍计入，另记 `zero_cost_calls`。已扣积分仍来自 `beichen_credit_exact`。仅 `pending_review` 行的 `unresolved_credit_milli` 计入待核预留合计，该列保存整积分。释放的行保留派发证据，退出待核且不作为已结算。Token 回报独立统计。分项、显式总量和原始输入均缺时计入 `token_missing_calls`，明确数值 0 保留为已知。`completeness` 标记整组覆盖情况。
+
+教师模型用量优先用 `gateway_calls.model_id` 保存的 UUID 归组，左连接 `models.id` 仅补充校内标识，停用或缺少当前模型资料的调用仍归入原 UUID。不可用 UUID（空值或全零）才按派发供应商、凭据和上游名查 `upstream_model_aliases`，渠道专属优先。命中且 `school_model` 能对应 `models.model_id` 时归入该 UUID。其余记录按供应商及小写上游名称归组并标明仅有上游名证据。查询无需新增列，也无需用当前绑定反推历史身份。
+
 学生余额查询读取所属项目的 `project_month_credit_buckets` 和个人的 `project_member_month_credit_buckets`，两边均按额度减已扣、千分之一积分以下的余数和在途占用。有效可用额取两边的较小值，最低为零。本月个人额度取 `project_members.monthly_credit_quota_milli`，与网关受理时刷新月桶的来源相同。历史账月优先读该月份的月桶。Key 月桶继续提供旧字段 `available`。
 
 教师学生用量由 `monthly_usage_cube` 与 `gateway_calls` 按调用时记录的学生、项目、Key 和模型全外连接聚合。两个来源先按这四个字段各归为一行，利用精确十进制 `numeric` 汇总已扣积分并避免连接放大计数。学生当前状态和项目成员资格只影响正常业务权限。教师报表从使用事实确定历史范围，当前用户、项目与 Key 资料用于名称、邮箱、状态和额度展示。明细用一条 SQL 按学生整体、项目、Key、模型各层合计，积分、已结算次数、零额次数及待核字段可逐层核对。

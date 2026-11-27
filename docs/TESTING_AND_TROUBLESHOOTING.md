@@ -213,6 +213,17 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 ### 北辰教师端用量、定价与对账
 
+#### 教师模型报表与学生账本的笔数
+
+1. 比较相同学生、项目、Key 和北辰范围时，先确认两边都包含同一批仍可查询的调用。教师模型报表用北京时间的派发时间选区间，学生账本和教师「学生用量」用受理账月。月末受理、次月零点派发时，分别查看教师模型报表的次月和学生账本的原账月。
+2. 教师模型报表的旧 `calls` 等于 `dispatched_calls`。含待核账和失败后释放的已派发调用。对照学生账本的 `calls` 时读取教师的 `settled_calls`。例如 127 笔派发中有 5 笔上游失败后释放，已结算为 122 笔。
+3. 金额为零时同时核对 `zero_cost_calls`、`token_missing_calls` 和 `pending_review_calls`。它们分别记录零额结算、没有可用 Token 计数、尚待核实的账。待核笔数大于零时，`pending_review_credits` 仍可能为零。Token 部分可用时结合 `completeness` 和 `tokens_missing` 检查已知分项。
+4. 某型号用量显示为横线或 0 时，查看报表中 `model_key`、`school_model_id` 和 `upstream_models`。已保存的校内 UUID 在换绑、停用后仍指向同一归组。只有 `identity_sources=["upstream_name"]` 的历史行还缺少校内身份，核对当时供应商和渠道的明确别名，确认拼写确实指向同一个校内型号后再配置。不同版本或不同已存校内 UUID 各自核对。
+
+设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test -p 1 ./internal/beichen -run 'TestModelUsage(SettlementAndLedger|Identity|Completeness|LegacySettlement)Postgres' -count=1 -v`。用例核对 127/122、待核释放前后、零额和缺失 Token、8 个现行型号的夹具积分和 Token、点号与连字符、渠道别名优先级、换绑和停用历史，以及北京时间跨月。运行 `go test ./internal/api/http -run TestModelUsageHandlerDefaultsToAllAndReturnsEnvelope -count=1` 核对返回字段和旧字段兼容性。
+
+#### 教师概览与对账排查
+
 教师页若显示「目录待复核」，展开「目录来源与分组」，核对实际绑定线路的 Key、分组、目录和探活。目录超过 30 分钟、最近扫描失败或早于已知的换组轮次时，原证据不计入覆盖。重新扫当前 Key 后，报价和探活分别随当轮证据恢复。其他 Key 未列出该型号时只显示目录详情。官网清单待刷新取决于清单时效及校内已启用 Key 是否有匹配，官网仍启用的未匹配 Key 单列。
 
 设置 `NEBULA_TEST_POSTGRES` 后执行 `go test ./internal/beichen ./internal/dataplane -run 'TestBeichenTeacherCoveragePostgres|TestBeichenOverviewRetiredCatalogPostgres|TestBeichenCapabilitiesAndGatewayPostgres' -count=1`。前端执行 `npm run test -- BeichenSchoolModels TeacherModels BeichenPriceDrawer`。回归覆盖 G3 / GM1 六个型号、绑定 Key 去重、原始上游名和校内别名、条件价、换组及目录过期、能力不可读和作废型号历史用量入口。

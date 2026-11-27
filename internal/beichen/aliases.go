@@ -18,14 +18,18 @@ type ModelAlias struct {
 
 // The fact row a retains the raw upstream name for price and receipt lookups.
 // Use the alias only when grouping or displaying the two sides of the ledger.
-const joinModelAliasSQL = `
+const modelAliasJoinStartSQL = `
 LEFT JOIN LATERAL (
   SELECT entry.school_model FROM upstream_model_aliases entry
-  WHERE entry.provider_id = $1 AND (entry.credential_id = a.credential_id OR entry.credential_id IS NULL)
+  WHERE entry.provider_id = `
+
+const modelAliasJoinEndSQL = ` AND (entry.credential_id = a.credential_id OR entry.credential_id IS NULL)
     AND lower(entry.upstream_model) = lower(a.model)
   ORDER BY entry.credential_id NULLS LAST, entry.created_at DESC, entry.id DESC
   LIMIT 1
 ) alias ON true`
+
+const joinModelAliasSQL = modelAliasJoinStartSQL + "$1" + modelAliasJoinEndSQL
 
 func (s *Service) ModelAliases(ctx context.Context, provider uuid.UUID) ([]ModelAlias, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
