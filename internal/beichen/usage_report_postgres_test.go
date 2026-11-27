@@ -242,16 +242,32 @@ func TestModelUsageLegacySettlementPostgres(t *testing.T) {
 	call.model = "legacy-paid"
 	insertReportCall(t, ctx, tx, call)
 	execTestSQL(t, ctx, tx, `UPDATE gateway_calls SET beichen_state=NULL,beichen_credit_exact=NULL,billing_state='charged',
- credit_milli=CASE WHEN upstream_model_name='legacy-free' THEN 0 ELSE 400 END`)
+ credit_milli=CASE WHEN upstream_model_name='legacy-free' THEN 0 ELSE 400 END WHERE upstream_model_name LIKE 'legacy-%'`)
+	call.model, call.state, call.credits = "current-exact", "charged", "2.5"
+	insertReportCall(t, ctx, tx, call)
+	// 精确扣分优先；即使旧千分积分字段不同，也不得再把两列相加。
+	execTestSQL(t, ctx, tx, "UPDATE gateway_calls SET credit_milli=9999 WHERE upstream_model_name='current-exact'")
 	period, _ := reportPeriod("month", time.Date(2026, 11, 20, 4, 0, 0, 0, beijing))
 	report, err := readModelUsage(ctx, tx, &provider, period)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := report.Totals
-	if got.DispatchedCalls != 2 || got.SettledCalls != 2 || got.ZeroCostCalls != 1 || got.Credits != "0" ||
+	if got.DispatchedCalls != 3 || got.SettledCalls != 3 || got.ZeroCostCalls != 1 || got.Credits != "2.9" ||
 		got.TokenMissingCalls != 0 || got.Completeness != "complete" {
 		t.Fatalf("旧账本状态或精确积分兼容口径错误: %+v", got)
+	}
+	for _, model := range report.Models {
+		want := map[string]string{"legacy-free": "0", "legacy-paid": "0.4", "current-exact": "2.5"}[model.Model]
+		if model.Credits != want || model.SettledCalls != 1 {
+			t.Fatalf("旧调用的逐型号扣分错误: %+v", model)
+		}
+		if model.Model == "legacy-paid" {
+			gotCredits, ok := new(big.Rat).SetString(model.Credits)
+			if !ok || gotCredits.Cmp(new(big.Rat).SetFrac64(400, 1000)) != 0 {
+				t.Fatalf("400 千分积分应等于 0.400，实际为 %s", model.Credits)
+			}
+		}
 	}
 }
 

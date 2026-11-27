@@ -165,7 +165,7 @@ model_identities AS (
 ), model_keys AS (
  SELECT a.*, m.model_id::text AS school_model,
    CASE WHEN a.school_model_id IS NOT NULL THEN 'school:' || a.school_model_id::text
-        ELSE 'upstream:' || a.provider_id::text || ':' || lower(a.model) END AS model_key
+        ELSE 'upstream:' || a.provider_id::text || ':' || a.credential_id::text || ':' || lower(a.model) END AS model_key
  FROM model_identities a LEFT JOIN models m ON m.id = a.school_model_id
 ), report_models AS (
  SELECT a.*, first_value(model) OVER (PARTITION BY model_key ORDER BY sent_at DESC, model) AS model_label
@@ -180,8 +180,13 @@ const pendingReviewCallsSQL = `count(*) FILTER (WHERE beichen_state = 'pending_r
 const settledCallSQL = `COALESCE(beichen_state, billing_state) = 'charged'`
 const zeroCostSQL = `CASE WHEN beichen_state IS NULL THEN credit_milli = 0 ELSE beichen_credit_exact = 0 END`
 
+// 北辰结算金额优先。迁移 0032 之前的旧调用没有 beichen_credit_exact，
+// 只能从已结算的千分积分还原；两种来源互斥，避免同一行重复累计。
+const settledCreditSQL = `CASE WHEN beichen_state = 'charged' THEN beichen_credit_exact
+  WHEN beichen_state IS NULL AND billing_state = 'charged' THEN credit_milli * 0.001::numeric END`
+
 const usageTotalsJSONSQL = `jsonb_build_object(
- 'credits', trim_scale(COALESCE(sum(beichen_credit_exact) FILTER (WHERE beichen_state = 'charged'), 0))::text,
+ 'credits', trim_scale(COALESCE(sum(` + settledCreditSQL + `), 0))::text,
  'tokens', COALESCE(sum(tokens), 0),
  'input_tokens', COALESCE(sum(input_tokens), 0),
  'output_tokens', COALESCE(sum(output_tokens), 0),

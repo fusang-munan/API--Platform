@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -246,8 +247,8 @@ VALUES($1,$2,'外部 Key','fixture',now(),now())`, otherKey, otherProvider)
 	add(uuid.Nil, otherProvider, otherKey, "legacy-name", now, 21)
 	add(uuid.Nil, otherProvider, otherKey, dotted, now, 22)
 
-	fallbackKey := func(provider uuid.UUID, name string) string {
-		return "upstream:" + provider.String() + ":" + name
+	fallbackKey := func(provider, credential uuid.UUID, name string) string {
+		return "upstream:" + provider.String() + ":" + credential.String() + ":" + name
 	}
 	type expectedModel struct {
 		key, label, schoolName string
@@ -259,13 +260,13 @@ VALUES($1,$2,'外部 Key','fixture',now(),now())`, otherKey, otherProvider)
 		{"school:" + current.String(), dotted, dotted, current, 41, 3, []string{"call_model_id", "configured_alias"}, []string{dashed, dotted, "LEGACY-NAME"}},
 		{"school:" + retired.String(), dashed, dashed, retired, 28, 2, []string{"call_model_id", "configured_alias"}, []string{dashed, "legacy-name"}},
 		{"school:" + orphan.String(), "retired-no-catalog", "", orphan, 29, 2, []string{"call_model_id"}, []string{"retired-no-catalog", "retired-no-catalog-alias"}},
-		{fallbackKey(f.provider, dashed), dashed, "", uuid.Nil, 18, 1, []string{"upstream_name"}, []string{dashed}},
-		{fallbackKey(f.provider, dotted), dotted, "", uuid.Nil, 19, 1, []string{"upstream_name"}, []string{dotted}},
-		{fallbackKey(f.provider, "claude-fable-5.2"), "claude-fable-5.2", "", uuid.Nil, 20, 1, []string{"upstream_name"}, []string{"claude-fable-5.2"}},
+		{fallbackKey(f.provider, newKey, dashed), dashed, "", uuid.Nil, 18, 1, []string{"upstream_name"}, []string{dashed}},
+		{fallbackKey(f.provider, newKey, dotted), dotted, "", uuid.Nil, 19, 1, []string{"upstream_name"}, []string{dotted}},
+		{fallbackKey(f.provider, newKey, "claude-fable-5.2"), "claude-fable-5.2", "", uuid.Nil, 20, 1, []string{"upstream_name"}, []string{"claude-fable-5.2"}},
 	}
 	all := append(slices.Clone(want),
-		expectedModel{fallbackKey(otherProvider, "legacy-name"), "legacy-name", "", uuid.Nil, 21, 1, []string{"upstream_name"}, []string{"legacy-name"}},
-		expectedModel{fallbackKey(otherProvider, dotted), dotted, "", uuid.Nil, 22, 1, []string{"upstream_name"}, []string{dotted}})
+		expectedModel{fallbackKey(otherProvider, otherKey, "legacy-name"), "legacy-name", "", uuid.Nil, 21, 1, []string{"upstream_name"}, []string{"legacy-name"}},
+		expectedModel{fallbackKey(otherProvider, otherKey, dotted), dotted, "", uuid.Nil, 22, 1, []string{"upstream_name"}, []string{dotted}})
 	for _, scope := range []struct {
 		provider *uuid.UUID
 		want     []expectedModel
@@ -295,5 +296,54 @@ VALUES($1,$2,'外部 Key','fixture',now(),now())`, otherKey, otherProvider)
 				t.Errorf("身份 %s 的校内模型证据错误: %+v", expected.key, row.ModelUsageIdentity)
 			}
 		}
+	}
+}
+
+func TestModelUsageFallbackSeparatesChannelsPostgres(t *testing.T) {
+	f := newModelUsagePostgresFixture(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, beijing)
+	tokens := 10
+	for _, call := range []struct {
+		credential uuid.UUID
+		credits    string
+		tokens     int
+	}{
+		{f.credentials[0], "1", 10},
+		{f.credentials[1], "2", 20},
+	} {
+		tokens = call.tokens
+		f.addCalls(t, 1, modelUsageFact{schoolModel: uuid.Nil, provider: f.provider, credential: call.credential,
+			upstreamModel: "same-upstream", state: "charged", credits: call.credits,
+			admitted: now, dispatched: now, input: &tokens})
+	}
+	// 0032 之前的旧账没有北辰精确扣分，只有已结算的千分积分。
+	f.exec(t, `UPDATE gateway_calls SET beichen_state=NULL,beichen_credit_exact=NULL,billing_state='charged'
+WHERE beichen_dispatch_model='same-upstream'`)
+	report := f.report(t, &f.provider, now)
+	if report.Totals.DispatchedCalls != 2 || report.Totals.SettledCalls != 2 ||
+		report.Totals.Credits != "3" || report.Totals.Tokens != 30 || len(report.Models) != 2 {
+		t.Fatalf("不同渠道的同名旧调用被错误合并: %+v", report)
+	}
+	want := map[uuid.UUID]struct {
+		credits string
+		tokens  int64
+	}{
+		f.credentials[0]: {"1", 10},
+		f.credentials[1]: {"2", 20},
+	}
+	for _, model := range report.Models {
+		parts := strings.SplitN(model.ModelKey, ":", 4)
+		if len(parts) != 4 || parts[0] != "upstream" {
+			t.Fatalf("旧记录回退键缺少稳定渠道身份: %s", model.ModelKey)
+		}
+		credential, err := uuid.Parse(parts[2])
+		if err != nil || model.Model != "same-upstream" || model.Calls != 1 || model.SettledCalls != 1 ||
+			model.Credits != want[credential].credits || model.Tokens != want[credential].tokens {
+			t.Fatalf("逐渠道行错误: %+v, %v", model, err)
+		}
+		delete(want, credential)
+	}
+	if len(want) != 0 {
+		t.Fatalf("缺少渠道行: %v", want)
 	}
 }

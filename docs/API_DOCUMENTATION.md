@@ -629,6 +629,7 @@ Key 证据不足时，标准余额计费、分组默认倍率有效且高峰开�
 | --- | --- |
 | `dispatched_calls`、`calls` | 相同的派发调用数。`calls` 保留旧计数口径。 |
 | `settled_calls` | 已结算笔数，含零额。北辰使用 `beichen_state=charged`，无北辰账务状态的旧行使用 `billing_state=charged`。 |
+| `credits` | 已结算调用的积分合计。北辰已扣行使用精确扣分 `beichen_credit_exact`。无北辰账务状态、`billing_state=charged` 的旧行按 `credit_milli × 0.001` 还原，例如 400 千分积分对应 0.400 积分，规范十进制字符串为 `"0.4"`。两种来源按结算状态互斥，避免重复累计。 |
 | `zero_cost_calls` | 已结算中实扣恰为零的笔数。北辰按精确扣分判断，旧行按 `credit_milli` 判断。 |
 | `pending_review_calls`、`pending_calls` | 当前处于 `pending_review` 的笔数。`pending_calls` 是兼容字段。结算或释放后退出待核统计。 |
 | `pending_review_credits` | 所选范围内待核调用当前预留的积分合计，十进制字符串。可出现有待核笔数且预留为 `"0"`。 |
@@ -639,14 +640,14 @@ Key 证据不足时，标准余额计费、分组默认倍率有效且高峰开�
 
 | 型号字段 | 含义 |
 | --- | --- |
-| `model_key`、`school_model_id` | 有校内身份时以调用保存的校内模型 UUID 归组，键为 `school:<uuid>`。无可确认的校内身份时按供应商及不区分大小写的上游名归组，键为 `upstream:<provider_uuid>:<lowercase_name>`，`school_model_id=null`。 |
+| `model_key`、`school_model_id` | 有校内身份时以调用保存的校内模型 UUID 归组，键为 `school:<uuid>`。无可确认的校内身份时按供应商、派发渠道及不区分大小写的上游名分别归组，键为 `upstream:<provider_uuid>:<credential_id>:<lowercase_name>`，`school_model_id=null`。 |
 | `school_model` | 可查到的校内模型标识（`models.model_id`），含停用模型。当前资料缺失时为 `null`，仍保留已存 UUID。 |
 | `model`、`upstream_models` | `model` 保留上游名称作为显示字段，取该分组在此报表范围内最近派发的原名，同一时刻按原名排序。不同身份可有相同显示名。`upstream_models` 列出本行范围内见过的派发原名，保留大小写和标点。 |
 | `identity_sources` | 本行的归属依据，可同时包含 `call_model_id`（调用保存的 UUID）及 `configured_alias`（缺少 UUID 时使用有效别名）。`upstream_name` 表示仅按上游原名归组，校内身份未确认。 |
 
-别名只用于未保存有效 UUID 的旧行。按派发时的供应商、渠道和上游名查现有别名，渠道专属优先于供应商默认，目标须对应现有校内模型。已保存的 UUID 在换绑或新增别名后仍有效。以 `claude-fable-5-1` 和 `claude-fable-5.1` 为例，只有记录指向同一个校内 UUID 时合并。不同 UUID 各自归组。缺少校内身份证据时按完整上游名分别列出，保留标点和版本号。
+别名只用于未保存有效 UUID 的旧行。按派发时的供应商、渠道和上游名查现有别名，渠道专属优先于供应商默认，目标须对应现有校内模型。已保存的 UUID 在换绑或新增别名后仍有效。以 `claude-fable-5-1` 和 `claude-fable-5.1` 为例，只有记录指向同一个校内 UUID 时合并。不同 UUID 各自归组。缺少校内身份证据时按供应商、渠道和完整上游名分别列出，两个渠道的同名调用在配置别名或确认校内身份前保留为两行，并保留标点和版本号。
 
-`credits` 累计 `beichen_state=charged` 的精确扣分。已回报的 Token 独立于扣费状态汇总，包括待核或中断调用已记录的分项。OpenAI Chat、Responses 和 Realtime 的原始输入包含缓存，依据明确的缓存明细或未命中数拆分。Anthropic 的原始输入是未缓存输入。Gemini 的已知输入包含工具提示，已知输出包含思考 Token。缺少互斥分项时，`tokens` 包含可以从原始总量或协议计数确认的用量，`tokens_missing` 表示其中尚未归入四类的数量。结合 `completeness` 判断覆盖范围。Token 和计数为 JSON 数字，积分为十进制字符串。
+`credits` 按上表累计已结算积分。已回报的 Token 独立于扣费状态汇总，包括待核或中断调用已记录的分项。OpenAI Chat、Responses 和 Realtime 的原始输入包含缓存，依据明确的缓存明细或未命中数拆分。Anthropic 的原始输入是未缓存输入。Gemini 的已知输入包含工具提示，已知输出包含思考 Token。缺少互斥分项时，`tokens` 包含可以从原始总量或协议计数确认的用量，`tokens_missing` 表示其中尚未归入四类的数量。结合 `completeness` 判断覆盖范围。Token 和计数为 JSON 数字，积分为十进制字符串。
 
 学生自己的用量（`GET /api/v1/student/usage`）和教师「学生用量」账本（`GET /api/v1/teacher/usage/students`）按调用受理时保存的北京时间账月统计。`calls` 是账本中的已结算笔数，含零额。对比次数时，先将学生、项目、Key、供应商和数据保留范围对齐，再用教师模型报表的 `settled_calls` 对照账本 `calls`。月末受理、次月派发的调用计入教师模型报表的次月，结算仍入学生的原账月。
 
