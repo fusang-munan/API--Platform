@@ -101,13 +101,14 @@ func TestTeacherStudentUsageRoutes(t *testing.T) {
 	start := time.Date(2024, 12, 31, 16, 0, 0, 0, time.UTC)
 	end := start.AddDate(0, 0, 31)
 	mock.ExpectBegin()
-	mock.ExpectQuery(`WITH ledger AS .*ORDER BY r\.milli DESC NULLS LAST, r\.user_id`).
-		WithArgs(start, nil, "", 20, 0).
+	mock.ExpectExec(`SET LOCAL statement_timeout`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`WITH ledger AS .*FROM matches r LIMIT`).
+		WithArgs(start, nil, "", 10001).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"total", "user_id", "name", "email", "projects", "keys", "credits", "calls", "zero",
-			"tokens", "coverage", "known", "complete", "review", "review_credits", "last_call_at",
-		}).AddRow(1, studentID, "Student", "student@example.test", 2, 3, "0.000000000000000001", 1, 0,
-			"9007199254740993", 1, 1, 0, 0, "0", start))
+			"user_id", "name", "email", "projects", "keys", "credits", "calls", "zero",
+			"tokens", "coverage", "known", "complete", "review", "review_credits", "last_call_at", "lower_name", "lower_email",
+		}).AddRow(studentID, "Student", "student@example.test", 2, 3, "0.000000000000000001", 1, 0,
+			"9007199254740993", 1, 1, 0, 0, "0", start, "student", "student@example.test"))
 	mock.ExpectQuery(`FROM beichen_upstream_usage_rows`).WithArgs(start, sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"rows", "debit_rows", "debit"}).AddRow(2, 1, "0"))
 	mock.ExpectCommit()

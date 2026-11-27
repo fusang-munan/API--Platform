@@ -392,7 +392,12 @@ go test ./...
 
 - Token 总量大于四项之和时，查看 `token_coverage.unclassified_tokens`。分项为 `null` 时，用同一账月的逐笔 `usage_state`、`usage_reason` 和原始协议计数核对。缓存命中率的实际样本数在 `cache_hit_coverage.sample_calls`。
 - 待核与在途金额差异可用同一账月的 `pending_review_calls`、`pending_review_credits` 和 `in_flight_credits` 复核。账页间的已用和次数应比较同一账月的服务端汇总 `data.totals`、`data.models`，最近调用分页可用来查对应的逐笔状态。
-- 在 `frontend` 执行 `npm test -- StudentModels StudentUsage studentUsage.test.ts`，核对切换 Key 后的模型用量、精确小数余额、零额已结算次数、在途占用和待核笔数。发现跨 Key 数字混入时，核对同一项目下所选 Key 的 `models` 与 `available`。模型仅保留历史授权时，用 `TestStudentKeyModelAuthorizationPostgres` 核对渠道当前目录、扫描失败和探活状态。
+- 两把 Key 都能受理请求、旧 `available` 却显示为零时，检查 `available_effective` 和 `project_member_available`。前者还受项目总余额限制，后者等于所属项目的个人余额。运行 `go test ./internal/api/http -run TestStudentUsageEffectiveBalanceHTTPPostgres -count=1 -v`，复现 Key 月桶为零、两把 Key 通过受理和项目总余额不足的场景。
+- 在 `frontend` 执行 `npm test -- StudentModels StudentUsage studentUsage.test.ts`，核对切换 Key 后的模型用量、精确小数余额、零额已结算次数、在途占用和待核笔数。发现跨 Key 数字混入时，核对同一项目下所选 Key 的 `models` 与 `available_effective`。模型仅保留历史授权时，用 `TestStudentKeyModelAuthorizationPostgres` 核对渠道当前目录、扫描失败和探活状态。
+
+### 学生模型目录搜索
+
+运行 `go test ./internal/api/http -run 'TestStudentCatalog(Batch|Bounds)HTTPPostgres' -count=1 -v`。测试记录 PostgreSQL 实际执行的 SQL，比较 1 个匹配和 23 个匹配的第二页，检查排序、候选总数、绑定优先级、协议和探活证据。搜索被拒绝时，检查 `q` 的 128 字符上限、`page` 的 1 至 10000 范围、`page_size` 的 1 至 50 范围及 URL 编码。
 
 ### 教师学生用量
 
@@ -411,7 +416,23 @@ PostgreSQL 样例覆盖两位同名学生、共享两个项目、每个项目多
 
 - 金额看起来对不上时，使用相同的 `month`、`project_id` 对比学生行的 `credits` 和明细的 `totals.credits`，再核对项目及 Key 的 `used`。用量查询使用受理账月，调用发生时间可能跨自然月。已扣积分与 `pending_review_credits` 各有独立口径。
 - 缺 Token 或最近时间但有已结算记录时，检查 `monthly_usage_cube` 是否仍有对应维度并查看明细 `token_coverage`。原始逐笔记录到期后，账本保留积分和次数。
-- 切换项目后「未确认归属 / 校方使用」仍按整个学校账月汇总。检查归档的 `occurred_at`、响应声明的冲突状态及匹配的回执或派发快照，确认哪些流水已有可核验归属。
+- 切换项目后「未确认归属 / 校方使用」仍按整个学校账月汇总。两条流水共用响应编号时，先核对回执的流水行号。回执仅确认对应行。缺少回执时，核对整个派发时间窗口是否只有一条候选。`TestTeacherStudentUsageUnattributedReceiptHTTPPostgres` 覆盖同号不同流水、唯一候选和跨账月歧义。
+- 列表翻页会复用最多 5 秒的报表快照。刚补记的金额可以在明细先显示，随后出现在重新读取的列表。列表读库超过 3 秒时返回 503。使用 `TestTeacherStudentUsageSnapshotHTTPPostgres`、`TestTeacherStudentUsageTimeoutHTTPPostgres` 和 `TestTeacherStudentUsageOverCacheLimitHTTPPostgres` 核对 10 万笔调用下冷热读库次数、到期刷新、超时恢复及超出缓存预算时的精确总数。
+
+#### 10 万笔账月的查询计划
+
+在本机 PostgreSQL 17.12 的隔离 schema 上，以同一份数据对比基线 `21673068` 与修复 SQL。样本含 12 个账月共 21 万次调用，目标账月 10 万次调用、1500 名学生及 49829 条上游归档。下表为 `EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)` 三次的执行时间中位数，查询均使用实际参数的计划。
+
+| 场景 | 主要计划节点或实际执行情况 | 中位数 |
+| --- | --- | ---: |
+| 基线首页 | `Parallel Seq Scan on gateway_calls`，物化 `CTE matches` 后统计和排序 | 277.370 ms |
+| 基线越界页 | 同样并行扫描及物化，仍计算总人数 | 277.058 ms |
+| 修复后未命中缓存 | 同样并行扫描，直接输出 1500 条学生汇总供缓存 | 281.614 ms |
+| 修复后命中缓存的后续页及越界页 | 复用汇总和全校归档统计，执行 0 条报表 SQL | 无数据库报表计划 |
+| 基线归档汇总 | 归档按时间筛选，以响应声明排除已归属数据 | 36.912 ms |
+| 修复后归档汇总 | 按回执流水或唯一派发候选排除，计划额外含一次 `Hash Anti Join` | 44.583 ms |
+
+首次加载仍需汇总该账月，性能收益来自省去后续页面的两条报表查询。执行 `go test ./internal/api/http -run TestTeacherStudentUsageSnapshotHTTPPostgres -count=1 -v` 可以用独立样本复核真实 HTTP 请求的冷热查询次数和耗时。
 
 ### 北辰网页报价持续为 0/4
 
