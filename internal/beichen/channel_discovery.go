@@ -9,14 +9,17 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
-	"strconv"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-const accountKeysURL = "https://beichenapi.com/api/v1/keys"
+const (
+	accountKeysURL     = "https://beichenapi.com/api/v1/keys"
+	accountKeyPageSize = 100
+)
 
 type listedKey struct {
 	ID            int64       `json:"id"`
@@ -89,6 +92,16 @@ func (s *Service) readAccountKeys(ctx context.Context, token string, modelKeys m
 		clear(collected)
 		keys, err = s.readAccountKeyRound(ctx, token, collected)
 	}
+	// The page-number API has no snapshot identifier. A complete-looking
+	// multi-page response can still mix different inventories.
+	if err == nil && len(keys) > accountKeyPageSize {
+		first := keys
+		clear(collected)
+		keys, err = s.readAccountKeyRound(ctx, token, collected)
+		if err == nil {
+			err = checkAccountKeyRounds(first, keys)
+		}
+	}
 	if trace, ok := ctx.Value(keyListReadTraceKey{}).(**keyListPageError); ok {
 		*trace = nil
 		errors.As(err, trace)
@@ -98,6 +111,26 @@ func (s *Service) readAccountKeys(ctx context.Context, token string, modelKeys m
 	}
 	maps.Copy(modelKeys, collected)
 	return keys, nil
+}
+
+func checkAccountKeyRounds(first, second []listedKey) error {
+	drift := fmt.Errorf("%w：两次完整分页的 Key 清单不一致，待核验", errKeyList)
+	if len(first) != len(second) {
+		return &keyListPageError{page: 1, cause: drift}
+	}
+	byID := make(map[int64]listedKey, len(first))
+	for _, key := range first {
+		byID[key.ID] = key
+	}
+	for i, key := range second {
+		previous, found := byID[key.ID]
+		// The observation time is local to each traversal.
+		key.checkedAt, previous.checkedAt = time.Time{}, time.Time{}
+		if !found || !reflect.DeepEqual(key, previous) {
+			return &keyListPageError{page: i/accountKeyPageSize + 1, cause: drift}
+		}
+	}
+	return nil
 }
 
 func retryKeyListRound(ctx context.Context, err error) bool {
@@ -126,7 +159,8 @@ func (s *Service) readAccountKeyRound(ctx context.Context, token string, modelKe
 		failed := func(cause error) ([]listedKey, error) {
 			return nil, &keyListPageError{page: page, cause: cause}
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, accountKeysURL+"?page_size=100&page="+strconv.Itoa(page), nil)
+		url := fmt.Sprintf("%s?page_size=%d&page=%d", accountKeysURL, accountKeyPageSize, page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return failed(errKeyList)
 		}
@@ -159,17 +193,17 @@ func (s *Service) readAccountKeyRound(ctx context.Context, token string, modelKe
 			return failed(errKeyList)
 		}
 		d := reply.Data
-		if d.Items == nil || d.Total == nil || *d.Total < 0 || *d.Total > 10000 || d.Page != page || d.Size != 100 {
+		if d.Items == nil || d.Total == nil || *d.Total < 0 || *d.Total > 10000 || d.Page != page || d.Size != accountKeyPageSize {
 			return failed(fmt.Errorf("%w：条目、总数、页码或每页条数无效", errKeyList))
 		}
 		if total >= 0 && *d.Total != total {
 			return failed(fmt.Errorf("%w：总数由 %d 变为 %d", errKeyList, total, *d.Total))
 		}
-		if len(d.Items) != min(100, *d.Total-len(keys)) {
+		if len(d.Items) != min(accountKeyPageSize, *d.Total-len(keys)) {
 			return failed(fmt.Errorf("%w：条目数与公布总数不一致", errKeyList))
 		}
 		total = *d.Total
-		if d.Pages != (total+99)/100 && !(total == 0 && d.Pages == 1) {
+		if d.Pages != (total+accountKeyPageSize-1)/accountKeyPageSize && !(total == 0 && d.Pages == 1) {
 			return failed(fmt.Errorf("%w：总页数无效", errKeyList))
 		}
 		for _, item := range d.Items {

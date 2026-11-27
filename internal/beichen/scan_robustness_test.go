@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -232,9 +234,114 @@ func TestBeichenScanRobustnessWebsiteCoveragePostgres(t *testing.T) {
 	run(1, true)
 }
 
-func scanAccountKeysPage(page, total int) string {
+func readScanWebsiteDirectory(t *testing.T, ctx context.Context, db *sql.DB, provider uuid.UUID) (WebsiteDirectoryStatus, []directoryPlatform) {
+	t.Helper()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	view, platforms, err := readWebsiteDirectory(ctx, tx, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return view, platforms
+}
+
+func TestBeichenScanRobustnessWebsiteIndependentCoveragePostgres(t *testing.T) {
+	const openai = `{"id":1,"name":"channel-1","platforms":[{"platform":"openai","groups":[{"id":11,"name":"group-11"}],
+		"models":[{"name":"model-a","pricing":{"billing_mode":"token","input_price":0.00001,"output_price":0.00002}}]}]}`
+	const anthropic = `{"id":2,"name":"channel-2","platforms":[{"platform":"anthropic","groups":[{"id":12,"name":"group-12"}],"models":["model-b"]}]}`
+	const gemini = `{"id":3,"name":"channel-3","platforms":[{"platform":"gemini","groups":[{"id":13,"name":"group-13"}],"models":["model-c"]}]}`
+	badPrice := strings.Replace(openai, `"input_price":0.00001`, `"input_price":{}`, 1)
+	type round struct {
+		sections []string
+		saved    string
+		pending  map[string]int
+	}
+	run := func(t *testing.T, full []string, rounds []round, wantPriceError bool) {
+		t.Helper()
+		ctx, db, s, job := newKeyScanFixture(t)
+		s.ConfigurePanelFallback("website-scan-session")
+		body := "[" + strings.Join(full, ",") + "]"
+		s.client.Transport = panelTransport(func(r *http.Request) (*http.Response, error) {
+			if r.URL.String() != panelURL {
+				return nil, errors.New("unexpected request")
+			}
+			return scanResponse(http.StatusOK, body), nil
+		})
+		if _, err := s.syncWebsiteDirectory(ctx, job.provider, true); err != nil {
+			t.Fatal(err)
+		}
+		initial, _ := readScanWebsiteDirectory(t, ctx, db, job.provider)
+		if initial.LastSuccess == nil {
+			t.Fatal("missing initial success")
+		}
+		lastSuccess := *initial.LastSuccess
+		for i, step := range rounds {
+			body = "[" + strings.Join(step.sections, ",") + "]"
+			partial := wantPriceError || len(step.pending) != 0
+			_, err := s.syncWebsiteDirectory(ctx, job.provider, true)
+			if (partial && !errors.Is(err, errWebsiteDirectoryPartial)) || (!partial && err != nil) {
+				t.Fatalf("round %d: unexpected scrape result %v", i+1, err)
+			}
+			view, platforms := readScanWebsiteDirectory(t, ctx, db, job.provider)
+			var names []string
+			for _, platform := range platforms {
+				names = append(names, platform.Platform)
+				if platform.Retained != (step.pending[platform.Platform] != 0) {
+					t.Fatalf("round %d: %s retained=%t", i+1, platform.Platform, platform.Retained)
+				}
+			}
+			slices.Sort(names)
+			if got := strings.Join(names, ","); got != step.saved {
+				t.Fatalf("round %d: saved %s, want %s", i+1, got, step.saved)
+			}
+			seenPriceError := false
+			pending := map[string]int{}
+			for _, failure := range view.LastRun.Failures {
+				if failure.Path == "coverage" {
+					pending[failure.Platform] = failure.ConfirmationRounds
+				}
+				seenPriceError = seenPriceError || (failure.Platform == "openai" && strings.Contains(failure.Reason, "pricing"))
+			}
+			if !maps.Equal(pending, step.pending) || seenPriceError != wantPriceError {
+				t.Fatalf("round %d: unexpected coverage or pricing diagnostics: %+v", i+1, view.LastRun.Failures)
+			}
+			if view.LastSuccess == nil || (partial && !view.LastSuccess.Equal(lastSuccess)) ||
+				(!partial && !view.LastSuccess.After(lastSuccess)) {
+				t.Fatalf("round %d: unexpected last success %v", i+1, view.LastSuccess)
+			}
+			lastSuccess = *view.LastSuccess
+		}
+	}
+	t.Run("interleaved-platforms-seven-rounds", func(t *testing.T) {
+		openaiOnly := []string{openai}
+		run(t, []string{openai, anthropic, gemini}, []round{
+			{[]string{openai, gemini}, "anthropic,gemini,openai", map[string]int{"anthropic": 1}},
+			{openaiOnly, "anthropic,gemini,openai", map[string]int{"anthropic": 2, "gemini": 1}},
+			{openaiOnly, "gemini,openai", map[string]int{"gemini": 2}},
+			{openaiOnly, "openai", nil},
+			{openaiOnly, "openai", nil},
+			{openaiOnly, "openai", nil},
+			{openaiOnly, "openai", nil},
+		}, false)
+	})
+	t.Run("bad-price-four-rounds", func(t *testing.T) {
+		openaiOnly := []string{badPrice}
+		run(t, []string{openai, anthropic}, []round{
+			{openaiOnly, "anthropic,openai", map[string]int{"anthropic": 1}},
+			{openaiOnly, "anthropic,openai", map[string]int{"anthropic": 2}},
+			{openaiOnly, "openai", nil},
+			{openaiOnly, "openai", nil},
+		}, true)
+	})
+}
+
+func scanAccountKeysPage(page, total, idOffset int) string {
 	items := make([]string, 0, 100)
-	for id := (page-1)*100 + 1; id <= min(page*100, total); id++ {
+	for i := (page-1)*100 + 1; i <= min(page*100, total); i++ {
+		id := i + idOffset
 		items = append(items, fmt.Sprintf(`{"id":%d,"user_id":7,"name":"key-%d","key":"sk-fixture-item-%04d"}`, id, id, id))
 	}
 	return fmt.Sprintf(`{"code":0,"data":{"items":[%s],"total":%d,"page":%d,"page_size":100,"pages":%d}}`,
@@ -254,23 +361,23 @@ func TestBeichenScanRobustnessKeyInventoryPostgres(t *testing.T) {
 		switch page {
 		case 1:
 			firstPageReads++
-			return scanResponse(http.StatusOK, scanAccountKeysPage(1, 101)), nil
+			return scanResponse(http.StatusOK, scanAccountKeysPage(1, 101, 0)), nil
 		case 2:
 			secondPageReads++
 			if reject {
 				return scanResponse(http.StatusBadGateway, ""), nil
 			}
 			if firstPageReads == 1 {
-				return scanResponse(http.StatusOK, scanAccountKeysPage(2, 102)), nil
+				return scanResponse(http.StatusOK, scanAccountKeysPage(2, 102, 0)), nil
 			}
-			return scanResponse(http.StatusOK, scanAccountKeysPage(2, 101)), nil
+			return scanResponse(http.StatusOK, scanAccountKeysPage(2, 101, 0)), nil
 		default:
 			return nil, errors.New("unexpected page")
 		}
 	})
 	initial, err := s.RefreshWebsiteKeys(ctx, job.provider)
 	if err != nil || initial.Status != "current" || initial.LastSeen == nil || len(initial.Keys) != 101 ||
-		firstPageReads != 2 || secondPageReads != 2 {
+		firstPageReads != 3 || secondPageReads != 3 {
 		t.Errorf("failed to re-read the unstable inventory: status=%s keys=%d pages=%d,%d err=%v",
 			initial.Status, len(initial.Keys), firstPageReads, secondPageReads, err)
 	}
@@ -282,8 +389,60 @@ func TestBeichenScanRobustnessKeyInventoryPostgres(t *testing.T) {
 		!strings.Contains(string(raw), `"failed_page":2`) || !strings.Contains(string(raw), "HTTP 502") {
 		t.Errorf("failed page or last success is missing: status=%s keys=%d err=%v", failed.Status, len(failed.Keys), err)
 	}
-	if firstPageReads != 4 || secondPageReads != 4 {
+	if firstPageReads != 5 || secondPageReads != 5 {
 		t.Errorf("failed page did not get a bounded whole-round retry: %d,%d", firstPageReads, secondPageReads)
+	}
+}
+
+func TestBeichenScanRobustnessKeyInventorySameTotalDriftPostgres(t *testing.T) {
+	ctx, _, s, job := newKeyScanFixture(t)
+	s.ConfigurePanelFallback("website-scan-session")
+	at := time.Now().UTC().Truncate(time.Microsecond)
+	s.now = func() time.Time { return at }
+	var reads []int
+	var offset int
+	var changeAfterFirstPage bool
+	s.client.Transport = panelTransport(func(r *http.Request) (*http.Response, error) {
+		page, err := strconv.Atoi(r.URL.Query().Get("page"))
+		if r.URL.Path != "/api/v1/keys" || err != nil || (page != 1 && page != 2) {
+			return nil, errors.New("unexpected page request")
+		}
+		reads = append(reads, page)
+		body := scanAccountKeysPage(page, 101, offset)
+		if page == 1 && changeAfterFirstPage {
+			offset, changeAfterFirstPage = 1, false
+		}
+		return scanResponse(http.StatusOK, body), nil
+	})
+
+	refresh := func(status string, firstID int64) WebsiteKeyInventoryReport {
+		t.Helper()
+		reads = nil
+		got, err := s.RefreshWebsiteKeys(ctx, job.provider)
+		if err != nil || got.Status != status || got.LastSeen == nil || len(got.Keys) != 101 ||
+			!slices.Equal(reads, []int{1, 2, 1, 2}) {
+			t.Fatalf("status=%s keys=%d pages=%v last_seen=%v err=%v", got.Status, len(got.Keys), reads, got.LastSeen, err)
+		}
+		for i, key := range got.Keys {
+			if want := firstID + int64(i); key.ID != want {
+				t.Fatalf("key %d: got %d, want %d", i, key.ID, want)
+			}
+		}
+		return got
+	}
+	initial := refresh("current", 1)
+	at = at.Add(time.Minute)
+	// Delete ID 1 and add ID 102 after the first page. Every page advertises
+	// a total of 101, but the first traversal misses ID 101.
+	changeAfterFirstPage = true
+	failed := refresh("unavailable", 1)
+	if !failed.LastSeen.Equal(*initial.LastSeen) || failed.FailedPage != 1 || !strings.Contains(failed.LastError, "清单不一致") {
+		t.Fatalf("drift was not reported with the previous success time: %+v", failed.WebsiteKeyInventoryDiagnostics)
+	}
+	at = at.Add(time.Minute)
+	recovered := refresh("current", 2)
+	if !recovered.LastSeen.After(*initial.LastSeen) || recovered.LastError != "" {
+		t.Fatalf("stable inventory did not recover: %+v", recovered.WebsiteKeyInventoryDiagnostics)
 	}
 }
 
