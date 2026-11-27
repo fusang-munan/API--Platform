@@ -137,51 +137,21 @@ WITH owned_keys AS (
  FROM monthly_usage_cube c JOIN owned_keys k ON k.id=c.api_key_id AND k.project_id=c.project_id
  WHERE c.user_id=$1 AND c.month=$2
 ), observations AS (
- SELECT c.project_id,c.api_key_id,c.model_id,max(c.model_name) AS model_name,
-   sum(parts.input_tokens) AS input,sum(parts.output_tokens) AS output,
-   sum(parts.cache_read_tokens) AS cache_read,sum(parts.cache_write_tokens) AS cache_write,
-   sum(token_evidence.known_total) AS tokens,sum(token_evidence.known_total-breakdown.classified) AS unclassified,
-   count(*) AS coverage_calls,count(token_evidence.known_total) AS known_calls,
-   count(*) FILTER (WHERE token_evidence.complete) AS complete_calls,
-   count(*) FILTER (WHERE c.billing_state='charged') AS recorded_charged_calls,
-   count(*) FILTER (WHERE c.beichen_state='pending_review') AS review_calls,
-   sum(c.unresolved_credit_milli) FILTER (WHERE c.beichen_state='pending_review') AS review_credits,
-   count(*) FILTER (WHERE token_evidence.cache_rate_input>0) AS cache_sample_calls,
-   sum(parts.cache_read_tokens) FILTER (WHERE token_evidence.cache_rate_input>0) AS cache_sample_read,
-   sum(token_evidence.cache_rate_input) FILTER (WHERE token_evidence.cache_rate_input>0) AS cache_sample_input
+ SELECT c.project_id,c.api_key_id,c.model_id,max(c.model_name) AS model_name,` + studentUsageObservationStatsSQL + `
  FROM gateway_calls c JOIN owned_keys k ON k.id=c.api_key_id AND k.project_id=c.project_id
 ` + studentTokenEvidenceSQL + `
- WHERE c.user_id=$1 AND c.month=$2 AND (
-   c.billing_state='charged' OR c.beichen_state='pending_review'
-   OR (c.outcome<>'pending' AND token_evidence.known_total IS NOT NULL)
- )
+ WHERE c.user_id=$1 AND c.month=$2 AND ` + studentUsageObservationFilterSQL + `
  GROUP BY c.project_id,c.api_key_id,c.model_id
 ), leaves AS (
- SELECT project_id,api_key_id,model_id,COALESCE(l.model_name,o.model_name) AS name,l.milli,l.calls,
-   o.input,o.output,o.cache_read,o.cache_write,o.tokens,o.unclassified,o.known_calls,o.complete_calls,
-   COALESCE(o.coverage_calls,0)+GREATEST(0,COALESCE(l.calls,0)-COALESCE(o.recorded_charged_calls,0)) AS coverage_calls,
-   o.review_calls,o.review_credits,o.cache_sample_calls,o.cache_sample_read,o.cache_sample_input
+ SELECT project_id,api_key_id,model_id,COALESCE(l.model_name,o.model_name) AS name,` + studentUsageLeafStatsSQL + `
  FROM ledger l FULL JOIN observations o USING (project_id,api_key_id,model_id)
 ), rollups AS (
- SELECT project_id,api_key_id,model_id,max(name) AS name,
-   COALESCE(sum(milli),0) AS milli,COALESCE(sum(calls),0)::bigint AS calls,
-   sum(input) AS input,sum(output) AS output,sum(cache_read) AS cache_read,sum(cache_write) AS cache_write,
-   sum(tokens) AS tokens,sum(unclassified) AS unclassified,
-   COALESCE(sum(coverage_calls),0)::bigint AS coverage_calls,COALESCE(sum(known_calls),0)::bigint AS known_calls,
-   COALESCE(sum(complete_calls),0)::bigint AS complete_calls,
-   COALESCE(sum(review_calls),0)::bigint AS review_calls,COALESCE(sum(review_credits),0) AS review_credits,
-   COALESCE(sum(cache_sample_calls),0)::bigint AS cache_sample_calls,
-   sum(cache_sample_read) AS cache_sample_read,sum(cache_sample_input) AS cache_sample_input
+ SELECT project_id,api_key_id,model_id,max(name) AS name,` + studentUsageSumsSQL + `
  FROM leaves
  GROUP BY GROUPING SETS ((project_id,api_key_id,model_id),(project_id,api_key_id),(project_id),(model_id),())
 )
 SELECT r.project_id,r.api_key_id,r.model_id,COALESCE(m.model_id,r.model_id::text,''),COALESCE(r.name,m.display_name,'') AS name,
-   trim_scale(r.milli*0.001)::text,r.calls,
-   r.input::text,r.output::text,r.cache_read::text,r.cache_write::text,r.tokens::text,
-   r.coverage_calls,r.known_calls,r.complete_calls,r.unclassified::text,
-   r.review_calls,trim_scale(r.review_credits)::text,
-   (r.cache_sample_read/NULLIF(r.cache_sample_input,0))::double precision,
-   r.cache_sample_calls,r.cache_sample_read::text,r.cache_sample_input::text
+` + studentUsageTotalsSQL + `
 FROM rollups r LEFT JOIN models m ON m.id=r.model_id
 ORDER BY r.milli DESC,name,r.model_id`
 
@@ -206,16 +176,10 @@ func (v *StudentUsage) loadRollups(ctx context.Context, tx *sql.Tx, userID uuid.
 		var projectID, keyID, modelID uuid.NullUUID
 		var id, name string
 		var usage StudentUsageTotals
-		tokens, coverage, cache := &usage.Tokens, &usage.TokenCoverage, &usage.CacheHitCoverage
-		if err := rows.Scan(&projectID, &keyID, &modelID, &id, &name, &usage.Credits, &usage.Calls,
-			&tokens.Input, &tokens.Output, &tokens.CacheRead, &tokens.CacheWrite, &tokens.Total,
-			&coverage.Calls, &coverage.KnownCalls, &coverage.CompleteCalls, &coverage.UnclassifiedTokens,
-			&usage.PendingReviewCalls, &usage.PendingReviewCredits, &usage.CacheHitRate,
-			&cache.SampleCalls, &cache.CacheReadTokens, &cache.InputWithCacheReadTokens); err != nil {
+		if err := rows.Scan(append([]any{&projectID, &keyID, &modelID, &id, &name}, usage.scanFields()...)...); err != nil {
 			return studentRollups{}, err
 		}
-		usage.Credits = displayCredits(usage.Credits)
-		usage.StudentUsageMetrics = usage.StudentUsageMetrics.forDisplay()
+		usage.formatForDisplay()
 		switch {
 		case modelID.Valid:
 			model := StudentModelUsage{UsageSlice: UsageSlice{ID: id, Name: name, Credits: usage.Credits, Calls: usage.Calls},

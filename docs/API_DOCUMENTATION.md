@@ -849,6 +849,59 @@ Anthropic-compatible 示例：
 
 项目和 Key 的 `in_flight_credits` 与旧字段 `pending` 等值，均为受理时在月桶里的在途占用。`available` 沿用额度扣除已用和在途占用的口径。Key 的 `pending_calls` 是 `pending_review_calls` 的兼容别名。项目与 Key 的旧布尔字段 `pending_review` 在有待核调用时为 `true`，无待核调用时省略。待核积分可能为零，此时仍以笔数判断是否有待核调用。
 
+### 教师按学生用量
+
+教师在控制台「学生用量」`/teacher/student-usage` 查看每位学生的用量，并展开项目、Key 和模型。两个接口均校验教师登录及当前账号状态，返回 `Cache-Control: private, no-store`。查询只能读取账本和用量证据。
+
+| 路由 | 查询参数 |
+| --- | --- |
+| `GET /api/v1/teacher/usage/students` | `month=YYYY-MM`，`project_id`，`search`（128 字以内，按姓名或邮箱做大小写无关的文字包含匹配），`page`（默认 1），`page_size`（默认 20，最大 100），`sort=credits\|calls\|tokens`（默认 `credits`），`order=asc\|desc`（默认 `desc`）。 |
+| `GET /api/v1/teacher/usage/students/{user_id}` | `month=YYYY-MM`，`project_id`。 |
+
+省略账月时取北京时间本月，省略项目时取所有项目。调用受理时存下的 `user_id` 和账月决定历史归属。停用学生、移出项目或历史 Key 缺少当前资料时，仍按保存的归属统计。项目数和 Key 数只计所选范围内有已结算、零额、待核或可汇总 Token 的项目和 Key。列表先筛选并按原始数值排序，同值按 `user_id` 排序，Token 未知的行排在最后。`total` 是筛选后的总人数，超过末页返回空 `items` 并保留该人数。
+
+列表成功响应示例
+
+```json
+{
+  "data": {
+    "month": "2025-01",
+    "items": [{
+      "user_id": "018a0000-0000-7000-8000-000000000001",
+      "user_name": "学生甲",
+      "user_email": "student@example.test",
+      "project_count": 2,
+      "key_count": 4,
+      "credits": "0.70000000000000007",
+      "calls": 8,
+      "zero_cost_calls": 1,
+      "total_tokens": "1110",
+      "completeness": "partial",
+      "pending_review_calls": 1,
+      "pending_review_credits": "7.000",
+      "last_call_at": "2025-01-31T16:00:01Z"
+    }],
+    "page": 1,
+    "page_size": 20,
+    "total": 1,
+    "unattributed_upstream": {
+      "rows": 4,
+      "debit_rows": 3,
+      "balance_debit": "0.000000000000000003"
+    }
+  },
+  "request_id": "example"
+}
+```
+
+- `calls` 是已结算调用数，包含扣费调用及 `zero_cost_calls`。待核笔数和预留积分由 `pending_review_*` 提供。积分保留实际精度并至少显示三位小数。
+- `total_tokens` 是已知 Token 合计，无证据时为 `null`。最近调用时间是纳入统计的逐笔记录里最晚的 `created_at`，仅存月账本时为 `null`。账号资料缺失时显示历史姓名和 `user_email: null`。
+- `unattributed_upstream` 按上游 `occurred_at` 取同一北京时间账月的**全校**已归档数据，独立于项目、搜索、排序和分页。 `rows` 为暂无可核验学生归属的归档笔数。 `debit_rows` 为有可确认的余额扣款笔数，`balance_debit` 为余额单位的十进制合计，无扣款证据时为 `null`。已确认余额扣款为零也计入 `debit_rows`。
+
+明细返回 `data.user_id`、`data.user_name`、`data.user_email` 和与学生月度用量相同结构的 `month`、`totals`、`projects[].keys[].models[]`、`models[]`，并在每层增加 `zero_cost_calls`。 `projects[].used` 和 `keys[].used` 取同一范围的月账本合计。额度、在途占用及可用额度按历史账月的额度桶读取。缺少当前 Key 资料时，使用快照名称及 `status: "unknown"`。接口返回 Key 标识、名称和状态等报表字段。
+
+无登录凭证时返回 `401 AUTHENTICATION_REQUIRED`，非教师和停用账户返回 403。无效月份、UUID、分页值或枚举返回 `400 VALIDATION_ERROR`。明细范围内无用量返回 `404 RESOURCE_NOT_FOUND`，读库异常返回 `503 DEPENDENCY_UNAVAILABLE`。
+
 ### 学生单笔回执
 
 学生使用 `GET /api/v1/student/usage/calls/{request_id}` 查自己的一笔北辰消费。请求编号取自学校网关响应头 `X-Request-ID`。金额以十进制字符串返回，缺失值为 `null`。
@@ -880,7 +933,6 @@ Anthropic-compatible 示例：
 ## 10. 明确排除项
 
 - 不实现余额、RPM、Token 限制、通知中心或模型价格。
-- 不提供老师浏览项目成员或 ACTIVE Key 的接口。
 - 不提供资源删除接口。
 - 不代理 Files、Uploads、Batches、Fine-tuning 或 Assistants/Threads 等有状态资源 API；这些接口没有可在每个请求中稳定取得的公开 model，若未来纳入必须新增资源 ID 到 Binding 的完整归属状态与授权契约，不能按默认 Binding 猜测上游。
 - 不提供旧路由兼容层、别名、双写或 internal usage/monitor 路由。

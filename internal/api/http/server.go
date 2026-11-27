@@ -143,6 +143,8 @@ func (s *Server) registerControlPlane() {
 	teacher.GET("/projects/:project_id/usage", s.teacherProjectUsage)
 	teacher.PATCH("/projects/:project_id/members/:user_id/monthly-credit-quota", s.updateTeacherMemberQuota)
 	teacher.GET("/project-spend", s.teacherProjectSpend)
+	teacher.GET("/usage/students", s.listTeacherStudentUsage)
+	teacher.GET("/usage/students/:user_id", s.teacherStudentUsageDetail)
 	teacher.GET("/model-usage", s.teacherModelUsage)
 	teacher.GET("/mentor-project-applications", s.teacherMentorApplications)
 	teacher.POST("/mentor-project-applications/:application_id/approve", s.reviewMentorApplication(true))
