@@ -1,9 +1,11 @@
 package beichen
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
+	"encoding/binary"
 	"errors"
-	"net/http"
 	"strings"
 
 	"github.com/google/uuid"
@@ -73,23 +75,10 @@ func readWithPanelAuthorization[T any](ctx context.Context, service *Service, pr
 func readWithPanelSession[T any](ctx context.Context, service *Service, provider uuid.UUID,
 	authorization panelAuthorization, retry bool, read func(panelAuthorization) (T, error)) (T, error) {
 	if authorization.delivered {
-		readDelivered := func(bearer string) (T, error) {
-			authorization.bearer = bearer
-			return read(authorization)
-		}
-		if retry {
-			return readWithCapturedWebSession(ctx, service, readDelivered)
-		}
-		bearer, err := service.webPanelToken(ctx)
-		if err != nil {
-			var zero T
-			return zero, err
-		}
-		value, err := readDelivered(bearer)
-		if panelAuthFailed(err) {
-			service.webReadError(bearer, upstreamHTTPStatus(http.StatusUnauthorized))
-		}
-		return value, err
+		return readWithCapturedPanelSession(ctx, service, retry, func(auth panelAuthorization) (T, error) {
+			auth.delivered = true
+			return read(auth)
+		})
 	}
 	value, err := read(authorization)
 	if err == nil {
@@ -146,6 +135,30 @@ func readWithPanelSession[T any](ctx context.Context, service *Service, provider
 		err = service.notePanelVerified(ctx, provider, renewed, false)
 	}
 	return value, err
+}
+
+// Hold the version stable until the snapshot transaction commits. Database
+// logins use the row lock, and captured sessions use the refresh mutex.
+func (s *Service) lockWebsiteSessionVersion(ctx context.Context, tx *sql.Tx, provider uuid.UUID, version []byte) (bool, func(), error) {
+	if version == nil {
+		return true, nil, nil
+	}
+	if len(version) == capturedWebVersionSize {
+		account := s.webAccount
+		if account == nil {
+			return false, nil, nil
+		}
+		account.mu.Lock()
+		return account.generation == binary.BigEndian.Uint64(version), account.mu.Unlock, nil
+	}
+	var current []byte
+	err := tx.QueryRowContext(ctx, `
+SELECT token_ciphertext FROM beichen_panel_accounts
+WHERE provider_id=$1 AND status='active' FOR SHARE`, provider).Scan(&current)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, nil, err
+	}
+	return bytes.Equal(current, version), nil, nil
 }
 
 func (s *Service) managedChannelQuote(ctx context.Context, access priceAccess, key string, group int64,

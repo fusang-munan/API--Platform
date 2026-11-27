@@ -1,7 +1,6 @@
 package beichen
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -401,11 +400,15 @@ RETURNING platforms, (SELECT failures FROM beichen_crawl_runs WHERE provider_id=
 	}
 	fetch, cancel := context.WithTimeout(ctx, jobTimeout)
 	start := time.Now()
-	var tokenVersion []byte
-	crawl, observedErr := readWithWebsiteKeySession(fetch, s, provider, "", func(session panelAuthorization) (directoryCrawl, error) {
+	var tokenVersion, capturedVersion []byte
+	readCtx := context.WithValue(fetch, capturedWebVersionKey{}, &capturedVersion)
+	crawl, observedErr := readWithWebsiteKeySession(readCtx, s, provider, "", func(session panelAuthorization) (directoryCrawl, error) {
 		tokenVersion = session.tokenVersion
 		return s.fetchWebsiteCrawl(fetch, session.bearer)
 	})
+	if tokenVersion == nil {
+		tokenVersion = capturedVersion
+	}
 	if observedErr != nil && !errors.Is(observedErr, errWebsiteDirectoryPartial) && !errors.Is(observedErr, errWebsiteDirectoryEmpty) {
 		crawl, _ = failedDirectoryCrawl(observedErr)
 	}
@@ -448,16 +451,14 @@ RETURNING platforms, (SELECT failures FROM beichen_crawl_runs WHERE provider_id=
 	}
 	defer tx.Rollback()
 	if tokenVersion != nil && crawl.rawResponse != nil {
-		// Use the same ciphertext version and row lock as the Key inventory.
-		// The check and all directory writes belong to the same transaction.
-		var current []byte
-		err := tx.QueryRowContext(ctx, `
-SELECT token_ciphertext FROM beichen_panel_accounts
-WHERE provider_id=$1 AND status='active' FOR SHARE`, provider).Scan(&current)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		current, unlock, err := s.lockWebsiteSessionVersion(ctx, tx, provider, tokenVersion)
+		if err != nil {
 			return PanelCrawlSummary{}, errPanelAccountDB
 		}
-		if !bytes.Equal(current, tokenVersion) {
+		if unlock != nil {
+			defer unlock()
+		}
+		if !current {
 			observedErr = errWebsiteDirectorySessionChanged
 			crawl = directoryCrawl{CrawlRun: CrawlRun{
 				StartedAt: crawl.StartedAt, DurationMS: crawl.DurationMS,

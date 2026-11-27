@@ -500,7 +500,7 @@ Key 证据不足时，标准余额计费、分组默认倍率有效且高峰开�
 
 `catalog_differences` 按启用 Key 返回已知分组、核对时间、`website_only` 和 `key_only`。官网分组与当前 Key 目录均可对比时标为 `compared`。比较使用保留的官网数据时标为 `stale`。缺少一方证据时标为 `unverified`。`website_only_models` 汇总当前 Key 均未匹配的官网型号及候选渠道，`website_only_status` 表示该汇总的核对状态。
 
-`website_directory.groups` 按平台和分组返回 `observed_at` 与 `retained`。`retained=true` 表示整组或组内部分型号沿用以前的快照。`incomplete` 表示该片段本轮未完整解析。`website_directory.last_run.failures` 记录待核验的平台及其连续确认轮数，也会单独记录报价错误。覆盖待核验时 `expected_model_count` 纳入前一次保存的覆盖规模，已确认下线的平台退出快照。抓取期间数据库网页登录版本更换时，`failures` 出现 `path=session`，已保存的目录标记为 `stale`，展示上次成功时间。`kind=catalog` 的 `last_error` 会说明目录缩水的确认进度或模型分页失败的页码。对 Key 日用量，`kind=key_usage` 的 `last_error` 及 Key 用量错误可列出失败账日、页码和沿用快照的采集时间。
+`website_directory.groups` 按平台和分组返回 `observed_at` 与 `retained`。`retained=true` 表示整组或组内部分型号沿用以前的快照。`incomplete` 表示该片段本轮未完整解析。`website_directory.last_run.failures` 记录待核验的平台及其连续确认轮数，也会单独记录报价错误。覆盖待核验时 `expected_model_count` 纳入前一次保存的覆盖规模，已确认下线的平台退出快照。抓取所用的数据库网页登录或版本交付会话在保存前更换时，`failures` 出现 `path=session`，已保存的目录标记为 `stale`，展示上次成功时间。`kind=catalog` 的 `last_error` 会说明目录缩水的确认进度或模型分页失败的页码。对 Key 日用量，`kind=key_usage` 的 `last_error` 及 Key 用量错误可列出失败账日、页码和沿用快照的采集时间。
 
 探活 POST 返回任务对象，GET 返回 `{run, results}`。概览中的 `probe_run` 使用相同任务对象。任务对象含 `state`（`idle`、`queued`、`running`、`completed` 或 `failed`）、`started_at`、`finished_at` 和 `error_code`。同一供应商在排队或执行时收到重复 POST 会合并。没有启用且已同步目录的 Key 时 POST 返回 400，供应商不存在或并非北辰时返回 404。未登录返回 401，角色不符返回 403。两个接口均返回 `Cache-Control: private, no-store`。
 
@@ -547,6 +547,8 @@ Key 证据不足时，标准余额计费、分组默认倍率有效且高峰开�
 清单读取失败时可返回 `last_error` 及 `failed_page`。`last_seen` 仍表示最近一次完整成功的观察。完整清单存在渠道归属疑问时，`match_issues` 按原因统计渠道数。`insufficient_key_evidence` 表示遮罩证据不足或无匹配项，`tied_website_candidates` 表示多个同强度候选，`multiple_school_credentials` 表示多个校内渠道指向同一官网 Key。
 
 多页 Key 清单的两次完整读取结果不一致时，同步状态为 `unavailable`，`last_error` 提示待核验，`failed_page` 指向复读时首先发现差异的位置。返回上次已保存的 `keys` 和 `last_seen`。
+
+读取 Key 清单所用的网页会话在保存前更换时，同步状态为 `unavailable`，`last_error` 提示会话已更换，并返回上次已保存的 `keys` 和 `last_seen`。数据库保存的会话和版本交付的会话均采用此规则。
 
 `data.keys` 的每一项包含北辰 `id`、`name`、脱敏后的 `key_prefix`、`group_id`、`group_name`、分组倍率 `rate`、`status`、`enabled`、`created_at`、`last_seen`、匹配的学校 `credential_id` 和 `match_status`。`peak` 包含 `enabled`、`rate`、`start` 和 `end`，取官网 Key 页的 `group.peak_rate_enabled`、`group.peak_rate_multiplier`、`group.peak_start` 和 `group.peak_end`。倍率用十进制字符串传输，未知字段为 `null`。匹配状态为 `matched`、`unmatched` 或 `ambiguous`。教师模型页按清单时效以及校内启用 Key 的匹配状态提示刷新，另列官网仍启用且未匹配校内 Key 的条目。
 

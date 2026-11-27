@@ -293,12 +293,14 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 同一命令还覆盖官网平台交错缺席七轮、坏报价下缺席四轮、101 条 Key 等量增删后的分页漂移，以及旧会话目录响应晚于新会话 Key 清单入库。
 
+设置隔离的本机 `NEBULA_TEST_POSTGRES` 后，运行 `go test ./internal/beichen -run 'Test(WebsiteSnapshotSessionVersionPostgres|CapturedWebSession)' -count=1 -v`。测试暂停目录和 Key 清单的旧请求，覆盖版本交付会话替换、清除教师网页登录后的交付会话续期、数据库网页登录替换。它还核对旧结果被丢弃、新会话可再次保存、刷新失败、轮换文件写入重试和并发 401 共用一次续期。
+
 三路部署配置使用 `scripts/seal-beichen.ps1 -SkipGemini` 加密。如果提示缺少渠道，核对 CC1、GM1 和 G3 是否都已填入且 Key 各自唯一。运行 `go test ./internal/infrastructure/schoolseal ./cmd/seal-beichen -count=1` 核对三路密文往返、旧四路密文读取及证书校验。
 
 - 若 Key 的型号总数比上一份目录减少至少一半，检查 `catalog.last_error` 中的确认进度。第三次连续返回同一完整型号集合时接受这次变化。不同集合重新从第一次计数，读取失败会清除计数并保留上次目录。HTTP 429 和单次请求超时按剩余时限最多重试一次。超过 2 秒的 `Retry-After` 留待下一轮处理。
 - 若官网目录缺少平台或分组，检查 `website_directory.last_run.failures` 及 `website_directory.groups` 中的采集时间和 `retained`。缺席或缩水的平台各需要三个连续一致的完整型号及分组观察。报价错误仍记录在本轮失败项中，清单完整时可以累计确认。平台确认下线后从快照移除，其他待核验平台继续沿用。整页没有可读型号时保留快照并记录读取失败。`beichen-crawl --match-db` 可查询对照结果，确认轮数由持久化抓取推进。
 - 如果官网 Key 清单未更新，先用 `last_seen` 找最近一次完整成功，再查 `failed_page` 与 `last_error`。多页清单完整复读一次，两次结果一致才更新。如果翻页时一删一增导致结果不同，页面保留旧清单并提示待核验，等上游清单稳定后可再点「刷新官网 Key」。`match_issues` 用于区分遮罩或归属证据不足、同强度候选、多个校内渠道认领同一官网 Key。
-- 如果 Key 清单已更新而目录提示「读取官网目录期间北辰网页会话已更换」，查看 `website_directory.last_run.failures` 的 `path=session` 和目录的上次成功时间。当前扫描结束后可点「测试抓取」，用新会话重试。
+- 如果目录或 Key 清单提示「北辰网页会话已更换」，说明本轮完成读取时使用的会话已经被续期或替换。目录可核对 `website_directory.last_run.failures` 的 `path=session` 与 `last_success`。Key 清单显示 `unavailable`，可核对 `last_error` 和 `last_seen`。两处都保留上次成功数据，当前扫描结束后可分别点「测试抓取」和「刷新官网 Key」。
 - 如果日用量只更新了部分日期，检查 `kind=key_usage` 的 `last_error` 和 Key 用量错误。错误附带失败账日、页码及该日旧快照时间。单日 100 页和 16 MiB 的读取上限、途中失败或总数变化都不会提交当日半份数据。账单缺字段时查 `kind=billing` 的 `website_group_observation.key_billing_missing_fields`，有效价表仍以 `kind=prices` 的状态为准。
 
 #### 改分组后仍显示旧倍率或缺报价

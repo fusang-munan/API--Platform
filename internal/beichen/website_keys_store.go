@@ -1,7 +1,6 @@
 package beichen
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -165,7 +164,10 @@ RETURNING status`, provider, lease, leaseSeconds, manual).Scan(&oldStatus)
 	observedAt := s.now().UTC().Truncate(time.Microsecond)
 	readCtx, cancel := context.WithTimeout(ctx, jobTimeout)
 	var page *keyListPageError
-	observation, readErr := read(context.WithValue(readCtx, keyListReadTraceKey{}, &page))
+	var capturedVersion []byte
+	readCtx = context.WithValue(readCtx, keyListReadTraceKey{}, &page)
+	readCtx = context.WithValue(readCtx, capturedWebVersionKey{}, &capturedVersion)
+	observation, readErr := read(readCtx)
 	cancel()
 	if readErr != nil {
 		status := "unavailable"
@@ -182,6 +184,9 @@ RETURNING status`, provider, lease, leaseSeconds, manual).Scan(&oldStatus)
 		saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
 		return nil, finishWebsiteKeyInventory(saveCtx, s.db, provider, lease, status, nil, report)
+	}
+	if observation.tokenVersion == nil {
+		observation.tokenVersion = capturedVersion
 	}
 	keys, err := s.applyWebsiteKeys(ctx, provider, lease, observation, observedAt, oldStatus != "current")
 	if errors.Is(err, errWebsiteKeySessionChanged) {
@@ -249,24 +254,22 @@ func (s *Service) applyWebsiteKeys(ctx context.Context, provider, lease uuid.UUI
 	if err != nil {
 		return nil, err
 	}
-	if observation.tokenVersion != nil {
-		var current []byte
-		err := tx.QueryRowContext(ctx, `
-SELECT token_ciphertext FROM beichen_panel_accounts
-WHERE provider_id=$1 AND status='active' FOR SHARE`, provider).Scan(&current)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	current, unlock, err := s.lockWebsiteSessionVersion(ctx, tx, provider, observation.tokenVersion)
+	if err != nil {
+		return nil, err
+	}
+	if unlock != nil {
+		defer unlock()
+	}
+	if !current {
+		if err := finishWebsiteKeyInventory(ctx, tx, provider, lease, "unavailable", nil,
+			WebsiteKeyInventoryDiagnostics{LastError: errWebsiteKeySessionChanged.Error()}); err != nil {
 			return nil, err
 		}
-		if !bytes.Equal(current, observation.tokenVersion) {
-			if err := finishWebsiteKeyInventory(ctx, tx, provider, lease, "unavailable", nil,
-				WebsiteKeyInventoryDiagnostics{LastError: errWebsiteKeySessionChanged.Error()}); err != nil {
-				return nil, err
-			}
-			if err := tx.Commit(); err != nil {
-				return nil, err
-			}
-			return nil, errWebsiteKeySessionChanged
+		if err := tx.Commit(); err != nil {
+			return nil, err
 		}
+		return nil, errWebsiteKeySessionChanged
 	}
 	listed := observation.keys
 	credentials, claims, err := s.findWebsiteCredentialMatches(ctx, tx, provider, listed)
