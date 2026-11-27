@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$Certificate,
-    [string]$Go = 'go'
+    [string]$Go = 'go',
+    [switch]$SkipGemini
 )
 $ErrorActionPreference = 'Stop'
 $certPath = (Resolve-Path -LiteralPath $Certificate).Path
@@ -17,7 +18,8 @@ try {
             $secret.Dispose()
         }
     }
-    $channels = foreach ($name in 'Gemini','CC1','GM1','G3') {
+    $names = if ($SkipGemini) { 'CC1','GM1','G3' } else { 'Gemini','CC1','GM1','G3' }
+    $channels = foreach ($name in $names) {
         @{ channel = $name; api_key = (Read-PrivateField "$name 北辰渠道 Key") }
     }
     $config = @{

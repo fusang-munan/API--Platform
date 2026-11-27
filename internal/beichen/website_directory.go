@@ -2,13 +2,18 @@ package beichen
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 )
 
@@ -20,11 +25,22 @@ var (
 )
 
 type WebsiteDirectoryStatus struct {
-	State       string     `json:"state"`
-	PriceUnit   string     `json:"price_unit"`
-	LastSuccess *time.Time `json:"last_success"`
-	LastError   *string    `json:"last_error"`
-	LastRun     *CrawlRun  `json:"last_run"`
+	State       string                    `json:"state"`
+	PriceUnit   string                    `json:"price_unit"`
+	LastSuccess *time.Time                `json:"last_success"`
+	LastError   *string                   `json:"last_error"`
+	LastRun     *CrawlRun                 `json:"last_run"`
+	Groups      []WebsiteGroupObservation `json:"groups,omitempty"`
+}
+
+type WebsiteGroupObservation struct {
+	ChannelID  int64     `json:"channel_id,omitempty"`
+	Platform   string    `json:"platform"`
+	GroupID    int64     `json:"group_id,omitempty"`
+	GroupName  string    `json:"group_name,omitempty"`
+	ObservedAt time.Time `json:"observed_at"`
+	Retained   bool      `json:"retained"`
+	Incomplete bool      `json:"incomplete,omitempty"`
 }
 
 type WebsiteGroup struct {
@@ -41,12 +57,14 @@ type WebsiteGroup struct {
 
 type directoryGroup struct {
 	WebsiteGroup
-	Platform     string `json:"platform,omitempty"`
-	Subscription string `json:"subscription_type,omitempty"`
-	PeakStart    string `json:"peak_start,omitempty"`
-	PeakEnd      string `json:"peak_end,omitempty"`
-	Timezone     string `json:"timezone,omitempty"`
-	OwnModels    bool   `json:"own_models,omitempty"`
+	Platform     string     `json:"platform,omitempty"`
+	Subscription string     `json:"subscription_type,omitempty"`
+	PeakStart    string     `json:"peak_start,omitempty"`
+	PeakEnd      string     `json:"peak_end,omitempty"`
+	Timezone     string     `json:"timezone,omitempty"`
+	OwnModels    bool       `json:"own_models,omitempty"`
+	ObservedAt   *time.Time `json:"observed_at,omitempty"`
+	Retained     bool       `json:"retained,omitempty"`
 }
 
 type directoryModel struct {
@@ -60,15 +78,165 @@ type directoryModel struct {
 }
 
 type directoryPlatform struct {
-	Scope         string           `json:"scope"`
-	ChannelID     int64            `json:"channel_id,omitempty"`
-	Channel       string           `json:"channel,omitempty"`
-	ChannelStatus string           `json:"channel_status,omitempty"`
-	Platform      string           `json:"platform"`
-	ObservedAt    time.Time        `json:"observed_at"`
-	Groups        []directoryGroup `json:"groups"`
-	Models        []directoryModel `json:"models"`
-	Incomplete    bool             `json:"incomplete,omitempty"`
+	Scope                string           `json:"scope"`
+	ChannelID            int64            `json:"channel_id,omitempty"`
+	Channel              string           `json:"channel,omitempty"`
+	ChannelStatus        string           `json:"channel_status,omitempty"`
+	Platform             string           `json:"platform"`
+	ObservedAt           time.Time        `json:"observed_at"`
+	Groups               []directoryGroup `json:"groups"`
+	Models               []directoryModel `json:"models"`
+	Incomplete           bool             `json:"incomplete,omitempty"`
+	MembershipIncomplete bool             `json:"membership_incomplete,omitempty"`
+	Retained             bool             `json:"retained,omitempty"`
+}
+
+func directoryGroupObservations(platforms []directoryPlatform, allRetained bool) []WebsiteGroupObservation {
+	var items []WebsiteGroupObservation
+	for _, platform := range platforms {
+		for _, group := range platform.Groups {
+			at := platform.ObservedAt
+			if group.ObservedAt != nil {
+				at = *group.ObservedAt
+			}
+			items = append(items, WebsiteGroupObservation{
+				ChannelID: platform.ChannelID, Platform: platform.Platform, GroupID: group.ID, GroupName: group.Name,
+				ObservedAt: at.UTC(), Retained: allRetained || platform.Retained || group.Retained, Incomplete: platform.Incomplete,
+			})
+		}
+	}
+	return items
+}
+
+// Coverage is checked against retained scopes as well as this run's fresh
+// scopes. A partial read cannot advance any omission confirmation.
+func (crawl *directoryCrawl) checkCoverage(previous []directoryPlatform, lastFailures []CrawlFailure, clean, advance bool) map[string]bool {
+	current := make(map[string]directoryPlatform, len(crawl.platforms))
+	for _, section := range crawl.platforms {
+		current[section.Scope] = section
+	}
+	prior := make(map[string]CrawlFailure, len(lastFailures))
+	for _, failure := range lastFailures {
+		if failure.SnapshotHash != "" {
+			prior[failure.Scope] = failure
+		}
+	}
+	retain := map[string]bool{}
+	for _, old := range previous {
+		section, present := current[old.Scope]
+		if !present && !clean && crawl.markUnreadableScope(old) {
+			retain[old.Scope] = true
+			continue
+		}
+		if present && section.Incomplete {
+			continue
+		}
+		reason, fingerprint := directoryCoverageDrop(old, section, present)
+		if reason == "" {
+			continue
+		}
+		rounds := 0
+		if clean && advance {
+			rounds = 1
+			if last := prior[old.Scope]; last.SnapshotHash == fingerprint && last.ConfirmationRounds > 0 &&
+				last.ConfirmationRounds < catalog.BeichenShrinkRounds {
+				rounds = last.ConfirmationRounds + 1
+			}
+			if rounds >= catalog.BeichenShrinkRounds {
+				continue
+			}
+			reason += fmt.Sprintf("，连续一致 %d/%d", rounds, catalog.BeichenShrinkRounds)
+		}
+		retain[old.Scope] = true
+		crawl.Failures = append(crawl.Failures, CrawlFailure{
+			ChannelID: old.ChannelID, Channel: old.Channel, Platform: old.Platform, Scope: old.Scope,
+			Path: "coverage", Reason: reason + "，沿用上次平台目录", Retained: true,
+			SnapshotHash: fingerprint, ConfirmationRounds: rounds,
+		})
+	}
+	if len(retain) != 0 {
+		crawl.membershipComplete = false
+		previousNames := map[string]bool{}
+		for _, section := range previous {
+			for _, model := range section.Models {
+				previousNames[model.Name] = true
+			}
+		}
+		crawl.ExpectedModelCount = max(crawl.ExpectedModelCount, len(previousNames))
+	}
+	return retain
+}
+
+func (crawl *directoryCrawl) markUnreadableScope(old directoryPlatform) bool {
+	for i, failure := range crawl.Failures {
+		if failure.Path == "coverage" {
+			continue
+		}
+		sameChannel := old.ChannelID != 0 && old.ChannelID == failure.ChannelID ||
+			old.Channel != "" && old.Channel == failure.Channel
+		if sameChannel && (failure.Platform == "" || strings.EqualFold(failure.Platform, old.Platform)) {
+			crawl.Failures[i].Retained = true
+			return true
+		}
+	}
+	return false
+}
+
+type directoryMembership struct {
+	Models []string            `json:"models"`
+	Groups map[string][]string `json:"groups"`
+}
+
+func platformMembership(section directoryPlatform) directoryMembership {
+	membership := directoryMembership{Groups: map[string][]string{}}
+	identifiers := map[string]bool{}
+	modelsByGroup := map[string]map[string]bool{}
+	groupKey := func(group directoryGroup) string {
+		if group.ID != 0 {
+			return fmt.Sprint(group.ID)
+		}
+		return "name/" + strings.ToLower(strings.TrimSpace(group.Name))
+	}
+	for _, group := range section.Groups {
+		modelsByGroup[groupKey(group)] = map[string]bool{}
+	}
+	for _, model := range section.Models {
+		name := strings.ToLower(model.Name)
+		identifiers[name] = true
+		for _, group := range directoryModelGroups(section, model) {
+			modelsByGroup[groupKey(group)][name] = true
+		}
+	}
+	for id, names := range modelsByGroup {
+		membership.Groups[id] = slices.Sorted(maps.Keys(names))
+	}
+	membership.Models = slices.Sorted(maps.Keys(identifiers))
+	return membership
+}
+
+func directoryCoverageDrop(old, current directoryPlatform, present bool) (string, string) {
+	if !present {
+		return "北辰官网平台本轮缺席，待核验", "absent"
+	}
+	before, after := platformMembership(old), platformMembership(current)
+	var reasons []string
+	if catalog.BeichenSnapshotShrank(len(before.Models), len(after.Models)) {
+		reasons = append(reasons, fmt.Sprintf("平台型号由 %d 个降至 %d 个", len(before.Models), len(after.Models)))
+	}
+	for _, id := range slices.Sorted(maps.Keys(before.Groups)) {
+		prior := before.Groups[id]
+		names, found := after.Groups[id]
+		if !found {
+			reasons = append(reasons, fmt.Sprintf("分组 %s 缺席", id))
+		} else if catalog.BeichenSnapshotShrank(len(prior), len(names)) {
+			reasons = append(reasons, fmt.Sprintf("分组 %s 型号由 %d 个降至 %d 个", id, len(prior), len(names)))
+		}
+	}
+	if len(reasons) == 0 {
+		return "", ""
+	}
+	raw, _ := json.Marshal(after)
+	return "北辰官网目录待核验：" + strings.Join(reasons, "，"), fmt.Sprintf("%x", sha256.Sum256(raw))
 }
 
 // On partial reads, replace complete scopes and preserve observations that were
@@ -81,6 +249,7 @@ func mergeWebsiteDirectory(previous, current []directoryPlatform) []directoryPla
 	for _, old := range previous {
 		i, found := seen[old.Scope]
 		if !found {
+			old.Retained = true
 			current = append(current, old)
 			continue
 		}
@@ -88,10 +257,17 @@ func mergeWebsiteDirectory(previous, current []directoryPlatform) []directoryPla
 		if !section.Incomplete {
 			continue
 		}
+		section.Groups = slices.Clone(section.Groups)
+		section.Models = slices.Clone(section.Models)
 		for _, group := range old.Groups {
 			if !slices.ContainsFunc(section.Groups, func(candidate directoryGroup) bool {
 				return group.ID == candidate.ID && (group.ID != 0 || group.Name == candidate.Name)
 			}) {
+				group.Retained = true
+				if group.ObservedAt == nil {
+					at := old.ObservedAt
+					group.ObservedAt = &at
+				}
 				section.Groups = append(section.Groups, group)
 			}
 		}
@@ -113,6 +289,18 @@ func mergeWebsiteDirectory(previous, current []directoryPlatform) []directoryPla
 		for _, model := range old.Models {
 			if !models[modelScope{model.GroupID, model.Name}] {
 				section.Models = append(section.Models, model)
+				for _, affected := range directoryModelGroups(*section, model) {
+					for j := range section.Groups {
+						group := &section.Groups[j]
+						if group.ID == affected.ID && (group.ID != 0 || group.Name == affected.Name) {
+							group.Retained = true
+							if group.ObservedAt == nil || model.ObservedAt.Before(*group.ObservedAt) {
+								at := model.ObservedAt
+								group.ObservedAt = &at
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -161,14 +349,15 @@ ORDER BY COALESCE(d.next_attempt, '-infinity'::timestamptz), p.id`, provider,
 
 func (s *Service) syncWebsiteDirectory(ctx context.Context, provider uuid.UUID, manual bool) (PanelCrawlSummary, error) {
 	lease := uuid.New()
-	var previous []byte
+	var previous, previousFailures []byte
 	err := s.db.QueryRowContext(ctx, `
 INSERT INTO beichen_website_directories(provider_id,lease_id,lease_until)
 VALUES ($1,$2,clock_timestamp()+$3::int*interval '1 second')
 ON CONFLICT(provider_id) DO UPDATE SET lease_id=EXCLUDED.lease_id,lease_until=EXCLUDED.lease_until
 WHERE (beichen_website_directories.lease_until IS NULL OR beichen_website_directories.lease_until<=clock_timestamp())
   AND ($4 OR beichen_website_directories.next_attempt<=clock_timestamp())
-RETURNING platforms`, provider, lease, leaseSeconds, manual).Scan(&previous)
+RETURNING platforms, (SELECT failures FROM beichen_crawl_runs WHERE provider_id=$1)`,
+		provider, lease, leaseSeconds, manual).Scan(&previous, &previousFailures)
 	if errors.Is(err, sql.ErrNoRows) {
 		if manual {
 			return PanelCrawlSummary{}, domain.NewError(domain.CodeInvalidTransition, "北辰官网目录正在抓取，请稍后刷新状态")
@@ -180,22 +369,56 @@ RETURNING platforms`, provider, lease, leaseSeconds, manual).Scan(&previous)
 	}
 	fetch, cancel := context.WithTimeout(ctx, jobTimeout)
 	crawl, observedErr := s.crawlWebsiteDirectory(fetch, provider, "")
-	if crawl.membershipComplete {
+	var old []directoryPlatform
+	var lastFailures []CrawlFailure
+	if json.Unmarshal(previous, &old) != nil || (len(previousFailures) != 0 && json.Unmarshal(previousFailures, &lastFailures) != nil) {
+		cancel()
+		return PanelCrawlSummary{}, errPanelAccountDB
+	}
+	retain := map[string]bool{}
+	if observedErr == nil || errors.Is(observedErr, errWebsiteDirectoryPartial) {
+		retain = crawl.checkCoverage(old, lastFailures, observedErr == nil, true)
+		if len(retain) != 0 {
+			crawl.platforms = slices.DeleteFunc(crawl.platforms, func(section directoryPlatform) bool { return retain[section.Scope] })
+			observedErr = errWebsiteDirectoryPartial
+		}
+		for _, section := range crawl.platforms {
+			if section.Incomplete && slices.ContainsFunc(old, func(prior directoryPlatform) bool { return prior.Scope == section.Scope }) {
+				for j := range crawl.Failures {
+					if crawl.Failures[j].ChannelID == section.ChannelID && crawl.Failures[j].Platform == section.Platform {
+						crawl.Failures[j].Retained = true
+					}
+				}
+			}
+		}
+	} else if len(old) != 0 {
+		for i := range crawl.Failures {
+			crawl.Failures[i].Retained = true
+		}
+	}
+	if crawl.membershipComplete && crawl.ModelCount != 0 {
 		crawl.KeyModelComparisons, crawl.KeyModelError = s.crawlKeyModels(fetch, provider, &crawl, "")
 		crawl.DurationMS = time.Since(crawl.StartedAt).Milliseconds()
 	}
 	cancel()
 	// Capture fresh records before restoring older data in a partial merge.
-	prices, err := json.Marshal(websitePriceObservations(crawl))
+	blockedGroups := map[int64]bool{}
+	for _, section := range old {
+		if retain[section.Scope] {
+			for _, group := range section.Groups {
+				blockedGroups[group.ID] = true
+			}
+		}
+	}
+	observations := slices.DeleteFunc(websitePriceObservations(crawl), func(quote groupPriceObservation) bool {
+		return blockedGroups[quote.GroupID]
+	})
+	prices, err := json.Marshal(observations)
 	if err != nil {
 		return PanelCrawlSummary{}, errPanelAccountDB
 	}
 	platforms := crawl.platforms
 	if errors.Is(observedErr, errWebsiteDirectoryPartial) {
-		var old []directoryPlatform
-		if err := json.Unmarshal(previous, &old); err != nil {
-			return PanelCrawlSummary{}, errPanelAccountDB
-		}
 		platforms = mergeWebsiteDirectory(old, platforms)
 	} else if observedErr != nil {
 		platforms = nil
@@ -310,5 +533,7 @@ WHERE d.provider_id=$1`, provider, int(2*websiteDirectoryInterval/time.Minute)).
 	if len(platforms) != 0 && stale {
 		status.State = "stale"
 	}
+	allRetained := status.LastError != nil && (status.LastRun == nil || status.LastRun.ModelCount == 0)
+	status.Groups = directoryGroupObservations(platforms, allRetained)
 	return status, platforms, nil
 }

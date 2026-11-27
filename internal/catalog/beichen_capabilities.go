@@ -77,12 +77,11 @@ type RetiredBeichenModel struct {
 	Channels []string
 }
 
-// BeichenKeyEvidenceCTE is shared by the teacher catalog and activation preview.
+// BeichenKeyEvidenceSQL is shared by model catalogs and activation preview.
 // A credential revision or an observed group transition invalidates earlier
 // catalog, pricing and probe evidence. Repeated reads of the same group do
 // not move that boundary.
-const BeichenKeyEvidenceCTE = `beichen_key_evidence AS (
- SELECT c.id AS credential_id, c.updated_at AS revision,
+const BeichenKeyEvidenceSQL = `SELECT c.id AS credential_id, c.updated_at AS revision,
    cat.last_success AS catalog_at, cat.last_error AS catalog_error,
    GREATEST(c.updated_at, changed.group_at, history.group_at,
      CASE WHEN identity.key_id IS NOT NULL AND
@@ -157,8 +156,10 @@ const BeichenKeyEvidenceCTE = `beichen_key_evidence AS (
  ) history ON true
  CROSS JOIN LATERAL (
    SELECT COALESCE(inventory.group_id,identity.group_id,observed.group_id,w.group_id,mv.group_id,access.group_id) AS group_id
- ) known
- WHERE c.provider_id=$1
+ ) known`
+
+const BeichenKeyEvidenceCTE = `beichen_key_evidence AS (
+ ` + BeichenKeyEvidenceSQL + ` WHERE c.provider_id=$1
 )`
 
 const BeichenCatalogCurrentSQL = `(e.catalog_error IS NULL AND

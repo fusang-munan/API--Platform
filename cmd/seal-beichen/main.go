@@ -1,4 +1,4 @@
-// Command seal-beichen reads a four-channel configuration from standard input
+// Command seal-beichen reads a Beichen channel configuration from standard input
 // and writes only a sealed box for the school. The public key must arrive over
 // HTTPS authenticated with the school's independently confirmed certificate.
 package main

@@ -77,6 +77,20 @@ func TestBeichenRefreshStoresOnlyActualCatalog(t *testing.T) {
 	}
 }
 
+func TestBeichenScanRobustnessProvisionChannelLifecycle(t *testing.T) {
+	s := &Service{}
+	const base = `[{"channel":"GM1","api_key":"sk-fixture-gm1"},{"channel":"G3","api_key":"sk-fixture-g3"},{"channel":"CC1","api_key":"sk-fixture-cc1"}`
+	for _, raw := range []string{base + "]", base + `,{"channel":"Gemini","status":"retired"}]`,
+		base + `,{"channel":"Gemini","status":"disabled","api_key":"sk-fixture-retired"}]`} {
+		if _, err := s.parseProvisionChannels(raw, ""); err != nil {
+			t.Errorf("could not provision without an active Gemini credential: %v", err)
+		}
+	}
+	if _, err := s.parseProvisionChannels(`[{"channel":"GM1","api_key":"sk-fixture-gm1"}]`, ""); err == nil {
+		t.Fatal("missing required channels accepted")
+	}
+}
+
 func TestValidateBeichenBaseURL(t *testing.T) {
 	for input, want := range map[string]string{
 		"https://api.beichenapi.com":     "https://api.beichenapi.com",

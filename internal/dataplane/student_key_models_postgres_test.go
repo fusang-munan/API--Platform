@@ -561,6 +561,11 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 		t.Fatalf("missing student state in directory: %s", body)
 	}
 
+	exec("UPDATE beichen_datasets SET last_success=NULL WHERE credential_id=$1 AND kind='catalog'", beichenCredential)
+	assertKeyState(verifiedIDs[0], "available", "available", "")
+	assertKeyState(terra, "maintenance", "unverified", "尚未扫描")
+	exec("UPDATE beichen_datasets SET last_success=clock_timestamp() WHERE credential_id=$1 AND kind='catalog'", beichenCredential)
+
 	exec("UPDATE beichen_datasets SET last_error='sensitive fixture detail' WHERE credential_id=$1 AND kind='catalog'", beichenCredential)
 	assertKeyState(terra, "maintenance", "unverified", "渠道目录读取失败")
 	assertKeyState(verifiedIDs[0], "available", "unverified", "渠道目录读取失败")
@@ -571,4 +576,10 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 	assertKeyState(terra, "maintenance", "maintenance", "当前线路无法接通")
 	exec("UPDATE models SET status='inactive' WHERE id=$1", terraID)
 	assertKeyState(terra, "maintenance", "disabled", "老师已停用")
+
+	exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+SELECT id,1,42,updated_at FROM provider_credentials WHERE id=$1`, beichenCredential)
+	exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+VALUES($1,1,43,clock_timestamp())`, beichenCredential)
+	assertKeyState(verifiedIDs[0], "available", "unverified", "渠道目录")
 }

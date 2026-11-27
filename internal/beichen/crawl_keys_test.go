@@ -192,12 +192,13 @@ func TestBeichenCrawlWebsiteKeyRatesPostgres(t *testing.T) {
 	}
 	keyBody = strings.Replace(keyBody, `"total":4`, `"total":5`, 1)
 	due()
-	if err := service.syncWebsiteKeyInventories(ctx); err != nil || *requests != 9 {
+	if err := service.syncWebsiteKeyInventories(ctx); err != nil || *requests != 10 {
 		t.Fatal("invalid page did not complete its scheduled failure handling")
 	}
 	after, err := service.WebsiteKeys(ctx, provider)
 	if err != nil || after.Status != "unavailable" || len(after.Keys) != 4 || after.Keys[0].ChangedAt == nil ||
-		!after.Keys[0].ChangedAt.Equal(changedAt) || after.LastSeen == nil || !after.LastSeen.Equal(now) {
+		!after.Keys[0].ChangedAt.Equal(changedAt) || after.LastSeen == nil || !after.LastSeen.Equal(now) ||
+		after.FailedPage != 1 || !strings.Contains(after.LastError, "条目数与公布总数不一致") {
 		t.Fatal("equivalent precision or partial pagination changed the last confirmed rate version")
 	}
 	var historyCount, multiplierCount int

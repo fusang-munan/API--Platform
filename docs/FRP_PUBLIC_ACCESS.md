@@ -46,7 +46,7 @@ bash scripts/compose-local.sh logs --no-color --tail=300 backend | grep 'mainten
 ### 北辰渠道配置和教师网页登录
 
 1. 学校按现有流程更新至 0.14.0 后，在已核实的学校 HTTPS 入口读取 `/.well-known/nebula-beichen-recipient`。该入口只返回收件公钥和算法。学校持久卷内的收件私钥与 HTTPS 身份各自保存。 首次取得证书时，可在浏览器的学校 HTTPS 证书详情中导出单张 DER 格式的服务器证书，用 `Get-FileHash -Algorithm SHA256 <证书路径>` 计算指纹，与校方通过独立渠道确认的 SHA-256 逐字核对。
-2. 在管理电脑的仓库目录运行 `scripts/seal-beichen.ps1 -Certificate <校方已核实的证书路径>`。工具先核对学校证书和公钥，再在本机读取四把推理 Key，写出 `internal/infrastructure/schoolseal/school-config.sealed.json`。
+2. 在管理电脑的仓库目录运行 `scripts/seal-beichen.ps1 -Certificate <校方已核实的证书路径>`。工具先核对学校证书和公钥，再在本机读取推理 Key，写出 `internal/infrastructure/schoolseal/school-config.sealed.json`。只预配 CC1、GM1 和 G3 时加 `-SkipGemini`。省略配置只跳过 Gemini 的预配，已有凭据状态由学校数据库管理。
 3. 渠道密文按学校现有的 GitHub 更新流程交付。服务器更换收件密钥时，可用校方确认的 HTTPS 入口取回新公钥，重新加密渠道配置。
 4. 教师在学校可信 HTTPS 入口进入「供应商管理 → 北辰 → 网页登录」，保存北辰网页会话，再点「测试抓取」查看平台、模型和失败项。会话加密持久保存在学校，由后台抓取与续期使用。
 

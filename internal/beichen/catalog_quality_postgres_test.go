@@ -26,6 +26,13 @@ func execCatalogTestSQL(t *testing.T, ctx context.Context, db *sql.DB, query str
 	}
 }
 
+func saveKeyCatalogFixture(ctx context.Context, tx *sql.Tx, job syncJob, entries []catalog.ProviderEntry, at time.Time) error {
+	if _, err := catalog.ReplaceCredentialEntries(ctx, tx, job.provider, job.credential, entries, at); err != nil {
+		return err
+	}
+	return recordSuccess(ctx, tx, job.credential, "catalog")
+}
+
 func saveCatalogFixture(t *testing.T, ctx context.Context, db *sql.DB, provider, credential uuid.UUID, entries []catalog.ProviderEntry, website []string) {
 	t.Helper()
 	tx, err := db.BeginTx(ctx, nil)
@@ -33,7 +40,7 @@ func saveCatalogFixture(t *testing.T, ctx context.Context, db *sql.DB, provider,
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	if err := saveKeyCatalog(ctx, tx, syncJob{provider: provider, credential: credential, kind: "catalog"}, entries, time.Now().UTC()); err != nil {
+	if err := saveKeyCatalogFixture(ctx, tx, syncJob{provider: provider, credential: credential, kind: "catalog"}, entries, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if website != nil {

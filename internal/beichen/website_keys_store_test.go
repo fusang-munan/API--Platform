@@ -33,8 +33,8 @@ func TestWebsiteKeysReportsStaleInventory(t *testing.T) {
 			mock.ExpectBegin()
 			mock.ExpectQuery("SELECT p.id FROM providers p").WithArgs(provider).
 				WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(provider))
-			mock.ExpectQuery("SELECT status,last_seen FROM beichen_website_key_sync").WithArgs(provider).
-				WillReturnRows(sqlmock.NewRows([]string{"status", "last_seen"}).AddRow(tc.stored, tc.lastSeen))
+			mock.ExpectQuery("FROM beichen_website_key_sync sync").WithArgs(provider).
+				WillReturnRows(sqlmock.NewRows([]string{"status", "last_seen", "last_error"}).AddRow(tc.stored, tc.lastSeen, nil))
 			keyRows := sqlmock.NewRows([]string{
 				"id", "name", "prefix", "group_id", "group_name", "rate", "peak_enabled", "peak_rate", "peak_start",
 				"peak_end", "observed_at", "changed_at", "status", "enabled", "created_at", "credential_id", "match_status",

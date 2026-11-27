@@ -29,11 +29,16 @@ type CrawlRun struct {
 }
 
 type CrawlFailure struct {
-	ChannelID int64  `json:"channel_id,omitempty"`
-	Channel   string `json:"channel,omitempty"`
-	Platform  string `json:"platform,omitempty"`
-	Path      string `json:"path"`
-	Reason    string `json:"reason"`
+	ChannelID          int64  `json:"channel_id,omitempty"`
+	Channel            string `json:"channel,omitempty"`
+	Platform           string `json:"platform,omitempty"`
+	GroupID            int64  `json:"group_id,omitempty"`
+	Path               string `json:"path"`
+	Reason             string `json:"reason"`
+	Retained           bool   `json:"retained,omitempty"`
+	Scope              string `json:"scope,omitempty"`
+	SnapshotHash       string `json:"snapshot_hash,omitempty"`
+	ConfirmationRounds int    `json:"confirmation_rounds,omitempty"`
 }
 
 func (run CrawlRun) panelSummary() PanelCrawlSummary {
@@ -113,6 +118,7 @@ func decodeWebsiteDirectory(body []byte, observedAt time.Time) (directoryCrawl, 
 			if readable {
 				platform.Scope = directoryScope(platform, i)
 				platform.Incomplete = len(problems.messages) != 0
+				platform.MembershipIncomplete = problems.membershipIncomplete
 				crawl.platforms = append(crawl.platforms, platform)
 			}
 		}
@@ -186,6 +192,8 @@ func decodeDirectoryPlatform(raw json.RawMessage, section directoryPlatform) (di
 			continue
 		}
 		group.AccountRate, group.AccountRateSource, group.AccountRateKeyID = nil, "", 0
+		at := section.ObservedAt
+		group.ObservedAt = &at
 		if group.ID > 0 {
 			group.OwnModels = readDirectoryModels(&section, group.websiteModelLists, group.ID,
 				fmt.Sprintf("groups[%d].", i), &sourceNames, &problems)
