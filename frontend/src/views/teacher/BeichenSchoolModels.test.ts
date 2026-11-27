@@ -176,6 +176,58 @@ function routedConditionalQuotes(cases: readonly (typeof conditionalQuoteCases)[
   return { data, inventory }
 }
 
+function sharedUpstreamConditionalModels(includeIDs: boolean) {
+  const upstream = 'gemini-4-terra'
+  const items = [
+    { id: '00000000-0000-4000-8000-000000000101', alias: 'terra-cc', key: 'cc',
+      label: 'Key CC', group: 2, groupName: 'CC 分组', rate: '0.6',
+      input: '0.000010', output: '0.000020', student: '660' },
+    { id: '00000000-0000-4000-8000-000000000102', alias: 'terra-g', key: 'g',
+      label: 'Key G', group: 3, groupName: 'G 分组', rate: '0.55',
+      input: '0.000004', output: '0.000008', student: '242' },
+  ] as const
+  const credentialIds = items.map(item => item.key)
+  const catalogKeys = items.map(item => ({
+    credential_id: item.key, group_id: item.group, label: item.label,
+    state: 'listed' as const, upstream_model: upstream,
+  }))
+  const data: TeacherOverview = {
+    comparison: [],
+    datasets: items.map(item => ({
+      kind: 'billing', credential_id: item.key, group_id: item.group, group_name: item.groupName,
+      group_rate: item.rate, group_status: 'assigned', billing_state: 'current',
+      effective_multiplier: item.rate, observed_at: keyObservedAt, last_success: quoteObservedAt,
+    })),
+    models: items.map(item => ({
+      model: upstream, credential_id: item.key, mode: 'follow', school_status: 'active', route_ready: true,
+      price_status: 'conditional', price_covered: true, price_source: 'panel',
+      price_observed_at: quoteObservedAt, school_rates: null, upstream_rates: null,
+      price_conditions: { billing_mode: 'token', input_price: item.input, output_price: item.output },
+      price_conditions_exact: { billing_mode: 'token', input_price: item.input, output_price: item.output },
+    })),
+    model_catalog: items.map(item => ({
+      model: upstream,
+      ...(includeIDs ? { school_model_id: item.id } : {}),
+      school_model: item.alias, school_status: 'active', activation: 'active',
+      catalog_state: 'key_listed', source: 'key',
+      price_state: 'conditional', price_covered: true,
+      credential_ids: credentialIds, route_count: 1, ready_count: 1,
+      bound_key_count: 2, covered_bound_key_count: 1,
+      bound_routes: [boundRoute(upstream, item.key, item.group, {
+        school_model: item.alias, credential_label: item.label,
+        price_state: 'conditional', group_checked_at: quoteObservedAt,
+      })],
+      catalog_keys: catalogKeys,
+      route_availability: responsesAvailable,
+    })),
+  }
+  const inventory = websiteKeys(...items.map(item => ({
+    credential_id: item.key, group_id: item.group, group_name: item.groupName,
+    rate: item.rate, observed_at: keyObservedAt,
+  })))
+  return { data, inventory, upstream, items }
+}
+
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset()
   toast.success.mockReset(); toast.error.mockReset()
@@ -294,7 +346,8 @@ describe('北辰模型管理', () => {
       const row = wrapper.get('[data-model="' + model + '"]')
       expect(row.get('.model-state-summary').text()).toContain('Key 覆盖 1/1 · 已发布线路 ' + (index < 4 ? 2 : 1))
       expect(row.find('[data-testid="group-mismatch"]').exists()).toBe(false)
-      expect(row.get('details [data-testid="key-catalog-gap"]').text()).toContain('该 Key 目录未列出')
+      expect(row.get('details').text()).toContain((index < 4 ? 'G3' : 'GM1') + ' Key 目录有')
+      expect(row.find('details [data-testid="key-catalog-gap"]').exists()).toBe(false)
     }
     expect(wrapper.get('.model-summary').text()).toContain('报价覆盖8 / 8')
     expect(wrapper.get('.model-diagnostics').attributes('open')).toBeUndefined()
@@ -1633,6 +1686,70 @@ describe('北辰模型管理', () => {
     await button(row, '查看档位').trigger('click')
     const dialog = wrapper.get('[aria-label="lab/tiered · 计价档位"]')
     expect(dialog.get('[data-testid="price-blocker-message"]').text()).toBe('该模型的官网报价快照已过期。')
+  })
+
+  it('同一上游两行按 catalogKey 打开各自 Key、倍率和条件价，刷新与关闭不串行', async () => {
+    const { data, inventory, upstream, items } = sharedUpstreamConditionalModels(true)
+    api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(inventory)
+    const wrapper = view()
+    await flushPromises()
+
+    const [, second] = items
+    const secondRow = wrapper.get(`[data-catalog-key="${second.id}"]`)
+    expect(secondRow.get('details').text()).toContain('Key G Key 目录有')
+    expect(secondRow.get('details').text()).not.toContain('Key CC Key')
+    await button(secondRow, '查看档位').trigger('click')
+    let dialog = wrapper.get(`[aria-label="${upstream} · 计价档位"]`)
+    expect(dialog.text()).toContain('Key G')
+    expect(dialog.text()).toContain('0.55×')
+    expect(dialog.text()).toContain('Key 分组 3')
+    expect(dialog.text()).toContain('242')
+    expect(dialog.text()).not.toContain('660')
+    expect(dialog.text()).not.toContain('Key CC')
+
+    api.beichenOverview.mockResolvedValue({
+      ...data, model_catalog: [...data.model_catalog!].reverse(),
+    })
+    await button(wrapper, '刷新模型').trigger('click')
+    await flushPromises()
+    dialog = wrapper.get(`[aria-label="${upstream} · 计价档位"]`)
+    expect(dialog.text()).toContain('Key G')
+    expect(dialog.text()).toContain('0.55×')
+    expect(dialog.text()).toContain('Key 分组 3')
+    expect(dialog.text()).toContain('242')
+    expect(dialog.text()).not.toContain('660')
+
+    const activeDialog = wrapper.findAllComponents(Dialog).at(-1)!
+    await activeDialog.vm.$emit('update:open', false)
+    await flushPromises()
+    expect(wrapper.find(`[aria-label="${upstream} · 计价档位"]`).exists()).toBe(false)
+
+    const firstRow = wrapper.get(`[data-catalog-key="${items[0].id}"]`)
+    await button(firstRow, '查看档位').trigger('click')
+    dialog = wrapper.get(`[aria-label="${upstream} · 计价档位"]`)
+    expect(dialog.text()).toContain('Key CC')
+    expect(dialog.text()).toContain('0.60×')
+    expect(dialog.text()).toContain('Key 分组 2')
+    expect(dialog.text()).toContain('660')
+    expect(dialog.text()).not.toContain('242')
+  })
+
+  it('catalogKey 缺少 UUID 时按校内名称回退，第二行仍打开自己的条件价', async () => {
+    const { data, inventory, upstream, items } = sharedUpstreamConditionalModels(false)
+    api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(inventory)
+    const wrapper = view()
+    await flushPromises()
+
+    const secondRow = wrapper.get(`[data-catalog-key="${items[1].alias}"]`)
+    await button(secondRow, '查看档位').trigger('click')
+    const dialog = wrapper.get(`[aria-label="${upstream} · 计价档位"]`)
+    expect(dialog.text()).toContain('Key G')
+    expect(dialog.text()).toContain('0.55×')
+    expect(dialog.text()).toContain('Key 分组 3')
+    expect(dialog.text()).toContain('242')
+    expect(dialog.text()).not.toContain('660')
   })
 
   it('一键启用只提交当前筛选中可启用的新旧模型', async () => {

@@ -320,7 +320,26 @@ function remainingRouteAvailability(routes: TeacherBoundRoute[], previousRecomme
       : '维护中。当前线路的协议最近一次探活均失败。', actionHint: '请核对剩余线路并重新探活。' }
 }
 
-function usageBindingSignatures(entry: TeacherCatalogModel) {
+function catalogRowCredentialIds(entry: TeacherCatalogModel) {
+  const ids = new Set<string>()
+  const hasBindings = Boolean(entry.bound_routes?.length)
+  const routes = hasBindings ? entry.bound_routes! : entry.preferred_routes ?? []
+  for (const route of routes) {
+    if (route.credential_id?.trim()) ids.add(route.credential_id.trim())
+  }
+  // Per-school bindings are authoritative when present. Credential IDs on
+  // legacy rows have no binding split, so retain them for compatibility.
+  if (!hasBindings) {
+    const credentialIds = (entry.credential_ids ?? []).filter(id => id.trim())
+    const overlapsPreferred = credentialIds.some(id => ids.has(id.trim()))
+    if (!ids.size || !overlapsPreferred) {
+      for (const id of credentialIds) ids.add(id.trim())
+    }
+  }
+  return ids
+}
+
+function usageBindingSignatures(entry: TeacherCatalogModel, credentialIds = catalogRowCredentialIds(entry)) {
   const signatures = new Set<string>()
   const routes = entry.bound_routes?.length ? entry.bound_routes : entry.preferred_routes ?? []
   const add = (credentialId?: string | null, upstream?: string | null) => {
@@ -330,7 +349,9 @@ function usageBindingSignatures(entry: TeacherCatalogModel) {
   }
   for (const route of routes) add(route.credential_id, route.upstream_model)
   for (const key of entry.catalog_keys ?? []) {
-    if (key.state === 'listed' && !key.stale) add(key.credential_id, key.upstream_model)
+    if (key.state === 'listed' && !key.stale && credentialIds.has(key.credential_id)) {
+      add(key.credential_id, key.upstream_model)
+    }
   }
   return signatures
 }
@@ -361,7 +382,8 @@ const catalog = computed(() => {
   for (const entry of modelCatalog ?? []) {
     if (entry.retired) continue
     const identity = teacherCatalogUsageKey(entry) ?? teacherCatalogReference(entry)
-    for (const signature of usageBindingSignatures(entry)) {
+    const credentialIds = catalogRowCredentialIds(entry)
+    for (const signature of usageBindingSignatures(entry, credentialIds)) {
       const models = usageUpstreamGroups.get(signature)
       if (models) models.add(identity)
       else usageUpstreamGroups.set(signature, new Set([identity]))
@@ -373,12 +395,19 @@ const catalog = computed(() => {
   return schoolCatalog({ ...data, model_catalog: modelCatalog }, props.providerId, websiteKeyGroups.value).map(row => {
     const catalogKey = (row.catalogKey ?? row.model).toLowerCase()
     const entry = entries.get(catalogKey) ?? { model: row.model, school_model: row.school }
-    const usageSharedUpstream = [...usageBindingSignatures(entry)]
+    const rowCredentialIds = catalogRowCredentialIds(entry)
+    const scopedCredentialIds = entry.credential_ids == null
+      ? undefined : entry.credential_ids.filter(id => rowCredentialIds.has(id))
+    const filteredCatalogKeys = (entry.catalog_keys ?? [])
+      .filter(key => rowCredentialIds.size === 0
+        ? scopedCredentialIds === undefined
+        : rowCredentialIds.has(key.credential_id))
+    const usageSharedUpstream = [...usageBindingSignatures(entry, rowCredentialIds)]
       .some(signature => (usageUpstreamGroups.get(signature)?.size ?? 0) > 1)
     const retired = entry.retired === true
     const source = entry.source
     const websiteOnly = entry.catalog_state === 'website_only'
-    const listed = !retired && (entry.catalog_state ? entry.catalog_state === 'key_listed' : entry.credential_ids?.length !== 0)
+    const listed = !retired && (entry.catalog_state ? entry.catalog_state === 'key_listed' : scopedCredentialIds?.length !== 0)
     const activation = entry.activation
     const preferred = (entry.preferred_routes ?? []).filter(route => route.provider_id === props.providerId && route.credential_id &&
       route.school_model.toLowerCase() === row.school.toLowerCase())
@@ -392,7 +421,7 @@ const catalog = computed(() => {
     const boundIds = new Set(entry.bound_routes
       ? boundRoutes.filter(route => route.key_enabled && route.credential_id).map(route => route.credential_id!)
       : legacyBoundIds)
-    const catalogKeys = entry.catalog_keys ?? []
+    const catalogKeys = filteredCatalogKeys
     const locations = entry.website_locations ?? []
     const catalogPending = !primaryGroupDenial && (entry.bound_catalog_pending || changedGroup)
     const keyCoverage = changedGroup ? new Set(boundRoutes.filter(route =>
@@ -432,8 +461,10 @@ const catalog = computed(() => {
     const groupPrices = currentGroupPrices(locations, credentialId ?? undefined, priceKey, priceRoute, record,
       entry.bound_routes != null, recordIdentityVerified, priceEvidence, conditional)
     const websiteTerms = groupPrices.website?.price_conditions_exact
-    const detailQuotes = row.quotes.filter(quote => hasPriceConditions(quote) || needsPriceDetails(quote.conditions) ||
-      (!quote.conditions && quote.status === 'confirmed' && quote.actual))
+    const detailQuotes = row.quotes.filter(quote =>
+      (quote.credentialId == null || rowCredentialIds.has(quote.credentialId)) &&
+      (hasPriceConditions(quote) || needsPriceDetails(quote.conditions) ||
+        (!quote.conditions && quote.status === 'confirmed' && quote.actual)))
     const detailWebsite = websiteTerms && needsPriceDetails(websiteTerms) && !detailQuotes.some(quote => quote.conditions === websiteTerms)
       ? formatPriceConditions(websiteTerms, null, true).standard : null
     const boundCatalogKeys = catalogKeys.filter(key => boundIds.has(key.credential_id) &&
@@ -485,7 +516,10 @@ const catalog = computed(() => {
   })
 })
 type CatalogRow = (typeof catalog.value)[number]
-const conditionsRow = computed(() => conditionsModel.value == null ? undefined : catalog.value.find(row => row.model === conditionsModel.value))
+const conditionsRow = computed(() => {
+  const key = conditionsModel.value?.trim().toLowerCase()
+  return key ? catalog.value.find(row => (row.catalogKey ?? row.model).trim().toLowerCase() === key) : undefined
+})
 const currentModels = computed(() => catalog.value.filter(row => !row.retired && !row.websiteOnly &&
   (row.listed || row.anomaly || row.boundKeyCount > 0)))
 const listedModels = computed(() => currentModels.value.filter(row => row.listed))
@@ -619,7 +653,11 @@ async function load(refreshedInventory?: BeichenWebsiteKeyInventory) {
     else if (websiteKeyInventory.value) websiteKeyInventory.value = { ...websiteKeyInventory.value, status: 'unavailable' }
     overview.value = result
     if (priceRow.value && catalogByModel.value.get(priceRow.value.model.toLowerCase())?.retired) priceRow.value = undefined
-    if (conditionsModel.value && catalogByModel.value.get(conditionsModel.value.toLowerCase())?.retired) conditionsModel.value = undefined
+    if (conditionsModel.value) {
+      const key = conditionsModel.value.trim().toLowerCase()
+      const row = catalog.value.find(item => (item.catalogKey ?? item.model).trim().toLowerCase() === key)
+      if (!row || row.retired) conditionsModel.value = undefined
+    }
   } catch (e) {
     if (!disposed && request === overviewRequest) {
       overview.value = undefined
@@ -1378,7 +1416,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
                   学生实价（积分 / 1M） · 输入 {{ row.groupPrices.activePrices.input ?? '—' }} · 输出 {{ row.groupPrices.activePrices.output ?? '—' }}
                 </small>
                 <small v-if="row.groupPrices.tierNote" class="row-note" data-testid="price-tier-note">{{ row.groupPrices.tierNote }}</small>
-                <button v-if="row.detailQuotes.length || row.detailWebsite" type="button" class="price-link" @click="conditionsModel = row.model">查看档位</button>
+                <button v-if="row.detailQuotes.length || row.detailWebsite" type="button" class="price-link"
+                  @click="conditionsModel = row.catalogKey ?? row.model">查看档位</button>
                 <p v-if="row.groupPrices.unmatched"
                   class="group-missing-note" data-testid="current-group-missing">当前 Key 分组未匹配</p>
               </div>
