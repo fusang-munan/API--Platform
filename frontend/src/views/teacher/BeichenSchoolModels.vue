@@ -9,8 +9,9 @@ import { useToast } from '../../composables/useToast'
 import {
   formatObservedAt, formatPriceConditions, indexWebsiteKeyGroups, keyGroupIssue, keyGroupRate, lastKnownKeyGroup,
   lastKnownKeyGroupLabel, matchingSchoolBinding, missingPriceDetailLabels, priceBelongsToWebsiteKeyGroup, priceDetailRows, schoolCatalog,
-  schoolPriceRoutes, schoolTokenPriceAt, schoolUsageCredits, schoolUsageModelMap, schoolUsagePendingNote,
-  schoolUsageSettlementNote, schoolUsageTokenNote, schoolUsageTokens, usageDispatchedCalls, usagePendingReviewCalls,
+  priceConditionsCoverBase, schoolPriceRoutes, schoolTokenPriceAt, schoolUsageCredits, schoolUsageModelLookup, schoolUsagePendingNote,
+  schoolUsageSettlementNote, schoolUsageTokenNote, schoolUsageTokens, teacherCatalogReference,
+  usageDispatchedCalls, usagePendingReviewCalls,
   verifiedWebsiteKeyBilling, websiteKeyEffectiveRate, type SchoolCatalogRow, type SchoolQuote,
   type TeacherBoundRoute, type TeacherCatalogModel, type TeacherOverview,
 } from '../../utils/beichenModels'
@@ -64,6 +65,8 @@ const priceRow = ref<SchoolCatalogRow>()
 const conditionsModel = ref<string>()
 const usageOpen = ref(false)
 const initialModel = ref('')
+const initialUsageKey = ref('')
+const initialUsageLabel = ref('')
 const websiteDirectory = computed(() => overview.value?.website_directory)
 const lastCrawl = computed(() => websiteDirectory.value?.last_run)
 const sourceLabels = { website: '官网', key: 'Key', both: '官网和 Key' } as const
@@ -152,7 +155,8 @@ function keyGroupDiagnosis(key?: BeichenCatalogKey) {
 
 function currentGroupPrices(locations: BeichenWebsiteLocation[], credentialId: string | undefined,
   key: BeichenCatalogKey | undefined, route: BeichenPreferredRoute | undefined, record: BeichenModel | undefined,
-  usesBoundRoutes: boolean, evidence?: TeacherBoundRoute, conditional?: SchoolQuote['conditionalPrice']) {
+  hasBindingSnapshot: boolean, recordIdentityVerified: boolean, evidence?: TeacherBoundRoute,
+  conditional?: SchoolQuote['conditionalPrice']) {
   const billing = credentialId ? billingByKey.value.get(credentialId) : undefined
   const prices = credentialId ? pricesByKey.value.get(credentialId) : undefined
   const websiteKey = confirmedWebsiteKey(credentialId)
@@ -194,10 +198,23 @@ function currentGroupPrices(locations: BeichenWebsiteLocation[], credentialId: s
   })
   const currentRoutePrice = evidence?.binding_ready && evidence.price_covered &&
     ['confirmed', 'manual', 'conditional'].includes(evidence.price_state)
-  const actualRates = currentRoutePrice && (!isDerived || record?.mode === 'manual') ? record?.school_rates : undefined
+  const billingMode = String(terms?.billing_mode ?? '').trim().toLowerCase()
+  const tokenBilling = !billingMode || billingMode === 'token'
+  // A pre-bound_routes response can still prove the same Key and upstream model
+  // through the selected preferred route plus the exact observed record.
+  const legacyRecordPrice = tokenBilling && !hasBindingSnapshot && recordIdentityVerified &&
+    !isDerived && record?.school_rates != null
+  const legacyQuotedPrice = tokenBilling && !hasBindingSnapshot && recordIdentityVerified &&
+    !isDerived && terms != null && groupMultiplier != null &&
+    priceConditionsCoverBase(terms, record?.price_conditions)
+  const trustedRates = currentRoutePrice || legacyRecordPrice
+  const actualRates = trustedRates && tokenBilling && (!isDerived || record?.mode === 'manual') ? record?.school_rates : undefined
   const conditionPrice = evidence?.price_state === 'conditional' && currentRoutePrice && !actualRates ? conditional : undefined
   const baseBand = conditionPrice ? schoolTokenPriceAt(conditionPrice, 0n) : null
   const baseRows = new Map(baseBand?.rows.map(field => [field.key, field]))
+  const legacyRows = new Map(legacyQuotedPrice
+    ? priceDetailRows(terms, multiplyDecimal(groupMultiplier, '1.10')).map(field => [field.key, field.credits])
+    : [])
   const studentPrice = (value?: string | number | null) => value == null ? null : multiplyDecimal(shiftDecimal(value, -6), '1.10')
   const activePrices = actualRates ? {
     input: studentPrice(actualRates.input),
@@ -208,15 +225,19 @@ function currentGroupPrices(locations: BeichenWebsiteLocation[], credentialId: s
         .find(field => field.key === 'cache_write_1h')?.credits ?? null : null,
     cache_read: studentPrice(actualRates.cache_read),
   } : {
-    input: baseRows.get('input')?.student ?? null,
-    output: baseRows.get('output')?.student ?? null,
-    cache5m: baseRows.get('cache_write_5m')?.student ?? null,
-    cache1h: baseRows.get('cache_write_1h')?.student ?? null,
-    cache_read: baseRows.get('cache_read')?.student ?? null,
+    input: baseRows.get('input')?.student ?? legacyRows.get('input') ?? null,
+    output: baseRows.get('output')?.student ?? legacyRows.get('output') ?? null,
+    cache5m: baseRows.get('cache_write_5m')?.student ?? legacyRows.get('cache_write_5m') ?? null,
+    cache1h: baseRows.get('cache_write_1h')?.student ?? legacyRows.get('cache_write_1h') ?? null,
+    cache_read: baseRows.get('cache_read')?.student ?? legacyRows.get('cache_read') ?? null,
   }
-  if (current && usesBoundRoutes) {
-    current.student = activePrices
-    if (!actualRates) current.student_source = null
+  const catalogStudent = current ? { ...current.student } : null
+  const canShowStudent = Boolean(actualRates || conditionPrice || legacyQuotedPrice && !current?.base_missing)
+  if (current) {
+    current.student = canShowStudent ? activePrices : {
+      input: null, output: null, cache5m: null, cache1h: null, cache_read: null,
+    }
+    current.student_source = canShowStudent ? 'website' : null
   }
   if (current && baseBand) {
     current.official = {
@@ -233,9 +254,16 @@ function currentGroupPrices(locations: BeichenWebsiteLocation[], credentialId: s
     current.observed_at = conditionPrice?.observedAt ?? null
   }
   const higherBands = conditionPrice?.intervals.filter(tier => tier.minTokens !== '0') ?? []
-  const tierNote = higherBands.length === 1 && higherBands[0].maxTokens == null && baseBand
-    ? `基础档 · 达 ${BigInt(higherBands[0].minTokens).toLocaleString('zh-CN')} Token 按高档`
-    : conditionPrice?.intervals.length ? (baseBand ? '基础档 · 按输入 Token 分档' : '按输入 Token 分档') : ''
+  const tierNote = conditionPrice?.onlyHigher
+    ? `仅高档 · ${BigInt(higherBands[0]?.minTokens ?? '0').toLocaleString('zh-CN')} Token 起`
+    : higherBands.length === 1 && higherBands[0].maxTokens == null && baseBand
+      ? `基础档 · 达 ${BigInt(higherBands[0].minTokens).toLocaleString('zh-CN')} Token 按高档`
+      : conditionPrice?.intervals.length ? (baseBand ? '基础档 · 按输入 Token 分档' : '按输入 Token 分档') : ''
+  const catalogParts = catalogStudent ? [
+    ['输入', catalogStudent.input], ['输出', catalogStudent.output], ['缓存写 5m', catalogStudent.cache5m],
+    ['缓存写 1h', catalogStudent.cache1h], ['缓存读', catalogStudent.cache_read],
+  ].flatMap(([label, value]) => value == null ? [] : [`${label} ${value}`]) : []
+  const catalogNote = catalogParts.length ? '官网目录参考学生价（积分 / 1M）：' + catalogParts.join(' · ') : ''
   const website = current?.price_conditions_exact
     ? { price_conditions_exact: current.price_conditions_exact, observed_at: current.observed_at }
     : null
@@ -245,7 +273,7 @@ function currentGroupPrices(locations: BeichenWebsiteLocation[], credentialId: s
     ? `历史流水参考：${reference}（每 1M Token，未作为主价）`
     : ''
   return {
-    current, website, observedAt, actualRates, activePrices, tierNote,
+    current, website, observedAt, actualRates, activePrices, tierNote, catalogNote,
     unmatched: Boolean(credentialId && groupId == null),
     currentTitle: current ? `当前 Key 分组 ${current.group_id} · ${effectiveRateText ? '生效 ' + effectiveRateText : '倍率待核实'}` : '',
     baseNote: current?.base_note ?? '',
@@ -308,17 +336,17 @@ const catalog = computed(() => {
         catalog_state: 'catalog_stale', price_covered: false, price_state: 'unverified', probe_state: 'unprobed', probe: null }
     })
     if (!changedKeys.size) return entry
-    changedGroups.add(entry.model.toLowerCase())
+    changedGroups.add(teacherCatalogReference(entry).toLowerCase())
     const catalogKeys = entry.catalog_keys?.map(key => changedKeys.has(key.credential_id) ? { ...key, stale: true } : key)
     return { ...entry, bound_routes: boundRoutes, catalog_keys: catalogKeys }
   })
-  const entries = new Map((modelCatalog ?? []).map(row => [row.model.toLowerCase(), row]))
+  const entries = new Map((modelCatalog ?? []).map(row => [teacherCatalogReference(row).toLowerCase(), row]))
   const observedPrices = new Map((data.models ?? []).map(record => [
     record.credential_id + ':' + record.model.toLowerCase(), record,
   ]))
   return schoolCatalog({ ...data, model_catalog: modelCatalog }, props.providerId, websiteKeyGroups.value).map(row => {
-    const model = row.model.toLowerCase()
-    const entry = entries.get(model) ?? { model: row.model }
+    const catalogKey = (row.catalogKey ?? row.model).toLowerCase()
+    const entry = entries.get(catalogKey) ?? { model: row.model, school_model: row.school }
     const retired = entry.retired === true
     const source = entry.source
     const websiteOnly = entry.catalog_state === 'website_only'
@@ -326,7 +354,7 @@ const catalog = computed(() => {
     const activation = entry.activation
     const preferred = (entry.preferred_routes ?? []).filter(route => route.provider_id === props.providerId && route.credential_id &&
       route.school_model.toLowerCase() === row.school.toLowerCase())
-    const changedGroup = changedGroups.has(model)
+    const changedGroup = changedGroups.has(catalogKey)
     const boundRoutes = entry.bound_routes ?? []
     const readyRoutes = boundRoutes.filter(route => route.binding_ready)
     const bindingIssue = retired ? undefined : entry.binding_issue
@@ -369,10 +397,12 @@ const catalog = computed(() => {
     const priceKey = catalogKeys.find(key => key.credential_id === credentialId)
     const upstreamModel = (priceRoute?.upstream_model ?? priceKey?.upstream_model ?? row.model).toLowerCase()
     const record = credentialId ? observedPrices.get(credentialId + ':' + upstreamModel) : undefined
+    const recordIdentityVerified = Boolean(record && credentialId && upstreamModel &&
+      record.credential_id === credentialId && record.model.toLowerCase() === upstreamModel)
     const conditional = row.quotes.find(quote => quote.credentialId === credentialId &&
       quote.upstreamModel === upstreamModel)?.conditionalPrice
     const groupPrices = currentGroupPrices(locations, credentialId ?? undefined, priceKey, priceRoute, record,
-      entry.bound_routes != null, priceEvidence, conditional)
+      entry.bound_routes != null, recordIdentityVerified, priceEvidence, conditional)
     const websiteTerms = groupPrices.website?.price_conditions_exact
     const detailQuotes = row.quotes.filter(quote => hasPriceConditions(quote) || needsPriceDetails(quote.conditions) ||
       (!quote.conditions && quote.status === 'confirmed' && quote.actual))
@@ -474,7 +504,6 @@ const batchRows = computed(() => rows.value.filter(row => row.listed))
 const hasBatchEligible = computed(() => batchRows.value.some(row => !row.active && !canEnableReason(row)))
 const monthlyUsage = computed<UsageState>(() => usageStates.value.month ?? {})
 const drawerUsage = computed<UsageState>(() => usageStates.value[range.value] ?? {})
-const usageByModel = computed(() => schoolUsageModelMap(monthlyUsage.value.data?.models))
 const monthlyStats = computed(() => {
   const totals = monthlyUsage.value.data?.totals
   const hitRate = totals?.cache_hit_rate
@@ -915,8 +944,10 @@ async function enableBatch(retry = false) {
   }
 }
 
-function openUsage(model = '') {
-  initialModel.value = model
+function openUsage(row?: CatalogRow) {
+  initialModel.value = row?.model ?? ''
+  initialUsageKey.value = row?.usageKey ?? row?.school ?? ''
+  initialUsageLabel.value = row?.model ?? ''
   range.value = 'month'
   usageOpen.value = true
 }
@@ -966,12 +997,16 @@ function missingPriceLabel(row: CatalogRow) {
   return detail ? '缺价 · ' + detail : '缺价'
 }
 
-function modelUsage(model: string) { return usageByModel.value.get(model.toLowerCase()) }
-function modelCredits(model: string) {
+function usageLookup(row: CatalogRow) {
+  return schoolUsageModelLookup(monthlyUsage.value.data?.models, row.usageKey ?? row.school, row.model)
+}
+function modelUsage(row: CatalogRow) { return usageLookup(row).model }
+function modelCredits(row: CatalogRow) {
   if (monthlyUsage.value.loading) return '读取中…'
   if (monthlyUsage.value.error) return '用量读取失败'
   if (!monthlyUsage.value.data) return '用量待读取'
-  const usage = modelUsage(model)
+  if (usageLookup(row).ambiguous) return '待确认'
+  const usage = modelUsage(row)
   if (!usage || usageDispatchedCalls(usage) === 0 && !usagePendingReviewCalls(usage)) return '本月无校内调用'
   return schoolUsageCredits(usage, true)
 }
@@ -1040,8 +1075,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
           <tr v-for="row in retiredRows" :key="row.model" :data-retired-model="row.model">
             <th scope="row" class="model-name">{{ row.model }}</th>
             <td data-label="原渠道">{{ row.historicalChannels.join('、') || '—' }}</td>
-            <td data-label="本月已扣积分">{{ modelCredits(row.model) }}</td>
-            <td data-label="历史用量"><button type="button" class="usage-link" :aria-label="'查看 ' + row.model + ' 的历史用量'" @click="openUsage(row.model)">查看历史用量</button></td>
+            <td data-label="本月已扣积分">{{ modelCredits(row) }}</td>
+            <td data-label="历史用量"><button type="button" class="usage-link" :aria-label="'查看 ' + row.model + ' 的历史用量'" @click="openUsage(row)">查看历史用量</button></td>
           </tr>
         </tbody>
       </table>
@@ -1233,7 +1268,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
           <tr><th scope="col">模型</th><th scope="col">状态与覆盖</th><th scope="col">价格</th><th scope="col">本月用量</th><th scope="col">操作</th></tr>
         </thead>
         <tbody>
-          <tr v-for="(row, index) in rows" :key="row.model" :data-model="row.model" :class="{ 'binding-issue-row': row.bindingIssue }">
+          <tr v-for="(row, index) in rows" :key="row.catalogKey ?? row.model" :data-model="row.model"
+            :data-catalog-key="row.catalogKey" :class="{ 'binding-issue-row': row.bindingIssue }">
             <th scope="row" class="model-name">{{ row.model }}</th>
             <td data-label="状态与覆盖" class="model-state">
               <div class="model-state-summary">
@@ -1295,7 +1331,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
                 </small>
                 <BeichenGroupPrices v-if="row.groupPrices.current" class="current-group-prices"
                   :row="row.groupPrices.current" :title="row.groupPrices.currentTitle"
-                  :note="row.groupPrices.baseNote" :derived-note="row.groupPrices.derivedNote">
+                  :note="row.groupPrices.baseNote"
+                  :derived-note="[row.groupPrices.derivedNote, row.groupPrices.catalogNote].filter(Boolean).join('；')">
                   <template #actions>
                     <small v-if="row.groupPrices.observedAt && row.groupPrices.observedLabel" class="group-price-note">
                       采集时间 <time :datetime="row.groupPrices.observedAt">{{ row.groupPrices.observedLabel }}（北京时间）</time>
@@ -1312,9 +1349,9 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
               </div>
             </td>
             <td data-label="本月用量" class="model-usage">
-              <button type="button" class="usage-link" :aria-label="'查看 ' + row.model + ' 用量'" @click="openUsage(row.model)">{{ modelCredits(row.model) }}</button>
-              <small v-if="modelUsage(row.model) && usageDispatchedCalls(modelUsage(row.model)) !== 0" class="row-note">Token {{ schoolUsageTokens(modelUsage(row.model)) }}</small>
-              <small v-if="usagePendingReviewCalls(modelUsage(row.model))" class="row-note">待核 {{ formatTokens(usagePendingReviewCalls(modelUsage(row.model))) }} 笔</small>
+              <button type="button" class="usage-link" :aria-label="'查看 ' + row.model + ' 用量'" @click="openUsage(row)">{{ modelCredits(row) }}</button>
+              <small v-if="modelUsage(row) && (usageDispatchedCalls(modelUsage(row)) ?? 0) !== 0" class="row-note">Token {{ schoolUsageTokens(modelUsage(row)) }}</small>
+              <small v-if="usagePendingReviewCalls(modelUsage(row))" class="row-note">待核 {{ formatTokens(usagePendingReviewCalls(modelUsage(row))) }} 笔</small>
             </td>
             <td data-label="操作">
               <div class="model-actions">
@@ -1336,7 +1373,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 
   <BeichenPriceDrawer :open="Boolean(priceRow)" :provider-id="providerId" :row="priceRow" @update:open="open => { if (!open) priceRow = undefined }" @saved="priceSaved" />
   <BeichenModelUsageDrawer v-model:open="usageOpen" :range="range" :usage="drawerUsage.data" :loading="drawerUsage.loading"
-    :error="drawerUsage.error" :initial-model="initialModel" @update:range="changeUsageRange" @retry="loadUsage(range)" />
+    :error="drawerUsage.error" :initial-model="initialModel" :initial-model-key="initialUsageKey"
+    :initial-model-label="initialUsageLabel" @update:range="changeUsageRange" @retry="loadUsage(range)" />
   <AppDialog :open="rebindOpen" title="预览北辰绑定重建" description="按当前渠道目录和模型别名更新线路。逐条确认变化后再执行。" wide
     @update:open="open => { if (!open && !rebinding) rebindOpen = false }">
     <section class="beichen-stack" :aria-busy="rebinding">

@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import type { BeichenOverview } from '../api/types'
-import { indexWebsiteKeyGroups, manualPriceDetailRows, missingPriceDetailLabels, priceDetailRows, schoolCatalog, websiteKeyEffectiveRate } from './beichenModels'
+import {
+  indexWebsiteKeyGroups, manualPriceDetailRows, missingPriceDetailLabels, priceDetailRows, schoolCatalog,
+  schoolUsageCredits, schoolUsageSettlementNote, websiteKeyEffectiveRate,
+} from './beichenModels'
 
 function overview(model: Record<string, unknown>): BeichenOverview {
   return {
@@ -120,6 +123,16 @@ describe('schoolCatalog credits', () => {
     expect(currentQuote).toMatchObject({ multiplier: '待核实', actual: null, actualRates: null })
     expect(currentQuote.conditions).toBeNull()
     expect(currentQuote.standard).toBeNull()
+  })
+})
+
+describe('legacy school usage settlement', () => {
+  it('缺少 settled_calls 和 zero_cost_calls 时只显示派发数，不把失败释放算作零额', () => {
+    const legacy = { credits: '0', tokens: 0, calls: 3, pending_calls: 0 }
+    expect(schoolUsageCredits(legacy)).toBe('0 积分 · 派发 3 笔（已结算笔数未提供）')
+    expect(schoolUsageSettlementNote(legacy)).toBe('派发 3 笔 · 已结算笔数未提供')
+    expect(schoolUsageCredits({ ...legacy, dispatched_calls: 3, settled_calls: 2, zero_cost_calls: 2 }))
+      .toBe('0 积分 · 2 次（零额）')
   })
 })
 

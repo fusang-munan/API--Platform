@@ -66,7 +66,8 @@ describe('北辰模型用量明细', () => {
     expect(student.get('th').text()).toContain('学生甲')
     expect(student.get('th small').text()).toBe('教学项目一 · 教学项目二')
     expect(student.findAll('td').map(cell => cell.text())).toEqual([
-      '1.2000000000000000001', '230 未归类 Token 40', '部分缺失', '1 笔',
+      '1.2000000000000000001 派发 4 笔 · 已结算笔数未提供',
+      '230 未归类 Token 40', '部分缺失', '1 笔',
     ])
     expect(wrapper.get('tbody').text()).not.toContain('学生乙')
     await expand.trigger('click')
@@ -103,6 +104,18 @@ describe('北辰模型用量明细', () => {
     expect(wrapper.get('[aria-label="用量汇总"]').text()).toContain('本月已扣积分9')
     expect(wrapper.get('tbody').text()).toContain('school/b')
     expect(wrapper.get('tbody').text()).not.toContain('school/a')
+  })
+
+  it('同名上游缺少校内 UUID 时不选择任意一行，显示待确认', () => {
+    const data = usage()
+    data.models = [
+      { ...metrics('1', 100), model: 'same-upstream' },
+      { ...metrics('9', 900), model: 'same-upstream' },
+    ]
+    const wrapper = drawer({ usage: data, initialModel: 'same-upstream' })
+    expect(wrapper.get('[data-testid="usage-identity-ambiguous"]').text()).toContain('用量待确认')
+    expect(wrapper.find('[aria-label="用量汇总"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('已扣积分9')
   })
 
   it('加载、读取失败和空集分别展示，旧数据没有核对字段时显示待确认', async () => {

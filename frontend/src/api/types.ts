@@ -192,6 +192,10 @@ type BeichenPanelPrice = 'input_price' | 'output_price' | 'cache_read_price' | '
   'video_input_price' | 'video_output_price' | 'per_request_price'
 export type BeichenPriceTier = Partial<Record<BeichenPanelPrice | 'min_tokens' | 'max_tokens', number | string | null>> & {
   billing_mode?: string | null
+  input_multiplier?: number | string | null
+  output_multiplier?: number | string | null
+  cache_read_multiplier?: number | string | null
+  cache_write_multiplier?: number | string | null
 }
 export type BeichenPriceConditions = BeichenPriceTier & {
   intervals?: BeichenPriceTier[] | null
@@ -662,6 +666,7 @@ export type BeichenCatalogModel = {
   model: string
   retired?: boolean
   school_model?: string | null
+  school_model_id?: string | null
   school_status?: BeichenSchoolStatus | null
   can_enable?: boolean | null
   credential_ids?: string[]
