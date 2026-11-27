@@ -61,6 +61,7 @@ type SchoolConditionalPrice = {
   base: SchoolTokenPriceBand | null
   intervals: Array<SchoolTokenPriceBand & { minTokens: string; maxTokens: string | null }>
   observedAt: string | null
+  onlyHigher: boolean
 }
 
 export const priceSourceLabels: Record<PriceSource, string> = {
@@ -109,6 +110,8 @@ export type SchoolCredentialPrice = {
 export type SchoolCatalogRow = {
   model: string
   school: string
+  catalogKey?: string
+  usageKey?: string
   status?: string | null
   canEnable?: boolean | null
   canDisable: boolean
@@ -176,11 +179,9 @@ export function usageDispatchedCalls(metrics?: SchoolUsageMetrics | null): numbe
 
 export function usageSettledCalls(metrics?: SchoolUsageMetrics | null): number | undefined {
   if (usageCount(metrics?.settled_calls)) return metrics.settled_calls
-  // An older response only has calls, whose definition was already settled calls.
-  if (usageCount(metrics?.dispatched_calls)) return undefined
-  const calls = usageDispatchedCalls(metrics)
-  const pending = usagePendingReviewCalls(metrics)
-  return pending != null && calls === pending ? 0 : calls
+  // calls is now a dispatched count. An old response cannot distinguish a
+  // released failure from a zero-cost settlement, so it is not settled evidence.
+  return undefined
 }
 
 export function usageZeroCostCalls(metrics?: SchoolUsageMetrics | null): number | undefined {
@@ -196,11 +197,46 @@ export function usageTokenMissingCalls(metrics?: SchoolUsageMetrics | null): num
   return usageCount(metrics?.token_missing_calls) ? metrics.token_missing_calls : undefined
 }
 
+function normalizedIdentity(value?: string | null) {
+  return value?.trim().toLowerCase() ?? ''
+}
+
+function schoolUsageStableKeys(model: SchoolUsageModel) {
+  const keys = [model.model_key, model.school_model_id, model.school_model]
+  if (model.school_model_id) keys.push('school:' + model.school_model_id)
+  return new Set(keys.map(normalizedIdentity).filter(Boolean))
+}
+
+function schoolUsageDisplayNames(model: SchoolUsageModel) {
+  return new Set([model.model, ...(model.upstream_models ?? [])].map(normalizedIdentity).filter(Boolean))
+}
+
+export type SchoolUsageLookup = { model?: SchoolUsageModel; ambiguous: boolean }
+
 export function schoolUsageModelMatches(model: SchoolUsageModel, value?: string | null) {
-  const target = value?.trim().toLowerCase()
+  const target = normalizedIdentity(value)
   if (!target) return true
-  const names = [model.model_key, model.school_model, model.model, model.school_model_id, ...(model.upstream_models ?? [])]
-  return names.some(name => typeof name === 'string' && name.toLowerCase() === target)
+  return schoolUsageStableKeys(model).has(target) || schoolUsageDisplayNames(model).has(target)
+}
+
+export function schoolUsageModelLookup(models: SchoolUsageModel[] | null | undefined,
+  identity?: string | null, displayFallback?: string | null): SchoolUsageLookup {
+  const target = normalizedIdentity(identity)
+  if (!target) return { ambiguous: false }
+  const rows = models ?? []
+  const stable = rows.filter(model => schoolUsageStableKeys(model).has(target))
+  if (stable.length === 1) return { model: stable[0], ambiguous: false }
+  if (stable.length > 1) return { ambiguous: true }
+  // Upstream names are display evidence only. Selecting the sole match is
+  // safe; two same-name school models without UUID evidence remain unresolved.
+  const byName = rows.filter(model => schoolUsageDisplayNames(model).has(target))
+  if (byName.length === 1) return { model: byName[0], ambiguous: false }
+  if (byName.length > 1) return { ambiguous: true }
+  const fallback = normalizedIdentity(displayFallback)
+  if (!fallback || fallback === target) return { ambiguous: false }
+  const byDisplay = rows.filter(model => schoolUsageDisplayNames(model).has(fallback))
+  if (byDisplay.length === 1) return { model: byDisplay[0], ambiguous: false }
+  return { ambiguous: byDisplay.length > 1 }
 }
 
 export function schoolUsageModelReference(model: SchoolUsageModel) {
@@ -211,17 +247,6 @@ export function schoolUsageModelLabel(model: SchoolUsageModel) {
   return model.school_model ?? model.model
 }
 
-export function schoolUsageModelMap(models?: SchoolUsageModel[] | null) {
-  const index = new Map<string, SchoolUsageModel>()
-  for (const model of models ?? []) {
-    // Prefer stable school identity over display-only upstream names.
-    for (const value of [model.school_model, model.model_key, model.school_model_id, model.model]) {
-      if (value && !index.has(value.toLowerCase())) index.set(value.toLowerCase(), model)
-    }
-  }
-  return index
-}
-
 export function schoolUsageCredits(metrics: SchoolUsageMetrics, withUnit = false) {
   const credits = shiftDecimal(metrics.credits, 0)
   if (credits === '—') return '积分未报告'
@@ -229,11 +254,14 @@ export function schoolUsageCredits(metrics: SchoolUsageMetrics, withUnit = false
   const settled = usageSettledCalls(metrics)
   const zeroCost = usageZeroCostCalls(metrics)
   const pending = usagePendingReviewCalls(metrics)
-  if (credits === '0' && settled && settled > 0 && (zeroCost == null || zeroCost >= settled)) {
+  if (credits === '0' && settled != null && zeroCost != null && zeroCost === settled && settled > 0) {
     return `0 积分 · ${formatTokens(settled)} 次（零额）`
   }
   if (credits === '0' && settled === 0 && dispatched && dispatched > 0) return '暂无已扣积分'
   if (credits === '0' && settled == null && dispatched && pending === dispatched) return '暂无已扣积分'
+  if (credits === '0' && settled == null && dispatched && !pending) {
+    return `0 积分 · 派发 ${formatTokens(dispatched)} 笔（已结算笔数未提供）`
+  }
   return withUnit ? credits + ' 积分' : credits
 }
 
@@ -250,13 +278,14 @@ export function schoolUsageTokens(metrics?: SchoolUsageMetrics) {
 }
 
 export function schoolUsageSettlementNote(metrics?: SchoolUsageMetrics | null) {
-  if (metrics?.dispatched_calls == null && metrics?.settled_calls == null && metrics?.zero_cost_calls == null) return ''
   const dispatched = usageDispatchedCalls(metrics)
   const settled = usageSettledCalls(metrics)
   const zeroCost = usageZeroCostCalls(metrics)
+  if (dispatched == null && settled == null && zeroCost == null) return ''
   const parts: string[] = []
   if (dispatched != null) parts.push(`派发 ${formatTokens(dispatched)} 笔`)
   if (settled != null) parts.push(`已结算 ${formatTokens(settled)} 笔`)
+  else if (dispatched != null) parts.push('已结算笔数未提供')
   if (zeroCost) parts.push(`零额 ${formatTokens(zeroCost)} 笔`)
   return parts.join(' · ')
 }
@@ -344,6 +373,17 @@ export function schoolPriceRoutes(entry: TeacherCatalogModel, providerId: string
   }))
 }
 
+export function teacherCatalogReference(entry: TeacherCatalogModel) {
+  return entry.school_model_id?.trim() || entry.school_model?.trim() || entry.model
+}
+
+export function teacherCatalogUsageKey(entry: TeacherCatalogModel) {
+  if (entry.school_model_id?.trim()) return entry.school_model_id.trim()
+  if (entry.school_model?.trim()) return entry.school_model.trim()
+  const names = new Set((entry.preferred_routes ?? []).map(route => route.school_model.trim()).filter(Boolean))
+  return names.size === 1 ? names.values().next().value : undefined
+}
+
 export function matchingSchoolBinding(routes: TeacherBoundRoute[] | undefined, route: BeichenPreferredRoute) {
   return routes?.find(binding => binding.credential_id === route.credential_id && binding.school_model === route.school_model &&
     binding.upstream_model === route.upstream_model && binding.protocol === route.adapter)
@@ -372,6 +412,8 @@ export function schoolCatalog(overview: TeacherOverview, providerId: string, web
     const statuses = new Set(rows.map(row => row.school_status))
     const ready = selected.some(route => route.state === 'ready')
     const ambiguous = !entry.school_model && names.size > 1 && !selected.length
+    const catalogKey = teacherCatalogReference(entry)
+    const usageKey = teacherCatalogUsageKey(entry)
     const status = ambiguous ? undefined
       : entry.school_status ?? (ready ? 'active' : statuses.size === 1 ? rows[0].school_status : undefined)
     const canDisable = status === 'active' && (entry.school_status === 'active' || selected.length > 0)
@@ -403,7 +445,7 @@ export function schoolCatalog(overview: TeacherOverview, providerId: string, web
     const modes = new Set(quoteList.map(quote => quote.mode))
     const mode = modes.size > 1 ? 'mixed' : modes.has('manual') ? 'manual' : 'follow'
     return {
-      model: entry.model, school, status, canEnable: entry.can_enable, canDisable,
+      model: entry.model, school, catalogKey, usageKey, status, canEnable: entry.can_enable, canDisable,
       routeCount: selected.length,
       readyCount: selected.filter(route => route.state === 'ready').length,
       priceReady: quoteList.length > 0 && quoteList.every(quote => quote.priceReady),
@@ -640,7 +682,7 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
   const conditionalPrice = covered && binding.price_state === 'conditional' && binding.group_id != null &&
     mode === 'follow' && !record?.school_rates && record?.price_covered !== false && !derived &&
     matchingQuote && canCalculate && terms && terms === record?.price_conditions_exact
-    ? schoolConditionalPrice(terms, formatDecimal(canCalculate), priceObservedAt) : undefined
+    ? schoolConditionalPrice(terms, formatDecimal(canCalculate), priceObservedAt, record?.price_conditions) : undefined
   const displayRate = binding && mode === 'follow' && (!covered || derived ||
     binding.price_state === 'conditional' && !conditionalPrice && !record?.school_rates) ? null : canCalculate
   const prices = terms ? formatPriceConditions(terms, displayRate, true) : null
@@ -778,7 +820,24 @@ function schoolTokenPriceBand(terms: BeichenPriceTier, rate: string, label: stri
   }) }
 }
 
-function schoolConditionalPrice(terms: BeichenPriceConditions, rate: string, observedAt?: string | null): SchoolConditionalPrice | undefined {
+function hasTierMultiplier(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const tier = value as Record<string, unknown>
+  return ['input_multiplier', 'output_multiplier', 'cache_read_multiplier', 'cache_write_multiplier']
+    .some(field => tier[field] != null)
+}
+
+export function priceConditionsCoverBase(terms?: BeichenPriceConditions | null,
+  rawTerms?: BeichenPriceConditions | null) {
+  const intervals = Array.isArray(terms?.intervals) ? terms.intervals : []
+  if (!intervals.length) return true
+  if (intervals.some(tier => tokenBoundary(tier.min_tokens).tokens === 0n)) return true
+  const rawIntervals = Array.isArray(rawTerms?.intervals) ? rawTerms.intervals : []
+  return rawIntervals.some(hasTierMultiplier)
+}
+
+function schoolConditionalPrice(terms: BeichenPriceConditions, rate: string, observedAt?: string | null,
+  rawTerms?: BeichenPriceConditions | null): SchoolConditionalPrice | undefined {
   const intervals = (Array.isArray(terms.intervals) ? terms.intervals : []).flatMap(tier => {
     if (!tier || typeof tier !== 'object' || Array.isArray(tier)) return []
     const min = tokenBoundary(tier.min_tokens)
@@ -791,8 +850,14 @@ function schoolConditionalPrice(terms: BeichenPriceConditions, rate: string, obs
     const band = schoolTokenPriceBand({ ...tier, billing_mode: tier.billing_mode ?? terms.billing_mode }, rate, label)
     return band ? [{ ...band, minTokens: min.label, maxTokens: max.tokens == null ? null : max.label }] : []
   })
-  const base = intervals.some(tier => tier.minTokens === '0') ? null : schoolTokenPriceBand(terms, rate, '基础档')
-  return base || intervals.length ? { base, intervals, observedAt: observedAt ?? null } : undefined
+  const coversBase = intervals.some(tier => tier.minTokens === '0')
+  // Without multiplier tiers, an interval list is the complete price table.
+  // The top-level rates are then only input metadata and do not cover gaps.
+  const baseEnabled = priceConditionsCoverBase(terms, rawTerms)
+  const base = baseEnabled && !coversBase ? schoolTokenPriceBand(terms, rate, '基础档') : null
+  return base || intervals.length ? {
+    base, intervals, observedAt: observedAt ?? null, onlyHigher: !base && intervals.length > 0,
+  } : undefined
 }
 
 export function schoolTokenPriceAt(price: SchoolConditionalPrice, inputTokens: bigint): SchoolTokenPriceBand | null {

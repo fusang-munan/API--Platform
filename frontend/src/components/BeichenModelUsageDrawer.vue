@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import type { BeichenModelUsage, BeichenUsageRange } from '../api/types'
 import {
-  schoolUsageCredits, schoolUsageModelLabel, schoolUsageModelMatches, schoolUsageModelReference,
+  schoolUsageCredits, schoolUsageModelLabel, schoolUsageModelLookup, schoolUsageModelReference,
   schoolUsagePendingNote, schoolUsageSettlementNote, schoolUsageTokenNote, schoolUsageTokens,
   usageDispatchedCalls, usagePendingReviewCalls, type SchoolUsageMetrics,
 } from '../utils/beichenModels'
@@ -17,6 +17,8 @@ const props = defineProps<{
   loading?: boolean
   error?: string
   initialModel?: string
+  initialModelKey?: string
+  initialModelLabel?: string
 }>()
 const emit = defineEmits<{ 'update:open': [open: boolean]; 'update:range': [range: BeichenUsageRange]; retry: [] }>()
 
@@ -34,23 +36,27 @@ const groups = [{ id: 'model', label: '按模型' }, { id: 'student', label: '�
 const completenessLabels = { complete: '完整', partial: '部分缺失', missing: '缺失' }
 const group = ref<UsageRow['kind']>('model')
 const focusedModel = ref('')
+const focusedModelLabel = ref('')
 const expandedModel = ref('')
 
-watch(() => [props.open, props.initialModel] as const, ([open, model]) => {
+watch(() => [props.open, props.initialModel, props.initialModelKey, props.initialModelLabel] as const,
+  ([open, model, key, label]) => {
   if (!open) return
   group.value = 'model'
-  focusedModel.value = model ?? ''
+  focusedModel.value = key || model || ''
+  focusedModelLabel.value = label || model || focusedModel.value
   expandedModel.value = focusedModel.value.toLowerCase()
 }, { immediate: true })
 
 const period = computed(() => ranges.find(item => item.id === props.range)?.label ?? '本月')
-const totals = computed(() => focusedModel.value
-  ? props.usage?.models?.find(row => schoolUsageModelMatches(row, focusedModel.value))
-  : props.usage?.totals)
-const noCalls = computed(() => Boolean(props.usage && (focusedModel.value && !totals.value ||
-  usageDispatchedCalls(totals.value) === 0 && !usagePendingReviewCalls(totals.value))))
+const focusedLookup = computed(() => schoolUsageModelLookup(props.usage?.models, focusedModel.value, focusedModelLabel.value))
+const identityAmbiguous = computed(() => Boolean(focusedModel.value && focusedLookup.value.ambiguous))
+const totals = computed(() => focusedModel.value ? focusedLookup.value.model : props.usage?.totals)
+const noCalls = computed(() => Boolean(props.usage && !identityAmbiguous.value &&
+  (focusedModel.value && !totals.value ||
+    usageDispatchedCalls(totals.value) === 0 && !usagePendingReviewCalls(totals.value))))
 const noCallsLabel = computed(() => props.range === 'all' ? '所选时段无校内调用' : period.value + '无校内调用')
-const keyBreakdownIncomplete = computed(() => Boolean(group.value === 'key' && focusedModel.value &&
+const keyBreakdownIncomplete = computed(() => Boolean(group.value === 'key' && focusedModel.value && !identityAmbiguous.value &&
   props.usage?.keys?.some(key => key.models == null)))
 const expandedStudents = computed(() => expandedModel.value ? accounts(expandedModel.value) : [])
 const columns = computed(() => ({ model: '模型', student: '学生账号', key: 'Key' })[group.value])
@@ -58,7 +64,8 @@ const rows = computed<UsageRow[]>(() => {
   if (group.value === 'student') return accounts(focusedModel.value)
   if (group.value === 'key') {
     return (props.usage?.keys ?? []).flatMap(key => {
-      const metrics = focusedModel.value ? key.models?.find(detail => schoolUsageModelMatches(detail, focusedModel.value)) : key
+      const metrics = focusedModel.value
+        ? schoolUsageModelLookup(key.models, focusedModel.value, focusedModelLabel.value).model : key
       if (!metrics) return []
       return [{
         id: key.api_key_id, kind: 'key', name: key.api_key_name,
@@ -66,8 +73,8 @@ const rows = computed<UsageRow[]>(() => {
       }]
     })
   }
-  return (props.usage?.models ?? [])
-    .filter(model => schoolUsageModelMatches(model, focusedModel.value))
+  const models = focusedModel.value ? (focusedLookup.value.model ? [focusedLookup.value.model] : []) : props.usage?.models ?? []
+  return models
     .flatMap(model => {
       const id = schoolUsageModelReference(model)
       const row: UsageRow = { id, kind: 'model', name: schoolUsageModelLabel(model), metrics: model }
@@ -83,7 +90,7 @@ function accounts(model: string): UsageRow[] {
   const students = new Map<string, { name: string; projects: Set<string>; metrics: SchoolUsageMetrics }>()
   for (const student of props.usage?.students ?? []) {
     const metrics: SchoolUsageMetrics | undefined = model
-      ? student.models?.find(detail => schoolUsageModelMatches(detail, model))
+      ? schoolUsageModelLookup(student.models, model, focusedModelLabel.value).model
       : student
     if (!metrics) continue
     const account = students.get(student.user_id)
@@ -137,8 +144,8 @@ function completenessLabel(metrics?: SchoolUsageMetrics) {
             @click="emit('update:range', item.id)">{{ item.label }}</button>
         </div>
         <div v-if="focusedModel" class="beichen-toolbar">
-          <span>模型 {{ focusedModel }}</span>
-          <button type="button" class="button ghost" @click="focusedModel = ''">查看全部模型</button>
+          <span>模型 {{ focusedModelLabel }}</span>
+          <button type="button" class="button ghost" @click="focusedModel = ''; focusedModelLabel = ''">查看全部模型</button>
         </div>
       </div>
       <p v-if="loading" role="status">正在读取用量…</p>
@@ -166,7 +173,10 @@ function completenessLabel(metrics?: SchoolUsageMetrics) {
           <button v-for="item in groups" :key="item.id" type="button" class="button ghost"
             :aria-pressed="group === item.id" @click="group = item.id">{{ item.label }}</button>
         </div>
-        <p v-if="noCalls" class="beichen-empty">{{ noCallsLabel }}</p>
+        <p v-if="identityAmbiguous" class="beichen-empty" data-testid="usage-identity-ambiguous">
+          同名模型缺少校内身份，用量待确认
+        </p>
+        <p v-else-if="noCalls" class="beichen-empty">{{ noCallsLabel }}</p>
         <p v-else-if="keyBreakdownIncomplete" class="beichen-note">部分 Key 的分型号明细未回报。</p>
         <table v-if="!noCalls && rows.length" class="beichen-table model-usage-table">
           <caption class="sr-only">{{ period }}{{ columns }}用量</caption>
