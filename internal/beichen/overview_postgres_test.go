@@ -122,7 +122,7 @@ FROM models WHERE model_id='active-binding'`, other)
 }
 
 func TestBeichenTeacherCoveragePostgres(t *testing.T) {
-	ctx, db, provider, _, keys := newActionsPostgres(t)
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
 	gm1, g3, cc1 := keys[1], keys[2], keys[3]
 	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
 	chat, responses := "openai_compatible", "openai_responses"
@@ -272,6 +272,28 @@ VALUES(gen_random_uuid(),$1,$2,$3,$4,clock_timestamp())`, provider, gm1, deepsee
 	if row, cap := read(deepseek[0]), capability(deepseek[0], gm1); !row.BoundCatalogPending || row.CoveredBoundKeyCount != 0 ||
 		row.ModelAvailability.Availability != "unverified" || row.LastProbeAt != nil || cap.CatalogState != "catalog_stale" || cap.PriceCovered {
 		t.Fatalf("过期目录应同时撤销两端的证据: %+v %+v", row, cap)
+	}
+
+	const withBackup = "gpt-fixture-with-backup"
+	scan(g3, []string{withBackup}, responses)
+	scan(gm1, []string{withBackup}, chat)
+	bind(withBackup, withBackup, g3, responses)
+	bind(withBackup, withBackup, gm1, chat)
+	probe(g3, withBackup, responses)
+	probe(gm1, withBackup, chat)
+	exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+VALUES($1,$3,'school','manual','teacher',$4,1000000,2000000),
+      ($2,$3,'school','manual','teacher',$4,9000000,10000000)`, g3, gm1, withBackup, actor)
+	if row := read(withBackup); row.BoundKeyCount != 2 || row.CoveredBoundKeyCount != 2 ||
+		row.ReadyCount != 2 || !capability(withBackup, g3).PriceCovered || !capability(withBackup, gm1).PriceCovered {
+		t.Fatalf("both Keys should start priced and ready: %+v", row)
+	}
+	group(gm1, 13)
+	if row := read(withBackup); row.BoundKeyCount != 2 || row.CoveredBoundKeyCount != 1 || row.ReadyCount != 1 ||
+		!row.BoundCatalogPending || !row.PriceCovered || row.PriceState != "manual" || capability(withBackup, gm1).PriceCovered ||
+		row.ModelAvailability.Availability != "available" || row.ModelAvailability.RecommendedProtocol == nil ||
+		*row.ModelAvailability.RecommendedProtocol != responses {
+		t.Fatalf("backup group change affected the primary route: %+v", row)
 	}
 }
 

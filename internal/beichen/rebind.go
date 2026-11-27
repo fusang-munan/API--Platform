@@ -38,9 +38,18 @@ type RebindChange struct {
 }
 
 type RebindPlan struct {
-	Preview      bool           `json:"preview"`
-	PreviewToken string         `json:"preview_token"`
-	Changes      []RebindChange `json:"changes"`
+	Preview          bool                    `json:"preview"`
+	PreviewToken     string                  `json:"preview_token"`
+	EvidenceVersions []RebindEvidenceVersion `json:"evidence_versions,omitempty"`
+	Changes          []RebindChange          `json:"changes"`
+}
+
+type RebindEvidenceVersion struct {
+	CredentialID       uuid.UUID `json:"credential_id"`
+	CredentialRevision time.Time `json:"credential_revision"`
+	GroupID            *int64    `json:"group_id"`
+	CatalogObservedAt  time.Time `json:"catalog_observed_at"`
+	EvidenceSince      time.Time `json:"evidence_since"`
 }
 
 type rebindSchool struct {
@@ -87,19 +96,6 @@ func (s *Service) Rebind(ctx context.Context, provider, actor uuid.UUID, preview
 	} else if err := lockAliasProvider(ctx, tx, provider); err != nil {
 		return RebindPlan{}, err
 	}
-	var ready bool
-	err = tx.QueryRowContext(ctx, `
-SELECT p.status='active' AND NOT EXISTS (
-  SELECT 1 FROM provider_credentials c
-  LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='catalog'
-  WHERE c.provider_id=p.id AND c.status='active' AND NOT `+keyCatalogCurrentSQL+`
-) FROM providers p WHERE p.id=$1`, provider).Scan(&ready)
-	if err != nil {
-		return RebindPlan{}, unavailable("核对北辰渠道目录失败", err)
-	}
-	if !ready {
-		return RebindPlan{}, domain.NewError(domain.CodeInvalidTransition, "请启用北辰供应商并成功同步所有已启用渠道的目录，再重建绑定")
-	}
 	bindings, priorities, err := readRebindBindings(ctx, tx, provider, !preview)
 	if err != nil {
 		return RebindPlan{}, unavailable("读取北辰绑定失败", err)
@@ -108,16 +104,31 @@ SELECT p.status='active' AND NOT EXISTS (
 	if err != nil {
 		return RebindPlan{}, unavailable("读取北辰重建目录失败", err)
 	}
+	versions, ready, err := readRebindEvidence(ctx, tx, provider)
+	if err != nil {
+		return RebindPlan{}, unavailable("核对北辰渠道目录失败", err)
+	}
+	if !ready {
+		return RebindPlan{}, domain.NewError(domain.CodeInvalidTransition,
+			"目录或分组待复核，请核对启用渠道的分组权限并重扫目录后重新预览")
+	}
 	changes := planRebind(bindings, entries, priorities)
-	raw, err := json.Marshal(changes)
+	rawChanges, err := json.Marshal(changes)
+	if err != nil {
+		return RebindPlan{}, unavailable("生成北辰重建预览失败", err)
+	}
+	raw, err := json.Marshal(struct {
+		EvidenceVersions []RebindEvidenceVersion
+		Changes          json.RawMessage
+	}{versions, rawChanges})
 	if err != nil {
 		return RebindPlan{}, unavailable("生成北辰重建预览失败", err)
 	}
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256(append([]byte(provider.String()), raw...)))
-	view := RebindPlan{Preview: preview, PreviewToken: fingerprint, Changes: changes}
+	view := RebindPlan{Preview: preview, PreviewToken: fingerprint, EvidenceVersions: versions, Changes: changes}
 	if !preview {
 		if token != fingerprint {
-			return RebindPlan{}, domain.NewError(domain.CodeInvalidTransition, "目录、别名或绑定已变化，请重新预览")
+			return RebindPlan{}, domain.NewError(domain.CodeInvalidTransition, "凭据、分组、目录、别名或绑定已变化，请重新预览")
 		}
 		if err := applyRebind(ctx, tx, provider, changes); err != nil {
 			return RebindPlan{}, err
@@ -128,9 +139,40 @@ SELECT p.status='active' AND NOT EXISTS (
 	}
 	if !preview && len(changes) > 0 {
 		slog.InfoContext(ctx, "北辰绑定重建", "event", "beichen_bindings_rebuilt", "actor_user_id", actor,
-			"provider_id", provider, "change_count", len(changes), "preview_token", fingerprint, "changes", string(raw))
+			"provider_id", provider, "change_count", len(changes), "preview_token", fingerprint, "changes", string(rawChanges))
 	}
 	return view, nil
+}
+
+func readRebindEvidence(ctx context.Context, tx *sql.Tx, provider uuid.UUID) ([]RebindEvidenceVersion, bool, error) {
+	var ready bool
+	var raw []byte
+	err := tx.QueryRowContext(ctx, `
+WITH `+catalog.BeichenKeyEvidenceCTE+`
+SELECT p.status='active' AND COALESCE(bool_and(`+catalog.BeichenCatalogCurrentSQL+`
+  AND `+catalog.BeichenGroupAllowsRouteSQL+`) FILTER (WHERE c.id IS NOT NULL),true),
+  COALESCE(jsonb_agg(jsonb_build_object(
+    'credential_id', c.id, 'credential_revision', e.revision, 'group_id', e.group_id,
+    'catalog_observed_at', e.catalog_at, 'evidence_since', e.evidence_since
+  ) ORDER BY c.id) FILTER (WHERE c.id IS NOT NULL),'[]'::jsonb)
+FROM providers p
+LEFT JOIN provider_credentials c ON c.provider_id=p.id AND c.status='active'
+LEFT JOIN beichen_key_evidence e ON e.credential_id=c.id
+WHERE p.id=$1 GROUP BY p.id`, provider).Scan(&ready, &raw)
+	if err != nil || !ready {
+		return nil, ready, err
+	}
+	var versions []RebindEvidenceVersion
+	if err := json.Unmarshal(raw, &versions); err != nil {
+		return nil, false, err
+	}
+	for i := range versions {
+		e := &versions[i]
+		e.CredentialRevision = e.CredentialRevision.UTC()
+		e.CatalogObservedAt = e.CatalogObservedAt.UTC()
+		e.EvidenceSince = e.EvidenceSince.UTC()
+	}
+	return versions, true, nil
 }
 
 // ConfirmCredentialSwitch only moves bindings from the selected original Key
@@ -347,15 +389,17 @@ WHERE provider_id<>$1 AND status='active' GROUP BY model_id,adapter`, provider)
 
 func readRebindCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID) ([]rebindCatalogEntry, error) {
 	rows, err := tx.QueryContext(ctx, `
-SELECT a.model,a.credential_id,c.label::text,a.raw_entry,to_json(a.supported_protocols),
-  a.catalog_source='key' AND a.last_seen_at>=c.updated_at AND `+keyCatalogCurrentSQL+`,
+WITH `+catalog.BeichenKeyEvidenceCTE+`
+SELECT a.model,k.credential_id,c.label::text,k.raw_entry,to_json(k.supported_protocols),
+  `+catalog.BeichenKeyListsModelSQL+` AND `+catalog.BeichenCatalogCurrentSQL+` AND `+catalog.BeichenGroupAllowsRouteSQL+`,
   alias.school_model IS NOT NULL,m.id,m.model_id::text
-FROM (SELECT k.model_id::text AS model,k.* FROM provider_model_catalog k WHERE k.provider_id=$1 AND k.status='active') a
-JOIN provider_credentials c ON c.id=a.credential_id AND c.provider_id=a.provider_id
-LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='catalog'
+FROM provider_model_catalog k
+JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
+JOIN beichen_key_evidence e ON e.credential_id=c.id
+CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
 `+joinModelAliasSQL+`
 LEFT JOIN models m ON m.model_id=COALESCE(alias.school_model,a.model)::citext
-WHERE c.status='active' ORDER BY a.credential_id,a.model`, provider)
+WHERE k.provider_id=$1 AND k.status='active' AND c.status='active' ORDER BY k.credential_id,a.model`, provider)
 	if err != nil {
 		return nil, err
 	}

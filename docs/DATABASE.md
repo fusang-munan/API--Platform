@@ -396,7 +396,9 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 北辰定时账单扫描、定向目录重扫及 `providercatalog` 共用每把 Key 的 `beichen_datasets.kind='billing'` 90 秒租约。应用将租约 UUID 作为轮次编号，写入前在事务中校验租约和凭据版本。`kind='catalog'` 的 `last_success` 只随接受的目录前进。`maintenance_state` 的 `beichen_catalog_shrink/<credential_uuid>` 记录待核验清单的版本、型号集合指纹和一致次数，完整接受或读取失败后清除。`kind='billing'` 的 `website_group_observation.key_billing_missing_fields` 可记录 Key 账单原始响应缺少的字段。独立官网证据继续决定该 Key 的归属是否可核实。
 
-教师覆盖和学生模型状态共用 Key 版本、分组变化时间及目录采集时间校验。历史导入的 Key 条目可提供单模型的列出证据。判断型号缺席需要 `kind='catalog'` 有本凭据及当前分组的完整成功快照。
+目录扫描收到明确的 `GROUP_NOT_ALLOWED` 时，在原扫描事务中写入 `maintenance_state` 的 `beichen_group_denial/<credential_uuid>`。其 `last_error` 保存 JSON 字段 `code` 和 `credential_revision`，`updated_at` 为数据库记录拒绝的时间。只采用版本与 `provider_credentials.updated_at` 一致的记录。普通 HTTP 403 和暂时失败沿用已有的拒绝证据，接受一份新的目录时在同一事务清除记录。
+
+教师覆盖、绑定重建和学生模型状态共用 Key 版本、分组变化时间、分组权限及目录采集时间校验。历史导入的 Key 条目可提供单模型的列出证据。判断型号缺席和重建绑定需要 `kind='catalog'` 有本凭据及当前分组的完整成功快照。确认重建持有供应商行锁，与目录持久化、别名写入和官网 Key 清单同步互斥。
 
 `0050_beichen_crawl_runs.sql` 新增 `beichen_crawl_runs`，按 `provider_id` 只保留每个供应商最近一次后台抓取的摘要，外键随供应商删除。`started_at` 记录发起时间，`duration_ms` 记录读取与解析耗时，`platform_count`、`group_count`、`model_count` 记录本轮读到的数据，`expected_model_count` 记录原响应中可辨认的去重型号数。`failures` 是 JSONB 数组，包含渠道、能辨认的平台、字段位置和错误原因。结果在同一条数据库语句中随快照及退避状态更新，只有持有有效抓取租约的任务可以写入。部分结果的计数基于合并旧快照之前的本轮响应。
 

@@ -577,6 +577,36 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 	exec("UPDATE models SET status='inactive' WHERE id=$1", terraID)
 	assertKeyState(terra, "maintenance", "disabled", "老师已停用")
 
+	t.Run("teacher and student block a disabled upstream Key", func(t *testing.T) {
+		exec(`INSERT INTO beichen_website_key_sync(provider_id,status,last_seen)
+VALUES($1,'current',clock_timestamp())`, beichenProvider)
+		defer exec("DELETE FROM beichen_website_key_sync WHERE provider_id=$1", beichenProvider)
+		exec(`INSERT INTO beichen_website_keys(provider_id,upstream_key_id,name,group_id,status,enabled,
+    credential_id,ciphertext_digest,match_status)
+SELECT provider_id,42,'Fixture Key',42,'inactive',false,id,sha256(credential_ciphertext),'matched'
+FROM provider_credentials WHERE id=$1`, beichenCredential)
+
+		target := verifiedIDs[0]
+		view, err := catalog.ReadBeichenCapabilities(ctx, db, beichenProvider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocked := slices.ContainsFunc(view.Capabilities, func(row catalog.ModelCapability) bool {
+			return row.Model == target && row.CredentialID != nil && *row.CredentialID == beichenCredential &&
+				row.GroupStatus == "not_allowed" && row.Availability == "maintenance" &&
+				len(row.AvailableProtocols) == 0 && row.RecommendedProtocol == nil
+		})
+		if !blocked {
+			t.Fatalf("teacher still offers the denied route for %s: %+v", target, view.Capabilities)
+		}
+		var page struct{ Data controlplane.ModelCatalogPage }
+		body := requireStatus(serve("GET", "/api/v1/student/model-catalog?q="+target, studentToken, ""), 200)
+		if err := json.Unmarshal([]byte(body), &page); err != nil || len(page.Data.Items) != 1 ||
+			page.Data.Items[0].RawEntry["availability_state"] != "channel_unavailable" {
+			t.Fatalf("student catalog should also block the denied route: %s (%v)", body, err)
+		}
+	})
+
 	exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
 SELECT id,1,42,updated_at FROM provider_credentials WHERE id=$1`, beichenCredential)
 	exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)

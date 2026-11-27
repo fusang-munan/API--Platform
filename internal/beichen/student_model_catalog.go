@@ -8,7 +8,8 @@ import (
 )
 
 // ReadStudentModelCatalog checks the current scan and group evidence for the
-// channels associated with these models.
+// channels associated with these models. Confirmed group restrictions count
+// as unavailable channels and an unresolved group still needs review.
 func ReadStudentModelCatalog(ctx context.Context, db *sql.DB, models []string) (map[string][]catalog.StudentChannelCatalog, error) {
 	result := make(map[string][]catalog.StudentChannelCatalog)
 	if len(models) == 0 {
@@ -29,7 +30,10 @@ WHERE m.model_id IN (SELECT name::citext FROM unnest($1::text[]) AS names(name))
   WHERE c.id IN (SELECT credential_id FROM student_model_channels)
 )
 SELECT b.model_id, b.base_url, b.credential_id, b.upstream_model,
-       `+catalog.BeichenCatalogCurrentSQL+` OR observed.listed, observed.listed
+       CASE WHEN `+catalog.BeichenGroupUnavailableSQL+` THEN true
+            WHEN `+catalog.BeichenGroupAllowsRouteSQL+` THEN `+catalog.BeichenCatalogCurrentSQL+` OR observed.listed
+            ELSE false END,
+       `+catalog.BeichenGroupAllowsRouteSQL+` AND observed.listed
 FROM student_model_channels b
 JOIN beichen_key_evidence e ON e.credential_id=b.credential_id
 LEFT JOIN provider_model_catalog k ON k.credential_id=b.credential_id AND k.provider_id=b.provider_id

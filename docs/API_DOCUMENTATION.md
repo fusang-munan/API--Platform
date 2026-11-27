@@ -316,7 +316,7 @@ data: {"revision":"01K2..."}
 
 Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场条目都返回 `protocols`、`available_protocols`、`recommended_protocol`、`probe_state`、`availability`、`availability_reason` 和 `last_probe_at`。`protocols` 是已配置且凭据有效的协议，`available_protocols` 是最近探活通过的协议。`availability` 为 `available`、`degraded`、`unverified` 或 `maintenance`，与网关的判断一致。`last_probe_at` 是当前线路最近一次探活的 UTC 时间，含失败结果，缺少有效探活记录时为 `null`。学生目录搜索在 `raw_entry` 中返回这些状态字段。
 
-学生模型广场和 Key 的授权模型返回 `availability_state`，目录搜索在 `raw_entry.availability_state` 返回同一状态。`available` 和 `degraded` 表示可用及近期探活异常仍可尝试，`unverified` 表示证据尚未核验，`maintenance` 和 `probe_failed` 分别表示线路维护和已配置线路的探活均失败。`channel_unavailable` 表示当前成功扫描的渠道目录未列出该模型，`disabled` 和 `not_published` 来自校内停用和待配置状态。状态使用已入库的目录及探活记录。凭据或分组变化后，旧分组的目录记录等待重新核验。历史导入的新鲜 Key 条目可证明该模型已列出，确认未列出需要当前目录的成功快照。
+学生模型广场和 Key 的授权模型返回 `availability_state`，目录搜索在 `raw_entry.availability_state` 返回同一状态。`available` 和 `degraded` 表示可用及近期探活异常仍可尝试，`unverified` 表示证据尚未核验，`maintenance` 和 `probe_failed` 分别表示线路维护和已配置线路的探活均失败。`channel_unavailable` 表示可核实的渠道目录均未开放该型号，包含北辰分组明确拒绝、Key 未分组或成功扫描的目录未列出型号的情况。`disabled` 和 `not_published` 来自校内停用和待配置状态。北辰绑定线路和教师能力接口共用分组权限条件。凭据或分组变化后，旧分组的目录记录等待重新核验。历史导入的新鲜 Key 条目可证明该模型已列出，确认未列出需要当前目录的成功快照。
 
 `POST /api/v1/student/api-keys/{api_key_id}/models` 接受 `{"model_ids":["gpt-4.1-mini"]}`，每批 1 至 100 个公开模型 ID。添加要求本人的 `active` Key、有效的项目访问权限及模型报价。已有线路且待验证的模型可新增授权；维护中的模型返回 `MODEL_NOT_READY`。收藏与授权各自独立。
 
@@ -417,6 +417,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 | 生成旧版北辰本机授权 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/account/export` | 供既有脚本使用，提交 `{"confirm":true}` 后返回 `beichen-session.env` |
 | 清除北辰网页登录 | DELETE | `/api/v1/teacher/providers/{provider_id}/beichen/account` | 清除已保存凭证及本机授权，并尝试退出对应的上游会话。已加载的版本交付会话可继续用于学校后台同步 |
 | 抓取北辰官网目录 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/crawl` | 手动更新官网目录，返回本轮抓取摘要 |
+| 预览或确认北辰绑定重建 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/rebind` | 按当前 Key 目录和别名调整绑定 |
 | 北辰校内试算价 | PATCH | `/api/v1/teacher/providers/{provider_id}/beichen/price` | 指定模型手动设价或恢复跟随 |
 | 北辰报价或账单导入 | POST | `/api/v1/teacher/providers/{provider_id}/beichen/import` | 按凭据导入受支持的 CSV |
 
@@ -461,6 +462,10 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 `credentials[].health` 包含 `credential`、`catalog`、`pricing`、`probe` 四个维度，各返回 `state`（`available`、`unavailable` 或 `pending`）和说明 `message`。`available_dimensions` 统计可用项。报价维度按当前可计算报价数判断。探活维度按有至少一种协议通过的模型占可探活模型的比例判断。
 
 `model_catalog[].bound_routes` 按绑定返回 `school_model`、`upstream_model`、`credential_id`、`credential_label`、`key_enabled`、`protocol`、`priority`、`group_id`、`group_status`、`group_checked_at`、`catalog_state`、`price_state`、`price_covered`、`probe_state` 与最近探活 `probe`。`published` 表示校内模型和绑定已启用。`binding_ready` 还要求当前 Key 和分组的目录可核实。`bound_key_count` 按启用的绑定 Key 去重，`covered_bound_key_count` 只计目录当前确实列出绑定上游名的 Key。`bound_catalog_pending=true` 表示至少一条绑定的目录或分组待复核。`ready_count` 按已发布且就绪的 Key 和协议去重。部分已发布线路失去目录证据也会返回 `binding_issue`。
+
+对 `/beichen/rebind` 发送 `{"preview":true}` 生成预览。返回的 `evidence_versions` 按 Key 排序，包含 `credential_id`、`credential_revision`、`group_id`、`catalog_observed_at` 和 `evidence_since`。`preview_token` 同时绑定这些版本和 `changes`。发送 `{"preview":false,"preview_token":"…"}` 确认。目录过期、权限失效或证据及计划改变时返回 `409 INVALID_STATE_TRANSITION`，教师需重新预览。
+
+`/v1/models` 明确返回 `GROUP_NOT_ALLOWED` 后，当前凭据版本在 `bound_routes` 和能力记录中返回 `group_status=not_allowed` 和 `catalog_state=group_blocked`。这把 Key 的线路退出推荐及报价覆盖。成功接受该 Key 的新目录时清除本次扫描的拒绝状态。
 
 `GET .../beichen/capabilities` 按 Key 和原始上游型号返回 `bindings`、`supported_protocols`、`available_protocols`、`responses_ready`、`recommended_protocol`、`availability` 和报价字段。`responses_ready` 表示存在当前已发布的 Responses 绑定。只有通过当轮探活的协议出现在 `available_protocols`。教师 `/api/v1/teacher/models` 的北辰线路复用同一协议判定。概览的 `route_availability` 汇总已发布线路，缺少当前绑定或探活证据时显示待核实。探活和报价都核对当前凭据版本及已知换组时间。陈旧目录保留供核对，`price_covered` 为 `false`，等待符合当前证据的探活。
 

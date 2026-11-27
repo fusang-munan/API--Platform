@@ -79,8 +79,24 @@ function normalizeSignal(value: string) {
 }
 const rescanKeys = computed(() => (overview.value?.credentials ?? []).filter(key => key.status === 'active'))
 const rescanKeyAvailable = computed(() => rescanKeys.value.some(key => key.credential_id === rescanKey.value))
+const bindingGroupDenials = computed(() => {
+  const groups = new Map<string, number | null>()
+  for (const model of overview.value?.model_catalog ?? []) {
+    for (const route of model.bound_routes ?? []) {
+      if (route.key_enabled && route.credential_id && route.group_status === 'not_allowed') {
+        groups.set(route.credential_id, route.group_id)
+      }
+    }
+  }
+  return groups
+})
 const billingByKey = computed(() => new Map((overview.value?.datasets ?? [])
-  .filter(dataset => dataset.kind === 'billing').map(dataset => [dataset.credential_id, dataset])))
+  .filter(dataset => dataset.kind === 'billing').map(dataset => {
+    const deniedGroup = bindingGroupDenials.value.get(dataset.credential_id)
+    return [dataset.credential_id, deniedGroup === undefined ? dataset : {
+      ...dataset, group_status: 'not_allowed' as const, group_id: deniedGroup ?? dataset.group_id,
+    }]
+  })))
 const pricesByKey = computed(() => new Map((overview.value?.datasets ?? [])
   .filter(dataset => dataset.kind === 'prices').map(dataset => [dataset.credential_id, dataset])))
 const websiteKeyGroups = computed(() => indexWebsiteKeyGroups(websiteKeyInventory.value))
@@ -116,11 +132,13 @@ const billingRows = computed(() => rescanKeys.value.flatMap(key => {
 const keyCapabilities = computed(() => (overview.value?.key_capabilities ?? []).map(key => {
   const group = key.website_group
   const websiteKey = confirmedWebsiteKey(key.credential_id)
-  if (!group || (websiteKey?.group_id != null && websiteKey.group_id === group.id &&
-      rateLabel(websiteKey.rate) === rateLabel(group.rate_multiplier))) {
-    return key
+  const visibleGroup = websiteKey?.group_id != null && websiteKey.group_id === group?.id &&
+    rateLabel(websiteKey.rate) === rateLabel(group.rate_multiplier) ? group : null
+  if (bindingGroupDenials.value.has(key.credential_id)) {
+    return { ...key, website_group: visibleGroup, group_status: 'not_allowed' as const,
+      models: [], models_error: '分组无权限' }
   }
-  return { ...key, website_group: null }
+  return { ...key, website_group: visibleGroup }
 }))
 const rebindModelCount = computed(() => new Set(rebindPlan.value?.changes.map(row => row.model_id)).size)
 
@@ -207,14 +225,57 @@ function currentGroupPrices(locations: BeichenWebsiteLocation[], credentialId: s
   }
 }
 
+function remainingRouteAvailability(routes: TeacherBoundRoute[], previousRecommendation?: string | null) {
+  const passed = routes.filter(route => route.probe_state === 'passed')
+  const unprobed = routes.filter(route => route.probe_state === 'unprobed')
+  const candidates = passed.length ? passed : unprobed
+  const recommended = candidates.find(route => route.protocol === previousRecommendation) ??
+    candidates.sort((left, right) => left.priority - right.priority || left.protocol.localeCompare(right.protocol))[0]
+  const lastProbeAt = routes.flatMap(route => route.probe ? [route.probe.checked_at] : [])
+    .sort((left, right) => Date.parse(right) - Date.parse(left))[0]
+  const recentPass = routes.some(route => {
+    if (!route.probe?.last_passed_at || route.probe.error_code === 'credential_unreadable') return false
+    const age = Date.now() - Date.parse(route.probe.last_passed_at)
+    return age >= 0 && age <= 7 * 24 * 60 * 60 * 1000
+  })
+  const evidence = { recommendedProtocol: recommended?.protocol, lastProbeAt }
+  if (passed.length) return { ...evidence, probeState: 'passed' as const, availability: 'available',
+    availabilityReason: '', actionHint: '可使用推荐协议接入。' }
+  if (!routes.length) return { ...evidence, probeState: 'unprobed' as const, availability: 'unverified',
+    availabilityReason: '绑定 Key 的分组已变化，请刷新模型并复核目录。', actionHint: '请用当前 Key 重扫目录并探活。' }
+  if (unprobed.length) return { ...evidence, probeState: 'unprobed' as const, availability: 'unverified',
+    availabilityReason: '已有绑定线路，当前还没有通过探活的协议。', actionHint: '发起探活以确认已发布协议。' }
+  return { ...evidence, probeState: 'failed' as const, availability: recentPass ? 'degraded' : 'maintenance',
+    availabilityReason: recentPass ? '最近一次探活失败，过去 7 天内曾探活通过。仍可尝试调用，可能请求失败。'
+      : '维护中。当前线路的协议最近一次探活均失败。', actionHint: '请核对剩余线路并重新探活。' }
+}
+
 const catalog = computed(() => {
   const data = overview.value
   if (!data) return []
-  const entries = new Map((data.model_catalog ?? []).map(row => [row.model.toLowerCase(), row]))
+  const changedGroups = new Set<string>()
+  const modelCatalog = data.model_catalog?.map(entry => {
+    const routes = entry.bound_routes
+    if (!routes?.length) return entry
+    const changedKeys = new Set<string>()
+    const boundRoutes = routes.map(route => {
+      const website = confirmedWebsiteKey(route.credential_id)
+      if (!route.key_enabled || !route.credential_id || website?.group_id == null || website.group_id === route.group_id) return route
+      if (route.group_checked_at && website.last_seen && Date.parse(website.last_seen) <= Date.parse(route.group_checked_at)) return route
+      changedKeys.add(route.credential_id)
+      return { ...route, group_id: website.group_id, group_status: 'pending', binding_ready: false,
+        catalog_state: 'catalog_stale', price_covered: false, price_state: 'unverified', probe_state: 'unprobed', probe: null }
+    })
+    if (!changedKeys.size) return entry
+    changedGroups.add(entry.model.toLowerCase())
+    const catalogKeys = entry.catalog_keys?.map(key => changedKeys.has(key.credential_id) ? { ...key, stale: true } : key)
+    return { ...entry, bound_routes: boundRoutes, catalog_keys: catalogKeys }
+  })
+  const entries = new Map((modelCatalog ?? []).map(row => [row.model.toLowerCase(), row]))
   const observedPrices = new Map((data.models ?? []).map(record => [
     record.credential_id + ':' + record.model.toLowerCase(), record,
   ]))
-  return schoolCatalog(data, props.providerId, websiteKeyGroups.value).map(row => {
+  return schoolCatalog({ ...data, model_catalog: modelCatalog }, props.providerId, websiteKeyGroups.value).map(row => {
     const model = row.model.toLowerCase()
     const entry = entries.get(model) ?? { model: row.model }
     const retired = entry.retired === true
@@ -224,16 +285,10 @@ const catalog = computed(() => {
     const activation = entry.activation
     const preferred = (entry.preferred_routes ?? []).filter(route => route.provider_id === props.providerId && route.credential_id &&
       route.school_model.toLowerCase() === row.school.toLowerCase())
-    const reportedBindings = entry.bound_routes ?? []
-    let changedGroup = false
-    const boundRoutes = reportedBindings.map(route => {
-      const website = confirmedWebsiteKey(route.credential_id)
-      if (!route.key_enabled || website?.group_id == null || website.group_id === route.group_id) return route
-      if (route.group_checked_at && website.last_seen && Date.parse(website.last_seen) <= Date.parse(route.group_checked_at)) return route
-      changedGroup = true
-      return { ...route, group_id: website.group_id, group_status: 'pending', binding_ready: false,
-        catalog_state: 'catalog_stale', price_covered: false, price_state: 'unverified', probe_state: 'unprobed', probe: null }
-    })
+    const changedGroup = changedGroups.has(model)
+    const boundRoutes = entry.bound_routes ?? []
+    const readyRoutes = boundRoutes.filter(route => route.binding_ready)
+    const remaining = changedGroup ? remainingRouteAvailability(readyRoutes, entry.route_availability?.recommended_protocol) : undefined
     const legacyBoundIds = preferred.filter(route => route.state === 'ready').map(route => route.credential_id!)
     const boundIds = new Set(entry.bound_routes
       ? boundRoutes.filter(route => route.key_enabled && route.credential_id).map(route => route.credential_id!)
@@ -244,34 +299,40 @@ const catalog = computed(() => {
     const keyCoverage = changedGroup ? new Set(boundRoutes.filter(route =>
       route.key_enabled && route.credential_id && route.catalog_state === 'key_listed').map(route => route.credential_id)).size
       : entry.covered_bound_key_count ?? boundIds.size
-    const readyCount = changedGroup ? new Set(boundRoutes.filter(route => route.binding_ready)
-      .map(route => route.credential_id + ':' + route.protocol)).size : entry.ready_count ?? row.readyCount
+    const readyCount = changedGroup ? new Set(readyRoutes.map(route => route.credential_id + ':' + route.protocol)).size
+      : entry.ready_count ?? row.readyCount
     const routeCount = entry.route_count ?? row.routeCount
-    const priceState = changedGroup ? 'unverified' : entry.price_state ?? oldPriceState(row)
+    const priceStates = new Set(readyRoutes.map(route => route.price_state))
+    const priceState = changedGroup ? (priceStates.size > 1 ? 'mixed' : priceStates.values().next().value ?? 'unverified')
+      : entry.price_state ?? oldPriceState(row)
     const priceBlocker = changedGroup ? undefined : entry.price_blocker?.message.trim()
-    const priceCovered = !retired && !websiteOnly && !changedGroup && (entry.price_covered ?? row.priceReady)
+    const priceCovered = !retired && !websiteOnly && (changedGroup ? readyRoutes.some(route => route.price_covered)
+      : entry.price_covered ?? row.priceReady)
     const routeBlocked = routeCount === 0 || entry.blockers?.some(blocker => blocker.code === 'no_ready_route') === true
     const blockerMessages = (entry.blockers ?? [])
       .filter(blocker => !routeBlocked || (blocker.code !== 'missing_price' && blocker.code !== 'conditional_price'))
       .map(blocker => blocker.message?.trim()).filter(Boolean)
     const hasKnownGroup = (id?: string | null) => confirmedWebsiteKey(id)?.group_id != null
-    const priceRoute = changedGroup ? undefined : schoolPriceRoutes(entry, props.providerId, row.school)
+    const matchingBinding = (priceRoute: BeichenPreferredRoute) => boundRoutes.find(route =>
+      route.credential_id === priceRoute.credential_id && route.school_model === priceRoute.school_model &&
+      route.upstream_model === priceRoute.upstream_model && route.protocol === priceRoute.adapter)
+    const priceRoute = schoolPriceRoutes(entry, props.providerId, row.school)
       .sort((left, right) => Number(right.state === 'ready') - Number(left.state === 'ready') ||
+        (changedGroup ? Number(Boolean(matchingBinding(right)?.price_covered)) - Number(Boolean(matchingBinding(left)?.price_covered)) : 0) ||
         Number(right.school_model === row.school) - Number(left.school_model === row.school) ||
         (!entry.bound_routes ? Number(hasKnownGroup(right.credential_id)) - Number(hasKnownGroup(left.credential_id)) : 0) ||
         left.priority - right.priority)[0]
-    const priceEvidence = priceRoute ? boundRoutes.find(route => route.credential_id === priceRoute.credential_id &&
-      route.upstream_model === priceRoute.upstream_model && route.protocol === priceRoute.adapter) : undefined
+    const priceEvidence = priceRoute ? matchingBinding(priceRoute) : undefined
     const listedKeys = catalogKeys.filter(key => key.state === 'listed' && !key.stale)
     const published = row.status === 'active' || activation === 'active' || boundRoutes.some(route => route.published)
-    const credentialId = changedGroup ? undefined : priceRoute?.credential_id ??
+    const credentialId = priceRoute?.credential_id ??
       (!published ? (listedKeys.find(key => confirmedWebsiteKey(key.credential_id)?.group_id != null) ?? listedKeys[0])?.credential_id : undefined)
     const priceKey = catalogKeys.find(key => key.credential_id === credentialId)
     const upstreamModel = (priceRoute?.upstream_model ?? priceKey?.upstream_model ?? row.model).toLowerCase()
     const record = credentialId ? observedPrices.get(credentialId + ':' + upstreamModel) : undefined
     const groupPrices = currentGroupPrices(locations, credentialId ?? undefined, priceKey, priceRoute, record, priceEvidence)
     const websiteTerms = groupPrices.website?.price_conditions_exact
-    const detailQuotes = changedGroup ? [] : row.quotes.filter(quote => hasPriceConditions(quote) || needsPriceDetails(quote.conditions) ||
+    const detailQuotes = row.quotes.filter(quote => hasPriceConditions(quote) || needsPriceDetails(quote.conditions) ||
       (!quote.conditions && quote.status === 'confirmed' && quote.actual))
     const detailWebsite = websiteTerms && needsPriceDetails(websiteTerms) && !detailQuotes.some(quote => quote.conditions === websiteTerms)
       ? formatPriceConditions(websiteTerms, null, true).standard : null
@@ -292,13 +353,13 @@ const catalog = computed(() => {
     const groupMismatch = missingGroup || groupDiagnoses.has('model_outside_key_group')
     const groupRateMismatch = groupDiagnoses.has('group_rate_mismatch') ||
       (groupDiagnoses.has('price_outside_key_group') && !priceCovered)
-    const availability = changedGroup ? 'unverified' : entry.route_availability?.availability
+    const availability = remaining?.availability ?? entry.route_availability?.availability
     const bindingIssue = retired ? undefined : entry.binding_issue
     const anomaly = !retired && !websiteOnly && (Boolean(bindingIssue || groupMismatch || groupRateMismatch || deniedGroups.length || catalogPending) ||
       published && ['maintenance', 'degraded', 'unavailable'].includes(availability ?? ''))
     const active = !retired && !anomaly && published && row.status !== 'pending_configuration' && readyCount > 0
-    const availableProtocols = entry.route_availability?.protocols ?? []
-    const protocolNames = availableProtocols.length ? availableProtocols : entry.protocols ?? []
+    const availableProtocols = remaining ? readyRoutes.map(route => route.protocol) : entry.route_availability?.protocols ?? []
+    const protocolNames = remaining || availableProtocols.length ? availableProtocols : entry.protocols ?? []
     const priceMissing = !retired && !websiteOnly && !priceCovered && priceState !== 'unverified' &&
       (priceState === 'missing' || priceState === 'derived' || Boolean(priceBlocker)) &&
       (entry.price_covered === false || Boolean(priceBlocker) || !websiteTerms ||
@@ -312,13 +373,13 @@ const catalog = computed(() => {
       listed, websiteOnly, source, locations, groupPrices, detailQuotes, detailWebsite,
       catalogKeys, groupMismatch, deniedGroups, missingGroup, groupRateMismatch,
       protocolLabels: [...new Set(protocolNames)].map(protocolLabel),
-      probeState: changedGroup ? 'unprobed' as const : entry.probe_state,
-      recommendedProtocol: changedGroup ? undefined : entry.route_availability?.recommended_protocol,
+      probeState: remaining?.probeState ?? entry.probe_state,
+      recommendedProtocol: remaining ? remaining.recommendedProtocol : entry.route_availability?.recommended_protocol,
       availability,
-      availabilityReason: changedGroup ? '绑定 Key 的分组已变化，请刷新模型并复核目录。' : entry.route_availability?.availability_reason,
-      actionHint: entry.action_hint,
+      availabilityReason: remaining?.availabilityReason ?? entry.route_availability?.availability_reason,
+      actionHint: remaining?.actionHint ?? entry.action_hint,
       protocolMissing: (routeCount === 0 || entry.protocols?.length === 0 && !availableProtocols.length) && !catalogPending,
-      lastProbeAt: changedGroup ? undefined : entry.last_probe_at,
+      lastProbeAt: remaining ? remaining.lastProbeAt : entry.last_probe_at,
       bindingIssue,
     }
   })
@@ -1136,7 +1197,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
                   <li v-for="(route, routeIndex) in row.boundRoutes" :key="routeIndex">
                     {{ route.school_model }} · {{ route.upstream_model }} · {{ route.credential_label || 'Key 待核实' }} · {{ protocolLabel(route.protocol) }}
                     <template v-if="route.group_id != null"> · 分组 {{ route.group_id }}</template>
-                    · {{ route.catalog_state === 'key_listed' ? '目录有' : route.catalog_state === 'catalog_stale' || route.catalog_state === 'catalog_unverified' ? '目录待复核' : '目录未列出' }}
+                    · {{ route.group_status === 'not_allowed' ? '分组无权限' : route.group_status === 'not_found' ? 'Key 分组不存在'
+                      : route.catalog_state === 'key_listed' ? '目录有' : route.catalog_state === 'catalog_stale' || route.catalog_state === 'catalog_unverified' ? '目录待复核' : '目录未列出' }}
                     · {{ route.price_covered ? '报价可计算' : route.price_state === 'missing' ? '缺报价' : '报价待核实' }}
                     · {{ route.binding_ready ? '已发布' : route.published ? '线路待核对' : '未发布' }} · {{ probeLabels[route.probe_state as keyof typeof probeLabels] ?? '待探活' }}
                   </li>
