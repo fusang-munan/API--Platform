@@ -36,6 +36,7 @@ export const routes: RouteRecordRaw[] = [
     { path: 'teacher/project-budgets', redirect: '/teacher/projects' },
     { path: 'teacher/projects', name: 'teacher-projects', component: TeacherProjects, meta: { role: 'teacher', title: '项目管理' } },
     { path: 'teacher/project-spend', name: 'teacher-project-spend', component: TeacherProjectSpend, meta: { role: 'teacher', title: '项目监控' } },
+    { path: 'teacher/student-usage', name: 'teacher-student-usage', component: () => import('../views/teacher/TeacherStudentUsage.vue'), meta: { role: 'teacher', title: '学生用量' } },
     { path: 'teacher/providers', name: 'teacher-providers', component: TeacherProviders, meta: { role: 'teacher', title: '供应商管理' } },
     { path: 'teacher/models', name: 'teacher-models', component: TeacherModels, meta: { role: 'teacher', title: '模型管理' } },
   ] }

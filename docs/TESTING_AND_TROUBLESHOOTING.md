@@ -378,6 +378,25 @@ go test ./...
 - Token 总量大于四项之和时，查看 `token_coverage.unclassified_tokens`。分项为 `null` 时，用同一账月的逐笔 `usage_state`、`usage_reason` 和原始协议计数核对。缓存命中率的实际样本数在 `cache_hit_coverage.sample_calls`。
 - 待核与在途金额差异可用同一账月的 `pending_review_calls`、`pending_review_credits` 和 `in_flight_credits` 复核。账页间的已用和次数应比较同一账月的服务端汇总 `data.totals`、`data.models`，最近调用分页可用来查对应的逐笔状态。
 
+### 教师学生用量
+
+配置隔离的本机 `NEBULA_TEST_POSTGRES` 后执行以下检查。
+
+```powershell
+go test ./internal/usage ./internal/controlplane ./internal/api/http -run 'Test(TeacherStudentUsage|StudentUsageContract)' -count=1 -v
+go vet ./internal/usage ./internal/controlplane ./internal/api/http
+cd frontend
+npm test -- TeacherStudentUsage router
+npm run typecheck
+npm run build
+```
+
+PostgreSQL 样例覆盖两位同名学生、共享两个项目、每个项目多把历史 Key 和多模型，核对精确积分、调用和已知 Token 的逐层加总，以及停用或退出项目后的历史、零额、待核、账月边界、归档归属和分页排序。HTTP 测试验证教师鉴权、禁缓存、无效参数和明细为空的状态码。前端测试覆盖查询、翻页、下钻、空态、加载失败重试及切换条件后的过期明细。
+
+- 金额看起来对不上时，使用相同的 `month`、`project_id` 对比学生行的 `credits` 和明细的 `totals.credits`，再核对项目及 Key 的 `used`。用量查询使用受理账月，调用发生时间可能跨自然月。已扣积分与 `pending_review_credits` 各有独立口径。
+- 缺 Token 或最近时间但有已结算记录时，检查 `monthly_usage_cube` 是否仍有对应维度并查看明细 `token_coverage`。原始逐笔记录到期后，账本保留积分和次数。
+- 切换项目后「未确认归属 / 校方使用」仍按整个学校账月汇总。检查归档的 `occurred_at`、响应声明的冲突状态及匹配的回执或派发快照，确认哪些流水已有可核验归属。
+
 ### 北辰网页报价持续为 0/4
 
 先从已核实的学校 HTTPS 入口读 `/.well-known/nebula-release.txt`。学校若显示 0.15.0，采价任务还依赖预配的分组行。同步可以先写入 Key 账单倍率，随后因缺少分组而跳过官网价表。北辰的标准 Key 账单格式可以省略分组 ID，网页价表本身要求登录。价格成功数统计有效的报价快照，流水成功数取决于有效的上游 Key 绑定和已成功读取的流水分页。
