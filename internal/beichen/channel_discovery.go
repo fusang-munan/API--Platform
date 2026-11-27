@@ -30,6 +30,7 @@ type listedKey struct {
 	fingerprint   *[sha256.Size]byte
 	prefixPreview string
 	groupIDKnown  bool
+	checkedAt     time.Time
 }
 
 // The inventory retains a fingerprint and a short prefix for an unmasked Key.
@@ -63,6 +64,7 @@ func (s *Service) readAccountKeys(ctx context.Context, token string, modelKeys m
 	if !validPanelBearer(token) {
 		return nil, errKeyList
 	}
+	checkedAt := s.now().UTC().Truncate(time.Microsecond)
 	var keys []listedKey
 	seen := map[int64]bool{}
 	total := -1
@@ -111,6 +113,7 @@ func (s *Service) readAccountKeys(ctx context.Context, token string, modelKeys m
 		}
 		for _, item := range d.Items {
 			k := item.listedKey
+			k.checkedAt = checkedAt
 			if k.ID <= 0 || k.ID > 9007199254740991 || seen[k.ID] || k.UserID <= 0 || owner != 0 && k.UserID != owner {
 				return nil, errKeyList
 			}
@@ -170,7 +173,7 @@ func identifyChannel(secret, channel, label string, keys []listedKey) (listedKey
 		return key, errKeyGroupMissing
 	}
 	if !validWebsiteGroupID(key.GroupID) {
-		return listedKey{}, errPanelGroupUnverified
+		return key, errPanelGroupUnverified
 	}
 	return key, nil
 }

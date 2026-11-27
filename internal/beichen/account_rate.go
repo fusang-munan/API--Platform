@@ -68,7 +68,7 @@ func (s *Service) fetchVerifiedKeyAccountRate(ctx context.Context, credential uu
 		var readErr keyBillingReadError
 		switch {
 		case errors.Is(err, errKeyGroupNotAllowed):
-			err = accountRateUnverified("Key 账单读取失败（HTTP 403，分组无权限）")
+			return billingInfo{}, time.Time{}, err
 		case errors.As(err, &readErr):
 			err = accountRateReadFailed("Key 账单读取失败", readErr.cause)
 		default:

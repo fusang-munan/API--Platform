@@ -79,6 +79,15 @@ func readKeyCapabilities(ctx context.Context, tx *sql.Tx, provider uuid.UUID, da
 			}
 		}
 		billingData := billing[key.CredentialID]
+		if binding := billingData.confirmedKeyBinding; binding != nil {
+			if key.WebsiteKeyID != nil && *key.WebsiteKeyID != binding.KeyID {
+				modelList, daily, stats = nil, nil, nil
+				key.WebsiteGroup, key.ModelsFetchedAt, key.ModelsError = nil, nil, nil
+				key.Unit, key.UsageFetchedAt, key.UsageError = nil, nil, nil
+				key.DayUnit, key.DayFetchedAt, key.ModelStatsDay, key.ModelStatsAt = nil, nil, nil, nil
+			}
+			key.WebsiteKeyID = &binding.KeyID
+		}
 		if billingData.GroupStatus != "" && (billingData.GroupID == nil ||
 			key.WebsiteGroup == nil || *billingData.GroupID != key.WebsiteGroup.ID) {
 			// A model list from another group cannot describe the current group.
@@ -91,7 +100,7 @@ func readKeyCapabilities(ctx context.Context, tx *sql.Tx, provider uuid.UUID, da
 			binding, fetched := billingData.confirmedKeyBinding, key.ModelsFetchedAt
 			// A successful model refresh timestamps the group snapshot written
 			// in the same Key usage check.
-			if billingData.GroupStatus != "assigned" || binding == nil || binding.GroupID != snapshot.ID ||
+			if billingData.GroupStatus != "assigned" || binding == nil || binding.GroupID == nil || *binding.GroupID != snapshot.ID ||
 				key.WebsiteKeyID == nil || binding.KeyID != *key.WebsiteKeyID || key.ModelsError != nil ||
 				fetched == nil || fetched.After(now) || now.Sub(*fetched) > keyUsageFreshness {
 				snapshot.AccountRate = nil

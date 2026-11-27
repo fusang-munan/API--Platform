@@ -631,3 +631,310 @@ func (f *accountRateJobFixture) readBilling() (Dataset, KeyCapability) {
 	}
 	return datasetForCredential(f.t, view, f.job.credential, "billing"), view.KeyCapabilities[index]
 }
+
+// These tests use the repository's isolated PostgreSQL and in-memory HTTP fixtures.
+func TestIndependentReviewDeniedGroupFallbackPostgres(t *testing.T) {
+	for _, deniedPath := range []string{billingPath, modelsPath, "models-without-derived"} {
+		t.Run(deniedPath, func(t *testing.T) {
+			f := newAccountRateJobFixture(t)
+			reviewEnablePricedChannel(f)
+			requestPath := deniedPath
+			if deniedPath == "models-without-derived" {
+				requestPath = modelsPath
+				f.groupID = 17
+				f.quote = websiteGroupFixture(17, "0.6", accountRateFixtureTerms)
+			}
+			f.syncBilling()
+			original := f.service.client.Transport
+			f.service.client.Transport = panelTransport(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Host == "api.beichenapi.com" && req.URL.Path == requestPath {
+					return &http.Response{StatusCode: http.StatusForbidden, Body: io.NopCloser(strings.NewReader(
+						`{"error":{"type":"GROUP_NOT_ALLOWED","message":"fixture-private-upstream"}}`))}, nil
+				}
+				return original.RoundTrip(req)
+			})
+			busy, err := f.service.runJob(f.ctx, f.job, true)
+			if err != nil && strings.Contains(err.Error(), "fixture-private-upstream") {
+				t.Fatal("upstream message reached the returned error")
+			}
+			item, _ := f.readBilling()
+			if item.LastError != nil && strings.Contains(*item.LastError, "fixture-private-upstream") {
+				t.Fatal("upstream message reached the billing dataset")
+			}
+			quote, priced := reviewCurrentQuote(f)
+			denied := errors.Is(err, errKeyGroupNotAllowed)
+			t.Logf("denied=%t; status=%s; billing=%s; quote_group=%d; priced_channels=%d",
+				denied, item.GroupStatus, item.BillingState, quote, priced)
+			if busy || !denied || item.GroupStatus != "not_allowed" || item.BillingState != "stale" || quote != 0 || priced != 0 {
+				t.Fatal("explicit denial must retire the quote and block the group default")
+			}
+		})
+	}
+}
+
+type reviewOldJobContext struct{}
+
+func TestIndependentReviewGroupRateBindingRacePostgres(t *testing.T) {
+	f := newAccountRateJobFixture(t)
+	reviewEnablePricedChannel(f)
+	f.service.now = time.Now
+	f.syncBilling()
+	original := f.service.client.Transport
+	arrived, release := make(chan struct{}), make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	f.service.client.Transport = panelTransport(func(req *http.Request) (*http.Response, error) {
+		old := req.Context().Value(reviewOldJobContext{}) != nil
+		switch {
+		case old && req.URL.Path == "/api/v1/groups/rates":
+			response, err := original.RoundTrip(req)
+			close(arrived)
+			select {
+			case <-release:
+				return response, err
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+		case old && req.URL.Path == billingPath:
+			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(""))}, nil
+		default:
+			return original.RoundTrip(req)
+		}
+	})
+	result := reviewRunOldJob(f, f.job, arrived)
+	f.groupID = 17
+	f.quote = websiteGroupFixture(f.groupID, "0.8", accountRateFixtureTerms)
+	f.refreshUsage()
+	beforeQuote, beforePriced := reviewCurrentQuote(f)
+	close(release)
+	err := <-result
+	afterQuote, afterPriced := reviewCurrentQuote(f)
+	item, _ := f.readBilling()
+	if item.GroupID == nil || *item.GroupID != 17 {
+		t.Fatal("new group 17 was not recorded in the overview")
+	}
+	t.Logf("overview_group=%d; quote_before_old_finish=%d; priced_before=%d; old_finish_succeeded=%t; quote_after=%d; priced_after=%d",
+		*item.GroupID, beforeQuote, beforePriced, err == nil, afterQuote, afterPriced)
+	if beforeQuote != 0 || beforePriced != 0 || err == nil || afterQuote != 0 || afterPriced != 0 {
+		t.Fatal("a quote for group 16 must stop when group 17 is confirmed")
+	}
+}
+
+func TestIndependentReviewPersonalDelayedKeyListPostgres(t *testing.T) {
+	f := newAccountRateJobFixture(t)
+	reviewEnablePricedChannel(f)
+	f.service.now = time.Now
+	f.refreshUsage()
+	original := f.service.client.Transport
+	arrived, release := make(chan struct{}), make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	f.service.client.Transport = panelTransport(func(req *http.Request) (*http.Response, error) {
+		if req.Context().Value(reviewOldJobContext{}) != nil {
+			switch req.URL.Path {
+			case "/api/v1/keys":
+				response, err := original.RoundTrip(req)
+				close(arrived)
+				select {
+				case <-release:
+					return response, err
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				}
+			case billingPath:
+				body := fmt.Sprintf(`{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token",
+					"api_key_id":12094,"group_id":16,"group_rate_multiplier":0.6,"effective_rate_multiplier":0.6,
+					"peak_rate_enabled":false,"observed_at":%q}`, time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano))
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+			}
+		}
+		return original.RoundTrip(req)
+	})
+	result := reviewRunOldJob(f, f.job, arrived)
+	f.groupID = 0
+	usage := syncJob{provider: f.job.provider, credential: f.job.credential, kind: "key_usage"}
+	if busy, err := f.service.runJob(f.ctx, usage, true); busy || !errors.Is(err, errKeyGroupMissing) {
+		t.Fatal("newer check did not confirm an unassigned Key")
+	}
+	item, _ := f.readBilling()
+	if item.GroupStatus != "not_found" {
+		t.Fatal("newer confirmed unassignment was not stored")
+	}
+	close(release)
+	err := <-result
+	item, _ = f.readBilling()
+	quote, priced := reviewCurrentQuote(f)
+	t.Logf("old_finish_succeeded=%t; group_status=%s; rate_source=%s; quote_group=%d; priced_channels=%d",
+		err == nil, item.GroupStatus, item.AccountRateSource, quote, priced)
+	if err == nil || item.GroupStatus != "not_found" || quote != 0 || priced != 0 {
+		t.Fatal("the delayed response must not replace a confirmed unassigned binding")
+	}
+}
+
+func TestIndependentReviewPersonalKeyChangedWithoutGroupPostgres(t *testing.T) {
+	f := newAccountRateJobFixture(t)
+	reviewEnablePricedChannel(f)
+	f.refreshUsage()
+	f.syncBilling()
+	f.keyID++
+	f.groupIDKnown = false
+	f.at = f.at.Add(time.Millisecond)
+	usage := syncJob{provider: f.job.provider, credential: f.job.credential, kind: "key_usage"}
+	if busy, err := f.service.runJob(f.ctx, usage, true); busy || !errors.Is(err, errPanelGroupUnverified) {
+		t.Fatal("fixture must return an unverified group")
+	}
+	item, _ := f.readBilling()
+	quote, priced := reviewCurrentQuote(f)
+	t.Logf("group_status=%s; billing=%s; quote_group=%d; priced_channels=%d", item.GroupStatus, item.BillingState, quote, priced)
+	if item.BillingState != "stale" || quote != 0 || priced != 0 {
+		t.Fatal("confirmed new Key ID must retire the previous Key's personal quote")
+	}
+}
+
+func TestIndependentReviewGroupRatePeakPostgres(t *testing.T) {
+	f := newAccountRateJobFixture(t)
+	reviewEnablePricedChannel(f)
+	zone := "UTC"
+	if f.at.Hour() >= 22 {
+		zone = "Asia/Shanghai"
+	}
+	f.quote = strings.Replace(f.quote, `"peak_rate_enabled":false`,
+		fmt.Sprintf(`"peak_rate_enabled":true,"peak_start":"00:00","peak_end":"23:59","peak_rate_multiplier":2,"timezone":%q`, zone), 1)
+	f.syncBilling()
+	item, key := f.readBilling()
+	var amountOK bool
+	err := f.db.QueryRowContext(f.ctx, `SELECT upstream_input=2400000 FROM beichen_price_at($1,$2,statement_timestamp())`,
+		f.job.credential, accountRateFixtureModel).Scan(&amountOK)
+	quote, priced := reviewCurrentQuote(f)
+	t.Logf("effective=%s; quote_group=%d; priced_channels=%d; amount_matches=%t", item.EffectiveMultiplierText, quote, priced, amountOK)
+	if err != nil || !amountOK || quote != 16 || priced != 1 || item.EffectiveMultiplierText != "1.2" ||
+		item.AccountRateSource != groupRateSource || !matchesAccountRate(key.WebsiteGroup, "0.6", groupRateSource, 0) {
+		t.Fatal("peak-on fallback must retain the base rate and apply the peak rate at settlement")
+	}
+}
+
+func reviewRunOldJob(f *accountRateJobFixture, job syncJob, arrived <-chan struct{}) <-chan error {
+	f.t.Helper()
+	result := make(chan error, 1)
+	go func() {
+		busy, err := f.service.runJob(context.WithValue(f.ctx, reviewOldJobContext{}, true), job, true)
+		if busy {
+			err = errors.New("old job did not acquire its lease")
+		}
+		result <- err
+	}()
+	select {
+	case <-arrived:
+		return result
+	case <-result:
+		f.t.Fatal("old job finished before the expected request")
+	case <-f.ctx.Done():
+		f.t.Fatal("timed out waiting for the old billing job")
+	}
+	return nil
+}
+
+func reviewEnablePricedChannel(f *accountRateJobFixture) {
+	f.t.Helper()
+	execCatalogTestSQL(f.t, f.ctx, f.db, `INSERT INTO beichen_provision_channels(credential_id,channel,key_fingerprint,discover_ids)
+		SELECT id,'CC1',sha256(credential_ciphertext),false FROM provider_credentials WHERE id=$1`, f.job.credential)
+}
+
+func reviewCurrentQuote(f *accountRateJobFixture) (int64, int64) {
+	f.t.Helper()
+	var group int64
+	err := f.db.QueryRowContext(f.ctx, `SELECT COALESCE((
+		SELECT s.group_id FROM beichen_panel_snapshots s
+		JOIN beichen_price_at($1,$2,statement_timestamp()) p ON p.upstream_input IS NOT NULL
+		WHERE s.credential_id=$1 AND s.effective_at<=statement_timestamp()
+		ORDER BY s.effective_at DESC LIMIT 1
+	),0)`, f.job.credential, accountRateFixtureModel).Scan(&group)
+	if err != nil {
+		f.t.Fatal("could not query current quote")
+	}
+	view, err := f.service.Overview(f.ctx, f.job.provider, f.at.In(beijing).Format(dayLayout))
+	if err != nil {
+		f.t.Fatal("could not read overview")
+	}
+	return group, view.WebsiteSync.PricedChannels
+}
+
+func TestIndependentReviewOlderUsageCannotReplaceNewKey(t *testing.T) {
+	f := newAccountRateJobFixture(t)
+	f.service.now = time.Now
+	f.refreshUsage()
+
+	original := f.service.client.Transport
+	arrived, release := make(chan struct{}), make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	today := f.at.In(beijing).Format(dayLayout)
+	f.service.client.Transport = panelTransport(func(req *http.Request) (*http.Response, error) {
+		if req.Context().Value(reviewOldJobContext{}) != nil && req.URL.Path == "/api/v1/usage" {
+			if req.URL.Query().Get("start_date") != today {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(emptyWebsiteUsageFixture))}, nil
+			}
+			response, err := original.RoundTrip(req)
+			close(arrived)
+			select {
+			case <-release:
+				return response, err
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+		}
+		return original.RoundTrip(req)
+	})
+	usage := syncJob{provider: f.job.provider, credential: f.job.credential, kind: "key_usage"}
+	result := reviewRunOldJob(f, usage, arrived)
+	f.keyID++
+	if _, err := f.service.RefreshWebsiteKeys(f.ctx, f.job.provider); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	err := <-result
+	_, card := f.readBilling()
+	var displayed int64
+	if card.WebsiteKeyID != nil {
+		displayed = *card.WebsiteKeyID
+	}
+	t.Logf("old_finish_succeeded=%t; confirmed_key=%d; displayed_key=%d; has_old_usage=%t",
+		err == nil, f.keyID, displayed, card.DailyUsage != nil)
+	if !errors.Is(err, errBillingKeyBindingChanged) || displayed != int64(f.keyID) || card.DailyUsage != nil {
+		t.Fatal("a delayed usage job must leave the newer Key binding and its card intact")
+	}
+}
+
+func TestIndependentReviewMissingGroupKeepsSameKeyBinding(t *testing.T) {
+	f := newAccountRateJobFixture(t)
+	reviewEnablePricedChannel(f)
+	f.refreshUsage()
+	f.syncBilling()
+	f.groupIDKnown = false
+	f.at = f.at.Add(time.Millisecond)
+	usage := syncJob{provider: f.job.provider, credential: f.job.credential, kind: "key_usage"}
+	if busy, err := f.service.runJob(f.ctx, usage, true); busy || !errors.Is(err, errPanelGroupUnverified) {
+		t.Fatal("fixture must return an unverified group")
+	}
+	item, _ := f.readBilling()
+	quote, priced := reviewCurrentQuote(f)
+	if item.confirmedKeyBinding == nil || item.confirmedKeyBinding.KeyID != int64(f.keyID) ||
+		item.BillingState != "current" || quote != 16 || priced != 1 {
+		t.Fatal("an omitted group field for the same Key must preserve its verified quote")
+	}
+}

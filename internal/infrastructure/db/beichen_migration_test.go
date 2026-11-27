@@ -424,3 +424,40 @@ VALUES($1, $2, '2026-11-18', 'model', 1, 10000, 1000, 2000, 24000, 'csv', $3),
 		}
 	}
 }
+
+func TestIndependentReview0071Scope(t *testing.T) {
+	ctx, conn := openMigrationTestDB(t)
+	applyMigrationTestBaseline(t, ctx, conn, "0071")
+	var oldName, oldDefinition string
+	err := conn.QueryRowContext(ctx, `SELECT c.conname, pg_get_constraintdef(c.oid) FROM pg_constraint c
+		JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=ANY(c.conkey)
+		WHERE c.conrelid='beichen_multiplier_versions'::regclass AND c.contype='c'
+		AND a.attname='account_rate_source'`).Scan(&oldName, &oldDefinition)
+	if err != nil {
+		t.Fatal("could not identify the original constraint")
+	}
+	_, err = conn.ExecContext(ctx, `ALTER TABLE beichen_multiplier_versions
+		ADD CONSTRAINT qa_keep_group_id_for_tagged_rate CHECK (account_rate_source IS NULL OR group_id IS NOT NULL)`)
+	if err != nil {
+		t.Fatal("could not add the unrelated test constraint")
+	}
+	script, err := migrationFiles.ReadFile("migrations/0071_beichen_group_rate_source.sql")
+	if err != nil {
+		t.Fatal("could not open the migration")
+	}
+	for range 2 {
+		if _, err := conn.ExecContext(ctx, string(script)); err != nil {
+			t.Fatal("raw migration was not repeatable")
+		}
+	}
+	var kept bool
+	err = conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM pg_constraint
+		WHERE conrelid='beichen_multiplier_versions'::regclass AND conname='qa_keep_group_id_for_tagged_rate')`).Scan(&kept)
+	if err != nil {
+		t.Fatal("could not check the unrelated test constraint")
+	}
+	t.Logf("0070 constraint name=%s; definition=%s; raw SQL ran twice; unrelated check retained=%t", oldName, oldDefinition, kept)
+	if !kept {
+		t.Fatal("0071 removed an unrelated check referencing account_rate_source")
+	}
+}

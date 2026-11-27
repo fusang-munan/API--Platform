@@ -98,7 +98,7 @@ func readIdentifiedWebsiteKey[T any](ctx context.Context, s *Service, access pri
 		return zero, err
 	}
 	match, err := identifyChannel(key, access.channel, access.label, keys)
-	if err != nil && !errors.Is(err, errKeyGroupMissing) {
+	if err != nil && match.ID == 0 {
 		return zero, err
 	}
 	return read(token, match)
@@ -106,11 +106,19 @@ func readIdentifiedWebsiteKey[T any](ctx context.Context, s *Service, access pri
 
 func (s *Service) fetchWebsiteKeyCatalog(ctx context.Context, token string, key listedKey) (websiteKeyCatalog, error) {
 	group := key.websiteGroup()
-	groupAt := s.now().UTC()
-	observed := websiteKeyCatalog{keyGroup: &group, keyGroupAt: groupAt, keyID: key.ID}
-	if group.ID == 0 {
-		return observed, errKeyGroupMissing
+	groupAt := key.checkedAt
+	if groupAt.IsZero() {
+		groupAt = s.now().UTC().Truncate(time.Microsecond)
 	}
+	observed := websiteKeyCatalog{keyGroupAt: groupAt, keyID: key.ID}
+	if group.ID == 0 {
+		if key.GroupID == 0 && key.groupIDKnown {
+			observed.keyGroup = &group
+			return observed, errKeyGroupMissing
+		}
+		return observed, errPanelGroupUnverified
+	}
+	observed.keyGroup = &group
 	crawl, err := s.fetchWebsiteCrawl(ctx, token)
 	if errors.Is(err, errWebsiteDirectoryEmpty) && crawl.membershipComplete && crawl.GroupCount == 0 {
 		return observed, errors.Join(err, errPanelGroupNotFound)

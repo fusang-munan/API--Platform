@@ -323,7 +323,9 @@ ORDER BY c.label, c.id, kinds.kind`, providerID)
 					switch {
 					case rateSource == "" && websiteGroupRate(evidence.Rate) != nil:
 						item.websiteAccountRate = &evidence.Rate
-					case rateSource == keyBillingRateSource && validWebsiteGroupID(evidence.KeyID) && samePanelRate(evidence.Rate, value):
+					case rateSource == keyBillingRateSource && item.confirmedKeyBinding != nil &&
+						item.confirmedKeyBinding.KeyID == evidence.KeyID && item.confirmedKeyBinding.GroupID != nil &&
+						*item.confirmedKeyBinding.GroupID == evidence.GroupID && samePanelRate(evidence.Rate, value):
 						item.AccountRate, item.AccountRateSource, item.accountRateKeyID = &value, rateSource, evidence.KeyID
 					}
 				}

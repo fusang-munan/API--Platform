@@ -224,7 +224,7 @@ INSERT INTO beichen_datasets (credential_id,kind,last_error) VALUES ($1,'prices'
 	defer tx.Rollback()
 	older := time.Now().UTC().Add(-time.Minute)
 	staleRead := websiteKeyCatalog{keyGroup: &WebsiteGroup{ID: 17}, keyGroupAt: older}
-	if err := saveBillingGroup(ctx, tx, key, revision, older, staleRead, nil); err != nil {
+	if _, err := saveBillingGroup(ctx, tx, key, revision, older, staleRead, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {

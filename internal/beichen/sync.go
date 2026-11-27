@@ -141,7 +141,20 @@ func (s *Service) executeSyncJobs(ctx context.Context, jobs []syncJob, manual bo
 		if ctx.Err() != nil {
 			return unavailable("北辰同步达到时限，已保存完成的任务", ctx.Err())
 		}
-		batch := jobs[:min(4, len(jobs))]
+		batchSize := min(4, len(jobs))
+		batch := make([]syncJob, 0, batchSize)
+		remaining := make([]syncJob, 0, len(jobs))
+		credentials := make(map[uuid.UUID]struct{}, batchSize)
+		for _, job := range jobs {
+			if len(batch) < batchSize {
+				if _, exists := credentials[job.credential]; !exists {
+					batch = append(batch, job)
+					credentials[job.credential] = struct{}{}
+					continue
+				}
+			}
+			remaining = append(remaining, job)
+		}
 		type outcome struct {
 			running bool
 			err     error
@@ -161,7 +174,7 @@ func (s *Service) executeSyncJobs(ctx context.Context, jobs []syncJob, manual bo
 				busy++
 			}
 		}
-		jobs = jobs[len(batch):]
+		jobs = remaining
 	}
 	if failed > 0 {
 		return unavailable(fmt.Sprintf("有 %d 项北辰同步未完成，请查看数据状态", failed), nil)
@@ -294,6 +307,10 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 	if websiteErr == nil {
 		info, quote, billingErr = directory.billing()
 	}
+	keyResult := <-keyResults
+	if billingErr == nil && errors.Is(keyResult.err, errKeyGroupNotAllowed) {
+		billingErr = deniedKeyGroup(quote.groupID)
+	}
 	partialErr := quote.err
 	if directory.keyBilling != nil && billingErr == nil {
 		// A successful Key read establishes the billing rule. The official
@@ -307,22 +324,13 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 			Source: group.AccountRateSource, KeyChecked: directory.keyGroupAt, Revision: revision,
 		}
 	}
-	keyResult := <-keyResults
 	return fetchResult{err: billingErr, partialErr: errors.Join(partialErr, keyResult.err), accountRate: evidence, save: func(ctx context.Context, tx *sql.Tx) error {
-		if evidence != nil && evidence.Source == keyBillingRateSource {
-			changed, err := personalRateBindingChanged(ctx, tx, job.credential, evidence)
-			if err != nil {
-				return err
-			}
-			if changed {
-				if err := saveBillingObservation(ctx, tx, job.credential, revision, info, errBillingKeyBindingChanged, quote.groupID, quote); err != nil {
-					return err
-				}
-				return errBillingKeyBindingChanged
-			}
-		}
-		if err := saveBillingGroup(ctx, tx, job.credential, revision, startedAt, directory, billingErr); err != nil {
+		accepted, err := saveBillingGroup(ctx, tx, job.credential, revision, startedAt, directory, billingErr, false)
+		if err != nil {
 			return err
+		}
+		if !accepted {
+			return errBillingKeyBindingChanged
 		}
 		if err := keyResult.save(ctx, tx); err != nil {
 			return err
@@ -547,7 +555,12 @@ WHERE credential_id=$1 AND kind=$2`, job.credential, job.leaseKind())
 			if !errors.Is(err, errBillingKeyBindingChanged) {
 				return err
 			}
-			result.err, result.accountRate = err, nil
+			_, releaseErr := tx.ExecContext(ctx, `UPDATE beichen_datasets SET lease_id=NULL, lease_until=NULL
+WHERE credential_id=$1 AND kind=$2`, job.credential, job.leaseKind())
+			if releaseErr == nil {
+				releaseErr = tx.Commit()
+			}
+			return errors.Join(err, releaseErr)
 		}
 	}
 	if job.kind == "catalog" {
@@ -566,7 +579,7 @@ WHERE credential_id=$1 AND kind='billing'`, job.credential)
 		message = &value
 	}
 	var accountRate *string
-	if result.accountRate != nil {
+	if result.err == nil && result.accountRate != nil {
 		raw, err := json.Marshal(result.accountRate)
 		if err != nil {
 			return err
