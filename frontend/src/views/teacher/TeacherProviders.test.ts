@@ -271,6 +271,7 @@ describe('北辰供应商行', () => {
         { model: 'lab/mixed', price_state: 'mixed', blockers: [{ code: 'missing_price' }] },
         { model: 'lab/mixed-active', price_state: 'mixed' },
         { model: 'lab/conditional', price_state: 'conditional' }, { model: 'lab/priced', price_state: 'manual' },
+        { model: 'lab/retired', retired: true, credential_ids: ['retired-key'], price_state: 'missing' },
       ],
       models: [
         { model: 'lab/mixed-active', mode: 'follow', price_status: 'confirmed' },

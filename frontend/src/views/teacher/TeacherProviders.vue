@@ -168,7 +168,7 @@ async function loadAnomalies(providerId: string, day: string, version: number) {
     if (version !== loadVersion) return
     const counts = overview.comparison?.flatMap(row => row.pending_review_calls == null ? [] : [row.pending_review_calls]) ?? []
     const catalog = overview.model_catalog ?? []
-    const listed = catalog.filter(model => model.credential_ids?.length !== 0)
+    const listed = catalog.filter(model => !model.retired && model.credential_ids?.length !== 0)
     const missing = new Set(listed.filter(model => model.price_covered === false || (model.price_covered == null &&
       (model.price_state === 'missing' || model.blockers?.some(blocker => blocker.code === 'missing_price'))))
       .map(model => model.model.trim().toLowerCase()))

@@ -29,7 +29,9 @@ const dateTime = new Intl.DateTimeFormat('zh-CN', {
 
 function membership(key: BeichenWebsiteKey) {
   if (key.match_status === 'ambiguous') return '匹配不唯一'
-  if (key.match_status === 'unmatched') return '未匹配'
+  if (key.match_status === 'unmatched') {
+    return key.status === 'active' ? '未匹配校内 Key（官网仍启用）' : '未匹配校内 Key'
+  }
   return provider.credentials?.find(credential => credential.id === key.credential_id)?.label ?? '已匹配'
 }
 

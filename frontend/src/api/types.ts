@@ -617,6 +617,7 @@ export type BeichenModelPriceResult = {
 }
 export type BeichenCatalogModel = {
   model: string
+  retired?: boolean
   school_model?: string | null
   school_status?: BeichenSchoolStatus | null
   can_enable?: boolean | null
@@ -624,7 +625,7 @@ export type BeichenCatalogModel = {
   preferred_routes?: BeichenPreferredRoute[] | null
   key_count?: number | null
   source?: 'website' | 'key' | 'both'
-  catalog_state?: 'website_only' | 'key_listed' | 'catalog_missing'
+  catalog_state?: 'website_only' | 'key_listed' | 'published_unavailable' | 'catalog_missing'
   catalog_keys?: BeichenCatalogKey[]
   website_locations?: BeichenWebsiteLocation[]
   route_count?: number | null

@@ -16,6 +16,71 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
+func TestBeichenOverviewRetiredCatalogPostgres(t *testing.T) {
+	ctx, db, provider, _, keys := newActionsPostgres(t)
+	retired, current := keys[0], keys[1]
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", retired)
+	exec(`
+INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+SELECT gen_random_uuid(), name, name, status, 1000, now(), now()
+FROM (VALUES ('retired-binding','active'), ('retired-website-record','pending_configuration'),
+  ('stale-active-key','active'), ('active-binding','active'), ('inactive-binding-active-key','active'),
+  ('active-binding-retired-key','active')) m(name,status)`)
+	exec(`
+INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,catalog_source,status,last_seen_at,synced_at,created_at,updated_at)
+VALUES (gen_random_uuid(),$1,$2,'retired-website-record','website','inactive',now(),now(),now(),now()),
+       (gen_random_uuid(),$1,$2,'stale-active-key','key','inactive',now(),now(),now(),now()),
+       (gen_random_uuid(),$1,$3,'stale-active-key','key','active',now()-interval '1 hour',now()-interval '1 hour',now(),now()),
+       (gen_random_uuid(),$1,$2,'active-binding','key','inactive',now(),now(),now(),now())`, provider, retired, current)
+	exec(`
+INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,status,priority,created_at,updated_at)
+SELECT gen_random_uuid(), m.id, $1, b.credential_id, b.upstream, b.adapter, b.status, 10, now(), now()
+FROM (VALUES ('retired-binding',$2::uuid,' retired-binding ','openai_compatible','inactive'),
+             ('active-binding',$3::uuid,'alias-with-missing-directory','openai_compatible','active'),
+             ('inactive-binding-active-key',$3::uuid,'inactive-binding-active-key','openai_compatible','inactive'),
+             ('active-binding-retired-key',$2::uuid,'active-binding-retired-key','openai_compatible','active'),
+             ('active-binding-retired-key',$2::uuid,'active-binding-retired-key','openai_responses','inactive'))
+  b(school,credential_id,upstream,adapter,status)
+JOIN models m ON m.model_id=b.school::citext`, provider, retired, current)
+
+	service := New(db, nil)
+	read := func() map[string]CatalogModel {
+		t.Helper()
+		view, err := service.Overview(ctx, provider, "2026-01-01")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows := make(map[string]CatalogModel)
+		for _, row := range view.ModelCatalog {
+			rows[row.Model] = row
+		}
+		return rows
+	}
+	rows := read()
+	for name, status := range map[string]string{"retired-binding": "active", "retired-website-record": "pending_configuration"} {
+		row := rows[name]
+		if !row.Retired || row.BindingIssue != nil || row.SchoolStatus != status || row.CanEnable {
+			t.Errorf("%s 应保留校内状态并退出当前异常: %+v", name, row)
+		}
+	}
+	for _, name := range []string{"stale-active-key", "active-binding", "inactive-binding-active-key", "active-binding-retired-key"} {
+		row := rows[name]
+		if row.Retired || row.BindingIssue == nil {
+			t.Errorf("%s 仍需显示线路异常: %+v", name, row)
+		}
+	}
+
+	exec(`
+INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,supported_protocols,last_seen_at,synced_at,created_at,updated_at)
+VALUES (gen_random_uuid(),$1,$2,'retired-binding',ARRAY['openai_compatible'],now(),now(),now(),now())`, provider, current)
+	exec("INSERT INTO beichen_datasets(credential_id,kind,last_success) VALUES ($1,'catalog',now())", current)
+	row := read()["retired-binding"]
+	if row.Retired || row.CatalogState != "key_listed" || row.CurrentKeyCount != 1 {
+		t.Fatalf("同型号被启用 Key 重新列出后应按当前目录展示: %+v", row)
+	}
+}
+
 func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 	dsn := os.Getenv("NEBULA_TEST_POSTGRES")
 	if dsn == "" {

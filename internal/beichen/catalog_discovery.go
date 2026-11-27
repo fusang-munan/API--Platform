@@ -1,6 +1,8 @@
 package beichen
 
 import (
+	"context"
+	"database/sql"
 	"maps"
 	"slices"
 	"strings"
@@ -131,6 +133,73 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 
 func (row CatalogModel) published() bool {
 	return row.SchoolStatus == "active" || row.SchoolModel != "" || row.BindingIssue != nil
+}
+
+// Use stored channel relationships even when a scan stopped listing the model.
+// Key rotation can leave an enabled binding on an old Key so the teacher
+// can diagnose and move it. Only disabled bindings count as retired evidence.
+func markRetiredCatalogModels(ctx context.Context, tx *sql.Tx, provider uuid.UUID, models []CatalogModel) error {
+	if len(models) == 0 {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+WITH north_bindings AS (
+  SELECT lower(btrim(b.upstream_model_name)) AS model, b.model_id,
+    b.status = 'inactive' AND (p.status <> 'active' OR COALESCE(c.status <> 'active', false)) AS retired
+  FROM model_bindings b
+  JOIN providers p ON p.id = b.provider_id
+  LEFT JOIN provider_credentials c ON c.id = b.credential_id AND c.provider_id = b.provider_id
+  WHERE b.provider_id = $1
+), channel_links AS (
+  SELECT lower(k.model_id::text) AS model, p.status <> 'active' OR c.status <> 'active' AS retired
+  FROM provider_model_catalog k
+  JOIN providers p ON p.id = k.provider_id
+  JOIN provider_credentials c ON c.id = k.credential_id AND c.provider_id = k.provider_id
+  WHERE k.provider_id = $1
+  UNION ALL
+  SELECT model, retired FROM north_bindings
+), historical_models AS (
+  SELECT model FROM channel_links GROUP BY model HAVING bool_and(retired)
+), school_models AS (
+  SELECT h.model, m.id AS model_id
+  FROM historical_models h JOIN models m ON m.model_id = h.model::citext
+  UNION
+  SELECT h.model, b.model_id FROM historical_models h JOIN north_bindings b USING (model)
+)
+SELECT h.model FROM historical_models h
+WHERE NOT EXISTS (
+  SELECT 1 FROM school_models s JOIN model_bindings b ON b.model_id = s.model_id
+  JOIN providers p ON p.id = b.provider_id
+  WHERE s.model = h.model AND b.status = 'active' AND p.status = 'active'
+)`, provider)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	historical := make(map[string]bool)
+	for rows.Next() {
+		var model string
+		if err := rows.Scan(&model); err != nil {
+			return err
+		}
+		historical[model] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range models {
+		row := &models[i]
+		// Keep alias matches and the existing diagnosis for a replacement Key
+		// associated with this model during catalog comparison.
+		hasActiveKey := slices.ContainsFunc(row.CatalogKeys, func(key CatalogKey) bool {
+			return key.State == "listed" || key.Replacement
+		})
+		if row.CatalogState != "website_only" && historical[strings.ToLower(row.Model)] && !hasActiveKey {
+			row.Retired = true
+			row.BindingIssue = nil
+		}
+	}
+	return nil
 }
 
 func catalogWebsiteMatches(keys []discoveryKey, websiteNames catalogNameMatcher, locations []WebsiteLocation) (map[string]bool, []CatalogKey) {
