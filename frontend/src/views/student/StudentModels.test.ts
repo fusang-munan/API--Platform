@@ -2,8 +2,7 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { APIError } from '../../api/client'
 import { studentAPI } from '../../api/student'
-import type { StudentModelCatalogPage } from '../../api/student'
-import type { StudentUsageReport } from '../../api/types'
+import type { StudentModelCatalogPage, StudentUsageSnapshot } from '../../api/student'
 import StudentModels from './StudentModels.vue'
 import studentModelsSource from './StudentModels.vue?raw'
 
@@ -63,7 +62,7 @@ function activeKey(models: unknown[] = []) {
   return fixture.key({ status: 'active', models })
 }
 
-function emptyUsage(): StudentUsageReport {
+function emptyUsage(): StudentUsageSnapshot {
   return {
     month: '2026-11',
     projects: [],
@@ -496,19 +495,20 @@ describe('StudentModels usage without prices', () => {
     window.history.replaceState({}, '', '/?key=key-1')
     vi.mocked(studentAPI.usage).mockResolvedValueOnce({
       ...emptyUsage(),
-      models: [{ id: 'gpt-5.3-codex', credits: '22.50040000000000001', calls: 7 }],
+      models: [{ id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex', credits: '22.50040000000000001', calls: 7 }],
       projects: [{
         project_id: 'project', project_name: 'Project', quota: '200.000', used: '17.50040000000000001', pending: '0.000', available: '182.49959999999999999',
         keys: [
           {
-            id: 'key-1', name: '我的 Key', status: 'active', used: '15.00040000000000001', pending: '0.000', available: '184.99959999999999999',
+            id: 'key-1', name: '我的 Key', status: 'active', used: '15.00040000000000001', pending: '0.000', available: '0.000',
+            available_effective: '0.0005', project_member_available: '182.49959999999999999',
             models: [
               { id: 'gpt-5.3-codex', name: 'gpt-5.3-codex', credits: '10.00040000000000001', calls: 2 },
               { id: 'claude-sonnet-4-5', name: 'claude-sonnet-4-5', credits: '5.000', calls: 1 },
             ],
           },
           {
-            id: 'key-2', name: '第二把 Key', status: 'active', used: '2.500', pending: '0.000', available: '0.000',
+            id: 'key-2', name: '第二把 Key', status: 'active', used: '2.500', pending: '0.000', available: '80.750',
             models: [{ id: 'gpt-5.3-codex', name: 'gpt-5.3-codex', credits: '2.500', calls: 1 }],
           },
         ],
@@ -519,23 +519,25 @@ describe('StudentModels usage without prices', () => {
           models: [{ id: 'gpt-5.3-codex', name: 'gpt-5.3-codex', credits: '10.000', calls: 4 }],
         }],
       }],
-    } as never)
+    })
     const wrapper = mountPage()
     await flushPromises()
 
     const card = wrapper.get('[data-model="gpt-5.3-codex"]')
     expect(card.get('[data-testid="model-used"]').text()).toBe('本月已用 10.00040000000000001 积分 · 2 次')
-    expect(wrapper.get('[data-testid="key-balance"]').text()).toBe('此 Key 可用积分 184.99959999999999999')
-    expect(wrapper.get('[data-testid="project-balance"]').text()).toBe('全部项目可用积分 222.49959999999999999')
+    expect(wrapper.get('[data-testid="key-balance"]').text()).toBe('本项目个人可用积分 0.0005')
+    expect(wrapper.get('[data-testid="key-project-member-balance"]').text()).toBe('项目内个人余额 182.49959999999999999')
+    expect(wrapper.get('[data-testid="project-balance"]').text()).toBe('各项目个人余额合计 222.49959999999999999')
     expect(card.text()).not.toContain('余额')
     const selector = wrapper.get('[data-testid="current-key"]')
     await selector.setValue('key-2')
     expect(card.get('[data-testid="model-used"]').text()).toBe('本月已用 2.5 积分 · 1 次')
-    expect(wrapper.get('[data-testid="key-balance"]').text()).toBe('此 Key 可用积分 0')
+    expect(wrapper.get('[data-testid="key-balance"]').text()).toBe('本项目个人可用积分 80.75')
+    expect(wrapper.find('[data-testid="key-project-member-balance"]').exists()).toBe(false)
     await selector.setValue('other-project-key')
     expect(card.get('[data-testid="model-used"]').text()).toBe('本月已用 10 积分 · 4 次')
     expect(wrapper.find('[data-testid="key-balance"]').exists()).toBe(false)
-    expect(wrapper.get('[data-testid="project-balance"]').text()).toBe('全部项目可用积分 222.49959999999999999')
+    expect(wrapper.get('[data-testid="project-balance"]').text()).toBe('各项目个人余额合计 222.49959999999999999')
     expect(wrapper.get('[data-testid="credit-rate-note"]').text()).toBe('100 积分 = 1 元；金额统一用积分显示。')
     expect(wrapper.text()).not.toContain('点/次')
     expect(wrapper.text()).not.toContain('基础积分')
@@ -551,7 +553,7 @@ describe('StudentModels usage without prices', () => {
         project_id: 'project', project_name: 'Project', quota: '200.000', used: '0.000', pending: '0.000', available: '200.000',
         keys: [{ id: 'key-1', name: '我的 Key', status: 'active', used: '0.000', pending: '0.000', models: [] }],
       }],
-    } as never)
+    })
     const wrapper = mountPage()
     await flushPromises()
 
@@ -568,6 +570,24 @@ describe('StudentModels usage without prices', () => {
     await flushPromises()
     expect(wrapper.get('[data-testid="model-used"]').text()).toBe('用量暂不可用')
     expect(wrapper.find('[data-testid="key-balance"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('keeps a legacy Key balance available when totals and its model usage are missing', async () => {
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([fixture.model('gpt-5.3-codex')])] as never)
+    vi.mocked(studentAPI.usage).mockResolvedValueOnce({
+      month: '2026-11',
+      projects: [{
+        project_id: 'project', project_name: 'Project', quota: '100.000',
+        used: '5.000', pending: '0.500', available: '94.500',
+        keys: [{ id: 'key-1', name: '我的 Key', status: 'active', used: '5.000', pending: '0.500', available: '25.000' }],
+      }],
+    } as unknown as StudentUsageSnapshot)
+    const wrapper = mountPage()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="key-balance"]').text()).toBe('本项目个人可用积分 25')
+    expect(wrapper.get('[data-testid="usage-pending-note"]').text()).toContain('全部项目在途占用 0.5 积分')
+    expect(wrapper.get('[data-testid="model-used"]').text()).toBe('用量暂不可用')
     wrapper.unmount()
   })
 

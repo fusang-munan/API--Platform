@@ -20,4 +20,8 @@ describe('student model usage labels', () => {
     })).toBe('本月 0.000 积分 · 0 次 · 待核 2 笔')
     expect(formatStudentModelUsage(undefined)).toBe('本月 0.000 积分 · 0 次')
   })
+
+  it('shows an older response’s charged amount when its call count is omitted', () => {
+    expect(formatStudentModelUsage({ credits: '1.250' })).toBe('本月已用 1.25 积分 · 0 次')
+  })
 })

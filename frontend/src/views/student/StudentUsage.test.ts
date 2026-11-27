@@ -1,8 +1,9 @@
 import { DOMWrapper, flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { StudentUsageMetrics, StudentUsageModel, StudentUsageReport } from '../../api/types'
-import type { StudentCallReceipt } from '../../utils/studentUsage'
+import type { StudentCallReceipt, StudentRecentCall, StudentUsageSnapshot } from '../../api/student'
+import type { StudentUsageMetrics, StudentUsageModel } from '../../api/types'
 import StudentUsage from './StudentUsage.vue'
+import studentUsageSource from './StudentUsage.vue?raw'
 
 const blankMetrics: StudentUsageMetrics = {
   tokens: { input: null, output: null, cache_read: null, cache_write: null, total: null },
@@ -84,7 +85,7 @@ const firstKeyMetrics: StudentUsageMetrics = {
   pending_review_credits: pendingModel.pending_review_credits,
 }
 
-const currentUsage: StudentUsageReport = {
+const currentUsage: StudentUsageSnapshot = {
   month: '2026-11',
   models: [mergedModel, pendingModel, zeroModel],
   totals: {
@@ -107,13 +108,15 @@ const currentUsage: StudentUsageReport = {
         {
           ...firstKeyMetrics,
           id: 'key-a', name: '开发 Key', status: 'active', used: firstModel.credits,
-          pending: '0.250', in_flight_credits: '0.250', available: '49.74959999999999999',
+          pending: '0.250', in_flight_credits: '0.250', available: '0.000',
+          available_effective: '49.74959999999999999', project_member_available: '99.62459999999999999',
           calls: 1, pending_calls: 1, pending_review: true, models: [firstModel, pendingModel],
         },
         {
           ...blankMetrics,
           id: 'key-idle', name: '在途 Key', status: 'active', used: '0.000',
-          pending: '0.125', in_flight_credits: '0.125', available: '0.875',
+          pending: '0.125', in_flight_credits: '0.125',
+          available_effective: '49.74959999999999999', project_member_available: '99.62459999999999999',
           calls: 0, pending_calls: 0, models: [],
         },
       ],
@@ -130,17 +133,32 @@ const currentUsage: StudentUsageReport = {
           ...secondModelMetrics,
           id: 'key-b', name: '测试 Key', status: 'active', used: secondModel.credits,
           pending: '0.000', in_flight_credits: '0.000', available: '49.99959999999999998',
+          available_effective: '0.000', project_member_available: '99.99959999999999998',
           calls: 1, pending_calls: 0, models: [secondModel],
         },
         {
           ...zeroModelMetrics,
           id: 'key-inactive', name: '停用的 Key', status: 'inactive', used: '0.000',
           pending: '0.000', in_flight_credits: '0.000',
+          available_effective: '0.000', project_member_available: '99.99959999999999998',
           calls: 1, pending_calls: 0, models: [zeroModel],
         },
       ],
     },
   ],
+}
+
+const legacyUsage: StudentUsageSnapshot = {
+  month: '2026-11',
+  projects: [{
+    project_id: 'legacy', project_name: '旧项目', quota: '100.000',
+    used: '7.250', pending: '1.375', available: '91.375', pending_review: true,
+    keys: [{
+      id: 'legacy-key', name: '旧版 Key', status: 'active',
+      used: '7.250', pending: '1.375', available: '35.000', pending_review: true,
+      models: [{ id: 'text', name: '旧版模型', credits: '7.250', calls: 3 }],
+    }],
+  }],
 }
 
 const callReceipt = {
@@ -161,6 +179,22 @@ const callReceipt = {
   total_tokens: '9007199254740996',
 } satisfies StudentCallReceipt
 
+const recentCall = {
+  id: '01800000-0000-7000-8000-000000000001',
+  request_id: 'recent-gateway-req',
+  model_id: 'gpt-5',
+  model_name: 'GPT-5',
+  project_name: '项目一',
+  input_tokens: 100,
+  output_tokens: 20,
+  cache_read_tokens: 0,
+  cache_write_tokens: null,
+  credits: '1.250',
+  status: 'succeeded',
+  billing_state: 'charged',
+  created_at: '2026-10-31T16:08:10Z',
+} satisfies StudentRecentCall
+
 const request = vi.fn<typeof fetch>()
 let wrapper: VueWrapper
 
@@ -173,12 +207,12 @@ function failure(status = 503) {
   return new Response(JSON.stringify({ error: { code } }), { status })
 }
 
-function emptyUsage(month: string): StudentUsageReport {
+function emptyUsage(month: string): StudentUsageSnapshot {
   return { month, projects: [], models: [], totals: { ...blankMetrics, credits: '0.000', calls: 0 } }
 }
 
-function mountUsage(data?: StudentUsageReport) {
-  if (data) request.mockResolvedValueOnce(response(data))
+function mountUsage(data?: unknown) {
+  if (data !== undefined) request.mockResolvedValueOnce(response(data))
   wrapper = mount(StudentUsage, {
     attachTo: document.body,
     global: {
@@ -199,8 +233,8 @@ function dialog() {
   return new DOMWrapper(document.body).get('[role="dialog"]')
 }
 
-async function openReceipt() {
-  await wrapper.get('[data-testid="open-receipt"]').trigger('click')
+async function openCallDialog(kind: 'recent' | 'receipt') {
+  await wrapper.get(`[data-testid="open-${kind}"]`).trigger('click')
   await flushPromises()
   return dialog()
 }
@@ -235,7 +269,7 @@ describe('StudentUsage', () => {
     expect(wrapper.get('h1').text()).toBe('2026 年 11 月个人用量')
     expect(wrapper.get('input[type="month"]').attributes('max')).toBe('2026-11')
     expect(wrapper.find('.range-switch').exists()).toBe(false)
-    expect(wrapper.text()).not.toContain('最近调用')
+    expect(wrapper.find('.usage-recent-list').exists()).toBe(false)
     expect(stat('quota')).toBe('200')
     expect(stat('used')).toBe('0.00080000000000003')
     expect(stat('pending')).toBe('0.375')
@@ -275,13 +309,15 @@ describe('StudentUsage', () => {
     expect(keys[0].findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual([
       '0.00040000000000001', '0.25', '49.74959999999999999',
     ])
+    expect(keys[0].text()).toContain('本项目个人可用积分')
     expect(keys[0].findAll('.usage-key-metrics dd').map(cell => cell.text())).toEqual(['1', '270', '2'])
     expect(keys[0].text()).toContain('待核 1 笔')
     expect(keys[1].text()).toContain('暂无模型记录')
-    expect(keys[1].findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['0', '0.125', '0.875'])
+    expect(keys[1].findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['0', '0.125', '49.74959999999999999'])
     expect(keys[1].find('button').exists()).toBe(false)
+    expect(keys[2].findAll('.usage-key-credits dd')[2].text()).toBe('0')
     expect(keys[3].text()).toContain('已停用')
-    expect(keys[3].findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['0', '0', '—'])
+    expect(keys[3].findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['0', '0', '0'])
     expect(keys[3].findAll('.usage-key-metrics dd').map(cell => cell.text())).toEqual(['1', '—', '1'])
 
     const first = keys[0].get('button')
@@ -330,16 +366,69 @@ describe('StudentUsage', () => {
     expect(wrapper.text()).toContain('所选月暂无模型用量')
   })
 
-  it('keeps project balances readable and reports a missing model rollup as an error', async () => {
-    request.mockResolvedValueOnce(response({ month: currentUsage.month, projects: currentUsage.projects }))
-    mountUsage()
+  it('renders real legacy project and Key data without the new metrics or model rollup', async () => {
+    mountUsage(legacyUsage)
     await flushPromises()
 
     expect(wrapper.get('[role="alert"]').text()).toContain('模型汇总读取失败')
     expect(wrapper.text()).not.toContain('所选月暂无模型用量')
     expect(stat('used')).toBe('—')
-    expect(stat('available')).toBe('199.62419999999999997')
-    expect(wrapper.findAll('[data-testid="usage-key-row"]')).toHaveLength(4)
+    expect(stat('pending')).toBe('1.375')
+    expect(stat('available')).toBe('91.375')
+    const row = wrapper.get('[data-testid="usage-key-row"]')
+    expect(row.findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['7.25', '1.375', '35'])
+    expect(row.findAll('.usage-key-metrics dd').map(cell => cell.text())).toEqual(['—', '—', '1'])
+    expect(row.text()).toContain('有待核账记录')
+
+    await row.get('button').trigger('click')
+    const model = wrapper.get('.usage-key-models tbody tr')
+    expect(model.get('th').text()).toContain('旧版模型')
+    expect(model.findAll('td').map(cell => cell.text())).toEqual(['7.25', '3', '—', '—', '—'])
+  })
+
+  it('handles mistyped optional fields and keeps an available totals amount when models are missing', async () => {
+    const project = legacyUsage.projects[0]
+    const key = project.keys[0]
+    mountUsage({
+      ...legacyUsage,
+      totals: currentUsage.totals,
+      models: { unexpected: true },
+      projects: [{
+        ...project,
+        keys: [{
+          ...key, available_effective: [], tokens: null, token_coverage: null,
+          in_flight_credits: false, calls: true, models: null,
+        }],
+      }],
+    })
+    await flushPromises()
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('模型汇总读取失败')
+    expect(stat('used')).toBe('0.00080000000000003')
+    const row = wrapper.get('[data-testid="usage-key-row"]')
+    expect(row.findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['7.25', '1.375', '35'])
+    expect(row.findAll('.usage-key-metrics dd').map(cell => cell.text())).toEqual(['—', '—', '—'])
+    expect(row.text()).toContain('模型明细暂不可用')
+  })
+
+  it('keeps an expanded Key open during and after refreshing the same month', async () => {
+    mountUsage(currentUsage)
+    await flushPromises()
+    const button = wrapper.get('[data-testid="usage-key-row"] button')
+    await button.trigger('click')
+    const detail = document.getElementById(button.attributes('aria-controls')!)!
+    const refresh = pendingResponse()
+    request.mockReturnValueOnce(refresh.promise)
+    window.dispatchEvent(new Event('focus'))
+    await flushPromises()
+    expect(button.attributes('aria-expanded')).toBe('true')
+    expect(detail.querySelectorAll('tbody tr')).toHaveLength(2)
+
+    refresh.resolve(response(currentUsage))
+    await flushPromises()
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(button.attributes('aria-expanded')).toBe('true')
+    expect(detail.querySelectorAll('tbody tr')).toHaveLength(2)
   })
 
   it('separates a failed read from an empty month and retries the selected month', async () => {
@@ -362,11 +451,114 @@ describe('StudentUsage', () => {
     expect(stat('used')).toBe('0')
   })
 
+  it('opens recent calls on demand, expands a record and keeps the current list while retrying pagination', async () => {
+    mountUsage(emptyUsage('2026-11'))
+    await flushPromises()
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+
+    const cursor = 'eyJjcmVhdGVkX2F0IjoiMjAyNi0xMC0zMVQxNjowODoxMFoifQ'
+    request.mockResolvedValueOnce(response({ items: [recentCall], next_cursor: cursor }))
+    const modal = await openCallDialog('recent')
+    expect(modal.get('h2').text()).toBe('最近调用')
+    expect(modal.get('[data-testid="recent-range-today"]').attributes('aria-pressed')).toBe('true')
+    expect(request.mock.lastCall?.[0]).toBe('/api/v1/student/usage/recent?range=today&limit=20')
+
+    const row = modal.get('.usage-recent-row')
+    expect(row.attributes('aria-expanded')).toBe('false')
+    expect(row.text()).toContain('1.25 积分')
+    expect(row.get('time').text()).toContain('00:08:10')
+    await row.trigger('click')
+    expect(row.attributes('aria-expanded')).toBe('true')
+    expect(modal.get('.usage-recent-detail code').text()).toBe(recentCall.request_id)
+    expect(modal.get('.usage-recent-detail').text()).toContain('项目一')
+    expect(modal.get('.usage-recent-detail').text()).toContain('成功')
+    expect(modal.findAll('.usage-receipt-tokens dd').map(cell => cell.text())).toEqual(['100', '20', '0', '—'])
+    expect(request).toHaveBeenCalledTimes(2)
+
+    request.mockResolvedValueOnce(failure())
+    const more = modal.get('.usage-recent-more')
+    await more.trigger('click')
+    await flushPromises()
+    expect(modal.get('[role="alert"]').text()).toBeTruthy()
+    expect(more.text()).toBe('重试')
+    expect(row.attributes('aria-expanded')).toBe('true')
+
+    request.mockResolvedValueOnce(response({
+      items: [{ ...recentCall, id: '01800000-0000-7000-8000-000000000002', request_id: 'older-call' }],
+      next_cursor: null,
+    }))
+    await more.trigger('click')
+    await flushPromises()
+    expect(request.mock.calls.slice(2).map(([url]) => url)).toEqual([
+      `/api/v1/student/usage/recent?range=today&limit=20&cursor=${cursor}`,
+      `/api/v1/student/usage/recent?range=today&limit=20&cursor=${cursor}`,
+    ])
+    expect(modal.findAll('.usage-recent-row')).toHaveLength(2)
+    expect(modal.find('.usage-recent-more').exists()).toBe(false)
+    expect(modal.find('[role="alert"]').exists()).toBe(false)
+  })
+
+  it('resets the cursor on range changes and ignores responses from a former range or a closed dialog', async () => {
+    mountUsage(emptyUsage('2026-11'))
+    await flushPromises()
+    const today = pendingResponse()
+    request.mockReturnValueOnce(today.promise)
+    const modal = await openCallDialog('recent')
+    expect(modal.get('[role="status"]').text()).toBe('正在读取最近调用…')
+
+    request.mockResolvedValueOnce(response({ items: [], next_cursor: null }))
+    await modal.get('[data-testid="recent-range-month"]').trigger('click')
+    await flushPromises()
+    expect(request.mock.calls[1][1]?.signal?.aborted).toBe(true)
+    expect(request.mock.lastCall?.[0]).toBe('/api/v1/student/usage/recent?range=month&limit=20')
+    today.resolve(response({ items: [recentCall], next_cursor: 'old-cursor' }))
+    await flushPromises()
+    expect(modal.get('[role="status"]').text()).toBe('所选范围暂无调用记录')
+    expect(modal.find('.usage-recent-more').exists()).toBe(false)
+
+    const all = pendingResponse()
+    request.mockReturnValueOnce(all.promise)
+    await modal.get('[data-testid="recent-range-all"]').trigger('click')
+    expect(request.mock.lastCall?.[0]).toBe('/api/v1/student/usage/recent?range=all&limit=20')
+    await modal.get('[aria-label="关闭"]').trigger('click')
+    await flushPromises()
+    expect(request.mock.lastCall?.[1]?.signal?.aborted).toBe(true)
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+
+    request.mockResolvedValueOnce(response({ items: [], next_cursor: null }))
+    const reopened = await openCallDialog('recent')
+    all.resolve(response({ items: [recentCall], next_cursor: null }))
+    await flushPromises()
+    expect(reopened.get('[data-testid="recent-range-today"]').attributes('aria-pressed')).toBe('true')
+    expect(reopened.get('[role="status"]').text()).toBe('所选范围暂无调用记录')
+  })
+
+  it('defines a narrow layout for the Key row and receipt form at 360px', () => {
+    const documentSource = new DOMParser().parseFromString(studentUsageSource, 'text/html')
+    const style = document.createElement('style')
+    style.textContent = documentSource.querySelector('style[scoped]')!.textContent
+    document.head.append(style)
+    try {
+      // jsdom exposes the layout rules, but does not calculate viewport geometry.
+      const narrow = Array.from(style.sheet!.cssRules).find((rule): rule is CSSMediaRule =>
+        rule instanceof CSSMediaRule && rule.conditionText === '(max-width: 560px)')
+      expect(narrow).toBeDefined()
+      const rules = Array.from(narrow!.cssRules).filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
+      expect(rules.find(rule => rule.selectorText === '.usage-key-row')?.style.getPropertyValue('grid-template-areas'))
+        .toBe("'identity action' 'credits credits' 'metrics metrics'")
+      expect(rules.find(rule => rule.selectorText === '.usage-receipt-form')?.style.getPropertyValue('grid-template-columns'))
+        .toBe('minmax(0, 1fr)')
+    } finally {
+      style.remove()
+    }
+  })
+
   it('only looks up a receipt when submitted in the dialog and displays its amount, all Token fields and reason', async () => {
     mountUsage(currentUsage)
     await flushPromises()
     expect(document.querySelector('[role="dialog"]')).toBeNull()
-    const modal = await openReceipt()
+    const modal = await openCallDialog('receipt')
     expect(request).toHaveBeenCalledTimes(1)
     expect(modal.get('h2').text()).toBe('查单笔调用')
 
@@ -398,7 +590,7 @@ describe('StudentUsage', () => {
   it('ignores a receipt response after the dialog has been closed and reopened', async () => {
     mountUsage(emptyUsage('2026-11'))
     await flushPromises()
-    const modal = await openReceipt()
+    const modal = await openCallDialog('receipt')
     const pending = pendingResponse()
     request.mockReturnValueOnce(pending.promise)
     await modal.get('input').setValue(callReceipt.request_id)
@@ -407,7 +599,7 @@ describe('StudentUsage', () => {
 
     await modal.get('[aria-label="关闭"]').trigger('click')
     await flushPromises()
-    const reopened = await openReceipt()
+    const reopened = await openCallDialog('receipt')
     pending.resolve(response(callReceipt))
     await flushPromises()
     expect(reopened.find('[data-testid="receipt-result"]').exists()).toBe(false)
@@ -418,7 +610,7 @@ describe('StudentUsage', () => {
   it('shows pending settlement and missing evidence separately from reported zeros', async () => {
     mountUsage(emptyUsage('2026-11'))
     await flushPromises()
-    const modal = await openReceipt()
+    const modal = await openCallDialog('receipt')
     request.mockResolvedValueOnce(response({
       ...callReceipt,
       request_id: 'pending-call',

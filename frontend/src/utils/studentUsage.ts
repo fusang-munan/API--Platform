@@ -1,88 +1,110 @@
-import type { StudentUsageMetrics, StudentUsageModelMetrics, StudentUsageProject } from '../api/types'
-import { formatTokens, shiftDecimal } from './credits'
+import type {
+  StudentKeyUsage, StudentModelUsage, StudentModelUsageFields, StudentProjectUsageRow, StudentUsageFields,
+} from '../api/student'
+import { formatPercent, formatTokens, shiftDecimal } from './credits'
 import { calculateCredits } from './format'
 
-export type StudentCallReceipt = {
-  request_id: string
-  model_id: string
-  model_name: string
-  created_at: string
-  channel: string
-  billing_state: string
-  charged_credits: string | null
-  receipt_applied: boolean | null
-  usage_state?: string
-  usage_reason: string | null
-  input_tokens: string | null
-  output_tokens: string | null
-  cache_read_tokens: string | null
-  cache_write_tokens: string | null
-  total_tokens: string | null
+function isUsageCredit(value: unknown): value is string {
+  return typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value)
 }
 
-export function formatUsageCredits(value?: string | null): string {
-  return shiftDecimal(value, 0)
+export function formatUsageCredits(value: unknown): string {
+  return isUsageCredit(value) ? shiftDecimal(value, 0) : '—'
 }
 
-export function formatUsageTokenCount(value?: string | null): string {
-  return typeof value === 'string' && /^\d+$/.test(value) ? BigInt(value).toLocaleString('zh-CN') : '—'
+export function isUsageCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+export function formatUsageCount(value: unknown): string {
+  return isUsageCount(value) ? formatTokens(value) : '—'
+}
+
+export function formatUsageTokenCount(value: unknown): string {
+  if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value).toLocaleString('zh-CN')
+  return formatUsageCount(value)
+}
+
+export function studentKeyAvailable(key?: StudentKeyUsage): string | null {
+  const amount = key?.available_effective
+  if (isUsageCredit(amount)) return amount
+  return isUsageCredit(key?.available) ? key.available : null
+}
+
+export function studentInFlightCredits(row: Pick<StudentProjectUsageRow, 'in_flight_credits' | 'pending'>): string | null {
+  if (isUsageCredit(row.in_flight_credits)) return row.in_flight_credits
+  return isUsageCredit(row.pending) ? row.pending : null
+}
+
+export function hasStudentUsageModels(value: unknown): value is StudentModelUsage[] {
+  return Array.isArray(value) && value.every(row => typeof row?.id === 'string')
 }
 
 export function sumStudentProjectCredits(
-  projects: StudentUsageProject[],
+  projects: StudentProjectUsageRow[],
   field: 'quota' | 'in_flight_credits' | 'available',
 ): string | null {
   if (!projects.length) return null
   let total = '0.000'
   for (const project of projects) {
-    const amount = project[field]
-    if (typeof amount !== 'string' || !/^\d+(?:\.\d+)?$/.test(amount)) return null
+    const amount = field === 'in_flight_credits' ? studentInFlightCredits(project) : project[field]
+    if (!isUsageCredit(amount)) return null
     total = calculateCredits(total, amount, 'add')
   }
   return total
 }
 
-export function formatUsageCacheCoverage(metrics: StudentUsageMetrics): string {
-  const samples = formatTokens(metrics.cache_hit_coverage.sample_calls)
-  const total = formatTokens(metrics.token_coverage.calls)
-  return `覆盖 ${samples}/${total} 笔`
+export function formatUsageCacheRate(value: unknown): string {
+  return typeof value === 'number' && value >= 0 && value <= 1 ? formatPercent(value) : '—'
 }
 
-export function formatUsagePendingReview(metrics: StudentUsageMetrics): string {
-  if (metrics.pending_review_calls <= 0) return ''
-  const calls = formatTokens(metrics.pending_review_calls)
-  const credits = formatUsageCredits(metrics.pending_review_credits)
-  return `待核 ${calls} 笔（预留 ${credits} 积分）`
+export function formatUsageCacheCoverage(metrics: StudentUsageFields): string {
+  const samples = metrics.cache_hit_coverage?.sample_calls
+  const total = metrics.token_coverage?.calls
+  if (!isUsageCount(samples) || !isUsageCount(total)) return ''
+  return `覆盖 ${formatTokens(samples)}/${formatTokens(total)} 笔`
 }
 
-export function formatUsageModelNotes(model: StudentUsageModelMetrics): string {
+export function formatUsagePendingReview(metrics?: StudentUsageFields | null): string {
+  const count = metrics?.pending_review_calls
+  if (!isUsageCount(count)) return metrics?.pending_review === true ? '有待核账记录' : ''
+  if (count === 0) return ''
+  const calls = `待核 ${formatTokens(count)} 笔`
+  const credits = formatUsageCredits(metrics?.pending_review_credits)
+  return credits === '—' ? calls : `${calls}（预留 ${credits} 积分）`
+}
+
+export function formatUsageModelNotes(model: StudentModelUsageFields): string {
   const notes: string[] = []
   const coverage = model.token_coverage
   if (model.completeness === 'unknown') notes.push('无回报')
   if (model.completeness === 'partial') {
-    notes.push(`部分回报（${formatTokens(coverage.complete_calls)}/${formatTokens(coverage.calls)} 笔完整）`)
+    notes.push(isUsageCount(coverage?.complete_calls) && isUsageCount(coverage?.calls)
+      ? `部分回报（${formatTokens(coverage.complete_calls)}/${formatTokens(coverage.calls)} 笔完整）`
+      : '部分回报')
   }
-  if (coverage.unclassified_tokens && coverage.unclassified_tokens !== '0') {
-    notes.push(`未分类 ${formatUsageTokenCount(coverage.unclassified_tokens)} Token`)
+  const unclassified = formatUsageTokenCount(coverage?.unclassified_tokens)
+  if (unclassified !== '—' && unclassified !== '0') {
+    notes.push(`未分类 ${unclassified} Token`)
   }
-  if ((model.calls ?? 0) > 0 && formatUsageCredits(model.credits) === '0') notes.push('零额已结算')
+  if (isUsageCount(model.calls) && model.calls > 0 && formatUsageCredits(model.credits) === '0') notes.push('零额已结算')
   const review = formatUsagePendingReview(model)
   if (review) notes.push(review)
   return notes.join(' · ') || '—'
 }
 
-type ModelUsageLabel = Pick<StudentUsageModelMetrics, 'credits' | 'calls' | 'pending_review_calls'>
+type ModelUsageLabel = Pick<StudentModelUsageFields, 'credits' | 'calls' | 'pending_review_calls'>
 
 export function formatStudentModelUsageParts(row?: ModelUsageLabel) {
   const settledCalls = row?.calls ?? 0
   const pendingCalls = row?.pending_review_calls ?? 0
   const amount = formatUsageCredits(row?.credits)
   let credits = '本月 0.000 积分'
-  if (settledCalls > 0) {
-    credits = amount === '0' ? '本月 0 积分' : `本月已用 ${amount} 积分`
-  }
-  const review = pendingCalls > 0 ? ` · 待核 ${formatTokens(pendingCalls)} 笔` : ''
-  return { credits, calls: `${formatTokens(settledCalls)} 次${review}` }
+  if (row && amount === '—') credits = '本月积分未知'
+  else if (row && amount !== '0') credits = `本月已用 ${amount} 积分`
+  else if (isUsageCount(settledCalls) && settledCalls > 0) credits = '本月 0 积分'
+  const review = isUsageCount(pendingCalls) && pendingCalls > 0 ? ` · 待核 ${formatTokens(pendingCalls)} 笔` : ''
+  return { credits, calls: `${formatUsageCount(settledCalls)} 次${review}` }
 }
 
 export function formatStudentModelUsage(row?: ModelUsageLabel): string {
