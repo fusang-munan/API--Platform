@@ -494,35 +494,45 @@ export type BeichenUsageTotals = {
   cache_read_tokens: number
   cache_write_tokens: number
   calls: number
+  dispatched_calls?: number
+  settled_calls?: number
+  zero_cost_calls?: number
   pending_calls: number
+  pending_review_calls?: number
+  pending_review_credits?: string
+  token_missing_calls?: number
   students?: number
   keys?: number
   cache_hit_rate?: number | null
   tokens_missing?: number | null
   completeness?: 'complete' | 'partial' | 'missing' | null
+  charged_tokens_missing_calls?: number
   school_absorbed_credits?: string | null
 }
-export type BeichenModelUsageRow = BeichenUsageTotals & { model: string }
-export type BeichenStudentModelUsage = { model: string; credits: string; tokens: number; calls: number }
-export type BeichenStudentUsageRow = {
+export type BeichenModelIdentity = {
+  model: string
+  model_key?: string | null
+  school_model_id?: string | null
+  school_model?: string | null
+  upstream_models?: string[] | null
+  identity_sources?: string[] | null
+}
+export type BeichenModelUsageRow = BeichenUsageTotals & BeichenModelIdentity
+export type BeichenStudentModelUsage = BeichenUsageTotals & BeichenModelIdentity
+export type BeichenStudentUsageRow = BeichenUsageTotals & {
   user_id: string
   user_name: string
   project_id: string
   project_name: string
-  credits: string
-  tokens: number
-  calls: number
   models: BeichenStudentModelUsage[]
 }
-export type BeichenKeyUsageRow = {
+export type BeichenKeyUsageRow = BeichenUsageTotals & {
   api_key_id: string
   api_key_name: string
   user_id: string
   user_name: string
   project_name: string
-  credits: string
-  tokens: number
-  calls: number
+  models?: BeichenStudentModelUsage[] | null
 }
 export type BeichenModelUsage = {
   range: BeichenUsageRange

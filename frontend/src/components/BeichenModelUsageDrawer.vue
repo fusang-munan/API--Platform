@@ -1,19 +1,19 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import type { BeichenKeyUsageRow, BeichenModelUsage, BeichenUsageRange } from '../api/types'
-import { schoolUsageCredits, schoolUsageTokens, type SchoolUsageMetrics } from '../utils/beichenModels'
+import type { BeichenModelUsage, BeichenUsageRange } from '../api/types'
+import {
+  schoolUsageCredits, schoolUsageModelLabel, schoolUsageModelMatches, schoolUsageModelReference,
+  schoolUsagePendingNote, schoolUsageSettlementNote, schoolUsageTokenNote, schoolUsageTokens,
+  usageDispatchedCalls, usagePendingReviewCalls, type SchoolUsageMetrics,
+} from '../utils/beichenModels'
 import { formatTokens, shiftDecimal } from '../utils/credits'
 import { calculateCredits } from '../utils/format'
 import AppDialog from './AppDialog.vue'
 
-type UsageReport = Omit<BeichenModelUsage, 'keys'> & {
-  keys: Array<BeichenKeyUsageRow & SchoolUsageMetrics & { models?: Array<SchoolUsageMetrics & { model: string }> | null }>
-}
-
 const props = defineProps<{
   open: boolean
   range: BeichenUsageRange
-  usage?: UsageReport
+  usage?: BeichenModelUsage
   loading?: boolean
   error?: string
   initialModel?: string
@@ -45,10 +45,10 @@ watch(() => [props.open, props.initialModel] as const, ([open, model]) => {
 
 const period = computed(() => ranges.find(item => item.id === props.range)?.label ?? '本月')
 const totals = computed(() => focusedModel.value
-  ? props.usage?.models?.find(row => row.model.toLowerCase() === focusedModel.value.toLowerCase())
+  ? props.usage?.models?.find(row => schoolUsageModelMatches(row, focusedModel.value))
   : props.usage?.totals)
 const noCalls = computed(() => Boolean(props.usage && (focusedModel.value && !totals.value ||
-  totals.value?.calls === 0 && !totals.value.pending_calls)))
+  usageDispatchedCalls(totals.value) === 0 && !usagePendingReviewCalls(totals.value))))
 const noCallsLabel = computed(() => props.range === 'all' ? '所选时段无校内调用' : period.value + '无校内调用')
 const keyBreakdownIncomplete = computed(() => Boolean(group.value === 'key' && focusedModel.value &&
   props.usage?.keys?.some(key => key.models == null)))
@@ -57,9 +57,8 @@ const columns = computed(() => ({ model: '模型', student: '学生账号', key:
 const rows = computed<UsageRow[]>(() => {
   if (group.value === 'student') return accounts(focusedModel.value)
   if (group.value === 'key') {
-    const model = focusedModel.value.toLowerCase()
     return (props.usage?.keys ?? []).flatMap(key => {
-      const metrics = model ? key.models?.find(detail => detail.model.toLowerCase() === model) : key
+      const metrics = focusedModel.value ? key.models?.find(detail => schoolUsageModelMatches(detail, focusedModel.value)) : key
       if (!metrics) return []
       return [{
         id: key.api_key_id, kind: 'key', name: key.api_key_name,
@@ -68,10 +67,10 @@ const rows = computed<UsageRow[]>(() => {
     })
   }
   return (props.usage?.models ?? [])
-    .filter(model => !focusedModel.value || model.model.toLowerCase() === focusedModel.value.toLowerCase())
+    .filter(model => schoolUsageModelMatches(model, focusedModel.value))
     .flatMap(model => {
-      const id = model.model.toLowerCase()
-      const row: UsageRow = { id, kind: 'model', name: model.model, metrics: model }
+      const id = schoolUsageModelReference(model)
+      const row: UsageRow = { id, kind: 'model', name: schoolUsageModelLabel(model), metrics: model }
       return id === expandedModel.value ? [row, ...expandedStudents.value] : [row]
     })
 })
@@ -81,11 +80,10 @@ function sumCounts(left?: number | null, right?: number | null) {
 }
 
 function accounts(model: string): UsageRow[] {
-  const modelId = model.toLowerCase()
   const students = new Map<string, { name: string; projects: Set<string>; metrics: SchoolUsageMetrics }>()
   for (const student of props.usage?.students ?? []) {
-    const metrics: SchoolUsageMetrics | undefined = modelId
-      ? student.models?.find(detail => detail.model.toLowerCase() === modelId)
+    const metrics: SchoolUsageMetrics | undefined = model
+      ? student.models?.find(detail => schoolUsageModelMatches(detail, model))
       : student
     if (!metrics) continue
     const account = students.get(student.user_id)
@@ -105,14 +103,21 @@ function accounts(model: string): UsageRow[] {
       credits: left === '—' || right === '—' ? null : calculateCredits(left, right, 'add'),
       tokens: sumCounts(previous.tokens, metrics.tokens),
       calls: sumCounts(previous.calls, metrics.calls),
+      dispatched_calls: sumCounts(previous.dispatched_calls, metrics.dispatched_calls),
+      settled_calls: sumCounts(previous.settled_calls, metrics.settled_calls),
+      zero_cost_calls: sumCounts(previous.zero_cost_calls, metrics.zero_cost_calls),
       pending_calls: sumCounts(previous.pending_calls, metrics.pending_calls),
+      pending_review_calls: sumCounts(previous.pending_review_calls, metrics.pending_review_calls),
+      pending_review_credits: previous.pending_review_credits == null || metrics.pending_review_credits == null
+        ? undefined : calculateCredits(previous.pending_review_credits, metrics.pending_review_credits, 'add'),
+      token_missing_calls: sumCounts(previous.token_missing_calls, metrics.token_missing_calls),
       tokens_missing: sumCounts(previous.tokens_missing, metrics.tokens_missing),
       completeness: completeness === nextCompleteness ? completeness : 'partial',
     }
   }
   return Array.from(students, ([id, account]) => ({
     id: 'student-' + id, kind: 'student', name: account.name, metrics: account.metrics,
-    detail: Array.from(account.projects).filter(Boolean).join(' · '), parentModel: modelId || undefined,
+    detail: Array.from(account.projects).filter(Boolean).join(' · '), parentModel: model || undefined,
   }))
 }
 
@@ -143,12 +148,20 @@ function completenessLabel(metrics?: SchoolUsageMetrics) {
       </div>
       <template v-else-if="usage">
         <dl v-if="totals && !noCalls" class="usage-totals" aria-label="用量汇总">
-          <div><dt>{{ period }}已扣积分</dt><dd>{{ schoolUsageCredits(totals) }}</dd></div>
-          <div><dt>Token 总数</dt><dd>{{ schoolUsageTokens(totals) }}</dd></div>
+          <div>
+            <dt>{{ period }}已扣积分</dt>
+            <dd>{{ schoolUsageCredits(totals) }}<small v-if="schoolUsageSettlementNote(totals)">{{ schoolUsageSettlementNote(totals) }}</small></dd>
+          </div>
+          <div>
+            <dt>Token 总数</dt>
+            <dd>{{ schoolUsageTokens(totals) }}<small v-if="schoolUsageTokenNote(totals)">{{ schoolUsageTokenNote(totals) }}</small></dd>
+          </div>
           <div><dt>完整性</dt><dd>{{ completenessLabel(totals) }}</dd></div>
-          <div><dt>待核笔数</dt><dd>{{ formatTokens(totals.pending_calls) }}</dd></div>
+          <div>
+            <dt>待核笔数</dt>
+            <dd>{{ formatTokens(usagePendingReviewCalls(totals)) }}<small v-if="schoolUsagePendingNote(totals)">{{ schoolUsagePendingNote(totals) }}</small></dd>
+          </div>
         </dl>
-        <p v-if="totals?.tokens_missing" class="beichen-note">未归类 Token {{ formatTokens(totals.tokens_missing) }}</p>
         <div class="usage-groups" role="group" aria-label="用量分组">
           <button v-for="item in groups" :key="item.id" type="button" class="button ghost"
             :aria-pressed="group === item.id" @click="group = item.id">{{ item.label }}</button>
@@ -173,14 +186,18 @@ function completenessLabel(metrics?: SchoolUsageMetrics) {
                     <small v-if="row.detail">{{ row.detail }}</small>
                   </template>
                 </th>
-                <td class="numeric-cell" data-label="已扣积分">{{ schoolUsageCredits(row.metrics) }}</td>
+                <td class="numeric-cell" data-label="已扣积分">
+                  {{ schoolUsageCredits(row.metrics) }}
+                  <small v-if="schoolUsageSettlementNote(row.metrics)">{{ schoolUsageSettlementNote(row.metrics) }}</small>
+                </td>
                 <td class="numeric-cell" data-label="Token">
                   {{ schoolUsageTokens(row.metrics) }}
-                  <small v-if="row.metrics.tokens_missing">未归类 Token {{ formatTokens(row.metrics.tokens_missing) }}</small>
+                  <small v-if="schoolUsageTokenNote(row.metrics)">{{ schoolUsageTokenNote(row.metrics) }}</small>
                 </td>
                 <td data-label="完整性" :data-completeness="row.metrics.completeness">{{ completenessLabel(row.metrics) }}</td>
                 <td data-label="待核">
-                  {{ row.metrics.pending_calls == null ? '—' : formatTokens(row.metrics.pending_calls) + ' 笔' }}
+                  {{ usagePendingReviewCalls(row.metrics) == null ? '—' : formatTokens(usagePendingReviewCalls(row.metrics)) + ' 笔' }}
+                  <small v-if="schoolUsagePendingNote(row.metrics)">{{ schoolUsagePendingNote(row.metrics) }}</small>
                 </td>
               </tr>
               <tr v-if="row.kind === 'model' && expandedModel === row.id && !expandedStudents.length">

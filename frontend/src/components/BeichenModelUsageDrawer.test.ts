@@ -93,6 +93,18 @@ describe('北辰模型用量明细', () => {
     expect(wrapper.emitted('update:range')).toEqual([['day']])
   })
 
+  it('同名上游型号按校内模型身份选择，不混淆不同模型的费用', () => {
+    const data = usage()
+    data.models = [
+      { ...metrics('1', 100), model: 'same-upstream', model_key: 'school:a', school_model: 'school/a', school_model_id: 'a' },
+      { ...metrics('9', 900), model: 'same-upstream', model_key: 'school:b', school_model: 'school/b', school_model_id: 'b' },
+    ]
+    const wrapper = drawer({ usage: data, initialModel: 'school/b' })
+    expect(wrapper.get('[aria-label="用量汇总"]').text()).toContain('本月已扣积分9')
+    expect(wrapper.get('tbody').text()).toContain('school/b')
+    expect(wrapper.get('tbody').text()).not.toContain('school/a')
+  })
+
   it('加载、读取失败和空集分别展示，旧数据没有核对字段时显示待确认', async () => {
     const wrapper = drawer({ loading: true })
     expect(wrapper.get('[role="status"]').text()).toContain('正在读取用量')

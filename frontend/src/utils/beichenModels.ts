@@ -1,4 +1,4 @@
-import type { BeichenCatalogModel, BeichenDataset, BeichenModel, BeichenOverview, BeichenPreferredRoute, BeichenPriceConditions, BeichenPriceTier, BeichenProtocolCapability, BeichenUsageTotals, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../api/types'
+import type { BeichenCatalogModel, BeichenDataset, BeichenModel, BeichenModelIdentity, BeichenOverview, BeichenPreferredRoute, BeichenPriceConditions, BeichenPriceTier, BeichenProtocolCapability, BeichenUsageTotals, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../api/types'
 import { formatTokens, multiplyDecimal, shiftDecimal } from './credits'
 
 export function isBeichenProvider(baseUrl: string) {
@@ -160,25 +160,119 @@ export type SchoolUsageMetrics = {
   tokens?: number | null
   calls?: number | null
   pending_calls?: number | null
-} & Pick<BeichenUsageTotals, 'completeness' | 'tokens_missing'>
+} & Pick<BeichenUsageTotals, 'completeness' | 'tokens_missing' | 'dispatched_calls' | 'settled_calls' |
+  'zero_cost_calls' | 'pending_review_calls' | 'pending_review_credits' | 'token_missing_calls'>
+
+export type SchoolUsageModel = SchoolUsageMetrics & BeichenModelIdentity
+
+function usageCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+export function usageDispatchedCalls(metrics?: SchoolUsageMetrics | null): number | undefined {
+  if (usageCount(metrics?.dispatched_calls)) return metrics.dispatched_calls
+  return usageCount(metrics?.calls) ? metrics.calls : undefined
+}
+
+export function usageSettledCalls(metrics?: SchoolUsageMetrics | null): number | undefined {
+  if (usageCount(metrics?.settled_calls)) return metrics.settled_calls
+  // An older response only has calls, whose definition was already settled calls.
+  if (usageCount(metrics?.dispatched_calls)) return undefined
+  const calls = usageDispatchedCalls(metrics)
+  const pending = usagePendingReviewCalls(metrics)
+  return pending != null && calls === pending ? 0 : calls
+}
+
+export function usageZeroCostCalls(metrics?: SchoolUsageMetrics | null): number | undefined {
+  return usageCount(metrics?.zero_cost_calls) ? metrics.zero_cost_calls : undefined
+}
+
+export function usagePendingReviewCalls(metrics?: SchoolUsageMetrics | null): number | undefined {
+  if (usageCount(metrics?.pending_review_calls)) return metrics.pending_review_calls
+  return usageCount(metrics?.pending_calls) ? metrics.pending_calls : undefined
+}
+
+export function usageTokenMissingCalls(metrics?: SchoolUsageMetrics | null): number | undefined {
+  return usageCount(metrics?.token_missing_calls) ? metrics.token_missing_calls : undefined
+}
+
+export function schoolUsageModelMatches(model: SchoolUsageModel, value?: string | null) {
+  const target = value?.trim().toLowerCase()
+  if (!target) return true
+  const names = [model.model_key, model.school_model, model.model, model.school_model_id, ...(model.upstream_models ?? [])]
+  return names.some(name => typeof name === 'string' && name.toLowerCase() === target)
+}
+
+export function schoolUsageModelReference(model: SchoolUsageModel) {
+  return model.model_key ?? model.school_model ?? model.model
+}
+
+export function schoolUsageModelLabel(model: SchoolUsageModel) {
+  return model.school_model ?? model.model
+}
+
+export function schoolUsageModelMap(models?: SchoolUsageModel[] | null) {
+  const index = new Map<string, SchoolUsageModel>()
+  for (const model of models ?? []) {
+    // Prefer stable school identity over display-only upstream names.
+    for (const value of [model.school_model, model.model_key, model.school_model_id, model.model]) {
+      if (value && !index.has(value.toLowerCase())) index.set(value.toLowerCase(), model)
+    }
+  }
+  return index
+}
 
 export function schoolUsageCredits(metrics: SchoolUsageMetrics, withUnit = false) {
   const credits = shiftDecimal(metrics.credits, 0)
   if (credits === '—') return '积分未报告'
-  if (credits === '0' && metrics.calls && metrics.pending_calls === 0) {
-    return `0 积分 · ${formatTokens(metrics.calls)} 次（零额）`
+  const dispatched = usageDispatchedCalls(metrics)
+  const settled = usageSettledCalls(metrics)
+  const zeroCost = usageZeroCostCalls(metrics)
+  const pending = usagePendingReviewCalls(metrics)
+  if (credits === '0' && settled && settled > 0 && (zeroCost == null || zeroCost >= settled)) {
+    return `0 积分 · ${formatTokens(settled)} 次（零额）`
   }
-  if (credits === '0' && metrics.pending_calls && metrics.pending_calls === metrics.calls) return '暂无已扣积分'
+  if (credits === '0' && settled === 0 && dispatched && dispatched > 0) return '暂无已扣积分'
+  if (credits === '0' && settled == null && dispatched && pending === dispatched) return '暂无已扣积分'
   return withUnit ? credits + ' 积分' : credits
 }
 
 export function schoolUsageTokens(metrics?: SchoolUsageMetrics) {
   if (!metrics) return '—'
-  if (metrics.tokens == null || metrics.tokens === 0 && metrics.completeness === 'missing' && metrics.calls !== 0) {
+  const dispatched = usageDispatchedCalls(metrics)
+  const missingCalls = usageTokenMissingCalls(metrics)
+  if (metrics.tokens == null || dispatched && missingCalls === dispatched ||
+    metrics.tokens === 0 && metrics.completeness === 'missing' && dispatched !== 0) {
     return '未回报'
   }
-  if (metrics.tokens === 0 && metrics.completeness == null && metrics.calls !== 0) return '待确认'
+  if (metrics.tokens === 0 && metrics.completeness == null && dispatched !== 0) return '待确认'
   return formatTokens(metrics.tokens)
+}
+
+export function schoolUsageSettlementNote(metrics?: SchoolUsageMetrics | null) {
+  if (metrics?.dispatched_calls == null && metrics?.settled_calls == null && metrics?.zero_cost_calls == null) return ''
+  const dispatched = usageDispatchedCalls(metrics)
+  const settled = usageSettledCalls(metrics)
+  const zeroCost = usageZeroCostCalls(metrics)
+  const parts: string[] = []
+  if (dispatched != null) parts.push(`派发 ${formatTokens(dispatched)} 笔`)
+  if (settled != null) parts.push(`已结算 ${formatTokens(settled)} 笔`)
+  if (zeroCost) parts.push(`零额 ${formatTokens(zeroCost)} 笔`)
+  return parts.join(' · ')
+}
+
+export function schoolUsageTokenNote(metrics?: SchoolUsageMetrics | null) {
+  const parts: string[] = []
+  const missingCalls = usageTokenMissingCalls(metrics)
+  if (missingCalls) parts.push(`${formatTokens(missingCalls)} 笔未回报 Token`)
+  if (metrics?.tokens_missing) parts.push(`未归类 Token ${formatTokens(metrics.tokens_missing)}`)
+  return parts.join(' · ')
+}
+
+export function schoolUsagePendingNote(metrics?: SchoolUsageMetrics | null) {
+  const pending = usagePendingReviewCalls(metrics)
+  const credits = shiftDecimal(metrics?.pending_review_credits, 0)
+  return pending && credits !== '—' ? `预留 ${credits} 积分` : ''
 }
 
 type WebsiteKeyRateVersion = BeichenWebsiteKey & { observed_at?: string | null }

@@ -9,7 +9,8 @@ import { useToast } from '../../composables/useToast'
 import {
   formatObservedAt, formatPriceConditions, indexWebsiteKeyGroups, keyGroupIssue, keyGroupRate, lastKnownKeyGroup,
   lastKnownKeyGroupLabel, matchingSchoolBinding, missingPriceDetailLabels, priceBelongsToWebsiteKeyGroup, priceDetailRows, schoolCatalog,
-  schoolPriceRoutes, schoolTokenPriceAt, schoolUsageCredits, schoolUsageTokens,
+  schoolPriceRoutes, schoolTokenPriceAt, schoolUsageCredits, schoolUsageModelMap, schoolUsagePendingNote,
+  schoolUsageSettlementNote, schoolUsageTokenNote, schoolUsageTokens, usageDispatchedCalls, usagePendingReviewCalls,
   verifiedWebsiteKeyBilling, websiteKeyEffectiveRate, type SchoolCatalogRow, type SchoolQuote,
   type TeacherBoundRoute, type TeacherCatalogModel, type TeacherOverview,
 } from '../../utils/beichenModels'
@@ -473,26 +474,29 @@ const batchRows = computed(() => rows.value.filter(row => row.listed))
 const hasBatchEligible = computed(() => batchRows.value.some(row => !row.active && !canEnableReason(row)))
 const monthlyUsage = computed<UsageState>(() => usageStates.value.month ?? {})
 const drawerUsage = computed<UsageState>(() => usageStates.value[range.value] ?? {})
-const usageByModel = computed(() => new Map((monthlyUsage.value.data?.models ?? []).map(row => [row.model.toLowerCase(), row])))
+const usageByModel = computed(() => schoolUsageModelMap(monthlyUsage.value.data?.models))
 const monthlyStats = computed(() => {
   const totals = monthlyUsage.value.data?.totals
   const hitRate = totals?.cache_hit_rate
   const hasHitRate = hitRate != null && hitRate >= 0 && hitRate <= 1
+  const dispatched = usageDispatchedCalls(totals)
   let cacheCoverage = ''
-  if (totals?.calls) {
+  if (dispatched && totals) {
     if (!hasHitRate) cacheCoverage = '暂无可计算样本'
     else if (totals.completeness === 'complete') {
-      const calls = formatTokens(totals.calls)
+      const calls = formatTokens(dispatched)
       cacheCoverage = `Token 明细覆盖 ${calls}/${calls} 次`
-    } else if (totals.completeness === 'partial') cacheCoverage = `样本覆盖部分调用（共 ${formatTokens(totals.calls)} 次）`
+    } else if (totals.completeness === 'partial') cacheCoverage = `样本覆盖部分调用（共 ${formatTokens(dispatched)} 次）`
     else cacheCoverage = '仅统计 Token 明细完整的样本，覆盖笔数未回报'
   }
+  const settlementNote = schoolUsageSettlementNote(totals)
+  const tokenNote = schoolUsageTokenNote(totals)
+  const pendingNote = schoolUsagePendingNote(totals)
   return [
-    { label: '已扣积分', value: shiftDecimal(totals?.credits, 0) },
-    { label: 'Token 总数', value: schoolUsageTokens(totals),
-      note: totals?.tokens_missing ? '未归类 Token ' + formatTokens(totals.tokens_missing) : '' },
+    { label: '已扣积分', value: shiftDecimal(totals?.credits, 0), note: settlementNote },
+    { label: 'Token 总数', value: schoolUsageTokens(totals), note: tokenNote },
     { label: '缓存命中率', value: hasHitRate ? formatPercent(hitRate) : '—', note: cacheCoverage },
-    { label: '待核笔数', value: formatTokens(totals?.pending_calls) },
+    { label: '待核笔数', value: formatTokens(usagePendingReviewCalls(totals)), note: pendingNote },
   ]
 })
 
@@ -968,7 +972,7 @@ function modelCredits(model: string) {
   if (monthlyUsage.value.error) return '用量读取失败'
   if (!monthlyUsage.value.data) return '用量待读取'
   const usage = modelUsage(model)
-  if (!usage || usage.calls === 0 && !usage.pending_calls) return '本月无校内调用'
+  if (!usage || usageDispatchedCalls(usage) === 0 && !usagePendingReviewCalls(usage)) return '本月无校内调用'
   return schoolUsageCredits(usage, true)
 }
 
@@ -1309,8 +1313,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
             </td>
             <td data-label="本月用量" class="model-usage">
               <button type="button" class="usage-link" :aria-label="'查看 ' + row.model + ' 用量'" @click="openUsage(row.model)">{{ modelCredits(row.model) }}</button>
-              <small v-if="modelUsage(row.model) && modelUsage(row.model)?.calls !== 0" class="row-note">Token {{ schoolUsageTokens(modelUsage(row.model)) }}</small>
-              <small v-if="modelUsage(row.model)?.pending_calls" class="row-note">待核 {{ formatTokens(modelUsage(row.model)?.pending_calls) }} 笔</small>
+              <small v-if="modelUsage(row.model) && usageDispatchedCalls(modelUsage(row.model)) !== 0" class="row-note">Token {{ schoolUsageTokens(modelUsage(row.model)) }}</small>
+              <small v-if="usagePendingReviewCalls(modelUsage(row.model))" class="row-note">待核 {{ formatTokens(usagePendingReviewCalls(modelUsage(row.model))) }} 笔</small>
             </td>
             <td data-label="操作">
               <div class="model-actions">

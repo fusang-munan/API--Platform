@@ -63,12 +63,12 @@ function usage(range: BeichenUsageRange = 'month'): BeichenModelUsage {
     totals: { ...total('33.00000000000000000001', 2000), cache_hit_rate: 0.125, pending_calls: 3, completeness: 'partial', students: 2, keys: 2 },
     models: [{ model: 'lab/a', ...total() }, { model: 'lab/b', ...total('22', 1000) }],
     students: [
-      { user_id: 'student-a', user_name: '学生甲', project_id: 'project', project_name: '教学项目', credits: '33', tokens: 2000, calls: 8,
-        models: [{ model: 'lab/a', credits: '11', tokens: 1000, calls: 4 }, { model: 'lab/b', credits: '22', tokens: 1000, calls: 4 }] },
-      { user_id: 'student-b', user_name: '学生乙', project_id: 'project', project_name: '教学项目', credits: '0', tokens: 0, calls: 1,
-        models: [{ model: 'lab/b', credits: '0', tokens: 0, calls: 1 }] },
+      { ...total('33', 2000), calls: 8, user_id: 'student-a', user_name: '学生甲', project_id: 'project', project_name: '教学项目',
+        models: [{ model: 'lab/a', ...total() }, { model: 'lab/b', ...total('22', 1000) }] },
+      { ...total('0', 0), calls: 1, user_id: 'student-b', user_name: '学生乙', project_id: 'project', project_name: '教学项目',
+        models: [{ model: 'lab/b', ...total('0', 0), calls: 1 }] },
     ],
-    keys: [{ api_key_id: 'school-key', api_key_name: '学校 Key 甲', user_id: 'student-a', user_name: '学生甲', project_name: '教学项目', credits: '33', tokens: 2000, calls: 8 }],
+    keys: [{ ...total('33', 2000), calls: 8, api_key_id: 'school-key', api_key_name: '学校 Key 甲', user_id: 'student-a', user_name: '学生甲', project_name: '教学项目' }],
   }
 }
 function pricedLocation(id: number, name: string, rate: string, input: string, output: string,
@@ -1565,6 +1565,33 @@ describe('北辰模型管理', () => {
     expect(wrapper.get('[aria-label="本月用量汇总"]').text()).toContain('未归类 Token 40')
     await row(names[0]).get('button').trigger('click')
     expect(wrapper.get('[role="dialog"]').text()).toContain('本月无校内调用')
+  })
+
+  it('消费派发、结算、零额、待核预留和 Token 缺失字段', async () => {
+    const name = 'lab/settlement'
+    api.beichenOverview.mockResolvedValue(overview([{ model: name }]))
+    const metrics = {
+      ...total('0', 0), calls: 5, dispatched_calls: 5, settled_calls: 3, zero_cost_calls: 3,
+      pending_calls: 2, pending_review_calls: 2, pending_review_credits: '17',
+      token_missing_calls: 2, tokens_missing: 7, completeness: 'partial' as const,
+    }
+    api.modelUsage.mockResolvedValueOnce({
+      ...usage(), totals: { ...metrics, cache_hit_rate: null }, models: [{ model: name, ...metrics }],
+    })
+    const wrapper = view()
+    await flushPromises()
+
+    const summary = wrapper.get('[aria-label="本月用量汇总"]')
+    expect(summary.text()).toContain('派发 5 笔 · 已结算 3 笔 · 零额 3 笔')
+    expect(summary.text()).toContain('2 笔未回报 Token · 未归类 Token 7')
+    expect(summary.text()).toContain('预留 17 积分')
+    expect(wrapper.get('[data-model="' + name + '"] .model-usage').text()).toContain('0 积分 · 3 次（零额）')
+
+    await wrapper.get('button[aria-label="查看 ' + name + ' 用量"]').trigger('click')
+    const dialog = wrapper.get('[role="dialog"]')
+    expect(dialog.get('td[data-label="已扣积分"]').text()).toContain('派发 5 笔 · 已结算 3 笔 · 零额 3 笔')
+    expect(dialog.get('td[data-label="Token"]').text()).toContain('2 笔未回报 Token · 未归类 Token 7')
+    expect(dialog.get('td[data-label="待核"]').text()).toContain('预留 17 积分')
   })
 
   it('从 Terra 打开抽屉切按 Key 后保留 1.6844212 积分，主动看全部才汇总其他模型', async () => {
