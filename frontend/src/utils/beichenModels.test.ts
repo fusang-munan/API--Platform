@@ -118,8 +118,8 @@ describe('schoolCatalog credits', () => {
     const currentQuote = schoolCatalog(data, 'provider-1', groups)[0].quotes[0]
     // 计费观测仍属于分组 2，不能把官网新分组的 0.6 当作已核实倍率。
     expect(currentQuote).toMatchObject({ multiplier: '待核实', actual: null, actualRates: null })
-    expect(currentQuote.conditions).not.toBeNull()
-    expect(currentQuote.standard).toContain('输入 4')
+    expect(currentQuote.conditions).toBeNull()
+    expect(currentQuote.standard).toBeNull()
   })
 })
 

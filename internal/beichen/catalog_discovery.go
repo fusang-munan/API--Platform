@@ -1,13 +1,12 @@
 package beichen
 
 import (
-	"context"
-	"database/sql"
 	"maps"
 	"slices"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 )
 
 // The merged directory is a teacher read model. Raw Key IDs and each row's
@@ -35,7 +34,9 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 		}
 		for _, name := range key.staleModels {
 			if i, ok := rows[strings.ToLower(name)]; ok {
-				setCatalogKey(&view.ModelCatalog[i], key.listed(name, ""))
+				evidence := key.listed(name, "")
+				evidence.Stale = true
+				setCatalogKey(&view.ModelCatalog[i], evidence)
 			}
 		}
 	}
@@ -75,9 +76,20 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 	view.WebsiteOnlyModels = []WebsiteOnlyModel{}
 	for i := range view.ModelCatalog {
 		row := &view.ModelCatalog[i]
+		if row.Retired {
+			if row.CatalogState == "" {
+				row.CatalogState = "catalog_missing"
+			}
+			continue
+		}
 		row.CurrentKeyCount, row.StaleKeyCount = 0, 0
 		protocols := map[string]bool{}
-		for _, key := range row.CatalogKeys {
+		for j := range row.CatalogKeys {
+			key := &row.CatalogKeys[j]
+			record := byKey[key.CredentialID][key.UpstreamModel]
+			if record != nil && !record.catalogCurrent {
+				key.Stale = true
+			}
 			switch {
 			case key.State != "listed":
 				continue
@@ -85,8 +97,10 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 				row.StaleKeyCount++
 			default:
 				row.CurrentKeyCount++
-				for _, protocol := range byKey[key.CredentialID][key.UpstreamModel].protocols {
-					protocols[protocol] = true
+				if record != nil {
+					for _, protocol := range record.protocols {
+						protocols[protocol] = true
+					}
 				}
 			}
 		}
@@ -135,71 +149,28 @@ func (row CatalogModel) published() bool {
 	return row.SchoolStatus == "active" || row.SchoolModel != "" || row.BindingIssue != nil
 }
 
-// Use stored channel relationships even when a scan stopped listing the model.
-// Key rotation can leave an enabled binding on an old Key so the teacher
-// can diagnose and move it. Only disabled bindings count as retired evidence.
-func markRetiredCatalogModels(ctx context.Context, tx *sql.Tx, provider uuid.UUID, models []CatalogModel) error {
-	if len(models) == 0 {
-		return nil
-	}
-	rows, err := tx.QueryContext(ctx, `
-WITH north_bindings AS (
-  SELECT lower(btrim(b.upstream_model_name)) AS model, b.model_id,
-    b.status = 'inactive' AND (p.status <> 'active' OR COALESCE(c.status <> 'active', false)) AS retired
-  FROM model_bindings b
-  JOIN providers p ON p.id = b.provider_id
-  LEFT JOIN provider_credentials c ON c.id = b.credential_id AND c.provider_id = b.provider_id
-  WHERE b.provider_id = $1
-), channel_links AS (
-  SELECT lower(k.model_id::text) AS model, p.status <> 'active' OR c.status <> 'active' AS retired
-  FROM provider_model_catalog k
-  JOIN providers p ON p.id = k.provider_id
-  JOIN provider_credentials c ON c.id = k.credential_id AND c.provider_id = k.provider_id
-  WHERE k.provider_id = $1
-  UNION ALL
-  SELECT model, retired FROM north_bindings
-), historical_models AS (
-  SELECT model FROM channel_links GROUP BY model HAVING bool_and(retired)
-), school_models AS (
-  SELECT h.model, m.id AS model_id
-  FROM historical_models h JOIN models m ON m.model_id = h.model::citext
-  UNION
-  SELECT h.model, b.model_id FROM historical_models h JOIN north_bindings b USING (model)
-)
-SELECT h.model FROM historical_models h
-WHERE NOT EXISTS (
-  SELECT 1 FROM school_models s JOIN model_bindings b ON b.model_id = s.model_id
-  JOIN providers p ON p.id = b.provider_id
-  WHERE s.model = h.model AND b.status = 'active' AND p.status = 'active'
-)`, provider)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	historical := make(map[string]bool)
-	for rows.Next() {
-		var model string
-		if err := rows.Scan(&model); err != nil {
-			return err
-		}
-		historical[model] = true
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for i := range models {
-		row := &models[i]
-		// Keep alias matches and the existing diagnosis for a replacement Key
-		// associated with this model during catalog comparison.
-		hasActiveKey := slices.ContainsFunc(row.CatalogKeys, func(key CatalogKey) bool {
-			return key.State == "listed" || key.Replacement
-		})
-		if row.CatalogState != "website_only" && historical[strings.ToLower(row.Model)] && !hasActiveKey {
-			row.Retired = true
-			row.BindingIssue = nil
+func markRetiredCatalogModels(view *Overview, retired map[string]catalog.RetiredBeichenModel) {
+	seen := make(map[string]bool)
+	for i := range view.ModelCatalog {
+		row := &view.ModelCatalog[i]
+		name := strings.ToLower(row.Model)
+		if old, ok := retired[name]; ok {
+			row.Retired, row.HistoricalChannels = true, old.Channels
+			row.CanEnable, row.BindingIssue = false, nil
+			row.PriceCovered, row.PriceBlocker = false, nil
+			row.Blockers = []CatalogBlocker{}
+			seen[name] = true
 		}
 	}
-	return nil
+	for name, old := range retired {
+		if !seen[name] {
+			view.ModelCatalog = append(view.ModelCatalog, CatalogModel{
+				Model: old.Model, Retired: true, HistoricalChannels: old.Channels, SchoolStatus: "not_configured",
+				CatalogState: "catalog_missing", CredentialIDs: []uuid.UUID{}, PreferredRoutes: []PreferredRoute{},
+				BoundRoutes: []CatalogBoundRoute{}, Protocols: []string{}, Blockers: []CatalogBlocker{},
+			})
+		}
+	}
 }
 
 func catalogWebsiteMatches(keys []discoveryKey, websiteNames catalogNameMatcher, locations []WebsiteLocation) (map[string]bool, []CatalogKey) {

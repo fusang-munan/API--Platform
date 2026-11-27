@@ -37,8 +37,9 @@ function bindingRouteProbePlanFor(modelId: string): { endpoint: BindingRouteProb
 
 const rows = ref<Model[]>([])
 const providers = ref<Provider[]>([])
-const tab = ref<'common' | 'all'>('all')
+const tab = ref<'common' | 'all' | 'retired'>('all')
 const query = ref('')
+const retiredInfo = reactive<Record<string, { total: number; matches: number }>>({})
 const selected = ref<{ model: Model; bindings: Binding[] } | null>(null)
 const selectedLine = ref<Model | null>(null)
 const dialogOpen = ref(false)
@@ -83,7 +84,9 @@ const schoolProviders = computed(() => providers.value.filter(provider => isBeic
 const schoolProviderIds = computed(() => new Set(schoolProviders.value.map(provider => provider.id)))
 const commonIds = computed(() => new Set(rows.value.filter(model => model.is_common).map(model => model.model_id.toLowerCase())))
 const otherModels = computed(() => rows.value.filter(model => !schoolProviderIds.value.has(model.provider_id ?? '')))
-const filtered = computed(() => sortModelsByRecency(otherModels.value
+const retiredCount = computed(() => schoolProviders.value.reduce((count, provider) => count + (retiredInfo[provider.id]?.total ?? 0), 0))
+const retiredMatches = computed(() => schoolProviders.value.reduce((count, provider) => count + (retiredInfo[provider.id]?.matches ?? 0), 0))
+const filtered = computed(() => tab.value === 'retired' ? [] : sortModelsByRecency(otherModels.value
   .filter(model => (tab.value === 'all' || model.is_common) && (!query.value || `${model.display_name} ${model.model_id}`.toLowerCase().includes(query.value.toLowerCase())))))
 const activeProviders = computed(() => providers.value.filter(provider => provider.status === 'active' && !isBeichenProvider(provider.base_url)))
 
@@ -354,20 +357,25 @@ onMounted(load)
         <p class="eyebrow">TEACHER</p>
         <h1>模型管理</h1>
       </div>
-      <button class="button primary" @click="reset">新增模型</button>
+      <button v-if="tab !== 'retired'" class="button primary" @click="reset">新增模型</button>
     </div>
     <p v-if="error" class="error banner">{{ error }}</p>
     <section class="panel">
       <div class="segmented">
-        <button :class="{ active: tab === 'common' }" @click="tab = 'common'">常用模型</button>
-        <button :class="{ active: tab === 'all' }" @click="tab = 'all'">全部模型</button>
+        <button type="button" :aria-pressed="tab === 'common'" :class="{ active: tab === 'common' }" @click="tab = 'common'">常用模型</button>
+        <button type="button" :aria-pressed="tab === 'all'" :class="{ active: tab === 'all' }" @click="tab = 'all'">全部模型</button>
+        <button v-if="schoolProviders.length" type="button" :aria-pressed="tab === 'retired'"
+          :class="{ active: tab === 'retired' }" @click="tab = 'retired'">已作废（{{ retiredCount }}）</button>
       </div>
       <label>搜索<input v-model="query" placeholder="名称或 model_id"></label>
+      <button v-if="query.trim() && tab !== 'retired' && retiredMatches" type="button" class="button ghost"
+        @click="tab = 'retired'">查看匹配的已作废型号（{{ retiredMatches }}）</button>
     </section>
     <LoadingRegion :initial-loading="loadState.initialLoading.value" :refreshing="loadState.refreshing.value" variant="cards" label="正在加载模型" style="margin-top:20px">
       <section v-for="provider in schoolProviders" :key="provider.id" class="panel">
         <h2>{{ provider.name }}</h2>
-        <BeichenSchoolModels :provider-id="provider.id" :query="query" :common-ids="tab === 'common' ? commonIds : undefined" />
+        <BeichenSchoolModels :provider-id="provider.id" :query="query" :common-ids="tab === 'common' ? commonIds : undefined"
+          :retired-only="tab === 'retired'" @retired-change="retiredInfo[provider.id] = $event" />
       </section>
       <div v-if="filtered.length" class="grid two">
         <article v-for="model in filtered" :key="lineKey(model)" class="panel">

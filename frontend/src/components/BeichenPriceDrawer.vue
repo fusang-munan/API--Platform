@@ -238,16 +238,20 @@ async function save() {
         <label><input v-model="mode" type="radio" value="follow" :name="fieldId + '-mode'">{{ followLabel }}</label>
         <label><input v-model="mode" type="radio" value="manual" :name="fieldId + '-mode'">手动定价</label>
       </fieldset>
-      <p v-if="hasDerived" class="beichen-note">反推价，待核对。自动计价优先采用同分组的正式官网价。反推价的缓存单价待核实。</p>
+      <fieldset class="price-mode" :disabled="editingDisabled || !modelKeys.length">
+        <legend>生效范围</legend>
+        <label><input v-model="scope" type="radio" value="all" :name="fieldId + '-scope'">全部 Key</label>
+        <label><input v-model="scope" type="radio" value="credentials" :name="fieldId + '-scope'">仅选中的 Key</label>
+      </fieldset>
+      <fieldset v-if="scope === 'credentials'" class="price-mode" :disabled="editingDisabled">
+        <legend>选择 Key（可多选）</legend>
+        <label v-for="key in modelKeys" :key="key.credential_id">
+          <input v-model="selectedIds" type="checkbox" :value="key.credential_id" :disabled="key.inactive">
+          {{ key.label }}<template v-if="key.inactive">（停用）</template>
+        </label>
+      </fieldset>
 
-      <div v-if="mode === 'follow'" class="price-detail-cards">
-        <BeichenPriceDetail v-for="quote in followPrices" :key="quote.credential_id" :detail="quote.detail"
-          :title="quote.label + ' · ' + (quote.derived ? '反推基础价详情' : '官网基础价详情')" />
-      </div>
-      <BeichenPriceDetail v-else :detail="manualDetail" title="手动价详情" />
-      <p v-if="missingPriceFields.length" class="beichen-note price-missing-summary">
-        缺价字段：{{ missingPriceFields.join('、') }}
-      </p>
+      <p v-if="hasDerived" class="beichen-note">反推价，待核对。自动计价优先采用同分组的正式官网价。反推价的缓存单价待核实。</p>
 
       <template v-if="mode === 'manual'">
         <div class="beichen-toolbar">
@@ -277,19 +281,6 @@ async function save() {
         <p class="beichen-note">{{ hasDerived ? '基础价随所选报价和渠道倍率更新。使用了无报价的缓存项时，调用进入待核账。' : '基础价随官网报价和渠道倍率更新。缺少可用报价时，调用可能进入待核账。' }}</p>
       </div>
 
-      <fieldset class="price-mode" :disabled="editingDisabled || !modelKeys.length">
-        <legend>生效范围</legend>
-        <label><input v-model="scope" type="radio" value="all" :name="fieldId + '-scope'">全部 Key</label>
-        <label><input v-model="scope" type="radio" value="credentials" :name="fieldId + '-scope'">仅选中的 Key</label>
-      </fieldset>
-      <fieldset v-if="scope === 'credentials'" class="price-mode" :disabled="editingDisabled">
-        <legend>选择 Key（可多选）</legend>
-        <label v-for="key in modelKeys" :key="key.credential_id">
-          <input v-model="selectedIds" type="checkbox" :value="key.credential_id" :disabled="key.inactive">
-          {{ key.label }}<template v-if="key.inactive">（停用）</template>
-        </label>
-      </fieldset>
-
       <p v-if="overviewLoading" class="beichen-note" role="status">正在读取此模型的 Key…</p>
       <div v-else-if="!outcome && (overviewError || (overview && (!modelKeys.length || incompleteScope)))" class="scope-notice">
         <p class="beichen-note" role="alert">{{ overviewError || (incompleteScope
@@ -298,20 +289,17 @@ async function save() {
         <button type="button" class="button ghost" :disabled="saving" @click="loadOverview">重新读取</button>
       </div>
 
-      <section v-if="overview && !overviewLoading" class="price-confirmation" :aria-labelledby="fieldId + '-confirmation'">
-        <h3 :id="fieldId + '-confirmation'">保存确认</h3>
-        <dl class="confirmation-summary">
-          <div><dt>影响 Key 数</dt><dd>{{ scope === 'all' && incompleteScope ? '待确认' : affectedKeys.length }}</dd></div>
-          <div><dt>影响行数</dt><dd>{{ scope === 'all' && incompleteScope ? '待确认' : affectedKeys.length }}</dd></div>
-          <div><dt>计价方式</dt><dd>{{ mode === 'follow' ? followLabel : '手动价' }}</dd></div>
-        </dl>
-        <h4>本次将影响的全部 Key</h4>
-        <ul v-if="affectedKeys.length" class="affected-keys" aria-label="本次将影响的全部 Key">
-          <li v-for="key in affectedKeys" :key="key.credential_id">{{ key.label }}<template v-if="key.inactive">（停用）</template></li>
-        </ul>
-        <p v-else-if="scope === 'credentials'" class="beichen-note">请至少选择一个 Key。</p>
-        <p class="beichen-note">每个 Key 对应此模型的一行价格。</p>
-        <p class="beichen-note">跟随官网时，下表为已乘渠道倍率的执行价；手动价为学生实价 ×1.10 前的基础价。</p>
+      <section v-if="overview && !overviewLoading" class="price-confirmation" :aria-labelledby="fieldId + '-preview'">
+        <h3 :id="fieldId + '-preview'">报价预览</h3>
+        <div v-if="mode === 'follow'" class="price-detail-cards">
+          <BeichenPriceDetail v-for="quote in followPrices" :key="quote.credential_id" :detail="quote.detail"
+            :title="quote.label + ' · ' + (quote.derived ? '反推基础价详情' : '官网基础价详情')" />
+        </div>
+        <BeichenPriceDetail v-else :detail="manualDetail" title="手动价详情" />
+        <p v-if="missingPriceFields.length" class="beichen-note price-missing-summary">
+          缺价字段：{{ missingPriceFields.join('、') }}
+        </p>
+        <p class="beichen-note">跟随官网时，下表为已乘渠道倍率的执行价。手动价为乘学校扣分系数前的基础价。</p>
         <table v-if="confirmationPrices.length" class="confirmation-rates">
           <caption>基础单价 / 百万 Token（1 元 = 100 积分）</caption>
           <thead><tr><th scope="col">用量项</th><th scope="col">元</th><th scope="col">积分</th></tr></thead>
@@ -334,6 +322,21 @@ async function save() {
             </tr>
           </tbody>
         </table>
+      </section>
+
+      <section v-if="overview && !overviewLoading" class="price-confirmation" :aria-labelledby="fieldId + '-confirmation'">
+        <h3 :id="fieldId + '-confirmation'">受影响 Key</h3>
+        <dl class="confirmation-summary">
+          <div><dt>影响 Key 数</dt><dd>{{ scope === 'all' && incompleteScope ? '待确认' : affectedKeys.length }}</dd></div>
+          <div><dt>影响行数</dt><dd>{{ scope === 'all' && incompleteScope ? '待确认' : affectedKeys.length }}</dd></div>
+          <div><dt>计价方式</dt><dd>{{ mode === 'follow' ? followLabel : '手动价' }}</dd></div>
+        </dl>
+        <h4>本次将影响的全部 Key</h4>
+        <ul v-if="affectedKeys.length" class="affected-keys" aria-label="本次将影响的全部 Key">
+          <li v-for="key in affectedKeys" :key="key.credential_id">{{ key.label }}<template v-if="key.inactive">（停用）</template></li>
+        </ul>
+        <p v-else-if="scope === 'credentials'" class="beichen-note">请至少选择一个 Key。</p>
+
         <p v-if="mode === 'manual' && scope === 'all'" class="beichen-note">新渠道同步后按此价生效。</p>
       </section>
       <p class="beichen-note">只影响保存后发起的调用，历史扣费保持原记账金额。</p>

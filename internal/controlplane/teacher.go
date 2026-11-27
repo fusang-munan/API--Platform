@@ -597,9 +597,26 @@ func (s *Service) teacherModelLinesForProvider(ctx context.Context, providerRow 
 	if err != nil {
 		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "list provider credentials", err)
 	}
+	var evidence map[uuid.UUID]map[string]catalog.ModelCapability
+	if catalog.IsBeichenBaseURL(providerRow.BaseURL) {
+		snapshot, err := catalog.ReadBeichenCapabilities(ctx, s.sqlDB, providerRow.ID)
+		if err != nil {
+			return nil, err
+		}
+		evidence = make(map[uuid.UUID]map[string]catalog.ModelCapability)
+		for _, row := range snapshot.Capabilities {
+			if row.CredentialID == nil {
+				continue
+			}
+			if evidence[*row.CredentialID] == nil {
+				evidence[*row.CredentialID] = make(map[string]catalog.ModelCapability)
+			}
+			evidence[*row.CredentialID][strings.ToLower(row.Model)] = row
+		}
+	}
 	result := make([]ModelView, 0)
 	for _, credential := range credentials {
-		lines, lineErr := s.teacherModelLinesForCredential(ctx, credential, providerRow)
+		lines, lineErr := s.teacherModelLinesForCredential(ctx, credential, providerRow, evidence[credential.ID], evidence != nil)
 		if lineErr != nil {
 			return nil, lineErr
 		}
@@ -628,6 +645,8 @@ func (s *Service) teacherModelLinesForCredential(
 	ctx context.Context,
 	credential *ent.ProviderCredential,
 	providerRow *ent.Provider,
+	evidence map[string]catalog.ModelCapability,
+	beichenProvider bool,
 ) ([]ModelView, error) {
 	catalogRows, err := s.db.ProviderModelCatalog.Query().
 		Where(
@@ -646,6 +665,9 @@ func (s *Service) teacherModelLinesForCredential(
 	publicModelIDs := make([]string, 0, len(uniqueCatalogRows))
 	for _, row := range uniqueCatalogRows {
 		publicModelIDs = append(publicModelIDs, row.ModelID)
+		for _, binding := range evidence[strings.ToLower(row.ModelID)].Bindings {
+			publicModelIDs = append(publicModelIDs, binding.SchoolModel)
+		}
 	}
 	modelByPublicID, err := s.modelsByPublicID(ctx, publicModelIDs)
 	if err != nil {
@@ -655,7 +677,29 @@ func (s *Service) teacherModelLinesForCredential(
 	for _, catalogRow := range uniqueCatalogRows {
 		modelID := strings.TrimSpace(catalogRow.ModelID)
 		item := teacherModelLineView(catalogRow, credential, providerRow, modelByPublicID[modelID])
-		if modelRow := modelByPublicID[modelID]; modelRow != nil {
+		if beichenProvider {
+			row, current := evidence[strings.ToLower(modelID)]
+			if !current {
+				continue
+			}
+			var bound []catalog.ProtocolCapability
+			for _, binding := range row.Bindings {
+				if school := modelByPublicID[binding.SchoolModel]; school != nil && school.IsCommon {
+					item.IsCommon = true
+				}
+				if binding.Published && modelByPublicID[modelID] == nil {
+					item.Status = string(entmodel.StatusActive)
+				}
+				if binding.BindingReady {
+					bound = append(bound, binding.ProtocolCapability)
+				}
+			}
+			availability := catalog.SummarizeModelAvailability(modelID, entmodel.StatusActive, bound)
+			availability.Availability, availability.AvailabilityReason = row.Availability, row.AvailabilityReason
+			availability.RecommendedProtocol, availability.ProbeState = row.RecommendedProtocol, row.ProbeState
+			item.setAvailability(availability)
+			item.SupportedProtocols = row.SupportedProtocols
+		} else if modelRow := modelByPublicID[modelID]; modelRow != nil {
 			ready, readyErr := catalog.CredentialLineHasActiveRoute(ctx, s.db, modelRow.ID, credential.ID)
 			if readyErr != nil {
 				return nil, domain.WrapError(domain.CodeDependencyUnavailable, "query model route", readyErr)

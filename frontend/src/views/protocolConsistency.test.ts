@@ -1,11 +1,12 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { describe, expect, it, vi } from 'vitest'
-import type { BeichenModelCapability, BeichenOverview, Model } from '../api/types'
+import type { BeichenModelCapability, Model } from '../api/types'
+import type { TeacherOverview } from '../utils/beichenModels'
 import BeichenSchoolModels from './teacher/BeichenSchoolModels.vue'
 import StudentModels from './student/StudentModels.vue'
 
 const teacherAPI = vi.hoisted(() => ({
-  beichenOverview: vi.fn(), beichenCapabilities: vi.fn(), modelUsage: vi.fn(),
+  beichenOverview: vi.fn(), modelUsage: vi.fn(),
   syncBeichen: vi.fn(), requestBeichenProbes: vi.fn(), beichenProbes: vi.fn(),
   previewBeichenRebind: vi.fn(), applyBeichenRebind: vi.fn(), rescanBeichenCatalog: vi.fn(),
   enableBeichenModelsBatch: vi.fn(), enableBeichenModel: vi.fn(), updateModel: vi.fn(), setBeichenModelPrice: vi.fn(),
@@ -28,7 +29,7 @@ const capability: BeichenModelCapability = {
   catalog_state: 'key_listed', availability: 'available', price_state: 'confirmed', price_blocker: null,
   multiplier_state: 'current', probe_state: 'passed', binding_state: 'ready', action_hint: '可使用推荐协议接入。',
 }
-const overview: BeichenOverview = {
+const overview: TeacherOverview = {
   datasets: [], comparison: [],
   models: [{
     model: modelID, credential_id: 'key-1', mode: 'follow', price_status: 'confirmed',
@@ -40,6 +41,10 @@ const overview: BeichenOverview = {
     model: modelID, school_status: 'active', can_enable: false, activation: 'active',
     preferred_routes: [{ school_model: modelID, provider_id: 'north', credential_id: 'key-1', credential_label: '渠道一', adapter: 'openai_compatible', priority: 1, state: 'ready', effective_multiplier_text: '0.1' }],
     protocols: ['anthropic', 'openai_compatible'], probe_state: 'passed',
+    route_availability: {
+      protocols: capability.supported_protocols, available_protocols: capability.available_protocols,
+      recommended_protocol: capability.recommended_protocol, availability: capability.availability,
+    },
   }],
 }
 const studentModel: Model = {
@@ -53,7 +58,6 @@ const studentModel: Model = {
 describe('协议与可用性三处一致', () => {
   it('同一模型在教师页和学生广场显示相同的推荐协议与可用状态', async () => {
     teacherAPI.beichenOverview.mockResolvedValue(overview)
-    teacherAPI.beichenCapabilities.mockResolvedValue({ capabilities: [capability], gaps: [] })
     teacherAPI.modelUsage.mockResolvedValue({
       range: 'month', start: null, end: '2026-11-21T12:00:00+08:00', timezone: 'Asia/Shanghai',
       totals: { credits: '0', tokens: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, calls: 0, pending_calls: 0 },

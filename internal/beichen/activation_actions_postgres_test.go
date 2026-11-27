@@ -230,10 +230,8 @@ FROM provider_credentials c CROSS JOIN rate WHERE c.id=$1`, key, single, batch, 
 					}
 					priceMessage = model.PriceBlocker.Message
 				}
-				if tc.noRoute && (model.CanEnable || model.PriceState != "conditional" || !slices.ContainsFunc(model.Blockers, func(blocker CatalogBlocker) bool {
-					return blocker.Code == "no_ready_route"
-				})) {
-					t.Fatalf("expected a route blocker ahead of conditional pricing: %+v", model)
+				if tc.noRoute && (!model.Retired || model.CanEnable || len(model.Blockers) != 0) {
+					t.Fatalf("disabled-only history should leave the current activation preview: %+v", model)
 				}
 			}
 			if previewed != 2 {
@@ -336,8 +334,9 @@ WHERE credential_id=$1 AND kind='catalog'`, key, tc.minutesAgo, tc.lastError)
 				}
 			}
 			i := slices.IndexFunc(view.ModelCatalog, func(model CatalogModel) bool { return model.Model == "published" })
-			if i < 0 || view.ModelCatalog[i].ReadyCount != 1 || view.ModelCatalog[i].Activation != "active" {
-				t.Fatalf("the published binding should still be ready: %+v", view.ModelCatalog)
+			if i < 0 || view.ModelCatalog[i].ReadyCount != 0 || view.ModelCatalog[i].SchoolStatus != "active" ||
+				!view.ModelCatalog[i].BoundCatalogPending || view.ModelCatalog[i].ModelAvailability.Availability != "unverified" {
+				t.Fatalf("the published binding should wait for current catalog evidence: %+v", view.ModelCatalog)
 			}
 			if id, err := service.EnableModel(ctx, provider, actor, "published", ""); err != nil || id != published {
 				t.Fatalf("the published model should still resolve to %s: %s (%v)", published, id, err)
