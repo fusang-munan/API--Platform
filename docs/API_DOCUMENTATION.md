@@ -468,6 +468,8 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `model_catalog[].school_model_id` 是校内模型在 `models.id` 中的 UUID，与用量报表的 `school_model_id` 相同。每个有已确认校内身份的目录行都返回该字段，客户端据此精确关联同名上游模型的校内用量。同一上游名绑定多个校内模型时分别成行，各行使用自己的 UUID，线路和统计只取该校内模型。仅官网发现、尚无校内绑定的目录行没有可确认的 UUID，此时省略该字段；旧响应没有此字段时，客户端可继续按 `school_model` 匹配，无法唯一确认时显示待确认。
 
+同一上游名的目录和官网证据会分发到所有同名校内行。`catalog_keys` 和 `credential_ids` 随后按该行的 `preferred_routes`、`bound_routes` 中出现的渠道过滤，只保留当前校内模型可用的 Key。相同 Key 同时属于两个校内模型时，两行都会显示；不同渠道各自绑定时分别显示。某行只有在自己没有当前目录证据时才进入 `published_unavailable`，不会因为同上游其他校内行的 Key 被误判。
+
 对 `/beichen/rebind` 发送 `{"preview":true}` 生成预览。返回的 `evidence_versions` 按 Key 排序，包含 `credential_id`、`credential_revision`、`group_id`、`catalog_observed_at` 和 `evidence_since`。`preview_token` 同时绑定这些版本和 `changes`。发送 `{"preview":false,"preview_token":"…"}` 确认。确认时遇到同步锁冲突、目录过期、权限失效或证据及计划变化，返回 `409 INVALID_STATE_TRANSITION` 并回滚全部绑定变更。教师需重新预览。成功日志记录操作人、供应商与变更数量。
 
 `/v1/models` 明确返回 `GROUP_NOT_ALLOWED` 后，当前凭据版本在 `bound_routes` 和能力记录中返回 `group_status=not_allowed` 和 `catalog_state=group_blocked`。这把 Key 的线路退出推荐及报价覆盖。如果已发布模型没有就绪线路，明确的分组拒绝通过 `binding_issue.code=group_not_allowed` 返回，`action_hint` 提示恢复该 Key 的分组权限后重扫。成功读到模型清单就会清除目录扫描的拒绝状态。若清单缩水待核验，教师概览仍会显示目录待复核。
