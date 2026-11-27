@@ -338,6 +338,12 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 学生月度用量的只读汇总在同一个可重复读事务中执行两条查询，分别读取汇总和额度。用量按 `user_id`、`project_id`、`api_key_id`、`model_id` 与账月归属。查询先限定该学生所属项目内的自有 Key，再在每个 Key × 模型上合并月账本和逐笔证据。月账本沿用以 `month` 开头的索引，调用查询可利用 `gateway_calls_student_receipt_lookup (user_id, request_id)` 的用户前缀及 `gateway_calls_key_created (api_key_id, created_at)` 的 Key 前缀。过滤使用调用受理时记录的 `month`，因此跨月派发或补记仍归入原账月。汇总复用现有表和索引。
 
+教师北辰模型用量读取 `gateway_calls` 的派发快照。用 `COALESCE(beichen_price_at, beichen_dispatch_at)`，旧行用 `sent_at`，按北京时间左闭右开的区间选取有派发渠道和上游型号、`outcome <> 'pending'` 的调用。教师报表使用派发月，学生账本使用受理时写入 `monthly_usage_cube.month` 的账月。跨月派发及之后的结算会在两个时间口径下落入不同月份。
+
+教师模型用量的 `calls` 和 `dispatched_calls` 是同一范围中的行数。`settled_calls` 计 `beichen_state='charged'` 及无北辰账务状态时 `billing_state='charged'` 的旧调用，精确扣分为零（旧调用的 `credit_milli=0`）仍计入，另记 `zero_cost_calls`。`credits` 对北辰已扣行只取 `beichen_credit_exact`，对缺少北辰账务状态的已结算旧行回退为 `credit_milli * 0.001`。两者按 `beichen_state` 是否为空互斥，不能相加；因此 400 千分积分计为 0.400 积分。仅 `pending_review` 行的 `unresolved_credit_milli` 计入待核预留合计，该列保存整积分。释放的行保留派发证据，退出待核且不作为已结算。Token 回报独立统计。分项、显式总量和原始输入均缺时计入 `token_missing_calls`，明确数值 0 保留为已知。`completeness` 标记整组覆盖情况。
+
+教师模型用量优先用 `gateway_calls.model_id` 保存的 UUID 归组，左连接 `models.id` 仅补充校内标识，停用或缺少当前模型资料的调用仍归入原 UUID。不可用 UUID（空值或全零）才按派发供应商、凭据和上游名查 `upstream_model_aliases`，渠道专属优先。命中且 `school_model` 能对应 `models.model_id` 时归入该 UUID。其余记录按供应商、派发渠道和小写上游名称归组并标明仅有上游名证据；不同渠道的同名旧调用分别成行。查询无需新增列，也无需用当前绑定反推历史身份。
+
 学生余额查询读取所属项目的 `project_month_credit_buckets` 和个人的 `project_member_month_credit_buckets`，两边均按额度减已扣、千分之一积分以下的余数和在途占用。有效可用额取两边的较小值，最低为零。本月个人额度取 `project_members.monthly_credit_quota_milli`，与网关受理时刷新月桶的来源相同。历史账月优先读该月份的月桶。Key 月桶继续提供旧字段 `available`。
 
 教师学生用量由 `monthly_usage_cube` 与 `gateway_calls` 按调用时记录的学生、项目、Key 和模型全外连接聚合。两个来源先按这四个字段各归为一行，利用精确十进制 `numeric` 汇总已扣积分并避免连接放大计数。学生当前状态和项目成员资格只影响正常业务权限。教师报表从使用事实确定历史范围，当前用户、项目与 Key 资料用于名称、邮箱、状态和额度展示。明细用一条 SQL 按学生整体、项目、Key、模型各层合计，积分、已结算次数、零额次数及待核字段可逐层核对。
@@ -391,6 +397,8 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 迁移 0045 给 `provider_model_catalog` 添加非空 `supported_protocols text[]`。目录同步写入适配器枚举，保留同一 Key 版本最近探活确认的协议。已有空数组按目录记录推断，下一次目录写入或成功探活时落库。`upstream_probes` 按供应商、凭据、模型和协议存最新结果，记录 HTTP 状态、受限错误代码、耗时、时间和输出 Token 限制。入库时复核 Key 版本和目录归属，成功结果与协议确认在同一事务保存。概览和最近结果接口只使用当前 Key 版本及目录的证据。
 
 教师模型目录和能力接口读取已有 `model_bindings`、`provider_model_catalog`、`beichen_datasets`、分组观测版本、报价快照以及 `upstream_probes`。读取时用当前凭据版本及已知分组变化约束目录、报价和探活。探活同时核对 `beichen_probe_usage` 的派发时间，避免采用换组前发起、换组后才保存的结果。作废判定读取历史目录、绑定状态与关联渠道，历史用量沿用原账本归属。
+
+教师概览的目录身份来自 `model_bindings.model_id` 对应的 `models.id`。同一原始上游名分别绑定多个校内模型时，概览按 `models.id` 拆成多行，返回各自的 `school_model` 与同名 UUID 字段 `school_model_id`；绑定证据和启用预览仍按原始上游名聚合，以保持单个启用动作和 Key 线路检查。目录合并以原始上游名到行号数组建立关联，把同一 Key 和官网证据分发给所有同名校内行。各行再按 `preferred_routes`、`bound_routes` 的渠道集合过滤 `catalog_keys`，并从剩余 Key 证据生成 `credential_ids`，避免把其他校内模型的 Key 混入。没有绑定或别名证据的官网目录没有可确认的校内 UUID，该字段省略。库存、价格和 Key 证据查询不新增表或列。
 
 `beichen_probe_jobs` 为每个供应商保留请求、开始、完成时间、错误代码和可续期的执行租约。手动提交写入排队时间。多实例通过同一租约领取，执行过程中分批保存，恢复被中断的任务时跳过本轮已经记录的组合。`beichen_website_catalogs` 按凭据保存最近核实的官网分组型号清单、Key 版本和时间，供按 Key 核对和能力诊断使用。
 

@@ -36,8 +36,8 @@ function modelUsage(): BeichenModelUsage {
   const totals = { credits: '11', tokens: 1000, input_tokens: 600, output_tokens: 200, cache_read_tokens: 100, cache_write_tokens: 100, calls: 2, pending_calls: 1, students: 1, keys: 1 }
   return { range: 'all', start: null, end: '2026-11-20T12:00:00+08:00', timezone: 'Asia/Shanghai', totals,
     models: [{ model: 'shared', ...totals }],
-    students: [{ user_id: 's', user_name: '学生甲', project_id: 'p', project_name: project.name, credits: '11', tokens: 1000, calls: 2, models: [{ model: 'shared', credits: '11', tokens: 1000, calls: 2 }] }],
-    keys: [{ api_key_id: 'student-key', api_key_name: '实验', user_id: 's', user_name: '学生甲', project_name: project.name, credits: '11', tokens: 1000, calls: 2 }],
+    students: [{ ...totals, user_id: 's', user_name: '学生甲', project_id: 'p', project_name: project.name, models: [{ model: 'shared', ...totals }] }],
+    keys: [{ ...totals, api_key_id: 'student-key', api_key_name: '实验', user_id: 's', user_name: '学生甲', project_name: project.name }],
   }
 }
 

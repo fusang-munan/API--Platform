@@ -466,6 +466,10 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `model_catalog[].bound_routes` 按绑定返回 `school_model`、`upstream_model`、`credential_id`、`credential_label`、`key_enabled`、`protocol`、`priority`、`group_id`、`group_status`、`group_checked_at`、`catalog_state`、`price_state`、`price_covered`、`probe_state` 与最近探活 `probe`。`published` 表示校内模型和绑定已启用。`binding_ready` 还要求当前 Key 和分组的目录可核实。`bound_key_count` 按启用的绑定 Key 去重，`covered_bound_key_count` 只计目录当前确实列出绑定上游名的 Key。`bound_catalog_pending=true` 表示至少一条绑定的目录或分组待复核。`ready_count` 按已发布且就绪的 Key 和协议去重。部分已发布线路失去目录证据也会返回 `binding_issue`。
 
+`model_catalog[].school_model_id` 是校内模型在 `models.id` 中的 UUID，与用量报表的 `school_model_id` 相同。每个有已确认校内身份的目录行都返回该字段，客户端据此精确关联同名上游模型的校内用量。同一上游名绑定多个校内模型时分别成行，各行使用自己的 UUID，线路和统计只取该校内模型。仅官网发现、尚无校内绑定的目录行没有可确认的 UUID，此时省略该字段；旧响应没有此字段时，客户端可继续按 `school_model` 匹配，无法唯一确认时显示待确认。
+
+同一上游名的目录和官网证据会分发到所有同名校内行。`catalog_keys` 和 `credential_ids` 随后按该行的 `preferred_routes`、`bound_routes` 中出现的渠道过滤，只保留当前校内模型可用的 Key。相同 Key 同时属于两个校内模型时，两行都会显示；不同渠道各自绑定时分别显示。某行只有在自己没有当前目录证据时才进入 `published_unavailable`，不会因为同上游其他校内行的 Key 被误判。
+
 对 `/beichen/rebind` 发送 `{"preview":true}` 生成预览。返回的 `evidence_versions` 按 Key 排序，包含 `credential_id`、`credential_revision`、`group_id`、`catalog_observed_at` 和 `evidence_since`。`preview_token` 同时绑定这些版本和 `changes`。发送 `{"preview":false,"preview_token":"…"}` 确认。确认时遇到同步锁冲突、目录过期、权限失效或证据及计划变化，返回 `409 INVALID_STATE_TRANSITION` 并回滚全部绑定变更。教师需重新预览。成功日志记录操作人、供应商与变更数量。
 
 `/v1/models` 明确返回 `GROUP_NOT_ALLOWED` 后，当前凭据版本在 `bound_routes` 和能力记录中返回 `group_status=not_allowed` 和 `catalog_state=group_blocked`。这把 Key 的线路退出推荐及报价覆盖。如果已发布模型没有就绪线路，明确的分组拒绝通过 `binding_issue.code=group_not_allowed` 返回，`action_hint` 提示恢复该 Key 的分组权限后重扫。成功读到模型清单就会清除目录扫描的拒绝状态。若清单缩水待核验，教师概览仍会显示目录待复核。
@@ -614,16 +618,42 @@ Key 证据不足时，标准余额计费、分组默认倍率有效且高峰开�
 
 共同顶层字段为 `range`、`start`、`end`、`timezone`。时区固定 `Asia/Shanghai`，时间以 RFC 3339 UTC 返回，区间左闭右开。`day` 是北京时间当天 00:00 至次日 00:00；`month` 是本月 1 日至次月 1 日；`all` 的 `start=null`、`end` 为查询时刻。总计基于当前数据库中仍保存的业务记录，不补造已经清理的历史 Token。
 
-学校用量可选 `provider_id`；省略时汇总所有北辰供应商，其他供应商调用不计入。调用归属沿用日对账的派发渠道、上游模型和发送时刻；只计已完成结算流程的调用，排除 `outcome=pending`。
+学校用量可选 `provider_id`，省略时汇总所有北辰供应商。根据派发快照中的发送时刻落入北京时间派发日或派发月，旧记录使用 `sent_at`。一笔派发归属可确认、已离开进行中状态的网关调用计一次。待核账和上游失败后释放预留的调用也计入，`outcome=pending` 和未派发的调用排除。
 
 | 学校用量字段 | 内容 |
 | --- | --- |
-| `totals` | `credits`（积分字符串）、`tokens`、`input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens`、`calls`、`pending_calls`、去重 `students` / `keys` 数量 |
-| `models[]` | `model` 与上述用量字段，按模型名排序 |
+| `totals` | 用量字段及去重的 `students` / `keys` 数量 |
+| `models[]` | 型号身份与用量字段，按 `model`、`model_key` 排序 |
 | `students[]` | `user_id`、`user_name`、`project_id`、`project_name` 与用量字段；同一账号在不同项目分行，`models[]` 给出各模型积分、Token 和调用数 |
 | `keys[]` | `api_key_id`、`api_key_name`、`user_id`、`user_name`、`project_id`、`project_name` 与用量字段，另含该 Key 的 `models[]` |
 
-`credits` 累计 `beichen_state=charged` 的精确扣分。已回报的 Token 独立于扣费状态汇总，包括待核或中断调用已记录的分项。OpenAI Chat、Responses 和 Realtime 的原始输入包含缓存，依据明确的缓存明细或未命中数拆分。Anthropic 的原始输入是未缓存输入。Gemini 的已知输入包含工具提示，已知输出包含思考 Token。缺少互斥分项时，`tokens` 包含可以从原始总量或协议计数确认的用量，`tokens_missing` 表示其中尚未归入四类的数量。结合 `completeness` 判断覆盖范围。Token 和计数为 JSON 数字，积分为十进制字符串。
+同一派发区间内，各层按查询时的状态统计以下指标。
+
+| 用量字段 | 统计口径 |
+| --- | --- |
+| `dispatched_calls`、`calls` | 相同的派发调用数。`calls` 保留旧计数口径。 |
+| `settled_calls` | 已结算笔数，含零额。北辰使用 `beichen_state=charged`，无北辰账务状态的旧行使用 `billing_state=charged`。 |
+| `credits` | 已结算调用的积分合计。北辰已扣行使用精确扣分 `beichen_credit_exact`。无北辰账务状态、`billing_state=charged` 的旧行按 `credit_milli × 0.001` 还原，例如 400 千分积分对应 0.400 积分，规范十进制字符串为 `"0.4"`。两种来源按结算状态互斥，避免重复累计。 |
+| `zero_cost_calls` | 已结算中实扣恰为零的笔数。北辰按精确扣分判断，旧行按 `credit_milli` 判断。 |
+| `pending_review_calls`、`pending_calls` | 当前处于 `pending_review` 的笔数。`pending_calls` 是兼容字段。结算或释放后退出待核统计。 |
+| `pending_review_credits` | 所选范围内待核调用当前预留的积分合计，十进制字符串。可出现有待核笔数且预留为 `"0"`。 |
+| `token_missing_calls` | 完全缺少可用 Token 计数的笔数。上游明确报告的零 Token 是有效观测。 |
+| `completeness`、`charged_tokens_missing_calls` | 全部调用的 Token 均完整时为 `complete`，有可用计数且存在缺项时为 `partial`，无可用计数时为 `missing`（含空结果）。后者统计北辰 `charged` 中计数缺项或全缺的笔数。 |
+
+型号身份在学校、学生、Key 的各层 `models[]` 使用同一规则。客户端按 `model_key` 关联模型和明细。
+
+| 型号字段 | 含义 |
+| --- | --- |
+| `model_key`、`school_model_id` | 有校内身份时以调用保存的校内模型 UUID 归组，键为 `school:<uuid>`。无可确认的校内身份时按供应商、派发渠道及不区分大小写的上游名分别归组，键为 `upstream:<provider_uuid>:<credential_id>:<lowercase_name>`，`school_model_id=null`。 |
+| `school_model` | 可查到的校内模型标识（`models.model_id`），含停用模型。当前资料缺失时为 `null`，仍保留已存 UUID。 |
+| `model`、`upstream_models` | `model` 保留上游名称作为显示字段，取该分组在此报表范围内最近派发的原名，同一时刻按原名排序。不同身份可有相同显示名。`upstream_models` 列出本行范围内见过的派发原名，保留大小写和标点。 |
+| `identity_sources` | 本行的归属依据，可同时包含 `call_model_id`（调用保存的 UUID）及 `configured_alias`（缺少 UUID 时使用有效别名）。`upstream_name` 表示仅按上游原名归组，校内身份未确认。 |
+
+别名只用于未保存有效 UUID 的旧行。按派发时的供应商、渠道和上游名查现有别名，渠道专属优先于供应商默认，目标须对应现有校内模型。已保存的 UUID 在换绑或新增别名后仍有效。以 `claude-fable-5-1` 和 `claude-fable-5.1` 为例，只有记录指向同一个校内 UUID 时合并。不同 UUID 各自归组。缺少校内身份证据时按供应商、渠道和完整上游名分别列出，两个渠道的同名调用在配置别名或确认校内身份前保留为两行，并保留标点和版本号。
+
+`credits` 按上表累计已结算积分。已回报的 Token 独立于扣费状态汇总，包括待核或中断调用已记录的分项。OpenAI Chat、Responses 和 Realtime 的原始输入包含缓存，依据明确的缓存明细或未命中数拆分。Anthropic 的原始输入是未缓存输入。Gemini 的已知输入包含工具提示，已知输出包含思考 Token。缺少互斥分项时，`tokens` 包含可以从原始总量或协议计数确认的用量，`tokens_missing` 表示其中尚未归入四类的数量。结合 `completeness` 判断覆盖范围。Token 和计数为 JSON 数字，积分为十进制字符串。
+
+学生自己的用量（`GET /api/v1/student/usage`）和教师「学生用量」账本（`GET /api/v1/teacher/usage/students`）按调用受理时保存的北京时间账月统计。`calls` 是账本中的已结算笔数，含零额。对比次数时，先将学生、项目、Key、供应商和数据保留范围对齐，再用教师模型报表的 `settled_calls` 对照账本 `calls`。月末受理、次月派发的调用计入教师模型报表的次月，结算仍入学生的原账月。
 
 调用对账的 `day` 默认是北京时间当天，响应为 `items` 和可空的 `next_cursor`。每页最多 50 条，以调用派发时间、调用 ID 倒序排列。后续页传回此前的 `next_cursor` 并沿用同一供应商和账日。接口仅供教师读取，返回 `Cache-Control: private, no-store`。
 

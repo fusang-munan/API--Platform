@@ -29,7 +29,7 @@ ALTER TABLE provider_credentials ADD COLUMN status text, ADD COLUMN updated_at t
 ALTER TABLE gateway_calls ADD COLUMN id uuid PRIMARY KEY DEFAULT gen_random_uuid();`)
 	applyBeichenTestMigrations(t, ctx, tx, "0031_beichen_usage_export.sql", "0033_beichen_panel_prices.sql",
 		"0034_beichen_panel_access.sql", "0035_beichen_receipts.sql", "0041_beichen_upstream_usage.sql",
-		"0044_beichen_conditional_billing.sql", "0046_beichen_billing_checks_and_aliases.sql",
+		"0044_beichen_conditional_billing.sql",
 		"0050_beichen_crawl_runs.sql", "0052_beichen_key_usage.sql", "0054_beichen_key_website_evidence.sql")
 	execTestSQL(t, ctx, tx, "INSERT INTO users(id) VALUES($1)", reportImportActor)
 	return ctx, db, tx
