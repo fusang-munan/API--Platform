@@ -231,9 +231,58 @@ FROM provider_credentials c JOIN beichen_multiplier_versions mv ON mv.credential
 	bind(school, raw, cc1, responses)
 	bind(school+"-fallback", raw, g3, responses)
 	probe(cc1, raw, responses)
-	if row, cap := read(raw), capability(raw, cc1); row.BoundKeyCount != 2 || row.CoveredBoundKeyCount != 2 ||
-		row.ReadyCount != 3 || len(row.BoundRoutes) != 3 || !cap.ResponsesReady || cap.Bindings[0].SchoolModel != school {
-		t.Fatalf("别名与同协议备用绑定应保留: %+v %+v", row, cap)
+	var schoolID, fallbackID uuid.UUID
+	if err := db.QueryRowContext(ctx, "SELECT id FROM models WHERE model_id=$1", school).Scan(&schoolID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT id FROM models WHERE model_id=$1", school+"-fallback").Scan(&fallbackID); err != nil {
+		t.Fatal(err)
+	}
+	view, err := New(db, nil).Overview(ctx, provider, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.ModelCatalog) != 8 {
+		t.Fatalf("教师概览应以校内模型为身份返回 8 行: %+v", view.ModelCatalog)
+	}
+	ids := make(map[uuid.UUID]string, len(view.ModelCatalog))
+	for _, row := range view.ModelCatalog {
+		if row.SchoolModelID == nil || *row.SchoolModelID == uuid.Nil || row.SchoolModel == "" {
+			t.Fatalf("目录行缺少校内模型 UUID: %+v", row)
+		}
+		if previous, ok := ids[*row.SchoolModelID]; ok {
+			t.Fatalf("不同目录行复用了校内 UUID %s: %s / %s", *row.SchoolModelID, previous, row.SchoolModel)
+		}
+		ids[*row.SchoolModelID] = row.SchoolModel
+	}
+	var rawRows []CatalogModel
+	for _, row := range view.ModelCatalog {
+		if row.Model == raw {
+			rawRows = append(rawRows, row)
+		}
+	}
+	if len(rawRows) != 2 || *rawRows[0].SchoolModelID == *rawRows[1].SchoolModelID {
+		t.Fatalf("同一上游的两个校内模型必须分别成行: %+v", rawRows)
+	}
+	for _, row := range rawRows {
+		wantID := fallbackID
+		wantRoutes := 1
+		if row.SchoolModel == school {
+			wantID, wantRoutes = schoolID, 2
+		} else if row.SchoolModel != school+"-fallback" {
+			t.Fatalf("意外的校内模型身份: %+v", row)
+		}
+		if *row.SchoolModelID != wantID || len(row.PreferredRoutes) != wantRoutes {
+			t.Fatalf("校内模型 UUID 或专属线路错误: %+v", row)
+		}
+		for _, route := range row.PreferredRoutes {
+			if !strings.EqualFold(route.SchoolModel, row.SchoolModel) {
+				t.Fatalf("概览行混入了其他校内模型的线路: %+v", row)
+			}
+		}
+	}
+	if cap := capability(raw, cc1); !cap.ResponsesReady || cap.Bindings[0].SchoolModel != school {
+		t.Fatalf("别名与同协议备用绑定应保留: %+v", cap)
 	}
 	caps, err := catalog.ReadBeichenCapabilities(ctx, db, provider)
 	if err != nil {

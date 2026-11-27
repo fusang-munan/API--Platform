@@ -136,6 +136,7 @@ type CatalogModel struct {
 	Retired              bool                      `json:"retired,omitempty"`
 	SchoolStatus         string                    `json:"school_status"`
 	SchoolModel          string                    `json:"school_model,omitempty"`
+	SchoolModelID        *uuid.UUID                `json:"school_model_id,omitempty"`
 	Model                string                    `json:"model"`
 	CredentialIDs        []uuid.UUID               `json:"credential_ids"`
 	PreferredRoutes      []PreferredRoute          `json:"preferred_routes"`
@@ -637,14 +638,37 @@ func readPreferredRoutes(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, 
 	}
 	view.ModelCatalog = make([]CatalogModel, 0, len(models))
 	for _, model := range models {
-		item, err := model.overviewWithStatus(ctx, tx, records, syncFailed, capabilities[strings.ToLower(model.name)])
-		if err != nil {
-			return err
+		modelCapabilities := capabilities[strings.ToLower(model.name)]
+		for _, catalogView := range model.catalogViews() {
+			item, err := catalogView.overviewWithStatus(ctx, tx, records, syncFailed,
+				bindingsForCatalogView(modelCapabilities, catalogView))
+			if err != nil {
+				return err
+			}
+			view.ModelCatalog = append(view.ModelCatalog, item)
 		}
-		view.ModelCatalog = append(view.ModelCatalog, item)
 	}
 	markRetiredCatalogModels(view, snapshot.RetiredModels)
 	return nil
+}
+
+// Each configured school model is a separate catalog identity. The activation
+// model remains grouped by upstream name for preview and publication.
+func bindingsForCatalogView(rows []catalog.ModelCapability, view *activationModel) []catalog.ModelCapability {
+	if len(view.schools) != 1 {
+		return rows
+	}
+	var school string
+	for _, item := range view.schools {
+		school = item.name
+	}
+	filtered := slices.Clone(rows)
+	for i := range filtered {
+		filtered[i].Bindings = slices.DeleteFunc(slices.Clone(filtered[i].Bindings), func(binding catalog.BeichenBinding) bool {
+			return !strings.EqualFold(strings.TrimSpace(binding.SchoolModel), strings.TrimSpace(school))
+		})
+	}
+	return filtered
 }
 
 func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
