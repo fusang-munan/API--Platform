@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 )
 
@@ -28,6 +29,7 @@ type ProtocolCapability struct {
 	ProbeState   string         `json:"probe_state"`
 	Probe        *ProbeEvidence `json:"probe,omitempty"`
 	upstream     string
+	credentialID uuid.UUID
 }
 
 func protocolCapability(protocol, upstream string, bound bool, probe *ProbeEvidence) ProtocolCapability {

@@ -76,10 +76,12 @@ function sliceCacheHitRate(model: UsageModelSlice): number | null {
  */
 export function summarizeStudentModels(
   projects: StudentProjectUsage[] | null | undefined,
+  keyID?: string,
 ): StudentModelUsageRow[] {
   const totals = new Map<string, ModelTotal>()
   for (const project of projects ?? []) {
     for (const key of project.keys ?? []) {
+      if (keyID !== undefined && key.id !== keyID) continue
       for (const model of key.models ?? []) {
         const id = String(model.id || model.name || '').trim()
         if (!id) continue
@@ -155,9 +157,14 @@ export function sumPendingCredits(projects: StudentProjectUsage[] | null | undef
   return formatCreditsMilli(total)
 }
 
-export function formatStudentModelUsage(row?: StudentModelUsageRow | null): string {
-  if (!row || row.calls <= 0) return '本月 0.000 积分 · 0 次'
+export function formatStudentModelUsageParts(row?: StudentModelUsageRow | null) {
+  if (!row || row.calls <= 0) return { credits: '本月 0.000 积分', calls: '0 次' }
   const calls = `${formatTokens(row.calls)} 次`
-  if (row.zeroCost) return `本月 0 积分 · ${calls}（未结算/待核或免费）`
-  return `本月已用 ${formatCredits(row.credits)} 积分 · ${calls}`
+  if (row.zeroCost) return { credits: '本月 0 积分', calls: `${calls}（未结算/待核或免费）` }
+  return { credits: `本月已用 ${formatCredits(row.credits)} 积分`, calls }
+}
+
+export function formatStudentModelUsage(row?: StudentModelUsageRow | null): string {
+  const { credits, calls } = formatStudentModelUsageParts(row)
+  return `${credits} · ${calls}`
 }

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/beichen"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
@@ -60,8 +61,8 @@ func modelCatalogCandidateFromPlatformModel(view ModelView) ModelCatalogCandidat
 		RawEntry: map[string]any{
 			"protocols": view.Protocols, "available_protocols": view.AvailableProtocols,
 			"recommended_protocol": view.RecommendedProtocol, "probe_state": view.ProbeState,
-			"availability": view.Availability, "availability_reason": view.AvailabilityReason,
-			"last_probe_at": view.LastProbeAt,
+			"availability": view.Availability, "availability_state": view.AvailabilityState,
+			"availability_reason": view.AvailabilityReason, "last_probe_at": view.LastProbeAt,
 		},
 	}
 	if view.DisplayName != "" {
@@ -110,6 +111,30 @@ func (s *Service) enrichStudentModelView(ctx context.Context, item ModelView, pl
 		item.setAvailability(catalog.SummarizeModelAvailability(item.ModelID, entmodel.Status(item.Status), protocols[platformModelID]))
 	}
 	return item, nil
+}
+
+func (s *Service) setStudentModelStates(ctx context.Context, groups ...[]ModelView) error {
+	ids := make([]string, 0)
+	for _, group := range groups {
+		for _, item := range group {
+			if item.ModelAvailability != nil && item.Status == string(entmodel.StatusActive) {
+				ids = append(ids, item.ModelID)
+			}
+		}
+	}
+	channels, err := beichen.ReadStudentModelCatalog(ctx, s.sqlDB, ids)
+	if err != nil {
+		return domain.WrapError(domain.CodeDependencyUnavailable, "read student model catalog evidence", err)
+	}
+	for _, group := range groups {
+		for i := range group {
+			item := &group[i]
+			if item.ModelAvailability != nil {
+				item.ModelAvailability.SetStudentState(item.ModelID, entmodel.Status(item.Status), channels[item.ModelID])
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Service) StudentModelPlaza(ctx context.Context, studentID uuid.UUID) (StudentModelPlazaView, error) {
@@ -185,7 +210,8 @@ func (s *Service) StudentModelLibrary(ctx context.Context, studentID uuid.UUID) 
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].ModelID < result[j].ModelID
 	})
-	return filterStudentVisibleModels(result), nil
+	result = filterStudentVisibleModels(result)
+	return result, s.setStudentModelStates(ctx, result)
 }
 
 func (s *Service) StudentCommonModels(ctx context.Context) ([]ModelView, error) {
@@ -217,7 +243,8 @@ func (s *Service) StudentCommonModels(ctx context.Context) ([]ModelView, error) 
 		}
 		result = append(result, item)
 	}
-	return filterStudentVisibleModels(result), nil
+	result = filterStudentVisibleModels(result)
+	return result, s.setStudentModelStates(ctx, result)
 }
 
 func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, pageSize int) (ModelCatalogPage, error) {
@@ -248,7 +275,7 @@ func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, 
 	if err != nil {
 		return ModelCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "list enabled models", err)
 	}
-	filtered := make([]ModelCatalogCandidate, 0, len(rows))
+	filtered := make([]ModelView, 0, len(rows))
 	for _, row := range rows {
 		if !modelMatchesStudentQuery(row, query) {
 			continue
@@ -264,7 +291,7 @@ func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, 
 		if !modelViewEnabledForStudents(view) {
 			continue
 		}
-		filtered = append(filtered, modelCatalogCandidateFromPlatformModel(view))
+		filtered = append(filtered, view)
 	}
 	total := len(filtered)
 	start := (page - 1) * pageSize
@@ -275,8 +302,16 @@ func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, 
 	if end > total {
 		end = total
 	}
+	models := filtered[start:end]
+	if err := s.setStudentModelStates(ctx, models); err != nil {
+		return ModelCatalogPage{}, err
+	}
+	items := make([]ModelCatalogCandidate, 0, len(models))
+	for _, model := range models {
+		items = append(items, modelCatalogCandidateFromPlatformModel(model))
+	}
 	return ModelCatalogPage{
-		Items:    filtered[start:end],
+		Items:    items,
 		Page:     page,
 		PageSize: pageSize,
 		Total:    total,

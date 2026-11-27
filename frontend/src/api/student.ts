@@ -1,18 +1,28 @@
-import { get, post } from './client'
-import type { ApiKey, Model, ModelCatalogPage, Organization, StudentModelPlaza, StudentProject, SubmitApiKey, StudentUsage } from './types'
+import { get, post, request } from './client'
+import type { ApiKey, Model, ModelCatalogCandidate, ModelCatalogPage, Organization, StudentProject, SubmitApiKey, StudentUsage } from './types'
+
+export type StudentAvailabilityState = 'available' | 'degraded' | 'maintenance' | 'probe_failed'
+  | 'channel_unavailable' | 'unverified' | 'disabled' | 'not_published'
+
+type StudentAvailabilityInfo = { availability_state?: StudentAvailabilityState }
+export type StudentModel = Model & StudentAvailabilityInfo
+export type StudentModelCandidate = ModelCatalogCandidate & StudentAvailabilityInfo
+export type StudentModelCatalogPage = Omit<ModelCatalogPage, 'items'> & { items: StudentModelCandidate[] }
+type StudentModelPlaza = { common_models: StudentModel[]; library_models: StudentModel[] }
+type StudentKey = Omit<ApiKey, 'models'> & { models: StudentModel[] }
 
 export const studentAPI = {
   organizations: () => get<Organization[]>('/api/v1/student/organizations'),
   projects: (org: string) => get<StudentProject[]>(`/api/v1/student/organizations/${org}/projects`),
   models: () => get<StudentModelPlaza>('/api/v1/student/models'),
-  commonModels: () => get<Model[]>('/api/v1/student/common-models'),
-  modelCatalog: (query = '', page = 1, pageSize = 20) =>
-    get<ModelCatalogPage>(`/api/v1/student/model-catalog?${new URLSearchParams({ q: query, page: String(page), page_size: String(pageSize) })}`),
-  addModel: (modelID: string) => post<Model>('/api/v1/student/models', { model_id: modelID }),
+  commonModels: () => get<StudentModel[]>('/api/v1/student/common-models'),
+  modelCatalog: (query = '', page = 1, pageSize = 20, signal?: AbortSignal) =>
+    request<StudentModelCatalogPage>(`/api/v1/student/model-catalog?${new URLSearchParams({ q: query, page: String(page), page_size: String(pageSize) })}`, { signal }),
+  addModel: (modelID: string) => post<StudentModel>('/api/v1/student/models', { model_id: modelID }),
   removeModel: (modelID: string) => post<{ removed: boolean }>('/api/v1/student/models/remove', { model_id: modelID }),
   usage: (month?: string) => get<StudentUsage>(`/api/v1/student/usage${month ? `?month=${month}` : ''}`),
-  keys: () => get<ApiKey[]>('/api/v1/student/api-keys'),
-  key: (id: string) => get<ApiKey>(`/api/v1/student/api-keys/${id}`),
+  keys: () => get<StudentKey[]>('/api/v1/student/api-keys'),
+  key: (id: string) => get<StudentKey>(`/api/v1/student/api-keys/${id}`),
   addKeyModels: (id: string, modelIDs: string[]) =>
     post<{ model_ids: string[]; added_model_ids: string[]; warnings?: { model_id: string; code: string; message: string }[] }>(
       `/api/v1/student/api-keys/${id}/models`, { model_ids: modelIDs },
