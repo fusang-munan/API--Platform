@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -44,10 +45,13 @@ type credentialRecord struct {
 }
 
 type fetchResult struct {
-	save       func(context.Context, *sql.Tx) error
-	err        error
-	partialErr error
+	save        func(context.Context, *sql.Tx) error
+	err         error
+	partialErr  error
+	accountRate *billingAccountRateObservation
 }
+
+var errBillingKeyBindingChanged = errors.New("同步期间北辰官网 Key 或分组已变化")
 
 func (s *Service) Run(ctx context.Context) {
 	if s.db == nil || s.crypto == nil {
@@ -109,8 +113,8 @@ func (s *Service) SyncCredential(ctx context.Context, providerID, credentialID u
 	discoveryErr := s.discoverChannelKeys(discovery, &credentialID)
 	finish()
 	if err := s.executeSyncJobs(ctx, []syncJob{
-		{provider: providerID, credential: credentialID, kind: "billing"},
 		{provider: providerID, credential: credentialID, kind: "key_usage"},
+		{provider: providerID, credential: credentialID, kind: "billing"},
 	}, true); err != nil {
 		return err
 	}
@@ -137,7 +141,20 @@ func (s *Service) executeSyncJobs(ctx context.Context, jobs []syncJob, manual bo
 		if ctx.Err() != nil {
 			return unavailable("北辰同步达到时限，已保存完成的任务", ctx.Err())
 		}
-		batch := jobs[:min(4, len(jobs))]
+		batchSize := min(4, len(jobs))
+		batch := make([]syncJob, 0, batchSize)
+		remaining := make([]syncJob, 0, len(jobs))
+		credentials := make(map[uuid.UUID]struct{}, batchSize)
+		for _, job := range jobs {
+			if len(batch) < batchSize {
+				if _, exists := credentials[job.credential]; !exists {
+					batch = append(batch, job)
+					credentials[job.credential] = struct{}{}
+					continue
+				}
+			}
+			remaining = append(remaining, job)
+		}
 		type outcome struct {
 			running bool
 			err     error
@@ -157,7 +174,7 @@ func (s *Service) executeSyncJobs(ctx context.Context, jobs []syncJob, manual bo
 				busy++
 			}
 		}
-		jobs = jobs[len(batch):]
+		jobs = remaining
 	}
 	if failed > 0 {
 		return unavailable(fmt.Sprintf("有 %d 项北辰同步未完成，请查看数据状态", failed), nil)
@@ -172,7 +189,7 @@ func (s *Service) listJobs(ctx context.Context, providerID *uuid.UUID) ([]syncJo
 	rows, err := s.db.QueryContext(ctx, `
 SELECT p.id, c.id, job.kind
 FROM providers p JOIN provider_credentials c ON c.provider_id = p.id
-CROSS JOIN (VALUES ('billing', 1), ('key_usage', 2)) AS job(kind, priority)
+CROSS JOIN (VALUES ('key_usage', 1), ('billing', 2)) AS job(kind, priority)
 LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = job.kind
 WHERE `+beichenProvider+` AND p.status = 'active' AND c.status = 'active'
   AND ($1::uuid IS NULL OR p.id = $1)
@@ -290,16 +307,30 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 	if websiteErr == nil {
 		info, quote, billingErr = directory.billing()
 	}
+	keyResult := <-keyResults
+	if billingErr == nil && errors.Is(keyResult.err, errKeyGroupNotAllowed) {
+		billingErr = deniedKeyGroup(quote.groupID)
+	}
 	partialErr := quote.err
 	if directory.keyBilling != nil && billingErr == nil {
 		// A successful Key read establishes the billing rule. The official
 		// website quote remains unavailable and is reported separately.
 		partialErr = nil
 	}
-	keyResult := <-keyResults
-	return fetchResult{err: billingErr, partialErr: errors.Join(partialErr, keyResult.err), save: func(ctx context.Context, tx *sql.Tx) error {
-		if err := saveBillingGroup(ctx, tx, job.credential, revision, startedAt, directory, billingErr); err != nil {
+	var evidence *billingAccountRateObservation
+	if group := directory.group; billingErr == nil && group.AccountRate != nil {
+		evidence = &billingAccountRateObservation{
+			GroupID: group.ID, KeyID: group.AccountRateKeyID, Rate: *group.AccountRate,
+			Source: group.AccountRateSource, KeyChecked: directory.keyGroupAt, Revision: revision,
+		}
+	}
+	return fetchResult{err: billingErr, partialErr: errors.Join(partialErr, keyResult.err), accountRate: evidence, save: func(ctx context.Context, tx *sql.Tx) error {
+		accepted, err := saveBillingGroup(ctx, tx, job.credential, revision, startedAt, directory, billingErr, false)
+		if err != nil {
 			return err
+		}
+		if !accepted {
+			return errBillingKeyBindingChanged
 		}
 		if err := keyResult.save(ctx, tx); err != nil {
 			return err
@@ -521,7 +552,15 @@ WHERE credential_id=$1 AND kind=$2`, job.credential, job.leaseKind())
 	}
 	if result.save != nil {
 		if err := result.save(ctx, tx); err != nil {
-			return err
+			if !errors.Is(err, errBillingKeyBindingChanged) {
+				return err
+			}
+			_, releaseErr := tx.ExecContext(ctx, `UPDATE beichen_datasets SET lease_id=NULL, lease_until=NULL
+WHERE credential_id=$1 AND kind=$2`, job.credential, job.leaseKind())
+			if releaseErr == nil {
+				releaseErr = tx.Commit()
+			}
+			return errors.Join(err, releaseErr)
 		}
 	}
 	if job.kind == "catalog" {
@@ -539,10 +578,25 @@ WHERE credential_id=$1 AND kind='billing'`, job.credential)
 		value := result.err.Error()
 		message = &value
 	}
+	var accountRate *string
+	if result.err == nil && result.accountRate != nil {
+		raw, err := json.Marshal(result.accountRate)
+		if err != nil {
+			return err
+		}
+		value := string(raw)
+		accountRate = &value
+	}
 	var failures int
 	err = tx.QueryRowContext(ctx, `
+WITH completed AS (SELECT clock_timestamp() AS at)
 UPDATE beichen_datasets SET
-  last_success = CASE WHEN $3 THEN clock_timestamp() ELSE last_success END,
+  last_success = CASE WHEN $3 THEN completed.at ELSE last_success END,
+  website_group_observation = CASE
+    WHEN kind <> 'billing' THEN website_group_observation
+    WHEN $7::jsonb IS NULL THEN website_group_observation - 'billing_account_rate'
+    ELSE jsonb_set(COALESCE(website_group_observation,'{}'),'{billing_account_rate}',
+      $7::jsonb || jsonb_build_object('last_success',completed.at)) END,
   last_error = $4, failure_count = CASE WHEN $6 THEN failure_count WHEN $4::text IS NULL THEN 0 ELSE LEAST(failure_count + 1, 6) END,
   next_attempt = CASE
     WHEN $6 THEN next_attempt
@@ -555,9 +609,11 @@ UPDATE beichen_datasets SET
     WHEN $4 IS NULL OR kind = 'usage' THEN clock_timestamp() + $5::int * interval '1 minute'
     ELSE clock_timestamp() + power(2, LEAST(failure_count, 6)) * interval '1 minute' END,
   lease_id = NULL, lease_until = NULL
+FROM completed
 WHERE credential_id = $1 AND kind = $2
 RETURNING failure_count`, job.credential, job.kind,
-		(result.save != nil && job.kind == "usage") || result.err == nil, message, refreshMinutes(job.kind), manual && job.kind == "usage").Scan(&failures)
+		(result.save != nil && job.kind == "usage") || result.err == nil, message, refreshMinutes(job.kind), manual && job.kind == "usage",
+		accountRate).Scan(&failures)
 	if err != nil {
 		return err
 	}

@@ -66,7 +66,7 @@ func (s *Service) fetchWebsiteKeyUsage(ctx context.Context, job syncJob, credent
 		check, err = readWebsiteKey(ctx, s, access, key, func(bearer string, identity listedKey) (websiteKeyCheck, error) {
 			check := websiteKeyCheck{key: identity}
 			check.catalog, check.catalogErr = s.fetchBillingCatalog(ctx, job, bearer, key, identity)
-			if panelAuthFailed(check.catalogErr) || errors.Is(check.catalogErr, errKeyGroupMissing) {
+			if panelAuthFailed(check.catalogErr) || !validWebsiteGroupID(identity.GroupID) {
 				return check, check.catalogErr
 			}
 			// Also refresh the most recent completed day for reconciliation.
@@ -90,7 +90,7 @@ func (s *Service) fetchWebsiteKeyUsage(ctx context.Context, job syncJob, credent
 	if check.key.ID == 0 {
 		check.catalogErr, check.usageErr = err, err
 	}
-	if (panelAuthFailed(check.catalogErr) || errors.Is(check.catalogErr, errKeyGroupMissing)) &&
+	if (panelAuthFailed(check.catalogErr) || !validWebsiteGroupID(check.key.GroupID)) &&
 		len(check.days) == 0 && check.usageErr == nil {
 		check.usageErr = check.catalogErr
 	}
@@ -103,8 +103,12 @@ func (s *Service) saveWebsiteKeyCheck(ctx context.Context, tx *sql.Tx, job syncJ
 	check websiteKeyCheck, at time.Time, today string) error {
 	digest := sha256.Sum256(credential.ciphertext)
 	id := job.credential
-	if err := saveBillingGroup(ctx, tx, id, credential.updatedAt, at, check.catalog, check.catalogErr); err != nil {
+	accepted, err := saveBillingGroup(ctx, tx, id, credential.updatedAt, at, check.catalog, check.catalogErr, true)
+	if err != nil {
 		return err
+	}
+	if !accepted {
+		return errBillingKeyBindingChanged
 	}
 	if _, err := tx.ExecContext(ctx, initKeyObservationSQL, id, digest[:], job.target.Multiplier, job.target.ExpectClaude); err != nil {
 		return err
@@ -173,7 +177,7 @@ WHERE credential_id=$1 AND key_digest=$2`, id, digest[:], day.unit, at)
 			}
 		}
 	}
-	_, err := tx.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 UPDATE beichen_key_observations SET models_error=$3,usage_error=$4
 WHERE credential_id=$1 AND key_digest=$2`, id, digest[:], websiteErrorText(check.catalogErr), websiteErrorText(check.usageErr))
 	return err

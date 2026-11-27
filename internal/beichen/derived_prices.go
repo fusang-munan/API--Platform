@@ -35,7 +35,7 @@ func (s *Service) fetchBillingCatalog(ctx context.Context, job syncJob, token, k
 		if err != nil && errors.Is(websiteErr, errWebsiteDirectoryEmpty) && !errors.Is(err, errKeyGroupNotAllowed) {
 			return directory, errWebsiteDirectoryEmpty
 		}
-		fallback.keyGroup, fallback.keyGroupAt = directory.keyGroup, directory.keyGroupAt
+		fallback.keyGroup, fallback.keyGroupAt, fallback.keyID = directory.keyGroup, directory.keyGroupAt, directory.keyID
 		if err != nil {
 			return fallback, err
 		}
@@ -59,16 +59,17 @@ func (s *Service) fetchBillingCatalog(ctx context.Context, job syncJob, token, k
 	}
 	if job.kind == "billing" && directory.group.AccountRate == nil {
 		if rateErr != nil {
-			directory.accountRateErr = accountRateReadFailed("官网账户倍率表读取失败", rateErr)
+			directory.accountRateErr = accountRateReadFailed(websiteAccountRatesReadFailure, rateErr)
 			return directory, nil
 		}
 		info, at, err := s.fetchVerifiedKeyAccountRate(ctx, job.credential, key, identity, directory.group)
-		if err != nil {
+		if err == nil {
+			directory.group.setKeyAccountRate(info)
+			directory.keyBillingSampleAt, directory.at = info.ObservedAt, at
+		} else if errors.Is(err, errKeyGroupNotAllowed) || !setGroupAccountRate(&directory.group) {
 			directory.accountRateErr = err
 			return directory, nil
 		}
-		directory.group.setKeyAccountRate(info)
-		directory.keyBillingSampleAt, directory.at = info.ObservedAt, at
 	}
 	// Existing evidence can require reconciling legacy model spellings even
 	// after the group is published. Quote terms still come from the website.

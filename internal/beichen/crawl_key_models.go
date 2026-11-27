@@ -159,9 +159,6 @@ ORDER BY p.channel`, provider)
 	if err != nil {
 		return results, "读取当前官网 Key 分组失败"
 	}
-	if rates == nil {
-		crawl.AccountRateError = "北辰官网账户倍率暂未核实"
-	}
 	keysPerGroup := make(map[int64]int)
 	for _, key := range keys {
 		if key.Status == "" || key.Status == "active" {
@@ -184,10 +181,8 @@ ORDER BY p.channel`, provider)
 	round.Wait()
 	fallbackRates := make(map[int64]*billingInfo)
 	for _, checked := range checkedRates {
-		if checked.info != nil {
+		if checked.groupID != 0 && (checked.info != nil || fallbackRates[checked.groupID] == nil) {
 			fallbackRates[checked.groupID] = checked.info
-		} else if checked.groupID != 0 {
-			crawl.AccountRateError = "部分北辰渠道的账户倍率未核实"
 		}
 	}
 	crawl.applyAccountRates(rates, fallbackRates)
@@ -229,17 +224,27 @@ func (s *Service) fetchWebsiteAccountRates(ctx context.Context, bearer string) (
 }
 
 func (crawl *directoryCrawl) applyAccountRates(rates map[int64]json.Number, fallback map[int64]*billingInfo) {
+	crawl.accountRatesVerified = rates != nil
+	crawl.AccountRateError = ""
+	if rates == nil {
+		crawl.AccountRateError = websiteAccountRatesReadFailure
+		return
+	}
 	for i := range crawl.platforms {
 		for j := range crawl.platforms[i].Groups {
 			group := &crawl.platforms[i].Groups[j]
+			if group.ID == 0 {
+				continue
+			}
 			if rate, ok := rates[group.ID]; ok {
-				group.AccountRate = &rate
-			} else if info := fallback[group.ID]; info != nil {
+				group.AccountRate, group.AccountRateSource, group.AccountRateKeyID = &rate, "", 0
+			} else if info, checked := fallback[group.ID]; info != nil {
 				group.setKeyAccountRate(*info)
+			} else if !setGroupAccountRate(group) && checked {
+				crawl.AccountRateError = "部分北辰渠道的账户倍率未核实"
 			}
 		}
 	}
-	crawl.accountRatesVerified = rates != nil
 }
 
 func (s *Service) checkCrawlKeyModels(ctx context.Context, result *CrawlKeyModelComparison,

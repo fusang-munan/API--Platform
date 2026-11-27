@@ -12,9 +12,11 @@ import (
 )
 
 const (
-	keyBillingRateSource          = "key_billing"
-	keyBillingDefaultRateMismatch = "Key 账单默认倍率与官网分组不一致"
-	keyBillingPeakMismatch        = "Key 账单高峰状态与官网分组不一致"
+	keyBillingRateSource           = "key_billing"
+	groupRateSource                = "group_rate"
+	websiteAccountRatesReadFailure = "官网账户倍率表读取失败"
+	keyBillingDefaultRateMismatch  = "Key 账单默认倍率与官网分组不一致"
+	keyBillingPeakMismatch         = "Key 账单高峰状态与官网分组不一致"
 )
 
 var errWebsiteAccountRateUnverified = errors.New("北辰官网账户倍率未核实，分组倍率仅供参考")
@@ -38,6 +40,15 @@ func (group *WebsiteGroup) setKeyAccountRate(info billingInfo) {
 	group.AccountRateKeyID = info.APIKeyID
 }
 
+func setGroupAccountRate(group *directoryGroup) bool {
+	if group.Subscription != "standard" || group.Rate == nil || websiteGroupRate(*group.Rate) == nil || group.PeakEnabled == nil {
+		return false
+	}
+	rate := *group.Rate
+	group.AccountRate, group.AccountRateSource, group.AccountRateKeyID = &rate, groupRateSource, 0
+	return true
+}
+
 // The caller must have identified the live Key and confirmed that a
 // successful account rates response omitted this website-listed group.
 func (s *Service) fetchVerifiedKeyAccountRate(ctx context.Context, credential uuid.UUID, key string,
@@ -57,7 +68,7 @@ func (s *Service) fetchVerifiedKeyAccountRate(ctx context.Context, credential uu
 		var readErr keyBillingReadError
 		switch {
 		case errors.Is(err, errKeyGroupNotAllowed):
-			err = accountRateUnverified("Key 账单读取失败（HTTP 403，分组无权限）")
+			return billingInfo{}, time.Time{}, err
 		case errors.As(err, &readErr):
 			err = accountRateReadFailed("Key 账单读取失败", readErr.cause)
 		default:

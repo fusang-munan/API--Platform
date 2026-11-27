@@ -37,6 +37,10 @@ type Dataset struct {
 	ObservedAt              *time.Time   `json:"observed_at,omitempty"`
 	FailureCount            int          `json:"failure_count,omitempty"`
 	Alert                   bool         `json:"alert,omitempty"`
+	accountRateKeyID        int64
+	websiteAccountRate      *json.Number
+	personalMultiplier      bool
+	confirmedKeyBinding     *websiteKeyBindingObservation
 }
 
 type Model struct {
@@ -262,7 +266,7 @@ SELECT c.id, kinds.kind, d.last_success, d.last_error, trim_scale(m.multiplier):
        WHEN m.id IS NULL OR d.last_success IS NULL THEN 'unverified'
        ELSE 'current' END,
   CASE WHEN kinds.kind = 'billing' THEN COALESCE(d.failure_count, 0) ELSE 0 END,
-  d.website_group_observation, c.updated_at, k.group_id, k.group_name, trim_scale(k.rate)::text, inventory.last_seen
+  d.website_group_observation, c.updated_at, COALESCE(k.upstream_key_id,0), k.group_id, k.group_name, trim_scale(k.rate)::text, inventory.last_seen
 FROM provider_credentials c
 CROSS JOIN (VALUES ('catalog'), ('billing'), ('prices'), ('usage')) AS kinds(kind)
 LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = kinds.kind
@@ -290,13 +294,15 @@ ORDER BY c.label, c.id, kinds.kind`, providerID)
 		var inventory WebsiteKey
 		if err := rows.Scan(&item.CredentialID, &item.Kind, &item.LastSuccess, &item.LastError, &multiplier,
 			&item.GroupID, &item.GroupRate, &item.PeakEnabled, &item.PeakRate, &item.ObservedAt, &rateSource,
-			&item.BillingState, &item.FailureCount, &observedGroup, &revision, &inventory.GroupID, &inventory.GroupName,
+			&item.BillingState, &item.FailureCount, &observedGroup, &revision, &inventory.ID, &inventory.GroupID, &inventory.GroupName,
 			&inventory.Rate, &inventory.LastSeen); err != nil {
 			return err
 		}
 		versionGroup, versionRate := item.GroupID, item.GroupRate
+		var evidence *billingAccountRateObservation
 		if item.Kind == "billing" {
-			if err := item.applyBillingGroup(observedGroup, revision, inventory); err != nil {
+			evidence, err = item.applyBillingGroup(observedGroup, revision, inventory)
+			if err != nil {
 				return err
 			}
 		}
@@ -306,10 +312,23 @@ ORDER BY c.label, c.id, kinds.kind`, providerID)
 			value := json.Number(*multiplier)
 			item.EffectiveMultiplier = &value
 			item.EffectiveMultiplierText = *multiplier
-			if rateSource == keyBillingRateSource && item.BillingState == "current" && item.GroupStatus == "assigned" &&
+			item.personalMultiplier = rateSource == keyBillingRateSource
+			if item.BillingState == "current" && item.GroupStatus == "assigned" &&
 				versionGroup != nil && item.GroupID != nil && *versionGroup == *item.GroupID &&
 				versionRate != nil && item.GroupRate != nil && samePanelRate(json.Number(*versionRate), json.Number(*item.GroupRate)) {
-				item.AccountRate, item.AccountRateSource = &value, rateSource
+				if rateSource == groupRateSource {
+					rate := json.Number(*versionRate)
+					item.AccountRate, item.AccountRateSource = &rate, rateSource
+				} else if evidence != nil && evidence.GroupID == *versionGroup && evidence.Source == rateSource {
+					switch {
+					case rateSource == "" && websiteGroupRate(evidence.Rate) != nil:
+						item.websiteAccountRate = &evidence.Rate
+					case rateSource == keyBillingRateSource && item.confirmedKeyBinding != nil &&
+						item.confirmedKeyBinding.KeyID == evidence.KeyID && item.confirmedKeyBinding.GroupID != nil &&
+						*item.confirmedKeyBinding.GroupID == evidence.GroupID && samePanelRate(evidence.Rate, value):
+						item.AccountRate, item.AccountRateSource, item.accountRateKeyID = &value, rateSource, evidence.KeyID
+					}
+				}
 			}
 		}
 		if item.LastSuccess != nil {

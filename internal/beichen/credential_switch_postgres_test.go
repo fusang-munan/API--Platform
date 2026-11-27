@@ -164,8 +164,8 @@ VALUES(gen_random_uuid(),$1,$2,$3,'fallback','anthropic',20,now(),now())`, model
 	}
 	assertRoute(false)
 	jobs, err := service.listJobs(ctx, nil)
-	if err != nil || len(jobs) != 2 || jobs[0].credential != to.ID || jobs[0].kind != "billing" ||
-		jobs[1].credential != to.ID || jobs[1].kind != "key_usage" {
+	if err != nil || len(jobs) != 2 || jobs[0].credential != to.ID || jobs[0].kind != "key_usage" ||
+		jobs[1].credential != to.ID || jobs[1].kind != "billing" {
 		t.Fatalf("后台应只排队接替 Key: %+v (%v)", jobs, err)
 	}
 	if err := service.syncJobs(ctx, nil); err != nil {

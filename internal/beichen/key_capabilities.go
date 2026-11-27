@@ -79,6 +79,15 @@ func readKeyCapabilities(ctx context.Context, tx *sql.Tx, provider uuid.UUID, da
 			}
 		}
 		billingData := billing[key.CredentialID]
+		if binding := billingData.confirmedKeyBinding; binding != nil {
+			if key.WebsiteKeyID != nil && *key.WebsiteKeyID != binding.KeyID {
+				modelList, daily, stats = nil, nil, nil
+				key.WebsiteGroup, key.ModelsFetchedAt, key.ModelsError = nil, nil, nil
+				key.Unit, key.UsageFetchedAt, key.UsageError = nil, nil, nil
+				key.DayUnit, key.DayFetchedAt, key.ModelStatsDay, key.ModelStatsAt = nil, nil, nil, nil
+			}
+			key.WebsiteKeyID = &binding.KeyID
+		}
 		if billingData.GroupStatus != "" && (billingData.GroupID == nil ||
 			key.WebsiteGroup == nil || *billingData.GroupID != key.WebsiteGroup.ID) {
 			// A model list from another group cannot describe the current group.
@@ -87,12 +96,23 @@ func readKeyCapabilities(ctx context.Context, tx *sql.Tx, provider uuid.UUID, da
 				key.ModelsError = nil
 			}
 		}
+		if snapshot := key.WebsiteGroup; snapshot != nil && snapshot.AccountRate != nil {
+			binding, fetched := billingData.confirmedKeyBinding, key.ModelsFetchedAt
+			// A successful model refresh timestamps the group snapshot written
+			// in the same Key usage check.
+			if billingData.GroupStatus != "assigned" || binding == nil || binding.GroupID == nil || *binding.GroupID != snapshot.ID ||
+				key.WebsiteKeyID == nil || binding.KeyID != *key.WebsiteKeyID || key.ModelsError != nil ||
+				fetched == nil || fetched.After(now) || now.Sub(*fetched) > keyUsageFreshness {
+				snapshot.AccountRate = nil
+			}
+		}
 		key.applyGroup(billingData)
 		key.ModelsError = billingData.groupReadError(key.ModelsError)
 		key.UsageError = billingData.groupReadError(key.UsageError)
 		key.ModelsState = keyDataState(key.ModelsFetchedAt, key.ModelsError, now)
 		key.UsageState = keyDataState(key.UsageFetchedAt, key.UsageError, now)
-		if value := billingData.EffectiveMultiplierText; value != "" {
+		if value := billingData.EffectiveMultiplierText; value != "" &&
+			(!billingData.personalMultiplier || billingData.AccountRateSource == keyBillingRateSource) {
 			key.StoredMultiplier = &value
 		}
 		savedRate := rateFromText(key.StoredMultiplier)
@@ -139,30 +159,39 @@ func readKeyCapabilities(ctx context.Context, tx *sql.Tx, provider uuid.UUID, da
 
 func (key *KeyCapability) applyGroup(billing Dataset) {
 	key.GroupStatus = billing.GroupStatus
-	if key.GroupStatus == "" {
+	switch {
+	case key.GroupStatus == "":
 		key.GroupStatus = "pending"
 		if key.WebsiteGroup != nil {
 			key.GroupStatus = "assigned"
 		}
-		return
-	}
-	if billing.GroupID == nil {
+	case billing.GroupID == nil:
 		key.WebsiteGroup = nil
+	default:
+		if key.WebsiteGroup == nil || key.WebsiteGroup.ID != *billing.GroupID {
+			key.WebsiteGroup = &WebsiteGroup{ID: *billing.GroupID}
+		}
+		if billing.GroupName != nil {
+			key.WebsiteGroup.Name = *billing.GroupName
+		}
+		if billing.GroupRate != nil {
+			rate := json.Number(*billing.GroupRate)
+			key.WebsiteGroup.Rate = &rate
+		}
+	}
+	group := key.WebsiteGroup
+	if group == nil {
 		return
 	}
-	if key.WebsiteGroup == nil || key.WebsiteGroup.ID != *billing.GroupID {
-		key.WebsiteGroup = &WebsiteGroup{ID: *billing.GroupID}
+	// Once billing has a result, use its account rate and identity as one observation.
+	if group.AccountRateSource != "" || group.AccountRateKeyID != 0 ||
+		billing.BillingState == "current" || billing.BillingState == "stale" || billing.LastError != nil {
+		group.AccountRate, group.AccountRateSource, group.AccountRateKeyID = nil, "", 0
 	}
-	if billing.GroupName != nil {
-		key.WebsiteGroup.Name = *billing.GroupName
-	}
-	if billing.GroupRate != nil {
-		rate := json.Number(*billing.GroupRate)
-		key.WebsiteGroup.Rate = &rate
-	}
-	if billing.AccountRateSource == keyBillingRateSource {
-		key.WebsiteGroup.AccountRate = billing.AccountRate
-		key.WebsiteGroup.AccountRateSource = billing.AccountRateSource
+	if billing.AccountRate != nil {
+		group.AccountRate, group.AccountRateSource, group.AccountRateKeyID = billing.AccountRate, billing.AccountRateSource, billing.accountRateKeyID
+	} else if billing.websiteAccountRate != nil {
+		group.AccountRate = billing.websiteAccountRate
 	}
 }
 

@@ -141,6 +141,7 @@ RETURNING status`, provider, lease, leaseSeconds, manual).Scan(&oldStatus)
 	if err != nil {
 		return nil, err
 	}
+	observedAt := s.now().UTC().Truncate(time.Microsecond)
 	readCtx, cancel := context.WithTimeout(ctx, jobTimeout)
 	observation, readErr := read(readCtx)
 	cancel()
@@ -154,7 +155,7 @@ RETURNING status`, provider, lease, leaseSeconds, manual).Scan(&oldStatus)
 		defer cancel()
 		return nil, finishWebsiteKeyInventory(saveCtx, s.db, provider, lease, status, nil)
 	}
-	keys, err := s.applyWebsiteKeys(ctx, provider, lease, observation, s.now().UTC(), oldStatus != "current")
+	keys, err := s.applyWebsiteKeys(ctx, provider, lease, observation, observedAt, oldStatus != "current")
 	if errors.Is(err, errWebsiteKeySessionChanged) {
 		return nil, nil
 	}
@@ -236,8 +237,22 @@ WHERE provider_id=$1 AND status='active' FOR SHARE`, provider).Scan(&current)
 		if len(credential.candidates) == 1 {
 			i := credential.candidates[0]
 			if claims[i] == 1 {
+				key := listed[i]
+				current = websiteKeyView(key)
+				groupID := current.GroupID
+				if groupID == nil && key.GroupID == 0 && key.groupIDKnown {
+					groupID = &key.GroupID
+				}
+				accepted, err := saveConfirmedKeyBinding(ctx, tx, credential.id, websiteKeyBindingObservation{
+					KeyID: key.ID, GroupID: groupID, CheckedAt: observedAt, Revision: credential.revision,
+				}, true)
+				if err != nil {
+					return nil, err
+				}
+				if !accepted {
+					continue
+				}
 				matched[i] = credential
-				current = websiteKeyView(listed[i])
 			}
 		}
 		if err := saveWebsiteKeyVersion(ctx, tx, credential, current, observedAt, recovered); err != nil {
