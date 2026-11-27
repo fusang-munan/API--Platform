@@ -1,5 +1,5 @@
-import type { BeichenCatalogModel, BeichenDataset, BeichenModel, BeichenOverview, BeichenPreferredRoute, BeichenPriceConditions, BeichenPriceTier, BeichenProtocolCapability, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../api/types'
-import { shiftDecimal } from './credits'
+import type { BeichenCatalogModel, BeichenDataset, BeichenModel, BeichenOverview, BeichenPreferredRoute, BeichenPriceConditions, BeichenPriceTier, BeichenProtocolCapability, BeichenUsageTotals, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../api/types'
+import { formatTokens, multiplyDecimal, shiftDecimal } from './credits'
 
 export function isBeichenProvider(baseUrl: string) {
   const address = baseUrl.trim()
@@ -27,6 +27,10 @@ export type SchoolQuote = {
   schoolSource?: PriceSource
   officialObservedAt?: string | null
   schoolObservedAt?: string | null
+  credentialId?: string
+  upstreamModel?: string
+  routeLabel?: string
+  conditionalPrice?: SchoolConditionalPrice
 }
 
 export type PriceSource = 'website' | 'derived' | 'manual'
@@ -47,6 +51,16 @@ export type PriceDetailView = {
   sourceLabel: string
   observedAt: string | null
   observedLabel: string
+}
+
+type SchoolTokenPriceBand = {
+  label: string
+  rows: Array<Pick<PriceDetailRow, 'key' | 'label' | 'yuan'> & { settlement: string | null; student: string | null }>
+}
+type SchoolConditionalPrice = {
+  base: SchoolTokenPriceBand | null
+  intervals: Array<SchoolTokenPriceBand & { minTokens: string; maxTokens: string | null }>
+  observedAt: string | null
 }
 
 export const priceSourceLabels: Record<PriceSource, string> = {
@@ -141,6 +155,32 @@ export type TeacherCatalogModel = Omit<BeichenCatalogModel, 'price_state'> & {
 
 export type TeacherOverview = Omit<BeichenOverview, 'model_catalog'> & { model_catalog?: TeacherCatalogModel[] | null }
 
+export type SchoolUsageMetrics = {
+  credits?: string | null
+  tokens?: number | null
+  calls?: number | null
+  pending_calls?: number | null
+} & Pick<BeichenUsageTotals, 'completeness' | 'tokens_missing'>
+
+export function schoolUsageCredits(metrics: SchoolUsageMetrics, withUnit = false) {
+  const credits = shiftDecimal(metrics.credits, 0)
+  if (credits === '—') return '积分未报告'
+  if (credits === '0' && metrics.calls && metrics.pending_calls === 0) {
+    return `0 积分 · ${formatTokens(metrics.calls)} 次（零额）`
+  }
+  if (credits === '0' && metrics.pending_calls && metrics.pending_calls === metrics.calls) return '暂无已扣积分'
+  return withUnit ? credits + ' 积分' : credits
+}
+
+export function schoolUsageTokens(metrics?: SchoolUsageMetrics) {
+  if (!metrics) return '—'
+  if (metrics.tokens == null || metrics.tokens === 0 && metrics.completeness === 'missing' && metrics.calls !== 0) {
+    return '未回报'
+  }
+  if (metrics.tokens === 0 && metrics.completeness == null && metrics.calls !== 0) return '待确认'
+  return formatTokens(metrics.tokens)
+}
+
 type WebsiteKeyRateVersion = BeichenWebsiteKey & { observed_at?: string | null }
 type WebsiteKeyGroups = {
   current: boolean
@@ -210,6 +250,11 @@ export function schoolPriceRoutes(entry: TeacherCatalogModel, providerId: string
   }))
 }
 
+export function matchingSchoolBinding(routes: TeacherBoundRoute[] | undefined, route: BeichenPreferredRoute) {
+  return routes?.find(binding => binding.credential_id === route.credential_id && binding.school_model === route.school_model &&
+    binding.upstream_model === route.upstream_model && binding.protocol === route.adapter)
+}
+
 export function schoolCatalog(overview: TeacherOverview, providerId: string, websiteGroups?: WebsiteKeyGroups): SchoolCatalogRow[] {
   const records = new Map<string, BeichenModel[]>()
   const prices = new Map<string, BeichenModel>()
@@ -249,8 +294,9 @@ export function schoolCatalog(overview: TeacherOverview, providerId: string, web
       const websiteKey = websiteGroups?.current ? matchedKey : undefined
       const previousGroup = lastKnownKeyGroup(websiteKey?.group_id != null ? undefined : matchedKey,
         billing, catalogGroups.get(route.credential_id))
+      const binding = matchingSchoolBinding(entry.bound_routes, route)
       const quote = schoolQuote(record, route.effective_multiplier_text ?? route.effective_multiplier,
-        route.state === 'candidate', billing, priceDataset, websiteKey, previousGroup)
+        route.state === 'candidate', billing, priceDataset, websiteKey, previousGroup, binding)
       quotes.set(JSON.stringify(quote), quote)
       credentials.set(route.credential_id, {
         credential_id: route.credential_id,
@@ -465,7 +511,7 @@ export function schoolQuoteDetail(quote: SchoolQuote, student: boolean): PriceDe
 
 function schoolQuote(record: BeichenModel | undefined, reported: string | number | null | undefined,
   candidate: boolean, billing?: BeichenDataset, priceDataset?: BeichenDataset, websiteKey?: WebsiteKeyRateVersion,
-  previousGroup?: ReturnType<typeof lastKnownKeyGroup>) {
+  previousGroup?: ReturnType<typeof lastKnownKeyGroup>, binding?: TeacherBoundRoute) {
   const status: SchoolQuote['status'] = record?.price_status === 'confirmed' || record?.price_status === 'conditional' ||
     record?.price_status === 'derived' || record?.price_status === 'not_listed' ? record.price_status : 'pending'
   const derived = record?.price_source === 'derived_from_usage' || status === 'derived'
@@ -477,8 +523,9 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
   const stale = billing?.billing_state === 'stale'
   const billingRate = billing?.effective_multiplier_text ?? billing?.effective_multiplier
   const hasGroupEvidence = Boolean(websiteKey || previousGroup)
+  const priceObservedAt = record?.price_observed_at ?? priceDataset?.last_success
   const matchingQuote = websiteKey && priceBelongsToWebsiteKeyGroup(websiteKey,
-    record?.price_observed_at ?? priceDataset?.last_success, billing?.group_id ?? previousGroup?.id)
+    priceObservedAt, binding?.group_id ?? billing?.group_id ?? previousGroup?.id)
   const observedRate = hasGroupEvidence
     ? matchingQuote ? websiteKeyEffectiveRate(websiteKey, billing) : null
     : billing?.billing_state === 'current' ? billingRate : reported
@@ -493,10 +540,19 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
   const terms = (websiteKey?.group_id == null || matchingQuote) && status !== 'not_listed' &&
     source && typeof source === 'object' && !Array.isArray(source) ? source : null
   const canCalculate = !priceError && (status === 'confirmed' || status === 'conditional' || status === 'derived') ? rate : null
-  const prices = terms ? formatPriceConditions(terms, canCalculate, true) : null
+  // Coverage and exact terms come from the current bound-route snapshot.
+  // The Key inventory and billing evidence must still agree with that route.
+  const covered = binding?.binding_ready && binding.price_covered
+  const conditionalPrice = covered && binding.price_state === 'conditional' && binding.group_id != null &&
+    mode === 'follow' && !record?.school_rates && record?.price_covered !== false && !derived &&
+    matchingQuote && canCalculate && terms && terms === record?.price_conditions_exact
+    ? schoolConditionalPrice(terms, formatDecimal(canCalculate), priceObservedAt) : undefined
+  const displayRate = binding && mode === 'follow' && (!covered || derived ||
+    binding.price_state === 'conditional' && !conditionalPrice && !record?.school_rates) ? null : canCalculate
+  const prices = terms ? formatPriceConditions(terms, displayRate, true) : null
   const standard = prices?.standard ?? null
   // Older confirmed quotes can have effective token rates without a website pricing object.
-  const legacy = !terms && canCalculate && status === 'confirmed' ? legacyEffectivePrice(record?.upstream_rates) : null
+  const legacy = !terms && displayRate && status === 'confirmed' ? legacyEffectivePrice(record?.upstream_rates) : null
   const actual = prices?.actual ?? legacy?.actual ?? null
   const schoolRates = mode === 'follow' && (stale || hasGroupEvidence &&
     (!matchingQuote || !verifiedWebsiteKeyBilling(websiteKey, billing))) ? null : record?.school_rates
@@ -541,7 +597,9 @@ function schoolQuote(record: BeichenModel | undefined, reported: string | number
   return { multiplier, multiplierLabel: mode === 'manual' ? '手动定价' : '倍率 ' + multiplier,
     standard, actual, actualRates, status, statusLabel, issue: issue || undefined, notes, mode, priceReady,
     conditions: terms, rateValue: rate ? formatDecimal(rate) : null,
-    officialSource, schoolSource, officialObservedAt, schoolObservedAt }
+    officialSource, schoolSource, officialObservedAt, schoolObservedAt, conditionalPrice,
+    credentialId: binding?.credential_id ?? undefined, upstreamModel: binding?.upstream_model.toLowerCase(),
+    routeLabel: binding?.credential_label }
 }
 
 const tokenPrices = [
@@ -614,6 +672,38 @@ function tokenBoundary(raw: number | string | null | undefined, upper = false) {
   const label = formatDecimal(parsed)
   const invalid = parsed.coefficient < 0n || label.includes('.')
   return { label, tokens: invalid ? null : BigInt(label), invalid }
+}
+
+function schoolTokenPriceBand(terms: BeichenPriceTier, rate: string, label: string): SchoolTokenPriceBand | null {
+  const base = priceDetailRows(terms)
+  if (base[0].yuan == null || base[1].yuan == null) return null
+  const settlement = priceDetailRows(terms, rate)
+  return { label, rows: base.map(({ key, label, yuan }, index) => {
+    const credits = settlement[index].credits
+    return { key, label, yuan, settlement: credits, student: credits == null ? null : multiplyDecimal(credits, '1.10') }
+  }) }
+}
+
+function schoolConditionalPrice(terms: BeichenPriceConditions, rate: string, observedAt?: string | null): SchoolConditionalPrice | undefined {
+  const intervals = (Array.isArray(terms.intervals) ? terms.intervals : []).flatMap(tier => {
+    if (!tier || typeof tier !== 'object' || Array.isArray(tier)) return []
+    const min = tokenBoundary(tier.min_tokens)
+    const max = tokenBoundary(tier.max_tokens ?? null, true)
+    if (min.tokens == null || max.invalid || max.tokens != null && max.tokens <= min.tokens) return []
+    const from = min.tokens.toLocaleString('zh-CN')
+    const to = max.tokens?.toLocaleString('zh-CN')
+    const label = min.tokens === 0n && to ? `基础档 · 输入 Token < ${to}`
+      : to ? `${from} ≤ 输入 Token < ${to}` : `输入 Token ≥ ${from}`
+    const band = schoolTokenPriceBand({ ...tier, billing_mode: tier.billing_mode ?? terms.billing_mode }, rate, label)
+    return band ? [{ ...band, minTokens: min.label, maxTokens: max.tokens == null ? null : max.label }] : []
+  })
+  const base = intervals.some(tier => tier.minTokens === '0') ? null : schoolTokenPriceBand(terms, rate, '基础档')
+  return base || intervals.length ? { base, intervals, observedAt: observedAt ?? null } : undefined
+}
+
+export function schoolTokenPriceAt(price: SchoolConditionalPrice, inputTokens: bigint): SchoolTokenPriceBand | null {
+  return price.intervals.find(tier => inputTokens >= BigInt(tier.minTokens) &&
+    (tier.maxTokens == null || inputTokens < BigInt(tier.maxTokens))) ?? price.base
 }
 
 export function formatPriceConditions(terms: BeichenPriceConditions, rate: Decimal | null, credits = false) {

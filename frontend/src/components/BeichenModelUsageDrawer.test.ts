@@ -56,7 +56,7 @@ describe('北辰模型用量明细', () => {
     expect(wrapper.get('td[data-completeness="partial"]').text()).toBe('部分缺失')
     const missing = wrapper.get('td[data-completeness="missing"]').element.closest('tr')!
     expect(missing.textContent).toContain('缺失')
-    expect(missing.querySelector('[data-label="Token"]')?.textContent).toBe('—')
+    expect(missing.querySelector('[data-label="Token"]')?.textContent?.trim()).toBe('未回报')
     const expand = wrapper.get('button[aria-label="查看 lab/a 的学生用量"]')
     expect(expand.attributes('aria-expanded')).toBe('false')
     await expand.trigger('click')
@@ -66,7 +66,7 @@ describe('北辰模型用量明细', () => {
     expect(student.get('th').text()).toContain('学生甲')
     expect(student.get('th small').text()).toBe('教学项目一 · 教学项目二')
     expect(student.findAll('td').map(cell => cell.text())).toEqual([
-      '1.2000000000000000001', '230', '部分缺失', '1 笔 待核 Token 40',
+      '1.2000000000000000001', '230 未归类 Token 40', '部分缺失', '1 笔',
     ])
     expect(wrapper.get('tbody').text()).not.toContain('学生乙')
     await expand.trigger('click')
@@ -77,14 +77,16 @@ describe('北辰模型用量明细', () => {
     expect(wrapper.get('tbody').text()).toContain('2 笔')
   })
 
-  it('模型入口直接展开对应学生，切到 Key 展示区间全部模型并保留时段切换', async () => {
+  it('旧响应缺少 Key 分型号明细时保留当前型号汇总，仍可主动看全部', async () => {
     const wrapper = drawer({ usage: usage(), initialModel: 'LAB/B' })
     expect(wrapper.findAll('tbody tr')).toHaveLength(2)
     expect(wrapper.get('tr.expanded-student').text()).toContain('学生乙')
     expect(wrapper.get('[aria-label="用量汇总"]').text()).toContain('待核笔数2')
-    await press(wrapper, '查看全部模型')
-    expect(wrapper.get('tbody').text()).toContain('lab/a')
     await press(wrapper, '按 Key')
+    expect(wrapper.text()).toContain('部分 Key 的分型号明细未回报')
+    expect(wrapper.get('[aria-label="用量汇总"]').text()).toContain('待核笔数2')
+    expect(wrapper.find('tbody').exists()).toBe(false)
+    await press(wrapper, '查看全部模型')
     expect(wrapper.get('tbody').text()).toContain('学校 Key 甲')
     expect(wrapper.get('[aria-label="用量汇总"]').text()).toContain('待核笔数3')
     await press(wrapper.get('[aria-label="用量时间范围"]'), '当天')
