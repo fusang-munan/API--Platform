@@ -340,9 +340,9 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 教师北辰模型用量读取 `gateway_calls` 的派发快照。用 `COALESCE(beichen_price_at, beichen_dispatch_at)`，旧行用 `sent_at`，按北京时间左闭右开的区间选取有派发渠道和上游型号、`outcome <> 'pending'` 的调用。教师报表使用派发月，学生账本使用受理时写入 `monthly_usage_cube.month` 的账月。跨月派发及之后的结算会在两个时间口径下落入不同月份。
 
-教师模型用量的 `calls` 和 `dispatched_calls` 是同一范围中的行数。`settled_calls` 计 `beichen_state='charged'` 及无北辰账务状态时 `billing_state='charged'` 的旧调用，精确扣分为零（旧调用的 `credit_milli=0`）仍计入，另记 `zero_cost_calls`。已扣积分仍来自 `beichen_credit_exact`。仅 `pending_review` 行的 `unresolved_credit_milli` 计入待核预留合计，该列保存整积分。释放的行保留派发证据，退出待核且不作为已结算。Token 回报独立统计。分项、显式总量和原始输入均缺时计入 `token_missing_calls`，明确数值 0 保留为已知。`completeness` 标记整组覆盖情况。
+教师模型用量的 `calls` 和 `dispatched_calls` 是同一范围中的行数。`settled_calls` 计 `beichen_state='charged'` 及无北辰账务状态时 `billing_state='charged'` 的旧调用，精确扣分为零（旧调用的 `credit_milli=0`）仍计入，另记 `zero_cost_calls`。`credits` 对北辰已扣行只取 `beichen_credit_exact`，对缺少北辰账务状态的已结算旧行回退为 `credit_milli * 0.001`。两者按 `beichen_state` 是否为空互斥，不能相加；因此 400 千分积分计为 0.400 积分。仅 `pending_review` 行的 `unresolved_credit_milli` 计入待核预留合计，该列保存整积分。释放的行保留派发证据，退出待核且不作为已结算。Token 回报独立统计。分项、显式总量和原始输入均缺时计入 `token_missing_calls`，明确数值 0 保留为已知。`completeness` 标记整组覆盖情况。
 
-教师模型用量优先用 `gateway_calls.model_id` 保存的 UUID 归组，左连接 `models.id` 仅补充校内标识，停用或缺少当前模型资料的调用仍归入原 UUID。不可用 UUID（空值或全零）才按派发供应商、凭据和上游名查 `upstream_model_aliases`，渠道专属优先。命中且 `school_model` 能对应 `models.model_id` 时归入该 UUID。其余记录按供应商及小写上游名称归组并标明仅有上游名证据。查询无需新增列，也无需用当前绑定反推历史身份。
+教师模型用量优先用 `gateway_calls.model_id` 保存的 UUID 归组，左连接 `models.id` 仅补充校内标识，停用或缺少当前模型资料的调用仍归入原 UUID。不可用 UUID（空值或全零）才按派发供应商、凭据和上游名查 `upstream_model_aliases`，渠道专属优先。命中且 `school_model` 能对应 `models.model_id` 时归入该 UUID。其余记录按供应商、派发渠道和小写上游名称归组并标明仅有上游名证据；不同渠道的同名旧调用分别成行。查询无需新增列，也无需用当前绑定反推历史身份。
 
 学生余额查询读取所属项目的 `project_month_credit_buckets` 和个人的 `project_member_month_credit_buckets`，两边均按额度减已扣、千分之一积分以下的余数和在途占用。有效可用额取两边的较小值，最低为零。本月个人额度取 `project_members.monthly_credit_quota_milli`，与网关受理时刷新月桶的来源相同。历史账月优先读该月份的月桶。Key 月桶继续提供旧字段 `available`。
 
