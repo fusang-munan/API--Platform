@@ -10,7 +10,7 @@ import {
   formatObservedAt, formatPriceConditions, indexWebsiteKeyGroups, keyGroupIssue, keyGroupRate, lastKnownKeyGroup,
   lastKnownKeyGroupLabel, matchingSchoolBinding, missingPriceDetailLabels, priceBelongsToWebsiteKeyGroup, priceDetailRows, schoolCatalog,
   priceConditionsCoverBase, schoolPriceRoutes, schoolTokenPriceAt, schoolUsageCredits, schoolUsageModelLookup, schoolUsagePendingNote,
-  schoolUsageSettlementNote, schoolUsageTokenNote, schoolUsageTokens, teacherCatalogReference,
+  schoolUsageSettlementNote, schoolUsageTokenNote, schoolUsageTokens, teacherCatalogReference, teacherCatalogUsageKey,
   usageDispatchedCalls, usagePendingReviewCalls,
   verifiedWebsiteKeyBilling, websiteKeyEffectiveRate, type SchoolCatalogRow, type SchoolQuote,
   type TeacherBoundRoute, type TeacherCatalogModel, type TeacherOverview,
@@ -67,6 +67,7 @@ const usageOpen = ref(false)
 const initialModel = ref('')
 const initialUsageKey = ref('')
 const initialUsageLabel = ref('')
+const initialUsageSharedUpstream = ref(false)
 const websiteDirectory = computed(() => overview.value?.website_directory)
 const lastCrawl = computed(() => websiteDirectory.value?.last_run)
 const sourceLabels = { website: '官网', key: 'Key', both: '官网和 Key' } as const
@@ -319,6 +320,21 @@ function remainingRouteAvailability(routes: TeacherBoundRoute[], previousRecomme
       : '维护中。当前线路的协议最近一次探活均失败。', actionHint: '请核对剩余线路并重新探活。' }
 }
 
+function usageBindingSignatures(entry: TeacherCatalogModel) {
+  const signatures = new Set<string>()
+  const routes = entry.bound_routes?.length ? entry.bound_routes : entry.preferred_routes ?? []
+  const add = (credentialId?: string | null, upstream?: string | null) => {
+    const key = credentialId?.trim().toLowerCase()
+    const model = (upstream ?? entry.model).trim().toLowerCase()
+    if (key && model) signatures.add(key + '|' + model)
+  }
+  for (const route of routes) add(route.credential_id, route.upstream_model)
+  for (const key of entry.catalog_keys ?? []) {
+    if (key.state === 'listed' && !key.stale) add(key.credential_id, key.upstream_model)
+  }
+  return signatures
+}
+
 const catalog = computed(() => {
   const data = overview.value
   if (!data) return []
@@ -341,12 +357,24 @@ const catalog = computed(() => {
     return { ...entry, bound_routes: boundRoutes, catalog_keys: catalogKeys }
   })
   const entries = new Map((modelCatalog ?? []).map(row => [teacherCatalogReference(row).toLowerCase(), row]))
+  const usageUpstreamGroups = new Map<string, Set<string>>()
+  for (const entry of modelCatalog ?? []) {
+    if (entry.retired) continue
+    const identity = teacherCatalogUsageKey(entry) ?? teacherCatalogReference(entry)
+    for (const signature of usageBindingSignatures(entry)) {
+      const models = usageUpstreamGroups.get(signature)
+      if (models) models.add(identity)
+      else usageUpstreamGroups.set(signature, new Set([identity]))
+    }
+  }
   const observedPrices = new Map((data.models ?? []).map(record => [
     record.credential_id + ':' + record.model.toLowerCase(), record,
   ]))
   return schoolCatalog({ ...data, model_catalog: modelCatalog }, props.providerId, websiteKeyGroups.value).map(row => {
     const catalogKey = (row.catalogKey ?? row.model).toLowerCase()
     const entry = entries.get(catalogKey) ?? { model: row.model, school_model: row.school }
+    const usageSharedUpstream = [...usageBindingSignatures(entry)]
+      .some(signature => (usageUpstreamGroups.get(signature)?.size ?? 0) > 1)
     const retired = entry.retired === true
     const source = entry.source
     const websiteOnly = entry.catalog_state === 'website_only'
@@ -441,7 +469,7 @@ const catalog = computed(() => {
       historicalChannels: entry.historical_channels ?? [],
       routeCount, readyCount, priceState, priceCovered, priceMissing, routeBlocked,
       blockers: [...new Set(blockerMessages)], priceBlocker,
-      listed, websiteOnly, source, locations, groupPrices, detailQuotes, detailWebsite,
+      listed, websiteOnly, source, locations, groupPrices, detailQuotes, detailWebsite, usageSharedUpstream,
       currentPriceRoute: priceEvidence?.binding_ready ? priceEvidence : undefined,
       catalogKeys, groupMismatch, deniedGroups, missingGroup, groupRateMismatch,
       protocolLabels: [...new Set(protocolNames)].map(protocolLabel),
@@ -948,6 +976,7 @@ function openUsage(row?: CatalogRow) {
   initialModel.value = row?.model ?? ''
   initialUsageKey.value = row?.usageKey ?? row?.school ?? ''
   initialUsageLabel.value = row?.model ?? ''
+  initialUsageSharedUpstream.value = row?.usageSharedUpstream === true
   range.value = 'month'
   usageOpen.value = true
 }
@@ -998,9 +1027,14 @@ function missingPriceLabel(row: CatalogRow) {
 }
 
 function usageLookup(row: CatalogRow) {
-  return schoolUsageModelLookup(monthlyUsage.value.data?.models, row.usageKey ?? row.school, row.model)
+  return schoolUsageModelLookup(monthlyUsage.value.data?.models, row.usageKey ?? row.school, row.model, {
+    upstreamShared: row.usageSharedUpstream,
+  })
 }
-function modelUsage(row: CatalogRow) { return usageLookup(row).model }
+function modelUsage(row: CatalogRow) {
+  const lookup = usageLookup(row)
+  return lookup.ambiguous ? undefined : lookup.model
+}
 function modelCredits(row: CatalogRow) {
   if (monthlyUsage.value.loading) return '读取中…'
   if (monthlyUsage.value.error) return '用量读取失败'
@@ -1031,6 +1065,7 @@ watch(() => props.providerId, () => {
   priceRow.value = undefined
   conditionsModel.value = undefined
   usageOpen.value = false
+  initialUsageSharedUpstream.value = false
   batchSelection.value = undefined
   batchProgress.value = undefined
   batchResults.value = []
@@ -1374,7 +1409,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
   <BeichenPriceDrawer :open="Boolean(priceRow)" :provider-id="providerId" :row="priceRow" @update:open="open => { if (!open) priceRow = undefined }" @saved="priceSaved" />
   <BeichenModelUsageDrawer v-model:open="usageOpen" :range="range" :usage="drawerUsage.data" :loading="drawerUsage.loading"
     :error="drawerUsage.error" :initial-model="initialModel" :initial-model-key="initialUsageKey"
-    :initial-model-label="initialUsageLabel" @update:range="changeUsageRange" @retry="loadUsage(range)" />
+    :initial-model-label="initialUsageLabel" :initial-model-shared-upstream="initialUsageSharedUpstream"
+    @update:range="changeUsageRange" @retry="loadUsage(range)" />
   <AppDialog :open="rebindOpen" title="预览北辰绑定重建" description="按当前渠道目录和模型别名更新线路。逐条确认变化后再执行。" wide
     @update:open="open => { if (!open && !rebinding) rebindOpen = false }">
     <section class="beichen-stack" :aria-busy="rebinding">

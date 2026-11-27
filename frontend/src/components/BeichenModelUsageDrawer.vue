@@ -19,6 +19,7 @@ const props = defineProps<{
   initialModel?: string
   initialModelKey?: string
   initialModelLabel?: string
+  initialModelSharedUpstream?: boolean
 }>()
 const emit = defineEmits<{ 'update:open': [open: boolean]; 'update:range': [range: BeichenUsageRange]; retry: [] }>()
 
@@ -37,19 +38,23 @@ const completenessLabels = { complete: '完整', partial: '部分缺失', missin
 const group = ref<UsageRow['kind']>('model')
 const focusedModel = ref('')
 const focusedModelLabel = ref('')
+const focusedSharedUpstream = ref(false)
 const expandedModel = ref('')
 
-watch(() => [props.open, props.initialModel, props.initialModelKey, props.initialModelLabel] as const,
-  ([open, model, key, label]) => {
+watch(() => [props.open, props.initialModel, props.initialModelKey, props.initialModelLabel,
+  props.initialModelSharedUpstream] as const,
+  ([open, model, key, label, sharedUpstream]) => {
   if (!open) return
   group.value = 'model'
   focusedModel.value = key || model || ''
   focusedModelLabel.value = label || model || focusedModel.value
+  focusedSharedUpstream.value = sharedUpstream === true
   expandedModel.value = focusedModel.value.toLowerCase()
 }, { immediate: true })
 
 const period = computed(() => ranges.find(item => item.id === props.range)?.label ?? '本月')
-const focusedLookup = computed(() => schoolUsageModelLookup(props.usage?.models, focusedModel.value, focusedModelLabel.value))
+const focusedLookup = computed(() => schoolUsageModelLookup(props.usage?.models, focusedModel.value, focusedModelLabel.value,
+  { upstreamShared: focusedSharedUpstream.value }))
 const identityAmbiguous = computed(() => Boolean(focusedModel.value && focusedLookup.value.ambiguous))
 const totals = computed(() => focusedModel.value ? focusedLookup.value.model : props.usage?.totals)
 const noCalls = computed(() => Boolean(props.usage && !identityAmbiguous.value &&
@@ -61,11 +66,13 @@ const keyBreakdownIncomplete = computed(() => Boolean(group.value === 'key' && f
 const expandedStudents = computed(() => expandedModel.value ? accounts(expandedModel.value) : [])
 const columns = computed(() => ({ model: '模型', student: '学生账号', key: 'Key' })[group.value])
 const rows = computed<UsageRow[]>(() => {
+  if (identityAmbiguous.value) return []
   if (group.value === 'student') return accounts(focusedModel.value)
   if (group.value === 'key') {
     return (props.usage?.keys ?? []).flatMap(key => {
       const metrics = focusedModel.value
-        ? schoolUsageModelLookup(key.models, focusedModel.value, focusedModelLabel.value).model : key
+        ? schoolUsageModelLookup(key.models, focusedModel.value, focusedModelLabel.value,
+          { upstreamShared: focusedSharedUpstream.value }).model : key
       if (!metrics) return []
       return [{
         id: key.api_key_id, kind: 'key', name: key.api_key_name,
@@ -90,7 +97,8 @@ function accounts(model: string): UsageRow[] {
   const students = new Map<string, { name: string; projects: Set<string>; metrics: SchoolUsageMetrics }>()
   for (const student of props.usage?.students ?? []) {
     const metrics: SchoolUsageMetrics | undefined = model
-      ? schoolUsageModelLookup(student.models, model, focusedModelLabel.value).model
+      ? schoolUsageModelLookup(student.models, model, focusedModelLabel.value,
+        { upstreamShared: focusedSharedUpstream.value }).model
       : student
     if (!metrics) continue
     const account = students.get(student.user_id)
@@ -145,7 +153,8 @@ function completenessLabel(metrics?: SchoolUsageMetrics) {
         </div>
         <div v-if="focusedModel" class="beichen-toolbar">
           <span>模型 {{ focusedModelLabel }}</span>
-          <button type="button" class="button ghost" @click="focusedModel = ''; focusedModelLabel = ''">查看全部模型</button>
+          <button type="button" class="button ghost"
+            @click="focusedModel = ''; focusedModelLabel = ''; focusedSharedUpstream = false">查看全部模型</button>
         </div>
       </div>
       <p v-if="loading" role="status">正在读取用量…</p>
@@ -154,7 +163,7 @@ function completenessLabel(metrics?: SchoolUsageMetrics) {
         <button type="button" class="button secondary" @click="emit('retry')">重试读取用量</button>
       </div>
       <template v-else-if="usage">
-        <dl v-if="totals && !noCalls" class="usage-totals" aria-label="用量汇总">
+        <dl v-if="!identityAmbiguous && totals && !noCalls" class="usage-totals" aria-label="用量汇总">
           <div>
             <dt>{{ period }}已扣积分</dt>
             <dd>{{ schoolUsageCredits(totals) }}<small v-if="schoolUsageSettlementNote(totals)">{{ schoolUsageSettlementNote(totals) }}</small></dd>
@@ -174,7 +183,7 @@ function completenessLabel(metrics?: SchoolUsageMetrics) {
             :aria-pressed="group === item.id" @click="group = item.id">{{ item.label }}</button>
         </div>
         <p v-if="identityAmbiguous" class="beichen-empty" data-testid="usage-identity-ambiguous">
-          同名模型缺少校内身份，用量待确认
+          {{ focusedSharedUpstream ? '同名上游未归属，用量待确认' : '同名模型缺少校内身份，用量待确认' }}
         </p>
         <p v-else-if="noCalls" class="beichen-empty">{{ noCallsLabel }}</p>
         <p v-else-if="keyBreakdownIncomplete" class="beichen-note">部分 Key 的分型号明细未回报。</p>

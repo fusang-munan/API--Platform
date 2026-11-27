@@ -496,6 +496,83 @@ describe('北辰模型管理', () => {
     }
   })
 
+  it('同 Key 两个校内型号共享上游时，一条无 UUID 合集在主表、抽屉和按 Key 都显示待确认', async () => {
+    const upstream = 'gemini-4-terra'
+    const key = 'shared-key'
+    const catalogEntry = (alias: string): TeacherCatalogModel => ({
+      model: upstream, school_model: alias, school_status: 'active', activation: 'active',
+      catalog_state: 'key_listed', price_state: 'missing', price_covered: false,
+      ready_count: 1, bound_key_count: 1, covered_bound_key_count: 1,
+      bound_routes: [boundRoute(upstream, key, 20, {
+        school_model: alias, price_state: 'missing', price_covered: false,
+      })],
+      catalog_keys: [{ credential_id: key, group_id: 20, label: '共享 Key',
+        state: 'listed', upstream_model: upstream }],
+    })
+    const aggregate = {
+      model: upstream, ...total('89.734599713', 200), calls: 1, pending_calls: 0,
+      dispatched_calls: 1, settled_calls: 1, zero_cost_calls: 0,
+    }
+    api.beichenOverview.mockResolvedValue({
+      comparison: [], datasets: [], models: [],
+      model_catalog: [catalogEntry('terra-a'), catalogEntry('terra-b')],
+    })
+    api.modelUsage.mockResolvedValue({
+      ...usage(), models: [aggregate],
+      keys: [{
+        api_key_id: 'key-a', api_key_name: '共享 Key', user_id: 'student-a', user_name: '学生甲',
+        project_name: '项目甲', ...aggregate, models: [aggregate],
+      }],
+      students: [],
+    })
+    const wrapper = view()
+    await flushPromises()
+
+    for (const alias of ['terra-a', 'terra-b']) {
+      const row = wrapper.get(`[data-catalog-key="${alias}"] .model-usage`)
+      expect(row.text()).toBe('待确认')
+    }
+    await wrapper.get('[data-catalog-key="terra-a"] button[aria-label="查看 gemini-4-terra 用量"]').trigger('click')
+    const dialog = wrapper.get('[role="dialog"]')
+    expect(dialog.get('[data-testid="usage-identity-ambiguous"]').text()).toContain('同名上游未归属')
+    expect(dialog.text()).not.toContain('89.734599713')
+    await button(dialog, '按 Key').trigger('click')
+    expect(dialog.get('[data-testid="usage-identity-ambiguous"]').text()).toContain('同名上游未归属')
+    expect(dialog.text()).not.toContain('89.734599713')
+  })
+
+  it('共享上游的合集带有校内 UUID 时只归属对应型号，另一个型号仍显示待确认', async () => {
+    const upstream = 'gemini-4-terra'
+    const first = { id: '00000000-0000-4000-8000-000000000011', alias: 'terra-a' }
+    const second = { id: '00000000-0000-4000-8000-000000000012', alias: 'terra-b' }
+    const catalogEntry = (item: typeof first): TeacherCatalogModel => ({
+      model: upstream, school_model: item.alias, school_model_id: item.id,
+      school_status: 'active', activation: 'active', catalog_state: 'key_listed',
+      price_state: 'missing', price_covered: false, ready_count: 1, bound_key_count: 1,
+      covered_bound_key_count: 1,
+      bound_routes: [boundRoute(upstream, 'shared-key', 20, {
+        school_model: item.alias, price_state: 'missing', price_covered: false,
+      })],
+    })
+    const withUUID = {
+      model: upstream, model_key: 'school:' + first.id, school_model_id: first.id,
+      school_model: first.alias, ...total('1.6844212', 100),
+      calls: 1, pending_calls: 0, dispatched_calls: 1, settled_calls: 1, zero_cost_calls: 0,
+    }
+    api.beichenOverview.mockResolvedValue({
+      comparison: [], datasets: [], models: [],
+      model_catalog: [catalogEntry(first), catalogEntry(second)],
+    })
+    api.modelUsage.mockResolvedValue({ ...usage(), models: [withUUID], keys: [], students: [] })
+    const wrapper = view()
+    await flushPromises()
+
+    expect(wrapper.get(`[data-catalog-key="${first.id}"] .model-usage`).text()).toContain('1.6844212 积分')
+    expect(wrapper.get(`[data-catalog-key="${second.id}"] .model-usage`).text()).toBe('本月无校内调用')
+    await wrapper.get(`[data-catalog-key="${first.id}"] button[aria-label="查看 gemini-4-terra 用量"]`).trigger('click')
+    expect(wrapper.get('[role="dialog"] [aria-label="用量汇总"]').text()).toContain('本月已扣积分1.6844212')
+  })
+
   it('无 bound_routes 但有同 Key 同上游固定价时显示 264/1320，公共目录学生价仅留参考', async () => {
     const model = 'claude-opus-5-5'
     const key = 'key-' + model

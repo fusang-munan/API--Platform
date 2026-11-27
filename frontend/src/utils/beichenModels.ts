@@ -212,6 +212,15 @@ function schoolUsageDisplayNames(model: SchoolUsageModel) {
 }
 
 export type SchoolUsageLookup = { model?: SchoolUsageModel; ambiguous: boolean }
+export type SchoolUsageLookupOptions = {
+  /** Multiple school models share this catalog Key and upstream name. */
+  upstreamShared?: boolean
+}
+
+function schoolUsageHasSchoolIdentity(model: SchoolUsageModel) {
+  return Boolean(model.school_model_id || model.school_model ||
+    normalizedIdentity(model.model_key).startsWith('school:'))
+}
 
 export function schoolUsageModelMatches(model: SchoolUsageModel, value?: string | null) {
   const target = normalizedIdentity(value)
@@ -220,22 +229,28 @@ export function schoolUsageModelMatches(model: SchoolUsageModel, value?: string 
 }
 
 export function schoolUsageModelLookup(models: SchoolUsageModel[] | null | undefined,
-  identity?: string | null, displayFallback?: string | null): SchoolUsageLookup {
+  identity?: string | null, displayFallback?: string | null,
+  options: SchoolUsageLookupOptions = {}): SchoolUsageLookup {
   const target = normalizedIdentity(identity)
+  const resolved = (model: SchoolUsageModel): SchoolUsageLookup => {
+    if (!options.upstreamShared) return { model, ambiguous: false }
+    if (!schoolUsageHasSchoolIdentity(model)) return { model, ambiguous: true }
+    return schoolUsageStableKeys(model).has(target) ? { model, ambiguous: false } : { ambiguous: false }
+  }
   if (!target) return { ambiguous: false }
   const rows = models ?? []
   const stable = rows.filter(model => schoolUsageStableKeys(model).has(target))
-  if (stable.length === 1) return { model: stable[0], ambiguous: false }
+  if (stable.length === 1) return resolved(stable[0])
   if (stable.length > 1) return { ambiguous: true }
   // Upstream names are display evidence only. Selecting the sole match is
   // safe; two same-name school models without UUID evidence remain unresolved.
   const byName = rows.filter(model => schoolUsageDisplayNames(model).has(target))
-  if (byName.length === 1) return { model: byName[0], ambiguous: false }
+  if (byName.length === 1) return resolved(byName[0])
   if (byName.length > 1) return { ambiguous: true }
   const fallback = normalizedIdentity(displayFallback)
   if (!fallback || fallback === target) return { ambiguous: false }
   const byDisplay = rows.filter(model => schoolUsageDisplayNames(model).has(fallback))
-  if (byDisplay.length === 1) return { model: byDisplay[0], ambiguous: false }
+  if (byDisplay.length === 1) return resolved(byDisplay[0])
   return { ambiguous: byDisplay.length > 1 }
 }
 
