@@ -118,6 +118,17 @@ describe('北辰模型用量明细', () => {
     expect(wrapper.text()).not.toContain('已扣积分9')
   })
 
+  it('目录已说明同 Key 同上游共享时，单条无 UUID 合集也显示未归属', () => {
+    const data = usage()
+    data.models = [{ ...metrics('89.734599713', 200), model: 'same-upstream' }]
+    const wrapper = drawer({
+      usage: data, initialModel: 'school/a', initialModelLabel: 'same-upstream', initialModelSharedUpstream: true,
+    })
+    expect(wrapper.get('[data-testid="usage-identity-ambiguous"]').text()).toContain('同名上游未归属')
+    expect(wrapper.find('[aria-label="用量汇总"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('89.734599713')
+  })
+
   it('加载、读取失败和空集分别展示，旧数据没有核对字段时显示待确认', async () => {
     const wrapper = drawer({ loading: true })
     expect(wrapper.get('[role="status"]').text()).toContain('正在读取用量')
