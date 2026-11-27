@@ -1,5 +1,113 @@
-import type { StudentProjectUsage, UsageSlice } from '../api/types'
-import { formatCredits, formatTokens } from './credits'
+import type { KeyUsage, StudentProjectUsage, StudentUsage, UsageSlice } from '../api/types'
+import { formatCredits, formatTokens, shiftDecimal } from './credits'
+import { calculateCredits } from './format'
+
+export type StudentUsageMetrics = {
+  tokens: Record<'input' | 'output' | 'cache_read' | 'cache_write' | 'total', string | null>
+  completeness: 'complete' | 'partial' | 'unknown'
+  token_coverage: {
+    calls: number
+    known_calls: number
+    complete_calls: number
+    unclassified_tokens: string | null
+  }
+  cache_hit_rate: number | null
+  cache_hit_coverage: {
+    sample_calls: number
+    cache_read_tokens: string | null
+    input_with_cache_read_tokens: string | null
+  }
+  pending_review_calls: number
+  pending_review_credits: string
+}
+
+export type StudentUsageModelMetrics = StudentUsageMetrics & { credits: string; calls?: number }
+export type StudentUsageModel = StudentUsageModelMetrics & Pick<UsageSlice, 'id' | 'name'>
+type StudentUsageBalance = StudentUsageMetrics & { calls: number; in_flight_credits: string }
+
+export type StudentUsageKey = Omit<KeyUsage, 'models'> & StudentUsageBalance & {
+  pending_calls: number
+  models: StudentUsageModel[]
+}
+
+export type StudentUsageProject = Omit<StudentProjectUsage, 'keys'> & StudentUsageBalance & {
+  keys: StudentUsageKey[]
+}
+
+export type StudentUsageReport = Omit<StudentUsage, 'projects'> & {
+  projects: StudentUsageProject[]
+  models: StudentUsageModel[]
+  totals: StudentUsageModelMetrics & { calls: number }
+}
+
+export type StudentCallReceipt = {
+  request_id: string
+  model_id: string
+  model_name: string
+  created_at: string
+  channel: string
+  billing_state: string
+  charged_credits: string | null
+  receipt_applied: boolean | null
+  usage_state?: string
+  usage_reason: string | null
+  input_tokens: string | null
+  output_tokens: string | null
+  cache_read_tokens: string | null
+  cache_write_tokens: string | null
+  total_tokens: string | null
+}
+
+export function formatUsageCredits(value?: string | null): string {
+  return shiftDecimal(value, 0)
+}
+
+export function formatUsageTokenCount(value?: string | null): string {
+  return typeof value === 'string' && /^\d+$/.test(value) ? BigInt(value).toLocaleString('zh-CN') : '—'
+}
+
+export function sumStudentProjectCredits(
+  projects: StudentUsageProject[],
+  field: 'quota' | 'in_flight_credits' | 'available',
+): string | null {
+  if (!projects.length) return null
+  let total = '0.000'
+  for (const project of projects) {
+    const amount = project[field]
+    if (typeof amount !== 'string' || !/^\d+(?:\.\d+)?$/.test(amount)) return null
+    total = calculateCredits(total, amount, 'add')
+  }
+  return total
+}
+
+export function formatUsageCacheCoverage(metrics: StudentUsageMetrics): string {
+  const samples = formatTokens(metrics.cache_hit_coverage.sample_calls)
+  const total = formatTokens(metrics.token_coverage.calls)
+  return `覆盖 ${samples}/${total} 笔`
+}
+
+export function formatUsagePendingReview(metrics: StudentUsageMetrics): string {
+  if (metrics.pending_review_calls <= 0) return ''
+  const calls = formatTokens(metrics.pending_review_calls)
+  const credits = formatUsageCredits(metrics.pending_review_credits)
+  return `待核 ${calls} 笔（预留 ${credits} 积分）`
+}
+
+export function formatUsageModelNotes(model: StudentUsageModelMetrics): string {
+  const notes: string[] = []
+  const coverage = model.token_coverage
+  if (model.completeness === 'unknown') notes.push('无回报')
+  if (model.completeness === 'partial') {
+    notes.push(`部分回报（${formatTokens(coverage.complete_calls)}/${formatTokens(coverage.calls)} 笔完整）`)
+  }
+  if (coverage.unclassified_tokens && coverage.unclassified_tokens !== '0') {
+    notes.push(`未分类 ${formatUsageTokenCount(coverage.unclassified_tokens)} Token`)
+  }
+  if ((model.calls ?? 0) > 0 && formatUsageCredits(model.credits) === '0') notes.push('零额已结算')
+  const review = formatUsagePendingReview(model)
+  if (review) notes.push(review)
+  return notes.join(' · ') || '—'
+}
 
 type UsageModelSlice = UsageSlice & {
   tokens?: number | null
@@ -71,7 +179,7 @@ function sliceCacheHitRate(model: UsageModelSlice): number | null {
 }
 
 /**
- * 把 /api/v1/student/usage 的项目 → Key → 模型三层结构按模型 ID 合并。
+ * 为模型广场的用量标签按模型 ID 合并项目 → Key → 模型明细。
  * credits 只含已成功结算的调用；calls 含已结算与 0 倍率调用，0 次时接口会省略该字段。
  */
 export function summarizeStudentModels(
@@ -146,7 +254,7 @@ export function summarizeStudentModels(
     })
 }
 
-/** 学生接口只有在项目层级返回在途/待核；这部分尚未分摊到具体模型。 */
+/** 汇总模型广场展示的项目在途积分。 */
 export function sumPendingCredits(projects: StudentProjectUsage[] | null | undefined): string {
   let total = 0
   for (const project of projects ?? []) {
