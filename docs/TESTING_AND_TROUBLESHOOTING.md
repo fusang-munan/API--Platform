@@ -308,6 +308,12 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 纯文本模型探活通过后仍显示「官网报价格式无效」或「非 Token 计价」时，先看 `price_blocker.message` 的字段名。旧解析会拒绝空字符串，并把非 Token 字段的零值当作有费用。运行 `go test ./internal/beichen -run 'TestPanelMixedPriceFixture|TestPanelMixedPricesActivationAndSettlementPostgres' -count=1 -v`，用构造的面板 JSON 和隔离的本机数据库复查。测试覆盖 gpt-6.1-sol 的固定价、gpt-6.2-sol 的两个 Token 档位、缺价档的提示与待核账、两种启用入口及扣分明细中被忽略的字段。
 
+#### 作废渠道的历史型号
+
+旧版会把某些仅关联停用渠道的型号继续列为线路异常。教师可刷新「模型管理 → 北辰」，在「全部模型」的「全部」筛选中查找「已作废」并打开原有用量明细，再切换「常用模型」「异常」和「待配置」确认这些型号已退出对应列表。若刷新后仍属异常，可核对教师概览的 `model_catalog[].retired`、渠道状态和绑定状态。普通换 Key 后可能仍有指向旧 Key 的启用绑定，此时「异常」应显示维护提示，可用渠道切换向导核对接替 Key。官网 Key 清单里的「未匹配校内 Key（官网仍启用）」对应 `match_status=unmatched` 和 `status=active`。
+
+在 frontend 下运行 `npm test -- BeichenSchoolModels BeichenWebsiteKeys BeichenPriceDrawer TeacherProviders`，核对启用 Key 计数、作废行显示范围和只读操作、刷新后旧定价与批量操作的拦截、真实异常、官网清单和缺价概况。设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run 'TestBeichenOverviewRetiredCatalogPostgres|TestCredentialSwitchLifecyclePostgres' -count=1`，核对历史目录和绑定、同时存在启用和停用绑定的型号、仍需迁移的启用绑定、陈旧目录，以及同一型号重新列入启用 Key 目录时的概览。
+
 后端使用隔离的本机 PostgreSQL。新建的测试库需在 `public` 安装 `citext`、`pg_trgm` 和 `pgcrypto`。全量测试的网关用例可使用下列本机端口。
 
 验证 0.23.0 的迁移和北辰回归时，在同一测试库运行下列命令。迁移测试从 0051 升级并重复执行，检查分组报价回填和旧账保留。对账测试核实历史归档、人工更正、无记录的零用量日和缺账金额。报价测试用模拟网页触发 401，检查各渠道共享一次续期。渠道切换测试确认网页用量同步后会生成线路迁移预览。

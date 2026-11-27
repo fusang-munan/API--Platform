@@ -88,6 +88,17 @@ beforeEach(() => {
 })
 
 describe('北辰模型定价范围', () => {
+  it('抽屉单独读到作废标志时禁止保存，即使响应仍含历史 Key', async () => {
+    const data = overview()
+    data.model_catalog[0].retired = true
+    api.beichenOverview.mockResolvedValue(data)
+    const wrapper = await view()
+    expect(wrapper.text()).toContain('该模型已作废，价格无法修改。')
+    expect(wrapper.get('button[type="submit"]').attributes()).toHaveProperty('disabled')
+    await wrapper.get('form').trigger('submit')
+    expect(api.setBeichenModelPrice).not.toHaveBeenCalled()
+  })
+
   it('标注反推来源，并可按正常的手动价格入口保存修正', async () => {
     const data = overview()
     data.model_catalog[0].price_state = 'derived'

@@ -458,7 +458,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `credentials[].health` 包含 `credential`、`catalog`、`pricing`、`probe` 四个维度，各返回 `state`（`available`、`unavailable` 或 `pending`）和说明 `message`。`available_dimensions` 统计可用项。报价维度按当前可计算报价数判断。探活维度按有至少一种协议通过的模型占可探活模型的比例判断。
 
-`model_catalog[].protocols` 使用网关绑定的协议枚举。`probe_state` 为 `unprobed`、`passed` 或 `failed`。同一模型任一当前 Key 和协议的最近结果通过即为 `passed`。`last_probe_at` 是所有有效最近结果里的最新时间。只有 `catalog_source=key` 的记录提供 Key 覆盖和探活依据；超过 30 分钟未刷新或扫描失败的目录保留展示，但 `probe_state` 回到 `unprobed`，不计入当前覆盖。官网来源和 `website_only` 型号不参与探活比例，也不显示探活结论。教师主表只列当前 Key 的 `/v1/models` 命中的模型，`website_only` 型号只在「官网目录」计数。发布可达线路数仍由 `ready_count` 表示。学校已启用但 `ready_count=0` 时返回 `binding_issue`，整个模型从当前目录消失时仍保留这个异常条目。`price_covered` 表示至少一条启用 Key 有可计算报价，发布时仍逐条检查实际会使用的线路。
+`model_catalog[].protocols` 使用网关绑定的协议枚举。`probe_state` 为 `unprobed`、`passed` 或 `failed`。同一模型任一当前 Key 和协议的最近结果通过即为 `passed`。`last_probe_at` 是所有有效最近结果里的最新时间。只有 `catalog_source=key` 的记录提供 Key 覆盖和探活依据；超过 30 分钟未刷新或扫描失败的目录保留展示，但 `probe_state` 回到 `unprobed`，不计入当前覆盖。官网来源和 `website_only` 型号不参与探活比例，也不显示探活结论。发布可达线路数由 `ready_count` 表示。学校已启用但 `ready_count=0` 时，仍需排查的记录返回 `binding_issue`。`price_covered` 表示至少一条启用 Key 有可计算报价，发布时仍逐条检查实际会使用的线路。
 
 线路就绪且报价阻止启用时，`model_catalog[].price_blocker` 返回 `{code, message}`，其中 `message` 说明涉及的字段及适用的档位号。常见代码包括 `missing_price`、`billing_mode_non_token`、`price_conditions_invalid`、`tier_missing_input`、`tier_missing_output`、`tier_range_invalid` 和 `effort_multiplier_invalid`。线路未就绪时，查看 `blockers` 中的 `no_ready_route`。
 
@@ -470,7 +470,9 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `website_directory` 返回完整官网目录状态、`last_success` 和 `last_error`。`fresh` 表示近期完整采集，`stale` 表示当前使用部分更新或保留的快照，`unverified` 表示等待取得官网目录。`model_catalog` 合并官网与启用 Key 的目录，并保留已发布但失去目录覆盖的模型。`source` 为 `website`、`key` 或 `both`。`catalog_state` 为 `key_listed`、`website_only`、`published_unavailable` 或 `catalog_missing`。`key_count` 等于 `current_key_count`，只统计当前 `/v1/models` 的 Key 目录证据；`current_key_count` 按 `catalog_keys[].state=listed` 且非陈旧的 Key 去重，`stale_key_count` 统计扫描失败或超过 30 分钟未刷新、沿用上次结果的 Key，两者为零时省略。`catalog_keys[].stale` 标记这些保留条目；它们保留展示，但不计入 `current_key_count` 和 `key_count`，`probe_state` 也回到 `unprobed`。目录表 `provider_model_catalog.catalog_source` 区分 `key` 和 `website`，迁移 `0061_provider_catalog_source.sql` 新增非空列并默认 `key`，同时把旧 `raw_entry->>'source'='beichen_website_group'` 的行回填为 `website`。
 
-`catalog_state=published_unavailable` 表示该模型曾发布（校内模型已启用、存在绑定或保留的绑定异常），但当前启用的渠道 Key 都没有在 `/v1/models` 列出它。该行保留在主表异常筛选中，`binding_issue.code` 为 `catalog_missing`；如果只剩陈旧的 Key 目录记录则为 `catalog_stale`。它不会转成 `website_only`，也不提供可启用的 Key 覆盖。`website_only` 型号只汇总在 `website_only_models`，不进入主表。
+`catalog_state=published_unavailable` 表示该模型曾发布（校内模型已启用、存在绑定或保留的绑定异常），但当前启用的渠道 Key 都没有在 `/v1/models` 列出它。学校仍需排查的记录保留在主表异常筛选，`binding_issue.code` 通常为 `catalog_missing` 或 `catalog_stale`，后者表示只剩陈旧的 Key 目录记录。`website_only` 型号汇总在 `website_only_models`。
+
+`model_catalog[].retired` 仅在作废时返回 `true`。有校内目录或绑定记录、关联渠道均停用，且同型号的北辰绑定均已停用时，概览可标记该行作废并省略 `binding_issue`。教师只在「模型管理 → 全部模型」的「全部」筛选中看到「已作废」行，并可查看历史用量。启用渠道的目录或绑定、启用供应商上同一校内模型的其他启用绑定、关联型号的启用接替 Key，以及官网归并匹配的启用 Key 均保留原有展示。换 Key 后仍启用的旧绑定继续显示维护提示。陈旧目录仍是关联启用渠道的证据。仅官网可见的型号继续按官网目录展示。
 
 `website_directory.last_run` 是最近一次后台抓取的摘要，尚无运行记录时为 `null`。摘要包含 `started_at`、`duration_ms`、`platform_count`、`group_count`、`model_count`、`expected_model_count` 和 `failures`。同一平台出现在不同渠道下时分别计数。模型按去掉首尾空白的官网原名去重，保留大小写及版本差异。分组按照分组 ID 去重，没有 ID 时用渠道内的平台和分组名识别。`expected_model_count` 含原响应中所有 `models` 和 `supported_models` 数组中能辨认的型号。当平台资料损坏时，本轮成功归入平台的模型数可能低于它。失败项提供 `path`、`reason` 以及可读取的 `channel_id`、`channel` 和 `platform`。
 

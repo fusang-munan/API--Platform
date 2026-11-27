@@ -36,6 +36,7 @@ let openVersion = 0
 
 const modelName = computed(() => props.row?.model.trim().toLowerCase())
 const catalogEntry = computed(() => overview.value?.model_catalog?.find(entry => entry.model.trim().toLowerCase() === modelName.value))
+const retired = computed(() => catalogEntry.value?.retired === true)
 const modelPrices = computed(() => {
   const prices = new Map<string, BeichenModel>()
   for (const record of overview.value?.models ?? []) {
@@ -67,7 +68,7 @@ const affectedKeys = computed(() => {
   return modelKeys.value.filter(key => !key.inactive && selected.has(key.credential_id))
 })
 const incompleteScope = computed(() => modelKeys.value.length < (catalogEntry.value?.key_count ?? 0))
-const editingDisabled = computed(() => !overview.value || overviewLoading.value || saving.value || Boolean(outcome.value))
+const editingDisabled = computed(() => !overview.value || overviewLoading.value || retired.value || saving.value || Boolean(outcome.value))
 const canSave = computed(() => props.open && props.row && !editingDisabled.value && affectedKeys.value.length > 0 &&
   (scope.value === 'credentials' || !incompleteScope.value))
 
@@ -231,6 +232,7 @@ async function save() {
   <AppDialog :open="open" :title="`${row?.model ?? '模型'} · 价格设置`"
     description="选择价格和生效范围，保存前核对受影响的 Key。" @update:open="close">
     <form class="price-drawer beichen-stack" :aria-busy="saving" novalidate @submit.prevent="save">
+      <p v-if="retired" class="beichen-note" role="status">该模型已作废，价格无法修改。</p>
       <fieldset class="price-mode" :disabled="editingDisabled">
         <legend>计价方式</legend>
         <label><input v-model="mode" type="radio" value="follow" :name="fieldId + '-mode'">{{ followLabel }}</label>

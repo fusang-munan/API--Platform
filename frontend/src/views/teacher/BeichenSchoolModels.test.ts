@@ -124,6 +124,103 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('北辰模型管理', () => {
+  it('概况按已启用的校内 Key 计数，目录为空也能显示', async () => {
+    const empty = overview([])
+    const credentials = [
+      { credential_id: 'cc1', label: 'CC1', status: 'active' },
+      { credential_id: 'g3', label: 'G3', status: 'active' },
+      { credential_id: 'gm1', label: 'GM1', status: 'active' },
+      { credential_id: 'retired', label: 'Gemini', status: 'inactive' },
+    ] as const
+    api.beichenOverview.mockResolvedValueOnce({ ...empty, credentials: [...credentials] })
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys(
+      { credential_id: null, group_id: 31, group_name: 'Gemini', rate: '1', match_status: 'unmatched' },
+    ))
+    const wrapper = view()
+    await flushPromises()
+    expect(wrapper.get('.model-summary').text()).toContain('可探测模型03 把已启用 Key 的当前目录')
+
+    api.beichenOverview.mockResolvedValueOnce({ ...empty, credentials: [credentials[3]] })
+    await button(wrapper, '刷新模型').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.model-summary').text()).toContain('0 把已启用 Key 的当前目录')
+  })
+
+  it('已作废的历史模型仅在全部模型的全部筛选中只读展示', async () => {
+    const data = overview([{ model: 'lab/pending' }])
+    const issue = { code: 'catalog_missing', message: '请核查供货渠道' }
+    const history = ['gemini-3.1-flash-lite', 'gemini-4-argon']
+    data.model_catalog!.push(
+      { model: history[0], retired: true, school_status: 'active', catalog_state: 'published_unavailable', credential_ids: [] },
+      { model: history[1], retired: true, school_status: 'pending_configuration', catalog_state: 'catalog_missing', credential_ids: [] },
+      { model: 'lab/gap', school_status: 'active', catalog_state: 'published_unavailable', credential_ids: [], binding_issue: issue },
+      { model: 'lab/website', catalog_state: 'website_only', credential_ids: [] },
+    )
+    api.beichenOverview.mockResolvedValue(data)
+    const wrapper = view()
+    await flushPromises()
+    const names = () => wrapper.findAll('.model-table > tbody > tr').map(row => row.attributes('data-model'))
+    expect(names()).toEqual(['lab/pending', ...history])
+    for (const model of history) {
+      const row = wrapper.get(`[data-model="${model}"]`)
+      expect(row.get('.status-pill').text()).toBe('已作废')
+      expect(row.findAll('button').map(item => item.attributes('aria-label'))).toEqual([`查看 ${model} 用量`])
+    }
+    expect(wrapper.get('.model-summary').text()).toContain('官网目录1')
+    await button(wrapper, '一键启用').trigger('click')
+    const batch = wrapper.get('[aria-label="一键启用当前筛选模型"]')
+    expect(batch.text()).toContain('lab/pending')
+    expect(batch.text()).not.toContain('gemini')
+    await button(batch, '取消').trigger('click')
+
+    await button(wrapper, '异常').trigger('click')
+    expect(names()).toEqual(['lab/gap'])
+    expect(wrapper.get('.binding-issue-row').text()).toContain(issue.message)
+    await button(wrapper, '待配置').trigger('click')
+    expect(names()).toEqual(['lab/pending'])
+    for (const label of ['已启用', '无报价', '手动价']) {
+      await button(wrapper, label).trigger('click')
+      expect(names()).not.toContain(history[0])
+      expect(names()).not.toContain(history[1])
+    }
+    await button(wrapper, '全部').trigger('click')
+    await wrapper.setProps({ commonIds: new Set(['lab/pending', ...history]) })
+    expect(names()).toEqual(['lab/pending'])
+    await wrapper.setProps({ commonIds: undefined, providerMaintenance: true })
+    expect(names()).toEqual(['lab/pending'])
+  })
+
+  it('刷新后的作废模型退出已打开的定价和批量预览', async () => {
+    const model = 'gemini-3.7-flash'
+    const listed = overview([{ model }])
+    const historical = overview([])
+    historical.model_catalog!.push({ model, retired: true, school_status: 'active', credential_ids: [] })
+    api.beichenOverview.mockResolvedValue(listed)
+    const wrapper = view()
+    await flushPromises()
+    await wrapper.get(`[aria-label="定价 ${model}"]`).trigger('click')
+    await flushPromises()
+    expect(wrapper.find('form.price-drawer').exists()).toBe(true)
+    await button(wrapper, '一键启用').trigger('click')
+    expect(wrapper.get('[aria-label="一键启用当前筛选模型"]').text()).toContain(model)
+
+    api.beichenOverview.mockResolvedValue(historical)
+    await button(wrapper, '刷新模型').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('form.price-drawer').exists()).toBe(false)
+    const batch = wrapper.get('[aria-label="一键启用当前筛选模型"]')
+    expect(batch.text()).not.toContain(model)
+    expect(button(batch, '确认启用 0 个').element.disabled).toBe(true)
+    expect(api.enableBeichenModelsBatch).not.toHaveBeenCalled()
+    expect(api.setBeichenModelPrice).not.toHaveBeenCalled()
+
+    api.beichenOverview.mockResolvedValue(listed)
+    await button(wrapper, '刷新模型').trigger('click')
+    await flushPromises()
+    expect(wrapper.get(`[data-model="${model}"]`).text()).not.toContain('已作废')
+    expect(wrapper.find(`[aria-label="定价 ${model}"]`).exists()).toBe(true)
+  })
+
   it('每个模型只渲染一份同组官网价，优先官网并换算五项费用', async () => {
     const observedAt = '2026-11-21T13:07:28Z'
     const claude = 'claude-sonnet-4-6'

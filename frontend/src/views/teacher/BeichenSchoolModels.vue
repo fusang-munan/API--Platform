@@ -349,10 +349,11 @@ const catalog = computed(() => {
     const routeCount = validCount(entry?.route_count) ?? row.routeCount
     const readyCount = validCount(entry?.ready_count) ?? row.readyCount
     const activation = entry?.activation
-    const active = row.status === 'active' || activation === 'active' || Boolean(entry?.binding_issue)
+    const retired = entry?.retired === true
+    const active = !retired && (row.status === 'active' || activation === 'active' || Boolean(entry?.binding_issue))
     const source = entry?.source
     const websiteOnly = entry?.catalog_state === 'website_only'
-    const listed = entry?.catalog_state ? entry.catalog_state === 'key_listed' : entry?.credential_ids?.length !== 0
+    const listed = !retired && (entry?.catalog_state ? entry.catalog_state === 'key_listed' : entry?.credential_ids?.length !== 0)
     const canDisable = row.canDisable || (activation === 'active' && Boolean(entry?.school_model))
     const capability = summarizeCapabilities(row.model)
     const priceState = capability?.priceState ?? entry?.price_state ?? oldPriceState(row)
@@ -400,7 +401,7 @@ const catalog = computed(() => {
     const priceMissing = !websiteOnly && !priceCovered && priceState === 'missing' &&
       (Boolean(priceBlocker) || !websiteTerms || missingPriceDetailLabels(websiteTerms).some(label => !label.startsWith('缓存')))
     return {
-      ...row, active, activation, canDisable, keyCoverage, routeCount, readyCount, priceState, priceCovered, priceMissing, routeBlocked,
+      ...row, retired, active, activation, canDisable, keyCoverage, routeCount, readyCount, priceState, priceCovered, priceMissing, routeBlocked,
       blockers: [...new Set(blockerMessages)],
       priceBlocker,
       listed,
@@ -422,7 +423,7 @@ const catalog = computed(() => {
       bindingInvalid: capability?.bindingInvalid ?? false,
       protocolMissing: capability ? capability.protocols.length === 0 : protocolCount === 0,
       lastProbeAt: newestTime([entry?.last_probe_at, capability?.lastProbeAt]),
-      bindingIssue: entry?.binding_issue,
+      bindingIssue: retired ? undefined : entry?.binding_issue,
     }
   })
 })
@@ -447,16 +448,17 @@ const probeRunLabel = computed(() => {
 })
 const catalogByModel = computed(() => new Map(catalog.value.map(row => [row.model.toLowerCase(), row])))
 const modelFilter = computed(() => normalizeSignal(props.query ?? ''))
-/** 已发布但当前四把 Key 都没探测到的异常模型，只在“异常”筛选里出现。 */
+/** 已发布但当前启用 Key 均未探测到的模型保留在「异常」筛选。 */
 function anomalousRow(row: CatalogRow) {
-  return !row.listed && !row.websiteOnly && (row.active || Boolean(row.bindingIssue))
+  return !row.retired && !row.listed && !row.websiteOnly && (row.active || Boolean(row.bindingIssue))
 }
 const searchedRows = computed(() => catalog.value.filter(row =>
-  (row.listed || anomalousRow(row)) &&
+  (row.listed || row.retired || anomalousRow(row)) &&
   (!modelFilter.value || [row.model, ...row.locations.map(location => location.name), ...row.catalogKeys.map(key => key.upstream_model ?? '')]
     .some(name => normalizeSignal(name).includes(modelFilter.value))) &&
   (!props.commonIds || props.commonIds.has(row.model.toLowerCase()))))
 const rows = computed(() => searchedRows.value.filter(row => {
+  if (row.retired) return filter.value === 'all' && !props.commonIds && !props.providerMaintenance
   if (filter.value === 'anomaly') return anomalousRow(row)
   if (!row.listed) return false
   return filter.value === 'all' ||
@@ -550,6 +552,8 @@ async function load(refreshedInventory?: BeichenWebsiteKeyInventory) {
     if (keyInventory) websiteKeyInventory.value = keyInventory
     else if (websiteKeyInventory.value) websiteKeyInventory.value = { ...websiteKeyInventory.value, status: 'unavailable' }
     overview.value = result
+    if (priceRow.value && catalogByModel.value.get(priceRow.value.model.toLowerCase())?.retired) priceRow.value = undefined
+    if (conditionsModel.value && catalogByModel.value.get(conditionsModel.value.toLowerCase())?.retired) conditionsModel.value = undefined
     if ((result.model_catalog ?? []).length && typeof teacherAPI.beichenCapabilities === 'function') {
       try {
         const capabilityResult = await teacherAPI.beichenCapabilities(providerId)
@@ -683,12 +687,13 @@ function canEnableReason(row: CatalogRow) {
 }
 
 function planBatch(models: string[]) {
-  return models.map(model => {
+  return models.flatMap(model => {
     const row = catalogByModel.value.get(model.toLowerCase())
+    if (row?.retired) return []
     const active = row?.active ?? false
     const canEnable = row?.listed && (row.activation === 'ready' || (row.activation == null && row.canEnable === true))
     const reason = active ? '已启用' : canEnable ? '' : row ? canEnableReason(row) : '当前目录中没有此模型'
-    return { model, active, reason }
+    return [{ model, active, reason }]
   })
 }
 
@@ -838,7 +843,7 @@ async function pollProbes() {
 }
 
 async function changeStatus(row: CatalogRow, enable: boolean) {
-  if (busy.value || enable && (row.active || canEnableReason(row))) return
+  if (busy.value || catalogByModel.value.get(row.model.toLowerCase())?.retired || enable && (row.active || canEnableReason(row))) return
   if (!enable && !window.confirm(`禁用 ${row.model} 后，学生将无法发起新的调用，确定继续？`)) return
   updating.value = row.model
   error.value = ''
@@ -1045,7 +1050,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
       </div>
     </section>
     <div class="beichen-summary model-summary" aria-label="模型概况">
-      <div class="beichen-stat"><span>可探测模型</span><strong>{{ overview ? formatTokens(listedModels.length) : '—' }}</strong><small>四把 Key 当前目录列出</small></div>
+      <div class="beichen-stat"><span>可探测模型</span><strong>{{ overview ? formatTokens(listedModels.length) : '—' }}</strong><small>{{ overview ? formatTokens(rescanKeys.length) : '—' }} 把已启用 Key 的当前目录</small></div>
       <div class="beichen-stat"><span>已启用</span><strong>{{ overview ? formatTokens(catalog.filter(row => row.active).length) : '—' }}</strong><small>学校模型</small></div>
       <div class="beichen-stat"><span>官网目录</span><strong>{{ overview ? formatTokens(websiteOnlyModels.length) : '—' }}</strong><small>仅官网可见，不进主表</small></div>
       <div class="beichen-stat"><span>报价覆盖</span><strong>{{ overview ? listedModels.filter(row => row.priceCovered).length + ' / ' + listedModels.length : '—' }}</strong><small>含可计算的 Token 条件价与手动价</small></div>
@@ -1196,7 +1201,11 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
         <tbody>
           <tr v-for="(row, index) in rows" :key="row.model" :data-model="row.model" :class="{ 'binding-issue-row': row.bindingIssue }">
             <th scope="row" class="model-name">{{ row.model }}</th>
-            <td data-label="状态与覆盖" class="model-state">
+            <td v-if="row.retired" data-label="状态与覆盖" class="model-state">
+              <span class="status-pill">已作废</span>
+              <small class="row-note">仅关联已停用的校内渠道</small>
+            </td>
+            <td v-else data-label="状态与覆盖" class="model-state">
               <div class="model-state-summary">
                 <span>Key 覆盖 {{ row.keyCoverage }}/{{ keyCount }}</span> ·
                 <span :title="row.routeCount + ' 条候选线路'">协议 {{ row.protocolCount ?? '待同步' }}</span> ·
@@ -1238,7 +1247,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
               </div>
             </td>
             <td data-label="价格" class="model-price">
-              <div class="model-price-content">
+              <span v-if="row.retired">—</span>
+              <div v-else class="model-price-content">
                 <span v-if="row.mode !== 'follow'" class="status-pill manual model-price-mode">
                   {{ row.mode === 'manual' ? '手动价生效' : '部分 Key 使用手动价' }} · 官网报价供参考
                 </span>
@@ -1262,7 +1272,8 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
               <small v-if="modelUsage(row.model)?.pending_calls" class="row-note">待核 {{ formatTokens(modelUsage(row.model)?.pending_calls) }} 笔</small>
             </td>
             <td data-label="操作">
-              <div class="model-actions">
+              <span v-if="row.retired">—</span>
+              <div v-else class="model-actions">
                 <button v-if="row.listed" type="button" class="button ghost" :disabled="busy" :aria-label="'定价 ' + row.model" @click="priceRow = row">{{ row.mode !== 'follow' ? '调整价格' : '手动定价' }}</button>
                 <button v-if="!row.active && !row.websiteOnly" type="button" class="button secondary" :disabled="busy || Boolean(canEnableReason(row))"
                   :aria-describedby="canEnableReason(row) ? reasonId + '-' + index : undefined" :aria-label="'启用 ' + row.model"

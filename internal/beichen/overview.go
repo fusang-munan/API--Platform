@@ -134,6 +134,7 @@ type CredentialSummary struct {
 
 type CatalogModel struct {
 	CanEnable        bool              `json:"can_enable"`
+	Retired          bool              `json:"retired,omitempty"`
 	SchoolStatus     string            `json:"school_status"`
 	SchoolModel      string            `json:"school_model,omitempty"`
 	Model            string            `json:"model"`
@@ -233,6 +234,9 @@ func (s *Service) Overview(ctx context.Context, providerID uuid.UUID, day string
 	}
 	if err == nil {
 		err = readCatalogDifferences(ctx, tx, providerID, &view)
+	}
+	if err == nil {
+		err = markRetiredCatalogModels(ctx, tx, providerID, view.ModelCatalog)
 	}
 	if err == nil {
 		view.ProbeRun, err = readProbeRun(ctx, tx, providerID)
