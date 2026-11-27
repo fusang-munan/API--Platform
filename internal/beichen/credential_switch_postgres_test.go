@@ -318,8 +318,15 @@ WHERE credential_id=$1 AND model_id='replacement'`, to, source, rowMinutesAgo)
 		})
 	}
 	setCatalog("key", 0, 0, "")
-	if _, err := service.Rebind(ctx, provider, actor, false, currentRebind.PreviewToken); err != nil {
-		t.Fatalf("rebuild should accept the restored catalog: %v", err)
+	if _, err := service.Rebind(ctx, provider, actor, false, currentRebind.PreviewToken); domain.ErrorCode(err) != domain.CodeInvalidTransition {
+		t.Fatalf("a new scan should invalidate the original preview: %v", err)
+	}
+	restored, err := service.Rebind(ctx, provider, actor, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Rebind(ctx, provider, actor, false, restored.PreviewToken); err != nil {
+		t.Fatalf("rebuild should accept a new preview for the restored catalog: %v", err)
 	}
 	var newRoutes, legacyRoutes int
 	if err := db.QueryRowContext(ctx, `SELECT
@@ -327,6 +334,102 @@ WHERE credential_id=$1 AND model_id='replacement'`, to, source, rowMinutesAgo)
   count(*) FILTER(WHERE model_id=$2 AND credential_id=$4 AND upstream_model_name='legacy')
 FROM model_bindings WHERE provider_id=$5 AND status='active'`, moved, legacy, to, from, provider).Scan(&newRoutes, &legacyRoutes); err != nil || newRoutes != 2 || legacyRoutes != 1 {
 		t.Fatalf("rebuilt or legacy bindings are incorrect: new=%d legacy=%d (%v)", newRoutes, legacyRoutes, err)
+	}
+}
+
+func TestRebindRejectsGroupVersionChangePostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	g3 := keys[2]
+	const model = "gpt-fixture-rebind"
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id<>$1", g3)
+	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES(gen_random_uuid(),$1::text,$1::text,'active',1000,now(),now())`, model)
+	exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+SELECT gen_random_uuid(),id,$1,$2,model_id::text,'openai_compatible',10,now(),now() FROM models WHERE model_id=$3`, provider, g3, model)
+	setGroup := func(id int) {
+		t.Helper()
+		exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+VALUES($1,1,$2,clock_timestamp())`, g3, id)
+	}
+	scan := func() {
+		t.Helper()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		var observedAt time.Time
+		if err := tx.QueryRowContext(ctx, "SELECT clock_timestamp()").Scan(&observedAt); err != nil {
+			t.Fatal(err)
+		}
+		entries := []catalog.ProviderEntry{
+			{ID: model, SupportedProtocols: []string{"openai_compatible", "openai_responses"}},
+		}
+		if err := saveKeyCatalogFixture(ctx, tx, syncJob{provider: provider, credential: g3}, entries, observedAt); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(db, nil)
+	preview := func() RebindPlan {
+		t.Helper()
+		plan, err := service.Rebind(ctx, provider, actor, true, "")
+		if err != nil || len(plan.Changes) != 1 || plan.Changes[0].Action != "add" ||
+			plan.Changes[0].Adapter != "openai_responses" || len(plan.EvidenceVersions) != 1 {
+			t.Fatalf("expected one versioned Responses change: %+v (%v)", plan, err)
+		}
+		return plan
+	}
+	assertRejected := func(plan RebindPlan) {
+		t.Helper()
+		_, err := service.Rebind(ctx, provider, actor, false, plan.PreviewToken)
+		if domain.ErrorCode(err) != domain.CodeInvalidTransition || !strings.Contains(err.Error(), "重新预览") {
+			t.Fatalf("expected a stale preview rejection: %v", err)
+		}
+		var written int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM model_bindings
+WHERE provider_id=$1 AND adapter='openai_responses' AND status='active'`, provider).Scan(&written); err != nil || written != 0 {
+			t.Fatalf("stale confirmation wrote %d active bindings (%v)", written, err)
+		}
+	}
+
+	setGroup(10)
+	scan()
+	old := preview()
+	evidence := old.EvidenceVersions[0]
+	if evidence.CredentialID != g3 || evidence.GroupID == nil || *evidence.GroupID != 10 ||
+		evidence.CredentialRevision.IsZero() || evidence.CatalogObservedAt.Before(evidence.CredentialRevision) {
+		t.Fatalf("unexpected preview evidence: %+v", evidence)
+	}
+	setGroup(12)
+	view, err := service.Overview(ctx, provider, "")
+	if err != nil || len(view.ModelCatalog) != 1 || view.ModelCatalog[0].ReadyCount != 0 || !view.ModelCatalog[0].BoundCatalogPending {
+		t.Fatalf("overview must invalidate the old group's directory: %+v (%v)", view.ModelCatalog, err)
+	}
+	if _, err := service.Rebind(ctx, provider, actor, true, ""); domain.ErrorCode(err) != domain.CodeInvalidTransition {
+		t.Fatalf("rebuild preview should use the same group evidence: %v", err)
+	}
+	assertRejected(old)
+
+	scan()
+	rescanned := preview()
+	if e := rescanned.EvidenceVersions[0]; e.GroupID == nil || *e.GroupID != 12 ||
+		!e.CatalogObservedAt.After(evidence.CatalogObservedAt) {
+		t.Fatalf("rescan did not establish the new evidence version: %+v", e)
+	}
+	assertRejected(old)
+	scan()
+	assertRejected(rescanned)
+	beforeRevision := preview()
+	exec("UPDATE provider_credentials SET updated_at=clock_timestamp() WHERE id=$1", g3)
+	scan()
+	assertRejected(beforeRevision)
+	fresh := preview()
+	if _, err := service.Rebind(ctx, provider, actor, false, fresh.PreviewToken); err != nil {
+		t.Fatalf("current preview should write the Responses binding: %v", err)
 	}
 }
 

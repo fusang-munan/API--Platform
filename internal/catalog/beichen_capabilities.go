@@ -93,9 +93,10 @@ const BeichenKeyEvidenceSQL = `SELECT c.id AS credential_id, c.updated_at AS rev
        THEN COALESCE(history.group_at, changed.group_at, GREATEST(identity.checked_at,inventory.last_seen)) END
    ) AS evidence_since,
    NULLIF(known.group_id,0) AS group_id,
-   COALESCE(GREATEST(identity.checked_at,inventory.last_seen),observed.checked_at,
-     w.checked_at,mv.effective_at,access.updated_at) AS group_checked_at,
+   GREATEST(scan_denial.checked_at,COALESCE(GREATEST(identity.checked_at,inventory.last_seen),observed.checked_at,
+     w.checked_at,mv.effective_at,access.updated_at)) AS group_checked_at,
    CASE
+     WHEN scan_denial.checked_at IS NOT NULL THEN 'not_allowed'
      WHEN known.group_id=0 THEN 'not_found'
      WHEN inventory.enabled=false AND inventory.last_seen>=COALESCE(identity.checked_at,c.updated_at) THEN 'not_allowed'
      WHEN observed.state='not_allowed' AND observed.group_id IS NOT DISTINCT FROM
@@ -114,6 +115,14 @@ const BeichenKeyEvidenceSQL = `SELECT c.id AS credential_id, c.updated_at AS rev
  FROM provider_credentials c
  LEFT JOIN beichen_datasets cat ON cat.credential_id=c.id AND cat.kind='catalog'
  LEFT JOIN beichen_datasets billing ON billing.credential_id=c.id AND billing.kind='billing'
+ LEFT JOIN LATERAL (
+   SELECT state.updated_at AS checked_at FROM maintenance_state state
+   WHERE state.name='` + beichenGroupDenialKey + `'||c.id::text
+     AND CASE WHEN starts_with(state.name,'` + beichenGroupDenialKey + `') THEN
+       state.last_error::jsonb->>'code'='GROUP_NOT_ALLOWED'
+       AND (state.last_error::jsonb->>'credential_revision')::timestamptz=c.updated_at
+     END
+ ) scan_denial ON true
  LEFT JOIN beichen_panel_access access ON access.credential_id=c.id AND access.updated_at=c.updated_at
  LEFT JOIN beichen_website_catalogs w ON w.credential_id=c.id AND w.credential_revision=c.updated_at
  LEFT JOIN LATERAL (
@@ -171,7 +180,10 @@ const BeichenKeyListsModelSQL = `(k.catalog_source='key' AND k.last_seen_at>=e.e
  e.catalog_error IS NULL AND COALESCE(e.catalog_at,k.last_seen_at)>=e.evidence_since AND
  COALESCE(e.catalog_at,k.last_seen_at)>statement_timestamp()-interval '30 minutes')`
 
-const BeichenGroupAllowsRouteSQL = `e.group_status NOT IN ('not_allowed','not_found','pending')`
+// A confirmed restriction differs from a group that is still awaiting review.
+const BeichenGroupUnavailableSQL = `e.group_status IN ('not_allowed','not_found')`
+
+const BeichenGroupAllowsRouteSQL = `(NOT (` + BeichenGroupUnavailableSQL + `) AND e.group_status<>'pending')`
 
 // A sweep saves its outcome after dispatch. When an attempt reservation is
 // present, also require its dispatch time to belong to the current group.
@@ -266,7 +278,8 @@ WITH ` + BeichenKeyEvidenceCTE + `, entries AS (
 )
 SELECT COALESCE(k.model_id::text,b.model,w.model),n.credential_id,COALESCE(c.label::text,''),
  COALESCE(p.status='active' AND c.status='active',false),COALESCE(octet_length(c.credential_ciphertext)>0,false),
- e.group_id,COALESCE(e.group_status,''),e.group_checked_at,
+ e.group_id,COALESCE(e.group_status,''),e.group_checked_at,COALESCE(` + BeichenGroupAllowsRouteSQL + `,false),
+ COALESCE(` + BeichenGroupUnavailableSQL + `,false),
  COALESCE(` + BeichenKeyListsModelSQL + `,false),w.model IS NOT NULL,
  COALESCE(` + BeichenCatalogCurrentSQL + ` AND
    (k.model_id IS NULL OR (k.catalog_source='key' AND k.last_seen_at>=e.evidence_since)),false),
@@ -309,6 +322,7 @@ ORDER BY n.name_key,c.label,c.id`
 type capabilityRow struct {
 	ModelCapability
 	hasCredential, keyListed, websiteListed, catalogCurrent, hadCatalog, activeSchool bool
+	groupAllowed, groupBlocked                                                        bool
 	fixedPrice, derivedPrice, priceExpired                                            bool
 	priceMode                                                                         string
 	priceTerms                                                                        []byte
@@ -445,7 +459,7 @@ func readCapabilityRows(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, v
 	for rows.Next() {
 		var row capabilityRow
 		if err := rows.Scan(&row.Model, &row.CredentialID, &row.CredentialLabel,
-			&row.KeyEnabled, &row.hasCredential, &row.GroupID, &row.GroupStatus, &row.GroupCheckedAt,
+			&row.KeyEnabled, &row.hasCredential, &row.GroupID, &row.GroupStatus, &row.GroupCheckedAt, &row.groupAllowed, &row.groupBlocked,
 			&row.keyListed, &row.websiteListed, &row.catalogCurrent, &row.hadCatalog,
 			&row.entryRaw, &row.declaredJSON, &row.activeSchool, &row.bindingsJSON, &row.probesJSON,
 			&row.priceMode, &row.fixedPrice, &row.derivedPrice, &row.priceTerms, &row.priceExpired, &row.MultiplierState); err != nil {
@@ -487,6 +501,11 @@ func (row *capabilityRow) evaluate(view *BeichenCapabilities) error {
 
 	rescan := "在供应商管理中重扫「" + row.CredentialLabel + "」Key 的模型目录。"
 	switch {
+	case row.KeyEnabled && row.groupBlocked:
+		row.CatalogState = "group_blocked"
+		if row.GroupStatus == "not_allowed" {
+			row.addGap(view, "catalog", "group_not_allowed", "分组无权限。", "请恢复该 Key 的北辰分组权限，再重扫目录。")
+		}
 	case row.keyListed && row.KeyEnabled:
 		row.CatalogState = "key_listed"
 	case row.KeyEnabled && !row.catalogCurrent:
@@ -502,8 +521,7 @@ func (row *capabilityRow) evaluate(view *BeichenCapabilities) error {
 		row.CatalogState = "catalog_missing"
 	}
 
-	groupAllowed := row.GroupStatus != "not_found" && row.GroupStatus != "not_allowed" && row.GroupStatus != "pending"
-	routeCurrent := row.keyListed && row.KeyEnabled && row.hasCredential && groupAllowed
+	routeCurrent := row.keyListed && row.KeyEnabled && row.hasCredential && row.groupAllowed
 	published := make([]string, 0, len(row.Bindings))
 	for i := range row.Bindings {
 		b := &row.Bindings[i]
@@ -536,7 +554,7 @@ func (row *capabilityRow) evaluate(view *BeichenCapabilities) error {
 
 	row.ProtocolDetails = []ProtocolCapability{}
 	var bound []ProtocolCapability
-	if row.keyListed && row.KeyEnabled {
+	if row.keyListed && row.KeyEnabled && !row.groupBlocked {
 		registered := RegisteredProtocols(entry)
 		if len(registered) == 0 {
 			row.addGap(view, "protocol", "protocol_missing", "当前 Key 没有登记网关可识别的协议。", rescan+" 核对官网支持的协议后再探活。")
@@ -573,6 +591,9 @@ func (row *capabilityRow) evaluate(view *BeichenCapabilities) error {
 	case row.BindingState == "invalid":
 		row.Availability = AvailabilityMaintenance
 		row.AvailabilityReason = "维护中。校内模型已发布，这条绑定无法使用。"
+		if row.GroupStatus == "not_allowed" {
+			row.AvailabilityReason = "维护中。绑定 Key 分组无权限。"
+		}
 	case whole.ProbeState == probeFailed:
 		row.Availability = AvailabilityMaintenance
 		row.AvailabilityReason = "维护中。当前线路的协议最近一次探活均失败。"

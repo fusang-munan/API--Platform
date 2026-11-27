@@ -102,6 +102,104 @@ func TestBeichenScanRobustnessKeySnapshotPostgres(t *testing.T) {
 	run("", "")
 }
 
+func TestKeyCatalogGroupDenialRecoveryPostgres(t *testing.T) {
+	ctx, db, service, job := newKeyScanFixture(t)
+	const model = "gpt-fixture-group-denial"
+	const listed = `{"data":[{"id":"gpt-fixture-group-denial","supported_protocols":["openai_responses"]}]}`
+	const denied = `{"error":{"type":"GROUP_NOT_ALLOWED","message":"private upstream detail"}}`
+	const other = `{"error":{"type":"IP_NOT_ALLOWED","message":"GROUP_NOT_ALLOWED"}}`
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+VALUES($1,1,10,clock_timestamp())`, job.credential)
+	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES(gen_random_uuid(),$1::text,$1::text,'active',1000,now(),now())`, model)
+	exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+SELECT gen_random_uuid(),id,$1,$2,model_id::text,'openai_responses',10,now(),now() FROM models WHERE model_id=$3`,
+		job.provider, job.credential, model)
+	status, body := http.StatusOK, listed
+	service.client.Transport = panelTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != modelsPath {
+			return nil, errors.New("unexpected request")
+		}
+		return scanResponse(status, body), nil
+	})
+	rescan := func() error {
+		t.Helper()
+		return service.RescanCatalog(ctx, job.provider, job.credential)
+	}
+	groupState := func() catalog.ModelCapability {
+		t.Helper()
+		view, err := catalog.ReadBeichenCapabilities(ctx, db, job.provider)
+		if err != nil || len(view.Capabilities) != 1 {
+			t.Fatalf("expected the bound teacher model: %+v (%v)", view, err)
+		}
+		return view.Capabilities[0]
+	}
+	assertDenialStored := func(want bool) {
+		t.Helper()
+		var current bool
+		err := db.QueryRowContext(ctx, `
+SELECT EXISTS (
+ SELECT 1 FROM maintenance_state state JOIN provider_credentials c ON c.id=$1
+ WHERE state.name='beichen_group_denial/'||c.id::text
+   AND state.last_error::jsonb->>'code'='GROUP_NOT_ALLOWED'
+   AND (state.last_error::jsonb->>'credential_revision')::timestamptz=c.updated_at
+)`, job.credential).Scan(&current)
+		if err != nil || current != want {
+			t.Fatalf("current group denial = %v, want %v (%v)", current, want, err)
+		}
+	}
+	if err := rescan(); err != nil {
+		t.Fatal(err)
+	}
+	status, body = http.StatusForbidden, other
+	if err := rescan(); err == nil || errors.Is(err, catalog.ErrBeichenKeyGroupNotAllowed) {
+		t.Fatalf("generic 403 should keep its own meaning: %v", err)
+	}
+	assertDenialStored(false)
+	status, body = http.StatusForbidden, denied
+	if err := rescan(); !errors.Is(err, catalog.ErrBeichenKeyGroupNotAllowed) {
+		t.Fatalf("expected an explicit group denial: %v", err)
+	}
+	assertDenialStored(true)
+	if row := groupState(); row.GroupStatus != "not_allowed" || row.GroupID == nil || *row.GroupID != 10 ||
+		row.GroupCheckedAt == nil || row.CatalogState != "group_blocked" || row.BindingState != "invalid" ||
+		row.Availability != "maintenance" || len(row.AvailableProtocols) != 0 {
+		t.Fatalf("teacher capability must explain the denied route: %+v", row)
+	}
+	overview, err := service.Overview(ctx, job.provider, "")
+	if err != nil || len(overview.ModelCatalog) != 1 {
+		t.Fatalf("expected the bound model in the teacher overview: %+v (%v)", overview.ModelCatalog, err)
+	}
+	row := overview.ModelCatalog[0]
+	if row.ReadyCount != 0 || row.BoundCatalogPending || len(row.BoundRoutes) != 1 ||
+		row.BoundRoutes[0].GroupStatus != "not_allowed" || row.ModelAvailability.Availability != "maintenance" {
+		t.Fatalf("teacher overview did not use the explicit group denial: %+v", row)
+	}
+	body = other
+	if err := rescan(); err == nil {
+		t.Fatal("generic 403 unexpectedly succeeded")
+	}
+	assertDenialStored(true)
+	status, body = http.StatusOK, listed
+	if err := rescan(); err != nil {
+		t.Fatal(err)
+	}
+	assertDenialStored(false)
+	if row := groupState(); row.GroupStatus != "assigned" || row.BindingState != "ready" {
+		t.Fatalf("successful rescan did not clear the denial: %+v", row)
+	}
+
+	status, body = http.StatusForbidden, denied
+	if err := rescan(); !errors.Is(err, catalog.ErrBeichenKeyGroupNotAllowed) {
+		t.Fatal(err)
+	}
+	exec("UPDATE provider_credentials SET updated_at=clock_timestamp() WHERE id=$1", job.credential)
+	if row := groupState(); row.GroupStatus == "not_allowed" {
+		t.Fatalf("old denial carried over to the next credential revision: %+v", row)
+	}
+}
+
 func TestBeichenScanRobustnessCrossWriterPostgres(t *testing.T) {
 	ctx, db, s, job := newKeyScanFixture(t)
 	started, release := make(chan struct{}), make(chan struct{})

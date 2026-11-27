@@ -21,6 +21,7 @@ const (
 	BeichenScanLeaseSeconds = 90
 	BeichenScanTimeout      = 25 * time.Second
 	BeichenShrinkRounds     = 3
+	beichenGroupDenialKey   = "beichen_group_denial/"
 )
 
 type ProviderSyncRunner struct {
@@ -259,12 +260,25 @@ ON CONFLICT (name) DO UPDATE SET last_error=EXCLUDED.last_error,updated_at=EXCLU
 		}
 	}
 	if observationErr != nil {
+		if errors.Is(fetchErr, ErrBeichenKeyGroupNotAllowed) {
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO maintenance_state (id,name,last_error,created_at,updated_at)
+VALUES ($1,$2,jsonb_build_object('code','GROUP_NOT_ALLOWED','credential_revision',$3::timestamptz)::text,
+  statement_timestamp(),statement_timestamp())
+ON CONFLICT (name) DO UPDATE SET last_error=EXCLUDED.last_error,updated_at=EXCLUDED.updated_at`,
+				uuid.Must(uuid.NewV7()), beichenGroupDenialKey+credential.String(), revision); err != nil {
+				return nil, err
+			}
+		}
 		_, err := tx.ExecContext(ctx, `
 INSERT INTO beichen_datasets (credential_id,kind,last_error) VALUES ($1,'catalog',$2)
 ON CONFLICT (credential_id,kind) DO UPDATE SET last_error=EXCLUDED.last_error`, credential, observationErr.Error())
 		return observationErr, err
 	}
 	if _, err := ReplaceCredentialEntries(ctx, tx, provider, credential, entries, at); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM maintenance_state WHERE name=$1", beichenGroupDenialKey+credential.String()); err != nil {
 		return nil, err
 	}
 	_, err := tx.ExecContext(ctx, `

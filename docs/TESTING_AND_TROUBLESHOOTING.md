@@ -306,6 +306,12 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run TestBeichenBillingGroupRefreshPostgres -count=1 -v`。构造数据覆盖 0.15 到 0.6 的切换、同平台不同分组单价、迟到的旧调用、仅高峰规则变更、官网读取失败、过期账单响应和连续失败告警。教师页运行 `npm test -- BeichenSchoolModels` 核对倍率与分组差异。
 
+#### 重建预览过期或绑定 Key 无分组权限
+
+- 换组后确认旧预览应返回 409，并提示重扫后重新预览。对照教师概览的 `bound_catalog_pending`、`ready_count` 与新预览的 `evidence_versions`。成功重扫后，即使拟改动的线路相同，也要使用新预览。
+- 重扫明确返回 `GROUP_NOT_ALLOWED` 时，核对 `bound_routes[].group_status=not_allowed` 和教师行的「分组无权限」。在北辰恢复该 Key 的分组权限，再重扫以清除拒绝。若仅 GM1 备用线路换组，仍就绪的 G3 继续显示可用及报价。两把 Key 都已绑定时，预期 Key 覆盖为 `1/2`。
+- 在隔离测试库运行 `go test ./internal/beichen ./internal/dataplane -run 'Test(RebindRejectsGroupVersionChange|KeyCatalogGroupDenialRecovery|BeichenTeacherCoverage|StudentKeyModelAuthorization)Postgres' -count=1`，并在 `frontend` 运行 `npm test -- BeichenSchoolModels`。测试复现旧预览确认、分组拒绝的写入与清除、备用换组和上游 Key 停用后学生目录的状态。
+
 #### 核对一把 Key 的实际用量和分组
 
 进入「模型管理 → 北辰 → Key 实际能力」，按渠道名找到对应 Key，点击「核对这个 Key」。可在弹层填写目标分组倍率，再点「开始核对」。官网分组名和倍率来自登录后的 Key 清单与可用渠道。切组当日的账单实付比值可包含切换前用量。用量显示陈旧时，查看具体账日的抓取错误。官网拒绝授权时先在「北辰网页登录」验证会话。若返回的流水属于另一把 Key 或分页缺失，保留上次核实数据，检查网页的 Key ID 和日期筛选后重试。

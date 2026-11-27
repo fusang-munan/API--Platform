@@ -1069,6 +1069,80 @@ describe('北辰模型管理', () => {
     expect(row.get('.model-state-summary').text()).toContain('Key 覆盖 1/1 · 已发布线路 1')
   })
 
+  it('备用 GM1 换组后保留 G3 报价、可用性和推荐协议', async () => {
+    const model = 'gpt-fixture-with-backup'
+    const data = overview([{ model, active: true, catalog: {
+      catalog_state: 'key_listed', activation: 'active', price_covered: true, price_state: 'confirmed', probe_state: 'passed',
+      bound_routes: [boundRoute(model, 'G3', 10), boundRoute(model, 'GM1', 6, { protocol: 'openai_compatible', priority: 20 })],
+      bound_key_count: 2, covered_bound_key_count: 2, ready_count: 2,
+      catalog_keys: [
+        { credential_id: 'G3', label: 'G3', group_id: 10, state: 'listed', upstream_model: model },
+        { credential_id: 'GM1', label: 'GM1', group_id: 6, state: 'listed', upstream_model: model },
+      ],
+      route_availability: { ...responsesAvailable, recommended_protocol: 'openai_compatible',
+        protocols: ['openai_compatible', 'openai_responses'], available_protocols: ['openai_compatible', 'openai_responses'] },
+      website_locations: [pricedLocation(10, 'G3', '1', '0.00001', '0.00002'), pricedLocation(6, 'GM1', '1', '0.00005', '0.0001')],
+    } }])
+    data.models = [
+      { ...data.models![0], credential_id: 'G3' },
+      { ...data.models![0], credential_id: 'GM1', school_rates: { input: 500000000, output: 1000000000 } },
+    ]
+    const g3 = { credential_id: 'G3', group_id: 10, group_name: 'G3', rate: '1' }
+    const gm1 = { credential_id: 'GM1', group_id: 6, group_name: 'GM1', rate: '1' }
+    api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys(g3, gm1))
+    const wrapper = view()
+    await flushPromises()
+    const row = wrapper.get('[data-model="gpt-fixture-with-backup"]')
+    expect(row.get('.model-state-summary').text()).toContain('Key 覆盖 2/2 · 已发布线路 2')
+    expect(row.get('.current-group-prices').text()).toContain('当前 Key 分组 10')
+    const originalPrice = currentGroupAmounts(row, 'input')
+    expect(originalPrice.join(' ')).toContain('110')
+
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys(g3, { ...gm1, group_id: 12 }))
+    await button(wrapper, '刷新模型').trigger('click')
+    await flushPromises()
+    expect(row.get('.model-state-summary').text()).toContain('Key 覆盖 1/2 · 已发布线路 1')
+    expect(row.get('[aria-label="实际绑定线路"]').text()).toMatch(/GM1 · OpenAI Chat\s+· 分组 12 · 目录待复核/)
+    expect(row.text()).toContain('GM1 Key 上次目录有')
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('可用')
+    expect(row.get('[data-testid="recommended-protocol"]').text()).toBe('推荐 OpenAI Responses')
+    expect(row.get('.current-group-prices').text()).toContain('当前 Key 分组 10')
+    expect(currentGroupAmounts(row, 'input')).toEqual(originalPrice)
+    expect(wrapper.get('.model-summary').text()).toContain('报价覆盖1 / 1')
+  })
+
+  it('绑定 Key 的明确分组拒绝显示为维护，重扫成功后清除提示', async () => {
+    const model = 'gpt-fixture-group-denial'
+    const route = boundRoute(model, 'G3', 10)
+    const data = overview([{ model, active: true, catalog: {
+      catalog_state: 'key_listed', activation: 'active', bound_routes: [route],
+      bound_key_count: 1, covered_bound_key_count: 1, ready_count: 1, route_availability: responsesAvailable,
+    } }])
+    const denied = { ...data, model_catalog: [{ ...data.model_catalog![0],
+      catalog_state: 'published_unavailable' as const, ready_count: 0, covered_bound_key_count: 0,
+      bound_routes: [{ ...route, group_status: 'not_allowed', catalog_state: 'group_blocked',
+        binding_ready: false, probe_state: 'unprobed', price_covered: false }],
+      route_availability: { ...responsesAvailable, protocols: [], available_protocols: [], recommended_protocol: null,
+        availability: 'maintenance', availability_reason: '维护中。绑定 Key 分组无权限。' },
+    }] }
+    api.beichenOverview.mockResolvedValueOnce(denied).mockResolvedValue(data)
+    const wrapper = view()
+    await flushPromises()
+    await button(wrapper, '异常').trigger('click')
+    const row = wrapper.get('[data-model="gpt-fixture-group-denial"]')
+    expect(row.get('[data-testid="group-denied"]').text()).toBe('分组无权限 · 分组 10')
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('维护中')
+    expect(row.get('.model-state-summary').text()).not.toContain('目录待复核')
+
+    await button(wrapper, '刷新模型').trigger('click')
+    await flushPromises()
+    await button(wrapper, '全部').trigger('click')
+    const restored = wrapper.get('[data-model="gpt-fixture-group-denial"]')
+    expect(restored.find('[data-testid="group-denied"]').exists()).toBe(false)
+    expect(restored.get('[data-testid="model-availability"]').text()).toBe('可用')
+  })
+
   it('查看档位展示服务端的 price_blocker.message 与缺价状态', async () => {
     const data = overview([{ model: 'lab/tiered', catalog: {
       activation: 'blocked', price_state: 'missing', price_covered: false,
