@@ -1865,7 +1865,7 @@ describe('北辰模型管理', () => {
     ]))
     api.enableBeichenModelsBatch.mockResolvedValue({
       enabled: [{ model: first, model_id: first }],
-      skipped: [{ model: second, reason: 'no_price', message: '报价已失效' }],
+      skipped: [{ model: second, reason: 'no_price', code: 'price_missing', message: '报价已失效' }],
     })
     const wrapper = view()
     await flushPromises()
@@ -1890,6 +1890,21 @@ describe('北辰模型管理', () => {
     expect(wrapper.get('[role="dialog"]').text()).toContain('将启用 1 个 · 跳过 0 个')
     expect(wrapper.get('[data-model="lab/manual"] .status-pill.manual').text()).toBe('手动价生效 · 官网报价供参考')
     expect(wrapper.get('[aria-label="定价 lab/manual"]').text()).toBe('调整价格')
+  })
+
+  it('批量启用缺少服务端提示时按认证失败码提示显式重绑', async () => {
+    const model = 'lab/auth-failed'
+    api.beichenOverview.mockResolvedValue(overview([{ model, catalog: { activation: 'ready' } }]))
+    api.enableBeichenModelsBatch.mockResolvedValue({
+      enabled: [], skipped: [{ model, reason: 'route_not_ready', code: 'auth_failed', message: '' }],
+    })
+    const wrapper = view()
+    await flushPromises()
+    await button(wrapper, '一键启用').trigger('click')
+    const dialog = wrapper.get('[role="dialog"]')
+    await button(dialog, '确认启用 1 个').trigger('click')
+    await flushPromises()
+    expect(dialog.get('[data-batch-status="failed"]').text()).toContain('原线路 Key 未通过认证，请显式重绑')
   })
 
   it('缺价徽章逐项写出缺失字段，不再只写缺价', async () => {
@@ -2226,6 +2241,24 @@ describe('北辰模型管理', () => {
     if (noRoute) expect(dialog.get('[data-testid="tier-route-reason"]').text()).toBe(routeMessage)
     else expect(dialog.find('[data-testid="tier-route-reason"]').exists()).toBe(false)
     expect(dialog.text()).not.toContain('请先设置手动价')
+  })
+
+  it.each([
+    ['no_candidate', '没有匹配的北辰候选线路'],
+    ['multi_school', '请指定校内模型 ID'],
+    ['multi_candidate', '同一协议有多个候选线路'],
+    ['auth_failed', '原线路 Key 未通过认证，请显式重绑'],
+  ])('启用按钮显示 %s 给出的线路原因', async (code, message) => {
+    api.beichenOverview.mockResolvedValue(overview([{ model: 'lab/blocked', catalog: {
+      activation: 'blocked', can_enable: false, route_count: 2, catalog_state: 'key_listed',
+      price_blocker: { code: 'missing_price', message: '缺少可用报价' },
+      blockers: [{ code, message }, { code: 'price_missing', message: '缺少可用报价' }],
+    } }]))
+    const wrapper = view()
+    await flushPromises()
+    const row = wrapper.get('[data-model="lab/blocked"]')
+    expect(button(row, '启用').element.disabled).toBe(true)
+    expect(row.get('.enable-reason').text()).toBe(message)
   })
 
   it('官网价和学生实价以统一精度展示，保留字符串零价与缺项', async () => {

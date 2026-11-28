@@ -653,9 +653,10 @@ export type BeichenPriceScope = { scope?: 'all' | 'credentials'; credential_ids?
 export type BeichenModelPriceUpdate = { model: string } & BeichenPriceScope & (
   { mode: 'follow' } | { mode: 'manual'; rates: { input: string; output: string; cache_read: string; cache_write: string } }
 )
+export type BeichenActivationBlockerCode = 'no_candidate' | 'multi_school' | 'multi_candidate' | 'auth_failed' | 'price_missing'
 export type BeichenBatchEnableResult = {
   enabled: Array<{ model: string; model_id: string }>
-  skipped: Array<{ model: string; reason: string; message: string }>
+  skipped: Array<{ model: string; reason: string; code?: BeichenActivationBlockerCode; message: string }>
 }
 export type BeichenModelPriceResult = {
   saved: boolean

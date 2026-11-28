@@ -33,7 +33,15 @@ type activationModel struct {
 type activationCandidate struct {
 	schoolID         uuid.UUID
 	fallbackSchoolID uuid.UUID
+	unresolvedAlias  bool
 	route            PreferredRoute
+}
+
+func (c activationCandidate) matchesSchool(id uuid.UUID) bool {
+	if c.fallbackSchoolID != uuid.Nil {
+		return c.fallbackSchoolID == id
+	}
+	return c.schoolID == id && !c.unresolvedAlias
 }
 
 type activationSchool struct {
@@ -59,19 +67,37 @@ type activationWrite struct {
 }
 
 type activationPlan struct {
-	routes, northRoutes       []PreferredRoute
-	writes                    []activationWrite
-	northReady, foreignActive bool
-	catalogBlocked            bool
-	rebindRequired            bool
-	ambiguity                 string
+	routes, northRoutes []PreferredRoute
+	writes              []activationWrite
+	blocker             CatalogBlocker
 }
 
 const (
+	blockerNoCandidate    = "no_candidate"
+	blockerMultiSchool    = "multi_school"
+	blockerMultiCandidate = "multi_candidate"
+	blockerAuthFailed     = "auth_failed"
+	blockerPriceMissing   = "price_missing"
+
 	ambiguousProtocolRoutes = "同一个校内模型的同一协议有多个候选线路，请先确认并绑定线路"
 	ambiguousFirstRoutes    = "首次启用有多个候选上游线路，请先确认并绑定线路"
 	authFailedRebindMessage = "原线路 Key 已被上游拒绝认证，请由教师显式重绑"
+	noCandidateMessage      = "没有与唯一活跃校内目标匹配的北辰候选线路，请检查 Key 目录、分组和路线配置"
+	pinnedRouteNotReady     = "原绑定线路尚未就绪，请同步该渠道或由教师明确重绑"
 )
+
+func activationBlockerError(blocker CatalogBlocker) error {
+	return &domain.Error{Code: domain.CodeValidation, Message: blocker.Message,
+		Details: map[string]string{"code": blocker.Code}}
+}
+
+func (p *activationPlan) setBlocker(blocker CatalogBlocker) {
+	// An explicit rebind takes precedence over candidate selection and pricing.
+	if p.blocker.Code == "" || blocker.Code == blockerAuthFailed ||
+		blocker.Code == blockerMultiCandidate && p.blocker.Code == blockerNoCandidate {
+		p.blocker = blocker
+	}
+}
 
 func loadActivationCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID, source string) ([]*activationModel, error) {
 	return readActivationCatalog(ctx, tx, provider, source, nil)
@@ -172,7 +198,7 @@ ORDER BY lower(k.model_id::text),c.id`
 		}
 		m := modelFor(modelID)
 		m.keys = append(m.keys, key)
-		if !available || !catalogCurrent || (aliased && targetID == nil) {
+		if !available || !catalogCurrent {
 			continue
 		}
 		entry, err := storedCatalogEntry(modelID, raw, protocols)
@@ -188,7 +214,7 @@ ORDER BY lower(k.model_id::text),c.id`
 				continue
 			}
 			keyID := key
-			candidate := activationCandidate{route: PreferredRoute{UpstreamModel: modelID, ProviderName: providerName, CredentialLabel: &label,
+			candidate := activationCandidate{unresolvedAlias: aliased && targetID == nil, route: PreferredRoute{UpstreamModel: modelID, ProviderName: providerName, CredentialLabel: &label,
 				Adapter: protocol, ProviderID: provider, CredentialID: &keyID, Priority: catalog.DefaultBindingPriority(modelbinding.Adapter(protocol)),
 				State: "candidate", EffectiveMultiplier: rates[key]}}
 			if targetID != nil {
@@ -304,20 +330,22 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 	if err := bound.Err(); err != nil {
 		return nil, err
 	}
-	// Record the only known target before Overview or a batch request narrows
-	// the view. Archived website-only entries cannot establish that mapping.
+	// A same-name retired school is not a second activation target. Let the
+	// unique live target receive candidates whose old mapping is nil or stale.
+	// Archived website-only entries cannot establish that mapping.
 	for _, m := range models {
-		if len(m.schools) != 1 {
-			continue
-		}
 		school := m.target("")
-		if !school.hasActivationMapping {
+		if school == nil || !school.hasActivationMapping {
 			continue
 		}
 		for _, candidates := range m.defaults {
 			for i := range candidates {
-				if candidates[i].schoolID == uuid.Nil {
-					candidates[i].fallbackSchoolID = school.id
+				candidate := &candidates[i]
+				mapped := m.schools[candidate.schoolID]
+				// A sole disabled school can still use an unmapped Key to repair its route.
+				unmapped := candidate.schoolID == uuid.Nil && !candidate.unresolvedAlias
+				if unmapped || school.selectable() && (mapped == nil || !mapped.selectable()) {
+					candidate.fallbackSchoolID = school.id
 				}
 			}
 		}
@@ -328,27 +356,52 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 
 func (m *activationModel) target(name string) *activationSchool {
 	if name != "" {
+		if id, err := uuid.Parse(name); err == nil && m.schools[id] != nil {
+			return m.schools[id]
+		}
 		for _, s := range m.schools {
 			if strings.EqualFold(name, s.name) {
 				return s
 			}
 		}
-		if id, err := uuid.Parse(name); err == nil && m.schools[id] != nil {
-			return m.schools[id]
-		}
 		if len(m.schools) != 0 || !strings.EqualFold(name, m.name) {
 			return nil
 		}
+	}
+	if live := m.selectableSchools(); len(live) == 1 {
+		return live[0]
 	}
 	switch len(m.schools) {
 	case 0:
 		return &activationSchool{name: m.name, status: "not_configured"}
 	case 1:
+		// An explicitly disabled model with its own routes can still be enabled.
 		for _, s := range m.schools {
 			return s
 		}
 	}
 	return nil
+}
+
+func (s *activationSchool) selectable() bool {
+	return s.status == "active" || s.status == "pending_configuration"
+}
+
+func (m *activationModel) selectableSchools() []*activationSchool {
+	schools := make([]*activationSchool, 0, len(m.schools))
+	for _, school := range m.schools {
+		if school.selectable() {
+			schools = append(schools, school)
+		}
+	}
+	return schools
+}
+
+func (m *activationModel) targetBlocker(selector string) CatalogBlocker {
+	if selector == "" && len(m.selectableSchools()) > 1 {
+		return CatalogBlocker{blockerMultiSchool, "该上游名称对应多个校内模型，请从活跃或待配置的模型中指定校内模型 ID"}
+	}
+	return CatalogBlocker{blockerNoCandidate, noCandidateMessage}
 }
 
 func (s *activationSchool) published() bool {
@@ -364,11 +417,14 @@ func (m *activationModel) alreadyPublished(s *activationSchool) bool {
 // Overview presents one directory row per confirmed school identity. Keeping
 // the activation model grouped by upstream name preserves preview actions.
 func (m *activationModel) catalogViews() []*activationModel {
-	if len(m.schools) <= 1 {
+	schools := m.selectableSchools()
+	if len(schools) == 0 {
+		schools = slices.Collect(maps.Values(m.schools))
+	}
+	if len(schools) <= 1 && len(schools) == len(m.schools) {
 		return []*activationModel{m}
 	}
-	views := make([]*activationModel, 0, len(m.schools))
-	schools := slices.Collect(maps.Values(m.schools))
+	views := make([]*activationModel, 0, len(schools))
 	slices.SortFunc(schools, func(a, b *activationSchool) int { return strings.Compare(a.name, b.name) })
 	for _, school := range schools {
 		view := *m
@@ -385,7 +441,7 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 		rank  int
 	}
 	choices := map[string]choice{}
-	hasNorth := false
+	hasNorth, foreignActive := false, false
 	lastPriority := map[string]int{}
 	for _, b := range s.bindings {
 		r := b.route
@@ -397,29 +453,28 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 			lastPriority[r.Adapter] = r.Priority
 		}
 		if b.active && !north {
-			plan.foreignActive = true
+			foreignActive = true
 		}
 		rank := 0
-		repair := false
-		if north && b.active && b.authFailedActiveKey {
-			plan.catalogBlocked = true
-			plan.rebindRequired = true
-		}
-		if north && b.active && !b.reachable && b.credential != nil && !b.authFailedActiveKey {
-			next, candidates, ambiguous := m.repairRoute(s, b.route.Adapter, b.route.UpstreamModel)
-			if ambiguous {
-				plan.ambiguity = ambiguousProtocolRoutes
-			}
-			if candidates == 1 {
-				next.SchoolModel = s.name
-				next.Priority = b.route.Priority
-				before := b.route
-				before.CredentialID = b.credential
-				plan.writes = append(plan.writes, activationWrite{id: b.id, route: next, before: &before})
-				plan.northRoutes = append(plan.northRoutes, next)
-				plan.northReady, r, rank, repair = true, next, 2, true
-			} else {
-				plan.catalogBlocked = true
+		if north && b.active {
+			switch {
+			case b.authFailedActiveKey:
+				plan.setBlocker(CatalogBlocker{blockerAuthFailed, authFailedRebindMessage})
+			case !b.reachable && b.credential != nil:
+				next, blocker := m.repairRoute(s, r.Adapter, r.UpstreamModel)
+				if blocker.Code != "" {
+					plan.setBlocker(blocker)
+				} else {
+					next.Priority = r.Priority
+					before := r
+					before.CredentialID = b.credential
+					plan.writes = append(plan.writes, activationWrite{id: b.id, route: next, before: &before})
+					plan.northRoutes = append(plan.northRoutes, next)
+					r, rank = next, 2
+				}
+			case !b.reachable && !s.published():
+				// Activation would also publish this retained, unpinned binding.
+				plan.setBlocker(CatalogBlocker{blockerNoCandidate, pinnedRouteNotReady})
 			}
 		}
 		if b.active && b.reachable {
@@ -429,13 +484,8 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 				rank = 3
 			}
 			if north {
-				plan.northReady = true
 				plan.northRoutes = append(plan.northRoutes, r)
 			}
-		}
-		// Activating the school model publishes its retained gateway bindings too.
-		if north && !s.published() && b.active && !b.reachable && !repair {
-			plan.catalogBlocked = true
 		}
 		// Bindings arrive in gateway priority and ID order.
 		if existing, ok := choices[r.Adapter]; !ok || rank > existing.rank {
@@ -445,8 +495,10 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 	// Configure new North routes only for this school identity. An existing
 	// North binding keeps its Key and protocol until the teacher rebinds it.
 	if !hasNorth {
-		defaults, ambiguity := m.defaultRoutes(s)
-		plan.ambiguity = ambiguity
+		defaults, blocker := m.defaultRoutes(s)
+		if blocker.Code != "" {
+			plan.setBlocker(blocker)
+		}
 		for _, r := range defaults {
 			adapter := r.Adapter
 			if c, exists := choices[adapter]; exists {
@@ -462,11 +514,19 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 			}
 			plan.writes = append(plan.writes, activationWrite{route: r})
 			plan.northRoutes = append(plan.northRoutes, r)
-			plan.northReady = true
 		}
 	}
-	for _, v := range choices {
-		plan.routes = append(plan.routes, v.route)
+	if s.status == "inactive" && len(m.selectableSchools()) > 0 {
+		plan.setBlocker(CatalogBlocker{blockerNoCandidate, "所选校内模型已停用，请选择同名的当前校内模型"})
+	}
+	if len(plan.northRoutes) == 0 {
+		plan.setBlocker(CatalogBlocker{blockerNoCandidate, noCandidateMessage})
+	}
+	if foreignActive && (s.multiplier == nil || *s.multiplier <= 0) {
+		plan.setBlocker(CatalogBlocker{blockerPriceMissing, "校内模型的其他供应商线路缺少可计算报价，请先设置校内倍率"})
+	}
+	for _, adapter := range slices.Sorted(maps.Keys(choices)) {
+		plan.routes = append(plan.routes, choices[adapter].route)
 	}
 	return plan
 }
@@ -474,49 +534,37 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 // repairRoute selects a replacement Key only when the school model has one
 // distinct candidate for the protocol. The teacher still has to preview and
 // submit the existing activation action; ambiguous candidates stay blocked.
-func (m *activationModel) repairRoute(s *activationSchool, adapter, upstream string) (PreferredRoute, int, bool) {
+func (m *activationModel) repairRoute(s *activationSchool, adapter, upstream string) (PreferredRoute, CatalogBlocker) {
 	var picked PreferredRoute
-	count, ambiguous := 0, false
 	for _, candidate := range m.defaults[adapter] {
-		mapped := candidate.schoolID == s.id
-		sameUpstream := candidate.fallbackSchoolID != uuid.Nil && candidate.fallbackSchoolID == s.id &&
-			strings.EqualFold(candidate.route.UpstreamModel, upstream)
-		if !mapped && !sameUpstream {
+		if !candidate.matchesSchool(s.id) || candidate.fallbackSchoolID != uuid.Nil &&
+			!strings.EqualFold(candidate.route.UpstreamModel, upstream) {
 			continue
 		}
-		route := candidate.route
-		route.SchoolModel = s.name
-		if count == 0 {
-			picked = route
-		} else if route.UpstreamModel != picked.UpstreamModel || route.CredentialID == nil ||
-			picked.CredentialID == nil || *route.CredentialID != *picked.CredentialID {
-			ambiguous = true
+		if picked.CredentialID != nil && !sameActivationSource(picked, candidate.route) {
+			return PreferredRoute{}, CatalogBlocker{blockerMultiCandidate, ambiguousProtocolRoutes}
 		}
-		count++
+		picked = candidate.route
 	}
-	if ambiguous {
-		return PreferredRoute{}, 0, true
+	if picked.CredentialID == nil {
+		return PreferredRoute{}, CatalogBlocker{blockerNoCandidate, pinnedRouteNotReady}
 	}
-	return picked, count, false
+	picked.SchoolModel = s.name
+	return picked, CatalogBlocker{}
 }
 
-func (m *activationModel) defaultRoutes(s *activationSchool) ([]PreferredRoute, string) {
+func (m *activationModel) defaultRoutes(s *activationSchool) ([]PreferredRoute, CatalogBlocker) {
 	var routes []PreferredRoute
-	var fallback *PreferredRoute
 	for _, adapter := range slices.Sorted(maps.Keys(m.defaults)) {
 		var selected *PreferredRoute
 		for _, candidate := range m.defaults[adapter] {
-			matchesFallback := candidate.fallbackSchoolID != uuid.Nil && candidate.fallbackSchoolID == s.id
-			if candidate.schoolID != s.id && !matchesFallback {
+			if !candidate.matchesSchool(s.id) {
 				continue
 			}
 			route := candidate.route
 			route.SchoolModel = s.name
 			if selected != nil && !sameActivationSource(route, *selected) {
-				return nil, ambiguousProtocolRoutes
-			}
-			if matchesFallback {
-				fallback = &route
+				return nil, CatalogBlocker{blockerMultiCandidate, ambiguousProtocolRoutes}
 			}
 			selected = &route
 		}
@@ -524,22 +572,18 @@ func (m *activationModel) defaultRoutes(s *activationSchool) ([]PreferredRoute, 
 			routes = append(routes, *selected)
 		}
 	}
-	// A single unmapped Key can supply several protocols for the same model.
+	// A single Key can supply several protocols for the first publication.
 	// A second Key or upstream model needs explicit teacher selection.
-	if fallback != nil && slices.ContainsFunc(routes, func(route PreferredRoute) bool {
-		return !sameActivationSource(route, *fallback)
+	if len(routes) > 1 && slices.ContainsFunc(routes[1:], func(route PreferredRoute) bool {
+		return !sameActivationSource(route, routes[0])
 	}) {
-		return nil, ambiguousFirstRoutes
+		return nil, CatalogBlocker{blockerMultiCandidate, ambiguousFirstRoutes}
 	}
-	return routes, ""
+	return routes, CatalogBlocker{}
 }
 
 func sameActivationSource(a, b PreferredRoute) bool {
 	return a.UpstreamModel == b.UpstreamModel && sameRouteKey(a.CredentialID, b.CredentialID)
-}
-
-func (p activationPlan) allowed(s *activationSchool) bool {
-	return p.northReady && !p.catalogBlocked && p.ambiguity == "" && (!p.foreignActive || s.multiplier != nil && *s.multiplier > 0)
 }
 
 type activationPrice struct {
@@ -656,24 +700,17 @@ LEFT JOIN LATERAL (
 ) snap ON true
 WHERE c.id=$2`
 
-func (m *activationModel) overview() CatalogModel {
+func (m *activationModel) overview(target *activationSchool, plan activationPlan) CatalogModel {
 	result := CatalogModel{Model: m.name, CredentialIDs: append([]uuid.UUID{}, m.keys...), SchoolStatus: "not_configured", PreferredRoutes: []PreferredRoute{}}
-	target := m.target("")
 	if target != nil {
-		plan := m.plan(target)
 		result.SchoolStatus = target.status
 		if target.id != uuid.Nil {
 			result.SchoolModel = target.name
 			id := target.id
 			result.SchoolModelID = &id
 		}
-		result.CanEnable = plan.allowed(target) && (!target.published() || len(plan.writes) > 0)
-		if len(m.schools) == 0 {
-			result.PreferredRoutes = append(result.PreferredRoutes, plan.routes...)
-		}
-	}
-	for _, s := range m.schools {
-		result.PreferredRoutes = append(result.PreferredRoutes, m.plan(s).routes...)
+		result.CanEnable = plan.blocker.Code == "" && (!target.published() || len(plan.writes) > 0)
+		result.PreferredRoutes = append(result.PreferredRoutes, plan.routes...)
 	}
 	for i := range result.PreferredRoutes {
 		r := &result.PreferredRoutes[i]
@@ -681,13 +718,6 @@ func (m *activationModel) overview() CatalogModel {
 			r.EffectiveMultiplierText = r.EffectiveMultiplier.String()
 		}
 	}
-	sort.Slice(result.PreferredRoutes, func(i, j int) bool {
-		a, b := result.PreferredRoutes[i], result.PreferredRoutes[j]
-		if a.SchoolModel != b.SchoolModel {
-			return a.SchoolModel < b.SchoolModel
-		}
-		return a.Adapter < b.Adapter
-	})
 	return result
 }
 
@@ -700,6 +730,7 @@ type BatchEnabledModel struct {
 type BatchSkippedModel struct {
 	Model          string          `json:"model"`
 	Reason         string          `json:"reason"`
+	Code           string          `json:"code,omitempty"`
 	Message        string          `json:"message"`
 	SuggestedRates *SuggestedRates `json:"suggested_rates,omitempty"`
 }
@@ -798,9 +829,10 @@ func selectBatchActivation(ctx context.Context, tx *sql.Tx, provider uuid.UUID, 
 			continue
 		}
 		if combined == nil {
-			combined = &activationModel{provider: provider, defaults: map[string][]activationCandidate{}}
+			combined = &activationModel{provider: provider, defaults: map[string][]activationCandidate{}, schools: map[uuid.UUID]*activationSchool{}}
 			target = school
 		}
+		maps.Copy(combined.schools, model.schools)
 		for protocol, routes := range model.defaults {
 			combined.defaults[protocol] = append(combined.defaults[protocol], routes...)
 		}
@@ -820,43 +852,35 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 	if err != nil {
 		return enabled, nil, err
 	}
-	skip := func(reason, message string) (BatchEnabledModel, *BatchSkippedModel, error) {
+	skip := func(reason, code, message string) (BatchEnabledModel, *BatchSkippedModel, error) {
 		if target != nil && target.id != uuid.Nil {
 			seenSchools[target.id] = true
 		}
-		return enabled, &BatchSkippedModel{Model: source, Reason: reason, Message: message}, nil
+		return enabled, &BatchSkippedModel{Model: source, Reason: reason, Code: code, Message: message}, nil
 	}
 	if m == nil {
-		return skip("not_found", "当前北辰目录中没有此模型")
+		return skip("not_found", "", "当前北辰目录中没有此模型")
 	}
 	if target == nil {
-		return skip("route_not_ready", "该上游名称对应多个校内模型，请指定校内模型 ID")
+		blocker := m.targetBlocker("")
+		return skip("route_not_ready", blocker.Code, blocker.Message)
 	}
 	if seenSchools[target.id] {
-		return skip("duplicate_school_model", "本批已处理同一个校内模型 ID")
-	}
-	if m.alreadyPublished(target) {
-		return skip("already_active", "模型已启用")
+		return skip("duplicate_school_model", "", "本批已处理同一个校内模型 ID")
 	}
 	plan := m.plan(target)
-	if plan.rebindRequired {
-		return skip("route_not_ready", authFailedRebindMessage)
+	if plan.blocker.Code != blockerAuthFailed && m.alreadyPublished(target) {
+		return skip("already_active", "", "模型已启用")
 	}
-	if plan.ambiguity != "" {
-		return skip("route_not_ready", plan.ambiguity)
-	}
-	if plan.catalogBlocked {
-		return skip("route_not_ready", "原绑定线路尚未就绪，请同步该渠道或由教师明确重绑")
-	}
-	if !plan.allowed(target) {
-		return skip("route_not_ready", "当前北辰 Key 目录、已配置的线路或其他供应商计价尚未就绪")
+	if plan.blocker.Code != "" {
+		return skip("route_not_ready", plan.blocker.Code, plan.blocker.Message)
 	}
 	price, err := plan.priceReadiness(ctx, tx, nil)
 	if err != nil {
 		return enabled, nil, err
 	}
 	if !price.ready() {
-		_, skipped, _ := skip("no_price", price.blocker.Message)
+		_, skipped, _ := skip("no_price", blockerPriceMissing, price.blocker.Message)
 		skipped.SuggestedRates = derivedPriceSuggestion(ctx, tx, plan.northRoutes)
 		return enabled, skipped, nil
 	}
@@ -909,27 +933,21 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 	m := models[0]
 	target := m.target(school)
 	if target == nil {
-		return uuid.Nil, invalid("请指定与该北辰目录对应的校内模型")
-	}
-	if m.alreadyPublished(target) {
-		return target.id, nil
+		return uuid.Nil, activationBlockerError(m.targetBlocker(school))
 	}
 	plan := m.plan(target)
-	if plan.rebindRequired {
-		return uuid.Nil, invalid(authFailedRebindMessage)
+	if plan.blocker.Code != blockerAuthFailed && m.alreadyPublished(target) {
+		return target.id, nil
 	}
-	if plan.ambiguity != "" {
-		return uuid.Nil, invalid(plan.ambiguity)
-	}
-	if !plan.allowed(target) {
-		return uuid.Nil, invalid("当前北辰 Key 目录、已配置的路线或其他供应商计价不支持直接启用")
+	if plan.blocker.Code != "" {
+		return uuid.Nil, activationBlockerError(plan.blocker)
 	}
 	price, err := plan.priceReadiness(ctx, tx, nil)
 	if err != nil {
 		return uuid.Nil, err
 	}
 	if !price.ready() {
-		return uuid.Nil, invalid(price.blocker.Message)
+		return uuid.Nil, activationBlockerError(CatalogBlocker{blockerPriceMissing, price.blocker.Message})
 	}
 	id, err := applyActivationPlan(ctx, tx, provider, actor, target, plan)
 	if err == nil {

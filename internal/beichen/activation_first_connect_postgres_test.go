@@ -189,24 +189,26 @@ FROM models m WHERE m.id=$1`, school, f.provider).Scan(&status, &bindings, &audi
 	}
 }
 
-func (f firstConnectFixture) assertSkipped(t *testing.T, reason, message string, selectors ...string) {
+func (f firstConnectFixture) assertSkipped(t *testing.T, reason, code, message string, selectors ...string) {
 	t.Helper()
 	result, err := f.service.EnableModelsBatch(f.ctx, f.provider, f.actor, selectors)
 	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != len(selectors) {
 		t.Fatalf("expected all selectors to be blocked: %+v, %v", result, err)
 	}
 	for i, skipped := range result.Skipped {
-		if skipped.Model != selectors[i] || skipped.Reason != reason || !strings.Contains(skipped.Message, message) {
-			t.Fatalf("expected %s with %q for %q, got %+v", reason, message, selectors[i], skipped)
+		if skipped.Model != selectors[i] || skipped.Reason != reason || skipped.Code != code || !strings.Contains(skipped.Message, message) {
+			t.Fatalf("expected %s/%s with %q for %q, got %+v", reason, code, message, selectors[i], skipped)
 		}
 	}
 }
 
-func (f firstConnectFixture) assertEnableRejected(t *testing.T, selector, message string) {
+func (f firstConnectFixture) assertEnableRejected(t *testing.T, selector, code, message string) {
 	t.Helper()
 	id, err := f.service.EnableModel(f.ctx, f.provider, f.actor, firstConnectUpstream, selector)
-	if id != uuid.Nil || domain.ErrorCode(err) != domain.CodeValidation || !strings.Contains(err.Error(), message) {
-		t.Fatalf("selector %q: expected validation error containing %q, got id=%s err=%v", selector, message, id, err)
+	if id != uuid.Nil || domain.ErrorCode(err) != domain.CodeValidation || activationErrorCode(err) != code ||
+		!strings.Contains(err.Error(), message) {
+		t.Fatalf("selector %q: expected %s containing %q, got id=%s code=%s err=%v",
+			selector, code, message, id, activationErrorCode(err), err)
 	}
 }
 
@@ -259,7 +261,7 @@ func TestEnableModelFirstConnectPostgres(t *testing.T) {
 			if err != nil || id != school {
 				t.Fatalf("repeated enable: id=%s, err=%v", id, err)
 			}
-			f.assertSkipped(t, "already_active", "模型已启用", school.String())
+			f.assertSkipped(t, "already_active", "", "模型已启用", school.String())
 			if after := f.assertPublished(t, school, f.keys[0], firstConnectAdapters); after != bindingIDs {
 				t.Fatal("repeated enable replaced bindings")
 			}
@@ -281,28 +283,38 @@ func TestEnableModelFirstConnectGuardsPostgres(t *testing.T) {
 				t.Fatalf("scoping the view must not let this row take the shared candidate: %+v", row)
 			}
 		}
-		f.assertEnableRejected(t, "", "请指定与该北辰目录对应的校内模型")
-		f.assertSkipped(t, "route_not_ready", "对应多个校内模型", firstConnectUpstream)
+		f.assertEnableRejected(t, "", blockerMultiSchool, "对应多个校内模型")
+		f.assertSkipped(t, "route_not_ready", blockerMultiSchool, "对应多个校内模型", firstConnectUpstream)
 		for _, target := range []uuid.UUID{school, otherSchool} {
-			f.assertEnableRejected(t, target.String(), "不支持直接启用")
-			f.assertSkipped(t, "route_not_ready", "尚未就绪", target.String())
+			f.assertEnableRejected(t, target.String(), blockerNoCandidate, "没有与唯一活跃校内目标匹配")
+			f.assertSkipped(t, "route_not_ready", blockerNoCandidate, "没有与唯一活跃校内目标匹配", target.String())
 			f.assertPending(t, target)
 		}
 	})
 	t.Run("multiple candidate keys", func(t *testing.T) {
 		f := newFirstConnectFixture(t)
-		school := f.unmappedSchool(t)
+		schoolName := "school-gemini-4-argon"
+		school := f.pendingSchool(t, schoolName, &f.keys[1])
 		f.readyKey(t, f.keys[2])
-		f.assertEnableRejected(t, school.String(), "同一协议有多个候选线路")
-		f.assertSkipped(t, "route_not_ready", "同一协议有多个候选线路", school.String())
+		f.assertEnableRejected(t, school.String(), blockerMultiCandidate, "同一协议有多个候选线路")
+		f.assertSkipped(t, "route_not_ready", blockerMultiCandidate, "同一协议有多个候选线路", school.String())
 
 		// Each protocol has one candidate, but the two protocols would pick
 		// two different unmapped Keys for the same school model.
 		execCatalogTestSQL(t, f.ctx, f.db, `UPDATE upstream_probes SET status_code=401,error_code='http_error'
 WHERE model=$1 AND ((credential_id=$2 AND protocol=$4) OR (credential_id=$3 AND protocol=$5))`,
 			firstConnectUpstream, f.keys[0], f.keys[2], firstConnectAdapters[0], firstConnectAdapters[1])
-		f.assertEnableRejected(t, school.String(), "首次启用有多个候选上游线路")
-		f.assertSkipped(t, "route_not_ready", "首次启用有多个候选上游线路", school.String())
+		f.assertEnableRejected(t, school.String(), blockerMultiCandidate, "首次启用有多个候选上游线路")
+		f.assertSkipped(t, "route_not_ready", blockerMultiCandidate, "首次启用有多个候选上游线路", school.String())
+		f.assertPending(t, school)
+
+		for _, key := range []uuid.UUID{f.keys[0], f.keys[2]} {
+			if err := f.service.PutModelAlias(f.ctx, f.provider, f.actor, &key, firstConnectUpstream, &schoolName); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.assertEnableRejected(t, school.String(), blockerMultiCandidate, "首次启用有多个候选上游线路")
+		f.assertSkipped(t, "route_not_ready", blockerMultiCandidate, "首次启用有多个候选上游线路", school.String())
 		f.assertPending(t, school)
 	})
 	t.Run("existing binding takes priority", func(t *testing.T) {
@@ -329,15 +341,15 @@ VALUES($1,$2,$3,$4,$5,'openai_responses',13,now(),now())`, binding, school, f.pr
 		f := newFirstConnectFixture(t)
 		school := f.unmappedSchool(t)
 		execCatalogTestSQL(t, f.ctx, f.db, "UPDATE provider_model_catalog SET catalog_source='website' WHERE credential_id=$1", f.keys[1])
-		f.assertSkipped(t, "route_not_ready", "尚未就绪", school.String())
+		f.assertSkipped(t, "route_not_ready", blockerNoCandidate, "没有与唯一活跃校内目标匹配", school.String())
 		f.assertPending(t, school)
 	})
 	t.Run("missing price", func(t *testing.T) {
 		f := newFirstConnectFixture(t)
 		school := f.unmappedSchool(t)
 		execCatalogTestSQL(t, f.ctx, f.db, "DELETE FROM beichen_price_versions WHERE credential_id=$1 AND model=$2", f.keys[0], firstConnectUpstream)
-		f.assertEnableRejected(t, school.String(), "缺少可用报价")
-		f.assertSkipped(t, "no_price", "缺少可用报价", school.String())
+		f.assertEnableRejected(t, school.String(), blockerPriceMissing, "缺少可用报价")
+		f.assertSkipped(t, "no_price", blockerPriceMissing, "缺少可用报价", school.String())
 		f.assertPending(t, school)
 	})
 	t.Run("401 and 403 probes", func(t *testing.T) {
@@ -346,8 +358,8 @@ VALUES($1,$2,$3,$4,$5,'openai_responses',13,now(),now())`, binding, school, f.pr
 		execCatalogTestSQL(t, f.ctx, f.db, `UPDATE upstream_probes
 SET status_code=CASE WHEN protocol='openai_responses' THEN 401 ELSE 403 END,error_code='http_error',checked_at=clock_timestamp()
 WHERE provider_id=$1 AND credential_id=$2 AND model=$3`, f.provider, f.keys[0], firstConnectUpstream)
-		f.assertEnableRejected(t, school.String(), "不支持直接启用")
-		f.assertSkipped(t, "route_not_ready", "尚未就绪", school.String())
+		f.assertEnableRejected(t, school.String(), blockerNoCandidate, "没有与唯一活跃校内目标匹配")
+		f.assertSkipped(t, "route_not_ready", blockerNoCandidate, "没有与唯一活跃校内目标匹配", school.String())
 		f.assertPending(t, school)
 	})
 	t.Run("active foreign route without school multiplier", func(t *testing.T) {
@@ -359,8 +371,8 @@ VALUES($1,'Other','https://other.invalid',now(),now())`, foreign)
 		execCatalogTestSQL(t, f.ctx, f.db, `INSERT INTO model_bindings
  (id,model_id,provider_id,upstream_model_name,adapter,created_at,updated_at)
 VALUES($1,$2,$3,$4,'openai_responses',now(),now())`, binding, school, foreign, firstConnectUpstream)
-		f.assertEnableRejected(t, school.String(), "不支持直接启用")
-		f.assertSkipped(t, "route_not_ready", "尚未就绪", school.String())
+		f.assertEnableRejected(t, school.String(), blockerPriceMissing, "缺少可计算报价")
+		f.assertSkipped(t, "route_not_ready", blockerPriceMissing, "缺少可计算报价", school.String())
 		f.assertPending(t, school)
 	})
 }

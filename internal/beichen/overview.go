@@ -712,7 +712,12 @@ func bindingsForCatalogView(rows []catalog.ModelCapability, view *activationMode
 func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 	records map[string]map[uuid.UUID]*Model, syncFailed map[uuid.UUID]bool, capabilities []catalog.ModelCapability,
 ) (CatalogModel, error) {
-	item := m.overview()
+	target := m.target("")
+	var plan activationPlan
+	if target != nil {
+		plan = m.plan(target)
+	}
+	item := m.overview(target, plan)
 	item.Blockers = []CatalogBlocker{}
 	item.Protocols = []string{}
 	item.BoundRoutes = []CatalogBoundRoute{}
@@ -741,13 +746,15 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 
 	if item.ReadyCount > 0 {
 		item.Activation = "active"
+		if plan.blocker.Code == blockerAuthFailed {
+			item.Blockers = append(item.Blockers, plan.blocker)
+		}
 		return item, nil
 	}
-	target := m.target("")
 	var price activationPrice
 	if item.CanEnable {
 		var err error
-		price, err = m.plan(target).priceReadiness(ctx, tx, records)
+		price, err = plan.priceReadiness(ctx, tx, records)
 		if err != nil {
 			return CatalogModel{}, err
 		}
@@ -758,22 +765,23 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 	}
 
 	item.Activation = "blocked"
-	if target == nil || target.status == "not_configured" {
+	if target != nil && target.status == "not_configured" {
 		item.Blockers = append(item.Blockers, CatalogBlocker{"not_configured", "请确认此目录模型对应的校内模型和线路"})
 	}
 	if !item.CanEnable {
-		item.Blockers = append(item.Blockers, CatalogBlocker{"no_ready_route", "没有可启用的北辰线路，请检查渠道状态和线路配置"})
-		if item.PriceState == "missing" || priceStates["missing"] {
-			item.Blockers = append(item.Blockers, CatalogBlocker{"missing_price", "线路缺少可用报价，请同步官网价或设置手动价"})
+		blocker := plan.blocker
+		if blocker.Code == "" {
+			blocker = m.targetBlocker("")
 		}
+		item.Blockers = append(item.Blockers, blocker)
 	}
 	if price.blocker != nil {
 		item.PriceBlocker = price.blocker
-		code := "missing_price"
+		code := blockerPriceMissing
 		if price.conditional {
 			code = "conditional_price"
 		}
-		item.Blockers = append(item.Blockers, CatalogBlocker{Code: code, Message: price.blocker.Message})
+		item.Blockers = append(item.Blockers, CatalogBlocker{code, price.blocker.Message})
 	}
 	for _, id := range m.keys {
 		if syncFailed[id] {

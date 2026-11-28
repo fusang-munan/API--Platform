@@ -470,7 +470,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `model_catalog[].bound_routes` 按绑定返回 `school_model`、`upstream_model`、`credential_id`、`credential_label`、`key_enabled`、`protocol`、`priority`、`group_id`、`group_status`、`group_checked_at`、`catalog_state`、`price_state`、`price_covered`、`probe_state` 与最近探活 `probe`。`published` 表示校内模型和绑定已启用。`binding_ready` 还要求当前 Key 和分组的目录可核实。`bound_key_count` 按启用的绑定 Key 去重，`covered_bound_key_count` 只计目录当前确实列出绑定上游名的 Key。`bound_catalog_pending=true` 表示至少一条绑定的目录或分组待复核。`ready_count` 按已发布且就绪的 Key 和协议去重。部分已发布线路失去目录证据也会返回 `binding_issue`。
 
-`model_catalog[].school_model_id` 是校内模型在 `models.id` 中的 UUID，与用量报表的 `school_model_id` 相同。每个有已确认校内身份的目录行都返回该字段，客户端据此精确关联同名上游模型的校内用量。同一上游名绑定多个校内模型时分别成行，各行使用自己的 UUID，线路和统计只取该校内模型。仅官网发现、尚无校内绑定的目录行没有可确认的 UUID，此时省略该字段；旧响应没有此字段时，客户端可继续按 `school_model` 匹配，无法唯一确认时显示待确认。
+`model_catalog[].school_model_id` 是校内模型在 `models.id` 中的 UUID，与用量报表的 `school_model_id` 相同。每个有已确认校内身份的目录行都返回该字段，客户端据此精确关联同名上游模型的校内用量。同一上游名有多个当前校内目标时分别成行，各行使用自己的 UUID 和关联线路。当前目标的状态是 `active` 或 `pending_configuration`。有当前目标时，同名的 `inactive` 校内模型退出该上游名的当前目录行。仅官网发现、尚无校内身份的目录行省略该字段。旧响应没有此字段时，客户端可按 `school_model` 匹配，无法唯一确认时显示待确认。
 
 同一上游名的目录和官网证据会分发到所有同名校内行。`catalog_keys` 和 `credential_ids` 随后按该行的 `preferred_routes`、`bound_routes` 中出现的渠道过滤，只保留当前校内模型可用的 Key。相同 Key 同时属于两个校内模型时，两行都会显示；不同渠道各自绑定时分别显示。某行只有在自己没有当前目录证据时才进入 `published_unavailable`，不会因为同上游其他校内行的 Key 被误判。
 
@@ -484,7 +484,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 已发布型号的 `price_covered` 表示至少一条当前已发布且就绪的线路有可计算报价。待配置型号按绑定或可用的 Key 目录判断。手动价及可按 Token 计算的 `conditional` 都计入。通过缺价字段可核查反推价和缺字段的档位。批量启用逐条验证启用后的线路。
 
-线路就绪且报价阻止启用时，`model_catalog[].price_blocker` 返回 `{code, message}`，其中 `message` 说明涉及的字段及适用的档位号。常见代码包括 `missing_price`、`billing_mode_non_token`、`price_conditions_invalid`、`tier_missing_input`、`tier_missing_output`、`tier_range_invalid` 和 `effort_multiplier_invalid`。线路未就绪时，查看 `blockers` 中的 `no_ready_route`。
+线路就绪且报价阻止启用时，`model_catalog[].price_blocker` 返回 `{code, message}`，其中 `message` 说明涉及的字段及适用的档位号。常见代码包括 `missing_price`、`billing_mode_non_token`、`price_conditions_invalid`、`tier_missing_input`、`tier_missing_output`、`tier_range_invalid` 和 `effort_multiplier_invalid`。概览的 `blockers` 使用 `price_missing` 或 `conditional_price` 汇总报价原因，并显示线路原因 `no_candidate`、`multi_candidate` 或 `auth_failed`。
 
 使用官网报价时，概览的 `models[].price_conditions` 保留官网原值。可按 Token 解析的报价在 `price_conditions_exact` 中显示实际使用的报价字段，数值以字符串返回以保留小数精度。空或省略的计费模式默认按 Token 处理，明确以 Token 为主时会忽略附带的按次、图像和视频单价。
 
@@ -585,18 +585,20 @@ Key 证据不足时，只有标准余额计费、分组默认倍率有效且高�
 
 `POST .../beichen/models/enable-batch` 接收 `models` 数组，每批 1 至 200 个模型。每项可传校内模型 UUID（`school_model_id`）或最长 256 字符的上游名称。教师页优先提交 UUID，旧客户端可提交唯一的上游名称。响应的 `model` 使用请求项，成功的 `model_id` 是校内 UUID。
 
-单个和批量启用都支持新 Key 首次接入。候选尚未直接关联校内模型时，上游名称须有唯一的校内目标，且可用候选只能来自同一把 Key 和同一上游型号。这把 Key 可以为同一模型建立多个协议的绑定。有多个校内目标时，即使请求指定了 UUID，也须有直接关联的候选或已有绑定才能启用。首次建立绑定仍须通过当前目录权限、探活和报价检查。
+单个和批量启用都支持新 Key 首次接入。候选没有关联 UUID，或关联的是停用、已不存在的校内模型时，可使用同一上游名下唯一已确认的当前校内目标。首次自动建立绑定只使用同一把 Key 和同一上游型号，可覆盖多个协议，并须通过当前目录权限、探活和报价检查。有多个当前目标时须指定校内 UUID，并使用直接关联的候选或已有绑定。
 
-已有线路的 Key 仍为 active，但当前 Key 版本被目录认证或探活确认 401/403 时，单个启用返回 400 `VALIDATION_ERROR`，批量项返回 `route_not_ready`。响应提示教师显式重绑，模型状态、原绑定和发布审计保持不变。停用或退役 Key 仍可按唯一候选自动修复；多个候选继续阻断。
+已有线路的 Key 仍为 `active`，且当前 Key 版本被目录认证或探活确认 401/403 时，启用以 `auth_failed` 阻断并提示教师显式重绑。停用或退役 Key 可按唯一候选修复，多个候选会阻断修复。
+
+单个启用被阻断时，HTTP `400 VALIDATION_ERROR` 的 `error.details.code` 返回具体原因。批量启用在 `skipped[].code` 返回相同的阻断码。`no_candidate` 表示没有符合当前目标的线路，`multi_school` 表示按上游名称无法唯一选中当前校内目标，`multi_candidate` 表示候选线路不唯一，`auth_failed` 表示原绑定认证失败，`price_missing` 表示缺少可用报价或校内倍率。按 UUID 分行的目录中，依赖共享候选且无法启用的行显示 `no_candidate`。
 
 ```json
 {
   "enabled": [{"model": "model-a", "model_id": "uuid"}],
-  "skipped": [{"model": "model-b", "reason": "no_price", "message": "第 2 档缺少输出 Token 单价（output_price）"}]
+  "skipped": [{"model": "model-b", "reason": "no_price", "code": "price_missing", "message": "第 2 档缺少输出 Token 单价（output_price）"}]
 }
 ```
 
-`reason` 包括 `not_found`、`already_active`、`route_not_ready`、`no_price`、`enable_failed`。各模型独立提交，单项失败不会撤销已成功的其他模型；重复请求返回已启用的跳过结果。可计算的纯 Token 条件价可用于启用，空或省略的 `billing_mode` 默认按 Token 处理。单个启用的错误提示和批量结果的 `message` 使用与概览相同的报价说明。
+`reason` 包括 `not_found`、`already_active`、`duplicate_school_model`、`route_not_ready`、`no_price` 和 `enable_failed`。各模型独立提交，已健康启用的模型再次提交时返回 `already_active`。可计算的纯 Token 条件价可用于启用，空或省略的 `billing_mode` 默认按 Token 处理。单个启用的错误提示和批量结果的 `message` 使用与概览相同的报价说明。
 
 `PATCH .../beichen/models/price` 请求示例：
 

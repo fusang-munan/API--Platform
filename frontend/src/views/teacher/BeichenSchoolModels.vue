@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { teacherAPI } from '../../api/teacher'
 import { apiErrorMessage } from '../../api/client'
-import type { BeichenHealthDimension, BeichenModelUsage, BeichenProbeRun, BeichenUsageRange, BindingAdapter } from '../../api/types'
+import type { BeichenActivationBlockerCode, BeichenHealthDimension, BeichenModelUsage, BeichenProbeRun, BeichenUsageRange, BindingAdapter } from '../../api/types'
 import type { BeichenCatalogKey, BeichenPreferredRoute, BeichenPriceConditions, BeichenRebindPlan, BeichenRebindRoute, BeichenWebsiteKeyInventory, BeichenWebsiteLocation } from '../../api/types'
 import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { useToast } from '../../composables/useToast'
@@ -33,6 +33,16 @@ type PriceState = NonNullable<TeacherCatalogModel['price_state']>
 type BatchOutcome = { selector: string; model: string; status: 'enabled' | 'skipped' | 'failed'; reason: string }
 type ProbeBudget = { date: string; used: number; limit: number; remaining: number; exhausted: boolean }
 type ProbeRunWithBudget = BeichenProbeRun & { budget?: ProbeBudget }
+
+const routeBlockerCodes = new Set(['no_ready_route', 'no_candidate', 'multi_school', 'multi_candidate', 'auth_failed'])
+const priceBlockerCodes = new Set(['missing_price', 'price_missing', 'conditional_price'])
+const activationBlockerLabels: Record<BeichenActivationBlockerCode, string> = {
+  no_candidate: '没有可用的北辰候选线路，请检查渠道目录',
+  multi_school: '对应多个校内模型，请逐行确认后启用',
+  multi_candidate: '候选线路不唯一，请确认并绑定线路',
+  auth_failed: '原线路 Key 未通过认证，请显式重绑',
+  price_missing: '缺少可用报价，请同步官网价或设置手动价',
+}
 
 const overview = ref<TeacherOverview>()
 const websiteKeyInventory = ref<BeichenWebsiteKeyInventory>()
@@ -472,10 +482,11 @@ const catalog = computed(() => {
     const priceBlocker = changedGroup ? undefined : entry.price_blocker?.message.trim()
     const priceCovered = !retired && !websiteOnly && (changedGroup ? readyRoutes.some(route => route.price_covered)
       : entry.price_covered ?? row.priceReady)
-    const routeBlocked = routeCount === 0 || entry.blockers?.some(blocker => blocker.code === 'no_ready_route') === true
+    const routeBlocked = routeCount === 0 || entry.blockers?.some(blocker => routeBlockerCodes.has(blocker.code)) === true
     const blockerMessages = (entry.blockers ?? [])
-      .filter(blocker => !routeBlocked || (blocker.code !== 'missing_price' && blocker.code !== 'conditional_price'))
+      .filter(blocker => !routeBlocked || !priceBlockerCodes.has(blocker.code))
       .map(blocker => blocker.message?.trim()).filter(Boolean)
+    const authBlockerMessage = entry.blockers?.find(blocker => blocker.code === 'auth_failed')?.message
     const hasKnownGroup = (id?: string | null) => confirmedWebsiteKey(id)?.group_id != null
     const priceOptions = schoolPriceRoutes(entry, props.providerId, row.school)
       .sort((left, right) => Number(right.state === 'ready') - Number(left.state === 'ready') ||
@@ -556,7 +567,7 @@ const catalog = computed(() => {
       boundRoutes, boundKeyCount: entry.bound_key_count ?? boundIds.size, keyCoverage, catalogPending,
       historicalChannels: entry.historical_channels ?? [],
       routeCount, readyCount, priceState, priceCovered, priceMissing, routeBlocked,
-      blockers: [...new Set(blockerMessages)], priceBlocker,
+      blockers: [...new Set(blockerMessages)], priceBlocker, authBlockerMessage,
       listed, websiteOnly, source, locations, groupPrices, detailQuotes, detailWebsite, usageSharedUpstream,
       currentPriceRoute: primaryEvidence?.binding_ready ? primaryEvidence : undefined,
       backupPriceRoute: priceEvidence?.binding_ready && priceEvidence !== primaryEvidence ? priceEvidence : undefined,
@@ -815,6 +826,7 @@ function websiteLocationLabel(location: BeichenWebsiteLocation) {
 
 function canEnableReason(row: CatalogRow) {
   if (row.retired) return '型号已作废'
+  if (row.activation === 'blocked' && row.routeBlocked && row.blockers.length) return row.blockers.join('；')
   if (row.published && row.activation !== 'ready') return row.bindingIssue?.message || '已启用'
   if (!row.listed) return '当前没有渠道 Key 列出此模型'
   if (row.catalogPending) return '绑定 Key 的目录待复核'
@@ -1054,7 +1066,9 @@ async function enableBatch(retry = false) {
           if (enabled.has(key)) return { selector, model, status: 'enabled', reason: '已启用' }
           const item = skipped.get(key)
           if (item?.reason === 'already_active') return { selector, model, status: 'skipped', reason: item.message || '已启用' }
-          return { selector, model, status: 'failed', reason: item ? item.message || '线路或价格未就绪' : '服务器未返回结果，请刷新后重试' }
+          const reason = item ? item.message || (item.code && activationBlockerLabels[item.code]) || '线路或价格未就绪'
+            : '服务器未返回结果，请刷新后重试'
+          return { selector, model, status: 'failed', reason }
         })
       } catch (cause) {
         const reason = apiErrorMessage(cause, '启用失败，请稍后重试')
@@ -1466,6 +1480,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
               <small v-if="!row.websiteOnly && row.availabilityReason" class="row-note" data-testid="availability-reason">{{ row.availabilityReason }}</small>
               <small v-if="!row.websiteOnly && row.actionHint" class="row-note" data-testid="action-hint">下一步：{{ row.actionHint }}</small>
               <small v-if="row.bindingIssue && !row.partialGroupCheck && (!row.primaryGroupDenial || !row.deniedGroups.length)" class="row-note binding-issue">{{ row.bindingIssue.message }}</small>
+              <small v-if="row.published && row.authBlockerMessage" class="row-note binding-issue">{{ row.authBlockerMessage }}</small>
               <small v-if="row.protocolLabels.length" class="row-note">{{ row.protocolLabels.join(' · ') }}</small>
               <div v-if="!row.websiteOnly && row.probeState" class="model-probe">
                 <span class="status-pill" :class="{ active: row.probeState === 'passed', danger: row.probeState === 'failed', pending: row.probeState === 'unprobed' }">{{ probeLabels[row.probeState] }}</span>

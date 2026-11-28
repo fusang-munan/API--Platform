@@ -40,7 +40,12 @@ func saveCatalogFixture(t *testing.T, ctx context.Context, db *sql.DB, provider,
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	if err := saveKeyCatalogFixture(ctx, tx, syncJob{provider: provider, credential: credential, kind: "catalog"}, entries, time.Now().UTC()); err != nil {
+	// Catalog evidence is compared with the credential and group timestamps set by PostgreSQL.
+	var observedAt time.Time
+	if err := tx.QueryRowContext(ctx, "SELECT clock_timestamp()").Scan(&observedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveKeyCatalogFixture(ctx, tx, syncJob{provider: provider, credential: credential, kind: "catalog"}, entries, observedAt); err != nil {
 		t.Fatal(err)
 	}
 	if website != nil {
