@@ -22,7 +22,7 @@ function location(id: number, name: string, price: BeichenPriceConditions | null
 function currentRow() {
   return buildCurrentGroupPriceRow([
     location(2, '[CC1]Claudecode-kiro-015', claudePrice, { channel: 'Claude 渠道', price_scope: 'platform' }),
-  ], 16, { keyGroup: { id: 16, name: '[CC2]ClaudeCode高智', rate: '0.6' } })
+  ], 16, { schoolMultiplier: '1.10', keyGroup: { id: 16, name: '[CC2]ClaudeCode高智', rate: '0.6' } })
 }
 
 describe('北辰模型价格表', () => {
@@ -68,10 +68,19 @@ describe('北辰模型价格表', () => {
   it('账号倍率优先显示为生效倍率，并在表头说明分组与账号差异', () => {
     const row = buildCurrentGroupPriceRow([
       location(10, 'GPT 分组', { billing_mode: 'token', input_price: '0.000008', output_price: '0.00004' }),
-    ], 10, { keyGroup: { id: 10, name: 'GPT 分组', rate: '0.24', account_rate: '0.2' } })
+    ], 10, { schoolMultiplier: '1.10', keyGroup: { id: 10, name: 'GPT 分组', rate: '0.24', account_rate: '0.2' } })
     const wrapper = mount(BeichenGroupPrices, { props: { row, title: '当前 Key 分组 10 · 生效 0.20×' } })
     expect(wrapper.get('[data-testid="rate-note"]').text()).toBe('分组 0.24× / 账号 0.20×')
     expect(wrapper.findAll('[data-price-row="student"] td').map(node => node.text())).toEqual(['176', '880', '—', '—', '—'])
+  })
+
+  it('保留具体缺价原因，并将精确的零显示为数字', () => {
+    const row = currentRow()!
+    row.student = { input: null, output: null, cache5m: null, cache1h: null, cache_read: '0' }
+    row.student_status = { status: 'only_higher', reason: '500,000 Token 起有报价' }
+    const wrapper = mount(BeichenGroupPrices, { props: { row } })
+    expect(wrapper.get('[data-testid="student-price-status"]').text()).toBe('仅高档 · 500,000 Token 起有报价')
+    expect(wrapper.get('[data-price-row="student"] [data-price="cache_read"]').text()).toBe('0')
   })
 
   it('价格数字右对齐、使用等宽字体和等宽数字', () => {

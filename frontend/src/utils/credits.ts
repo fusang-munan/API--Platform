@@ -97,8 +97,19 @@ export function multiplyDecimal(value: string | number | null | undefined, facto
   const product = left * right
   const negative = parsed.sign !== multiplier.sign
   const digits = product.toString().padStart(scale + 1, '0')
-  const whole = digits.slice(0, -scale).replace(/^0+(?=\d)/, '')
+  const whole = (scale ? digits.slice(0, -scale) : digits).replace(/^0+(?=\d)/, '')
   const fraction = (scale ? digits.slice(-scale) : '').replace(/0+$/, '')
   const zero = whole === '0' && !fraction
   return (zero ? '' : negative ? '-' : '') + whole + (fraction ? '.' + fraction : '')
+}
+
+// Quote displays use one precision. A very small positive price must remain
+// distinguishable from a verified zero.
+export function formatPriceAmount(value: string | null | undefined, empty = '—'): string {
+  if (value == null) return empty
+  const digits = 8
+  const shown = trimDecimal(value, digits)
+  if (shown === '—') return empty
+  if (shown === '0' && /[1-9]/.test(value)) return '<0.' + '0'.repeat(digits - 1) + '1'
+  return shown
 }

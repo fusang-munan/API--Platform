@@ -23,8 +23,9 @@ func newActionsPostgres(t *testing.T) (context.Context, *sql.DB, uuid.UUID, uuid
 		t.Skip("需要隔离的本机 nebula_test PostgreSQL")
 	}
 	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil || cfg.Host != "127.0.0.1" || cfg.Database != "nebula_test" || cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
-		t.Fatal("仅允许连接 sslmode=disable 的本机 nebula_test 测试数据库")
+	if err != nil || cfg.Host != "127.0.0.1" || (cfg.Database != "nebula_test" && cfg.Database != "nebula_test_hjb") ||
+		cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
+		t.Fatal("仅允许连接 sslmode=disable 的本机 nebula_test 或 nebula_test_hjb 测试数据库")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	t.Cleanup(cancel)

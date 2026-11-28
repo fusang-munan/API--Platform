@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { creditsToYuan, formatCredits, formatPercent, formatTokens, formatYuan, multiplyDecimal, shiftDecimal, trimDecimal } from './credits'
+import { creditsToYuan, formatCredits, formatPercent, formatPriceAmount, formatTokens, formatYuan, multiplyDecimal, shiftDecimal, trimDecimal } from './credits'
 
 describe('credit display helpers', () => {
   it('trims and groups credit strings', () => {
@@ -29,5 +29,16 @@ describe('credit display helpers', () => {
     expect(multiplyDecimal('150', '1.10')).toBe('165')
     expect(multiplyDecimal('0.15', '1.1')).toBe('0.165')
     expect(multiplyDecimal('187.5', '1.10')).toBe('206.25')
+    expect(multiplyDecimal('50', '1')).toBe('50')
+    expect(multiplyDecimal('9007199254740993', '2')).toBe('18014398509481986')
+    expect(multiplyDecimal('0', '2')).toBe('0')
+    expect(multiplyDecimal('-2', '3')).toBe('-6')
+  })
+
+  it('uses the same display precision while distinguishing zero, tiny prices and missing prices', () => {
+    expect(formatPriceAmount('0.550000000000001')).toBe('0.55')
+    expect(formatPriceAmount('0.000000001')).toBe('<0.00000001')
+    expect(formatPriceAmount('0.000000000')).toBe('0')
+    expect(formatPriceAmount(null, '缺价')).toBe('缺价')
   })
 })

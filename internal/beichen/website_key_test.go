@@ -43,16 +43,16 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 		{name: "effective rate can differ from the default",
 			keyFields: strings.Replace(keyFields, `"effective_rate_multiplier":0.6`, `"effective_rate_multiplier":0.5`, 1),
 			usage:     strings.Replace(usage, "0.006", "0.005", 1), wantRate: "0.5", wantKeyRead: true},
-		{name: "account rates outage skips Key billing", ratesStatus: http.StatusServiceUnavailable,
-			wantReason: "官网账户倍率表读取失败（HTTP 503）"},
-		{name: "invalid account rates response skips Key billing", rates: "null",
-			wantReason: "官网账户倍率表读取失败"},
-		{name: "subscription group skips Key billing", nonStandard: true,
-			wantReason: "官网分组不是标准余额计费"},
+		{name: "account rates outage allows the verified group default", ratesStatus: http.StatusServiceUnavailable,
+			keyStatus: http.StatusNotFound, wantKeyRead: true, rejectKey: "Key 账单读取失败（HTTP 404）"},
+		{name: "invalid account rates response still prefers verified Key billing", rates: "null",
+			usage: usage, wantRate: "0.6", wantKeyRead: true},
+		{name: "subscription group cannot sign the default rate", nonStandard: true,
+			wantReason: "官网分组不是标准余额计费", wantKeyRead: true},
 		{name: "unknown peak state does not allow the default rate", unknownPeak: true,
-			wantReason: "官网分组未确认关闭高峰计费"},
+			wantReason: "官网分组未确认关闭高峰计费", wantKeyRead: true},
 		{name: "peak group uses the default rate with the active peak multiplier", peakGroup: true, wantRate: "1.2",
-			rejectKey: "官网分组未确认关闭高峰计费"},
+			rejectKey: "官网分组未确认关闭高峰计费", wantKeyRead: true},
 		{name: "Key billing HTTP 404 falls back to the group default", keyStatus: http.StatusNotFound, wantKeyRead: true,
 			rejectKey: "Key 账单读取失败（HTTP 404）"},
 		{name: "omitted group is distinct from a conflicting group", keyFields: strings.TrimPrefix(keyFields, `"group_id":16,`),
@@ -242,8 +242,10 @@ func TestDirectoryAccountRateCoverage(t *testing.T) {
 		{WebsiteGroup: WebsiteGroup{ID: 4, Rate: &defaultRate}, Subscription: "standard"},
 	}}}}
 	rates := map[int64]json.Number{1: "0.4"}
-	fallback := map[int64]*billingInfo{1: nil, 2: {Multiplier: "0.5", APIKeyID: 42}, 3: nil}
-	crawl.applyAccountRates(rates, fallback)
+	fallback := map[int64]crawlKeyRate{1: {groupID: 1},
+		2: {groupID: 2, info: &billingInfo{Multiplier: "0.5", APIKeyID: 42}},
+		3: {groupID: 3, groupDefault: &defaultRate}}
+	crawl.applyAccountRates(rates, fallback, nil)
 	groups := crawl.platforms[0].Groups
 	if crawl.AccountRateError != "" || !matchesAccountRate(&groups[0].WebsiteGroup, "0.4", "", 0) ||
 		!matchesAccountRate(&groups[1].WebsiteGroup, "0.5", keyBillingRateSource, 42) ||
@@ -256,8 +258,8 @@ func TestDirectoryAccountRateCoverage(t *testing.T) {
 		t.Fatal("the fallback rate must be independent of the default rate")
 	}
 
-	fallback[4] = nil
-	crawl.applyAccountRates(rates, fallback)
+	fallback[4] = crawlKeyRate{groupID: 4}
+	crawl.applyAccountRates(rates, fallback, nil)
 	if crawl.AccountRateError != "部分北辰渠道的账户倍率未核实" ||
 		!matchesAccountRate(&groups[3].WebsiteGroup, "", "", 0) {
 		t.Fatalf("directory did not report a checked group without verified evidence: %s", crawl.AccountRateError)

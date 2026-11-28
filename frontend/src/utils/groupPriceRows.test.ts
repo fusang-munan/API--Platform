@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { BeichenPriceConditions, BeichenWebsiteGroup, BeichenWebsiteLocation } from '../api/types'
-import { buildCurrentGroupPriceRow, priceReferenceText } from './groupPriceRows'
+import { buildCurrentGroupPriceRow as buildPriceRow, priceReferenceText, type GroupPriceRowOptions } from './groupPriceRows'
+
+function buildCurrentGroupPriceRow(locations: BeichenWebsiteLocation[], group?: number, options?: GroupPriceRowOptions) {
+  return buildPriceRow(locations, group, { schoolMultiplier: '1.10', ...options })
+}
 
 const claudePrice: BeichenPriceConditions = {
   billing_mode: 'token',
@@ -23,6 +27,14 @@ function location(group: BeichenWebsiteGroup, price: BeichenPriceConditions | nu
 }
 
 describe('当前 Key 分组价格行', () => {
+  it('按后端系数计算 1 元 × 100 × 0.5 × 1.10 并保留零价', () => {
+    const locations = [location({ id: 10, rate_multiplier: '0.5' },
+      { billing_mode: 'token', input_price: '0.000001', output_price: '0', cache_read_price: null })]
+    expect(buildPriceRow(locations, 10, { schoolMultiplier: '1.10' })?.student)
+      .toMatchObject({ input: '55', output: '0', cache_read: null })
+    expect(buildPriceRow(locations, 10, { schoolMultiplier: '1' })?.student.input).toBe('50')
+    expect(buildPriceRow(locations, 10)?.student.input).toBeNull()
+  })
   it('当前分组有完整官网价时，直接使用该分组基础价', () => {
     const row = buildCurrentGroupPriceRow([
       location({ id: 16, name: '[CC2]ClaudeCode高智', status: 'active', rate_multiplier: '0.6' }),

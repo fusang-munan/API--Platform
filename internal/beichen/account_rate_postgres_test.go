@@ -53,6 +53,7 @@ VALUES($1,'CC1',sha256($2::bytea),false)`, credential, ciphertext)
 	keyList := websiteKeyListFixture(secret, "CC1", keyID, groupID)
 	actual := "0.006"
 	billingStatus, billingGroup := http.StatusOK, groupID
+	billingErrorBody := "fixture-response:" + secret + ":" + bearer
 	ratesStatus := http.StatusOK
 	accountRates := `{"code":0,"data":{"6":0.08,"10":0.2}}`
 	sampleAge := time.Second
@@ -92,8 +93,7 @@ VALUES($1,'CC1',sha256($2::bytea),false)`, credential, ciphertext)
 				body = fmt.Sprintf(`{"data":[{"id":%q,"supported_protocols":["anthropic"]}]}`, model)
 			case billingPath:
 				if billingStatus != http.StatusOK {
-					body := "fixture-response:" + secret + ":" + bearer
-					return &http.Response{StatusCode: billingStatus, Body: io.NopCloser(strings.NewReader(body))}, nil
+					return &http.Response{StatusCode: billingStatus, Body: io.NopCloser(strings.NewReader(billingErrorBody))}, nil
 				}
 				groupField := ""
 				if billingGroup != 0 {
@@ -165,16 +165,12 @@ FROM beichen_price_at($1,$2,COALESCE($3::timestamptz,statement_timestamp()))`, c
 	job := syncJob{provider: provider, credential: credential, kind: "billing"}
 	checkBilling := func(wantSource string) {
 		t.Helper()
-		wantPriced := wantSource != ""
-		wantState, wantCount, wantRate, wantKey := "current", int64(1), "0.6", int64(0)
+		wantRate, wantKey := "0.6", int64(0)
 		if wantSource == keyBillingRateSource {
 			wantKey = keyID
 		}
-		if !wantPriced {
-			wantState, wantCount, wantRate = "stale", 0, ""
-		}
 		busy, err := service.runJob(ctx, job, true)
-		if busy || (wantPriced && err != nil) || (!wantPriced && !errors.Is(err, errWebsiteAccountRateUnverified)) {
+		if busy || err != nil {
 			t.Fatalf("unexpected billing job result: busy=%t err=%v", busy, err)
 		}
 		view, err := service.Overview(ctx, provider, today)
@@ -182,18 +178,16 @@ FROM beichen_price_at($1,$2,COALESCE($3::timestamptz,statement_timestamp()))`, c
 			t.Fatal(err)
 		}
 		item := datasetForCredential(t, view, credential, "billing")
-		if item.BillingState != wantState || item.GroupStatus != "assigned" || item.GroupID == nil || *item.GroupID != groupID ||
-			item.GroupRate == nil || *item.GroupRate != "0.6" || item.EffectiveMultiplierText != "0.6" ||
-			!matchesAccountRate(&WebsiteGroup{AccountRate: item.AccountRate, AccountRateSource: item.AccountRateSource},
-				wantRate, wantSource, 0) ||
-			(item.LastError == nil) != wantPriced || view.WebsiteSync.PricedChannels != wantCount {
-			t.Fatalf("unexpected billing or coverage after rate check: %+v", item)
+		accountRate := item.AccountRate
+		if wantSource == "" {
+			accountRate = item.websiteAccountRate
 		}
-		if !wantPriced {
-			const want = "北辰官网账户倍率未核实，分组倍率仅供参考：官网账户倍率表读取失败（HTTP 503）"
-			if *item.LastError != want {
-				t.Fatalf("expected stored billing error %q, got %+v", want, item)
-			}
+		if item.BillingState != "current" || item.GroupStatus != "assigned" || item.GroupID == nil || *item.GroupID != groupID ||
+			item.GroupRate == nil || *item.GroupRate != "0.6" || item.EffectiveMultiplierText != "0.6" ||
+			!matchesAccountRate(&WebsiteGroup{AccountRate: accountRate, AccountRateSource: item.AccountRateSource},
+				wantRate, wantSource, 0) ||
+			item.LastError != nil || view.WebsiteSync.PricedChannels != 1 {
+			t.Fatalf("unexpected billing or coverage after rate check: %+v", item)
 		}
 		index := slices.IndexFunc(view.KeyCapabilities, func(capability KeyCapability) bool {
 			return capability.CredentialID == credential && capability.Label == "CC1"
@@ -206,7 +200,7 @@ FROM beichen_price_at($1,$2,COALESCE($3::timestamptz,statement_timestamp()))`, c
 			capability.WebsiteGroup.ID != groupID || capability.WebsiteGroup.Rate == nil || *capability.WebsiteGroup.Rate != "0.6" {
 			t.Fatalf("CC1 capability disagrees with current billing evidence: %+v", capability.WebsiteGroup)
 		}
-		priceAt(nil, wantPriced)
+		priceAt(nil, true)
 	}
 
 	checkBilling(groupRateSource)
@@ -261,19 +255,47 @@ FROM beichen_price_at($1,$2,COALESCE($3::timestamptz,statement_timestamp()))`, c
 	if err := db.QueryRowContext(ctx, "SELECT statement_timestamp()").Scan(&priorPriceAt); err != nil {
 		t.Fatal(err)
 	}
-	// The last Key usage check can retain a rate read from the website.
-	// A subsequent billing outage must suppress that previously displayed rate.
+	// The last usage check observed an account rate. A later outage uses the
+	// confirmed group default while retaining previous directory history.
 	accountRates = `{"code":0,"data":{"16":0.5}}`
 	if err := service.RefreshKeyUsage(ctx, provider, credential, KeyUsageTarget{}); err != nil {
 		t.Fatal(err)
 	}
 	ratesStatus = http.StatusServiceUnavailable
-	checkDirectory("", "", 0, websiteAccountRatesReadFailure)
+	checkDirectory("0.6", groupRateSource, 0, websiteAccountRatesReadFailure)
 	if afterCount, afterRate, afterSource := history(); afterCount != count || afterRate != rate || afterSource != source {
 		t.Fatalf("outage overwrote verified directory history: %d, %s, %s", afterCount, afterRate, afterSource)
 	}
-	checkBilling("")
+	checkBilling(groupRateSource)
 	priceAt(&priorPriceAt, true)
+
+	ratesStatus = http.StatusOK
+	for _, damagedRates := range []string{`{"code":0,"data":[]}`, `{"code":0,"data":{"16":{"invalid":true},"6":0.08}}`} {
+		accountRates = damagedRates
+		checkDirectory("0.6", groupRateSource, 0, websiteAccountRatesReadFailure)
+		checkBilling(groupRateSource)
+	}
+	// An unrelated malformed entry cannot discard this group's valid rate.
+	accountRates = `{"code":0,"data":{"16":0.6,"6":"invalid"}}`
+	checkDirectory("0.6", "", 0, websiteAccountRatesReadFailure)
+	checkBilling("")
+
+	// An explicit denial is authoritative even while the entire table is down.
+	ratesStatus = http.StatusServiceUnavailable
+	billingStatus, billingErrorBody = http.StatusForbidden, `{"error":{"type":"GROUP_NOT_ALLOWED","message":"fixture-private"}}`
+	checkDirectory("", "", 0, websiteAccountRatesReadFailure)
+	busy, err := service.runJob(ctx, job, true)
+	if busy || !errors.Is(err, errKeyGroupNotAllowed) {
+		t.Fatalf("explicit denial did not block the group fallback: busy=%t err=%v", busy, err)
+	}
+	view, err := service.Overview(ctx, provider, today)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item := datasetForCredential(t, view, credential, "billing"); item.GroupStatus != "not_allowed" || item.BillingState != "stale" {
+		t.Fatalf("expected a blocked billing status: %+v", item)
+	}
+	priceAt(nil, false)
 }
 
 func matchesAccountRate(group *WebsiteGroup, rate, source string, keyID int64) bool {
