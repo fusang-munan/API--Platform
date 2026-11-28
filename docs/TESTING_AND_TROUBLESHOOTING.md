@@ -366,7 +366,7 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 运行 `go test ./internal/beichen -run '^(TestEnableModelCatalogSourceBoth|TestActivationCatalogSourceNeedsKeyEvidence|TestActivationCatalogSourceWebsiteOnlyNeedsBinding)Postgres$' -count=1 -v` 验证 `both`。生产形状使用组 `31`、倍率 `0.5`、确认价格、两种协议探活成功和唯一当前校内目标；同时覆盖 Key 目录过期、分组拒绝与 `website` 无绑定。
 
-运行 `go test ./internal/beichen -run '^(TestEnableModel(MissingAliasFallsBackToUpstream|AliasAndUpstreamDifferentLiveTargets|ValidAliasTakesPriority)|TestActivationNoCandidateDiagnostics)Postgres$' -count=1 -v` 验证别名路径和诊断计数。用例覆盖失效别名回退、有效别名优先、active 与 pending 两种冲突目标、概览两行关闭启用、按 alias UUID 仍阻断、无绑定或审计写入，以及单模型和批量诊断字段。
+运行 `go test ./internal/beichen -run '^(TestEnableModel(StaleCandidateFallsBackToUniqueSelectableTarget|MissingAliasFallsBackToUpstream|AliasAndUpstreamDifferentLiveTargets|ValidAliasTakesPriority)|TestActivationNoCandidateDiagnostics|TestDefaultRoutesUniqueNilCandidateUsesFallback|TestActivationFallbackDiagnosticsExcludeDirectMatches)Postgres?$' -count=1 -v` 验证别名路径、唯一目标回退和诊断计数。用例覆盖旧 UUID 与空 UUID 候选在唯一目标下回退、`hasActivationMapping=false`、website-only 拒绝回退、active 与 pending 两种冲突目标、概览两行关闭启用、按 alias UUID 仍阻断、无绑定或审计写入，以及 direct 与 fallback 混合时的计数。
 
 测试中刚写入的 Key 目录被判为陈旧时，核对目录观测时间是否早于凭据版本或分组变更。构造当前目录的测试数据使用 PostgreSQL 时钟，避免 Windows 上应用与数据库的时钟精度差异影响时间先后。
 

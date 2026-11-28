@@ -52,6 +52,7 @@ type activationSchool struct {
 	name, status         string
 	multiplier           *int64
 	hasActivationMapping bool
+	websiteOnly          bool
 	bindings             []activationBinding
 }
 
@@ -131,16 +132,8 @@ func (m *activationModel) blockerDiagnostics(blocker CatalogBlocker) map[string]
 func (m *activationModel) fallbackSchool() *activationSchool {
 	if schools := m.selectableSchools(); len(schools) == 1 {
 		target := schools[0]
-		if target.hasActivationMapping {
+		if !target.websiteOnly {
 			return target
-		} else {
-			for _, candidates := range m.defaults {
-				for _, candidate := range candidates {
-					if candidate.schoolID != uuid.Nil {
-						return target
-					}
-				}
-			}
 		}
 	} else if len(schools) == 0 && len(m.schools) == 1 {
 		// A sole disabled target can still repair its existing route.
@@ -160,7 +153,11 @@ func (m *activationModel) applyFallbackSchools() {
 	}
 	for _, candidates := range m.defaults {
 		for i := range candidates {
-			candidates[i].fallbackSchoolID = fallback.id
+			if candidates[i].schoolID == fallback.id {
+				candidates[i].fallbackSchoolID = uuid.Nil
+			} else {
+				candidates[i].fallbackSchoolID = fallback.id
+			}
 		}
 	}
 }
@@ -397,26 +394,28 @@ WITH `+catalog.BeichenKeyEvidenceCTE+`, `+activationSchoolSourcesSQL+`, north AS
  WHERE b.provider_id=$1 AND s.status='active' AND btrim(b.upstream_model_name)<>''
    AND ($2::text='' OR btrim(b.upstream_model_name)::citext=$2::citext)
 ), school_names AS (
- SELECT n.model_id AS upstream,alias_target.id,k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AS key_or_binding
+ SELECT n.model_id AS upstream,alias_target.id,k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AS key_or_binding,
+   k.catalog_source='website' AS website_source
  FROM north n JOIN provider_model_catalog k ON k.provider_id=$1 AND k.model_id=n.model_id
  CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
  `+joinModelAliasSQL+`
  JOIN models alias_target ON alias_target.model_id=alias.school_model::citext
  WHERE (k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+`) OR $2::text=''
  UNION
- SELECT n.model_id AS upstream,upstream_target.id,k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AS key_or_binding
+ SELECT n.model_id AS upstream,upstream_target.id,k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AS key_or_binding,
+   k.catalog_source='website' AS website_source
  FROM north n JOIN provider_model_catalog k ON k.provider_id=$1 AND k.model_id=n.model_id
  CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
  JOIN models upstream_target ON upstream_target.model_id=a.model::citext
  WHERE (k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+`) OR $2::text=''
  UNION ALL
- SELECT n.model_id,b.model_id,true FROM north n JOIN model_bindings b ON b.provider_id=$1 AND lower(btrim(b.upstream_model_name))=lower(n.model_id::text)
+ SELECT n.model_id,b.model_id,true,false FROM north n JOIN model_bindings b ON b.provider_id=$1 AND lower(btrim(b.upstream_model_name))=lower(n.model_id::text)
 ), names AS (
- SELECT upstream,id,bool_or(key_or_binding) AS key_or_binding FROM school_names
+ SELECT upstream,id,bool_or(key_or_binding) AS key_or_binding,bool_or(website_source) AS website_source FROM school_names
  WHERE $3::uuid IS NULL OR upstream IN (SELECT upstream FROM school_sources)
  GROUP BY upstream,id
 )
-SELECT n.upstream::text,m.id,m.model_id::text,m.status,m.credit_multiplier_milli,n.key_or_binding,b.id,b.adapter,b.upstream_model_name,
+SELECT n.upstream::text,m.id,m.model_id::text,m.status,m.credit_multiplier_milli,n.key_or_binding,n.website_source AND NOT n.key_or_binding,b.id,b.adapter,b.upstream_model_name,
  b.provider_id,p.name::text,b.priority,b.status='active',b.credential_id,
  COALESCE(b.credential_id IS NOT NULL AND bc.status='active' AND bc.retired_at IS NULL AND (
    `+catalog.BeichenCatalogAuthFailureSQL+` OR EXISTS (
@@ -463,7 +462,7 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 		var priority *int
 		var active, authFailedActiveKey, reachable *bool
 		var bindingKey *uuid.UUID
-		if err := bound.Scan(&source, &school.id, &school.name, &school.status, &school.multiplier, &school.hasActivationMapping, &id, &adapter, &upstream, &owner, &providerName,
+		if err := bound.Scan(&source, &school.id, &school.name, &school.status, &school.multiplier, &school.hasActivationMapping, &school.websiteOnly, &id, &adapter, &upstream, &owner, &providerName,
 			&priority, &active, &bindingKey, &authFailedActiveKey, &reachable, &key, &label); err != nil {
 			return nil, err
 		}

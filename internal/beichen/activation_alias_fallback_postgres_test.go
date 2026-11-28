@@ -247,6 +247,56 @@ func TestActivationNoCandidateDiagnosticsPostgres(t *testing.T) {
 	})
 }
 
+func TestDefaultRoutesUniqueNilCandidateUsesFallback(t *testing.T) {
+	target := &activationSchool{id: uuid.New(), name: "school-target", status: "active"}
+	provider, key := uuid.New(), uuid.New()
+	m := &activationModel{
+		provider: provider, multiSchoolTargets: false, diagnostics: newActivationDiagnostics(),
+		schools: map[uuid.UUID]*activationSchool{target.id: target},
+		defaults: map[string][]activationCandidate{
+			"openai_responses": {{route: PreferredRoute{UpstreamModel: firstConnectUpstream, ProviderID: provider, CredentialID: &key, Adapter: "openai_responses"}}},
+		},
+	}
+	m.applyFallbackSchools()
+	if candidate := m.defaults["openai_responses"][0]; candidate.fallbackSchoolID != target.id {
+		t.Fatalf("unique target did not receive a nil-school candidate: %+v", candidate)
+	}
+	routes, blocker := m.defaultRoutes(target)
+	if blocker.Code != "" || len(routes) != 1 || routes[0].SchoolModel != target.name {
+		t.Fatalf("unique nil candidate did not match: routes=%+v blocker=%+v", routes, blocker)
+	}
+	m.updateCandidateDiagnostics()
+	if m.diagnostics[diagnosticCandidateRows] != 1 || m.diagnostics[diagnosticMatchingSchool] != 0 ||
+		m.diagnostics[diagnosticFallbackSchool] != 1 || m.diagnostics[diagnosticSchools] != 1 {
+		t.Fatalf("unexpected nil candidate diagnostics: %+v", m.diagnostics)
+	}
+}
+
+func TestActivationFallbackDiagnosticsExcludeDirectMatches(t *testing.T) {
+	target := &activationSchool{id: uuid.New(), name: "school-target", status: "active"}
+	oldTarget, provider, directKey, fallbackKey := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	m := &activationModel{
+		provider: provider, diagnostics: newActivationDiagnostics(),
+		schools: map[uuid.UUID]*activationSchool{target.id: target},
+		defaults: map[string][]activationCandidate{
+			"openai_responses": {
+				{schoolID: target.id, route: PreferredRoute{UpstreamModel: firstConnectUpstream, ProviderID: provider, CredentialID: &directKey, Adapter: "openai_responses"}},
+				{schoolID: oldTarget, route: PreferredRoute{UpstreamModel: firstConnectUpstream, ProviderID: provider, CredentialID: &fallbackKey, Adapter: "openai_responses"}},
+			},
+		},
+	}
+	m.applyFallbackSchools()
+	direct, fallback := m.defaults["openai_responses"][0], m.defaults["openai_responses"][1]
+	if direct.fallbackSchoolID != uuid.Nil || fallback.fallbackSchoolID != target.id {
+		t.Fatalf("fallback assignment mixed direct and fallback candidates: direct=%+v fallback=%+v", direct, fallback)
+	}
+	m.updateCandidateDiagnostics()
+	if m.diagnostics[diagnosticCandidateRows] != 2 || m.diagnostics[diagnosticMatchingSchool] != 1 ||
+		m.diagnostics[diagnosticFallbackSchool] != 1 || m.diagnostics[diagnosticSchools] != 1 {
+		t.Fatalf("direct match was counted as fallback: %+v", m.diagnostics)
+	}
+}
+
 func assertActivationDiagnostics(t *testing.T, details map[string]any, want map[string]int) {
 	t.Helper()
 	for key, expected := range want {
