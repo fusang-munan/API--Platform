@@ -7,7 +7,7 @@ import type {
 export type StudentAvailabilityState = 'available' | 'degraded' | 'maintenance' | 'probe_failed'
   | 'channel_unavailable' | 'unverified' | 'disabled' | 'not_published'
 
-type StudentAvailabilityInfo = { availability_state?: StudentAvailabilityState }
+type StudentAvailabilityInfo = { availability_state?: StudentAvailabilityState; addable?: boolean }
 export type StudentModel = Model & StudentAvailabilityInfo
 export type StudentModelCandidate = ModelCatalogCandidate & StudentAvailabilityInfo
 export type StudentModelCatalogPage = Omit<ModelCatalogPage, 'items'> & { items: StudentModelCandidate[] }

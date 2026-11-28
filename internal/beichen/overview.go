@@ -56,7 +56,12 @@ type Model struct {
 	PriceConditionsExact map[string]any  `json:"price_conditions_exact,omitempty"`
 	UpstreamRates        *DisplayRates   `json:"upstream_rates"`
 	SchoolRates          *DisplayRates   `json:"school_rates"`
-	PriceCovered         bool            `json:"price_covered"`
+	// SchoolRates are base credits before the school surcharge. Follow
+	// rates already include the effective upstream multiplier.
+	SchoolRatesIncludeEffectiveMultiplier bool         `json:"school_rates_include_effective_multiplier,omitempty"`
+	QuoteEffectiveMultiplier              *string      `json:"quote_effective_multiplier"`
+	StudentPrice                          StudentPrice `json:"student_price"`
+	PriceCovered                          bool         `json:"price_covered"`
 
 	available          bool
 	currentKey         bool // the saved row belongs to this revision of the credential
@@ -76,6 +81,20 @@ type DisplayRates struct {
 	CacheRead  *string `json:"cache_read"`
 	CacheWrite *string `json:"cache_write"`
 }
+
+type StudentPrice struct {
+	Status string `json:"status"`
+	Reason string `json:"reason"`
+}
+
+const (
+	studentPriceNoRoute     = "no_route"
+	studentPriceRatePending = "multiplier_pending"
+	studentPriceNoBase      = "missing_base_price"
+	studentPriceHigher      = "only_higher"
+	studentPriceManual      = "manual"
+	studentPriceNormal      = "normal"
+)
 
 type Comparison struct {
 	CredentialID             uuid.UUID `json:"credential_id"`
@@ -108,6 +127,7 @@ type Overview struct {
 	Credentials        []CredentialSummary    `json:"credentials"`
 	KeyCapabilities    []KeyCapability        `json:"key_capabilities"`
 	Datasets           []Dataset              `json:"datasets"`
+	SchoolMultipliers  map[uuid.UUID]string   `json:"school_multipliers"`
 	Models             []Model                `json:"models"`
 	ModelCatalog       []CatalogModel         `json:"model_catalog"`
 	Comparison         []Comparison           `json:"comparison"`
@@ -151,6 +171,7 @@ type CatalogModel struct {
 	ReadyCount           int                       `json:"ready_count"`
 	PriceState           string                    `json:"price_state"`
 	PriceCovered         bool                      `json:"price_covered"`
+	StudentPrice         StudentPrice              `json:"student_price"`
 	PriceBlocker         *CatalogBlocker           `json:"price_blocker,omitempty"`
 	Blockers             []CatalogBlocker          `json:"blockers"`
 	Activation           string                    `json:"activation"`
@@ -169,16 +190,17 @@ type CatalogModel struct {
 
 type CatalogBoundRoute struct {
 	catalog.BeichenBinding
-	UpstreamModel   string     `json:"upstream_model"`
-	CredentialID    *uuid.UUID `json:"credential_id"`
-	CredentialLabel string     `json:"credential_label"`
-	KeyEnabled      bool       `json:"key_enabled"`
-	GroupID         *int64     `json:"group_id"`
-	GroupStatus     string     `json:"group_status,omitempty"`
-	GroupCheckedAt  *time.Time `json:"group_checked_at,omitempty"`
-	CatalogState    string     `json:"catalog_state"`
-	PriceState      string     `json:"price_state"`
-	PriceCovered    bool       `json:"price_covered"`
+	UpstreamModel   string       `json:"upstream_model"`
+	CredentialID    *uuid.UUID   `json:"credential_id"`
+	CredentialLabel string       `json:"credential_label"`
+	KeyEnabled      bool         `json:"key_enabled"`
+	GroupID         *int64       `json:"group_id"`
+	GroupStatus     string       `json:"group_status,omitempty"`
+	GroupCheckedAt  *time.Time   `json:"group_checked_at,omitempty"`
+	CatalogState    string       `json:"catalog_state"`
+	PriceState      string       `json:"price_state"`
+	PriceCovered    bool         `json:"price_covered"`
+	StudentPrice    StudentPrice `json:"student_price"`
 }
 
 type CatalogBlocker struct {
@@ -255,6 +277,11 @@ func (s *Service) Overview(ctx context.Context, providerID uuid.UUID, day string
 	}
 	if err == nil {
 		err = readCatalogDifferences(ctx, tx, providerID, &view)
+		for i := range view.ModelCatalog {
+			if item := &view.ModelCatalog[i]; item.StudentPrice.Status == "" || item.Retired {
+				item.StudentPrice = noStudentPriceRoute("")
+			}
+		}
 	}
 	if err == nil {
 		view.ProbeRun, err = readProbeRun(ctx, tx, providerID)
@@ -399,7 +426,8 @@ SELECT k.credential_id, k.model_id::text, k.catalog_source, price.mode,
         'cache_write_price',trim_scale(version.cache_write_rate * 0.000000000001::numeric)))
        WHEN `+catalog.BeichenPanelQuoteCurrentSQL+`
        THEN snap.model_pricing -> (k.model_id::text) END,
-  COALESCE(version.source,''),version.observed_at,
+  COALESCE(version.source,''),COALESCE(version.observed_at, CASE WHEN `+catalog.BeichenPanelQuoteCurrentSQL+` THEN snap.effective_at END),
+  CASE WHEN `+catalog.BeichenPanelQuoteCurrentSQL+` THEN trim_scale(quote_rate.multiplier)::text END,
   CASE WHEN follow.current THEN trim_scale(price.upstream_input)::text END,
   CASE WHEN follow.current THEN trim_scale(price.upstream_output)::text END,
   CASE WHEN follow.current THEN trim_scale(price.upstream_cache_read)::text END,
@@ -419,9 +447,11 @@ JOIN beichen_key_evidence e ON e.credential_id=c.id
 CROSS JOIN LATERAL (SELECT `+catalog.BeichenKeyListsModelSQL+` AS current) key_catalog
 LEFT JOIN models named ON named.model_id = k.model_id
 LEFT JOIN LATERAL (
-  SELECT effective_at,expires_at,credential_revision,credential_ciphertext_sha256,group_id,model_pricing FROM beichen_panel_snapshots
+  SELECT effective_at,expires_at,credential_revision,credential_ciphertext_sha256,group_id,model_pricing,multiplier_version FROM beichen_panel_snapshots
   WHERE credential_id = c.id AND effective_at <= statement_timestamp() ORDER BY effective_at DESC LIMIT 1
 ) snap ON true
+LEFT JOIN beichen_multiplier_versions quote_rate ON quote_rate.id=snap.multiplier_version
+  AND quote_rate.credential_id=c.id AND quote_rate.effective_at<=snap.effective_at
 LEFT JOIN LATERAL (
   SELECT school.status AS school_status, b.status = 'active' AS binding_ready
   FROM model_bindings b JOIN models school ON school.id = b.model_id
@@ -456,7 +486,7 @@ ORDER BY k.credential_id, k.model_id`, providerID)
 		var terms, rawEntry, protocols []byte
 		var passed, fixedPrice bool
 		err := rows.Scan(&model.CredentialID, &model.Model, &model.CatalogSource, &model.Mode,
-			&model.SchoolStatus, &model.RouteReady, &terms, &model.PriceSource, &model.PriceObservedAt,
+			&model.SchoolStatus, &model.RouteReady, &terms, &model.PriceSource, &model.PriceObservedAt, &model.QuoteEffectiveMultiplier,
 			&upstream.Input, &upstream.Output, &upstream.CacheRead, &upstream.CacheWrite,
 			&school.Input, &school.Output, &school.CacheRead, &school.CacheWrite, &model.available, &model.currentKey, &model.catalogCurrent, &rawEntry, &protocols,
 			&model.lastProbeAt, &passed, &model.credentialRejected, &fixedPrice)
@@ -504,8 +534,9 @@ ORDER BY k.credential_id, k.model_id`, providerID)
 		} else if model.priceReadiness.conditional || fixedPrice && conditionalPanelPricing(terms) {
 			model.PriceStatus = "conditional"
 		}
-		if school.Input != nil {
+		if school.Input != nil || school.Output != nil {
 			model.SchoolRates = &school
+			model.SchoolRatesIncludeEffectiveMultiplier = true
 		}
 		model.PriceCovered = model.priceReadiness.ready()
 		view.Models = append(view.Models, model)
@@ -535,7 +566,9 @@ func readCredentials(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view
 	// Catalog and price errors can be written as part of that billing job.
 	rows, err := tx.QueryContext(ctx, `
 SELECT c.id, c.label::text, c.status, s.catalog_at, s.prices_at, s.billing_at, s.usage_at, s.last_error,
-  p.status = 'active' AND c.status = 'active', octet_length(c.credential_ciphertext) > 0, c.updated_at
+  p.status = 'active' AND c.status = 'active', octet_length(c.credential_ciphertext) > 0, c.updated_at,
+  (CASE WHEN EXISTS (SELECT 1 FROM beichen_provision_channels school WHERE school.credential_id=c.id)
+    THEN 1.10 ELSE 1 END)::text
 FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
 LEFT JOIN beichen_datasets b ON b.credential_id = c.id AND b.kind = 'billing'
 CROSS JOIN LATERAL (
@@ -559,15 +592,18 @@ ORDER BY c.label, c.id`, providerID)
 	}
 	defer rows.Close()
 	view.Credentials = []CredentialSummary{}
+	view.SchoolMultipliers = make(map[uuid.UUID]string)
 	for rows.Next() {
 		var item CredentialSummary
 		var enabled, configured bool
 		var revision time.Time
+		var schoolMultiplier string
 		times := []**time.Time{&item.CatalogLastSuccess, &item.PricesLastSuccess, &item.BillingLastSuccess, &item.UsageLastSuccess}
 		if err := rows.Scan(&item.CredentialID, &item.Label, &item.Status, times[0], times[1], times[2], times[3], &item.LastError,
-			&enabled, &configured, &revision); err != nil {
+			&enabled, &configured, &revision, &schoolMultiplier); err != nil {
 			return err
 		}
+		view.SchoolMultipliers[item.CredentialID] = schoolMultiplier
 		item.LastError = billing[item.CredentialID].groupReadError(item.LastError)
 		for _, timestamp := range times {
 			if *timestamp != nil {
@@ -619,9 +655,11 @@ func readPreferredRoutes(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, 
 		row := &view.Models[i]
 		name := strings.ToLower(row.Model)
 		row.RouteReady, row.PriceCovered = false, false
+		row.StudentPrice = noStudentPriceRoute("")
 		for _, route := range capabilities[name] {
 			if route.CredentialID != nil && *route.CredentialID == row.CredentialID {
 				row.RouteReady, row.PriceCovered = route.BindingState == "ready", route.PriceCovered
+				row.StudentPrice = studentPriceForRoute(row, route, row.RouteReady)
 				break
 			}
 		}
@@ -682,7 +720,7 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 	for _, school := range m.schools {
 		hasPublishedSchool = hasPublishedSchool || school.status == "active"
 	}
-	priceStates := item.applyRouteEvidence(capabilities, hasPublishedSchool)
+	priceStates := item.applyRouteEvidence(capabilities, records, hasPublishedSchool)
 	switch {
 	case len(priceStates) > 1:
 		item.PriceState = "mixed"
@@ -746,7 +784,8 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 	return item, nil
 }
 
-func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability, publishedSchool bool) map[string]bool {
+func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability,
+	records map[string]map[uuid.UUID]*Model, publishedSchool bool) map[string]bool {
 	type routeKey struct {
 		credential uuid.UUID
 		protocol   string
@@ -755,7 +794,9 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability, pub
 	bound, covered := make(map[uuid.UUID]bool), make(map[uuid.UUID]bool)
 	var publishedProtocols, candidateProtocols []catalog.ProtocolCapability
 	priceStates := make(map[string]bool)
-	invalidBinding, groupDenied := false, false
+	invalidBinding, groupDenied, groupPending := false, false, false
+	item.StudentPrice = noStudentPriceRoute("")
+	var pricePriority int
 	for _, row := range rows {
 		current := row.CatalogState == "key_listed" && row.KeyEnabled
 		if current {
@@ -766,10 +807,15 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability, pub
 		}
 		priceBasis := !publishedSchool && len(row.Bindings) > 0 && current
 		for _, b := range row.Bindings {
+			var record *Model
+			if row.CredentialID != nil {
+				record = records[strings.ToLower(row.Model)][*row.CredentialID]
+			}
+			studentPrice := studentPriceForRoute(record, row, b.BindingReady)
 			item.BoundRoutes = append(item.BoundRoutes, CatalogBoundRoute{
 				BeichenBinding: b, UpstreamModel: row.Model, CredentialID: row.CredentialID, CredentialLabel: row.CredentialLabel,
 				GroupID: row.GroupID, GroupStatus: row.GroupStatus, GroupCheckedAt: row.GroupCheckedAt, KeyEnabled: row.KeyEnabled,
-				CatalogState: row.CatalogState, PriceState: row.PriceState, PriceCovered: row.PriceCovered,
+				CatalogState: row.CatalogState, PriceState: row.PriceState, PriceCovered: row.PriceCovered, StudentPrice: studentPrice,
 			})
 			if row.CredentialID != nil && row.KeyEnabled {
 				bound[*row.CredentialID] = true
@@ -781,7 +827,13 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability, pub
 			}
 			invalidBinding = invalidBinding || b.Published && !b.BindingReady
 			groupDenied = groupDenied || b.Published && row.KeyEnabled && row.GroupStatus == "not_allowed"
+			groupPending = groupPending || b.Published && row.KeyEnabled && !b.BindingReady &&
+				(row.GroupStatus == "pending" || row.GroupStatus == "not_found")
 			if b.BindingReady {
+				rank, currentRank := studentPrice.rank(), item.StudentPrice.rank()
+				if rank > currentRank || rank == currentRank && b.Priority < pricePriority {
+					item.StudentPrice, pricePriority = studentPrice, b.Priority
+				}
 				key := routeKey{*row.CredentialID, b.Protocol}
 				ready[key], candidates[key], priceBasis = true, true, true
 				publishedProtocols = append(publishedProtocols, b.ProtocolCapability)
@@ -809,9 +861,15 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability, pub
 				item.ModelAvailability.AvailabilityReason = item.BindingIssue.Message
 			case item.ReadyCount > 0:
 				item.BindingIssue.Message = "部分已发布线路需要检查绑定 Key 和目录。"
+				if groupDenied || groupPending {
+					item.BindingIssue = &CatalogBlocker{"partial_group_check", "部分线路的绑定 Key 分组待核对。"}
+				}
 			case len(candidates) == 0:
 				item.BindingIssue = &CatalogBlocker{"catalog_missing", "学校已启用该模型，当前 Key 目录里已找不到它。请同步目录并核查供货渠道。"}
 			}
+		}
+		if item.ReadyCount == 0 && item.BindingIssue != nil {
+			item.StudentPrice.Reason = item.BindingIssue.Message
 		}
 	} else {
 		item.ModelAvailability = catalog.SummarizeModelAvailability(item.Model, "active", candidateProtocols)
@@ -836,6 +894,92 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability, pub
 		item.ActionHint = "发起探活以确认已发布协议。"
 	}
 	return priceStates
+}
+
+func noStudentPriceRoute(groupStatus string) StudentPrice {
+	switch groupStatus {
+	case "not_allowed":
+		return StudentPrice{studentPriceNoRoute, "该线路的绑定 Key 分组无权限"}
+	case "not_found":
+		return StudentPrice{studentPriceNoRoute, "该线路的绑定 Key 分组不存在"}
+	case "pending":
+		return StudentPrice{studentPriceNoRoute, "该线路的绑定 Key 分组待核对"}
+	default:
+		return StudentPrice{studentPriceNoRoute, "没有已就绪的发布线路"}
+	}
+}
+
+func (price StudentPrice) rank() int {
+	switch price.Status {
+	case studentPriceNormal, studentPriceManual:
+		return 4
+	case studentPriceHigher:
+		return 3
+	case studentPriceRatePending:
+		return 2
+	case studentPriceNoBase:
+		return 1
+	}
+	return 0
+}
+
+func studentPriceForRoute(model *Model, route catalog.ModelCapability, ready bool) StudentPrice {
+	if !ready {
+		return noStudentPriceRoute(route.GroupStatus)
+	}
+	if model != nil {
+		fixed := model.SchoolRates != nil && model.SchoolRates.Input != nil && model.SchoolRates.Output != nil
+		switch {
+		case fixed && model.Mode == "manual":
+			return StudentPrice{studentPriceManual, "使用教师设置的基础单价和学校系数"}
+		case model.PriceSource == derivedPriceSource:
+			return StudentPrice{studentPriceNoBase, "历史流水反推价待核对"}
+		case route.PriceState == "conditional":
+			if model.QuoteEffectiveMultiplier == nil {
+				return StudentPrice{studentPriceRatePending, "该条件价缺少同一报价快照的生效倍率"}
+			}
+			if onlyHigherPriceTiers(model.PriceConditions, model.PriceConditionsExact) {
+				return StudentPrice{studentPriceHigher, "官网只提供较高输入 Token 档位的单价"}
+			}
+			return StudentPrice{studentPriceNormal, "使用当前线路的官网条件价"}
+		case fixed:
+			return StudentPrice{studentPriceNormal, "使用当前线路已应用生效倍率的单价"}
+		}
+	}
+	if route.MultiplierState != "current" {
+		return StudentPrice{studentPriceRatePending, "当前线路的生效倍率待核对"}
+	}
+	if route.PriceBlocker != nil {
+		return StudentPrice{studentPriceNoBase, route.PriceBlocker.Message}
+	}
+	return StudentPrice{studentPriceNoBase, "当前线路缺少可用的基础单价"}
+}
+
+func onlyHigherPriceTiers(raw json.RawMessage, exact map[string]any) bool {
+	intervals, _ := exact["intervals"].([]any)
+	if len(intervals) == 0 {
+		return false
+	}
+	for _, interval := range intervals {
+		tier, _ := interval.(map[string]any)
+		if tier["min_tokens"] == "0" {
+			return false
+		}
+	}
+	// Multiplier intervals have a base quote outside their ranges. The
+	// normalized terms replace those multipliers with absolute tier prices.
+	var terms struct {
+		Intervals []map[string]json.RawMessage `json:"intervals"`
+	}
+	_ = json.Unmarshal(raw, &terms)
+	for _, tier := range terms.Intervals {
+		for _, field := range []string{"input_multiplier", "output_multiplier", "cache_read_multiplier", "cache_write_multiplier"} {
+			if value := tier[field]; len(value) > 0 && !bytes.Equal(value, []byte("null")) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (item *CatalogModel) addPriceEvidence(row catalog.ModelCapability, states map[string]bool) {

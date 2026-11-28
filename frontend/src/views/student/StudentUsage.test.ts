@@ -277,27 +277,31 @@ describe('StudentUsage', () => {
     expect(wrapper.get('a[href="student-models"]').text()).toBe('到模型广场添加模型')
 
     const table = wrapper.get('[data-testid="student-model-summary"]')
+    expect(table.element.closest('details')?.open).toBe(false)
+    expect(wrapper.get('.usage-key-list').element.compareDocumentPosition(table.element) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     const rows = table.findAll('tbody tr')
     expect(rows).toHaveLength(3)
     expect(rows[0].get('th').text()).toContain('文本模型')
-    expect(rows[0].findAll('td').slice(0, 3).map(cell => cell.text())).toEqual(['0.00080000000000003', '2', '240'])
+    expect(rows[0].findAll('td').slice(0, 2).map(cell => cell.text())).toEqual(['0.00080000000000003', '2'])
+    expect(rows[0].get('td[data-label="Token"]').text()).toContain('240')
+    expect(rows[0].get('td[data-label="Token"] small').text()).toBe('完整')
     expect(rows[0].get('td[data-label="缓存命中率"]').text()).toContain('37.5%')
-    expect(rows[0].get('td[data-label="缓存命中率"] small').text()).toBe('覆盖 2/2 笔')
-    expect(rows[1].get('td[data-label="Token"]').text()).toBe('130')
-    expect(rows[1].get('td[data-label="调用次数"]').text()).toBe('0')
-    expect(rows[1].get('td[data-label="说明"]').text()).toContain('部分回报（0/1 笔完整）')
+    expect(rows[0].get('td[data-label="缓存命中率"] small').text()).toBe('完整 · 覆盖 2/2 笔')
+    expect(rows[1].get('td[data-label="Token"]').text()).toContain('130')
+    expect(rows[1].get('td[data-label="调用次数"]').text()).toBe('未回报')
+    expect(rows[1].get('td[data-label="Token"] small').text()).toBe('部分回报（0/1 笔完整）')
     expect(rows[1].get('td[data-label="说明"]').text()).toContain('未分类 126 Token')
     expect(rows[1].get('td[data-label="说明"]').text()).toContain('待核 1 笔（预留 10 积分）')
-    expect(rows[1].get('td[data-label="缓存命中率"]').text()).toContain('—')
+    expect(rows[1].get('td[data-label="缓存命中率"]').text()).toContain('无样本')
     expect(rows[1].get('td[data-label="缓存命中率"] small').text()).toBe('覆盖 0/1 笔')
     expect(rows[1].text()).not.toContain('零额已结算')
-    expect(rows[2].get('td[data-label="Token"]').text()).toBe('—')
-    expect(rows[2].get('td[data-label="说明"]').text()).toBe('无回报 · 零额已结算')
+    expect(rows[2].get('td[data-label="Token"]').text()).toBe('无样本')
+    expect(rows[2].get('td[data-label="说明"]').text()).toBe('零额已结算')
     const total = table.get('tfoot tr')
     expect(total.get('td[data-label="已扣积分"]').text()).toBe('0.00080000000000003')
     expect(total.get('td[data-label="调用次数"]').text()).toBe('3')
-    expect(total.get('td[data-label="Token"]').text()).toBe('370')
-    expect(total.get('td[data-label="缓存命中率"] small').text()).toBe('覆盖 2/4 笔')
+    expect(total.get('td[data-label="Token"]').text()).toContain('370')
+    expect(total.get('td[data-label="缓存命中率"] small').text()).toBe('部分回报 · 覆盖 2/4 笔')
   })
 
   it('keeps idle and inactive Keys visible and expands model details independently for each project and Key', async () => {
@@ -306,19 +310,14 @@ describe('StudentUsage', () => {
 
     const keys = wrapper.findAll('[data-testid="usage-key-row"]')
     expect(keys).toHaveLength(4)
-    expect(keys[0].findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual([
-      '0.00040000000000001', '0.25', '49.74959999999999999',
+    expect(keys.map(row => row.findAll('.usage-key-totals dd').map(cell => cell.text()))).toEqual([
+      ['项目一', '0.00040000000000001', '1'],
+      ['项目一', '0', '0'],
+      ['项目二', '0.00040000000000002', '1'],
+      ['项目二', '0', '1'],
     ])
-    expect(keys[0].text()).toContain('本项目个人可用积分')
-    expect(keys[0].findAll('.usage-key-metrics dd').map(cell => cell.text())).toEqual(['1', '270', '2'])
-    expect(keys[0].text()).toContain('待核 1 笔')
-    expect(keys[1].text()).toContain('暂无模型记录')
-    expect(keys[1].findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['0', '0.125', '49.74959999999999999'])
-    expect(keys[1].find('button').exists()).toBe(false)
-    expect(keys[2].findAll('.usage-key-credits dd')[2].text()).toBe('0')
+    expect(wrapper.find('.usage-key-models table').exists()).toBe(false)
     expect(keys[3].text()).toContain('已停用')
-    expect(keys[3].findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['0', '0', '0'])
-    expect(keys[3].findAll('.usage-key-metrics dd').map(cell => cell.text())).toEqual(['1', '—', '1'])
 
     const first = keys[0].get('button')
     const other = keys[2].get('button')
@@ -329,11 +328,23 @@ describe('StudentUsage', () => {
     expect(other.attributes('aria-expanded')).toBe('false')
     const details = document.getElementById(first.attributes('aria-controls')!)!
     expect(details.querySelectorAll('tbody tr')).toHaveLength(2)
+    expect(details.querySelector('td[data-label="已扣积分"]')?.textContent?.trim()).toBe('0.00040000000000001')
+    expect(details.textContent).toContain('本项目个人可用积分')
+    expect(details.textContent).toContain('49.74959999999999999')
+    expect(details.textContent).toContain('待核 1 笔')
     expect(details.textContent).toContain('22.2%')
     expect(details.textContent).toContain('部分回报')
     await first.trigger('click')
     expect(first.attributes('aria-expanded')).toBe('false')
     expect(details.querySelector('table')).toBeNull()
+    await other.trigger('click')
+    const otherDetail = document.getElementById(other.attributes('aria-controls')!)!
+    expect(otherDetail.querySelectorAll('tbody tr')).toHaveLength(1)
+    expect(otherDetail.querySelector('td[data-label="已扣积分"]')?.textContent?.trim()).toBe('0.00040000000000002')
+    await keys[1].get('button').trigger('click')
+    const idle = document.getElementById(keys[1].get('button').attributes('aria-controls')!)!
+    expect(idle.textContent).toContain('暂无模型记录')
+    expect(idle.textContent).toContain('0.125')
 
     const chart = wrapper.get('.usage-project-heading button')
     expect(chart.attributes('aria-expanded')).toBe('false')
@@ -358,7 +369,7 @@ describe('StudentUsage', () => {
     ])
     expect(wrapper.get('h1').text()).toBe('2026 年 10 月个人用量')
     expect(wrapper.text()).toContain('所选月暂无模型用量')
-    expect(wrapper.text()).toContain('所选月暂无项目和 Key 记录')
+    expect(wrapper.text()).toContain('所选月暂无 Key 记录')
 
     pending.resolve(response(currentUsage))
     await flushPromises()
@@ -376,14 +387,14 @@ describe('StudentUsage', () => {
     expect(stat('pending')).toBe('1.375')
     expect(stat('available')).toBe('91.375')
     const row = wrapper.get('[data-testid="usage-key-row"]')
-    expect(row.findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['7.25', '1.375', '35'])
-    expect(row.findAll('.usage-key-metrics dd').map(cell => cell.text())).toEqual(['—', '—', '1'])
-    expect(row.text()).toContain('有待核账记录')
+    expect(row.findAll('.usage-key-totals dd').map(cell => cell.text())).toEqual(['旧项目', '7.25', '未回报'])
 
     await row.get('button').trigger('click')
+    expect(wrapper.get('.usage-key-models').text()).toContain('有待核账记录')
+    expect(wrapper.get('.usage-key-details').findAll('dd').map(cell => cell.text())).toEqual(['1.375', '35', '无样本', '无样本'])
     const model = wrapper.get('.usage-key-models tbody tr')
     expect(model.get('th').text()).toContain('旧版模型')
-    expect(model.findAll('td').map(cell => cell.text())).toEqual(['7.25', '3', '—', '—', '—'])
+    expect(model.findAll('td').map(cell => cell.text())).toEqual(['7.25', '3', '无样本', '无样本', ''])
   })
 
   it('handles mistyped optional fields and keeps an available totals amount when models are missing', async () => {
@@ -406,9 +417,10 @@ describe('StudentUsage', () => {
     expect(wrapper.get('[role="alert"]').text()).toContain('模型汇总读取失败')
     expect(stat('used')).toBe('0.00080000000000003')
     const row = wrapper.get('[data-testid="usage-key-row"]')
-    expect(row.findAll('.usage-key-credits dd').map(cell => cell.text())).toEqual(['7.25', '1.375', '35'])
-    expect(row.findAll('.usage-key-metrics dd').map(cell => cell.text())).toEqual(['—', '—', '—'])
-    expect(row.text()).toContain('模型明细暂不可用')
+    expect(row.findAll('.usage-key-totals dd').map(cell => cell.text())).toEqual(['旧项目', '7.25', '未回报'])
+    await row.get('button').trigger('click')
+    expect(wrapper.get('.usage-key-details').findAll('dd').map(cell => cell.text())).toEqual(['1.375', '35', '无样本', '无样本'])
+    expect(wrapper.get('.usage-key-models').text()).toContain('模型明细暂不可用')
   })
 
   it('keeps an expanded Key open during and after refreshing the same month', async () => {
@@ -429,6 +441,25 @@ describe('StudentUsage', () => {
     expect(request).toHaveBeenCalledTimes(2)
     expect(button.attributes('aria-expanded')).toBe('true')
     expect(detail.querySelectorAll('tbody tr')).toHaveLength(2)
+  })
+
+  it('shows a reported zero cache hit rate separately from total-only and ledger-only rows', async () => {
+    const zeroHit = { ...firstModel, cache_hit_rate: 0, cache_hit_coverage: {
+      sample_calls: 1, cache_read_tokens: '0', input_with_cache_read_tokens: '100',
+    } }
+    const totalOnly = { ...pendingModel, tokens: { ...blankMetrics.tokens, total: '130' } }
+    const trueZero = { ...zeroModel, id: 'zero-calls', calls: 0 }
+    mountUsage({ ...currentUsage, models: [zeroHit, totalOnly, zeroModel, trueZero] })
+    await flushPromises()
+    const rows = wrapper.get('[data-testid="student-model-summary"]').findAll('tbody tr')
+    expect(rows[0].get('[data-label="缓存命中率"]').text()).toContain('0%')
+    expect(rows[0].get('[data-label="缓存命中率"] small').text()).toContain('完整')
+    expect(rows[1].get('[data-label="Token"]').text()).toContain('130')
+    expect(rows[1].get('[data-label="Token"]').text()).toContain('部分回报')
+    expect(rows[1].get('[data-label="缓存命中率"]').text()).toContain('无样本')
+    expect(rows[1].get('[data-label="调用次数"]').text()).toBe('未回报')
+    expect(rows[3].get('[data-label="调用次数"]').text()).toBe('0')
+    expect(rows[2].get('[data-label="Token"]').text()).toBe('无样本')
   })
 
   it('separates a failed read from an empty month and retries the selected month', async () => {
@@ -473,7 +504,7 @@ describe('StudentUsage', () => {
     expect(modal.get('.usage-recent-detail code').text()).toBe(recentCall.request_id)
     expect(modal.get('.usage-recent-detail').text()).toContain('项目一')
     expect(modal.get('.usage-recent-detail').text()).toContain('成功')
-    expect(modal.findAll('.usage-receipt-tokens dd').map(cell => cell.text())).toEqual(['100', '20', '0', '—'])
+    expect(modal.findAll('.usage-receipt-tokens dd').map(cell => cell.text())).toEqual(['100', '20', '0', '无样本'])
     expect(request).toHaveBeenCalledTimes(2)
 
     request.mockResolvedValueOnce(failure())
@@ -514,7 +545,8 @@ describe('StudentUsage', () => {
     expect(request.mock.lastCall?.[0]).toBe('/api/v1/student/usage/recent?range=month&limit=20')
     today.resolve(response({ items: [recentCall], next_cursor: 'old-cursor' }))
     await flushPromises()
-    expect(modal.get('[role="status"]').text()).toBe('所选范围暂无调用记录')
+    expect(modal.get('p.usage-recent-empty[role="status"]').text()).toBe('所选范围暂无调用记录')
+    expect(modal.find('.usage-recent-list').exists()).toBe(false)
     expect(modal.find('.usage-recent-more').exists()).toBe(false)
 
     const all = pendingResponse()
@@ -525,6 +557,7 @@ describe('StudentUsage', () => {
     await flushPromises()
     expect(request.mock.lastCall?.[1]?.signal?.aborted).toBe(true)
     expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(document.querySelector('.usage-recent-empty')).toBeNull()
 
     request.mockResolvedValueOnce(response({ items: [], next_cursor: null }))
     const reopened = await openCallDialog('recent')
@@ -546,7 +579,7 @@ describe('StudentUsage', () => {
       expect(narrow).toBeDefined()
       const rules = Array.from(narrow!.cssRules).filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
       expect(rules.find(rule => rule.selectorText === '.usage-key-row')?.style.getPropertyValue('grid-template-areas'))
-        .toBe("'identity action' 'credits credits' 'metrics metrics'")
+        .toBe("'name action' 'totals totals'")
       expect(rules.find(rule => rule.selectorText === '.usage-receipt-form')?.style.getPropertyValue('grid-template-columns'))
         .toBe('minmax(0, 1fr)')
     } finally {
@@ -574,7 +607,7 @@ describe('StudentUsage', () => {
       '文本模型', callReceipt.request_id, '0.00080000000000003', '已结算', '北辰', '已用回执补记',
     ])
     expect(detail.findAll('.usage-receipt-tokens dd').map(cell => cell.text())).toEqual([
-      '9,007,199,254,740,993', '3', '0', '—', '9,007,199,254,740,996',
+      '9,007,199,254,740,993', '3', '0', '无样本', '9,007,199,254,740,996',
     ])
     expect(detail.get('.usage-evidence').text()).toContain('部分回报 · 仅回报了部分缓存写入量')
 
@@ -633,6 +666,6 @@ describe('StudentUsage', () => {
     expect(detail.text()).toContain('暂无匹配回执')
     expect(detail.get('.usage-evidence').text()).toContain('分项用量不完整')
     expect(detail.get('.usage-receipt-meta').text()).toContain('已扣积分—')
-    expect(detail.findAll('.usage-receipt-tokens dd').map(cell => cell.text())).toEqual(['—', '4', '—', '—', '130'])
+    expect(detail.findAll('.usage-receipt-tokens dd').map(cell => cell.text())).toEqual(['无样本', '4', '无样本', '无样本', '130'])
   })
 })

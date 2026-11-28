@@ -204,6 +204,17 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 ### 北辰接入验收
 
+0.29.0 渠道回归需设置 `NEBULA_CHANNEL_TEST_POSTGRES`，指向隔离的本机 `nebula_test_*` 数据库。迁移包验证 0071 升到 0072 后的独立渠道登记、旧 Gemini 恢复和官网 Key 归属。从仓库根目录运行以下命令，使用 Go 的测试覆盖文件载入官网身份核对用例。
+
+```powershell
+go test -p 1 -overlay internal/infrastructure/db/migrations/testdata/beichen_channel_tests.overlay.json ./internal/beichen ./internal/infrastructure/db/migrations -run 'TestBeichen(Channel|TeacherPanel|IndependentChannel|Restores|UpgradeChain)' -count=1
+go test ./internal/dataplane ./internal/usage -run 'TestBeichenGemini' -count=1
+```
+
+若教师登记或更换 Key 被拒绝，先检查可信 HTTPS 入口，再核对活动渠道登记和官网 Key 归属。收到 Gemini 归属待确认时，核实原凭据后在恢复请求中传入 `confirm_retired_channel`。若原生目录或探活已确认而仍只有兼容线路，检查教师是否完成显式绑定。定时扫描只更新候选和线路状态。
+
+运行 `go test -p 1 ./internal/infrastructure/db/migrations ./internal/beichen ./internal/controlplane -run 'Test(BeichenUpgradeChain|AccountRateConflictBlocks|PeerKeyConflict|RebindRestoresOnly|ScheduledBeichenMaterialization|GeminiCatalogMaterialization)' -count=1 -v` 复查回归。用例覆盖 0065 未改动的凭据经 0067 回填后仍需确认、0072 原 SQL 重放、账单缺分组号仍识别倍率冲突、两把 Key 顺序采价和 401/403 后旧重绑令牌失效。`NEBULA_TEST_POSTGRES` 支持白名单内的本机 `nebula_test_integration` 与 `nebula_test_rev_integration`。已配置却不合规的目录集成测试连接会报错。
+
 1. 在隔离的本机 PostgreSQL 测试库运行 `go test ./...`。设置 `NEBULA_TEST_POSTGRES` 指向回环地址上的 `nebula_test` 后，可验证报价快照、小数精度、重复流水、延迟结算及并发超额。前端运行 `npm run typecheck`、`npm run test` 和 `npm run build`。
 2. 从已核实的学校 HTTPS 入口核对镜像版本与收件公钥。教师页应直接显示同一模型的首选倍率和启用状态。目录有模型但暂缺倍率时要显示待同步。核对价格时查看同一把北辰 Key 的分组、基础输入输出价、缓存价格、倍率和适用时段。
 3. 校方准备好真实验收后，使用同一把学生 Key，四条渠道各发一笔短文本请求。依次记录学生可用额、学校请求编号、上游响应编号，以及北辰官网使用明细的数字 Key ID、模型、用量和实扣。收到响应但账单尚未出现时保留待核，继续读取相同编号。
@@ -244,15 +255,15 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 浏览器价格弹层从 `channels/available` 的 `supported_models[].pricing` 读取，悬停和切换型号不会请求另一份价表。价格结构中的缓存 1h/12h、图片、视频单价、分档和推理强度倍率按发布值保留。遇到 Key 只列出少数型号时，查看「Key 实际型号核对」中的分组 ID 和错误。只有该 Key 的 `GET /v1/models` 返回成功且匹配其当前分组时，才计入匹配。HTTP 403 或分组待核实时，确认支持目录读取的 Key 与目标分组已经匹配，再刷新官网目录。
 
-网页通过 `GET /api/v1/groups/rates` 在分组默认倍率之外显示当前账号的倍率。该端点只返回分组 ID 和倍率，不提供来源或 Key 编号；目录分组直接命中时省略 `account_rate_source` 和 `account_rate_key_id`。核对分组报价时同时比较默认倍率、账户倍率和有效倍率。该请求整张失败时，官网已列分组本轮仍待核，历史版本保留，`website_directory.last_run.account_rate_error` 记录「官网账户倍率表读取失败」；它与“响应成功但缺少某个分组”不同，后者才可能进入 Key 账单或分组倍率回退。回归用例分别改变默认倍率、价格和个人倍率，并验证失败前后不会产生虚假的历史版本。
+网页通过 `GET /api/v1/groups/rates` 在分组默认倍率之外显示当前账号的倍率。该端点只返回分组 ID 和倍率，不提供来源或 Key 编号；目录分组直接命中时省略 `account_rate_source` 和 `account_rate_key_id`。核对分组报价时同时比较默认倍率、账户倍率和有效倍率。该请求整张失败、缺少当前分组或只有其他分组单条损坏时，会继续检查当前分组下每把 Key 的账单证据；无冲突且标准余额计费、默认倍率有效、高峰明确关闭时可以回退，有冲突时保持待核并保留冲突原因。`website_directory.last_run.account_rate_error` 在无冲突整表失败时记录「官网账户倍率表读取失败」，有冲突时记录「北辰账户倍率证据冲突」及具体原因。回归用例分别改变默认倍率、价格和个人倍率，并验证失败前后不会产生虚假的历史版本。
 
-CC1 的账单提示「北辰官网账户倍率未核实」时，先区分三种情况。`官网账户倍率表读取失败` 表示整张表失败：不要检查 Key 账单或分组默认倍率回退，官网已列分组仍待核，历史版本保留。只有响应成功但缺少当前分组时，才进入回退。
+CC1 的账单提示「北辰官网账户倍率未核实」时，先区分无证据和证据冲突。`官网账户倍率表读取失败` 表示整张表失败，但仍要继续检查当前 Key 账单是否给出与分组默认不同的明确倍率；没有冲突时可按分组默认值回退，有冲突时整组待核。响应成功但缺少当前分组、账单 404 或账单没有有效倍率同样属于无账户证据，不代表可以忽略其他 Key 已给出的冲突。同一分组多把 Key 冲突时，`account_rate_error` 必须保留「北辰账户倍率证据冲突」原因。
 
 Key 账单回退要求同一把活跃 Key、同一分组、账单分组号和 Key 编号明确、账单默认倍率与官网一致、高峰状态明确关闭、账单样本仍有效，并与最近 30 分钟抓取的北京时间当天同 Key 同组完整用量精确匹配。完整用量需有请求，实付除以原价的比值必须等于账单生效倍率。共用官网目录只有该组仅有一把活跃 Key 时才能发布 `key_billing`。`Key 账单读取失败（HTTP 404）` 表示接口未找到；`Key 账单缺少分组号（group_id 未提供或为 0）` 表示标准账单未提供回退所需的独立分组证据。分组号、Key 编号、默认倍率、高峰状态或采样时间不符时，页面指出对应校验项。用量不足时可在教师页点「核对这个 Key」刷新官网用量后再同步。这些 Key 账单错误只有在 `group_rate` 也无法形成时才可能进入 `billing.last_error`；`group_rate` 成功时，缺少 Key 账单证据也可以完成同步。Key 账单或型号清单返回 `GROUP_NOT_ALLOWED` 时，分组状态为 `not_allowed`，当前报价失效。
 
-Key 证据不足时，标准余额计费、分组默认倍率有效且高峰开关已知的分组发布 `group_rate`，高峰开启或关闭都支持。`account_rate_multiplier` 取默认倍率，`effective_multiplier` 仍应用高峰规则，`group_rate` 不带个人 Key 编号。高峰开启时，高峰倍率、时区和起止时间必须能解析，否则报价不可结算。只有分组不是 standard、默认倍率无效、高峰状态未知，或整表读取失败，才继续保持未核实。官网目录完全没有列出该分组时，继续使用既有 Key-only 账单和型号路径。目录摘要出现「部分北辰渠道的账户倍率未核实」时，说明至少一个已检查渠道既没有 Key 账单证据，也不满足 `group_rate` 条件，按该渠道的分组类型、默认倍率和高峰开关排查。
+Key 证据不足时，只有标准余额计费、分组默认倍率有效且高峰明确关闭的分组才发布 `group_rate`。`account_rate_multiplier` 取默认倍率，`effective_multiplier` 保持同一值，`group_rate` 不带个人 Key 编号。高峰开启或状态未知时不得回退，新报价待核。整表读取失败不会自动阻止所有分组：无冲突分组仍可判断回退，冲突优先阻断。同一分组只要任一 Key 出现账单倍率与默认不同、账单分组号冲突或高峰冲突，其他 Key 的 Key 账单或分组默认值都不能覆盖该冲突。目录摘要出现「部分北辰渠道的账户倍率未核实」时，说明至少一个已检查渠道既没有 Key 账单证据，也不满足 `group_rate` 条件；出现「北辰账户倍率证据冲突」时，按冲突 Key 的账单倍率、分组号和高峰状态排查。
 
-在隔离的本机 PostgreSQL 上，运行 `go test ./internal/beichen ./internal/infrastructure/db -run 'TestWebsiteKeyBillingAccountRates|TestKeyCapabilityAccountRateEvidence|TestBeichenAccountRateKeyIdentityPostgres|TestBeichenDirectAccountRateFreshnessPostgres|TestBeichenPersonalQuoteAfterGroupMovePostgres|TestBeichenPersonalQuoteAfterGroupRemovedPostgres|TestBeichenAgedDirectKeySnapshotPostgres|TestBeichenCC1AccountRateFallbackPostgres|TestBeichenBillingGroupRefreshPostgres|TestBeichenMigration0070AccountRateSource|TestBeichenMigration0071GroupRateSource' -count=1`。覆盖交付会话、官网账户倍率优先、目录直接值不产生 Key 编号、Key 能力旧证据清理、同 Key 用量刷新不丢倍率、Key 编号变化或同 Key 换组/无组后旧个人倍率和报价失效、证据修订不匹配只隐藏账户倍率、当前官网直接表值覆盖旧 Key 快照、有效高峰下的直接表值、Key-only 未标注倍率不冒充官网表值、表缺组时的 Key 账单回退、单活跃 Key 限制、近 30 分钟完整用量、`group_rate` 高峰开和关、整表失败保留历史、官网未列组 Key-only 路径、拒绝原因入库、有效报价恢复与失效、同组多 Key 隔离、0070 从 0069 升级，以及 0071 保留已有 `key_billing`、允许 `group_rate` 高峰开启或关闭、拒绝未知高峰和未知来源。测试夹具中的 CC1 0.60、1.2 只用于验证倍率分支，不代表线上报价或资金结果。
+在隔离的本机 PostgreSQL 上，运行 `go test ./internal/beichen ./internal/infrastructure/db -run 'TestWebsiteKeyBillingAccountRates|TestCrawlAccountRateGroupConflictPriority|TestKeyCapabilityAccountRateEvidence|TestBeichenAccountRateKeyIdentityPostgres|TestBeichenDirectAccountRateFreshnessPostgres|TestBeichenPersonalQuoteAfterGroupMovePostgres|TestBeichenPersonalQuoteAfterGroupRemovedPostgres|TestBeichenAgedDirectKeySnapshotPostgres|TestBeichenCC1AccountRateFallbackPostgres|TestBeichenBillingGroupRefreshPostgres|TestBeichenMigration0070AccountRateSource|TestBeichenMigration0071GroupRateSource' -count=1`。覆盖交付会话、官网账户倍率优先、目录直接值不产生 Key 编号、Key 能力旧证据清理、同 Key 用量刷新不丢倍率、Key 编号变化或同 Key 换组/无组后旧个人倍率和报价失效、证据修订不匹配只隐藏账户倍率、当前官网直接表值覆盖旧 Key 快照、有效高峰下的直接表值、Key-only 未标注倍率不冒充官网表值、表缺组时的 Key 账单回退、单活跃 Key 限制、近 30 分钟完整用量、`group_rate` 高峰关闭、同组一冲突一可回退、同组两冲突和无冲突回退、整表失败按分组判断、官网未列组 Key-only 路径、拒绝原因入库、有效报价恢复与失效、0070 从 0069 升级，以及 0071 保留已有 `key_billing`、允许高峰关闭的 `group_rate`、拒绝高峰开启或未知高峰和未知来源。测试夹具中的 CC1 0.60、1.2 只用于验证倍率分支，不代表线上报价或资金结果。
 
 Key 卡片显示旧个人倍率、错误 Key 编号或旧直接表值时，检查 `beichen_datasets.website_group_observation` 的 `billing_account_rate`。首次成功计费前，Key 卡片可显示该 Key 30 分钟内且分组配对的官网直读值；过期后清除。`credential_revision` 和 `last_success` 必须与当前 billing 数据集一致；`key_id` 必须对应当前 `website_key_id` 和官网清单中的 Key。仅证据轮次或修订不匹配时，只隐藏账户倍率，不单独撤销报价；确认 Key 编号变化、同 Key 换组或无组时，失效旧倍率和报价，历史版本仍保留。Key 清单省略分组时，一旦匹配到新 Key 编号，旧报价就会退出当前计价。在途任务提交时校验凭据修订、租约和按请求时间排序的 `confirmed_key_binding`。独立回归 `go test ./internal/beichen ./internal/infrastructure/db -run '^TestIndependentReview' -count=1 -v` 覆盖旧请求延迟返回、用量刷新换组或换号、明确拒绝分组权限、高峰报价和迁移保留其他约束。旧快照失效时只采用当前 billing 成功轮次写入的官网直接表值，该值不产生 Key 编号；Key-only 倍率也不冒充官网直接表值。`group_rate` 不依赖该子对象，直接从匹配的当前倍率版本读取。
 
@@ -325,7 +336,7 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 #### 重建预览过期或绑定 Key 无分组权限
 
 - 换组后确认旧预览应返回 409，并提示重新预览。对照教师概览的 `bound_catalog_pending`、`ready_count` 与新预览的 `evidence_versions`。同步持有事务锁时确认同样返回 409。测试使用数据库触发器，在确认已读取分组证据、即将插入 Responses 绑定时暂停，由另一连接提交从分组 10 到 12 的变化。恢复确认后应返回冲突，数据库中的 Responses 绑定数量应为 0。
-- 重扫明确返回 `GROUP_NOT_ALLOWED` 时，核对 `bound_routes[].group_status=not_allowed`、`binding_issue.code=group_not_allowed` 和教师行的恢复权限提示。在北辰恢复该 Key 的分组权限，再重扫。若成功读取的型号从 4 个减少到 2 个，分组拒绝应立即清除，目录显示待复核并保留原清单和 `last_success`。若仅 GM1 备用线路换组，仍就绪的 G3 继续显示可用及报价。两把 Key 都已绑定时，预期 Key 覆盖为 `1/2`。
+- 重扫明确返回 `GROUP_NOT_ALLOWED` 时，核对 `bound_routes[].group_status=not_allowed`、`binding_issue.code=group_not_allowed` 和教师行的恢复权限提示。恢复该 Key 的权限后重扫。成功扫描会清除目录拒绝，新读到的型号立即入库。旧型号在三轮完整扫描中都缺席才失去目录证据。若仅 GM1 备用线路换组，仍就绪的 G3 继续显示可用及报价。两把 Key 都已绑定时，预期 Key 覆盖为 `1/2`。
 - 在隔离测试库运行 `go test ./internal/beichen ./internal/dataplane -run 'Test(RebindRejectsGroupVersionChange|KeyCatalogGroupDenialRecovery|CatalogQualityAliasCRUDAndRebind|BeichenTeacherCoverage|StudentKeyModelAuthorization)Postgres' -count=1`，并在 `frontend` 运行 `npm test -- BeichenSchoolModels`。日志回归检查成功事件的操作人、供应商和变更数量，以及预览令牌和变更明细是否已移除。
 
 #### 核对一把 Key 的实际用量和分组
@@ -426,6 +437,8 @@ go test ./...
 ### 学生模型目录搜索
 
 运行 `go test ./internal/api/http -run 'TestStudentCatalog(Batch|Bounds)HTTPPostgres' -count=1 -v`。测试记录 PostgreSQL 实际执行的 SQL，比较 1 个匹配和 23 个匹配的第二页，检查排序、候选总数、绑定优先级、协议和探活证据。搜索被拒绝时，检查 `q` 的 128 字符上限、`page` 的 1 至 10000 范围、`page_size` 的 1 至 50 范围及 URL 编码。
+
+状态计数异常时，核对无搜索词的第一页返回的 `directory.models` 和本人 Key 授权。目录列表与统计都以 `addable` 为准。北辰 Key 下的型号明细按调用记录中的项目、学生和 Key 归属聚合。运行 `go test ./internal/beichen -run TestModelUsageKeyBreakdownUsesRecordedOwnerAndProjectPostgres -count=1` 核对同一 Key 的历史归属。
 
 ### 教师学生用量
 
@@ -538,7 +551,7 @@ ORDER BY j.channel;
 | 北辰返回 429 `unresolved_exposure_limit` | 同一学生待核预留加本笔默认预留达到上限 | 核对跨项目和 Key 的待核金额 | 按学生 ID 执行 `SELECT count(*), coalesce(sum(unresolved_credit_milli),0) FROM gateway_calls WHERE user_id=$1 AND beichen_state='pending_review'`；同一学生非北辰路由仍可受理 |
 | 网关返回 429 `student_concurrency_exceeded` | 同一学生派发中的调用已达上限，所有 Key 和项目共用名额 | 等已有调用结束后重试；直接运行或本地 Compose 可设置 `NEBULA_STUDENT_CONCURRENCY_LIMIT` 覆盖默认 5，生产 Compose 显式指定 5 | 设置本机测试库 `NEBULA_TEST_POSTGRES`，运行 `go test -p 1 ./internal/usage ./internal/dataplane -run 'TestGatewayQuotaPostgres\|TestStudentConcurrencyHTTPPostgres' -count=5`，核对第六笔被拒且未计费 |
 | 回退后返回 429 `pending_review_limit` | `NEBULA_UNRESOLVED_EXPOSURE=0`，待核笔数达到旧上限 | 核对待核行数，默认上限为 20 | 只想关闭推荐分项扣款时，保留额度开关默认值，设置 `NEBULA_PENDING_AUTO_SETTLE=0` |
-| 北辰响应成功但缓存明细缺失，仍显示待核 | 区间过宽、上界未知、定价超过上界容差，或为 Gemini 原生响应 | 用调用 ID 查询 `beichen_review_reason`、`unresolved_credit_milli`、`pricing_detail`，核对派发时费率及开关 | 设置本机测试库 `NEBULA_TEST_POSTGRES`，运行 `go test -p 1 ./internal/dataplane -run TestBeichenPending -count=1 -v`，覆盖并发封顶、倍率、模型身份、开关、教师价与上界 |
+| 北辰响应成功但缓存明细缺失，仍显示待核 | 区间过宽、上界未知、定价超过上界容差，或未获得可信终态用量 | 用调用 ID 查询 `beichen_review_reason`、`unresolved_credit_milli`、`pricing_detail`，核对派发时费率及终态用量 | 设置本机测试库 `NEBULA_TEST_POSTGRES`，运行 `go test -p 1 ./internal/dataplane -run 'TestBeichenPending\|TestBeichenGemini' -count=1 -v` |
 | 网关返回 model unavailable | 模型、binding 或 provider 被停用 | 老师启用完整路由链或添加 binding | 按 model -> binding -> provider 顺序排查状态和 priority |
 | 上游 429/5xx 后没有切换 | 没有下一个 ACTIVE binding，或流已经开始写出 | 添加低优先级候选；流开始后只能返回当前错误 | 查看候选排序、adapter、priority 和首字节是否已发送 |
 | multipart 请求失败 | Content-Type boundary 丢失、文件过大或客户端重复读取 body | 保留原始 Content-Type，调整允许大小 | 检查请求大小和 boundary；不要把文件内容写入日志 |

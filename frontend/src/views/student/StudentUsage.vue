@@ -4,7 +4,7 @@ import { ChevronDown, History, Search } from 'lucide-vue-next'
 import { APIError, apiErrorMessage } from '../../api/client'
 import { studentAPI } from '../../api/student'
 import type {
-  StudentCallReceipt, StudentKeyUsage, StudentModelUsageFields, StudentProjectUsageRow,
+  StudentCallReceipt, StudentKeyUsage, StudentModelUsageFields, StudentProjectUsageRow, StudentUsageFields,
   StudentRecentCall, StudentRecentRange, StudentUsageSnapshot,
 } from '../../api/student'
 import AppDialog from '../../components/AppDialog.vue'
@@ -110,6 +110,36 @@ const projectSummaries = computed(() => (report.value?.projects ?? []).map(proje
     })),
   }
 }))
+const keySummaries = computed(() => projectSummaries.value.flatMap(({ project, keyRows }) =>
+  keyRows.map(row => ({ ...row, project }))))
+
+function tokenSample(value: unknown) {
+  const count = formatUsageTokenCount(value)
+  return count === '—' ? '无样本' : count
+}
+
+function tokenCoverage(metrics: StudentUsageFields) {
+  if (tokenSample(metrics.tokens?.total) === '无样本') return ''
+  if (metrics.completeness === 'complete') return '完整'
+  const coverage = metrics.token_coverage
+  return isUsageCount(coverage?.complete_calls) && isUsageCount(coverage?.calls)
+    ? `部分回报（${formatUsageCount(coverage.complete_calls)}/${formatUsageCount(coverage.calls)} 笔完整）`
+    : '部分回报'
+}
+
+function cacheRate(metrics: StudentUsageFields) {
+  const rate = formatUsageCacheRate(metrics.cache_hit_rate)
+  return rate === '—' || metrics.cache_hit_coverage?.sample_calls === 0 ? '无样本' : rate
+}
+
+function cacheCoverage(metrics: StudentUsageFields) {
+  const total = metrics.token_coverage?.calls
+  const samples = metrics.cache_hit_coverage?.sample_calls
+  const coverage = formatUsageCacheCoverage(metrics)
+  if (cacheRate(metrics) === '无样本') return coverage
+  const label = isUsageCount(total) && total > 0 && total === samples ? '完整' : '部分回报'
+  return coverage ? `${label} · ${coverage}` : label
+}
 
 const modelColumns: Array<{
   label: string
@@ -118,12 +148,16 @@ const modelColumns: Array<{
   numeric?: boolean
 }> = [
   { label: '已扣积分', value: model => formatUsageCredits(model.credits), numeric: true },
-  { label: '调用次数', value: model => formatUsageCount(model.calls ?? 0), numeric: true },
-  { label: 'Token', value: model => formatUsageTokenCount(model.tokens?.total), numeric: true },
+  {
+    label: '调用次数',
+    value: model => isUsageCount(model.calls) ? formatUsageCount(model.calls) : '未回报',
+    numeric: true,
+  },
+  { label: 'Token', value: model => tokenSample(model.tokens?.total), detail: tokenCoverage, numeric: true },
   {
     label: '缓存命中率',
-    value: model => formatUsageCacheRate(model.cache_hit_rate),
-    detail: formatUsageCacheCoverage,
+    value: cacheRate,
+    detail: cacheCoverage,
     numeric: true,
   },
   { label: '说明', value: formatUsageModelNotes },
@@ -325,7 +359,7 @@ onBeforeUnmount(() => recentRequest?.abort())
               <History :size="15" aria-hidden="true" />最近调用
             </button>
           </template>
-          <div class="usage-recent">
+          <div class="usage-recent" :aria-busy="recentLoading">
             <div class="range-switch" role="group" aria-label="最近调用范围（北京时间）">
               <button v-for="range in recentRanges" :key="range.value" type="button"
                 :aria-pressed="recentRange === range.value" :data-testid="`recent-range-${range.value}`"
@@ -356,7 +390,7 @@ onBeforeUnmount(() => recentRequest?.abort())
                     </dl>
                     <dl class="usage-receipt-tokens" aria-label="Token 明细">
                       <div v-for="{ field, label } in callTokenFields" :key="field">
-                        <dt>{{ label }}</dt><dd>{{ formatUsageTokenCount(call[field]) }}</dd>
+                        <dt>{{ label }}</dt><dd>{{ tokenSample(call[field]) }}</dd>
                       </div>
                     </dl>
                   </div>
@@ -365,7 +399,7 @@ onBeforeUnmount(() => recentRequest?.abort())
             </ul>
             <p v-if="recentError" class="error banner" role="alert">{{ recentError }}</p>
             <p v-else-if="recentLoading" class="muted" role="status">正在读取最近调用…</p>
-            <p v-else-if="!recentCalls.length" class="muted" role="status">所选范围暂无调用记录</p>
+            <p v-else-if="!recentCalls.length" class="muted usage-recent-empty" role="status">所选范围暂无调用记录</p>
             <button v-if="recentError || recentCursor" class="button ghost usage-recent-more" type="button"
               :disabled="recentLoading" @click="loadRecent">{{ recentError ? '重试' : '加载更多' }}</button>
           </div>
@@ -406,7 +440,7 @@ onBeforeUnmount(() => recentRequest?.abort())
             </dl>
             <dl class="usage-receipt-tokens" aria-label="Token 明细">
               <div v-for="{ field, label } in receiptTokenFields" :key="field">
-                <dt>{{ label }}</dt><dd>{{ formatUsageTokenCount(receipt[field]) }}</dd>
+                <dt>{{ label }}</dt><dd>{{ tokenSample(receipt[field]) }}</dd>
               </div>
             </dl>
             <p v-if="receipt.usage_state || receipt.usage_reason" class="muted usage-evidence">
@@ -435,11 +469,118 @@ onBeforeUnmount(() => recentRequest?.abort())
           </div>
         </section>
 
-        <section class="panel usage-panel" :aria-labelledby="`${pageId}-models`">
+        <section class="panel usage-panel" :aria-labelledby="`${pageId}-keys`">
           <header class="beichen-section-head">
-            <h2 :id="`${pageId}-models`">按模型合计</h2>
+            <h2 :id="`${pageId}-keys`">按 Key 查看</h2>
             <RouterLink class="usage-model-link" :to="{ name: 'student-models' }">到模型广场添加模型</RouterLink>
           </header>
+          <p class="muted usage-table-note">调用次数含零额结算。待核账记录单列。</p>
+          <EmptyState v-if="!keySummaries.length" title="所选月暂无 Key 记录" />
+          <ul v-else class="usage-key-list" aria-label="Key 用量">
+            <li v-for="{ project, key, models: keyModels, pendingReview: keyReview } in keySummaries"
+              :key="key.id">
+              <div class="usage-key-row" data-testid="usage-key-row">
+                <div class="usage-key-name">
+                  <strong>{{ key.name }}</strong>
+                  <span class="status-badge" :class="key.status">{{ statusLabel(key.status) }}</span>
+                </div>
+                <dl class="usage-key-totals">
+                  <div><dt>项目</dt><dd>{{ project.project_name }}</dd></div>
+                  <div><dt>已扣积分</dt><dd>{{ formatUsageCredits(key.used) }}</dd></div>
+                  <div><dt>调用次数</dt><dd>{{ isUsageCount(key.calls) ? formatUsageCount(key.calls) : '未回报' }}</dd></div>
+                </dl>
+                <button class="button ghost usage-disclosure" type="button"
+                  :aria-expanded="expandedSections.has(keySectionId(project.project_id, key.id))"
+                  :aria-controls="keySectionId(project.project_id, key.id)"
+                  :aria-label="`查看 ${project.project_name} · ${key.name} 的用量明细`"
+                  @click="toggleSection(keySectionId(project.project_id, key.id))">
+                  详情<ChevronDown :size="14" aria-hidden="true" />
+                </button>
+              </div>
+              <div v-show="expandedSections.has(keySectionId(project.project_id, key.id))"
+                :id="keySectionId(project.project_id, key.id)" class="usage-key-models">
+                <template v-if="expandedSections.has(keySectionId(project.project_id, key.id))">
+                  <dl class="usage-key-details">
+                    <div><dt>在途积分</dt><dd>{{ formatUsageCredits(studentInFlightCredits(key)) }}</dd></div>
+                    <div><dt>本项目个人可用积分</dt><dd>{{ formatUsageCredits(studentKeyAvailable(key)) }}</dd></div>
+                    <div>
+                      <dt>Token</dt><dd>{{ tokenSample(key.tokens?.total) }}</dd>
+                      <small v-if="tokenCoverage(key)">{{ tokenCoverage(key) }}</small>
+                    </div>
+                    <div>
+                      <dt>缓存命中率</dt><dd>{{ cacheRate(key) }}</dd>
+                      <small v-if="cacheCoverage(key)">{{ cacheCoverage(key) }}</small>
+                    </div>
+                  </dl>
+                  <p v-if="keyReview" class="usage-review">{{ keyReview }}</p>
+                  <div v-if="keyModels?.length" class="beichen-table-wrap">
+                    <table class="beichen-table usage-model-table">
+                      <caption class="sr-only">{{ key.name }} 的模型用量</caption>
+                      <thead>
+                        <tr>
+                          <th scope="col">模型</th>
+                          <th v-for="column in modelColumns" :key="column.label" scope="col"
+                            :class="{ 'numeric-cell': column.numeric }">{{ column.label }}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="model in keyModels" :key="model.id">
+                          <th scope="row">
+                            <strong>{{ model.name || model.id }}</strong>
+                            <small v-if="model.name && model.name !== model.id">{{ model.id }}</small>
+                          </th>
+                          <td v-for="column in modelColumns" :key="column.label" :data-label="column.label"
+                            :class="{ 'numeric-cell': column.numeric }">
+                            {{ column.value(model) }}
+                            <small v-if="column.detail">{{ column.detail(model) }}</small>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <p v-else class="muted">{{ keyModels ? '暂无模型记录' : '模型明细暂不可用' }}</p>
+                </template>
+              </div>
+            </li>
+          </ul>
+        </section>
+
+        <details v-if="projectSummaries.length" class="panel usage-panel usage-secondary">
+          <summary>项目额度</summary>
+          <article v-for="{ project, balance, keyRows, pendingReview } in projectSummaries" :key="project.project_id"
+            class="usage-project">
+            <header class="usage-project-heading">
+              <div>
+                <h3>{{ project.project_name }}</h3>
+                <div class="usage-summary">
+                  <span>月额度 <strong>{{ formatUsageCredits(project.quota) }}</strong></span>
+                  <span>学校已用 <strong>{{ formatUsageCredits(project.used) }}</strong></span>
+                  <span>在途 <strong>{{ formatUsageCredits(studentInFlightCredits(project)) }}</strong></span>
+                  <span class="usage-project-balance">{{ balance.label }}<strong>{{ formatUsageCredits(balance.amount) }}</strong></span>
+                  <span v-if="isUsageCount(project.calls)">已结算 {{ formatUsageCount(project.calls) }} 次</span>
+                </div>
+                <p v-if="pendingReview" class="usage-review">{{ pendingReview }}</p>
+              </div>
+              <button class="button ghost usage-disclosure" type="button"
+                :aria-expanded="expandedSections.has(chartSectionId(project.project_id))"
+                :aria-controls="chartSectionId(project.project_id)"
+                @click="toggleSection(chartSectionId(project.project_id))">
+                额度图<ChevronDown :size="14" aria-hidden="true" />
+              </button>
+            </header>
+            <div v-show="expandedSections.has(chartSectionId(project.project_id))"
+              :id="chartSectionId(project.project_id)" class="usage-chart">
+              <CreditDonut v-if="expandedSections.has(chartSectionId(project.project_id))"
+                :segments="projectSegments(project, keyRows)" :total="Number(project.quota)" unit="积分"
+                :label="`${project.project_name} 各 Key 已扣积分与额度`" />
+            </div>
+
+            <p v-if="!keyRows.length" class="muted usage-no-keys">暂无 Key 记录</p>
+          </article>
+        </details>
+
+        <details class="panel usage-panel usage-secondary">
+          <summary>全部 Key 按模型合计</summary>
           <div v-if="!totals || !models" class="usage-load-error">
             <p class="error" role="alert">模型汇总读取失败。返回数据缺少汇总字段。</p>
             <button class="button secondary" type="button" @click="load">重试</button>
@@ -483,107 +624,7 @@ onBeforeUnmount(() => recentRequest?.abort())
             </div>
           </template>
           <EmptyState v-else-if="models && totals" title="所选月暂无模型用量" />
-        </section>
-
-        <section class="panel usage-panel" :aria-labelledby="`${pageId}-keys`">
-          <h2 :id="`${pageId}-keys`">按 Key 明细</h2>
-          <EmptyState v-if="!projectSummaries.length" title="所选月暂无项目和 Key 记录" />
-          <article v-for="{ project, balance, keyRows, pendingReview } in projectSummaries" :key="project.project_id"
-            class="usage-project">
-            <header class="usage-project-heading">
-              <div>
-                <h3>{{ project.project_name }}</h3>
-                <div class="usage-summary">
-                  <span>月额度 <strong>{{ formatUsageCredits(project.quota) }}</strong></span>
-                  <span>学校已用 <strong>{{ formatUsageCredits(project.used) }}</strong></span>
-                  <span>在途 <strong>{{ formatUsageCredits(studentInFlightCredits(project)) }}</strong></span>
-                  <span class="usage-project-balance">{{ balance.label }}<strong>{{ formatUsageCredits(balance.amount) }}</strong></span>
-                  <span v-if="isUsageCount(project.calls)">已结算 {{ formatUsageCount(project.calls) }} 次</span>
-                </div>
-                <p v-if="pendingReview" class="usage-review">{{ pendingReview }}</p>
-              </div>
-              <button class="button ghost usage-disclosure" type="button"
-                :aria-expanded="expandedSections.has(chartSectionId(project.project_id))"
-                :aria-controls="chartSectionId(project.project_id)"
-                @click="toggleSection(chartSectionId(project.project_id))">
-                额度图<ChevronDown :size="14" aria-hidden="true" />
-              </button>
-            </header>
-            <div v-show="expandedSections.has(chartSectionId(project.project_id))"
-              :id="chartSectionId(project.project_id)" class="usage-chart">
-              <CreditDonut v-if="expandedSections.has(chartSectionId(project.project_id))"
-                :segments="projectSegments(project, keyRows)" :total="Number(project.quota)" unit="积分"
-                :label="`${project.project_name} 各 Key 已扣积分与额度`" />
-            </div>
-
-            <p v-if="!keyRows.length" class="muted usage-no-keys">暂无 Key 记录</p>
-            <template v-for="{ key, models: keyModels, pendingReview: keyReview } in keyRows"
-              :key="keySectionId(project.project_id, key.id)">
-              <div class="usage-key-row" data-testid="usage-key-row">
-                <div class="usage-key-identity">
-                  <div class="usage-key-name">
-                    <strong>{{ key.name }}</strong>
-                    <span class="status-badge" :class="key.status">{{ statusLabel(key.status) }}</span>
-                  </div>
-                  <small v-if="keyReview" class="usage-review">{{ keyReview }}</small>
-                </div>
-                <dl class="usage-key-credits">
-                  <div><dt>已扣积分</dt><dd>{{ formatUsageCredits(key.used) }}</dd></div>
-                  <div><dt>在途积分</dt><dd>{{ formatUsageCredits(studentInFlightCredits(key)) }}</dd></div>
-                  <div><dt>本项目个人可用积分</dt><dd>{{ formatUsageCredits(studentKeyAvailable(key)) }}</dd></div>
-                </dl>
-                <dl class="usage-key-metrics">
-                  <div><dt>调用次数</dt><dd>{{ formatUsageCount(key.calls) }}</dd></div>
-                  <div>
-                    <dt>Token</dt><dd>{{ formatUsageTokenCount(key.tokens?.total) }}</dd>
-                    <small v-if="isUsageCount(key.token_coverage?.calls) && key.token_coverage.calls > 0
-                      && (key.completeness === 'partial' || key.completeness === 'unknown')">
-                      {{ key.completeness === 'partial' ? '部分回报' : '无回报' }}
-                    </small>
-                  </div>
-                  <div><dt>模型数</dt><dd>{{ formatUsageCount(keyModels?.length) }}</dd></div>
-                </dl>
-                <div class="usage-key-action">
-                  <button v-if="keyModels?.length" class="button ghost usage-disclosure" type="button"
-                    :aria-expanded="expandedSections.has(keySectionId(project.project_id, key.id))"
-                    :aria-controls="keySectionId(project.project_id, key.id)"
-                    :aria-label="`${expandedSections.has(keySectionId(project.project_id, key.id)) ? '收起' : '展开'} ${key.name} 的模型明细`"
-                    @click="toggleSection(keySectionId(project.project_id, key.id))">
-                    {{ expandedSections.has(keySectionId(project.project_id, key.id)) ? '收起明细' : '展开明细' }}
-                    <ChevronDown :size="14" aria-hidden="true" />
-                  </button>
-                  <span v-else class="muted">{{ keyModels ? '暂无模型记录' : '模型明细暂不可用' }}</span>
-                </div>
-              </div>
-              <div v-if="keyModels?.length" v-show="expandedSections.has(keySectionId(project.project_id, key.id))"
-                :id="keySectionId(project.project_id, key.id)" class="beichen-table-wrap usage-key-models">
-                <table v-if="expandedSections.has(keySectionId(project.project_id, key.id))" class="beichen-table usage-model-table">
-                  <caption class="sr-only">{{ key.name }} 的模型用量</caption>
-                  <thead>
-                    <tr>
-                      <th scope="col">模型</th>
-                      <th v-for="column in modelColumns" :key="column.label" scope="col"
-                        :class="{ 'numeric-cell': column.numeric }">{{ column.label }}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="model in keyModels" :key="model.id">
-                      <th scope="row">
-                        <strong>{{ model.name || model.id }}</strong>
-                        <small v-if="model.name && model.name !== model.id">{{ model.id }}</small>
-                      </th>
-                      <td v-for="column in modelColumns" :key="column.label" :data-label="column.label"
-                        :class="{ 'numeric-cell': column.numeric }">
-                        {{ column.value(model) }}
-                        <small v-if="column.detail">{{ column.detail(model) }}</small>
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </template>
-          </article>
-        </section>
+        </details>
       </div>
     </LoadingRegion>
   </section>
@@ -634,6 +675,19 @@ onBeforeUnmount(() => recentRequest?.abort())
   padding: clamp(14px, 2.1vw, 24px);
 }
 
+.usage-secondary > summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.usage-secondary[open] > summary {
+  margin-bottom: 12px;
+}
+
+.usage-secondary > .usage-project + .usage-project {
+  margin-top: 12px;
+}
+
 .usage-stats {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
@@ -679,7 +733,7 @@ onBeforeUnmount(() => recentRequest?.abort())
 }
 
 .usage-model-table small,
-.usage-key-row small {
+.usage-key-models small {
   display: block;
   font-size: 11px;
   font-weight: 400;
@@ -740,33 +794,38 @@ onBeforeUnmount(() => recentRequest?.abort())
 }
 
 .usage-review,
-.usage-key-row .usage-review {
+.usage-key-models .usage-review {
   margin: 4px 0 0;
   color: #835615;
   font-size: 12px;
 }
 
-.usage-no-keys {
+.usage-key-list {
+  display: grid;
   margin: 0;
-  padding: 10px 14px 14px;
+  padding: 0;
+  list-style: none;
+}
+
+.usage-key-list > li {
+  min-width: 0;
+  border-top: 1px solid var(--line);
 }
 
 .usage-key-row {
   display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(0, 2.45fr) minmax(0, 1.65fr) auto;
-  grid-template-areas: 'identity credits metrics action';
-  align-items: start;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2.6fr) auto;
+  grid-template-areas: 'name totals action';
+  align-items: center;
   gap: 10px 14px;
-  padding: 12px 14px;
-  border-top: 1px solid var(--line);
+  padding: 12px 0;
 }
 
-.usage-key-identity { grid-area: identity; }
-.usage-key-credits { grid-area: credits; }
-.usage-key-metrics { grid-area: metrics; }
-.usage-key-action { grid-area: action; }
+.usage-key-totals { grid-area: totals; }
+.usage-key-row > button { grid-area: action; }
 
 .usage-key-name {
+  grid-area: name;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -780,8 +839,8 @@ onBeforeUnmount(() => recentRequest?.abort())
   overflow-wrap: anywhere;
 }
 
-.usage-key-credits,
-.usage-key-metrics,
+.usage-key-totals,
+.usage-key-details,
 .usage-receipt-meta,
 .usage-receipt-tokens {
   display: grid;
@@ -790,18 +849,26 @@ onBeforeUnmount(() => recentRequest?.abort())
   min-width: 0;
 }
 
-.usage-key-credits,
-.usage-key-metrics {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+.usage-key-totals {
+  grid-template-columns: minmax(0, 1.4fr) repeat(2, minmax(0, 1fr));
+  overflow-wrap: anywhere;
+}
+
+.usage-key-details {
+  grid-template-columns: repeat(auto-fit, minmax(min(125px, 100%), 1fr));
+  overflow-wrap: anywhere;
+  margin-bottom: 8px;
 }
 
 .usage-key-row dt,
+.usage-key-details dt,
 .usage-receipt-result dt {
   font-size: 11px;
   color: var(--ink-soft);
 }
 
 .usage-key-row dd,
+.usage-key-details dd,
 .usage-receipt-result dd {
   margin: 3px 0 0;
   font-size: 13px;
@@ -809,8 +876,15 @@ onBeforeUnmount(() => recentRequest?.abort())
   font-variant-numeric: tabular-nums;
 }
 
-.usage-key-action > span {
-  font-size: 12px;
+.usage-key-models {
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.usage-key-models > p {
+  margin: 4px 0;
 }
 
 .usage-disclosure {
@@ -831,7 +905,6 @@ onBeforeUnmount(() => recentRequest?.abort())
   transform: rotate(180deg);
 }
 
-.usage-key-models,
 .usage-chart {
   margin: 0 14px 12px;
 }
@@ -849,6 +922,11 @@ onBeforeUnmount(() => recentRequest?.abort())
 
 .usage-recent p {
   margin: 0;
+}
+
+.usage-recent-empty {
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .usage-recent-list {
@@ -964,14 +1042,6 @@ onBeforeUnmount(() => recentRequest?.abort())
   font-size: 12px;
 }
 
-@media (max-width: 1100px) {
-  .usage-key-row {
-    grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas: 'identity identity' 'credits credits' 'metrics action';
-    align-items: center;
-  }
-}
-
 @media (max-width: 900px) {
   .usage-model-table thead {
     display: table-header-group;
@@ -1012,28 +1082,14 @@ onBeforeUnmount(() => recentRequest?.abort())
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .usage-key-credits {
-    padding: 8px 10px;
-    border-radius: 8px;
-    background: var(--surface);
-  }
-
   .usage-key-row {
-    grid-template-areas: 'identity action' 'credits credits' 'metrics metrics';
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: 'name action' 'totals totals';
     gap: 8px 6px;
   }
 
-  .usage-key-row dt,
-  .usage-key-row dd {
-    font-size: 11px;
-  }
-
-  .usage-key-action {
-    max-width: 112px;
-  }
-
   .usage-heading .usage-disclosure,
-  .usage-key-action .usage-disclosure,
+  .usage-key-row .usage-disclosure,
   .usage-receipt-form input {
     min-height: 44px;
   }

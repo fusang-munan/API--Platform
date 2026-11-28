@@ -2,6 +2,7 @@ package beichen
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,16 +59,20 @@ func (s *Service) fetchBillingCatalog(ctx context.Context, job syncJob, token, k
 		return directory, nil
 	}
 	if job.kind == "billing" && directory.group.AccountRate == nil {
-		if rateErr != nil {
-			directory.accountRateErr = accountRateReadFailed(websiteAccountRatesReadFailure, rateErr)
-			return directory, nil
-		}
 		info, at, err := s.fetchVerifiedKeyAccountRate(ctx, job.credential, key, identity, directory.group)
-		if err == nil {
+		directory.billMatchesGroup = !at.IsZero()
+		switch {
+		case err == nil:
 			directory.group.setKeyAccountRate(info)
 			directory.keyBillingSampleAt, directory.at = info.ObservedAt, at
-		} else if errors.Is(err, errKeyGroupNotAllowed) || !setGroupAccountRate(&directory.group) {
+		case errors.Is(err, errKeyGroupNotAllowed), errors.Is(err, errAccountRateConflict):
 			directory.accountRateErr = err
+			return directory, nil
+		case !setGroupAccountRate(&directory.group, identity):
+			directory.accountRateErr = err
+			if rateErr != nil {
+				directory.accountRateErr = errors.Join(accountRateReadFailed(websiteAccountRatesReadFailure, rateErr), err)
+			}
 			return directory, nil
 		}
 	}
@@ -88,6 +93,53 @@ WHERE provider_id=$1 AND group_id=$2 AND source='derived_from_usage' AND observe
 		return directory, keyMetadataError(err, identity.GroupID, "北辰 Key 的实际型号清单无法读取")
 	}
 	return directory.withActualModels(actual), nil
+}
+
+type billingCatalogWrite struct {
+	startedAt   time.Time
+	directory   websiteKeyCatalog
+	info        billingInfo
+	quote       panelQuote
+	websiteRead bool
+}
+
+func (write billingCatalogWrite) save(ctx context.Context, tx *sql.Tx, job syncJob, revision time.Time, result *fetchResult) error {
+	directory := write.directory
+	accepted, err := saveBillingGroup(ctx, tx, job.credential, revision, write.startedAt, directory, result.err, false)
+	if err != nil {
+		return err
+	}
+	if !accepted {
+		return errBillingKeyBindingChanged
+	}
+	if group := directory.keyGroup; group != nil && validWebsiteGroupID(group.ID) && directory.keyID != 0 {
+		// Billing jobs hold different Key locks; serialize observations and
+		// fallback publication for this group before reading peer evidence.
+		if _, err := tx.ExecContext(ctx, `
+SELECT pg_advisory_xact_lock(hashtextextended(
+  'beichen_datasets'::regclass::oid::text||'/billing-rate/'||$1::uuid::text||'/'||$2::bigint::text,0))`,
+			job.provider, group.ID); err != nil {
+			return err
+		}
+		if err := saveBillingRateEvidence(ctx, tx, job.credential, revision, write, result.err); err != nil {
+			return err
+		}
+		if result.err == nil && (write.info.accountRateSource == groupRateSource || write.info.accountRateSource == keyBillingRateSource) {
+			conflict, err := groupHasAccountRateConflict(ctx, tx, job.provider, group.ID)
+			if err != nil {
+				return err
+			}
+			if conflict {
+				result.err = accountRateConflict("同组 Key 已记录账单倍率或权限冲突，请核对该组的账单")
+			}
+		}
+	}
+	if write.websiteRead {
+		if err := saveWebsiteCatalog(ctx, tx, job.credential, revision, directory.catalogQuote()); err != nil {
+			return err
+		}
+	}
+	return saveBillingObservation(ctx, tx, job.credential, revision, write.info, result.err, write.quote.groupID, write.quote)
 }
 
 func (directory websiteKeyCatalog) withActualModels(actual []catalog.ProviderEntry) websiteKeyCatalog {

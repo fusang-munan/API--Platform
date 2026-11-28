@@ -27,6 +27,7 @@ type websiteKeyCatalog struct {
 	keyBilling         *billingInfo // Key-only catalog when the group has no website listing.
 	keyBillingSampleAt time.Time    // Sample used for a verified account-rate fallback.
 	accountRateErr     error
+	billMatchesGroup   bool
 	websiteModels      []string
 }
 

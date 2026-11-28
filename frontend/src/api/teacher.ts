@@ -4,6 +4,13 @@ import type { BeichenWebsiteKeyInventory, PendingAuditReport } from './types'
 import type { BeichenAccount, BeichenAccountLogin, BeichenBatchEnableResult, BeichenCapabilities, BeichenCrawlSummary, BeichenImport, BeichenModelPriceResult, BeichenModelPriceUpdate, BeichenModelUsage, BeichenOverview, BeichenPriceUpdate, BeichenProbeRun, BeichenProbes, BeichenReceiptPage, BeichenReconcile, BeichenUsageRange } from './types'
 import type { Application, Binding, BindingCreate, BindingRouteProbeEndpoint, BindingRouteProbeStep, BindingUpdate, MentorCandidate, Model, ModelCatalogPage, ModelCreate, ModelUpdate, Organization, OrganizationCreate, OrganizationUpdate, ProbeEndpoint, ProbeResponse, Project, ProjectBudget, ProjectBudgetUpdate, ProjectCreate, ProjectUpdate, Provider, ProviderCatalogSyncView, ProviderCreate, ProviderCredential, ProviderCredentialCreate, ProviderCredentialUpdate, ProviderUpdate, ProjectUsage, StudentAccount } from './types'
 interface BeichenPanelStatus { configured: boolean; group_id?: number; upstream_key_id?: number }
+
+export const beichenSchoolChannels = ['CC1', 'G3', 'GM1', 'Gemini'] as const
+export type BeichenSchoolChannel = typeof beichenSchoolChannels[number]
+type CreateProviderCredential = ProviderCredentialCreate & (
+  | { channel: BeichenSchoolChannel; replaces_credential_id?: never }
+  | { channel?: never; replaces_credential_id?: string }
+)
 export const teacherAPI = {
   beichenPanelStatus: (provider: string, credential: string) => get<BeichenPanelStatus>(`/api/v1/teacher/providers/${provider}/beichen/access/${credential}`),
   setBeichenPanelAccess: (provider: string, credential: string, body: { enabled: boolean; group_id?: number; upstream_key_id?: number; token?: string }) =>
@@ -34,7 +41,7 @@ export const teacherAPI = {
   updateProvider: (id: string, body: ProviderUpdate) => patch<Provider>(`/api/v1/teacher/providers/${id}`, body),
   deleteProvider: (id: string) => del(`/api/v1/teacher/providers/${id}`),
   providerCredentials: (providerId: string) => get<ProviderCredential[]>(`/api/v1/teacher/providers/${providerId}/credentials`),
-  createProviderCredential: (providerId: string, body: ProviderCredentialCreate) => post<ProviderCredential>(`/api/v1/teacher/providers/${providerId}/credentials`, body),
+  createProviderCredential: (providerId: string, body: CreateProviderCredential) => post<ProviderCredential>(`/api/v1/teacher/providers/${providerId}/credentials`, body),
   updateProviderCredential: (providerId: string, credentialId: string, body: ProviderCredentialUpdate) => patch<ProviderCredential>(`/api/v1/teacher/providers/${providerId}/credentials/${credentialId}`, body),
   deleteProviderCredential: (providerId: string, credentialId: string) => del(`/api/v1/teacher/providers/${providerId}/credentials/${credentialId}`),
   resetProviderCatalog: (id: string) => post<ProviderCatalogSyncView>(`/api/v1/teacher/providers/${id}/reset-catalog`),

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 type modelScanTransport func(*http.Request) (*http.Response, error)
@@ -46,6 +47,69 @@ func TestBeichenScanRobustnessPaginationAndBackoff(t *testing.T) {
 	want := []string{"/v1/models", "/v1/models", "/v1/models?cursor=c2", "/v1/models?cursor=c2", "/v1/models?cursor=c3"}
 	if err != nil || !slices.Equal(paths, want) || len(entries) != 3 || entries[0].ID != "a" || entries[2].ID != "c" {
 		t.Fatalf("incomplete result: pages=%v models=%d err=%v", paths, len(entries), err)
+	}
+}
+
+func TestBeichenModelSnapshotRecognizesPageTokensAndIncompleteFirstPage(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		first, final string
+		query        string
+		complete     bool
+	}{
+		{"unmarked first page", `{"data":[{"id":"a"}]}`, "", "", false},
+		{"explicit final page", `{"data":[{"id":"a"}],"hasMore":false}`, "", "", true},
+		{"camel token", `{"data":{"items":[{"id":"a"}],"nextPageToken":"p +/"}}`,
+			`{"models":[{"id":"b"}],"pagination":{"nextPageToken":null}}`, "pageToken", true},
+		{"snake token", `{"data":[{"id":"a"}],"pagination":{"next_page_token":"p +/"}}`,
+			`{"data":[{"id":"b"}]}`, "page_token", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reads int
+			client := &http.Client{Transport: modelScanTransport(func(req *http.Request) (*http.Response, error) {
+				reads++
+				body := tc.first
+				if req.URL.RawQuery != "" {
+					if req.URL.Query().Get(tc.query) != "p +/" {
+						t.Fatalf("unexpected pagination query: %s", req.URL.RawQuery)
+					}
+					body = tc.final
+				}
+				if reads > 2 {
+					t.Fatal("continuation repeated")
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+			})}
+			snapshot, err := FetchBeichenModelSnapshot(context.Background(), "fixture", client)
+			want := 1
+			if tc.query != "" {
+				want = 2
+			}
+			if err != nil || snapshot.Complete != tc.complete || len(snapshot.Entries) != want || reads != want {
+				t.Fatalf("complete=%t entries=%d requests=%d error=%v", snapshot.Complete, len(snapshot.Entries), reads, err)
+			}
+		})
+	}
+}
+
+func TestBeichenModelSnapshotDefersLongRetryAfterOnSecondPage(t *testing.T) {
+	for _, header := range []string{"120", time.Now().Add(2 * time.Minute).UTC().Format(http.TimeFormat)} {
+		reads := 0
+		client := &http.Client{Transport: modelScanTransport(func(r *http.Request) (*http.Response, error) {
+			reads++
+			if r.URL.Query().Has("pageToken") {
+				return &http.Response{StatusCode: http.StatusTooManyRequests, Body: http.NoBody,
+					Header: http.Header{"Retry-After": {header}}}, nil
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(
+				`{"data":[{"id":"partial"}],"nextPageToken":"second"}`))}, nil
+		})}
+		snapshot, err := FetchBeichenModelSnapshot(context.Background(), "fixture", client)
+		if reads != 2 || snapshot.Complete || len(snapshot.Entries) != 0 ||
+			!errors.Is(err, BeichenHTTPStatus(http.StatusTooManyRequests)) || time.Until(BeichenRetryAt(err)) < time.Minute {
+			t.Fatalf("incomplete scan was not deferred: requests=%d complete=%t count=%d error=%v",
+				reads, snapshot.Complete, len(snapshot.Entries), err)
+		}
 	}
 }
 

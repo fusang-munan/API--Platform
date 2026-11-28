@@ -80,10 +80,67 @@ VALUES ($1,'billing',$2::jsonb)
 ON CONFLICT (credential_id,kind) DO UPDATE SET website_group_observation=excluded.website_group_observation ||
   jsonb_strip_nulls(jsonb_build_object(
     'billing_account_rate',prior.website_group_observation->'billing_account_rate',
+    'billing_rate_evidence',prior.website_group_observation->'billing_rate_evidence',
     'confirmed_key_binding',prior.website_group_observation->'confirmed_key_binding'))
 WHERE (prior.website_group_observation->>'credential_revision')::timestamptz IS DISTINCT FROM $4::timestamptz
    OR (prior.website_group_observation->>'checked_at')::timestamptz <= $3`, credential, string(raw), observation.CheckedAt, revision)
 	return true, err
+}
+
+func saveBillingRateEvidence(ctx context.Context, tx *sql.Tx, credential uuid.UUID, revision time.Time,
+	write billingCatalogWrite, billingErr error) error {
+	// A peer's conflict must never be written as this Key's own observation.
+	directory := write.directory
+	conflict := errors.Is(directory.accountRateErr, errAccountRateConflict) || errors.Is(billingErr, errKeyGroupNotAllowed)
+	if !conflict && !directory.billMatchesGroup {
+		return nil
+	}
+	checkedAt := directory.keyGroupAt
+	if checkedAt.IsZero() {
+		checkedAt = write.startedAt
+	}
+	_, err := tx.ExecContext(ctx, `
+UPDATE beichen_datasets SET website_group_observation=website_group_observation || jsonb_build_object(
+  'billing_rate_evidence',jsonb_build_object('key_id',$2::bigint,'group_id',$3::bigint,
+    'credential_revision',$4::timestamptz,'checked_at',$5::timestamptz,'conflict',$6::boolean))
+WHERE credential_id=$1 AND kind='billing'
+  AND ((website_group_observation#>>'{billing_rate_evidence,credential_revision}')::timestamptz IS DISTINCT FROM $4
+    OR (website_group_observation#>>'{billing_rate_evidence,checked_at}')::timestamptz <= $5)`,
+		credential, directory.keyID, directory.keyGroup.ID, revision, checkedAt, conflict)
+	return err
+}
+
+func groupHasAccountRateConflict(ctx context.Context, tx *sql.Tx, provider uuid.UUID, groupID int64) (bool, error) {
+	var conflict bool
+	err := tx.QueryRowContext(ctx, `
+WITH active_keys AS (
+  SELECT c.updated_at AS revision,j.channel,obs.binding,
+    CASE WHEN (obs.rate->>'credential_revision')::timestamptz=c.updated_at
+      AND obs.rate->>'group_id'=obs.binding->>'group_id'
+      AND obs.rate->>'key_id'=obs.binding->>'key_id'
+      AND (obs.binding->>'credential_revision')::timestamptz=c.updated_at
+    THEN obs.rate END AS rate
+  FROM provider_credentials c
+  LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
+  LEFT JOIN beichen_datasets d ON d.credential_id=c.id AND d.kind='billing'
+  CROSS JOIN LATERAL (SELECT d.website_group_observation->'confirmed_key_binding' AS binding,
+    d.website_group_observation->'billing_rate_evidence' AS rate) obs
+  WHERE c.provider_id=$1 AND c.status='active'
+)
+SELECT EXISTS (
+  SELECT 1 FROM active_keys WHERE rate->>'group_id'=$2::bigint::text AND rate->>'conflict'='true'
+) OR EXISTS (
+  SELECT 1 FROM beichen_crawl_runs run
+  CROSS JOIN LATERAL jsonb_array_elements(run.key_model_comparisons) comparison
+  JOIN active_keys k ON k.channel=comparison->>'channel' AND k.revision<=run.started_at
+  WHERE run.provider_id=$1 AND run.started_at>=statement_timestamp()-interval '30 minutes'
+    AND comparison->>'group_id'=$2::bigint::text
+    AND strpos(run.account_rate_error,$3)>0 AND strpos(comparison->>'error',$3)>0
+    AND COALESCE(k.binding->>'group_id',$2::bigint::text)=$2::bigint::text
+    AND NOT COALESCE(k.rate->>'conflict'='false' AND
+      (k.rate->>'checked_at')::timestamptz>run.started_at,false)
+)`, provider, groupID, errAccountRateConflict.Error()).Scan(&conflict)
+	return conflict, err
 }
 
 func (item *Dataset) applyBillingGroup(raw []byte, revision time.Time, inventory WebsiteKey) (*billingAccountRateObservation, error) {

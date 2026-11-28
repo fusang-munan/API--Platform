@@ -13,7 +13,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 )
 
 func newActionsPostgres(t *testing.T) (context.Context, *sql.DB, uuid.UUID, uuid.UUID, []uuid.UUID) {
@@ -23,8 +25,10 @@ func newActionsPostgres(t *testing.T) (context.Context, *sql.DB, uuid.UUID, uuid
 		t.Skip("需要隔离的本机 nebula_test PostgreSQL")
 	}
 	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil || cfg.Host != "127.0.0.1" || cfg.Database != "nebula_test" || cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
-		t.Fatal("仅允许连接 sslmode=disable 的本机 nebula_test 测试数据库")
+	if err != nil || cfg.Host != "127.0.0.1" ||
+		!testutil.IsIsolatedPostgresDatabase(cfg.Database) || (cfg.Database == "nebula_test_hjc2" && cfg.User != "nebula_qa") ||
+		cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
+		t.Fatal("仅允许连接指定的本机 PostgreSQL 测试数据库，且须使用 sslmode=disable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	t.Cleanup(cancel)
@@ -150,6 +154,251 @@ CREATE TRIGGER reject_action_fixture BEFORE INSERT ON models FOR EACH ROW EXECUT
 	}
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM models WHERE model_id='unpriced'`).Scan(&unpriced); err != nil || unpriced != 0 {
 		t.Fatalf("无价格项不应创建模型: %d, %v", unpriced, err)
+	}
+}
+
+func TestEnableModelsBatchLeavesAmbiguousSchoolBindingsPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	const upstream = "shared-upstream"
+	schools := []uuid.UUID{uuid.New(), uuid.New()}
+	for i, school := range schools {
+		saveCatalogFixture(t, ctx, db, provider, keys[i], []catalog.ProviderEntry{
+			{ID: upstream, SupportedProtocols: []string{"openai_responses"}},
+		}, nil)
+		execCatalogTestSQL(t, ctx, db, `INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES($1,$2,'shared display name','pending_configuration',1000,now(),now())`, school, []string{upstream, "school-b"}[i])
+		execCatalogTestSQL(t, ctx, db, `INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,$3,$4,'openai_responses',11,now(),now())`, school, provider, keys[i], upstream)
+		execCatalogTestSQL(t, ctx, db, `INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+VALUES($1,$2,'school','manual','teacher',$3,1000000,2000000)`, keys[i], upstream, actor)
+	}
+	service := New(db, nil)
+	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{upstream, strings.ToUpper(upstream)})
+	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
+		!strings.Contains(result.Skipped[0].Message, "对应多个校内模型") {
+		t.Fatalf("an upstream-only request must not choose between distinct school models: %+v %v", result, err)
+	}
+	var intact bool
+	err = db.QueryRowContext(ctx, `SELECT
+  (SELECT count(*)=2 FROM model_bindings WHERE provider_id=$1 AND upstream_model_name=$2)
+  AND (SELECT count(*)=2 FROM model_bindings b JOIN models m ON m.id=b.model_id
+    WHERE b.provider_id=$1 AND b.upstream_model_name=$2 AND b.adapter='openai_responses' AND b.priority=11
+      AND m.status='pending_configuration' AND ((m.id=$3 AND b.credential_id=$5) OR (m.id=$4 AND b.credential_id=$6)))`,
+		provider, upstream, schools[0], schools[1], keys[0], keys[1]).Scan(&intact)
+	if err != nil || !intact {
+		t.Fatalf("batch request overwrote or published one of the same-name routes: %v", err)
+	}
+	result, err = service.EnableModelsBatch(ctx, provider, actor, []string{schools[0].String(), schools[1].String()})
+	if err != nil || len(result.Enabled) != 2 || len(result.Skipped) != 0 ||
+		result.Enabled[0].ModelID != schools[0] || result.Enabled[1].ModelID != schools[1] {
+		t.Fatalf("the two explicit school IDs must enable independently: %+v %v", result, err)
+	}
+	err = db.QueryRowContext(ctx, `SELECT count(*)=2 FROM model_bindings b JOIN models m ON m.id=b.model_id
+WHERE b.provider_id=$1 AND b.upstream_model_name=$2 AND b.adapter='openai_responses' AND b.priority=11
+  AND m.status='active' AND ((m.id=$3 AND b.credential_id=$5) OR (m.id=$4 AND b.credential_id=$6))`,
+		provider, upstream, schools[0], schools[1], keys[0], keys[1]).Scan(&intact)
+	if err != nil || !intact {
+		t.Fatalf("enabling both school IDs did not preserve separate bindings: %v", err)
+	}
+}
+
+func TestEnableModelsBatchScopesCandidateRoutesToSchoolIDsPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	service := New(db, nil)
+	const shared, extra, ambiguous = "same-alias", "another-alias", "ambiguous-route"
+	first, second, unresolved := uuid.New(), uuid.New(), uuid.New()
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	exec(`INSERT INTO models(id,model_id,display_name,status,created_at,updated_at)
+VALUES($1,'school-one','shared name','pending_configuration',now(),now()),
+      ($2,'school-two','shared name','pending_configuration',now(),now()),
+      ($3,$4::text,$4::text,'pending_configuration',now(),now())`, first, second, unresolved, ambiguous)
+	for i, name := range []string{"school-one", "school-two"} {
+		key := keys[i]
+		saveCatalogFixture(t, ctx, db, provider, key, []catalog.ProviderEntry{
+			{ID: shared, SupportedProtocols: []string{"openai_responses"}},
+			{ID: ambiguous, SupportedProtocols: []string{"openai_responses"}},
+		}, nil)
+		if err := service.PutModelAlias(ctx, provider, actor, &key, shared, &name); err != nil {
+			t.Fatal(err)
+		}
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+VALUES($1,$2,'school','manual','teacher',$4,1000000,1000000),
+      ($1,$3,'school','manual','teacher',$4,1000000,1000000)`, key, shared, ambiguous, actor)
+	}
+	view, err := service.Overview(ctx, provider, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[uuid.UUID]uuid.UUID{first: keys[0], second: keys[1]}
+	for _, row := range view.ModelCatalog {
+		if row.Model != shared {
+			continue
+		}
+		if row.SchoolModelID == nil || len(row.PreferredRoutes) != 1 || !row.CanEnable ||
+			row.PreferredRoutes[0].CredentialID == nil || *row.PreferredRoutes[0].CredentialID != want[*row.SchoolModelID] {
+			t.Fatalf("candidate used a Key for a different school model: %+v", row)
+		}
+		delete(want, *row.SchoolModelID)
+	}
+	if len(want) != 0 {
+		t.Fatal("missing separately scoped candidate rows")
+	}
+
+	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{shared, unresolved.String(), first.String(), second.String()})
+	if err != nil || len(result.Enabled) != 2 || len(result.Skipped) != 2 ||
+		result.Enabled[0].ModelID != first || result.Enabled[1].ModelID != second ||
+		!strings.Contains(result.Skipped[0].Message, "对应多个校内模型") ||
+		!strings.Contains(result.Skipped[1].Message, "同一协议有多个候选线路") {
+		t.Fatalf("unexpected batch selection results: %+v %v", result, err)
+	}
+	// A second upstream name pointing to the same school ID is a duplicate,
+	// even though it is a distinct name in the request.
+	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,supported_protocols,last_seen_at,synced_at,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,$3,ARRAY['openai_responses'],now(),now(),now(),now())`, provider, keys[1], extra)
+	school := "school-one"
+	if err := service.PutModelAlias(ctx, provider, actor, &keys[1], extra, &school); err != nil {
+		t.Fatal(err)
+	}
+	result, err = service.EnableModelsBatch(ctx, provider, actor, []string{first.String(), extra})
+	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 2 ||
+		result.Skipped[0].Reason != "already_active" || result.Skipped[1].Reason != "duplicate_school_model" {
+		t.Fatalf("same school must be processed once: %+v %v", result, err)
+	}
+	// The first school's pinned Key is unavailable. The other Key's same-name
+	// listing and alias must not repair or replace that binding during enable.
+	exec("UPDATE models SET status='inactive' WHERE id=$1", first)
+	exec("UPDATE provider_model_catalog SET status='inactive' WHERE credential_id=$1 AND model_id=$2", keys[0], shared)
+	exec("UPDATE provider_model_catalog SET status='inactive' WHERE credential_id=$1 AND model_id=$2", keys[1], extra)
+	result, err = service.EnableModelsBatch(ctx, provider, actor, []string{first.String()})
+	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
+		!strings.Contains(result.Skipped[0].Message, "原绑定线路尚未就绪") {
+		t.Fatalf("unavailable pinned route should require a teacher rebind: %+v %v", result, err)
+	}
+	if id, err := service.EnableModel(ctx, provider, actor, shared, school); id != uuid.Nil || domain.ErrorCode(err) != domain.CodeValidation {
+		t.Fatalf("single enable should also keep the pinned route: %s %v", id, err)
+	}
+	var intact bool
+	err = db.QueryRowContext(ctx, `SELECT count(*)=2 FROM model_bindings b JOIN models m ON m.id=b.model_id
+WHERE b.provider_id=$1 AND b.upstream_model_name=$2 AND b.adapter='openai_responses' AND b.status='active'
+  AND ((m.id=$3 AND m.status='inactive' AND b.credential_id=$5) OR (m.id=$4 AND m.status='active' AND b.credential_id=$6))`,
+		provider, shared, first, second, keys[0], keys[1]).Scan(&intact)
+	if err != nil || !intact {
+		t.Fatalf("published selectors did not preserve independent routes: %v", err)
+	}
+}
+
+func TestConcurrentEnableKeepsOneBindingPerProtocolPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	const model = "concurrent-new"
+	saveCatalogFixture(t, ctx, db, provider, keys[0], []catalog.ProviderEntry{
+		{ID: model, SupportedProtocols: []string{"openai_responses"}},
+	}, nil)
+	execCatalogTestSQL(t, ctx, db, `INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+VALUES($1,$2,'school','manual','teacher',$3,1000000,1000000)`, keys[0], model, actor)
+	service := New(db, nil)
+	type outcome struct {
+		id  uuid.UUID
+		err error
+	}
+	start := make(chan struct{})
+	results := make(chan outcome, 2)
+	for range 2 {
+		go func() {
+			<-start
+			id, err := service.EnableModel(ctx, provider, actor, model, "")
+			results <- outcome{id, err}
+		}()
+	}
+	close(start)
+	a, b := <-results, <-results
+	if a.err != nil || b.err != nil || a.id == uuid.Nil || a.id != b.id {
+		t.Fatalf("concurrent enable did not converge on the same school ID: %+v %+v", a, b)
+	}
+	var bindings, audits int
+	err := db.QueryRowContext(ctx, `SELECT
+  (SELECT count(*) FROM model_bindings WHERE model_id=$1 AND provider_id=$2 AND adapter='openai_responses'),
+  (SELECT count(*) FROM model_multiplier_audits WHERE model_id=$1)`, a.id, provider).Scan(&bindings, &audits)
+	if err != nil || bindings != 1 || audits != 1 {
+		t.Fatalf("expected one binding and one publication audit, got %d and %d (%v)", bindings, audits, err)
+	}
+}
+
+func TestTeacherEnableRepairsRetiredKeyOnlyWithOneCandidatePostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	oldKey, replacement, secondReplacement := keys[1], keys[0], keys[2]
+	const upstream = "retired-key-school"
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	saveCatalogFixture(t, ctx, db, provider, oldKey, []catalog.ProviderEntry{
+		{ID: upstream, SupportedProtocols: []string{"openai_responses"}},
+	}, nil)
+	modelID := uuid.New()
+	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES($1,$2::text,$2::text,'inactive',1000,now(),now())`, modelID, upstream)
+	exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,$3,$4,'openai_responses',19,now(),now())`, modelID, provider, oldKey, upstream)
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", oldKey)
+	for _, key := range []uuid.UUID{replacement, secondReplacement} {
+		saveCatalogFixture(t, ctx, db, provider, key, []catalog.ProviderEntry{
+			{ID: upstream, SupportedProtocols: []string{"openai_responses"}},
+		}, nil)
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+VALUES($1,$2,'school','manual','teacher',$3,1000000,2000000)`, key, upstream, actor)
+	}
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", secondReplacement)
+	service := New(db, nil)
+	row := func() CatalogModel {
+		t.Helper()
+		view, err := service.Overview(ctx, provider, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range view.ModelCatalog {
+			if item.Model == upstream {
+				return item
+			}
+		}
+		t.Fatal("missing catalog row")
+		return CatalogModel{}
+	}
+	first := row()
+	if !first.CanEnable || first.SchoolModelID == nil || *first.SchoolModelID != modelID ||
+		len(first.PreferredRoutes) != 1 || first.PreferredRoutes[0].CredentialID == nil ||
+		*first.PreferredRoutes[0].CredentialID != replacement {
+		t.Fatalf("single replacement should be previewed without changing the school model: %+v", first)
+	}
+	if id, err := service.EnableModel(ctx, provider, actor, upstream, ""); err != nil || id != modelID {
+		t.Fatalf("explicit enable did not preserve the school model: %s %v", id, err)
+	}
+	var repaired bool
+	err := db.QueryRowContext(ctx, `SELECT
+  (SELECT status='active' FROM models WHERE id=$1)
+  AND (SELECT count(*)=1 FROM models WHERE model_id=$2)
+  AND (SELECT count(*)=1 FROM model_bindings WHERE model_id=$1 AND provider_id=$3
+    AND adapter='openai_responses' AND status='active' AND credential_id=$4 AND priority=19)`,
+		modelID, upstream, provider, replacement).Scan(&repaired)
+	if err != nil || !repaired {
+		t.Fatalf("repair changed or duplicated the school identity: %v", err)
+	}
+
+	// A second viable Key makes the choice ambiguous. The teacher must use the
+	// explicit rebind preview instead of having a route picked automatically.
+	exec("UPDATE models SET status='inactive' WHERE id=$1", modelID)
+	exec("UPDATE provider_credentials SET status='active' WHERE id=$1", secondReplacement)
+	exec(`UPDATE model_bindings SET credential_id=$2,status='active' WHERE model_id=$1 AND adapter='openai_responses'`,
+		modelID, oldKey)
+	ambiguous := row()
+	if ambiguous.CanEnable {
+		t.Fatalf("multiple replacement Keys must be ambiguous: %+v", ambiguous)
+	}
+	if id, err := service.EnableModel(ctx, provider, actor, upstream, ""); id != uuid.Nil ||
+		!strings.Contains(err.Error(), "多个候选线路") {
+		t.Fatalf("ambiguous replacement was not rejected: %s %v", id, err)
+	}
+	var unchanged bool
+	err = db.QueryRowContext(ctx, `SELECT count(*)=1 AND bool_and(credential_id=$2)
+FROM model_bindings WHERE model_id=$1 AND adapter='openai_responses'`, modelID, oldKey).Scan(&unchanged)
+	if err != nil || !unchanged {
+		t.Fatalf("ambiguous enable changed a binding: %v", err)
 	}
 }
 

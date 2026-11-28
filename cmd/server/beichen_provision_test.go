@@ -18,6 +18,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/controlplane"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	store "github.com/starprince1234/Nebula-api/internal/infrastructure/db"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 )
 
 const provisionFixture = `[
@@ -70,7 +71,7 @@ func TestBeichenProvisionPostgres(t *testing.T) {
 		t.Skip("requires a disposable loopback nebula_test database")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || config.Database != "nebula_test" || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
+	if err != nil || config.Host != "127.0.0.1" || !testutil.IsIsolatedPostgresDatabase(config.Database) || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal("requires loopback nebula_test with sslmode=disable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)

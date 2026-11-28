@@ -2,37 +2,41 @@ package catalog
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 
 	"github.com/google/uuid"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providermodelcatalog"
 )
 
-func LoadActiveCatalogEntries(ctx context.Context, client *ent.Client, credentialID uuid.UUID) ([]ProviderEntry, error) {
-	rows, err := client.ProviderModelCatalog.Query().
-		Where(
-			providermodelcatalog.CredentialIDEQ(credentialID),
-			providermodelcatalog.StatusEQ(providermodelcatalog.StatusActive),
-		).
-		Order(ent.Asc(providermodelcatalog.FieldModelID)).
-		All(ctx)
+func LoadActiveCatalogEntries(ctx context.Context, db *sql.DB, credentialID uuid.UUID) ([]ProviderEntry, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT model_id::text, COALESCE(upstream_object, ''), COALESCE(display_name, ''),
+       COALESCE(upstream_created_at, ''), COALESCE(owned_by, ''), COALESCE(description, ''),
+       raw_entry, to_json(supported_protocols)
+FROM provider_model_catalog
+WHERE credential_id=$1 AND status='active'
+ORDER BY model_id`, credentialID)
 	if err != nil {
 		return nil, err
 	}
-	result := make([]ProviderEntry, 0, len(rows))
-	for _, row := range rows {
-		entry := ProviderEntry{
-			ID:          row.ModelID,
-			Object:      stringValue(row.UpstreamObject),
-			DisplayName: stringValue(row.DisplayName),
-			CreatedAt:   stringValue(row.UpstreamCreatedAt),
-			OwnedBy:     stringValue(row.OwnedBy),
-			Description: stringValue(row.Description),
-			Raw:         row.RawEntry,
+	defer rows.Close()
+	result := make([]ProviderEntry, 0)
+	for rows.Next() {
+		var entry ProviderEntry
+		var raw, protocols []byte
+		if err := rows.Scan(&entry.ID, &entry.Object, &entry.DisplayName, &entry.CreatedAt,
+			&entry.OwnedBy, &entry.Description, &raw, &protocols); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(raw, &entry.Raw); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(protocols, &entry.SupportedProtocols); err != nil {
+			return nil, err
 		}
 		result = append(result, entry)
 	}
-	return result, nil
+	return result, rows.Err()
 }
 
 func stringValue(value *string) string {

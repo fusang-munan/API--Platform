@@ -27,12 +27,14 @@ func (metrics *CallMetrics) MergeProtocolUsage(adapter modelbinding.Adapter, raw
 	mergeCount := metrics.mergeCount
 	switch adapter {
 	case modelbinding.AdapterGoogleGeminiV1beta:
+		// Keep the native counts separate. Billing adds tool prompt tokens
+		// to input and thoughts to candidate output after the terminal frame.
 		mergeCount(&metrics.PromptTokens, math.MaxInt32, values["promptTokenCount"])
 		mergeCount(&metrics.CompletionTokens, math.MaxInt32, values["candidatesTokenCount"])
 		mergeCount(&metrics.TotalTokens, math.MaxInt32, values["totalTokenCount"])
-		mergeCount(&metrics.CacheHitTokens, math.MaxInt64, values["cachedContentTokenCount"])
-		mergeCount(&metrics.ReasoningTokens, math.MaxInt64, values["thoughtsTokenCount"])
-		mergeCount(&metrics.ToolPromptTokens, math.MaxInt64, values["toolUsePromptTokenCount"])
+		mergeCount(&metrics.CacheHitTokens, math.MaxInt32, values["cachedContentTokenCount"])
+		mergeCount(&metrics.ReasoningTokens, math.MaxInt32, values["thoughtsTokenCount"])
+		mergeCount(&metrics.ToolPromptTokens, math.MaxInt32, values["toolUsePromptTokenCount"])
 		return
 	case modelbinding.AdapterAnthropic:
 		mergeCount(&metrics.PromptTokens, math.MaxInt32, values["input_tokens"])

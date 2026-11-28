@@ -300,12 +300,15 @@ func TestStudentKeyModelAuthorizationPostgres(t *testing.T) {
 		{`{"model_ids":["gpt-fixture-new","fixture-disabled"]}`, "停用或还未发布", 409},
 		{`{"model_ids":["fixture-no-route"]}`, "没有可接入的线路", 409},
 		{`{"model_ids":["fixture-stale"]}`, "没有可接入的线路", 409},
-		{`{"model_ids":["gpt-fixture-failed"]}`, "探活均失败", 409},
+		{`{"model_ids":["gpt-fixture-failed"]}`, "连通测试均失败", 409},
 		{`{"model_ids":["fixture-nonexistent"]}`, "model not found in platform catalog", 404},
 	} {
 		body := requireStatus(serve("POST", endpoint, studentToken, refusal.body), refusal.status)
 		if !strings.Contains(body, refusal.reason) {
 			t.Fatalf("missing rejection reason %q: %s", refusal.reason, body)
+		}
+		if refusal.reason == "连通测试均失败" && !strings.Contains(body, "HTTP 503") {
+			t.Fatalf("missing classified probe status for %q: %s", refusal.reason, body)
 		}
 	}
 	if got := modelList(); !slices.Equal(got, verifiedIDs) || sends != 0 {

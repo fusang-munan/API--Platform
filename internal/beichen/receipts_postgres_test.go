@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
@@ -25,7 +26,7 @@ func TestReceiptSweepPostgresG3(t *testing.T) {
 		t.Skip("requires a disposable local nebula_test database")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || config.Database != "nebula_test" ||
+	if err != nil || config.Host != "127.0.0.1" || !testutil.IsIsolatedPostgresDatabase(config.Database) ||
 		(config.User != "nebula_qa" && config.User != "nebula_test") || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal("requires the loopback nebula_test database with a test role and sslmode=disable")
 	}

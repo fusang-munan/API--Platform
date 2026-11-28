@@ -65,11 +65,11 @@ func TestEnableModelsBatchRetriesSerializationAndDeduplicates(t *testing.T) {
 	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM providers p`).WithArgs(provider).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT k.model_id::text,k.raw_entry`).WithArgs(provider, "Missing").
+	mock.ExpectQuery(`SELECT k.model_id::text,k.raw_entry`).WithArgs(provider, "Missing", nil).
 		WillReturnError(&pgconn.PgError{Code: "40001"})
 	mock.ExpectRollback()
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT k.model_id::text,k.raw_entry`).WithArgs(provider, "Missing").
+	mock.ExpectQuery(`SELECT k.model_id::text,k.raw_entry`).WithArgs(provider, "Missing", nil).
 		WillReturnRows(sqlmock.NewRows([]string{"model"}))
 	mock.ExpectRollback()
 	result, err := New(db, nil).EnableModelsBatch(context.Background(), provider, actor, []string{"Missing", "missing"})

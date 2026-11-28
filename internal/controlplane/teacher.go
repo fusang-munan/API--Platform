@@ -456,7 +456,11 @@ func (s *Service) UpdateProvider(ctx context.Context, id uuid.UUID, input Provid
 		return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "start provider update transaction", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	current, err := tx.Provider.Query().Where(provider.IDEQ(id)).Only(ctx)
+	query := tx.Provider.Query().Where(provider.IDEQ(id))
+	if input.BaseURL != "" {
+		query.ForUpdate()
+	}
+	current, err := query.Only(ctx)
 	if ent.IsNotFound(err) {
 		return ProviderView{}, domain.NewError(domain.CodeNotFound, "provider not found")
 	}
@@ -476,7 +480,21 @@ func (s *Service) UpdateProvider(ctx context.Context, id uuid.UUID, input Provid
 		if err != nil {
 			return ProviderView{}, err
 		}
-		builder.SetBaseURL(baseURL)
+		if catalog.IsBeichenBaseURL(current.BaseURL) && catalog.IsBeichenBaseURL(baseURL) {
+			// Different official URL spellings use the same upstream.
+			input.BaseURL = ""
+		} else if baseURL != current.BaseURL {
+			if catalog.IsBeichenBaseURL(current.BaseURL) {
+				exists, err := current.QueryCredentials().Exist(ctx)
+				if err != nil {
+					return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "核对北辰凭据失败", err)
+				}
+				if exists {
+					return ProviderView{}, domain.NewError(domain.CodeInvalidTransition, "供应商已有北辰凭据，不能修改接口地址")
+				}
+			}
+			builder.SetBaseURL(baseURL)
+		}
 	}
 	if input.Status != nil {
 		status, err := resourceStatus(input.Status, "")
@@ -1049,7 +1067,11 @@ func (s *Service) CreateBinding(ctx context.Context, publicModelID string, input
 	if !providerExists {
 		return BindingView{}, domain.NewError(domain.CodeNotFound, "provider not found")
 	}
-	credentialID, err := s.resolveProbeCredentialID(ctx, input.ProviderID, input.UpstreamModelName)
+	probed, err := probedAdaptersFromInput(input)
+	if err != nil {
+		return BindingView{}, err
+	}
+	credentialID, err := s.resolveProbeCredentialID(ctx, input.ProviderID, input.UpstreamModelName, probed)
 	if err != nil {
 		return BindingView{}, err
 	}
@@ -1130,7 +1152,8 @@ type BindingRouteProbeInput struct {
 func (s *Service) ProbeModelBindingRoute(ctx context.Context, input BindingRouteProbeInput) (catalog.RouteProbeStep, error) {
 	endpoint := catalog.BindingRouteProbeEndpoint(strings.TrimSpace(input.Endpoint))
 	switch endpoint {
-	case catalog.BindingRouteProbeChatCompletions, catalog.BindingRouteProbeResponses, catalog.BindingRouteProbeMessages, catalog.BindingRouteProbeImagesGenerations:
+	case catalog.BindingRouteProbeChatCompletions, catalog.BindingRouteProbeResponses, catalog.BindingRouteProbeMessages, catalog.BindingRouteProbeImagesGenerations,
+		catalog.BindingRouteProbeGenerateContent, catalog.BindingRouteProbeStreamGenerateContent, catalog.BindingRouteProbeEmbedContent:
 	default:
 		return catalog.RouteProbeStep{}, domain.NewError(domain.CodeValidation, "invalid binding route probe endpoint")
 	}
@@ -1145,7 +1168,8 @@ func (s *Service) ProbeModelBindingRoute(ctx context.Context, input BindingRoute
 	if err != nil {
 		return catalog.RouteProbeStep{}, domain.WrapError(domain.CodeDependencyUnavailable, "query provider", err)
 	}
-	credentialPlain, _, err := s.probeCredentialForProvider(ctx, input.ProviderID, upstreamModelName)
+	credentialPlain, err := s.catalogProbeCredential(ctx, providerRow, upstreamModelName,
+		catalog.ProbeProtocolsForEndpoints([]catalog.BindingRouteProbeEndpoint{endpoint})...)
 	if err != nil {
 		return catalog.RouteProbeStep{}, err
 	}
@@ -1154,6 +1178,14 @@ func (s *Service) ProbeModelBindingRoute(ctx context.Context, input BindingRoute
 }
 
 func bindingAdaptersFromInput(modelID string, input BindingInput) ([]modelbinding.Adapter, error) {
+	probed, err := probedAdaptersFromInput(input)
+	if err != nil {
+		return nil, err
+	}
+	return catalog.ExpandChatGatewayAdapters(modelID, probed), nil
+}
+
+func probedAdaptersFromInput(input BindingInput) ([]modelbinding.Adapter, error) {
 	if len(input.ProbedAdapters) == 0 {
 		return nil, domain.NewError(domain.CodeValidation, "probed_adapters is required; run route probe before saving bindings")
 	}
@@ -1173,41 +1205,29 @@ func bindingAdaptersFromInput(modelID string, input BindingInput) ([]modelbindin
 	if len(result) == 0 {
 		return nil, domain.NewError(domain.CodeValidation, "probed_adapters is required; run route probe before saving bindings")
 	}
-	return catalog.ExpandChatGatewayAdapters(modelID, result), nil
+	return result, nil
 }
 
-func (s *Service) resolveProbeCredentialID(ctx context.Context, providerID uuid.UUID, upstreamModelName string) (*uuid.UUID, error) {
-	_, credentialID, err := s.probeCredentialForProvider(ctx, providerID, upstreamModelName)
-	return credentialID, err
-}
-
-func (s *Service) probeCredentialForProvider(ctx context.Context, providerID uuid.UUID, upstreamModelName string) (string, *uuid.UUID, error) {
-	if credentialID, resolveErr := s.ResolveCredentialForUpstream(ctx, providerID, upstreamModelName); resolveErr != nil {
-		return "", nil, resolveErr
-	} else if credentialID != nil {
-		row, err := s.db.ProviderCredential.Get(ctx, *credentialID)
-		if err != nil {
-			return "", nil, domain.WrapError(domain.CodeDependencyUnavailable, "query provider credential", err)
+func (s *Service) resolveProbeCredentialID(ctx context.Context, providerID uuid.UUID, upstreamModelName string, probed []modelbinding.Adapter) (*uuid.UUID, error) {
+	baseURL, err := s.db.Provider.Query().Where(provider.IDEQ(providerID)).Select(provider.FieldBaseURL).String(ctx)
+	if err != nil && !ent.IsNotFound(err) {
+		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "query provider", err)
+	}
+	if catalog.IsBeichenBaseURL(baseURL) {
+		protocols := make([]string, 0, len(probed))
+		for _, adapter := range probed {
+			protocols = append(protocols, string(adapter))
 		}
-		plain, err := s.security.DecryptCredential(row.CredentialCiphertext)
+		row, err := catalog.FindProbeCatalogCredential(ctx, s.sqlDB, s.db, providerID, baseURL, upstreamModelName, protocols...)
 		if err != nil {
-			return "", nil, domain.WrapError(domain.CodeDependencyUnavailable, "decrypt provider credential", err)
+			return nil, domain.WrapError(domain.CodeDependencyUnavailable, "query probe model catalog", err)
 		}
-		return plain, credentialID, nil
+		if row == nil {
+			return nil, domain.NewError(domain.CodeValidation, "模型渠道待核，未找到同时声明所测协议的唯一 Key")
+		}
+		return &row.ID, nil
 	}
-	credentials, err := catalog.ActiveCredentials(ctx, s.db, &providerID)
-	if err != nil {
-		return "", nil, domain.WrapError(domain.CodeDependencyUnavailable, "list active provider credentials", err)
-	}
-	if len(credentials) == 0 {
-		return "", nil, domain.NewError(domain.CodeValidation, "provider has no active credentials")
-	}
-	plain, err := s.security.DecryptCredential(credentials[0].CredentialCiphertext)
-	if err != nil {
-		return "", nil, domain.WrapError(domain.CodeDependencyUnavailable, "decrypt provider credential", err)
-	}
-	id := credentials[0].ID
-	return plain, &id, nil
+	return s.ResolveCredentialForUpstream(ctx, providerID, upstreamModelName)
 }
 
 func (s *Service) UpdateBinding(ctx context.Context, bindingID uuid.UUID, input BindingInput) (BindingView, error) {

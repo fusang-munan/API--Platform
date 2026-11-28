@@ -35,9 +35,16 @@ WITH matched AS (
 ), retired_credentials AS (
   UPDATE provider_credentials c SET status = 'inactive', updated_at = statement_timestamp()
   FROM targets t WHERE c.id = t.id AND c.status = 'active'
+  RETURNING c.id,c.updated_at
 ), retired_catalog AS (
   UPDATE provider_model_catalog m SET status = 'inactive', updated_at = statement_timestamp()
   FROM targets t WHERE m.credential_id = t.id AND m.provider_id = t.provider_id AND m.status = 'active'
+), retirement_evidence AS (
+  -- Record the rows changed by this statement before 0067 backfills retired_at.
+  INSERT INTO maintenance_state (id,name,created_at,updated_at)
+  SELECT gen_random_uuid(),'beichen_0065_retirement/'||id::text,updated_at,updated_at
+  FROM retired_credentials
+  ON CONFLICT (name) DO NOTHING
 )
 UPDATE model_bindings b SET status = 'inactive', updated_at = statement_timestamp()
 FROM targets t WHERE b.credential_id = t.id AND b.provider_id = t.provider_id AND b.status = 'active';

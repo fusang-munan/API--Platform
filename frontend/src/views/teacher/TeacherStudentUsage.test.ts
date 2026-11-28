@@ -63,6 +63,8 @@ let widget: VueWrapper | undefined
 afterEach(() => {
   widget?.unmount()
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
+  vi.useRealTimers()
 })
 
 it('按已应用条件分页，并以相同的月份和项目参数加载学生、项目、Key、模型明细', async () => {
@@ -122,15 +124,64 @@ it('按已应用条件分页，并以相同的月份和项目参数加载学生�
   await view.get('.student-row').trigger('click')
   await flushPromises()
   expect(expand.attributes('aria-expanded')).toBe('true')
-  expect(view.get('.project-detail > summary').text()).toContain('课程项目')
-  view.get('.project-detail').element.setAttribute('open', '')
   view.get('.key-detail').element.setAttribute('open', '')
   expect(view.get('.key-detail > summary').text()).toContain('历史 Key')
+  expect(view.get('.key-detail > summary').text()).toContain('课程项目')
   expect(view.get('.model-list').text()).toContain('模型甲')
   expect(view.get('.model-list').text()).toContain('待核 2 笔')
-  expect(view.get('.model-list').text()).toContain('缓存读 —')
+  expect(view.get('.model-list').text()).toContain('缓存读 无样本')
   await expand.trigger('click')
   expect(view.find('.detail-row').exists()).toBe(false)
+})
+
+it('先显示两项目的三把 Key，共用的模型仍各自计费，60 秒后刷新列表和展开的明细', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+  vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+  const baseProject = detail.projects[0]
+  const baseKey = baseProject.keys[0]
+  const rows = (first: string): TeacherStudentUsageDetail => ({
+    ...detail,
+    projects: [{
+      ...baseProject,
+      keys: [
+        { ...baseKey, name: '课程 Key', used: first, calls: 1, models: [{ ...model, credits: first, calls: 1 }] },
+        { ...baseKey, id: 'key-2', name: '实验 Key', used: '2.000', calls: 2, models: [{ ...model, credits: '2.000', calls: 2 }] },
+      ],
+    }, {
+      ...baseProject, project_id: 'project-b', project_name: '竞赛项目',
+      keys: [{ ...baseKey, id: 'key-3', name: '竞赛 Key', used: '3.000', calls: 1, models: [{ ...model, credits: '3.000', calls: 1 }] }],
+    }],
+  })
+  let listReads = 0
+  let detailReads = 0
+  vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+    const url = endpoint(path)
+    if (url.pathname === '/api/v1/teacher/projects') return json(projects)
+    expect(url.searchParams.get('month')).toBe(schoolMonth())
+    if (url.pathname === route) return page(url, [{ ...student, credits: ++listReads === 1 ? '6.000' : '9.000' }])
+    return json(rows(++detailReads === 1 ? '1.000' : '4.000'))
+  }))
+  const view = widget = mount(TeacherStudentUsage)
+  await flushPromises()
+  await view.get('.student-button').trigger('click')
+  await flushPromises()
+  const keys = view.findAll<HTMLDetailsElement>('.key-detail')
+  expect(keys.map(key => key.get('summary').text())).toEqual([
+    expect.stringMatching(/课程 Key.*课程项目.*1.000 积分.*1 次.*详情/),
+    expect.stringMatching(/实验 Key.*课程项目.*2.000 积分.*2 次.*详情/),
+    expect.stringMatching(/竞赛 Key.*竞赛项目.*3.000 积分.*1 次.*详情/),
+  ])
+  expect(keys.every(key => !key.element.open)).toBe(true)
+  keys[1].element.open = true
+  expect(keys[1].get('.model-list').text()).toMatch(/模型甲.*2.000 积分.*2 次/)
+  expect(keys[1].get('.model-list').text()).not.toContain('3.000 积分')
+
+  await vi.advanceTimersByTimeAsync(60_000)
+  await flushPromises()
+  expect([listReads, detailReads]).toEqual([2, 2])
+  expect(view.get('.student-row').text()).toContain('9.000')
+  expect(view.get('.key-detail > summary').text()).toContain('4.000 积分')
+  expect(keys[1].element.open).toBe(true)
 })
 
 it('学生列表与项目加载失败后各自可重试，空结果仍展示全校未确认流水', async () => {

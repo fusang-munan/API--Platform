@@ -150,7 +150,7 @@ func readProbeBudget(ctx context.Context, db rowQueryer, now time.Time) (ProbeBu
 func readRecentProbes(ctx context.Context, tx *sql.Tx, providerID uuid.UUID) ([]ProbeResult, error) {
 	rows, err := tx.QueryContext(ctx, `
 SELECT r.provider_id, r.credential_id, r.model, r.protocol, r.status_code,
-       r.error_code, r.duration_ms, r.checked_at,
+       COALESCE(r.detail->>'failure_code',r.error_code), r.duration_ms, r.checked_at,
        CASE WHEN r.last_passed_at >= c.updated_at THEN r.last_passed_at END, r.detail
 FROM upstream_probes r
 JOIN providers p ON p.id = r.provider_id AND p.status = 'active'
@@ -173,6 +173,10 @@ LIMIT 100`, providerID)
 			return nil, err
 		}
 		result.CheckedAt = result.CheckedAt.UTC()
+		if result.ErrorCode != nil {
+			code := classifiedProbeFailure(result.StatusCode, *result.ErrorCode)
+			result.ErrorCode = &code
+		}
 		if result.LastPassedAt != nil {
 			passedAt := result.LastPassedAt.UTC()
 			result.LastPassedAt = &passedAt

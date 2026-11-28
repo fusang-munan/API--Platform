@@ -98,6 +98,7 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 			}
 			continue
 		}
+		row.explainProbeFailures()
 		row.CredentialIDs = catalogCredentialIDs(row.CatalogKeys)
 		row.CurrentKeyCount, row.StaleKeyCount = 0, 0
 		protocols := map[string]bool{}
@@ -160,6 +161,50 @@ func mergeCatalogDiscovery(view *Overview, keys []discoveryKey, web map[string][
 	slices.SortFunc(view.WebsiteOnlyModels, func(a, b WebsiteOnlyModel) int {
 		return strings.Compare(strings.ToLower(a.Model), strings.ToLower(b.Model))
 	})
+}
+
+func (row *CatalogModel) explainProbeFailures() {
+	reasons := map[string]bool{}
+	for i := range row.BoundRoutes {
+		route := &row.BoundRoutes[i]
+		if route.ProbeState != "failed" || route.Probe == nil {
+			continue
+		}
+		probe := *route.Probe
+		probe.ErrorCode = classifiedProbeFailure(probe.StatusCode, probe.ErrorCode)
+		route.Probe = &probe
+		if !route.BindingReady {
+			continue
+		}
+		reason := catalog.BeichenHTTPStatus(probe.StatusCode).Error()
+		switch probe.ErrorCode {
+		case "credential_invalid":
+			reason = "渠道 Key 未通过上游认证"
+		case "credential_unreadable":
+			reason = "学校服务无法读取渠道 Key"
+		case "endpoint_unsupported":
+			reason = "上游未提供该协议端点（HTTP 404）"
+		case "rate_limited":
+			reason = "上游暂时限流（HTTP 429）"
+		case "timeout":
+			reason = "上游请求超时"
+		case "network_error":
+			reason = "网络请求失败"
+		case "invalid_response":
+			reason = "上游响应与协议格式不符"
+		}
+		reasons[reason] = true
+	}
+	if len(reasons) == 0 || row.ModelAvailability.ProbeState != "failed" {
+		return
+	}
+	reason := strings.Join(slices.Sorted(maps.Keys(reasons)), "、")
+	switch row.ModelAvailability.Availability {
+	case catalog.AvailabilityDegraded:
+		row.ModelAvailability.AvailabilityReason = reason + "。过去 7 天内曾通过探活，仍可尝试调用。"
+	case catalog.AvailabilityMaintenance:
+		row.ModelAvailability.AvailabilityReason = reason + "。请核对线路后重新探活。"
+	}
 }
 
 // Only split upstream identities need strict evidence filtering. A replacement
@@ -288,7 +333,10 @@ func (key discoveryKey) diagnoseGroup(locations []WebsiteLocation, missingModel 
 			}
 		}
 	}
-	if missingModel && hasOtherGroup && !hasCurrentGroup {
+	// A retained historical row is not current group evidence. When the
+	// selected group does not list the model at all, the model is outside the
+	// group even if an older snapshot still carries its price.
+	if hasOtherGroup && !hasCurrentGroup {
 		return "model_outside_key_group"
 	}
 	if !missingModel && hasCurrentGroup && key.priceError != nil && *key.priceError == errPanelRulesConflict.Error() {

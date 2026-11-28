@@ -1,27 +1,16 @@
 package catalog
 
-import (
-	"testing"
+import "testing"
 
-	"github.com/google/uuid"
-	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
-)
-
-func TestPickCredentialForUpstreamModel(t *testing.T) {
-	claudeID := uuid.New()
-	gptID := uuid.New()
-	credentials := []*ent.ProviderCredential{
-		{ID: claudeID, Label: "claude"},
-		{ID: gptID, Label: "gpt"},
+func TestCredentialListsEveryProbedProtocol(t *testing.T) {
+	supported := []string{"openai_compatible", "openai_responses"}
+	if !credentialListsProtocols(supported, []string{"openai_compatible"}) {
+		t.Fatal("a declared Chat protocol was rejected")
 	}
-	base := "https://api.llmapi.site"
-
-	picked := PickCredentialForUpstreamModel(credentials, "gpt-5.6-luna", base)
-	if picked == nil || picked.ID != gptID {
-		t.Fatalf("expected gpt credential for luna, got %#v", picked)
+	if credentialListsProtocols(supported, []string{"openai_compatible", "google_gemini_v1beta"}) {
+		t.Fatal("a missing native protocol was treated as confirmed")
 	}
-	picked = PickCredentialForUpstreamModel(credentials, "claude-sonnet-5", base)
-	if picked == nil || picked.ID != claudeID {
-		t.Fatalf("expected claude credential for claude model, got %#v", picked)
+	if credentialListsProtocols(nil, []string{"google_gemini_v1beta"}) {
+		t.Fatal("an undeclared catalog row selected a Key")
 	}
 }

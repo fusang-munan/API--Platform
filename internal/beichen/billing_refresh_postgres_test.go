@@ -302,21 +302,19 @@ beichen_multiplier_version,beichen_state FROM gateway_calls WHERE id=$1`, call.C
 
 	ratesStatus = http.StatusServiceUnavailable
 	beforeOutage := keyBillingReads
-	if _, err := service.runJob(ctx, syncJob{provider: provider, credential: key, kind: "billing"}, true); !errors.Is(err, errWebsiteAccountRateUnverified) {
-		t.Fatalf("an account rate outage cannot prove a missing group and should require review: %v", err)
+	if _, err := service.runJob(ctx, syncJob{provider: provider, credential: key, kind: "billing"}, true); err != nil {
+		t.Fatalf("a conflict-free account rate outage should use the confirmed group default: %v", err)
 	}
-	if keyBillingReads != beforeOutage {
-		t.Fatal("an account rate outage must not read Key billing for a listed group")
+	if keyBillingReads != beforeOutage+1 {
+		t.Fatal("the fallback must inspect Key billing for conflicting evidence")
 	}
-	missingRate := billing(overview(), "stale", "0.6", 60)
-	if missingRate.GroupRate == nil || *missingRate.GroupRate != "0.6" || missingRate.LastError == nil ||
-		*missingRate.LastError != "北辰官网账户倍率未核实，分组倍率仅供参考：官网账户倍率表读取失败（HTTP 503）" {
-		t.Fatalf("account rate failure should preserve the group default and record a billing error: %+v", missingRate)
+	fallbackRate := billing(overview(), "current", "0.6", 60)
+	if fallbackRate.GroupRate == nil || *fallbackRate.GroupRate != "0.6" || fallbackRate.LastError != nil ||
+		fallbackRate.AccountRate == nil || fallbackRate.AccountRateSource != groupRateSource {
+		t.Fatalf("conflict-free fallback should publish the group default: %+v", fallbackRate)
 	}
 	call, route := dispatch()
 	finalize(call, route)
-	if err := db.QueryRowContext(ctx, `SELECT beichen_state,student_credits::text FROM gateway_calls WHERE id=$1`, call.CallID).
-		Scan(&state, &debit); err != nil || state != "pending_review" || debit.Valid {
-		t.Fatalf("unverified account rate was used to charge a call: %s %+v (%v)", state, debit, err)
-	}
+	fallbackVersion := multiplierVersion(5)
+	checkCharge(call, fallbackVersion, "1.2", "1.32")
 }

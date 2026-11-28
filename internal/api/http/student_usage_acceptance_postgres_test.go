@@ -25,6 +25,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/controlplane"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
@@ -65,7 +66,7 @@ func newUsageHTTPFixture(t *testing.T) *usageHTTPFixture {
 		t.Skip("requires a disposable local nebula_test database")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || config.Database != "nebula_test" ||
+	if err != nil || config.Host != "127.0.0.1" || !testutil.IsIsolatedPostgresDatabase(config.Database) ||
 		config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal("requires a loopback-only nebula_test database with sslmode=disable")
 	}
@@ -305,13 +306,23 @@ func TestStudentCatalogBatchHTTPPostgres(t *testing.T) {
 	f.exec(t, `INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at) VALUES
 		(gen_random_uuid(),'batch-inactive','Inactive','inactive',1000,now(),now()),
 		(gen_random_uuid(),'batch-zero','Free','active',0,now(),now())`)
+	retiredProvider, retiredCredential := uuid.New(), uuid.New()
+	f.exec(t, `INSERT INTO providers(id,name,base_url,created_at,updated_at)
+		VALUES($1,'Retired route','https://fixture.example.test',now(),now())`, retiredProvider)
+	f.exec(t, `INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
+		VALUES($1,$2,'retired',$3,now(),now())`, retiredCredential, retiredProvider, ciphertext)
 	f.exec(t, `INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
 		SELECT gen_random_uuid(),m.id,b.provider,b.credential,m.model_id,b.adapter,b.priority,now(),now()
 		FROM models m CROSS JOIN (VALUES ($1::uuid,$2::uuid,'openai_responses',10),($3::uuid,$4::uuid,'anthropic',20)) b(provider,credential,adapter,priority)
 		WHERE m.model_id <> 'batch-24'`, first, firstCredential, second, secondCredential)
+	// batch-24 is only reachable through a credential that is retired below.
+	f.exec(t, `INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+		SELECT gen_random_uuid(),m.id,$1,$2,m.model_id,'openai_responses',10,now(),now()
+		FROM models m WHERE m.model_id='batch-24'`, retiredProvider, retiredCredential)
 	f.exec(t, `INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,last_seen_at,synced_at,created_at,updated_at)
 		SELECT gen_random_uuid(),b.provider_id,b.credential_id,m.model_id,now(),now(),now(),now()
 		FROM models m JOIN model_bindings b ON m.id=b.model_id`)
+	f.exec(t, `UPDATE provider_credentials SET status='inactive' WHERE id=$1`, retiredCredential)
 	f.exec(t, `INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,duration_ms,checked_at)
 		VALUES ($1,$2,'batch-23','openai_responses',200,1,now())`, first, firstCredential)
 
@@ -339,6 +350,24 @@ func TestStudentCatalogBatchHTTPPostgres(t *testing.T) {
 	if raw["availability_state"] != "available" || !reflect.DeepEqual(raw["available_protocols"], []any{"openai_responses"}) ||
 		raw["last_probe_at"] == nil {
 		t.Fatalf("page missing stored availability evidence: %+v", raw)
+	}
+	directory := readUsageHTTPData[controlplane.StudentCatalogPage](t, f.get(route+"?page_size=1", token))
+	if len(directory.Items) != 1 || directory.Total != 23 || directory.Directory == nil || len(directory.Directory.Models) != 23 {
+		t.Fatalf("directory coverage changed with page size: %+v", directory)
+	}
+	for _, model := range directory.Directory.Models {
+		if model.ModelID == "batch-24" {
+			t.Fatalf("retired route leaked into the shared directory: %+v", model)
+		}
+	}
+	addable := directory.Directory.Models[22]
+	if addable.ModelID != "batch-23" || addable.WithGrant != "callable" || addable.WithoutGrant != "addable" || !addable.Addable {
+		t.Fatalf("eligible model beyond the first page is missing its grant outcomes: %+v", addable)
+	}
+	unverified := directory.Directory.Models[0]
+	if unverified.WithGrant != "unverified" || unverified.WithoutGrant != "addable" || !unverified.Addable ||
+		unverified.RawEntry["availability_reason"] == "" || unverified.RawEntry["addable"] != true {
+		t.Fatalf("unverified model is missing its explanation: %+v", unverified)
 	}
 }
 

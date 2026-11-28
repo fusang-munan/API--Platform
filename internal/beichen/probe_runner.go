@@ -1,16 +1,18 @@
 package beichen
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
-
 	"time"
 
 	"github.com/google/uuid"
@@ -234,12 +236,33 @@ func retryFailedProbes(ctx context.Context, observations []probeObservation, del
 
 // probeFailureRetryable reports failures that can heal on their own.
 func probeFailureRetryable(observation probeObservation) bool {
-	status := observation.statusCode
-	if observation.errorCode == "credential_unreadable" || (status >= 400 && status < 500 && status != 408 && status != 429) {
-		return false
+	switch classifiedProbeFailure(observation.statusCode, observation.errorCode) {
+	case "network_error", "timeout", "rate_limited", "upstream_error":
+		return true
 	}
-	return observation.errorCode == "network_error" || observation.errorCode == "timeout" ||
-		status == 408 || status == 429 || (status >= 500 && status < 600)
+	return false
+}
+
+func classifiedProbeFailure(status int, code string) string {
+	if code == "GROUP_NOT_ALLOWED" || code == "credential_unreadable" {
+		return code
+	}
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return "credential_invalid"
+	case status == http.StatusNotFound:
+		return "endpoint_unsupported"
+	case status == http.StatusRequestTimeout:
+		return "timeout"
+	case status == http.StatusTooManyRequests:
+		return "rate_limited"
+	case status >= 500 && status <= 599:
+		return "upstream_error"
+	case status >= 300:
+		return "http_" + strconv.Itoa(status)
+	default:
+		return code
+	}
 }
 
 func (s *Service) listProbeTargets(ctx context.Context, job probeJob) ([]probeTarget, bool, error) {
@@ -343,14 +366,51 @@ func observeTarget(ctx context.Context, target probeTarget) probeObservation {
 	}
 	ctx, cancel := context.WithTimeout(ctx, probeAttemptTimeout)
 	defer cancel()
-	step, err := target.client.ProbeTokenStep(ctx, target.model, target.protocol)
+	probe := *target.client
+	client := probe.Client
+	if client == nil {
+		client = catalog.NewRouteProbe(probe.BaseURL, probe.Credential).Client
+	}
+	singleRequest := *client
+	transport := singleRequest.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	capture := &probeResponseCapture{transport: transport}
+	singleRequest.Transport = capture
+	probe.Client = &singleRequest
+	step, err := probe.ProbeTokenStep(ctx, target.model, target.protocol)
 	if err != nil {
 		result.errorCode = "network_error"
 		return result
 	}
 	result.usage = step.Usage
-	result.statusCode, result.errorCode, result.durationMS = step.HTTPStatus, step.FailureCode, step.DurationMS
+	result.statusCode, result.durationMS = step.HTTPStatus, step.DurationMS
+	result.errorCode = classifiedProbeFailure(step.HTTPStatus, step.FailureCode)
+	if capture.groupDenied && step.HTTPStatus == http.StatusForbidden {
+		result.errorCode = "GROUP_NOT_ALLOWED"
+	}
 	return result
+}
+
+type probeResponseCapture struct {
+	transport   http.RoundTripper
+	groupDenied bool
+}
+
+func (c *probeResponseCapture) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := c.transport.RoundTrip(req)
+	if err != nil || resp == nil || resp.StatusCode != http.StatusForbidden || req.URL.Host != "api.beichenapi.com" || resp.Body == nil {
+		return resp, err
+	}
+	body := resp.Body
+	var prefix bytes.Buffer
+	c.groupDenied = catalog.BeichenGroupDenied(io.TeeReader(body, &prefix))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(&prefix, body), body}
+	return resp, nil
 }
 
 func renewProbeLease(ctx context.Context, db rowQueryer, job probeJob) error {
@@ -367,6 +427,9 @@ func (s *Service) saveProbeBatch(ctx context.Context, job probeJob, observations
 		return err
 	}
 	defer tx.Rollback()
+	if err := catalog.LockBeichenRouteEvidence(ctx, tx, job.provider); err != nil {
+		return err
+	}
 	if err := renewProbeLease(ctx, tx, job); err != nil {
 		return err
 	}
@@ -376,17 +439,27 @@ func (s *Service) saveProbeBatch(ctx context.Context, job probeJob, observations
 		err := tx.QueryRowContext(ctx, `
 SELECT c.id FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
 WHERE p.id = $1 AND `+beichenProvider+` AND p.status = 'active' AND c.id = $2 AND c.status = 'active' AND c.updated_at = $3
-FOR SHARE OF p FOR NO KEY UPDATE OF c`, job.provider, target.credential, target.revision).Scan(&key)
+  AND EXISTS (SELECT 1 FROM provider_model_catalog m
+    WHERE m.provider_id=p.id AND m.credential_id=c.id AND m.model_id::text=$4
+      AND m.status='active' AND m.catalog_source='key' AND m.last_seen_at>=c.updated_at)
+FOR SHARE OF p FOR NO KEY UPDATE OF c`, job.provider, target.credential, target.revision, target.model).Scan(&key)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		if err != nil {
 			return err
 		}
+		storedCode := result.errorCode
+		if result.statusCode >= 300 {
+			// The legacy column has a closed set of codes. Keep the specific
+			// attribution in the probe detail without a schema change.
+			storedCode = "http_error"
+		}
 		if _, err := tx.ExecContext(ctx, `
 WITH saved AS (
   INSERT INTO upstream_probes(provider_id, credential_id, model, protocol, status_code, error_code, duration_ms, checked_at, detail, last_passed_at)
-  SELECT $1, $2, m.model_id::text, $4, $5, NULLIF($6, ''), $7, statement_timestamp(), '{"max_output_tokens":1}'::jsonb,
+  SELECT $1, $2, m.model_id::text, $4, $5, NULLIF($6, ''), $7, statement_timestamp(),
+    jsonb_strip_nulls(jsonb_build_object('max_output_tokens',1,'failure_code',NULLIF($11::text,$6::text))),
     CASE WHEN NULLIF($6, '') IS NULL AND $5 BETWEEN 200 AND 299 THEN statement_timestamp() END
   FROM provider_model_catalog m
   WHERE m.provider_id = $1 AND m.credential_id = $2 AND m.model_id = $3::citext
@@ -394,7 +467,7 @@ WITH saved AS (
   ON CONFLICT (provider_id, credential_id, model, protocol) DO UPDATE SET status_code = EXCLUDED.status_code,
     error_code = EXCLUDED.error_code, duration_ms = EXCLUDED.duration_ms, checked_at = EXCLUDED.checked_at, detail = EXCLUDED.detail,
     last_passed_at = COALESCE(EXCLUDED.last_passed_at,
-      CASE WHEN upstream_probes.last_passed_at >= $9::timestamptz THEN upstream_probes.last_passed_at END)
+      CASE WHEN $10::boolean AND upstream_probes.last_passed_at >= $9::timestamptz THEN upstream_probes.last_passed_at END)
   RETURNING error_code
 )
 UPDATE provider_model_catalog m SET supported_protocols = CASE
@@ -403,8 +476,15 @@ UPDATE provider_model_catalog m SET supported_protocols = CASE
   ELSE array_append(m.supported_protocols, $4) END
 WHERE m.provider_id = $1 AND m.credential_id = $2 AND m.model_id = $3::citext
   AND NOT ($4 = ANY(m.supported_protocols)) AND EXISTS (SELECT 1 FROM saved WHERE error_code IS NULL)`,
-			job.provider, key, target.model, target.protocol, result.statusCode, result.errorCode, result.durationMS, target.registered, target.revision); err != nil {
+			job.provider, key, target.model, target.protocol, result.statusCode, storedCode, result.durationMS,
+			target.registered, target.revision, probeFailureRetryable(result), result.errorCode); err != nil {
 			return err
+		}
+		denied := result.errorCode == "GROUP_NOT_ALLOWED"
+		if denied || result.errorCode == "" && result.statusCode >= 200 && result.statusCode < 300 {
+			if err := catalog.SaveBeichenProbeGroupDenial(ctx, tx, key, target.revision, target.model, target.protocol, denied); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()

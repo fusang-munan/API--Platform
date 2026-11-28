@@ -25,7 +25,7 @@ import AppDialog from '../../components/AppDialog.vue'
 import LoadingRegion from '../../components/LoadingRegion.vue'
 import { useLoadState } from '../../composables/useLoadState'
 import { useToast } from '../../composables/useToast'
-import { APIError } from '../../api/client'
+import { APIError, request } from '../../api/client'
 
 type PlazaKey = Pick<ApiKey, 'id' | 'status' | 'updated_at' | 'name' | 'project'> & { models: StudentModel[] }
 type KeyModelMutation = {
@@ -36,8 +36,9 @@ type KeyModelMutation = {
 }
 type ModelAvailability = { state: string; label: string; available: boolean; addable: boolean; reason: string }
 type KeyCoverage = { inKey: boolean; label: string; tone: 'ok' | 'warn' | 'unavailable' | 'muted' }
-type ModelGroup = 'callable' | 'unverified' | 'maintenance' | 'addable'
-type ModelGroupCounts = Record<ModelGroup, number>
+type ModelGroup = 'callable' | 'unverified' | 'historical' | 'maintenance' | 'addable'
+type DirectoryModel = StudentModelCandidate & { with_grant: ModelGroup; without_grant: ModelGroup }
+type DirectoryResponse = { directory?: { models: DirectoryModel[] } }
 
 const commonRows = ref<StudentModel[]>([])
 const libraryRows = ref<StudentModel[]>([])
@@ -48,6 +49,9 @@ const catalogResult = ref<StudentModelCatalogPage | null>(null)
 const catalogLoading = ref(false)
 const catalogError = ref('')
 const catalogScroll = ref<HTMLElement | null>(null)
+const directory = ref<DirectoryModel[] | null>(null)
+const directoryLoading = ref(false)
+const directoryError = ref(false)
 const usage = ref<StudentUsageSnapshot | null>(null)
 const usageLoaded = ref(false)
 const usageFailed = ref(false)
@@ -70,6 +74,7 @@ const actionNotice = ref('')
 let keyListRevision = 0
 let catalogTimer: ReturnType<typeof setTimeout> | undefined
 let catalogRequest: AbortController | undefined
+let directoryRequest: AbortController | undefined
 const catalogPageSize = 20
 const loadState = useLoadState()
 const toast = useToast()
@@ -99,36 +104,44 @@ const allRows = computed(() => uniqueModels([
 ]))
 const modelGroupOptions: Array<{ value: ModelGroup; label: string }> = [
   { value: 'callable', label: '可调用' },
-  { value: 'unverified', label: '待核验' },
-  { value: 'maintenance', label: '暂不可用' },
   { value: 'addable', label: '可添加' },
+  { value: 'unverified', label: '待核验' },
+  { value: 'historical', label: '历史授权' },
+  { value: 'maintenance', label: '暂不可用' },
 ]
 const searchModels = computed(() => sortModelsByRecency(
   filterStudentModels(allRows.value, query.value, category.value, status.value),
 ) as StudentModel[])
 const groupedModels = computed<Record<ModelGroup, StudentModel[]>>(() => {
   const buckets: Record<ModelGroup, StudentModel[]> = {
-    callable: [], unverified: [], maintenance: [], addable: [],
+    callable: [], unverified: [], historical: [], maintenance: [], addable: [],
   }
-  for (const model of searchModels.value) buckets[modelGroupFor(model)].push(model)
+  const key = currentKey.value
+  if (!directory.value || !key) {
+    for (const model of searchModels.value) buckets[modelGroupFor(model)].push(model)
+    return buckets
+  }
+  const directoryIDs = new Set<string>()
+  for (const item of directory.value) {
+    directoryIDs.add(modelKey(item.model_id))
+    // The same add-eligibility drives the group count and the add button.
+    const model = modelFromCatalog(item)
+    buckets[modelGroupFor(model)].push(model)
+  }
+  for (const model of key.models) {
+    if (!directoryIDs.has(modelKey(model.model_id))) buckets.historical.push(model)
+  }
   return buckets
 })
-const groupCounts = computed<ModelGroupCounts>(() => ({
-  callable: groupedModels.value.callable.length,
-  unverified: groupedModels.value.unverified.length,
-  maintenance: groupedModels.value.maintenance.length,
-  addable: groupedModels.value.addable.length,
-}))
 const filteredModels = computed(() => groupedModels.value[modelGroup.value])
-const hasAnyModels = computed(() => searchModels.value.length > 0)
-const maintenanceInKeyModels = computed(() => (currentKey.value?.models ?? [])
-  .filter(model => modelGroupFor(model) === 'maintenance'))
+const hasAnyModels = computed(() => searchModels.value.length > 0 || currentKey.value != null)
+const maintenanceInKeyModels = computed(() => groupedModels.value.historical)
 const maintenanceInKeyModelIDs = computed(() => maintenanceInKeyModels.value.map(model => model.model_id))
 const currentGroupEmptyTitle = computed(() => {
-  if (!searchModels.value.length) return '还没有模型'
   switch (modelGroup.value) {
     case 'callable': return '当前 Key 还没有可调用的模型'
     case 'unverified': return '当前没有待核验的模型'
+    case 'historical': return '当前 Key 没有历史授权'
     case 'maintenance': return '当前没有暂不可用的模型'
     case 'addable': return '没有可添加的新模型'
   }
@@ -274,14 +287,14 @@ function modelAvailability(model: StudentModel): ModelAvailability {
     state, label, available: false, addable: false, reason: studentSafeReason(reason, fallback),
   })
   switch (state) {
-    case 'available': return { state, label: '可用', available: true, addable: true, reason: '' }
+    case 'available': return { state, label: '可用', available: true, addable: model.addable ?? true, reason: '' }
     case 'degraded': return {
-      state, label: '可用 · 探活异常', available: true, addable: true,
+      state, label: '可用 · 探活异常', available: true, addable: model.addable ?? true,
       reason: studentSafeReason(reason, '最近一次探活失败，仍可尝试调用。'),
     }
     case 'unverified': return {
       ...blocked('待核验', '线路尚未完成连通测试，调用可能失败。'),
-      addable: model.route_ready && model.availability !== 'maintenance',
+      addable: model.addable ?? (model.route_ready && model.availability !== 'maintenance'),
     }
     case 'channel_unavailable':
       return blocked(keyHasModel(model.model_id) ? '当前渠道未开放 · 历史授权' : '当前渠道未开放', '当前渠道目录未列出该模型。')
@@ -305,11 +318,16 @@ function keyHasModel(modelID: string) {
 }
 
 function modelGroupFor(model: StudentModel): ModelGroup {
-  const state = modelAvailability(model).state
+  const availability = modelAvailability(model)
+  const state = availability.state
   const inKey = keyHasModel(model.model_id)
-  if (state === 'available' || state === 'degraded') return inKey ? 'callable' : 'addable'
-  if (state === 'unverified') return 'unverified'
-  return 'maintenance'
+  if (inKey) {
+    if (state === 'available' || state === 'degraded') return 'callable'
+    if (state === 'unverified') return 'unverified'
+    return 'historical'
+  }
+  if (availability.addable) return 'addable'
+  return state === 'unverified' ? 'unverified' : 'maintenance'
 }
 
 function keyCoverage(model: StudentModel): KeyCoverage {
@@ -358,6 +376,7 @@ function modelFromCatalog(item: StudentModelCandidate): StudentModel {
     availability: stringField('availability') ?? known?.availability,
     availability_state: (stringField('availability_state') as StudentAvailabilityState | undefined) ?? known?.availability_state,
     availability_reason: stringField('availability_reason') ?? known?.availability_reason,
+    addable: typeof field('addable') === 'boolean' ? field('addable') as boolean : known?.addable,
   }
 }
 
@@ -430,6 +449,26 @@ function selectModelGroup(group: ModelGroup) {
   modelGroup.value = group
 }
 
+async function loadDirectory() {
+  directoryRequest?.abort()
+  const controller = directoryRequest = new AbortController()
+  directoryLoading.value = true
+  directoryError.value = false
+  try {
+    const result = await request<DirectoryResponse>('/api/v1/student/model-catalog?page_size=1', { signal: controller.signal })
+    if (controller.signal.aborted) return
+    if (!Array.isArray(result.directory?.models)) throw new Error('Missing student model directory')
+    directory.value = result.directory.models
+  } catch {
+    if (!controller.signal.aborted) {
+      directory.value = null
+      directoryError.value = true
+    }
+  } finally {
+    if (!controller.signal.aborted) directoryLoading.value = false
+  }
+}
+
 async function load() {
   const revision = ++keyListRevision
   await loadState.run(async () => {
@@ -463,6 +502,7 @@ async function load() {
       const selected = selectableKeys.value.find(key => key.id === requested) ?? selectCurrentStudentKey(selectableKeys.value)
       currentKeyID.value = selected?.id ?? ''
       syncKeyQuery(currentKeyID.value)
+      if (selected) void loadDirectory()
       error.value = ''
     } catch (caught) {
       if (revision === keyListRevision) error.value = caught instanceof APIError ? caught.message : '加载模型和 Key 失败'
@@ -660,6 +700,7 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   cancelCatalogSearch()
+  directoryRequest?.abort()
   window.removeEventListener('nebula:refresh', refresh)
 })
 </script>
@@ -743,7 +784,7 @@ onBeforeUnmount(() => {
         <section class="plaza-column">
           <div class="plaza-heading">
             <h2>我的模型</h2>
-            <button v-if="modelGroup === 'maintenance' && maintenanceInKeyModels.length"
+            <button v-if="modelGroup === 'historical' && maintenanceInKeyModels.length"
               class="button ghost danger-text" data-testid="cleanup-maintenance"
               :disabled="busy" @click="cleanupUnavailable">
               {{ cleaningMaintenance ? '正在清理…' : '清理全部不可用授权' }}
@@ -753,8 +794,12 @@ onBeforeUnmount(() => {
             <button v-for="option in modelGroupOptions" :key="option.value" role="tab"
               :aria-selected="modelGroup === option.value" :class="{ active: modelGroup === option.value }"
               :data-testid="`model-group-${option.value}`" @click="selectModelGroup(option.value)">
-              {{ option.label }}<span class="group-count">{{ groupCounts[option.value] }}</span>
+              {{ option.label }}<span v-if="currentKey && directory" class="group-count">{{ groupedModels[option.value].length }}</span>
             </button>
+          </div>
+          <p v-if="currentKey && directoryLoading" class="muted" role="status">正在读取完整目录…</p>
+          <div v-else-if="currentKey && directoryError" class="muted">
+            完整目录计数暂不可用 <button class="button ghost" type="button" @click="loadDirectory">重试</button>
           </div>
           <div class="plaza-cards">
             <article v-for="model in filteredModels" :key="model.model_id" class="panel is-interactive" :data-model="model.model_id">
@@ -782,7 +827,7 @@ onBeforeUnmount(() => {
                 <button class="button ghost" @click="expanded = expanded === model.model_id ? '' : model.model_id">{{ expanded === model.model_id ? '收起' : '查看详情' }}</button>
                 <template v-if="currentKey">
                   <button v-if="!keyHasModel(model.model_id)" class="button secondary" data-testid="sync-key-model"
-                    :disabled="!canAddModel(model)" @click="addModel(model.model_id)">
+                    :disabled="!canAddModel(model)" @click="addModel(model.model_id, model)">
                     {{ addModelLabel(model) }}
                   </button>
                   <button v-else class="button ghost danger-text" data-testid="remove-key-model"
@@ -831,65 +876,54 @@ onBeforeUnmount(() => {
             <button class="button secondary" type="button" @click="searchCatalog()">重试</button>
           </div>
           <p v-else-if="!catalogRows.length" class="catalog-message muted" role="status">暂无匹配模型</p>
-          <table v-else class="catalog-table" role="table" aria-label="模型目录">
-            <colgroup>
-              <col class="catalog-model-column">
-              <col class="catalog-usage-column">
-              <col class="catalog-protocol-column">
-              <col>
-              <col class="catalog-action-column">
-            </colgroup>
-            <thead role="rowgroup">
-              <tr role="row">
-                <th scope="col" role="columnheader">模型 / 厂商</th>
-                <th scope="col" role="columnheader">本月用量</th>
-                <th scope="col" role="columnheader">协议</th>
-                <th scope="col" role="columnheader">状态</th>
-                <th scope="col" role="columnheader">操作</th>
-              </tr>
-            </thead>
-            <tbody role="rowgroup">
-              <tr v-for="row in catalogRows" :key="row.model.model_id" :data-catalog-model="row.model.model_id" role="row">
-                <td class="catalog-model" role="cell">
+          <ul v-else class="catalog-list" aria-label="模型目录">
+            <li v-for="row in catalogRows" :key="row.model.model_id" :data-catalog-model="row.model.model_id" class="catalog-row">
+              <div class="catalog-row-heading">
+                <div class="catalog-model">
                   <strong>{{ row.model.display_name }}</strong>
-                  <small class="muted">
-                    <template v-if="row.model.display_name !== row.model.model_id">{{ row.model.model_id }} · </template>
-                    {{ catalogProviderLabel(row.item) }}
-                  </small>
-                </td>
-                <td class="catalog-usage" role="cell">
-                  <span class="catalog-cell-label muted" aria-hidden="true">本月用量</span>
-                  <span>{{ row.usage.credits }}</span>
-                  <small v-if="row.usage.calls" class="muted">{{ row.usage.calls }}</small>
-                </td>
-                <td class="catalog-protocol" role="cell">
-                  <span class="catalog-cell-label muted" aria-hidden="true">协议</span>
-                  <div v-if="row.protocols.length" class="catalog-chips">
+                  <small v-if="row.model.display_name !== row.model.model_id" class="muted">{{ row.model.model_id }}</small>
+                </div>
+                <button v-if="row.addable" type="button" class="button secondary catalog-action" :disabled="busy"
+                  :aria-label="`加入 ${row.model.model_id} 到当前 Key`" data-testid="catalog-add"
+                  @click="addModel(row.model.model_id, row.model)">
+                  {{ syncingModelID === row.model.model_id ? '正在加入…' : '加入当前 Key' }}
+                </button>
+              </div>
+              <dl class="catalog-row-meta">
+                <div>
+                  <dt>厂商</dt>
+                  <dd>{{ catalogProviderLabel(row.item) }}</dd>
+                </div>
+                <div class="catalog-usage">
+                  <dt>本月用量</dt>
+                  <dd>
+                    <span>{{ row.usage.credits }}</span>
+                    <small v-if="row.usage.calls" class="muted">{{ row.usage.calls }}</small>
+                  </dd>
+                </div>
+                <div class="catalog-protocol">
+                  <dt>协议</dt>
+                  <dd v-if="row.protocols.length" class="catalog-chips">
                     <span v-for="value in row.protocols" :key="value" class="chip protocol-chip"
                       :class="{ recommend: value === row.model.recommended_protocol }"
                       :title="protocolMeta(value).label" data-testid="catalog-protocol-chip">
                       {{ protocolShortLabel(value) }}<template v-if="value === row.model.recommended_protocol"> · 推荐</template>
                     </span>
-                  </div>
-                  <small v-else class="muted">协议待同步</small>
-                </td>
-                <td class="catalog-status" role="cell">
-                  <div class="catalog-chips">
+                  </dd>
+                  <dd v-else class="muted">协议待同步</dd>
+                </div>
+                <div>
+                  <dt>状态</dt>
+                  <dd class="catalog-chips">
                     <span v-if="row.joined" class="chip muted" data-testid="catalog-joined">已加入</span>
                     <span class="chip" :class="row.tone" :title="row.availability.reason"
                       data-testid="catalog-key-coverage">{{ row.status }}</span>
-                  </div>
-                </td>
-                <td class="catalog-action" role="cell">
-                  <button v-if="row.addable" type="button" class="button secondary" :disabled="busy"
-                    :aria-label="`加入 ${row.model.model_id} 到当前 Key`" data-testid="catalog-add"
-                    @click="addModel(row.model.model_id, row.model)">
-                    {{ syncingModelID === row.model.model_id ? '正在加入…' : '加入当前 Key' }}
-                  </button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
+                  </dd>
+                  <dd v-if="row.availability.reason" class="muted">{{ row.availability.reason }}</dd>
+                </div>
+              </dl>
+            </li>
+          </ul>
         </div>
         <nav class="catalog-pagination" aria-label="模型目录分页">
           <span class="muted" aria-live="polite">{{ catalogRange }}</span>
@@ -965,34 +999,40 @@ onBeforeUnmount(() => {
 }
 .catalog-results:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
 .catalog-message { padding: 20px 12px; text-align: center; }
-.catalog-table { width: 100%; table-layout: fixed; border-spacing: 0; }
-.catalog-model-column { width: 28%; }
-.catalog-usage-column { width: 16%; }
-.catalog-protocol-column { width: 22%; }
-.catalog-action-column { width: 108px; }
-.catalog-table th,
-.catalog-table td { padding: 8px 10px; text-align: left; overflow-wrap: anywhere; }
-.catalog-table th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: #f4f6fa;
-  color: var(--ink-soft);
-  font-size: 12px;
-  font-weight: 650;
+.catalog-list { margin: 0; padding: 0; list-style: none; }
+.catalog-row { padding: 12px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.catalog-row:last-child { border-bottom: 0; }
+.catalog-row-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px 12px;
 }
-.catalog-table tbody tr { height: 60px; }
-.catalog-table td { border-bottom: 1px solid #e5e9f1; vertical-align: middle; font-size: 13px; }
-.catalog-model strong,
-.catalog-table small { display: block; }
-.catalog-table small { margin-top: 3px; font-size: 12px; line-height: 1.35; }
+.catalog-model strong, .catalog-row small { display: block; }
+.catalog-row small { margin-top: 3px; font-size: 12px; line-height: 1.35; }
+.catalog-row-meta {
+  display: grid;
+  grid-template-columns: minmax(0, .8fr) minmax(0, 1fr) repeat(2, minmax(0, 1.5fr));
+  gap: 8px 12px;
+  margin: 8px 0 0;
+  font-size: 13px;
+}
+.catalog-row-meta dt { margin-bottom: 3px; color: var(--ink-soft); font-size: 12px; }
+.catalog-row-meta dd { margin: 0; }
+.catalog-row-meta dd + dd { margin-top: 4px; }
 .catalog-usage,
 .catalog-pagination { font-variant-numeric: tabular-nums; }
 .catalog-chips { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
-.catalog-chips .chip { max-width: 100%; padding: 4px 7px; line-height: 1.3; }
-.catalog-table .catalog-action { text-align: right; }
-.catalog-action .button { padding-inline: 9px; white-space: nowrap; }
-.catalog-cell-label { display: none; }
+.catalog-chips .chip {
+  display: inline-block;
+  min-width: 0;
+  max-width: 100%;
+  padding: 4px 7px;
+  line-height: 1.3;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.catalog-action { min-height: 44px; padding-inline: 9px; white-space: nowrap; }
 .catalog-pagination {
   display: flex;
   flex: none;
@@ -1007,40 +1047,15 @@ onBeforeUnmount(() => {
 .catalog-pagination .button,
 .catalog-message .button { min-height: 44px; }
 
-@media (max-width: 740px) {
+@media (max-width: 800px) {
   .catalog-results { scrollbar-gutter: auto; }
-  .catalog-table,
-  .catalog-table tbody { display: block; }
-  .catalog-table colgroup { display: none; }
-  .catalog-table thead {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-  }
-  .catalog-table tbody tr {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    grid-template-areas: "model model" "usage protocol" "status action";
-    align-items: start;
-    gap: 10px 12px;
-    height: auto;
+  .catalog-row, .catalog-row:last-child {
     margin-block: 8px;
-    padding: 12px;
-    border: 1px solid #e5e9f1;
+    border: 1px solid var(--line);
     border-radius: 12px;
-    background: #fff;
+    background: var(--surface);
   }
-  .catalog-table td { min-width: 0; padding: 0; border: 0; }
-  .catalog-model { grid-area: model; }
-  .catalog-usage { grid-area: usage; }
-  .catalog-protocol { grid-area: protocol; }
-  .catalog-status { grid-area: status; align-self: center; }
-  .catalog-action { grid-area: action; }
-  .catalog-cell-label { display: block; margin-bottom: 3px; font-size: 12px; }
-  .catalog-action .button { min-height: 44px; max-width: 100%; white-space: normal; }
+  .catalog-row-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (prefers-reduced-motion: reduce) {

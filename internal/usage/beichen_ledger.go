@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 )
 
 // PrepareDispatch records intent before sending anything billable upstream.
@@ -325,8 +326,8 @@ func quoteBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metri
 	}
 	reason := ""
 	metrics = metrics.ClassifyBeichenUsage(protocol)
-	partial := metrics.State == UsagePartial
-	manualPriced := mode == "manual" && (school.Valid || (partial && !noFixedSchool))
+	priceSplitInGo := metrics.State == UsagePartial || protocol == string(modelbinding.AdapterGoogleGeminiV1beta)
+	manualPriced := mode == "manual" && (school.Valid || (priceSplitInGo && !noFixedSchool))
 	anthropicWrite := protocol == "anthropic" && metrics.CacheWriteTokens != nil && *metrics.CacheWriteTokens > 0
 	cacheDuration := beichenCacheTTL(ttl)
 	switch {
@@ -355,7 +356,7 @@ func quoteBeichenReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, metri
 			source: "gateway_usage_price", multiplierVersion: quoteVersion, quoteMultiplier: quoteMultiplier,
 			tier: evaluated.Tier, snapshot: terms, detail: evaluated.Detail,
 		}
-	case partial:
+	case priceSplitInGo:
 		// Fixed school rates already include any upstream group multiplier.
 		// Apply the same conversion as beichen_token_credits and the manual
 		// school adjustment above, then book through the ordinary ledger.

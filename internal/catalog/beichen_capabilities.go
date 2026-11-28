@@ -93,10 +93,14 @@ const BeichenKeyEvidenceSQL = `SELECT c.id AS credential_id, c.updated_at AS rev
        THEN COALESCE(history.group_at, changed.group_at, GREATEST(identity.checked_at,inventory.last_seen)) END
    ) AS evidence_since,
    NULLIF(known.group_id,0) AS group_id,
-   GREATEST(scan_denial.checked_at,COALESCE(GREATEST(identity.checked_at,inventory.last_seen),observed.checked_at,
+   GREATEST(CASE WHEN scan_denial.checked_at IS NOT NULL AND
+       (known.group_id IS NULL OR scan_denial.group_id IS NOT DISTINCT FROM known.group_id)
+     THEN scan_denial.checked_at END,
+     COALESCE(GREATEST(identity.checked_at,inventory.last_seen),observed.checked_at,
      w.checked_at,mv.effective_at,access.updated_at)) AS group_checked_at,
    CASE
-     WHEN scan_denial.checked_at IS NOT NULL THEN 'not_allowed'
+     WHEN scan_denial.checked_at IS NOT NULL AND
+       (known.group_id IS NULL OR scan_denial.group_id IS NOT DISTINCT FROM known.group_id) THEN 'not_allowed'
      WHEN known.group_id=0 THEN 'not_found'
      WHEN inventory.enabled=false AND inventory.last_seen>=COALESCE(identity.checked_at,c.updated_at) THEN 'not_allowed'
      WHEN observed.state='not_allowed' AND observed.group_id IS NOT DISTINCT FROM
@@ -116,7 +120,8 @@ const BeichenKeyEvidenceSQL = `SELECT c.id AS credential_id, c.updated_at AS rev
  LEFT JOIN beichen_datasets cat ON cat.credential_id=c.id AND cat.kind='catalog'
  LEFT JOIN beichen_datasets billing ON billing.credential_id=c.id AND billing.kind='billing'
  LEFT JOIN LATERAL (
-   SELECT state.updated_at AS checked_at FROM maintenance_state state
+   SELECT state.updated_at AS checked_at,NULLIF(state.last_error::jsonb->>'group_id','')::bigint AS group_id
+   FROM maintenance_state state
    WHERE state.name='` + beichenGroupDenialKey + `'||c.id::text
      AND CASE WHEN starts_with(state.name,'` + beichenGroupDenialKey + `') THEN
        state.last_error::jsonb->>'code'='GROUP_NOT_ALLOWED'

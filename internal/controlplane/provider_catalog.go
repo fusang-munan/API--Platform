@@ -33,11 +33,13 @@ type ProviderCatalogSyncView struct {
 }
 
 type ProviderCredentialInput struct {
-	Label                string
-	GroupHint            *string
-	Credential           *string
-	Status               *string
-	ReplacesCredentialID *uuid.UUID
+	Label                 string
+	GroupHint             *string
+	Credential            *string
+	Status                *string
+	Channel               *string
+	ReplacesCredentialID  *uuid.UUID
+	ConfirmRetiredChannel *string
 }
 
 type ProviderCredentialView struct {
@@ -108,6 +110,12 @@ func (s *Service) CreateProviderCredential(ctx context.Context, providerID uuid.
 	if input.Credential == nil {
 		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "credential is required")
 	}
+	if input.Channel != nil && !beichen.IsSchoolChannel(*input.Channel) {
+		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "学校渠道须为 CC1、G3、GM1 或 Gemini")
+	}
+	if input.Channel != nil && input.ReplacesCredentialID != nil {
+		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "请在独立登记和接替原 Key 中选择一种方式")
+	}
 	label, err := ValidateName(input.Label, 128)
 	if err != nil {
 		return ProviderCredentialView{}, err
@@ -125,17 +133,23 @@ func (s *Service) CreateProviderCredential(ctx context.Context, providerID uuid.
 			Label: &label, GroupHint: input.GroupHint, Status: &status, Ciphertext: ciphertext,
 			Replaces: input.ReplacesCredentialID,
 		}
-		if edit.Replaces != nil {
-			if *edit.Replaces == uuid.Nil {
-				return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "请选择有效的原渠道")
+		if edit.Replaces != nil && *edit.Replaces == uuid.Nil {
+			return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "请选择有效的原渠道")
+		}
+		if input.Channel != nil {
+			edit.Channel = *input.Channel
+		}
+		if edit.Channel != "" || edit.Replaces != nil {
+			if !validBeichenInferenceKey(*input.Credential) {
+				return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "北辰推理 Key 格式无效")
 			}
 			fingerprint := sha256.Sum256([]byte(*input.Credential))
 			edit.Fingerprint = fingerprint[:]
 		}
 		return s.saveBeichenCredential(ctx, providerID, uuid.Nil, edit)
 	}
-	if input.ReplacesCredentialID != nil {
-		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "选择原渠道仅适用于北辰")
+	if input.Channel != nil || input.ReplacesCredentialID != nil {
+		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "登记或接替学校渠道仅适用于北辰")
 	}
 	builder := s.db.ProviderCredential.Create().
 		SetProviderID(row.ID).
@@ -161,6 +175,9 @@ func (s *Service) CreateProviderCredential(ctx context.Context, providerID uuid.
 }
 
 func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, credentialID uuid.UUID, input ProviderCredentialInput) (ProviderCredentialView, error) {
+	if input.Channel != nil || input.ReplacesCredentialID != nil {
+		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "学校渠道登记或接替须通过新建凭据提交")
+	}
 	row, err := s.db.ProviderCredential.Query().
 		Where(
 			providercredential.IDEQ(credentialID),
@@ -174,11 +191,12 @@ func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, cred
 	if err != nil {
 		return ProviderCredentialView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query provider credential", err)
 	}
-	if row.Edges.Provider != nil && catalog.IsBeichenBaseURL(row.Edges.Provider.BaseURL) {
-		if input.Credential != nil {
-			return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "更换北辰 Key 请在渠道切换向导添加新 Key，以保留原凭据的账单记录")
-		}
-		edit := beichen.CredentialEdit{GroupHint: input.GroupHint}
+	isBeichen := row.Edges.Provider != nil && catalog.IsBeichenBaseURL(row.Edges.Provider.BaseURL)
+	if input.ConfirmRetiredChannel != nil && (!isBeichen || input.Credential == nil || *input.ConfirmRetiredChannel != "Gemini") {
+		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "confirm_retired_channel 仅可在为旧 Gemini 渠道提交新 Key 时设为 Gemini")
+	}
+	if isBeichen {
+		edit := beichen.CredentialEdit{GroupHint: input.GroupHint, ConfirmRetiredGemini: input.ConfirmRetiredChannel != nil}
 		if input.Label != "" {
 			label, err := ValidateName(input.Label, 128)
 			if err != nil {
@@ -192,6 +210,20 @@ func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, cred
 				return ProviderCredentialView{}, err
 			}
 			edit.Status = &status
+		}
+		if input.Credential != nil {
+			if row.Status != providercredential.StatusInactive || edit.Status == nil || *edit.Status != "active" {
+				return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "原地更换 Key 仅适用于重新启用停用的 Gemini 渠道，其他渠道请使用接替向导")
+			}
+			if !validBeichenInferenceKey(*input.Credential) {
+				return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "北辰推理 Key 格式无效")
+			}
+			ciphertext, err := s.security.EncryptCredential(*input.Credential)
+			if err != nil {
+				return ProviderCredentialView{}, domain.WrapError(domain.CodeDependencyUnavailable, "加密北辰推理 Key 失败", err)
+			}
+			fingerprint := sha256.Sum256([]byte(*input.Credential))
+			edit.Ciphertext, edit.Fingerprint = ciphertext, fingerprint[:]
 		}
 		return s.saveBeichenCredential(ctx, providerID, credentialID, edit)
 	}
@@ -324,6 +356,10 @@ func (s *Service) syncProviderCatalog(ctx context.Context, providerID uuid.UUID,
 	if row.Status != provider.StatusActive {
 		return ProviderCatalogSyncView{}, domain.NewError(domain.CodeValidation, "provider must be active")
 	}
+	isBeichen := catalog.IsBeichenBaseURL(row.BaseURL)
+	if isBeichen && resetGovernance {
+		return ProviderCatalogSyncView{}, domain.NewError(domain.CodeInvalidTransition, "北辰目录支持同步候选，已发布线路请由教师启用或重绑")
+	}
 	syncedAt := s.now().UTC()
 	total, err := s.fetchAndStoreProviderCatalog(ctx, row, syncedAt)
 	if err != nil {
@@ -337,10 +373,10 @@ func (s *Service) syncProviderCatalog(ctx context.Context, providerID uuid.UUID,
 	}
 	// Each Beichen key may list the same model. Refreshing a catalog must
 	// not move a teacher's binding to the last key or publish a model.
-	if catalog.IsBeichenBaseURL(row.BaseURL) && !resetGovernance {
+	if isBeichen {
 		return view, nil
 	}
-	if err := s.materializeStoredProviderCatalog(ctx, providerID, resetGovernance); err != nil {
+	if err := s.materializeStoredProviderCatalog(ctx, providerID, resetGovernance, true); err != nil {
 		return ProviderCatalogSyncView{}, domain.WrapError(domain.CodeDependencyUnavailable, "materialize synced models", err)
 	}
 	if err := catalog.ReconcileProviderBindingRoutes(ctx, s.db, providerID); err != nil {
@@ -398,28 +434,26 @@ func (s *Service) fetchAndStoreProviderCatalog(ctx context.Context, providerRow 
 	return total, nil
 }
 
-func (s *Service) materializeStoredProviderCatalog(ctx context.Context, providerID uuid.UUID, resetGovernance bool) error {
+func (s *Service) materializeStoredProviderCatalog(ctx context.Context, providerID uuid.UUID, resetGovernance, touchBindings bool) error {
 	credentials, err := catalog.ActiveCredentials(ctx, s.db, &providerID)
 	if err != nil {
 		return err
 	}
 	for _, credential := range credentials {
-		entries, loadErr := catalog.LoadActiveCatalogEntries(ctx, s.db, credential.ID)
+		entries, loadErr := catalog.LoadActiveCatalogEntries(ctx, s.sqlDB, credential.ID)
 		if loadErr != nil {
 			return loadErr
 		}
-		if err := catalog.MaterializeCredentialModels(ctx, s.db, providerID, credential.ID, entries, resetGovernance, true); err != nil {
+		if err := catalog.MaterializeCredentialModels(ctx, s.db, providerID, credential.ID, entries, resetGovernance, touchBindings); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// MaterializeBeichenCatalogs folds the freshest per-Key Beichen catalog rows
-// into platform models and bindings without resetting teacher governance. The
-// scheduled Beichen jobs already refresh provider_model_catalog every few
-// minutes; this pass makes newly probed models visible as candidates instead of
-// leaving them stranded in the raw catalog table.
+// MaterializeBeichenCatalogs makes scanned entries visible as candidates.
+// Catalog and probe jobs refresh route evidence. Binding changes remain in the
+// teacher activation and rebind flows.
 func (s *Service) MaterializeBeichenCatalogs(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return nil
@@ -438,11 +472,7 @@ func (s *Service) MaterializeBeichenCatalogs(ctx context.Context) error {
 		if !catalog.IsBeichenBaseURL(row.BaseURL) {
 			continue
 		}
-		if err := s.materializeStoredProviderCatalog(ctx, row.ID, false); err != nil {
-			failures = append(failures, fmt.Errorf("provider %s: %w", row.ID, err))
-			continue
-		}
-		if err := catalog.ReconcileProviderBindingRoutes(ctx, s.db, row.ID); err != nil {
+		if err := s.materializeStoredProviderCatalog(ctx, row.ID, false, false); err != nil {
 			failures = append(failures, fmt.Errorf("provider %s: %w", row.ID, err))
 		}
 	}

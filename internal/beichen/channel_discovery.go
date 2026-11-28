@@ -259,7 +259,7 @@ func (k listedKey) fragments() (prefix, suffix string, valid bool) {
 }
 
 func identifyChannel(secret, channel, label string, keys []listedKey) (listedKey, error) {
-	candidates := websiteKeyCandidates(keys, secret, channel, label)
+	candidates, _ := websiteKeyCandidates(keys, secret, channel, label)
 	if len(candidates) == 0 {
 		return listedKey{}, fmt.Errorf("%w：遮罩证据不足或未找到匹配项", errKeyMatch)
 	}
@@ -479,12 +479,11 @@ WHERE a.credential_id=$1 AND a.updated_by=$2 AND c.updated_at=$3 AND c.status='a
 	}
 	actor := uuid.MustParse(ProvisionActorID)
 	if lookupErr == nil {
-		var occupied bool
-		err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM beichen_receipt_active_bindings WHERE upstream_key_id=$1 AND credential_id<>$2)`, k.ID, j.credential).Scan(&occupied)
+		available, err := panelKeyAvailableTx(ctx, tx, j.credential, k.ID)
 		if err != nil {
 			return err
 		}
-		if occupied {
+		if !available {
 			lookupErr = fmt.Errorf("%w：该官网 Key 已绑定其他校内渠道", errKeyMatch)
 		}
 	}

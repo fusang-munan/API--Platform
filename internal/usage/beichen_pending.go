@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/usage/pendingaudit"
 )
 
@@ -28,7 +29,7 @@ func (m CallMetrics) CanAuditBeichenSplit() bool {
 		return false
 	}
 	switch m.UsageReason {
-	case "", "token_breakdown_unconfirmed", cacheWriteSubtotalOnlyReason, "cache_write_not_in_usage_metadata":
+	case "", "token_breakdown_unconfirmed", cacheWriteSubtotalOnlyReason:
 		return true
 	}
 	return false
@@ -76,6 +77,13 @@ func writePendingReserve(ctx context.Context, tx *sql.Tx, callID uuid.UUID, maxC
 
 func decidePendingReport(ctx context.Context, tx *sql.Tx, callID uuid.UUID, protocol string, metrics CallMetrics) (pendingDecision, error) {
 	var d pendingDecision
+	if protocol == string(modelbinding.AdapterGoogleGeminiV1beta) {
+		// Gemini counts confirm the read and input split. A verified receipt
+		// can explain cache creation independently of those counters.
+		d.result.Class = pendingaudit.ClassUnknown
+		d.result.Note = "Gemini 缓存写入需核对上游回执"
+		return d, nil
+	}
 	in := pendingaudit.Input{
 		Protocol: protocol, PromptTokens: metrics.PromptTokens, CompletionTokens: metrics.CompletionTokens,
 		TotalTokens: metrics.TotalTokens, CacheReadTokens: metrics.CacheHitTokens, CacheWriteTokens: metrics.CacheWriteTokens,

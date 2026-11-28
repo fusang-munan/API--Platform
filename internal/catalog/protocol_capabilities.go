@@ -1,6 +1,8 @@
 package catalog
 
 import (
+	"errors"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -109,13 +111,41 @@ func protocolFamilyRank(model, protocol string) int {
 	switch {
 	case IsAnthropicFamilyModel(name):
 		preferred = []modelbinding.Adapter{modelbinding.AdapterAnthropic, chat, responses}
-	case strings.Contains(name, "gemini"):
+	case IsGeminiFamilyModel(name):
 		preferred = []modelbinding.Adapter{modelbinding.AdapterGoogleGeminiV1beta, chat, responses}
 	}
 	if index := slices.Index(preferred, modelbinding.Adapter(protocol)); index >= 0 {
 		return 3 - index
 	}
 	return 0
+}
+
+// GeminiModelPath addresses the same model resource in forwarding and probes.
+func GeminiModelPath(model, operation string) string {
+	return "/v1beta/models/" + url.PathEscape(strings.TrimPrefix(model, "models/")) + ":" + operation
+}
+
+// GeminiUpstreamURL resolves native operations on the Beichen API root even
+// when the configured OpenAI-compatible base ends in /v1.
+func GeminiUpstreamURL(baseURL, requestPath, rawQuery string) (string, error) {
+	base, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || base.Hostname() == "" || !strings.HasPrefix(requestPath, "/v1beta/models/") {
+		return "", errors.New("invalid Gemini upstream URL")
+	}
+	basePath := strings.TrimRight(base.EscapedPath(), "/")
+	switch {
+	case IsBeichenBaseURL(baseURL) && basePath == "/v1":
+		basePath = ""
+	case strings.HasSuffix(basePath, "/v1beta"):
+		requestPath = strings.TrimPrefix(requestPath, "/v1beta")
+	}
+	rawPath := basePath + requestPath
+	path, err := url.PathUnescape(rawPath)
+	if err != nil {
+		return "", errors.New("invalid Gemini upstream path")
+	}
+	base.Path, base.RawPath, base.RawQuery = path, rawPath, rawQuery
+	return base.String(), nil
 }
 
 type ProtocolEndpoint struct {

@@ -7,15 +7,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeymodel"
-	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/gatewaycall"
+	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelmultiplieraudit"
 )
 
 // MaterializeProviderModels upserts platform models from upstream catalog entries.
 // When resetGovernance is true (Reset Catalog), multiplier/common/status are cleared.
-// When touchBindings is true, heuristic bindings are synced; keep false unless applying a full catalog import.
+// Candidate refreshes leave existing governed models and all bindings alone.
 func MaterializeProviderModels(ctx context.Context, client *ent.Client, providerID uuid.UUID, entries []ProviderEntry, resetGovernance, touchBindings bool) error {
 	return materializeProviderEntries(ctx, client, providerID, uuid.Nil, entries, resetGovernance, touchBindings)
 }
@@ -30,6 +30,7 @@ func MaterializeCredentialModels(ctx context.Context, client *ent.Client, provid
 
 func materializeProviderEntries(ctx context.Context, client *ent.Client, providerID, credentialID uuid.UUID, entries []ProviderEntry, resetGovernance, touchBindings bool) error {
 	defaultMultiplier := int64(0)
+	candidateOnly := !touchBindings && !resetGovernance
 	for _, entry := range entries {
 		modelID := strings.TrimSpace(entry.ID)
 		if modelID == "" || len([]rune(modelID)) > 256 {
@@ -52,9 +53,15 @@ func materializeProviderEntries(ctx context.Context, client *ent.Client, provide
 		} else if queryErr != nil {
 			return queryErr
 		} else {
+			if candidateOnly && row.Status != entmodel.StatusPendingConfiguration {
+				continue
+			}
 			update := row.Update().
 				SetDisplayName(displayName).
 				SetUpstreamMetadata(upstream)
+			if candidateOnly {
+				update.Where(entmodel.StatusEQ(entmodel.StatusPendingConfiguration))
+			}
 			if resetGovernance {
 				update.SetCreditMultiplierMilli(defaultMultiplier).SetIsCommon(false).SetStatus(entmodel.StatusPendingConfiguration)
 			}
@@ -67,6 +74,9 @@ func materializeProviderEntries(ctx context.Context, client *ent.Client, provide
 				update.SetDescription(description)
 			}
 			row, queryErr = update.Save(ctx)
+			if candidateOnly && ent.IsNotFound(queryErr) {
+				continue
+			}
 		}
 		if queryErr != nil {
 			return queryErr
@@ -76,6 +86,9 @@ func materializeProviderEntries(ctx context.Context, client *ent.Client, provide
 				return err
 			}
 		}
+	}
+	if !touchBindings {
+		return nil
 	}
 	if resetGovernance {
 		if credentialID != uuid.Nil {
@@ -298,15 +311,7 @@ func syncCredentialBindings(
 	if err != nil {
 		return err
 	}
-	for _, binding := range existing {
-		if _, ok := expectedSet[binding.Adapter]; ok || binding.Status != modelbinding.StatusActive {
-			continue
-		}
-		if err := client.ModelBinding.UpdateOne(binding).SetStatus(modelbinding.StatusInactive).Exec(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
+	return deactivateUnsupportedBindings(ctx, client, existing, expectedSet, upstreamModelID)
 }
 
 func syncProviderBindings(
@@ -367,8 +372,19 @@ func syncProviderBindings(
 	if err != nil {
 		return err
 	}
+	return deactivateUnsupportedBindings(ctx, client, existing, expectedSet, upstreamModelID)
+}
+
+func deactivateUnsupportedBindings(ctx context.Context, client *ent.Client, existing []*ent.ModelBinding,
+	expected map[modelbinding.Adapter]struct{}, upstreamModelID string) error {
+	_, hasNativeGemini := expected[modelbinding.AdapterGoogleGeminiV1beta]
 	for _, binding := range existing {
-		if _, ok := expectedSet[binding.Adapter]; ok || binding.Status != modelbinding.StatusActive {
+		if _, ok := expected[binding.Adapter]; ok || binding.Status != modelbinding.StatusActive {
+			continue
+		}
+		// Native Gemini evidence adds a route alongside existing Chat/Responses.
+		if hasNativeGemini && IsChatGatewayAdapter(binding.Adapter) &&
+			strings.EqualFold(strings.TrimSpace(binding.UpstreamModelName), upstreamModelID) {
 			continue
 		}
 		if err := client.ModelBinding.UpdateOne(binding).SetStatus(modelbinding.StatusInactive).Exec(ctx); err != nil {

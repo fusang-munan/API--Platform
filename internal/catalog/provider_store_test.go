@@ -35,8 +35,8 @@ func TestProviderCatalogUpsertStoresExtendedFields(t *testing.T) {
 	}}
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE provider_model_catalog SET status='inactive',synced_at=$1,updated_at=$1 WHERE credential_id=$2`)).
-		WithArgs(syncedAt, credentialID).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE provider_model_catalog SET status='inactive',synced_at=$1,updated_at=$1 WHERE credential_id=$2 AND provider_id=$3`)).
+		WithArgs(syncedAt, credentialID, providerID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`INSERT INTO provider_model_catalog`).
 		WithArgs(sqlmock.AnyArg(), providerID, credentialID, "gpt-5.3-codex", "GPT 5.3 Codex", "coding model", "openai", "model", "2024-01-01T00:00:00Z", sqlmock.AnyArg(), syncedAt, `["openai_responses","openai_compatible"]`).

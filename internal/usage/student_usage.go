@@ -292,10 +292,16 @@ func (v *StudentUsage) loadBalances(ctx context.Context, tx *sql.Tx, userID uuid
 		if !visible {
 			continue
 		}
+		// Match the model breakdown's ledger even when the Key's quota bucket
+		// is absent. The bucket still supplies availability and in-flight use.
+		used := stats.Credits
+		if !hasHistory {
+			used = "0.000"
+		}
 		key := KeyUsage{
 			ID: keyID.UUID.String(), Name: keyName.String, Status: status,
 			AvailableEffective: displayCredits(availableEffective), ProjectMemberAvailable: project.Available,
-			Used: displayCredits(keyUsed), Pending: domain.FormatCredits(keyPending), InFlightCredits: domain.FormatCredits(keyPending),
+			Used: used, Pending: domain.FormatCredits(keyPending), InFlightCredits: domain.FormatCredits(keyPending),
 			Calls: stats.Calls, PendingCalls: stats.PendingReviewCalls, PendingReview: stats.PendingReviewCalls > 0,
 			Models: rollups.models[keyID.UUID], StudentUsageMetrics: stats.StudentUsageMetrics.forDisplay(),
 		}

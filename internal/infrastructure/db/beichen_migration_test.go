@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/starprince1234/Nebula-api/internal/beichen"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 )
 
 func TestBeichenMigrationUpgrade(t *testing.T) {
@@ -284,7 +285,7 @@ func openIsolatedMigrationSchema(t *testing.T) (context.Context, *sql.DB) {
 	if err != nil {
 		t.Fatal("invalid test PostgreSQL URL")
 	}
-	if config.Host != "127.0.0.1" || config.Database != "nebula_test" || len(config.Fallbacks) != 0 {
+	if config.Host != "127.0.0.1" || !testutil.IsIsolatedPostgresDatabase(config.Database) || len(config.Fallbacks) != 0 {
 		t.Fatal("migration test requires a loopback-only nebula_test database with sslmode=disable")
 	}
 	conn, err := sql.Open(DriverName, dsn)

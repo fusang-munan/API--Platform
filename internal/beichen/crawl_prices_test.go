@@ -214,9 +214,21 @@ VALUES($1,$2,$3,$4,'active',$5,sha256($6::bytea),'matched')`, provider, id, key.
 	rates = `{"code":0,"data":{"6":0.07,"10":0.2}}`
 	refresh()
 	rowCount(68)
+	// A damaged entry in group 6 must not suppress group 10's valid observation.
+	rates = `{"code":0,"data":{"6":"invalid","10":0.22}}`
+	refresh()
+	rowCount(80)
+	var validAccount string
+	if err := db.QueryRowContext(ctx, `
+SELECT trim_scale((group_rules->>'account_rate_multiplier')::numeric)
+FROM beichen_group_price_observations
+WHERE provider_id=$1 AND group_id=10 AND source='website'
+ORDER BY observed_at DESC LIMIT 1`, provider).Scan(&validAccount); err != nil || validAccount != "0.22" {
+		t.Fatalf("valid group 10 rate did not reach history while group 6 was malformed: %q (%v)", validAccount, err)
+	}
 	rateStatus = http.StatusBadGateway
 	refresh()
-	rowCount(68)
+	rowCount(88)
 	var gmRate, otherRate, gmAccount, gmInput, otherInput, unit string
 	if err := db.QueryRowContext(ctx, `
 SELECT a.group_rules->>'rate_multiplier',b.group_rules->>'rate_multiplier',a.group_rules->>'account_rate_multiplier',
@@ -224,7 +236,7 @@ SELECT a.group_rules->>'rate_multiplier',b.group_rules->>'rate_multiplier',a.gro
 FROM beichen_group_price_observations a JOIN beichen_group_price_observations b USING(provider_id,model)
 WHERE a.provider_id=$1 AND a.model='deepseek-v4-pro' AND a.group_id=6 AND b.group_id=15
 ORDER BY a.observed_at DESC LIMIT 1`, provider).Scan(&gmRate, &otherRate, &gmAccount, &gmInput, &otherInput, &unit); err != nil ||
-		gmRate != "0.12" || otherRate != "0.16" || gmAccount != "0.07" || gmInput != "0.000011" || otherInput != "0.000009" || unit != websitePriceUnit {
+		gmRate != "0.12" || otherRate != "0.16" || gmAccount != "0.12" || gmInput != "0.000011" || otherInput != "0.000009" || unit != websitePriceUnit {
 		t.Fatalf("group history or currency was mixed: %s/%s, %s/%s, %s (%v)", gmRate, otherRate, gmInput, otherInput, unit, err)
 	}
 }

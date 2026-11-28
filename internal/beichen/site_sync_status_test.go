@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 )
 
 func TestOverviewWebsiteSyncPostgres(t *testing.T) {
@@ -20,7 +21,7 @@ func TestOverviewWebsiteSyncPostgres(t *testing.T) {
 		t.Skip("requires a disposable loopback nebula_test database")
 	}
 	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil || cfg.Host != "127.0.0.1" || cfg.Database != "nebula_test" ||
+	if err != nil || cfg.Host != "127.0.0.1" || !testutil.IsIsolatedPostgresDatabase(cfg.Database) ||
 		cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
 		t.Fatal("requires loopback nebula_test with sslmode=disable")
 	}

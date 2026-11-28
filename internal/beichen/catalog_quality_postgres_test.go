@@ -135,9 +135,9 @@ WHERE kind='billing' AND credential_id=$1`, first)
 	if after.WebsiteOnlyStatus != "compared" || len(after.WebsiteOnlyModels) != 1 || !strings.EqualFold(after.WebsiteOnlyModels[0].Model, "web-only") {
 		t.Fatal("重扫后新增模型应退出仅网页清单")
 	}
-	if len(after.Models) != 2 || !reflect.DeepEqual(after.CatalogDifferences[0].CheckedAt, before.CatalogDifferences[0].CheckedAt) ||
+	if len(after.Models) != 3 || !reflect.DeepEqual(after.CatalogDifferences[0].CheckedAt, before.CatalogDifferences[0].CheckedAt) ||
 		!reflect.DeepEqual(after.CatalogDifferences[1].CheckedAt, before.CatalogDifferences[1].CheckedAt) {
-		t.Fatal("重扫应保留网页读回时间和其他渠道目录")
+		t.Fatal("单页重扫应保留尚未确认移除的型号、网页读回时间和其他渠道目录")
 	}
 	var billingUnchanged bool
 	if err := db.QueryRowContext(ctx, `SELECT last_success='2026-01-01 00:00Z' AND next_attempt='2026-02-01 00:00Z'
@@ -149,7 +149,7 @@ AND last_error='fixture' AND lease_id IS NULL FROM beichen_datasets WHERE creden
 	if err := service.RescanCatalog(ctx, provider, first); domain.ErrorCode(err) != domain.CodeDependencyUnavailable || strings.Contains(err.Error(), fakeKey) {
 		t.Fatal("重扫失败应返回安全的错误")
 	}
-	if view := overview(); view.WebsiteOnlyStatus != "unverified" || len(view.Models) != 2 {
+	if view := overview(); view.WebsiteOnlyStatus != "unverified" || len(view.Models) != 3 {
 		t.Fatal("失败扫描不能替换上轮完整目录或断定模型仅在网页可见")
 	}
 	status, rotate = http.StatusOK, true
@@ -216,10 +216,10 @@ VALUES ($1,$5,$8,$9,'old-name','openai_responses','active',9,now(),now()),
 		t.Fatalf("同渠道的别名未按不区分大小写的键更新: %+v (%v)", aliases, err)
 	}
 	preview, err := service.Rebind(ctx, provider, actor, true, "")
-	if err != nil || !preview.Preview || len(preview.Changes) != 4 || len(preview.PreviewToken) != 64 || audit.Len() != 0 {
-		t.Fatalf("预览不应写审计，且应包含四条影响: %+v (%v)", preview, err)
+	if err != nil || !preview.Preview || len(preview.Changes) != 2 || len(preview.PreviewToken) != 64 || audit.Len() != 0 {
+		t.Fatalf("预览只应包含当前绑定的两条明确变更: %+v (%v)", preview, err)
 	}
-	wantActions := map[string]int{"add": 1, "enable": 1, "update": 1, "disable": 1}
+	wantActions := map[string]int{"add": 1, "update": 1}
 	for _, change := range preview.Changes {
 		wantActions[change.Action]--
 		if change.Action == "add" && (change.After.Priority != 201 || change.Before != nil) {
@@ -254,7 +254,7 @@ VALUES ($1,$5,$8,$9,'old-name','openai_responses','active',9,now(),now()),
 		t.Fatalf("确认结果与预览不一致: %v", err)
 	}
 	if strings.Count(audit.String(), "beichen_bindings_rebuilt") != 1 || !strings.Contains(audit.String(), actor.String()) ||
-		!strings.Contains(audit.String(), provider.String()) || !strings.Contains(audit.String(), `"change_count":4`) {
+		!strings.Contains(audit.String(), provider.String()) || !strings.Contains(audit.String(), `"change_count":2`) {
 		t.Fatal("重建审计缺少操作人、供应商或变更数量")
 	}
 	if strings.Contains(audit.String(), preview.PreviewToken) || strings.Contains(audit.String(), `"preview_token"`) || strings.Contains(audit.String(), `"changes"`) {
@@ -264,9 +264,10 @@ VALUES ($1,$5,$8,$9,'old-name','openai_responses','active',9,now(),now()),
 	err = db.QueryRowContext(ctx, `SELECT
   (SELECT status='inactive' FROM models WHERE id=$1)
   AND (SELECT priority=200 AND upstream_model_name='foreign' AND status='active' FROM model_bindings WHERE id=$2)
-  AND (SELECT status='inactive' FROM model_bindings WHERE id=$3)`, classics, foreignBinding, staleBinding).Scan(&preserved)
+  AND (SELECT status='active' FROM model_bindings WHERE id=$3)
+  AND (SELECT status='inactive' FROM model_bindings WHERE id=$4)`, classics, foreignBinding, staleBinding, inactiveBinding).Scan(&preserved)
 	if err != nil || !preserved {
-		t.Fatal("重建改变了模型状态、其他供应商线路或未停用过期线路")
+		t.Fatal("重建改变了模型状态、其他供应商线路、目录缺失线路或停用线路")
 	}
 	secondPreview, err := service.Rebind(ctx, provider, actor, true, "")
 	if err != nil || len(secondPreview.Changes) != 0 {
@@ -275,5 +276,98 @@ VALUES ($1,$5,$8,$9,'old-name','openai_responses','active',9,now(),now()),
 	exec("UPDATE beichen_datasets SET last_error='fixture' WHERE credential_id=$1 AND kind='catalog'", second)
 	if _, err := service.Rebind(ctx, provider, actor, true, ""); domain.ErrorCode(err) != domain.CodeInvalidTransition {
 		t.Fatal("目录扫描失败时不应重建绑定")
+	}
+}
+
+func TestRebindRestoresOnlyTheSelectedSchoolModelPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	school, otherSchool := uuid.New(), uuid.New()
+	oldBinding, otherBinding, activeBinding := uuid.New(), uuid.New(), uuid.New()
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES($1,'school-one','same display','active',1000,now(),now()),($2,'school-two','same display','active',1000,now(),now())`, school, otherSchool)
+	exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,status,priority,created_at,updated_at)
+VALUES ($1,$4,$6,$7,'same-upstream','openai_responses','inactive',17,now(),now()),
+       ($2,$5,$6,$7,'same-upstream','openai_responses','inactive',25,now(),now()),
+       ($3,$4,$6,$8,'same-upstream','openai_compatible','active',42,now(),now())`,
+		oldBinding, otherBinding, activeBinding, school, otherSchool, provider, keys[0], keys[2])
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", keys[0])
+	saveCatalogFixture(t, ctx, db, provider, keys[1], []catalog.ProviderEntry{
+		{ID: "same-upstream", SupportedProtocols: []string{"openai_responses", "openai_compatible"}},
+	}, nil)
+	s := New(db, nil)
+	before := func() bool {
+		t.Helper()
+		var intact bool
+		err := db.QueryRowContext(ctx, `SELECT
+  (SELECT status='inactive' AND credential_id=$4 FROM model_bindings WHERE id=$1)
+  AND (SELECT status='inactive' AND credential_id=$4 AND priority=25 FROM model_bindings WHERE id=$2)
+  AND (SELECT status='active' AND credential_id=$5 AND priority=42 FROM model_bindings WHERE id=$3)`,
+			oldBinding, otherBinding, activeBinding, keys[0], keys[2]).Scan(&intact)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return intact
+	}
+	selector := (bindingRestore{schoolModelID: school, credentialID: keys[1]}).tokenPrefix()
+	preview, err := s.Rebind(ctx, provider, actor, true, selector)
+	if err != nil || len(preview.Changes) != 1 || !before() {
+		t.Fatalf("targeted preview must be read-only and independent of other Key scans: %+v %v", preview, err)
+	}
+	change := preview.Changes[0]
+	if change.ModelID != school || change.BindingID == nil || *change.BindingID != oldBinding || change.Action != "enable" ||
+		change.After.CredentialID == nil || *change.After.CredentialID != keys[1] || change.After.Priority != 17 {
+		t.Fatalf("wrong target in restoration: %+v", change)
+	}
+	tampered := strings.Replace(preview.PreviewToken, school.String(), otherSchool.String(), 1)
+	if _, err := s.Rebind(ctx, provider, actor, false, tampered); domain.ErrorCode(err) != domain.CodeInvalidTransition || !before() {
+		t.Fatalf("confirmation was accepted with a changed school model scope: %v", err)
+	}
+	if _, err := s.Rebind(ctx, provider, actor, true, (bindingRestore{school, uuid.New()}).tokenPrefix()); domain.ErrorCode(err) != domain.CodeInvalidTransition {
+		t.Fatalf("confirmation scope accepted a Key outside this provider: %v", err)
+	}
+	checkBlockedPreview := func() {
+		t.Helper()
+		if _, err := s.Rebind(ctx, provider, actor, true, selector); domain.ErrorCode(err) != domain.CodeInvalidTransition || !before() {
+			t.Fatalf("blocked replacement was offered by a new preview: %v", err)
+		}
+		if _, err := s.Rebind(ctx, provider, actor, false, preview.PreviewToken); domain.ErrorCode(err) != domain.CodeInvalidTransition || !before() {
+			t.Fatalf("old confirmation activated a blocked replacement: %v", err)
+		}
+	}
+	for _, status := range []int{401, 403} {
+		exec(`INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,error_code,duration_ms,checked_at)
+VALUES($1,$2,'same-upstream','openai_responses',$3,'http_error',1,clock_timestamp())
+ON CONFLICT(provider_id,credential_id,model,protocol) DO UPDATE
+SET status_code=excluded.status_code,checked_at=excluded.checked_at`, provider, keys[1], status)
+		checkBlockedPreview()
+	}
+	exec(`UPDATE upstream_probes SET status_code=200,error_code=NULL,checked_at=clock_timestamp(),last_passed_at=clock_timestamp()
+WHERE provider_id=$1 AND credential_id=$2`, provider, keys[1])
+	exec(`INSERT INTO maintenance_state(id,name,last_error,created_at,updated_at)
+SELECT gen_random_uuid(),'beichen_catalog_auth/'||id::text,jsonb_build_object('credential_revision',updated_at)::text,
+       clock_timestamp(),clock_timestamp() FROM provider_credentials WHERE id=$1`, keys[1])
+	checkBlockedPreview()
+	exec("DELETE FROM maintenance_state WHERE name='beichen_catalog_auth/'||$1::uuid::text", keys[1])
+	oldToken := preview.PreviewToken
+	preview, err = s.Rebind(ctx, provider, actor, true, selector)
+	if err != nil || len(preview.Changes) != 1 || preview.PreviewToken == oldToken {
+		t.Fatalf("healthy replacement was not offered: %+v %v", preview, err)
+	}
+	if _, err := s.Rebind(ctx, provider, actor, false, oldToken); domain.ErrorCode(err) != domain.CodeInvalidTransition || !before() {
+		t.Fatalf("reauthenticated replacement accepted a superseded preview: %v", err)
+	}
+	result, err := s.Rebind(ctx, provider, actor, false, preview.PreviewToken)
+	if err != nil || result.Preview || !reflect.DeepEqual(result.Changes, preview.Changes) {
+		t.Fatalf("restoration changed the approved plan: %+v %v", result, err)
+	}
+	var onlyTarget bool
+	err = db.QueryRowContext(ctx, `SELECT
+  (SELECT status='active' AND credential_id=$4 AND priority=17 FROM model_bindings WHERE id=$1)
+  AND (SELECT status='inactive' AND credential_id=$5 AND priority=25 FROM model_bindings WHERE id=$2)
+  AND (SELECT status='active' AND credential_id=$6 AND priority=42 FROM model_bindings WHERE id=$3)`,
+		oldBinding, otherBinding, activeBinding, keys[1], keys[0], keys[2]).Scan(&onlyTarget)
+	if err != nil || !onlyTarget {
+		t.Fatalf("targeted restoration altered another binding: %v", err)
 	}
 }

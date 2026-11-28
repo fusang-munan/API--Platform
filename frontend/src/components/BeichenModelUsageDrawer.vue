@@ -41,6 +41,11 @@ const focusedModelLabel = ref('')
 const focusedSharedUpstream = ref(false)
 const expandedModel = ref('')
 
+// The caller selects the month before opening and uses retry to reload that range.
+watch(() => props.open, open => {
+  if (open) emit('retry')
+}, { immediate: true })
+
 watch(() => [props.open, props.initialModel, props.initialModelKey, props.initialModelLabel,
   props.initialModelSharedUpstream] as const,
   ([open, model, key, label, sharedUpstream]) => {
@@ -145,7 +150,7 @@ function completenessLabel(metrics?: SchoolUsageMetrics) {
 <template>
   <AppDialog :open="open" title="北辰 · 用量明细" description="按模型、学生账号或 Key 查看校内网关用量。" wide
     @update:open="emit('update:open', $event)">
-    <section class="model-usage-panel beichen-stack" :aria-busy="loading">
+    <section class="model-usage-panel beichen-stack" :aria-busy="Boolean(loading)">
       <div class="beichen-toolbar">
         <div class="range-switch" role="group" aria-label="用量时间范围">
           <button v-for="item in ranges" :key="item.id" type="button" :aria-pressed="range === item.id"
@@ -157,9 +162,9 @@ function completenessLabel(metrics?: SchoolUsageMetrics) {
             @click="focusedModel = ''; focusedModelLabel = ''; focusedSharedUpstream = false">查看全部模型</button>
         </div>
       </div>
-      <p v-if="loading" role="status">正在读取用量…</p>
+      <p v-if="loading" role="status">{{ range === 'all' ? '正在读取用量总计…' : `正在读取${period}用量…` }}</p>
       <div v-else-if="error" role="alert">
-        <p>{{ error }}</p>
+        <p class="error">{{ error }}</p>
         <button type="button" class="button secondary" @click="emit('retry')">重试读取用量</button>
       </div>
       <template v-else-if="usage">

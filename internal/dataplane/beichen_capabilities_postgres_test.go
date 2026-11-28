@@ -272,7 +272,10 @@ func TestBeichenCapabilitiesAndGatewayPostgres(t *testing.T) {
 		}
 		row, model = readLine(claude.model), modelsList("?include_unavailable=1")[claude.model]
 		if row.Availability != "maintenance" || row.ProbeState != "failed" || row.RecommendedProtocol != nil ||
-			model.Availability != "maintenance" || model.RecommendedProtocol != nil || !strings.Contains(model.AvailabilityReason, "探活均失败") {
+			model.Availability != "maintenance" || model.RecommendedProtocol != nil ||
+			!strings.Contains(row.AvailabilityReason, "HTTP 503") ||
+			!strings.Contains(model.AvailabilityReason, "连通测试均失败") ||
+			!strings.Contains(model.AvailabilityReason, "HTTP 503") {
 			t.Fatalf("failed route disappeared or remained recommended: %+v %+v", row, model)
 		}
 		maintenance := readError(serve("POST", "/v1/responses", studentKey, `{"model":"claude-fixture"}`, 503))

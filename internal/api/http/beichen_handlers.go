@@ -271,7 +271,7 @@ func (s *Server) beichenPanelAccess(c *gin.Context) {
 		return
 	}
 	access := beichen.PanelAccessInput{Enabled: *input.Enabled, GroupID: input.GroupID, Token: input.Token, UpstreamKeyID: input.UpstreamKeyID}
-	if err := s.service.Beichen().SetPanelAccess(c.Request.Context(), provider, credential, identity(c).UserID, access); err != nil {
+	if err := s.service.Beichen().SetTeacherPanelAccess(c.Request.Context(), provider, credential, identity(c).UserID, access); err != nil {
 		writeError(c, err)
 		return
 	}
