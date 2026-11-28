@@ -58,11 +58,18 @@ type probeRequest struct {
 	Path      string
 	Body      []byte
 	Anthropic bool
+	Gemini    bool
 }
 
 func buildProbeRequest(endpoint, model string) (probeRequest, error) {
 	var path string
 	var payload any
+	nativeEndpoint := catalog.BindingRouteProbeEndpoint(endpoint)
+	switch nativeEndpoint {
+	case catalog.BindingRouteProbeGenerateContent, catalog.BindingRouteProbeStreamGenerateContent, catalog.BindingRouteProbeEmbedContent:
+		path, body, err := catalog.GeminiProbeRequest(model, nativeEndpoint)
+		return probeRequest{Method: http.MethodPost, Path: path, Body: body, Gemini: true}, err
+	}
 	switch endpoint {
 	case "chat_completions":
 		path = "/v1/chat/completions"
@@ -290,6 +297,9 @@ func validateProbeBaseURL(value string) (string, error) {
 }
 
 func probeTarget(baseURL, requestPath string) (string, error) {
+	if strings.HasPrefix(requestPath, "/v1beta/models/") {
+		return catalog.GeminiUpstreamURL(baseURL, requestPath, "")
+	}
 	parsed, err := url.Parse(baseURL)
 	if err != nil {
 		return "", err
@@ -300,6 +310,21 @@ func probeTarget(baseURL, requestPath string) (string, error) {
 	}
 	parsed.Path = strings.TrimRight(basePath, "/") + "/" + strings.TrimLeft(requestPath, "/")
 	return parsed.String(), nil
+}
+
+func (s *Service) catalogProbeCredential(ctx context.Context, providerRow *ent.Provider, model string) (string, error) {
+	row, err := catalog.FindProbeCatalogCredential(ctx, s.db, providerRow.ID, providerRow.BaseURL, model)
+	if err != nil {
+		return "", domain.WrapError(domain.CodeDependencyUnavailable, "query probe model catalog", err)
+	}
+	if row == nil {
+		return "", domain.NewError(domain.CodeValidation, "模型渠道待核，请先同步列有该模型的 Key 目录")
+	}
+	plain, err := s.security.DecryptCredential(row.CredentialCiphertext)
+	if err != nil {
+		return "", domain.WrapError(domain.CodeDependencyUnavailable, "decrypt provider credential", err)
+	}
+	return plain, nil
 }
 
 func (s *Service) ProbeModel(ctx context.Context, input ProbeInput) (ProbeResponse, error) {
@@ -335,25 +360,9 @@ func (s *Service) ProbeModel(ctx context.Context, input ProbeInput) (ProbeRespon
 			return ProbeResponse{}, domain.NewError(domain.CodeNotFound, "provider not found")
 		}
 		baseURL = row.BaseURL
-		credentials, err := catalog.ActiveCredentials(ctx, s.db, input.ProviderID)
-		if err != nil || len(credentials) == 0 {
-			return ProbeResponse{}, domain.NewError(domain.CodeValidation, "provider has no active credentials")
-		}
-		var picked *ent.ProviderCredential
-		if credentialID, found, findErr := catalog.FindActiveCatalogCredential(ctx, s.db, *input.ProviderID, model, uuid.Nil); findErr == nil && found && credentialID != nil {
-			for _, row := range credentials {
-				if row.ID == *credentialID {
-					picked = row
-					break
-				}
-			}
-		}
-		if picked == nil {
-			picked = catalog.PickCredentialForUpstreamModel(credentials, model, baseURL)
-		}
-		credential, err = s.security.DecryptCredential(picked.CredentialCiphertext)
+		credential, err = s.catalogProbeCredential(ctx, row, model)
 		if err != nil {
-			return ProbeResponse{}, domain.WrapError(domain.CodeDependencyUnavailable, "decrypt provider credential", err)
+			return ProbeResponse{}, err
 		}
 		client = &http.Client{Timeout: 40 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	} else {
@@ -402,6 +411,8 @@ func (s *Service) ProbeModel(ctx context.Context, input ProbeInput) (ProbeRespon
 		if definition.Anthropic {
 			req.Header.Set("x-api-key", credential)
 			req.Header.Set("anthropic-version", "2023-06-01")
+		} else if definition.Gemini {
+			req.Header.Set("x-goog-api-key", credential)
 		} else {
 			req.Header.Set("Authorization", "Bearer "+credential)
 		}
@@ -414,14 +425,19 @@ func (s *Service) ProbeModel(ctx context.Context, input ProbeInput) (ProbeRespon
 			continue
 		}
 		limited := io.LimitReader(upstream.Body, 65537)
-		raw, _ := io.ReadAll(limited)
+		raw, readErr := io.ReadAll(limited)
 		_ = upstream.Body.Close()
 		item.HTTPStatus = upstream.StatusCode
 		if len(raw) > 65536 {
 			raw = raw[:65536]
 			item.Truncated = true
 		}
-		if upstream.StatusCode >= 200 && upstream.StatusCode < 300 {
+		if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
+			item.Error = fmt.Sprintf("upstream returned HTTP %d", upstream.StatusCode)
+		} else if definition.Gemini && (readErr != nil || item.Truncated ||
+			!catalog.GeminiProbeResponseOK(raw, catalog.BindingRouteProbeEndpoint(endpoint))) {
+			item.Error = "invalid_response"
+		} else {
 			if endpoint == "models" {
 				response.Configuration = extractProbeConfiguration(raw, model)
 				item.Limits = response.Configuration.ProbeLimits
@@ -429,8 +445,6 @@ func (s *Service) ProbeModel(ctx context.Context, input ProbeInput) (ProbeRespon
 				item.Limits = extractProbeLimits(raw)
 				mergeLimits(&response.Configuration.ProbeLimits, item.Limits)
 			}
-		} else {
-			item.Error = fmt.Sprintf("upstream returned HTTP %d", upstream.StatusCode)
 		}
 		response.Results = append(response.Results, item)
 	}

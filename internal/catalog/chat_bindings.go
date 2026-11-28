@@ -81,9 +81,16 @@ func IsAnthropicFamilyModel(modelID string) bool {
 	return false
 }
 
+func IsGeminiFamilyModel(modelID string) bool {
+	return containsToken(NormalizeSignal(modelID), "gemini")
+}
+
 func DefaultAdaptersForModel(modelID string) []modelbinding.Adapter {
 	if IsImageGenerationModel(modelID) {
 		return []modelbinding.Adapter{modelbinding.AdapterOpenaiImages}
+	}
+	if IsGeminiFamilyModel(modelID) {
+		return []modelbinding.Adapter{modelbinding.AdapterGoogleGeminiV1beta}
 	}
 	if IsAnthropicFamilyModel(modelID) {
 		return []modelbinding.Adapter{

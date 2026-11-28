@@ -2,8 +2,12 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
@@ -121,5 +125,70 @@ func TestRouteProbeStepReturnsStructuredResult(t *testing.T) {
 	step, err := probe.ProbeStep(context.Background(), "gpt-5.6-luna", BindingRouteProbeChatCompletions)
 	if err != nil || !step.OK || step.Adapter != modelbinding.AdapterOpenaiCompatible {
 		t.Fatalf("unexpected step: %#v err=%v", step, err)
+	}
+}
+
+func TestGeminiRouteProbeRecordsOnlyRequestedOperation(t *testing.T) {
+	for _, base := range []string{"https://api.beichenapi.com", "https://api.beichenapi.com/v1"} {
+		for _, tc := range []struct {
+			endpoint BindingRouteProbeEndpoint
+			op, body string
+		}{
+			{BindingRouteProbeGenerateContent, "generateContent", `{"candidates":[]}`},
+			{BindingRouteProbeStreamGenerateContent, "streamGenerateContent", `[{"candidates":[{"finishReason":"STOP"}]}]`},
+			{BindingRouteProbeEmbedContent, "embedContent", `{"embedding":{"values":[0.5]}}`},
+		} {
+			calls := 0
+			probe := &RouteProbe{BaseURL: base, Credential: "fixture", Client: &http.Client{Transport: modelScanTransport(func(r *http.Request) (*http.Response, error) {
+				calls++
+				want := "/v1beta/models/upstream:" + tc.op
+				if r.Method != http.MethodPost || r.URL.Path != want || r.Header.Get("x-goog-api-key") != "fixture" || r.Header.Get("Authorization") != "" {
+					t.Errorf("%s: native request used wrong method, path or authentication", tc.op)
+				}
+				var payload map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Errorf("%s: probe payload invalid: %v", tc.op, err)
+				}
+				if tc.endpoint == BindingRouteProbeEmbedContent {
+					if string(payload["model"]) != `"models/upstream"` || len(payload["content"]) == 0 {
+						t.Error("embedding probe is missing the native model or text")
+					}
+				} else if len(payload["contents"]) == 0 || string(payload["generationConfig"]) != `{"maxOutputTokens":1}` {
+					t.Error("generation probe is missing the native prompt or output limit")
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+			})}}
+			step, err := probe.ProbeStep(context.Background(), "models/upstream", tc.endpoint)
+			if err != nil || calls != 1 || !step.OK || step.Endpoint != tc.endpoint || step.Adapter != modelbinding.AdapterGoogleGeminiV1beta {
+				t.Fatalf("%s %s: calls=%d step=%+v err=%v", base, tc.op, calls, step, err)
+			}
+		}
+	}
+}
+
+func TestGeminiDiscoveryAcceptsOnePassingOperation(t *testing.T) {
+	probe := &RouteProbe{BaseURL: "https://api.beichenapi.com/v1", Credential: "fixture", Client: &http.Client{Transport: modelScanTransport(func(r *http.Request) (*http.Response, error) {
+		status, body := http.StatusNotFound, `{}`
+		switch r.URL.Path {
+		case "/v1beta/models/gemini-pro:generateContent":
+			status, body = http.StatusOK, `{"candidates":[]}`
+		case "/v1beta/models/gemini-pro:streamGenerateContent":
+			status, body = http.StatusOK, `{"wrong":"response shape"}`
+		case "/v1beta/models/gemini-embedding-001:embedContent":
+			status, body = http.StatusOK, `{"embedding":{"values":[0.5]}}`
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}}
+	adapters, err := probe.Discover(context.Background(), "gemini-pro")
+	if err != nil || !slices.Equal(adapters, []modelbinding.Adapter{modelbinding.AdapterGoogleGeminiV1beta}) {
+		t.Fatalf("native protocol lost despite one operation passing: %v %v", adapters, err)
+	}
+	step, err := probe.ProbeStep(context.Background(), "gemini-pro", BindingRouteProbeStreamGenerateContent)
+	if err != nil || step.OK || step.FailureCode != "invalid_response" {
+		t.Fatalf("non-native response marked stream probe passed: %+v %v", step, err)
+	}
+	step, err = probe.ProbeTokenStep(context.Background(), "gemini-embedding-001", string(modelbinding.AdapterGoogleGeminiV1beta))
+	if err != nil || step.Endpoint != BindingRouteProbeEmbedContent || !step.OK {
+		t.Fatalf("embedding model probed the wrong operation: %+v %v", step, err)
 	}
 }

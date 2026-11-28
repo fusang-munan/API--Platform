@@ -1,38 +1,46 @@
 package catalog
 
 import (
+	"context"
 	"strings"
 
+	entsql "entgo.io/ent/dialect/sql"
+	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providermodelcatalog"
 )
 
-// PickCredentialForUpstreamModel chooses the provider Key line that should own an upstream model id.
-// Used when probing without an explicit credential_id (same rules as catalog sync filtering).
-func PickCredentialForUpstreamModel(credentials []*ent.ProviderCredential, upstreamModel, baseURL string) *ent.ProviderCredential {
-	if len(credentials) == 0 {
-		return nil
+// FindProbeCatalogCredential uses only a credential that lists the model.
+// Beichen website-only catalog entries do not confirm what a Key can access.
+func FindProbeCatalogCredential(ctx context.Context, client *ent.Client, providerID uuid.UUID, baseURL, model string) (*ent.ProviderCredential, error) {
+	model = strings.TrimSpace(model)
+	matches := providermodelcatalog.ModelIDEqualFold(model)
+	if strings.HasPrefix(model, "models/") || IsGeminiFamilyModel(model) {
+		nativeID := strings.TrimPrefix(model, "models/")
+		matches = providermodelcatalog.Or(
+			providermodelcatalog.ModelIDEqualFold(nativeID),
+			providermodelcatalog.ModelIDEqualFold("models/"+nativeID),
+		)
 	}
-	want := credentialLineForModelID(upstreamModel)
-	if want == "" {
-		return credentials[0]
+	query := client.ProviderModelCatalog.Query().Where(
+		providermodelcatalog.ProviderIDEQ(providerID),
+		providermodelcatalog.StatusEQ(providermodelcatalog.StatusActive),
+		matches,
+	)
+	if IsBeichenBaseURL(baseURL) {
+		query.Where(func(selector *entsql.Selector) {
+			selector.Where(entsql.EQ(selector.C("catalog_source"), "key"))
+		})
 	}
-	for _, row := range credentials {
-		line := resolveCredentialLine(row.Label, row.GroupHint, baseURL)
-		if line == want {
-			return row
-		}
+	row, err := query.QueryCredential().Where(
+		providercredential.ProviderIDEQ(providerID),
+		providercredential.StatusEQ(providercredential.StatusActive),
+		providercredential.HasProviderWith(provider.StatusEQ(provider.StatusActive)),
+	).Order(ent.Asc(providercredential.FieldID)).First(ctx)
+	if ent.IsNotFound(err) {
+		return nil, nil
 	}
-	return credentials[0]
-}
-
-func credentialLineForModelID(modelID string) string {
-	id := strings.ToLower(strings.TrimSpace(modelID))
-	switch {
-	case strings.HasPrefix(id, "claude"):
-		return "claude"
-	case strings.HasPrefix(id, "gemini") || strings.Contains(id, "gemini"):
-		return "gemini"
-	default:
-		return "codex"
-	}
+	return row, err
 }

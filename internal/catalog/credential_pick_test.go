@@ -1,27 +1,39 @@
 package catalog
 
 import (
+	"context"
 	"testing"
 
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
 )
 
-func TestPickCredentialForUpstreamModel(t *testing.T) {
-	claudeID := uuid.New()
-	gptID := uuid.New()
-	credentials := []*ent.ProviderCredential{
-		{ID: claudeID, Label: "claude"},
-		{ID: gptID, Label: "gpt"},
+func TestFindProbeCatalogCredentialRequiresBeichenKeyEvidence(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
 	}
-	base := "https://api.llmapi.site"
-
-	picked := PickCredentialForUpstreamModel(credentials, "gpt-5.6-luna", base)
-	if picked == nil || picked.ID != gptID {
-		t.Fatalf("expected gpt credential for luna, got %#v", picked)
+	db := ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, sqlDB)))
+	defer db.Close()
+	providerID := uuid.New()
+	owner := uuid.New()
+	find := func(model string) (*ent.ProviderCredential, error) {
+		return FindProbeCatalogCredential(context.Background(), db, providerID, "https://api.beichenapi.com/v1", model)
 	}
-	picked = PickCredentialForUpstreamModel(credentials, "claude-sonnet-5", base)
-	if picked == nil || picked.ID != claudeID {
-		t.Fatalf("expected claude credential for claude model, got %#v", picked)
+	const query = `FROM "provider_credentials".*"provider_model_catalog".*"model_id" ILIKE.*"catalog_source" =.*ORDER BY "provider_credentials"."id"`
+	mock.ExpectQuery(query).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(owner))
+	picked, err := find("models/gemini-pro")
+	if err != nil || picked == nil || picked.ID != owner {
+		t.Fatalf("did not pick the catalog owner: %v", err)
+	}
+	mock.ExpectQuery(query).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	if picked, err := find("gemini-unlisted"); err != nil || picked != nil {
+		t.Fatalf("unlisted model got a credential or error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }

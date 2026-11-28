@@ -1,6 +1,12 @@
 package usage
 
-import "math"
+import (
+	"math"
+
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
+)
+
+const geminiCacheWriteUnreported = "cache_write_not_in_usage_metadata"
 
 // ClassifyBeichenUsage preserves nullable native counts even when a terminal
 // observation has enough evidence to price only the input as a group.
@@ -16,15 +22,24 @@ func (m CallMetrics) ClassifyBeichenUsage(protocol string) CallMetrics {
 		m.State = UsagePartial
 		return m
 	}
-	if protocol == "google_gemini_v1beta" {
-		// GenerateContent usageMetadata reports inclusive prompt and cached
-		// reads. It supplies no evidence about a Beichen cache-creation charge.
-		if m.PromptTokens != nil && m.CacheHitTokens != nil && *m.CacheHitTokens >= 0 && *m.CacheHitTokens <= *m.PromptTokens {
+	if protocol == string(modelbinding.AdapterGoogleGeminiV1beta) {
+		if m.State == UsageReported {
+			tokens, reason := normalizeBeichenConditionalTokens(m, protocol)
+			if reason != "" {
+				m.State, m.UsageReason = UsagePartial, reason
+			} else {
+				uncached := *m.PromptTokens - *tokens.Read
+				m.CacheMissTokens, m.CacheHitTokens = &uncached, tokens.Read
+				if m.CompletionTokens == nil {
+					m.CompletionTokens = new(int64)
+				}
+				if tokens.UnconfirmedReason != "" {
+					m.State, m.UsageReason = UsagePartial, tokens.UnconfirmedReason
+				}
+			}
+		} else if m.PromptTokens != nil && m.CacheHitTokens != nil && *m.CacheHitTokens >= 0 && *m.CacheHitTokens <= *m.PromptTokens {
 			uncached := *m.PromptTokens - *m.CacheHitTokens
 			m.CacheMissTokens = &uncached
-		}
-		if m.State == UsageReported {
-			m.State, m.UsageReason = UsagePartial, "cache_write_not_in_usage_metadata"
 		}
 		return m
 	}
@@ -46,13 +61,23 @@ func (m CallMetrics) ClassifyBeichenUsage(protocol string) CallMetrics {
 	return m
 }
 
-// CanPriceBeichenUsage admits a partial terminal observation only when its
-// sole ambiguity is the allocation of a known number of input tokens.
+// CanPriceBeichenUsage admits terminal input allocations with a unique price
+// and Gemini usage whose only unreported charge is cache creation.
 func (m CallMetrics) CanPriceBeichenUsage(protocol string) bool {
 	if m.State == UsageReported {
 		return true
 	}
-	if m.State != UsagePartial || m.UsageReason != "token_breakdown_unconfirmed" {
+	if m.State != UsagePartial {
+		return false
+	}
+	if protocol == string(modelbinding.AdapterGoogleGeminiV1beta) {
+		if m.UsageReason != geminiCacheWriteUnreported {
+			return false
+		}
+		tokens, reason := normalizeBeichenConditionalTokens(m, protocol)
+		return reason == "" && tokens.UnconfirmedReason == geminiCacheWriteUnreported
+	}
+	if m.UsageReason != "token_breakdown_unconfirmed" {
 		return false
 	}
 	tokens, reason := normalizeBeichenConditionalTokens(m, protocol)
@@ -65,6 +90,9 @@ func normalizeBeichenConditionalTokens(m CallMetrics, protocol string) (beichenB
 		if count != nil && *count < 0 {
 			return t, "inconsistent_token_breakdown"
 		}
+	}
+	if protocol == string(modelbinding.AdapterGoogleGeminiV1beta) {
+		return normalizeGeminiTokens(m)
 	}
 	if m.PromptTokens == nil || m.CompletionTokens == nil {
 		return t, "missing_price_or_token_breakdown"
@@ -123,6 +151,52 @@ func normalizeBeichenConditionalTokens(m CallMetrics, protocol string) (beichenB
 		}
 	} else {
 		t.Unsplit = remaining
+	}
+	return t, ""
+}
+
+func normalizeGeminiTokens(m CallMetrics) (beichenBillableTokens, string) {
+	var t beichenBillableTokens
+	if m.PromptTokens == nil || (m.CompletionTokens == nil && m.TotalTokens == nil) {
+		return t, "missing_price_or_token_breakdown"
+	}
+	// Gemini's native counters are proto3 scalars. A zero count can be
+	// omitted. Cache creation has no native counter and stays unknown.
+	zero := int64(0)
+	t.Read, t.Write = m.CacheHitTokens, m.CacheWriteTokens
+	if t.Read == nil {
+		t.Read = &zero
+	}
+	prompt := *m.PromptTokens
+	if *t.Read > prompt {
+		return t, "inconsistent_token_breakdown"
+	}
+	uncached := prompt - *t.Read
+	if m.CacheMissTokens != nil && *m.CacheMissTokens != uncached {
+		return t, "inconsistent_token_breakdown"
+	}
+
+	// Tools consume additional input. Thoughts are additional output.
+	tool, thoughts, candidates := int64(0), int64(0), int64(0)
+	if m.ToolPromptTokens != nil {
+		tool = *m.ToolPromptTokens
+	}
+	if m.ReasoningTokens != nil {
+		thoughts = *m.ReasoningTokens
+	}
+	if m.CompletionTokens != nil {
+		candidates = *m.CompletionTokens
+	}
+	if tool > math.MaxInt64-prompt || thoughts > math.MaxInt64-candidates {
+		return t, "inconsistent_token_total"
+	}
+	input := uncached + tool
+	t.Input, t.TotalIn, t.Output = &input, prompt+tool, candidates+thoughts
+	if t.Output > math.MaxInt64-t.TotalIn || (m.TotalTokens != nil && *m.TotalTokens != t.TotalIn+t.Output) {
+		return t, "inconsistent_token_total"
+	}
+	if t.Write == nil {
+		t.UnconfirmedReason = geminiCacheWriteUnreported
 	}
 	return t, ""
 }

@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
@@ -18,11 +19,38 @@ func TestResolveAdapterUsesTokenRules(t *testing.T) {
 		{"openai-response", modelbinding.AdapterOpenaiResponses},
 		{"custom-provider-embeddings-v2", modelbinding.AdapterOpenaiEmbeddings},
 		{"/v1beta/models/gemini-pro:generateContent", modelbinding.AdapterGoogleGeminiV1beta},
+		{"/v1beta/models/custom:streamGenerateContent", modelbinding.AdapterGoogleGeminiV1beta},
+		{"/v1beta/models/custom:embedContent", modelbinding.AdapterGoogleGeminiV1beta},
+		{"/v1beta/models/custom-rerank:embedContent", modelbinding.AdapterGoogleGeminiV1beta},
+		{"openai-embeddings-v1beta", modelbinding.AdapterOpenaiEmbeddings},
+		{"gemini-embedding-001", modelbinding.AdapterGoogleGeminiV1beta},
+		{"embedContent", modelbinding.AdapterGoogleGeminiV1beta},
 	}
 	for _, test := range tests {
 		adapter, ok := ResolveAdapter(test.signal)
 		if !ok || adapter != test.want {
 			t.Fatalf("signal %q => %#v ok=%v, want %s", test.signal, adapter, ok, test.want)
+		}
+	}
+}
+
+func TestGeminiCatalogProtocols(t *testing.T) {
+	for _, tc := range []struct {
+		entry ProviderEntry
+		want  modelbinding.Adapter
+	}{
+		{ProviderEntry{ID: "gemini-pro"}, modelbinding.AdapterGoogleGeminiV1beta},
+		{ProviderEntry{ID: "gemini-embedding-001"}, modelbinding.AdapterGoogleGeminiV1beta},
+		{ProviderEntry{ID: "custom", Raw: map[string]any{"supportedGenerationMethods": []any{"embedContent"}}},
+			modelbinding.AdapterGoogleGeminiV1beta},
+		{ProviderEntry{ID: "gemini-embedding-001", Raw: map[string]any{"endpoints": []any{"/v1/embeddings"}}},
+			modelbinding.AdapterOpenaiEmbeddings},
+	} {
+		if got := RegisteredProtocols(tc.entry); !slices.Equal(got, []string{string(tc.want)}) {
+			t.Errorf("%s: registered %v, want %s", tc.entry.ID, got, tc.want)
+		}
+		if got := AdaptersFromUpstream(tc.entry); !slices.Equal(got, []modelbinding.Adapter{tc.want}) {
+			t.Errorf("%s: bindings %v, want %s", tc.entry.ID, got, tc.want)
 		}
 	}
 }

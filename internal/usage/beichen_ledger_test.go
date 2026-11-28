@@ -23,9 +23,9 @@ func newBeichenLedgerTestDB(t *testing.T) (context.Context, *sql.DB) {
 		t.Skip("requires a disposable local nebula_test database")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || config.Database != "nebula_test" ||
+	if err != nil || config.Host != "127.0.0.1" || (config.Database != "nebula_test" && config.Database != "nebula_test_hjc1") ||
 		config.TLSConfig != nil || len(config.Fallbacks) != 0 {
-		t.Fatal("requires a loopback-only nebula_test database with sslmode=disable")
+		t.Fatal("requires a disposable loopback ledger test database with sslmode=disable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)

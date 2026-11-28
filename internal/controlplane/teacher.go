@@ -1130,7 +1130,8 @@ type BindingRouteProbeInput struct {
 func (s *Service) ProbeModelBindingRoute(ctx context.Context, input BindingRouteProbeInput) (catalog.RouteProbeStep, error) {
 	endpoint := catalog.BindingRouteProbeEndpoint(strings.TrimSpace(input.Endpoint))
 	switch endpoint {
-	case catalog.BindingRouteProbeChatCompletions, catalog.BindingRouteProbeResponses, catalog.BindingRouteProbeMessages, catalog.BindingRouteProbeImagesGenerations:
+	case catalog.BindingRouteProbeChatCompletions, catalog.BindingRouteProbeResponses, catalog.BindingRouteProbeMessages, catalog.BindingRouteProbeImagesGenerations,
+		catalog.BindingRouteProbeGenerateContent, catalog.BindingRouteProbeStreamGenerateContent, catalog.BindingRouteProbeEmbedContent:
 	default:
 		return catalog.RouteProbeStep{}, domain.NewError(domain.CodeValidation, "invalid binding route probe endpoint")
 	}
@@ -1145,7 +1146,7 @@ func (s *Service) ProbeModelBindingRoute(ctx context.Context, input BindingRoute
 	if err != nil {
 		return catalog.RouteProbeStep{}, domain.WrapError(domain.CodeDependencyUnavailable, "query provider", err)
 	}
-	credentialPlain, _, err := s.probeCredentialForProvider(ctx, input.ProviderID, upstreamModelName)
+	credentialPlain, err := s.catalogProbeCredential(ctx, providerRow, upstreamModelName)
 	if err != nil {
 		return catalog.RouteProbeStep{}, err
 	}

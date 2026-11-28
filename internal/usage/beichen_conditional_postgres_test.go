@@ -74,6 +74,9 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 		if protocol == "anthropic" {
 			path = "/v1/messages"
 		}
+		if protocol == "google_gemini_v1beta" {
+			path = "/v1beta/models/" + name + ":generateContent"
+		}
 		r, err := store.Reserve(ctx, key, model, uuid.NewString(), protocol, path, "", "", CallCorrelation{}, route)
 		if err != nil {
 			t.Fatal(err)
@@ -256,6 +259,38 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 			receipt, err := store.StudentCallReceipt(ctx, student, r.RequestID)
 			if err != nil || receipt.AmountSource == nil || *receipt.AmountSource != "estimated_unique_amount" || receipt.UsageState == nil || *receipt.UsageState != "partial" {
 				t.Fatalf("receipt missing amount provenance: %+v %v", receipt, err)
+			}
+		}
+	})
+	t.Run("Gemini fixed and manual quotes book confirmed usage once", func(t *testing.T) {
+		t.Setenv("NEBULA_PENDING_AUTO_SETTLE", "0")
+		prompt, candidate, read, thought, tool, total := int64(100), int64(3), int64(2), int64(2), int64(1), int64(106)
+		m := CallMetrics{State: UsageReported, PromptTokens: &prompt, CompletionTokens: &candidate,
+			CacheHitTokens: &read, ReasoningTokens: &thought, ToolPromptTokens: &tool, TotalTokens: &total}
+		for _, tc := range []struct{ source, base, actual string }{
+			{"gateway_usage_price", "0.0275", "0.03025"},
+			{"teacher_manual_price", "0.00011", "0.000121"},
+		} {
+			if tc.source == "teacher_manual_price" {
+				exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,cache_read_rate,actor_id)
+					VALUES($1,'fixed-model','school','manual','teacher',1000000,2000000,500000,$2)`, credential, student)
+			}
+			var before int
+			if err := db.QueryRowContext(ctx, `SELECT charged_count FROM monthly_usage_cube WHERE api_key_id=$1`, key).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			r, route := dispatch("fixed-model", "google_gemini_v1beta", nil, "", nil)
+			finalize(r, route, m)
+			finalize(r, route, m)
+			checkCharge(r, tc.actual, tc.actual, "0", tc.base, tc.source)
+			var after int
+			if err := db.QueryRowContext(ctx, `SELECT charged_count FROM monthly_usage_cube WHERE api_key_id=$1`, key).Scan(&after); err != nil || after != before+1 {
+				t.Fatalf("Gemini charge count was %d before and %d after: %v", before, after, err)
+			}
+			receipt, err := store.StudentCallReceipt(ctx, student, r.RequestID)
+			if err != nil || receipt.AmountSource == nil || *receipt.AmountSource != "confirmed_tokens_only" ||
+				receipt.UsageState == nil || *receipt.UsageState != "partial" {
+				t.Fatalf("Gemini charge lost its partial usage provenance: %+v %v", receipt, err)
 			}
 		}
 	})

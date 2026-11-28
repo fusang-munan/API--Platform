@@ -3,7 +3,6 @@ package dataplane
 import (
 	"bytes"
 	"encoding/json"
-
 	"strings"
 
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
@@ -14,6 +13,8 @@ type ResponseMetrics struct {
 	usage.CallMetrics
 	stopExplicit bool
 	terminal     bool
+	geminiModel  string
+	geminiReview string
 }
 
 func parseJSONResponseMetrics(adapter modelbinding.Adapter, body []byte) ResponseMetrics {
@@ -99,6 +100,7 @@ func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, paylo
 	if adapter == modelbinding.AdapterGoogleGeminiV1beta {
 		metrics.noteResponseID(payload["responseId"])
 		metrics.MergeProtocolUsage(adapter, payload["usageMetadata"])
+		metrics.noteGeminiPricingEvidence(payload)
 		return
 	}
 	metrics.noteResponseID(payload["id"])
@@ -118,6 +120,40 @@ func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, paylo
 		}
 	}
 	metrics.MergeProtocolUsage(adapter, payload["usage"])
+}
+
+func (metrics *ResponseMetrics) noteGeminiPricingEvidence(payload map[string]json.RawMessage) {
+	for _, field := range []string{"modelVersion", "model"} {
+		if reported := strings.TrimPrefix(rawString(payload[field]), "models/"); reported != "" {
+			if metrics.geminiModel != "" && metrics.geminiModel != reported {
+				metrics.geminiReview = beichenModelMismatch
+			}
+			metrics.geminiModel = reported
+		}
+	}
+	if metrics.geminiReview != "" {
+		return
+	}
+	if payload == nil || (len(payload["error"]) != 0 && !bytes.Equal(bytes.TrimSpace(payload["error"]), []byte("null"))) {
+		metrics.geminiReview = beichenUnsupportedPrice
+		return
+	}
+	for _, field := range []string{"candidates", "usageMetadata"} {
+		var value any
+		if json.Unmarshal(payload[field], &value) == nil && !beichenGeminiTextValue(value) {
+			metrics.geminiReview = beichenUnsupportedPrice
+			return
+		}
+	}
+}
+
+func (metrics ResponseMetrics) beichenGeminiResponseReview(expectedModel string) string {
+	// Gemini binds the model in the dispatched URL. modelVersion, when
+	// present, can invalidate that evidence. It need not appear in every frame.
+	if metrics.geminiModel != "" && metrics.geminiModel != strings.TrimPrefix(expectedModel, "models/") {
+		return beichenModelMismatch
+	}
+	return metrics.geminiReview
 }
 
 // OpenAI's final usage is a snapshot. Earlier counters can still explain a
@@ -157,6 +193,20 @@ func jsonObject(raw json.RawMessage) map[string]json.RawMessage {
 }
 
 func applyReplyState(adapter modelbinding.Adapter, metrics *ResponseMetrics, payload map[string]json.RawMessage) {
+	if adapter == modelbinding.AdapterGoogleGeminiV1beta {
+		var candidates []map[string]json.RawMessage
+		if json.Unmarshal(payload["candidates"], &candidates) == nil {
+			for _, candidate := range candidates {
+				if reason := rawString(candidate["finishReason"]); reason != "" && reason != "FINISH_REASON_UNSPECIFIED" {
+					metrics.terminal = true
+				}
+			}
+		}
+		if reason := rawString(jsonObject(payload["promptFeedback"])["blockReason"]); reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
+			metrics.terminal = true
+		}
+		return
+	}
 	noteToolRequest(metrics, payload["content"])
 	noteToolRequest(metrics, payload["output"])
 	noteToolRequest(metrics, payload["content_block"])
@@ -185,19 +235,6 @@ func applyReplyState(adapter modelbinding.Adapter, metrics *ResponseMetrics, pay
 			}
 			noteToolRequest(metrics, deltaRaw)
 		}
-	}
-	if candidatesRaw, ok := payload["candidates"]; ok && adapter == modelbinding.AdapterGoogleGeminiV1beta {
-		var candidates []map[string]json.RawMessage
-		if json.Unmarshal(candidatesRaw, &candidates) == nil {
-			for _, candidate := range candidates {
-				if reason := rawString(candidate["finishReason"]); reason != "" && reason != "FINISH_REASON_UNSPECIFIED" {
-					metrics.terminal = true
-				}
-			}
-		}
-	}
-	if reason := rawString(jsonObject(payload["promptFeedback"])["blockReason"]); adapter == modelbinding.AdapterGoogleGeminiV1beta && reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
-		metrics.terminal = true
 	}
 	if adapter == modelbinding.AdapterAnthropic {
 		noteStopReason(metrics, rawString(payload["stop_reason"]))

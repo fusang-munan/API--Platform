@@ -16,8 +16,49 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/beichen"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
+
+func TestBeichenGeminiProbeCatalogKeyPostgres(t *testing.T) {
+	ctx := context.Background()
+	fx := newBeichenGatewayFixture(t, ctx)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := fx.db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const model = "gemini-fixture"
+	first := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
+		VALUES($1,$2,'First active Key',decode('01','hex'),now(),now())`, first, fx.provider)
+	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,catalog_source,last_seen_at,synced_at,created_at,updated_at)
+		VALUES(gen_random_uuid(),$1,$2,$3,'website',now(),now(),now(),now())`, fx.provider, first, model)
+	find := func() uuid.UUID {
+		t.Helper()
+		owner, err := catalog.FindProbeCatalogCredential(ctx, fx.gateway.db, fx.provider, "https://api.beichenapi.com/v1", model)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if owner == nil {
+			return uuid.Nil
+		}
+		return owner.ID
+	}
+	if owner := find(); owner != uuid.Nil {
+		t.Fatal("website-only ownership selected an active Key")
+	}
+	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,catalog_source,last_seen_at,synced_at,created_at,updated_at)
+		VALUES(gen_random_uuid(),$1,$2,$3,'key',now(),now(),now(),now())`, fx.provider, fx.credential, "models/"+model)
+	if owner := find(); owner != fx.credential {
+		t.Fatal("probe did not select the Key that lists the Gemini model")
+	}
+	exec(`UPDATE provider_credentials SET status='inactive' WHERE id=$1`, fx.credential)
+	if owner := find(); owner != uuid.Nil {
+		t.Fatal("inactive ownership triggered a probe with another Key")
+	}
+}
 
 func testBeichen41CallTokenAudit(t *testing.T, ctx context.Context, db *sql.DB, gateway *Gateway, provider, credential, binding, teacher uuid.UUID, publicModel, upstreamModel, studentKey string) {
 	t.Helper()
@@ -55,8 +96,9 @@ func testBeichen41CallTokenAudit(t *testing.T, ctx context.Context, db *sql.DB, 
 	event := func(payload string) string { return "data: " + strings.ReplaceAll(payload, "\n", "\ndata: ") + "\n\n" }
 	fullResponses := object(`"id":"resp_audit","status":"completed","usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,
 		"input_tokens_details":{"cached_tokens":30,"cache_write_tokens":10}}`)
-	gemini := `{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":15,
-		"cachedContentTokenCount":30,"thoughtsTokenCount":5,"toolUsePromptTokenCount":2,"totalTokenCount":122}}`
+	geminiUsage := `{"promptTokenCount":100,"candidatesTokenCount":15,
+		"cachedContentTokenCount":30,"thoughtsTokenCount":5,"toolUsePromptTokenCount":2,"totalTokenCount":122}`
+	gemini := fmt.Sprintf(`{"modelVersion":%q,"candidates":[{"finishReason":"STOP"}],"usageMetadata":%s}`, upstreamModel, geminiUsage)
 	geminiPath := "/v1beta/models/" + publicModel
 	cases := []struct {
 		name, adapter, path, request, response string
@@ -90,9 +132,13 @@ func testBeichen41CallTokenAudit(t *testing.T, ctx context.Context, db *sql.DB, 
 				event(`{"type":"message_delta","usage":{"output_tokens":20}}`) + event(`{"type":"message_stop"}`),
 			5, true, true, "reported", "0.0003675", "0.03675", 60, 10, 120},
 		{"gemini-json", "google_gemini_v1beta", geminiPath + ":generateContent", `"contents":[]`, gemini,
-			5, false, false, "partial", "0.000362", "0.0362", 72, 0, 122},
-		{"gemini-sse", "google_gemini_v1beta", geminiPath + ":streamGenerateContent?alt=sse", `"contents":[]`, event(gemini),
-			5, true, false, "partial", "0.000362", "0.0362", 72, 0, 122},
+			5, false, true, "partial", "0.000362", "0.03585", 72, 0, 122},
+		{"gemini-sse", "google_gemini_v1beta", geminiPath + ":streamGenerateContent?alt=sse", `"contents":[]`,
+			event(`{"candidates":[{"finishReason":"STOP"}]}`) + event(`{"usageMetadata":`+geminiUsage+`}`),
+			4, true, true, "partial", "0.000362", "0.03585", 72, 0, 122},
+		{"gemini-array", "google_gemini_v1beta", geminiPath + ":streamGenerateContent", `"contents":[]`,
+			`[{"candidates":[{"finishReason":"STOP"}]},{"usageMetadata":` + geminiUsage + `}]`,
+			1, false, true, "partial", "0.000362", "0.03585", 72, 0, 122},
 		{"missing", "openai_responses", "/v1/responses", `"input":"fixture"`, object(`"status":"completed","usage":null`),
 			1, false, false, "missing", "", "", 0, 0, 0},
 	}
@@ -110,6 +156,9 @@ func testBeichen41CallTokenAudit(t *testing.T, ctx context.Context, db *sql.DB, 
 			verifyCost, delta := tc.actualCost, "0"
 			if tc.name == "chat-json" && i == 0 {
 				verifyCost, delta = "0.0008", "-0.0065"
+			}
+			if tc.adapter == "google_gemini_v1beta" {
+				delta = "-0.00035"
 			}
 			wants[id] = wantAudit{tc.usageState, tc.base, verifyCost, delta, tc.total, tc.pricesLocally}
 			gateway.client.Transport = beichenGatewayTestTransport(func(r *http.Request) (*http.Response, error) {
@@ -145,11 +194,23 @@ func testBeichen41CallTokenAudit(t *testing.T, ctx context.Context, db *sql.DB, 
 			}
 			var sent time.Time
 			var charged bool
-			var state string
+			var state, billing string
+			var studentCredits sql.NullString
 			err := db.QueryRowContext(ctx, `SELECT sent_at,actual_credits IS NOT NULL,usage_state FROM gateway_calls WHERE request_id=$1`, id).
 				Scan(&sent, &charged, &state)
 			if err != nil || charged != tc.pricesLocally || state != tc.usageState {
 				t.Fatalf("%s: pre-receipt state=%s charged=%t err=%v", id, state, charged, err)
+			}
+			if tc.adapter == "google_gemini_v1beta" {
+				err := db.QueryRowContext(ctx, `SELECT beichen_state,trim_scale(student_credits)::text,
+					usage_reason='cache_write_not_in_usage_metadata' AND cache_hit_tokens=30 AND cache_miss_tokens=70
+					AND cache_write_tokens IS NULL AND reasoning_tokens=5 AND tool_prompt_tokens=2
+					AND pricing_detail @> '{"amount_source":"confirmed_tokens_only","cache_write_tokens":null,
+						"input_tokens":72,"output_tokens":20,"unconfirmed_usage_reason":"cache_write_not_in_usage_metadata"}'
+					FROM gateway_calls WHERE request_id=$1`, id).Scan(&billing, &studentCredits, &charged)
+				if err != nil || billing != "charged" || !charged || studentCredits.String != "0.039435" {
+					t.Fatalf("%s: wrong Gemini charge, state=%s, credits=%v, evidence=%t: %v", id, billing, studentCredits, charged, err)
+				}
 			}
 			if verifyCost != "" {
 				rowID++
@@ -214,6 +275,10 @@ func testBeichen41CallTokenAudit(t *testing.T, ctx context.Context, db *sql.DB, 
 				row.MissingTokenReasons["cache_write_tokens"] == "" {
 				t.Fatalf("%s: receipt altered local observation or was presented as an estimate: %+v", row.RequestID, row)
 			}
+			if row.Protocol == "google_gemini_v1beta" && (!tokenIs(row.LocalTokens.Input, 72) || !tokenIs(row.LocalTokens.CacheRead, 30) ||
+				row.LocalTokens.CacheWrite != nil || row.MissingTokenReasons["cache_write_tokens"] != "cache_write_not_in_usage_metadata") {
+				t.Fatalf("%s: receipt changed Gemini's local evidence: %+v", row.RequestID, row)
+			}
 			if row.StudentCredits == nil {
 				t.Fatalf("%s: student charge is missing", row.RequestID)
 			}
@@ -231,8 +296,8 @@ func testBeichen41CallTokenAudit(t *testing.T, ctx context.Context, db *sql.DB, 
 		}
 		cursor = *page.NextCursor
 	}
-	if len(wants) != 0 || studentTotal.FloatString(5) != "1.85075" {
+	if len(wants) != 0 || studentTotal.FloatString(5) != "1.84690" {
 		t.Fatalf("missing %d audit rows or student credits %s", len(wants), studentTotal.FloatString(5))
 	}
-	t.Log("41 calls, 4,820 known tokens, 25 locally priced / 15 receipt-priced / 1 pending, 1.85075 student credits")
+	t.Log("41 calls, 4,820 known tokens, 35 locally priced / 5 receipt-priced / 1 pending, 1.84690 student credits")
 }

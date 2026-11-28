@@ -3,12 +3,19 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
+	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 )
 
@@ -104,5 +111,97 @@ func TestProbeTargetDoesNotDuplicateVersionPrefix(t *testing.T) {
 	target, err := probeTarget("https://example.com/v1", "/v1/responses")
 	if err != nil || target != "https://example.com/v1/responses" {
 		t.Fatalf("unexpected target %q, err=%v", target, err)
+	}
+	target, err = probeTarget("https://api.beichenapi.com/v1", "/v1beta/models/gemini-fixture:embedContent")
+	if err != nil || target != "https://api.beichenapi.com/v1beta/models/gemini-fixture:embedContent" {
+		t.Fatalf("unexpected Beichen native probe target %q, err=%v", target, err)
+	}
+}
+
+func TestNativeProbeEndpointsUseCatalogCredential(t *testing.T) {
+	service, mock, closeService := newIdentityTestService(t)
+	defer closeService()
+	var err error
+	service.security, err = security.NewManager(nil, nil, []byte("fixture"), make([]byte, 32), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "fixture-gemini-catalog-owner"
+	ciphertext, err := service.security.EncryptCredential(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			_, _ = io.WriteString(w, `{"data":[]}`)
+			return
+		}
+		if r.Method != http.MethodPost || r.Header.Get("x-goog-api-key") != key || r.Header.Get("Authorization") != "" {
+			t.Error("native probe used the wrong authentication")
+		}
+		switch r.URL.Path {
+		case "/v1beta/models/gemini-fixture:generateContent":
+			_, _ = io.WriteString(w, `{"candidates":[]}`)
+		case "/v1beta/models/gemini-fixture:streamGenerateContent":
+			_, _ = io.WriteString(w, `[{"candidates":[]}]`)
+		case "/v1beta/models/gemini-fixture:embedContent":
+			_, _ = io.WriteString(w, `{"embedding":{"values":[0.5]}}`)
+		default:
+			t.Error("probe used the wrong native endpoint")
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+	providerID, owner := uuid.New(), uuid.New()
+	expectProvider := func(base string) {
+		mock.ExpectQuery(`FROM "providers"`).WithArgs(providerID).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "base_url"}).AddRow(providerID, base))
+	}
+	const catalogQuery = `FROM "provider_credentials".*"provider_model_catalog"`
+	expectOwner := func() {
+		expectProvider(upstream.URL)
+		mock.ExpectQuery(catalogQuery).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "credential_ciphertext"}).AddRow(owner, ciphertext))
+	}
+	endpoints := []string{"generate_content", "stream_generate_content", "embed_content"}
+	expectOwner()
+	got, err := service.ProbeModel(context.Background(), ProbeInput{
+		ProviderID: &providerID, UpstreamModelName: "models/gemini-fixture", Endpoints: endpoints,
+	})
+	if err != nil || len(got.Results) != len(endpoints)+1 {
+		t.Fatalf("generic probe did not report the requested endpoints: %+v %v", got, err)
+	}
+	for i, endpoint := range endpoints {
+		item := got.Results[i+1]
+		if item.Endpoint != endpoint || item.HTTPStatus != 200 || item.Error != "" {
+			t.Fatalf("generic probe failed for %s: %+v", endpoint, item)
+		}
+	}
+	expectOwner()
+	step, err := service.ProbeModelBindingRoute(context.Background(), BindingRouteProbeInput{
+		ProviderID: providerID, UpstreamModelName: "gemini-fixture", Endpoint: string(catalog.BindingRouteProbeStreamGenerateContent),
+	})
+	if err != nil || !step.OK || step.Adapter != modelbinding.AdapterGoogleGeminiV1beta {
+		t.Fatalf("binding probe did not return native success: %+v %v", step, err)
+	}
+
+	for _, preflight := range []bool{false, true} {
+		expectProvider("https://api.beichenapi.com/v1")
+		mock.ExpectQuery(catalogQuery + `.*"catalog_source"`).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+		if preflight {
+			_, err = service.ProbeModelBindingRoute(context.Background(), BindingRouteProbeInput{
+				ProviderID: providerID, UpstreamModelName: "gemini-unlisted", Endpoint: "embed_content",
+			})
+		} else {
+			_, err = service.ProbeModel(context.Background(), ProbeInput{
+				ProviderID: &providerID, UpstreamModelName: "gemini-unlisted", Endpoints: []string{"embed_content"},
+			})
+		}
+		if domain.ErrorCode(err) != domain.CodeValidation || !strings.Contains(err.Error(), "待核") {
+			t.Fatalf("probe did not stop at missing ownership: %v", err)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
