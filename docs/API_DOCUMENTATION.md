@@ -484,6 +484,8 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 已发布型号的 `price_covered` 表示至少一条当前已发布且就绪的线路有可计算报价。待配置型号按绑定或可用的 Key 目录判断。手动价及可按 Token 计算的 `conditional` 都计入。通过缺价字段可核查反推价和缺字段的档位。批量启用逐条验证启用后的线路。
 
+`model_catalog[].published` 表示校内模型已发布，`active` 表示已发布且至少一条北辰线路就绪。已发布型号的就绪线路均缺少可用报价时，`route_availability.availability` 返回 `unavailable` 并附报价阻断原因。未发布缺价型号返回 `not_published`。能力记录也返回 `published`。可用于学生价的官网报价通过 `models[].quote_usable` 标识。采价续期失败时，仍有可用官网报价的 Key 在 `datasets[].refresh_error` 显示失败原因。
+
 线路就绪且报价阻止启用时，`model_catalog[].price_blocker` 返回 `{code, message}`，其中 `message` 说明涉及的字段及适用的档位号。常见代码包括 `missing_price`、`billing_mode_non_token`、`price_conditions_invalid`、`tier_missing_input`、`tier_missing_output`、`tier_range_invalid` 和 `effort_multiplier_invalid`。概览的 `blockers` 使用 `price_missing` 或 `conditional_price` 汇总报价原因，并显示线路原因 `no_candidate`、`multi_candidate` 或 `auth_failed`。
 
 使用官网报价时，概览的 `models[].price_conditions` 保留官网原值。可按 Token 解析的报价在 `price_conditions_exact` 中显示实际使用的报价字段，数值以字符串返回以保留小数精度。空或省略的计费模式默认按 Token 处理，明确以 Token 为主时会忽略附带的按次、图像和视频单价。
@@ -588,6 +590,8 @@ Key 证据不足时，只有标准余额计费、分组默认倍率有效且高�
 单个和批量启用都支持新 Key 首次接入。校内别名命中现有模型时优先使用别名目标；别名指向的名称已不在 `models` 中时，回退到同一上游名对应的模型。候选没有关联 UUID，或关联的是停用、已不存在的校内模型时，也可使用同一上游名下唯一已确认的当前校内目标。首次自动建立绑定只使用同一把 Key 和同一上游型号，可覆盖多个协议，并须通过当前目录权限、探活和报价检查。别名目标与上游名目标是两个不同的活跃或待配置模型时，概览的每个目标行都关闭启用并返回 `multi_school`。这种映射冲突不能通过提交任一校内 UUID 绕过，需先修正别名或模型映射。
 
 已有线路的 Key 仍为 `active`，且当前 Key 版本被目录认证或探活确认 401/403 时，启用以 `auth_failed` 阻断并提示教师显式重绑。停用或退役 Key 可按唯一候选修复，多个候选会阻断修复。
+
+首次启用选中有旧 `inactive` 绑定的协议时原地恢复该绑定。已发布且仍有当前网站目录证据的旧线路支持幂等启用，批量返回 `already_active`。同批按校内模型 UUID 去重，事务成功提交或确认 `already_active` 后占用去重位置。
 
 单个启用被阻断时，HTTP `400 VALIDATION_ERROR` 的 `error.details.code` 返回具体原因。批量启用在 `skipped[].code` 返回相同的阻断码，教师概览的 `model_catalog[].blockers[].code` 使用同一组阻断码和提示。`no_candidate` 表示没有符合当前目标的线路，`multi_school` 表示按上游名称无法唯一选中当前校内目标，`multi_candidate` 表示候选线路不唯一，`auth_failed` 表示原绑定认证失败，`price_missing` 表示缺少可用报价或校内倍率。上游名称有多个活跃或待配置目标时，拆分的各阻断行返回 `multi_school`，提示“该上游名称对应多个活跃校内模型，请指定校内模型 ID”。
 

@@ -380,6 +380,12 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 在 `frontend` 下运行 `npm test -- BeichenSchoolModels BeichenModelUsageDrawer`。现有用例核对目录按 `school_model_id` 精确取用同名上游的校内费用，也核对旧响应缺少该字段时使用校内名称和唯一线路回退，无法唯一确认时显示待确认。字段是新增的可空属性，旧接口响应仍可消费。
 
+首接时报绑定冲突时，检查该校内模型、北辰供应商和协议是否已有 `inactive` 绑定。运行 `go test -p 1 ./internal/beichen -run '^TestEnableModelRestoresInactiveProtocolSlotsPostgres$' -count=1`，核对两个协议均可用新 Key 恢复，并沿用原绑定 ID 和优先级。
+
+缺价时同时核对发布状态、`price_blocker` 和可用性。已发布且没有可用报价的型号显示 `unavailable`，未发布缺价显示 `not_published`。Claude 报价刷新失败时，检查当前 Key、分组和倍率版本，以及从成功观测起算的 20 分钟有效窗口。运行 `go test -p 1 ./internal/beichen -run '^TestOverview(StudentPriceDiagnostics|ClaudeQuoteRenewal)Postgres$' -count=1`，复查宽限、过期和学生价。基础单价每百万 Token 1 元时，乘渠道倍率 0.5 和学校系数 1.10 后为每百万 Token 55 积分。
+
+教师页金额或启用反馈异常时，在 `frontend` 运行 `npm test -- BeichenSchoolModels BeichenKeyCapabilities`。用例核对 Key 清单与账日记录分开计数、金额显示元及原币、一键启用的跳过和失败分类，以及单项和批量 `no_candidate` 的诊断计数。浏览器复查 390、520、1024 和 1280 像素宽度下的状态列、报价表和档位弹窗，窄屏的宽表在容器内横向滚动。
+
 纯文本模型探活通过后仍显示「官网报价格式无效」或「非 Token 计价」时，先看 `price_blocker.message` 的字段名。旧解析会拒绝空字符串，并把非 Token 字段的零值当作有费用。运行 `go test ./internal/beichen -run 'TestPanelMixedPriceFixture|TestPanelMixedPricesActivationAndSettlementPostgres' -count=1 -v`，用构造的面板 JSON 和隔离的本机数据库复查。测试覆盖 gpt-6.1-sol 的固定价、gpt-6.2-sol 的两个 Token 档位、缺价档的提示与待核账、两种启用入口及扣分明细中被忽略的字段。
 
 #### 作废渠道的历史型号

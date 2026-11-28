@@ -384,6 +384,8 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 迁移 0042 给报价快照增加 Key 密文的 SHA-256 摘要，用于确认调价前后还是同一把 Key。每个快照仍保留采样时的凭据版本。目录、标准价、计价条件和对应倍率在同一个同步事务中保存。`model_pricing` 的 JSON `null` 值表示本轮完整核对后分组未列出该模型，键缺失表示未建立这项证据。采集失败写入 `beichen_datasets`，已有报价可用至原定有效期。若账单成功返回但仍无法核实分组，或者确认倍率或分组变化，旧价提前失效。显式停用采价会立即撤销报价。
 
+官网报价通常从成功观测起有效 20 分钟，若期间发生高峰倍率切换则提前到切换时刻截止。读取时仍需匹配凭据、分组及当前有效倍率版本。
+
 迁移 0043 仅扩展 `gateway_calls.beichen_base_source` 的具名 CHECK，新增 `teacher_manual_price`，不改历史记录。查找旧约束时同时匹配来源列和原枚举值，保留来源与基础积分的空值一致性约束，以及基础积分乘派发时学校系数等于已扣积分的恒等式。重复执行该迁移仍得到相同约束。
 
 教师按模型设置价格时，读取指定北辰供应商下 `provider_model_catalog.status='active'` 的全部凭据，按凭据 UUID 顺序以 `FOR SHARE OF p FOR NO KEY UPDATE OF c` 加锁，重新核实目录归属后只取一次 `clock_timestamp()`。所有 `beichen_price_versions` 校内价格版本在同一事务内写入，`track='school'`、`source='teacher'`、`basis='manual'` 或 `follow`，并带教师 ID；实际新增的版本共用一个 `effective_at`，相同观察继续幂等。手动输入价、输出价必须存在，费率以「积分/百万 Token × 1,000,000」整数保存，范围为 0..1,000,000,000,000；恢复跟随时四项费率全部为空。HTTP 按模型定价输入为十进制积分字符串，以有理数精确缩放，缺省缓存价按零处理。
@@ -405,6 +407,8 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 教师模型目录和能力接口读取已有 `model_bindings`、`provider_model_catalog`、`beichen_datasets`、分组观测版本、报价快照以及 `upstream_probes`。读取时用当前凭据版本及已知分组变化约束目录、报价和探活。探活同时核对 `beichen_probe_usage` 的派发时间，避免采用换组前发起、换组后才保存的结果。作废判定读取历史目录、绑定状态与关联渠道，历史用量沿用原账本归属。
 
 教师首次启用时，按上游名称、已有绑定和 Key 目录别名定位 `models.id`。同名且状态为 `active` 或 `pending_configuration` 的已确认校内目标只有一个时，未关联目标或仍关联历史目标的合格候选可建立到该 UUID 的协议绑定。写入 `model_bindings`、校内模型状态和需要的倍率审计在同一事务提交。阻断时整次操作不产生这些写入。
+
+模型没有活动北辰绑定时，选中的协议可原地恢复对应的 `inactive` 绑定，沿用原绑定 UUID 和优先级。更新条件包括原绑定状态、凭据、上游名和优先级。
 
 `provider_model_catalog.catalog_source` 由迁移 `0061` 新增，无取值约束，默认 `key`，旧官网行回填 `website`。当前 Key 目录写入器只写 `key`，官网目录清理逻辑只处理 `website`。读取端把 `key` 和 `both` 都视为 Key 目录载体；`both` 仍须满足当前目录、分组和探活证据，才能生成线路候选。仅 `website` 的行继续要求已有活动绑定。教师概览的 `models[].catalog_source` 返回该列原值，合并后的 `model_catalog[].source=both` 则由同一行的 Key 与官网证据共同推导。
 
