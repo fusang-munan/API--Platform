@@ -182,15 +182,38 @@ ORDER BY p.channel`, provider)
 		}()
 	}
 	round.Wait()
-	fallbackRates := make(map[int64]crawlKeyRate)
-	for _, checked := range checkedRates {
-		prior := fallbackRates[checked.groupID]
-		if checked.groupID != 0 && (prior.groupID == 0 || checked.info != nil || prior.info == nil && checked.groupDefault != nil) {
-			fallbackRates[checked.groupID] = checked
-		}
-	}
+	fallbackRates := mergeCrawlKeyRates(checkedRates)
 	crawl.applyAccountRates(rates, fallbackRates, rateErr)
 	return results, ""
+}
+
+// Any conflicting Key makes its whole group inconclusive. A later verified
+// Key or group default must never replace that evidence.
+func mergeCrawlKeyRates(checked []crawlKeyRate) map[int64]crawlKeyRate {
+	merged := make(map[int64]crawlKeyRate)
+	for _, evidence := range checked {
+		if evidence.groupID == 0 {
+			continue
+		}
+		prior, exists := merged[evidence.groupID]
+		if !exists || crawlKeyRatePriority(evidence) > crawlKeyRatePriority(prior) {
+			merged[evidence.groupID] = evidence
+		}
+	}
+	return merged
+}
+
+func crawlKeyRatePriority(evidence crawlKeyRate) int {
+	switch {
+	case evidence.conflict != nil:
+		return 3
+	case evidence.info != nil:
+		return 2
+	case evidence.groupDefault != nil:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // The website renders these logged-in account rates next to group defaults.
@@ -237,6 +260,7 @@ func (crawl *directoryCrawl) applyAccountRates(rates map[int64]json.Number, fall
 	if !crawl.accountRatesVerified {
 		crawl.AccountRateError = websiteAccountRatesReadFailure
 	}
+	var conflictReason string
 	for i := range crawl.platforms {
 		for j := range crawl.platforms[i].Groups {
 			group := &crawl.platforms[i].Groups[j]
@@ -248,7 +272,9 @@ func (crawl *directoryCrawl) applyAccountRates(rates map[int64]json.Number, fall
 			} else if evidence, checked := fallback[group.ID]; checked {
 				switch {
 				case evidence.conflict != nil:
-					crawl.AccountRateError = evidence.conflict.Error()
+					if conflictReason == "" {
+						conflictReason = evidence.conflict.Error()
+					}
 				case evidence.info != nil:
 					group.setKeyAccountRate(*evidence.info)
 				case evidence.groupDefault != nil:
@@ -259,6 +285,9 @@ func (crawl *directoryCrawl) applyAccountRates(rates map[int64]json.Number, fall
 				}
 			}
 		}
+	}
+	if conflictReason != "" {
+		crawl.AccountRateError = conflictReason
 	}
 }
 

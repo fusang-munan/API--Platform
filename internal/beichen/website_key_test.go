@@ -295,6 +295,38 @@ func TestDirectoryAccountRateCoverage(t *testing.T) {
 	}
 }
 
+func TestCrawlAccountRateGroupConflictPriority(t *testing.T) {
+	rate := json.Number("0.5")
+	conflict := accountRateConflict("Key 账单生效倍率与官网分组默认倍率不一致")
+	merged := mergeCrawlKeyRates([]crawlKeyRate{
+		{groupID: 16, conflict: conflict},
+		{groupID: 16, info: &billingInfo{Multiplier: "0.5", APIKeyID: 12094}},
+		{groupID: 16, groupDefault: &rate},
+		{groupID: 17, conflict: conflict},
+		{groupID: 17, conflict: accountRateConflict("Key 账单分组号与官网不一致")},
+		{groupID: 18, groupDefault: &rate},
+		{groupID: 18, groupDefault: &rate},
+	})
+	crawl := directoryCrawl{platforms: []directoryPlatform{{Groups: []directoryGroup{
+		{WebsiteGroup: WebsiteGroup{ID: 16}}, {WebsiteGroup: WebsiteGroup{ID: 17}},
+		{WebsiteGroup: WebsiteGroup{ID: 18}},
+	}}}}
+	crawl.applyAccountRates(nil, merged, errors.New("rate table unavailable"))
+	groups := crawl.platforms[0].Groups
+	for _, group := range groups[:2] {
+		if group.AccountRate != nil || group.AccountRateSource != "" {
+			t.Fatalf("group %d published a rate despite a conflicting Key: %+v", group.ID, group)
+		}
+	}
+	if !matchesAccountRate(&groups[2].WebsiteGroup, "0.5", groupRateSource, 0) {
+		t.Fatalf("conflict-free group did not receive the group fallback: %+v", groups[2].WebsiteGroup)
+	}
+	if !strings.Contains(crawl.AccountRateError, "证据冲突") ||
+		strings.Contains(crawl.AccountRateError, "官网账户倍率表读取失败") {
+		t.Fatalf("group conflict reason was not retained: %q", crawl.AccountRateError)
+	}
+}
+
 func TestKeyCapabilityAccountRateEvidence(t *testing.T) {
 	rate, inherited := json.Number("0.6"), json.Number("0.5")
 	const otherKey = 99
