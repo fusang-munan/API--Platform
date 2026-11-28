@@ -71,6 +71,8 @@ func TestEnableModelsBatchRetriesSerializationAndDeduplicates(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT k.model_id::text,k.raw_entry`).WithArgs(provider, "Missing", nil).
 		WillReturnRows(sqlmock.NewRows([]string{"model"}))
+	mock.ExpectQuery(`SELECT EXISTS \(\s*SELECT 1 FROM model_bindings b`).WithArgs(provider, "Missing").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectRollback()
 	result, err := New(db, nil).EnableModelsBatch(context.Background(), provider, actor, []string{"Missing", "missing"})
 	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 || result.Skipped[0].Model != "Missing" || result.Skipped[0].Reason != "not_found" {

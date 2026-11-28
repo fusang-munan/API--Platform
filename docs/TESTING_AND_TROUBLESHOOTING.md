@@ -360,21 +360,35 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 概览显示 `model_catalog.source=both`、`catalog_keys.state=listed` 且已有官网目录，但启用仍返回 `no_candidate` 时，查询该行的 `provider_model_catalog.catalog_source`。旧读取只接受 `key`，若生产行为 `both`，整条候选记录会从启用预览消失。修复后 `key|both` 统一作为 Key 载体，`both` 仍必须通过 Key 目录新鲜度、分组和探活检查；`website` 仍要求已有活动绑定。目录、定价、线路能力、探活和发布协议使用同一读取口径。
 
-`catalog_source` 已确认为 `both` 且 Key 目录、价格和探活都正常，启用仍为 `no_candidate` 时，检查 `upstream_model_aliases.school_model` 是否指向不存在的 `models.model_id`。旧读取只按 `COALESCE(alias.school_model, upstream_model)` 解析，别名失效会同时丢掉别名和上游名两个有效路径。修复后别名目标存在时优先，目标不存在时回退上游名；别名与上游名指向两个不同的活跃或待配置模型时返回 `multi_school`。概览的两个目标行都显示该阻断并关闭启用，单模型或批量即使提交 alias UUID 也不会写入绑定或审计，必须先修正映射。`no_candidate` 的 `error.details` 或批量 `skipped[].details` 提供 `rows`、`available`、`catalog_current`、`alias_missing`、`target_missing`、`key_listed`、`group_allowed` 以及候选匹配阶段的 `candidate_rows`、`matching_school`、`fallback_school`、`schools` 整数计数。
+`catalog_source` 已确认为 `both` 且 Key 目录、价格和探活都正常，启用仍为 `no_candidate` 时，检查 `upstream_model_aliases.school_model` 是否指向不存在的 `models.model_id`。旧读取只按 `COALESCE(alias.school_model, upstream_model)` 解析，别名失效会同时丢掉别名和上游名两个有效路径。修复后别名目标存在时优先，目标不存在时回退上游名；别名与上游名指向两个不同的活跃或待配置模型时返回 `multi_school`。概览的两个目标行都显示该阻断并关闭启用，单模型或批量即使提交 alias UUID 也不会写入绑定或审计，必须先修正映射。`no_candidate` 的 `error.details` 或批量 `skipped[].details` 提供目录、目标、候选计数，以及 `north_ready`、`ambiguous`、`catalog_blocked`、`foreign_active`、`multiplier_set`、`writes`、`routes` 计划状态。
 
 设置独立的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run '^TestEnableModel(FirstConnect.*|RetiredSameName.*|MultipleLiveTargets|PrioritizesAuthFailure)Postgres$' -count=1 -v`。用例覆盖一把 Gemini Key 的两个协议、确认报价、成功探活、未关联或旧目标关联、按名称和 UUID 启用、重复启用，以及多目标、多候选、跨 Key 拼协议、缺价和缺少校内倍率时的阻断。查看单个响应的 `error.details.code`、批量的 `skipped[].code` 或教师概览的 `blockers` 定位具体原因。多个活跃校内目标拆成两行时，两行的阻断码和提示均与单模型、批量一致，均为 `multi_school`。
 
 运行 `go test ./internal/beichen -run '^(TestEnableModelCatalogSourceBoth|TestActivationCatalogSourceNeedsKeyEvidence|TestActivationCatalogSourceWebsiteOnlyNeedsBinding)Postgres$' -count=1 -v` 验证 `both`。生产形状使用组 `31`、倍率 `0.5`、确认价格、两种协议探活成功和唯一当前校内目标；同时覆盖 Key 目录过期、分组拒绝与 `website` 无绑定。
 
-运行 `go test ./internal/beichen -run '^(TestEnableModel(StaleCandidateFallsBackToUniqueSelectableTarget|MissingAliasFallsBackToUpstream|AliasAndUpstreamDifferentLiveTargets|ValidAliasTakesPriority)|TestActivationNoCandidateDiagnostics|TestDefaultRoutesUniqueNilCandidateUsesFallback|TestActivationFallbackDiagnosticsExcludeDirectMatches)Postgres?$' -count=1 -v` 验证别名路径、唯一目标回退和诊断计数。用例覆盖旧 UUID 与空 UUID 候选在唯一目标下回退、`hasActivationMapping=false`、website-only 拒绝回退、active 与 pending 两种冲突目标、概览两行关闭启用、按 alias UUID 仍阻断、无绑定或审计写入，以及 direct 与 fallback 混合时的计数。
+运行 `go test ./internal/beichen -run '^(TestEnableModel(StaleCandidateFallsBackToUniqueSelectableTarget|MissingAliasFallsBackToUpstream|AliasAndUpstreamDifferentLiveTargets|AliasAndUpstreamSameKeyUsesCanonicalName|ValidAliasTakesPriority)|TestActivationNoCandidateDiagnostics|TestDefaultRoutesUniqueNilCandidateUsesFallback|TestActivationFallbackDiagnosticsExcludeDirectMatches|TestSelectActivationRouteCanonicalAndAmbiguity)Postgres?$' -count=1 -v` 验证别名路径、唯一目标回退和诊断计数。用例覆盖旧 UUID 与空 UUID 候选在唯一目标下回退、`hasActivationMapping=false`、website-only 拒绝回退、active 与 pending 两种冲突目标、概览两行关闭启用、按 alias UUID 仍阻断、规范上游名选择、同协议重复候选、不同 Key 歧义、无绑定或审计写入，以及 direct 与 fallback 混合时的计数。
 
 测试中刚写入的 Key 目录被判为陈旧时，核对目录观测时间是否早于凭据版本或分组变更。构造当前目录的测试数据使用 PostgreSQL 时钟，避免 Windows 上应用与数据库的时钟精度差异影响时间先后。
 
 启用成功替换了一条 active 旧线路的 Key 时，先查原 Key 的 `beichen_catalog_auth` 和绑定协议探活。当前凭据版本被 401/403 拒绝属于认证失败，不能由首接候选自动修复。单个启用应返回提示显式重绑的 400，批量应返回 `route_not_ready`，模型、绑定和审计均不应变化。停用或退役 Key 可按唯一候选修复。只有一个已停用校内目标时，教师显式启用仍可修复其已有绑定。运行 `go test ./internal/beichen -run '^TestEnableModel(DoesNotAutoRepairAuthFailedActiveRoute|DoesNotPublishCredentialCatalogAuthFailure|RepairsInactiveOrRetiredAuthFailedRoute|KeepsHealthyExistingRoute)Postgres$' -count=1 -v` 核对 401、403、目录认证标记、停用、退役和健康旧线路。运行 `go test ./internal/dataplane -run '^TestBeichenTeacherEnablesDiscoveredModelForStudent$' -count=1` 核对改名和轮换 Key 后仍沿用原 UUID。
 
+批量启用里第一个上游名称（陈旧别名）返回 `route_not_ready` / `no_candidate`，随后同一个校内模型的 UUID 却返回 `duplicate_school_model`、成功数为 0，单独提交该 UUID 又能修复时，先看第一项的 `skipped[].details.writes`。旧逻辑只要模型已发布并存在活动绑定就直接返回 `already_active`，即使计划为 `no_candidate`、待写 0 条，也会占用本批的校内去重位。现在单个与批量共用同一判断：计划有待写或阻断时如实报阻断，只有计划就绪或线路仍由当前网站目录支撑时才返回 `already_active`；去重位只在事务提交成功或确认已启用后占用。运行 `go test ./internal/beichen -run '^(TestEnableModelsBatchRepairsAfterStaleAliasSkipPostgres|TestEnableModelRepairsPublishedUnreachableBindingsPostgres)$' -count=1 -v` 核对第二项修复两条绑定、绑定 ID 与审计保持不变。
+
+已发布模型再次启用返回 400 或批量 `route_not_ready`、提示「原绑定线路尚未就绪」，而不是 `already_active` 时，查该绑定 Key 的 `beichen_datasets`（`kind='catalog'` 的 `last_success` 是否超过 30 分钟或存在 `last_error`）以及 `provider_model_catalog.catalog_source`。Key 证据过期且没有当前网站目录条目支撑的线路不再算已启用；`catalog_source='website'` 的已发布旧绑定只在没有可接替当前 Key 时返回 `already_active`，存在可接替 Key 时按下一条修复。名称与 UUID 两种查询共用同一加载路径。运行 `go test ./internal/beichen -run '^(TestEnableRequiresCurrentKeyCatalogPostgres|TestEnableWebsiteOnlyPublishedRouteIsAlreadyActivePostgres)$' -count=1 -v`，用例覆盖按名称和 UUID 重复启用都返回 `already_active`、不写绑定和审计，以及 Key 证据过期仍阻断。
+
+网站目录豁免还要求该型号当前没有任何 Key 目录可接替。存在可接替的当前 Key 时，名称查询只报 `route_not_ready` / `no_candidate` 且不占批量去重位，随后同一校内 UUID 按 Key 候选修复两条绑定并保留原 ID 与优先级；运行 `go test ./internal/beichen -run '^TestEnableModelsBatchRepairsRepairableWebsiteRoutePostgres$' -count=1 -v` 核对。
+
 教师概览的同上游型号必须按校内模型分别显示。设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test -p 1 ./internal/beichen -run TestBeichenTeacherCoveragePostgres -count=1 -v`。用例构造 8 个目录行，断言每行都有非空且唯一的 `school_model_id`；其中同一上游名绑定两个校内模型时返回两行，两个 UUID 不同，专属 `preferred_routes` 不混入另一校内模型。两行都必须得到官网和 Key 目录证据，状态均为 `key_listed` 而不是 `published_unavailable`；各自只保留 CC1 或 G3 的 `catalog_keys` 和 `credential_ids`，不再出现两行共享全部 Key 的宽范围结果。其余 6 个现行型号的计数、价格、Key 覆盖和分组继续由同一用例核对。
 
 在 `frontend` 下运行 `npm test -- BeichenSchoolModels BeichenModelUsageDrawer`。现有用例核对目录按 `school_model_id` 精确取用同名上游的校内费用，也核对旧响应缺少该字段时使用校内名称和唯一线路回退，无法唯一确认时显示待确认。字段是新增的可空属性，旧接口响应仍可消费。
+
+首接时报绑定冲突时，检查该校内模型、北辰供应商和协议是否已有 `inactive` 绑定。运行 `go test -p 1 ./internal/beichen -run '^TestEnableModelRestoresInactiveProtocolSlotsPostgres$' -count=1`，核对两个协议均可用新 Key 恢复，并沿用原绑定 ID 和优先级。
+
+缺价时同时核对发布状态、`price_blocker` 和可用性。已发布且没有可用报价的型号显示 `unavailable`，未发布缺价显示 `not_published`。Claude 报价刷新失败时，检查当前 Key、分组和倍率版本，以及从成功观测起算的 20 分钟有效窗口。运行 `go test -p 1 ./internal/beichen -run '^TestOverview(StudentPriceDiagnostics|ClaudeQuoteRenewal)Postgres$' -count=1`，复查宽限、过期和学生价。基础单价每百万 Token 1 元时，乘渠道倍率 0.5 和学校系数 1.10 后为每百万 Token 55 积分。
+
+教师页的未发布型号显示「未发布」，不应因缺价变成「不可用」。待配置但已有 `price_covered=true` 的型号计入报价覆盖，例如单项页面显示 `1 / 1`。采价续期失败时，`datasets[].refresh_error` 非空，诊断区的「续期失败，沿用旧报价」显示 Key 标签和具体原因。在 `frontend` 运行 `npm test -- BeichenSchoolModels`，核对未发布缺价、待发布有价覆盖和续期失败诊断。
+
+教师页金额或启用反馈异常时，在 `frontend` 运行 `npm test -- BeichenSchoolModels BeichenKeyCapabilities`。用例核对 Key 清单与账日记录分开计数、金额显示元及原币、一键启用的跳过和失败分类，以及单项和批量 `no_candidate` 的诊断计数。浏览器复查 390、520、1024 和 1280 像素宽度下的状态列、报价表和档位弹窗，窄屏的宽表在容器内横向滚动。
 
 纯文本模型探活通过后仍显示「官网报价格式无效」或「非 Token 计价」时，先看 `price_blocker.message` 的字段名。旧解析会拒绝空字符串，并把非 Token 字段的零值当作有费用。运行 `go test ./internal/beichen -run 'TestPanelMixedPriceFixture|TestPanelMixedPricesActivationAndSettlementPostgres' -count=1 -v`，用构造的面板 JSON 和隔离的本机数据库复查。测试覆盖 gpt-6.1-sol 的固定价、gpt-6.2-sol 的两个 Token 档位、缺价档的提示与待核账、两种启用入口及扣分明细中被忽略的字段。
 

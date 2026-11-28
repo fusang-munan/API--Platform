@@ -359,10 +359,16 @@ func TestPanelExpiry(t *testing.T) {
 	if _, err := panelExpiry(info, now.Add(time.Minute)); err == nil {
 		t.Fatal("accepted stale observation")
 	}
+	now = now.Add(-18*time.Minute + time.Second)
+	info.ObservedAt = now
+	expires, err = panelExpiry(info, now)
+	if err != nil || !expires.Equal(now.Add(18*time.Minute)) {
+		t.Fatalf("got %s, %v, want the peak boundary during renewal grace", expires, err)
+	}
 	peak = false
 	expires, err = panelExpiry(info, now)
-	if err != nil || !expires.Equal(now.Add(panelQuoteTTL)) {
-		t.Fatalf("got %s, %v, want TTL expiry", expires, err)
+	if err != nil || !expires.Equal(now.Add(20*time.Minute)) {
+		t.Fatalf("got %s, %v, want bounded renewal grace", expires, err)
 	}
 }
 

@@ -132,23 +132,12 @@ export type MentorCandidate = { id: string; name: string; email: string; is_memb
 export type Session = { access_token: string; token_type: string; expires_in: number; user: User; identity: Role }
 export type PageMeta = { next_cursor?: string | null }
 export type Envelope<T> = { data: T; meta?: PageMeta; request_id?: string }
-export type ApiErrorDetails = {
+export type ApiErrorDetails = ({
   code?: string
   model_ids?: string[]
   operation?: string
   state_changed?: boolean
-  rows?: number
-  available?: number
-  catalog_current?: number
-  alias_missing?: number
-  target_missing?: number
-  key_listed?: number
-  group_allowed?: number
-  candidate_rows?: number
-  matching_school?: number
-  fallback_school?: number
-  schools?: number
-} | Array<{ field: string; reason: string }>
+} & Partial<BeichenActivationDiagnostics>) | Array<{ field: string; reason: string }>
 export type ApiError = { error?: { code?: string; message?: string; details?: ApiErrorDetails }; request_id?: string }
 
 export type OrganizationCreate = { name: string; description?: string; status?: ResourceStatus }
@@ -186,6 +175,7 @@ export type BeichenDataset = {
   kind: string
   last_success?: string | null
   last_error?: string | null
+  refresh_error?: string | null
   effective_multiplier: number | string | null
   effective_multiplier_text?: string
   account_rate_multiplier?: number | string
@@ -682,6 +672,13 @@ export type BeichenActivationDiagnostics = {
   matching_school: number
   fallback_school: number
   schools: number
+  north_ready: boolean
+  ambiguous: boolean
+  catalog_blocked: boolean
+  foreign_active: boolean
+  multiplier_set: boolean
+  writes: number
+  routes: number
 }
 export type BeichenBatchEnableResult = {
   enabled: Array<{ model: string; model_id: string }>

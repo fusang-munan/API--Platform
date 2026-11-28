@@ -108,7 +108,8 @@ func TestBeichenCapabilityRescanAndReplayPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	if after := read(); after.CatalogState != "key_listed" || after.BindingState != "ready" ||
-		after.Availability != "unverified" || after.RecommendedProtocol == nil || *after.RecommendedProtocol != "anthropic" {
+		after.Availability != catalog.AvailabilityUnavailable || after.ProbeState != "unprobed" ||
+		after.PriceBlocker == nil || after.PriceBlocker.Code != "missing_price" {
 		t.Fatalf("rescan did not discover and restore the registered route: %+v", after)
 	}
 

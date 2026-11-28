@@ -40,13 +40,14 @@ it('展示 CC2 的官网分组和单 Key 流水，在弹层按倍率核对选中
   const view = mountKeys([cc2])
 
   expect(view.get('section').attributes('aria-label')).toBe('Key 实际能力')
-  expect(view.text()).toContain('2 个模型')
+  expect(view.get('article header').text()).toContain('Key 清单 2 个')
   expect(view.findAll('.key-models li').map(item => item.text())).toEqual(cc2.models)
   expect(view.text()).toContain('[CC2]ClaudeCode高智 · 分组 602 · 0.6×')
   expect(view.text()).toContain('北辰 Key 42')
   // 账号余额属于账号级数据，不能出现在单 Key 能力卡片里。
   expect(view.text()).not.toContain('4.974')
-  expect(view.text()).toContain('单日原价 0.11 · 实付 0.066（USD）')
+  expect(view.text()).toContain('原价 0.11 元 · 实付 0.066 元')
+  expect(view.get('.key-day-usage > small').text()).toBe('原币 USD')
   expect(view.text()).toContain('缓存读取 — · 缓存写入 0')
   expect(view.get('a').text()).toBe('打开北辰核对分组')
   expect(view.find('form').exists()).toBe(false)
@@ -67,7 +68,7 @@ it('展示 CC2 的官网分组和单 Key 流水，在弹层按倍率核对选中
 
   await view.setProps({ capabilities: [{ ...cc2, usage_state: 'stale', group_check: 'pending', usage_error: '北辰接口返回 HTTP 401' }] })
   expect(view.text()).toContain('已陈旧')
-  expect(view.text()).toContain('实付 0.066（USD）')
+  expect(view.text()).toContain('实付 0.066 元')
   expect(view.find('[role="alert"]').exists()).toBe(false)
   view.unmount()
 })
@@ -90,7 +91,7 @@ it('Gemini 保留分组名并显示权限缺失，G3 显示已核实的倍率和
   expect(geminiCard.get('[role="status"]').text()).toBe(denied)
   expect(geminiCard.text()).not.toMatch(/找不到|分组不存在|gemini-old/)
   expect(g3Card.text()).toContain('0.20×')
-  expect(g3Card.text()).toContain('1 个模型')
+  expect(g3Card.get('header').text()).toContain('Key 清单 1 个')
   expect(g3Card.text()).toContain('gpt-6.2-sol')
   expect(g3Card.text()).not.toMatch(/Claude|目标分组|有差异/)
   expect(view.findAll('input')).toHaveLength(0)
@@ -103,5 +104,31 @@ it.each([
 ] as const)('按 %s 展示分组状态', (group_status, message) => {
   const view = mountKeys([{ ...cc2, group_status, website_group: null, models: [], models_fetched_at: null }])
   expect(view.get('[role="status"]').text()).toBe(message)
+  view.unmount()
+})
+
+it.each(['unknown', null, 'CNY'])('日金额统一用元，分开列出 Key 清单和账日记录（币种 %s）', day_unit => {
+  const models = ['model-a', 'model-b', 'model-c', 'model-d']
+  const observedModels = [...models, 'usage-only-e', 'usage-only-f']
+  const view = mountKeys([{
+    ...cc2, day_unit, models, model_stats_day: '2026-11-21', model_stats_fetched_at: at,
+    model_stats: observedModels.map((model, index) => ({
+      ...cc2.daily_usage!, model, requests: index + 1,
+      cost: index ? '0.11' : null, actual_cost: index ? '0.066' : '0', multiplier_diff: index === 1,
+    })),
+  }])
+  view.get('details').element.setAttribute('open', '')
+  expect(view.get('article header').text()).toContain('Key 清单 4 个')
+  expect(view.get('article header').text()).not.toContain('账日有记录')
+  expect(view.findAll('ul[aria-label="Key 清单"] li').map(row => row.text())).toEqual(models)
+  expect(view.get('.key-usage-models h5').text()).toBe('账日有记录 6 个')
+  const table = view.get('.model-observations table')
+  expect(table.findAll('thead th').map(cell => cell.text())).toEqual(['模型', '笔数', '原价', '实付', '观测倍率'])
+  expect(table.findAll('tbody th').map(cell => cell.element.firstChild?.textContent)).toEqual(observedModels)
+  expect(table.findAll('tbody tr')[0].findAll('td').map(cell => cell.text())).toEqual(['1', '—', '0 元', '0.6×'])
+  expect(table.findAll('tbody tr')[1].findAll('td').map(cell => cell.text())).toEqual(['2', '0.11 元', '0.066 元', '0.6×与已存偏差超过 5%'])
+  expect(view.text()).toContain('实付 0.066 元')
+  expect(view.get('.key-day-usage > small').text()).toBe('原币 ' + (day_unit ?? 'unknown'))
+  expect(view.text()).not.toMatch(/币种待核|原始币种标记/)
   view.unmount()
 })
