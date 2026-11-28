@@ -1,6 +1,7 @@
 package beichen
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -83,6 +84,7 @@ func TestEnableModelDoesNotAutoRepairAuthFailedActiveRoutePostgres(t *testing.T)
 			school, before := f.authFailedBindings(t, "school-auth-"+uuid.NewString()[:8], statusCode)
 			id, err := f.service.EnableModel(f.ctx, f.provider, f.actor, firstConnectUpstream, school.String())
 			if id != uuid.Nil || domain.ErrorCode(err) != domain.CodeValidation ||
+				activationErrorCode(err) != blockerAuthFailed ||
 				!strings.Contains(err.Error(), "拒绝认证") || !strings.Contains(err.Error(), "显式重绑") {
 				t.Fatalf("auth-failed active route was auto-repaired: id=%s err=%v", id, err)
 			}
@@ -91,7 +93,8 @@ func TestEnableModelDoesNotAutoRepairAuthFailedActiveRoutePostgres(t *testing.T)
 			}
 			result, err := f.service.EnableModelsBatch(f.ctx, f.provider, f.actor, []string{school.String()})
 			if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
-				result.Skipped[0].Reason != "route_not_ready" || !strings.Contains(result.Skipped[0].Message, "显式重绑") {
+				result.Skipped[0].Reason != "route_not_ready" || result.Skipped[0].Code != blockerAuthFailed ||
+				!strings.Contains(result.Skipped[0].Message, "显式重绑") {
 				t.Fatalf("batch did not keep auth failure blocked: %+v %v", result, err)
 			}
 			if after := f.bindingSnapshot(t, school); !before.equal(after) {
@@ -110,11 +113,52 @@ func TestEnableModelDoesNotPublishCredentialCatalogAuthFailurePostgres(t *testin
 	before := f.bindingSnapshot(t, school)
 	id, err := f.service.EnableModel(f.ctx, f.provider, f.actor, firstConnectUpstream, school.String())
 	if id != uuid.Nil || domain.ErrorCode(err) != domain.CodeValidation ||
+		activationErrorCode(err) != blockerAuthFailed ||
 		!strings.Contains(err.Error(), "拒绝认证") || !strings.Contains(err.Error(), "显式重绑") {
 		t.Fatalf("catalog auth failure published the model: id=%s err=%v", id, err)
 	}
 	if after := f.bindingSnapshot(t, school); !before.equal(after) {
 		t.Fatalf("catalog auth failure changed the model or binding: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestEnableModelPrioritizesAuthFailurePostgres(t *testing.T) {
+	for _, name := range []string{"no replacement", "ambiguous replacements"} {
+		t.Run(name, func(t *testing.T) {
+			f := newFirstConnectFixture(t)
+			school, before := f.authFailedBindings(t, "school-mixed-failures", 404, 403)
+			if name == "no replacement" {
+				execCatalogTestSQL(t, f.ctx, f.db, `UPDATE upstream_probes SET status_code=401,error_code='http_error'
+WHERE provider_id=$1 AND credential_id=$2 AND model=$3 AND protocol=$4`,
+					f.provider, f.keys[0], firstConnectUpstream, firstConnectAdapters[0])
+			} else {
+				f.readyKey(t, f.keys[2])
+			}
+
+			view, err := f.service.Overview(f.ctx, f.provider, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.ContainsFunc(view.ModelCatalog, func(row CatalogModel) bool {
+				return row.Model == firstConnectUpstream && row.SchoolModelID != nil && *row.SchoolModelID == school &&
+					!row.CanEnable && slices.Contains(row.Blockers, CatalogBlocker{blockerAuthFailed, authFailedRebindMessage})
+			}) {
+				t.Fatal("overview did not show the auth failure as the activation blocker")
+			}
+			f.assertEnableRejected(t, school.String(), blockerAuthFailed, authFailedRebindMessage)
+			f.assertSkipped(t, "route_not_ready", blockerAuthFailed, authFailedRebindMessage, school.String())
+			if after := f.bindingSnapshot(t, school); !before.equal(after) {
+				t.Fatalf("blocked enable changed the model or binding: before=%+v after=%+v", before, after)
+			}
+
+			execCatalogTestSQL(t, f.ctx, f.db, `UPDATE models SET status='active',credit_multiplier_milli=1000 WHERE id=$1`, school)
+			published := f.bindingSnapshot(t, school)
+			f.assertEnableRejected(t, school.String(), blockerAuthFailed, authFailedRebindMessage)
+			f.assertSkipped(t, "route_not_ready", blockerAuthFailed, authFailedRebindMessage, school.String())
+			if after := f.bindingSnapshot(t, school); !published.equal(after) {
+				t.Fatalf("blocked enable changed the published model or binding: before=%+v after=%+v", published, after)
+			}
+		})
 	}
 }
 

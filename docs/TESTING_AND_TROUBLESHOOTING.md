@@ -356,11 +356,13 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 #### 教师目录的校内模型身份
 
-新 Key 已匹配且报价和探活正常，启用仍返回 `route_not_ready` 时，检查该上游名称在教师概览的 `school_model_id`、`preferred_routes` 和 `bound_routes`。旧版会漏掉尚无直接校内关联的新 Key。新版在上游名称只有一个校内目标、候选来自同一把 Key 时，允许教师启用并建立各可用协议的绑定。发现多个校内目标或多个候选 Key 时，先确认校内目标和线路。
+新 Key 已匹配且报价和探活正常，启用仍返回 `route_not_ready` 时，核对教师概览的 `school_model_id`、`preferred_routes`、`bound_routes` 与 `blockers`。同名的 `inactive` 历史目标可能使旧版误判为多目标。修复后，缺少校内关联或仍指向历史目标的候选可接入唯一已确认的当前 UUID。预览应显示同一把 Key 的可用协议，启用后在 `bound_routes` 核对每条协议和原 UUID。没有现有绑定时，可直接使用启用操作，重建绑定预览主要核对已有线路。
 
-设置独立的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run '^TestEnableModelFirstConnect.*Postgres$' -count=1 -v`。用例覆盖概览、按名称和 UUID 的单个及批量首次启用、重复启用、保留已有绑定，以及多目标、多候选、401/403、缺价和其他供应商线路无校内倍率时的阻断。
+设置独立的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run '^TestEnableModel(FirstConnect.*|RetiredSameName.*|MultipleLiveTargets|PrioritizesAuthFailure)Postgres$' -count=1 -v`。用例覆盖一把 Gemini Key 的两个协议、确认报价、成功探活、未关联或旧目标关联、按名称和 UUID 启用、重复启用，以及多目标、多候选、跨 Key 拼协议、缺价和缺少校内倍率时的阻断。查看单个响应的 `error.details.code`、批量的 `skipped[].code` 或教师概览的 `blockers` 定位具体原因。多个活跃校内目标拆成两行时，两行的阻断码和提示均与单模型、批量一致，均为 `multi_school`。
 
-启用成功替换了一条 active 旧线路的 Key 时，先查原 Key 的 `beichen_catalog_auth` 和绑定协议探活。当前凭据版本被 401/403 拒绝属于认证失败，不能由首接候选自动修复。单个启用应返回提示显式重绑的 400，批量应返回 `route_not_ready`，模型、绑定和审计均不应变化。停用或退役 Key 才允许按唯一候选修复。运行 `go test ./internal/beichen -run '^TestEnableModel(DoesNotAutoRepairAuthFailedActiveRoute|DoesNotPublishCredentialCatalogAuthFailure|RepairsInactiveOrRetiredAuthFailedRoute|KeepsHealthyExistingRoute)Postgres$' -count=1 -v` 核对 401、403、目录认证标记、停用、退役和健康旧线路。
+测试中刚写入的 Key 目录被判为陈旧时，核对目录观测时间是否早于凭据版本或分组变更。构造当前目录的测试数据使用 PostgreSQL 时钟，避免 Windows 上应用与数据库的时钟精度差异影响时间先后。
+
+启用成功替换了一条 active 旧线路的 Key 时，先查原 Key 的 `beichen_catalog_auth` 和绑定协议探活。当前凭据版本被 401/403 拒绝属于认证失败，不能由首接候选自动修复。单个启用应返回提示显式重绑的 400，批量应返回 `route_not_ready`，模型、绑定和审计均不应变化。停用或退役 Key 可按唯一候选修复。只有一个已停用校内目标时，教师显式启用仍可修复其已有绑定。运行 `go test ./internal/beichen -run '^TestEnableModel(DoesNotAutoRepairAuthFailedActiveRoute|DoesNotPublishCredentialCatalogAuthFailure|RepairsInactiveOrRetiredAuthFailedRoute|KeepsHealthyExistingRoute)Postgres$' -count=1 -v` 核对 401、403、目录认证标记、停用、退役和健康旧线路。运行 `go test ./internal/dataplane -run '^TestBeichenTeacherEnablesDiscoveredModelForStudent$' -count=1` 核对改名和轮换 Key 后仍沿用原 UUID。
 
 教师概览的同上游型号必须按校内模型分别显示。设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test -p 1 ./internal/beichen -run TestBeichenTeacherCoveragePostgres -count=1 -v`。用例构造 8 个目录行，断言每行都有非空且唯一的 `school_model_id`；其中同一上游名绑定两个校内模型时返回两行，两个 UUID 不同，专属 `preferred_routes` 不混入另一校内模型。两行都必须得到官网和 Key 目录证据，状态均为 `key_listed` 而不是 `published_unavailable`；各自只保留 CC1 或 G3 的 `catalog_keys` 和 `credential_ids`，不再出现两行共享全部 Key 的宽范围结果。其余 6 个现行型号的计数、价格、Key 覆盖和分组继续由同一用例核对。
 

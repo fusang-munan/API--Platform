@@ -769,7 +769,7 @@ VALUES($1,'catalog',$3,NULL,0,'-infinity'),
 	if manual.PriceState != "manual" || manual.Activation != "ready" {
 		t.Errorf("仅手动价的模型应可启用: %+v", manual)
 	}
-	for name, want := range map[string]string{"unpriced": "not_configured,missing_price,sync_failed"} {
+	for name, want := range map[string]string{"unpriced": "not_configured,price_missing,sync_failed"} {
 		model := models[name]
 		var codes []string
 		for _, blocker := range model.Blockers {
