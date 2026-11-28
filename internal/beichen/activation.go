@@ -23,11 +23,12 @@ import (
 // Both preview and publication use the same snapshot and route selection.
 // Only a teacher's explicit action writes a model, bindings or governance audit.
 type activationModel struct {
-	name     string
-	provider uuid.UUID
-	keys     []uuid.UUID
-	defaults map[string][]activationCandidate
-	schools  map[uuid.UUID]*activationSchool
+	name               string
+	provider           uuid.UUID
+	keys               []uuid.UUID
+	defaults           map[string][]activationCandidate
+	schools            map[uuid.UUID]*activationSchool
+	multiSchoolTargets bool
 }
 
 type activationCandidate struct {
@@ -83,6 +84,7 @@ const (
 	ambiguousFirstRoutes    = "首次启用有多个候选上游线路，请先确认并绑定线路"
 	authFailedRebindMessage = "原线路 Key 已被上游拒绝认证，请由教师显式重绑"
 	noCandidateMessage      = "没有与唯一活跃校内目标匹配的北辰候选线路，请检查 Key 目录、分组和路线配置"
+	multiSchoolMessage      = "该上游名称对应多个活跃校内模型，请指定校内模型 ID"
 	pinnedRouteNotReady     = "原绑定线路尚未就绪，请同步该渠道或由教师明确重绑"
 )
 
@@ -399,7 +401,7 @@ func (m *activationModel) selectableSchools() []*activationSchool {
 
 func (m *activationModel) targetBlocker(selector string) CatalogBlocker {
 	if selector == "" && len(m.selectableSchools()) > 1 {
-		return CatalogBlocker{blockerMultiSchool, "该上游名称对应多个校内模型，请从活跃或待配置的模型中指定校内模型 ID"}
+		return CatalogBlocker{blockerMultiSchool, multiSchoolMessage}
 	}
 	return CatalogBlocker{blockerNoCandidate, noCandidateMessage}
 }
@@ -429,6 +431,7 @@ func (m *activationModel) catalogViews() []*activationModel {
 	for _, school := range schools {
 		view := *m
 		view.schools = map[uuid.UUID]*activationSchool{school.id: school}
+		view.multiSchoolTargets = len(schools) > 1
 		views = append(views, &view)
 	}
 	return views

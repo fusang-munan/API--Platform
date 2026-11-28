@@ -38,7 +38,7 @@ const routeBlockerCodes = new Set(['no_ready_route', 'no_candidate', 'multi_scho
 const priceBlockerCodes = new Set(['missing_price', 'price_missing', 'conditional_price'])
 const activationBlockerLabels: Record<BeichenActivationBlockerCode, string> = {
   no_candidate: '没有可用的北辰候选线路，请检查渠道目录',
-  multi_school: '对应多个校内模型，请逐行确认后启用',
+  multi_school: '该上游名称对应多个活跃校内模型，请指定校内模型 ID',
   multi_candidate: '候选线路不唯一，请确认并绑定线路',
   auth_failed: '原线路 Key 未通过认证，请显式重绑',
   price_missing: '缺少可用报价，请同步官网价或设置手动价',

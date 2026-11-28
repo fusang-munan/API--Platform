@@ -187,12 +187,14 @@ VALUES($1,$2,$3,'pending_configuration',now(),now())`, second, secondModel, firs
 	f.aliasCatalog(t, f.keys[3], secondModel)
 
 	id, err := f.service.EnableModel(f.ctx, f.provider, f.actor, firstConnectUpstream, "")
-	if id != uuid.Nil || domain.ErrorCode(err) != domain.CodeValidation || activationErrorCode(err) != blockerMultiSchool {
+	if id != uuid.Nil || domain.ErrorCode(err) != domain.CodeValidation || activationErrorCode(err) != blockerMultiSchool ||
+		err.Error() != multiSchoolMessage {
 		t.Fatalf("multiple live targets: id=%s code=%s err=%v", id, activationErrorCode(err), err)
 	}
 	result, err := f.service.EnableModelsBatch(f.ctx, f.provider, f.actor, []string{firstConnectUpstream})
 	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
-		result.Skipped[0].Reason != "route_not_ready" || result.Skipped[0].Code != blockerMultiSchool {
+		result.Skipped[0].Reason != "route_not_ready" || result.Skipped[0].Code != blockerMultiSchool ||
+		result.Skipped[0].Message != multiSchoolMessage {
 		t.Fatalf("multiple live targets batch: %+v err=%v", result, err)
 	}
 
@@ -210,10 +212,16 @@ VALUES($1,$2,$3,'pending_configuration',now(),now())`, second, secondModel, firs
 		t.Fatalf("expected two live catalog rows, got %+v", rows)
 	}
 	for _, row := range rows {
-		if row.CanEnable || !slices.ContainsFunc(row.Blockers, func(blocker CatalogBlocker) bool {
+		if row.CanEnable {
+			t.Fatalf("live target should remain blocked: %+v", row)
+		}
+		if !slices.Contains(row.Blockers, CatalogBlocker{blockerMultiSchool, multiSchoolMessage}) {
+			t.Fatalf("live target missing the shared multi_school blocker: %+v", row)
+		}
+		if slices.ContainsFunc(row.Blockers, func(blocker CatalogBlocker) bool {
 			return blocker.Code == blockerNoCandidate
 		}) {
-			t.Fatalf("live target missing no_candidate blocker: %+v", row)
+			t.Fatalf("live target replaced multi_school with no_candidate: %+v", row)
 		}
 	}
 	f.assertPending(t, shape.current)

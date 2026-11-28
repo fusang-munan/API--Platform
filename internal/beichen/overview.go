@@ -768,12 +768,18 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 	if target != nil && target.status == "not_configured" {
 		item.Blockers = append(item.Blockers, CatalogBlocker{"not_configured", "请确认此目录模型对应的校内模型和线路"})
 	}
+	if !item.CanEnable && m.multiSchoolTargets {
+		item.Blockers = append(item.Blockers, CatalogBlocker{blockerMultiSchool, multiSchoolMessage})
+	}
 	if !item.CanEnable {
 		blocker := plan.blocker
 		if blocker.Code == "" {
 			blocker = m.targetBlocker("")
 		}
-		item.Blockers = append(item.Blockers, blocker)
+		if m.multiSchoolTargets && blocker.Code == blockerNoCandidate {
+			blocker = CatalogBlocker{blockerMultiSchool, multiSchoolMessage}
+		}
+		item.Blockers = appendCatalogBlocker(item.Blockers, blocker)
 	}
 	if price.blocker != nil {
 		item.PriceBlocker = price.blocker
@@ -781,7 +787,7 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 		if price.conditional {
 			code = "conditional_price"
 		}
-		item.Blockers = append(item.Blockers, CatalogBlocker{code, price.blocker.Message})
+		item.Blockers = appendCatalogBlocker(item.Blockers, CatalogBlocker{code, price.blocker.Message})
 	}
 	for _, id := range m.keys {
 		if syncFailed[id] {
@@ -790,6 +796,15 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 		}
 	}
 	return item, nil
+}
+
+func appendCatalogBlocker(blockers []CatalogBlocker, blocker CatalogBlocker) []CatalogBlocker {
+	if blocker.Code == "" || slices.ContainsFunc(blockers, func(existing CatalogBlocker) bool {
+		return existing.Code == blocker.Code
+	}) {
+		return blockers
+	}
+	return append(blockers, blocker)
 }
 
 func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability,

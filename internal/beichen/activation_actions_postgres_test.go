@@ -175,7 +175,7 @@ VALUES($1,$2,'school','manual','teacher',$3,1000000,2000000)`, keys[i], upstream
 	service := New(db, nil)
 	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{upstream, strings.ToUpper(upstream)})
 	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
-		!strings.Contains(result.Skipped[0].Message, "对应多个校内模型") {
+		!strings.Contains(result.Skipped[0].Message, multiSchoolMessage) {
 		t.Fatalf("an upstream-only request must not choose between distinct school models: %+v %v", result, err)
 	}
 	var intact bool
@@ -247,7 +247,7 @@ VALUES($1,$2,'school','manual','teacher',$4,1000000,1000000),
 	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{shared, unresolved.String(), first.String(), second.String()})
 	if err != nil || len(result.Enabled) != 2 || len(result.Skipped) != 2 ||
 		result.Enabled[0].ModelID != first || result.Enabled[1].ModelID != second ||
-		!strings.Contains(result.Skipped[0].Message, "对应多个校内模型") ||
+		!strings.Contains(result.Skipped[0].Message, multiSchoolMessage) ||
 		!strings.Contains(result.Skipped[1].Message, "同一协议有多个候选线路") {
 		t.Fatalf("unexpected batch selection results: %+v %v", result, err)
 	}

@@ -283,8 +283,8 @@ func TestEnableModelFirstConnectGuardsPostgres(t *testing.T) {
 				t.Fatalf("scoping the view must not let this row take the shared candidate: %+v", row)
 			}
 		}
-		f.assertEnableRejected(t, "", blockerMultiSchool, "对应多个校内模型")
-		f.assertSkipped(t, "route_not_ready", blockerMultiSchool, "对应多个校内模型", firstConnectUpstream)
+		f.assertEnableRejected(t, "", blockerMultiSchool, multiSchoolMessage)
+		f.assertSkipped(t, "route_not_ready", blockerMultiSchool, multiSchoolMessage, firstConnectUpstream)
 		for _, target := range []uuid.UUID{school, otherSchool} {
 			f.assertEnableRejected(t, target.String(), blockerNoCandidate, "没有与唯一活跃校内目标匹配")
 			f.assertSkipped(t, "route_not_ready", blockerNoCandidate, "没有与唯一活跃校内目标匹配", target.String())
