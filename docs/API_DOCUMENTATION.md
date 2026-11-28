@@ -591,7 +591,7 @@ Key 证据不足时，只有标准余额计费、分组默认倍率有效且高�
 
 单个启用被阻断时，HTTP `400 VALIDATION_ERROR` 的 `error.details.code` 返回具体原因。批量启用在 `skipped[].code` 返回相同的阻断码，教师概览的 `model_catalog[].blockers[].code` 使用同一组阻断码和提示。`no_candidate` 表示没有符合当前目标的线路，`multi_school` 表示按上游名称无法唯一选中当前校内目标，`multi_candidate` 表示候选线路不唯一，`auth_failed` 表示原绑定认证失败，`price_missing` 表示缺少可用报价或校内倍率。上游名称有多个活跃或待配置目标时，拆分的各阻断行返回 `multi_school`，提示“该上游名称对应多个活跃校内模型，请指定校内模型 ID”。
 
-`no_candidate` 的只读诊断计数同时出现在单个响应的 `error.details` 和批量项的 `skipped[].details`。`rows` 是读取到的候选目录行数，`available` 是通过 Key、供应商和目录新鲜度基础检查的行数，`catalog_current` 是通过完整目录、分组和密钥可读检查的行数，`alias_missing` 是别名存在但目标模型不存在的行数，`target_missing` 是别名与上游名都找不到目标的行数，`key_listed` 是通过当前 Key 目录检查的行数，`group_allowed` 是通过分组权限检查的行数。`candidate_rows` 是生成的目标候选数，`matching_school` 是直接命中当前唯一目标的候选数，`fallback_school` 是通过唯一目标回退命中的候选数，`schools` 是当前可选校内目标数。计数只包含整数，不返回凭据、Key 或上游响应内容。
+`no_candidate` 的只读诊断同时出现在单个响应的 `error.details` 和批量项的 `skipped[].details`。`rows` 是读取到的候选目录行数，`available` 是通过 Key、供应商和目录新鲜度基础检查的行数，`catalog_current` 是通过完整目录、分组和密钥可读检查的行数，`alias_missing` 是别名存在但目标模型不存在的行数，`target_missing` 是别名与上游名都找不到目标的行数，`key_listed` 是通过当前 Key 目录检查的行数，`group_allowed` 是通过分组权限检查的行数。`candidate_rows` 是生成的目标候选数，`matching_school` 是直接命中当前唯一目标的候选数，`fallback_school` 是通过唯一目标回退命中的候选数，`schools` 是当前可选校内目标数。计划状态包含布尔值 `north_ready`、`ambiguous`、`catalog_blocked`、`foreign_active`、`multiplier_set`，以及整数 `writes`、`routes`。诊断只包含这些布尔和整数，不返回凭据、Key 或上游响应内容。
 
 ```json
 {
@@ -600,7 +600,7 @@ Key 证据不足时，只有标准余额计费、分组默认倍率有效且高�
 }
 ```
 
-`no_candidate` 批量项示例中的 `details` 使用 `{"rows":1,"available":1,"catalog_current":0,"alias_missing":1,"target_missing":0,"key_listed":1,"group_allowed":0,"candidate_rows":0,"matching_school":0,"fallback_school":0,"schools":1}`；其他阻断码不附加计数。
+`no_candidate` 批量项示例中的 `details` 使用 `{"rows":1,"available":1,"catalog_current":0,"alias_missing":1,"target_missing":0,"key_listed":1,"group_allowed":0,"candidate_rows":0,"matching_school":0,"fallback_school":0,"schools":1,"north_ready":false,"ambiguous":false,"catalog_blocked":false,"foreign_active":false,"multiplier_set":false,"writes":0,"routes":0}`；其他阻断码不附加诊断。
 
 `reason` 包括 `not_found`、`already_active`、`duplicate_school_model`、`route_not_ready`、`no_price` 和 `enable_failed`。各模型独立提交，已健康启用的模型再次提交时返回 `already_active`。可计算的纯 Token 条件价可用于启用，空或省略的 `billing_mode` 默认按 Token 处理。单个启用的错误提示和批量结果的 `message` 使用与概览相同的报价说明。
 

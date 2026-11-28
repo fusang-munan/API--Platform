@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 )
 
@@ -192,6 +193,7 @@ func TestActivationNoCandidateDiagnosticsPostgres(t *testing.T) {
 			diagnosticCandidateRows: 0, diagnosticMatchingSchool: 0, diagnosticFallbackSchool: 0, diagnosticSchools: 1,
 		}
 		assertActivationDiagnostics(t, activationErrorDetails(err), want)
+		assertActivationPlanDiagnostics(t, activationErrorDetails(err), false, 0, 0)
 
 		result, err := f.service.EnableModelsBatch(f.ctx, f.provider, f.actor, []string{school.String()})
 		if err != nil || len(result.Skipped) != 1 || result.Skipped[0].Code != blockerNoCandidate {
@@ -200,6 +202,7 @@ func TestActivationNoCandidateDiagnosticsPostgres(t *testing.T) {
 		if !mapsEqual(result.Skipped[0].Details, want) {
 			t.Fatalf("batch diagnostics = %+v, want %+v", result.Skipped[0].Details, want)
 		}
+		assertActivationPlanDiagnostics(t, result.Skipped[0].Details, false, 0, 0)
 		f.assertPending(t, school)
 	})
 
@@ -244,6 +247,7 @@ func TestActivationNoCandidateDiagnosticsPostgres(t *testing.T) {
 			diagnosticCandidateRows: 2, diagnosticMatchingSchool: 0, diagnosticFallbackSchool: 0, diagnosticSchools: 0,
 		}
 		assertActivationDiagnostics(t, activationErrorDetails(err), want)
+		assertActivationPlanDiagnostics(t, activationErrorDetails(err), false, 0, 0)
 	})
 }
 
@@ -297,6 +301,55 @@ func TestActivationFallbackDiagnosticsExcludeDirectMatches(t *testing.T) {
 	}
 }
 
+func TestEnableModelAliasAndUpstreamSameKeyUsesCanonicalNamePostgres(t *testing.T) {
+	f := newFirstConnectFixture(t)
+	school := f.addSchoolModel(t, firstConnectUpstream, "pending_configuration")
+	const aliasUpstream = "gemini-4-argon-alias"
+	saveCatalogFixture(t, f.ctx, f.db, f.provider, f.keys[0], []catalog.ProviderEntry{
+		{ID: firstConnectUpstream, SupportedProtocols: firstConnectAdapters},
+		{ID: aliasUpstream, SupportedProtocols: firstConnectAdapters},
+	}, nil)
+	schoolName := firstConnectUpstream
+	if err := f.service.PutModelAlias(f.ctx, f.provider, f.actor, &f.keys[0], aliasUpstream, &schoolName); err != nil {
+		t.Fatal(err)
+	}
+	f.configureProductionBothCatalog(t)
+
+	result, err := f.service.EnableModelsBatch(f.ctx, f.provider, f.actor, []string{school.String()})
+	if err != nil || len(result.Enabled) != 1 || len(result.Skipped) != 0 || result.Enabled[0].ModelID != school {
+		t.Fatalf("same-key alias/upstream candidates should enable: %+v err=%v", result, err)
+	}
+	f.assertPublished(t, school, f.keys[0], firstConnectAdapters)
+}
+
+func TestSelectActivationRouteCanonicalAndAmbiguity(t *testing.T) {
+	provider := uuid.New()
+	keyA, keyB := uuid.New(), uuid.New()
+	route := func(key uuid.UUID, upstream string, priority int) PreferredRoute {
+		return PreferredRoute{UpstreamModel: upstream, ProviderID: provider, CredentialID: &key, Priority: priority, Adapter: "openai_responses"}
+	}
+	t.Run("target name wins and duplicates collapse", func(t *testing.T) {
+		selected, blocker := selectActivationRoute([]PreferredRoute{
+			route(keyA, "alias-upstream", 1), route(keyA, "school-target", 10), route(keyA, "school-target", 10),
+		}, "school-target", "")
+		if blocker.Code != "" || selected.UpstreamModel != "school-target" {
+			t.Fatalf("canonical candidate was not selected: selected=%+v blocker=%+v", selected, blocker)
+		}
+	})
+	t.Run("different key remains ambiguous", func(t *testing.T) {
+		_, blocker := selectActivationRoute([]PreferredRoute{route(keyA, "alias-a", 10), route(keyB, "alias-b", 10)}, "school-target", "")
+		if blocker.Code != blockerMultiCandidate {
+			t.Fatalf("different keys should stay ambiguous: %+v", blocker)
+		}
+	})
+	t.Run("same-key different upstream uses priority", func(t *testing.T) {
+		selected, blocker := selectActivationRoute([]PreferredRoute{route(keyA, "alias-a", 20), route(keyA, "alias-b", 10)}, "school-target", "")
+		if blocker.Code != "" || selected.UpstreamModel != "alias-b" {
+			t.Fatalf("priority did not disambiguate: selected=%+v blocker=%+v", selected, blocker)
+		}
+	})
+}
+
 func assertActivationDiagnostics(t *testing.T, details map[string]any, want map[string]int) {
 	t.Helper()
 	for key, expected := range want {
@@ -307,12 +360,23 @@ func assertActivationDiagnostics(t *testing.T, details map[string]any, want map[
 	}
 }
 
-func mapsEqual(left, right map[string]int) bool {
-	if len(left) != len(right) {
-		return false
+func assertActivationPlanDiagnostics(t *testing.T, details map[string]any, multiplierSet bool, writes, routes int) {
+	t.Helper()
+	want := map[string]any{
+		"north_ready": false, "ambiguous": false, "catalog_blocked": false, "foreign_active": false,
+		"multiplier_set": multiplierSet, "writes": writes, "routes": routes,
 	}
+	for key, value := range want {
+		if details[key] != value {
+			t.Fatalf("plan diagnostic %s = %#v, want %#v; all=%+v", key, details[key], value, details)
+		}
+	}
+}
+
+func mapsEqual(left map[string]any, right map[string]int) bool {
 	for key, value := range right {
-		if left[key] != value {
+		got, ok := left[key].(int)
+		if !ok || got != value {
 			return false
 		}
 	}

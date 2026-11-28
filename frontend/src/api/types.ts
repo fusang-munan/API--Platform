@@ -148,6 +148,13 @@ export type ApiErrorDetails = {
   matching_school?: number
   fallback_school?: number
   schools?: number
+  north_ready?: boolean
+  ambiguous?: boolean
+  catalog_blocked?: boolean
+  foreign_active?: boolean
+  multiplier_set?: boolean
+  writes?: number
+  routes?: number
 } | Array<{ field: string; reason: string }>
 export type ApiError = { error?: { code?: string; message?: string; details?: ApiErrorDetails }; request_id?: string }
 
@@ -682,6 +689,13 @@ export type BeichenActivationDiagnostics = {
   matching_school: number
   fallback_school: number
   schools: number
+  north_ready: boolean
+  ambiguous: boolean
+  catalog_blocked: boolean
+  foreign_active: boolean
+  multiplier_set: boolean
+  writes: number
+  routes: number
 }
 export type BeichenBatchEnableResult = {
   enabled: Array<{ model: string; model_id: string }>
