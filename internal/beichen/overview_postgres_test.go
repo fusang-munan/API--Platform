@@ -3,6 +3,7 @@ package beichen
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -24,12 +25,13 @@ func TestOverviewStudentPriceDiagnosticsPostgres(t *testing.T) {
 	ctx, db, provider, actor, keys := newActionsPostgres(t)
 	primary, backup, pending := keys[1], keys[2], keys[3]
 	const fixed, higher, manual, unverified, noRoute = "fixture-fixed", "fixture-higher", "fixture-manual", "fixture-unverified", "fixture-no-route"
+	const missing, candidateMissing = "gemini-3.5-flash-lite", "fixture-candidate-missing"
 	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
 	for _, item := range []struct {
 		key   uuid.UUID
 		names []string
 	}{
-		{primary, []string{fixed, manual, noRoute}}, {backup, []string{fixed, higher}}, {pending, []string{unverified}},
+		{primary, []string{fixed, manual, noRoute, missing, candidateMissing}}, {backup, []string{fixed, higher, missing}}, {pending, []string{unverified}},
 	} {
 		entries := make([]catalog.ProviderEntry, 0, len(item.names))
 		for _, name := range item.names {
@@ -38,18 +40,25 @@ func TestOverviewStudentPriceDiagnosticsPostgres(t *testing.T) {
 		saveCatalogFixture(t, ctx, db, provider, item.key, entries, nil)
 	}
 	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
-SELECT gen_random_uuid(),n,n,'active',1000,now(),now() FROM unnest($1::text[]) n`, []string{fixed, higher, manual, unverified})
+SELECT gen_random_uuid(),n,n,'active',1000,now(),now() FROM unnest($1::text[]) n`, []string{fixed, higher, manual, unverified, missing})
 	for _, route := range []struct {
 		key      uuid.UUID
 		name     string
 		priority int
 		adapter  string
 	}{{primary, fixed, 1, "openai_compatible"}, {backup, fixed, 2, "openai_responses"}, {backup, higher, 1, "openai_compatible"},
-		{primary, manual, 1, "openai_compatible"}, {pending, unverified, 1, "openai_compatible"}} {
+		{primary, manual, 1, "openai_compatible"}, {pending, unverified, 1, "openai_compatible"},
+		{primary, missing, 1, "openai_compatible"}, {backup, missing, 2, "openai_responses"},
+		{primary, candidateMissing, 1, "openai_compatible"}} {
 		exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,status,priority,created_at,updated_at)
 SELECT gen_random_uuid(),id,$1,$2,model_id,$5,'active',$4,now(),now() FROM models WHERE model_id=$3`,
 			provider, route.key, route.name, route.priority, route.adapter)
 	}
+	exec(`UPDATE models SET status='pending_configuration' WHERE model_id=$1`, candidateMissing)
+	exec(`INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,duration_ms,checked_at)
+SELECT $1,k,n,p,200,1,clock_timestamp()
+FROM (VALUES ($2::uuid,$4::text,'openai_compatible'),($3::uuid,$4::text,'openai_responses'),
+ ($2::uuid,$5::text,'openai_compatible')) fixture(k,n,p)`, provider, primary, backup, missing, manual)
 	exec(`INSERT INTO beichen_provision_channels(credential_id,channel,key_fingerprint,discover_ids)
 SELECT id,n,sha256(credential_ciphertext || convert_to(n,'UTF8')),false
 FROM (VALUES ($1::uuid,'GM1'),($2::uuid,'G3')) k(id,n)
@@ -69,15 +78,18 @@ SELECT credential_id,$2,'upstream','base','panel',1000000,1000000,0,0,effective_
 		backup, fixed)
 	service := New(db, nil)
 	base := int64(50_000_000)
-	if err := service.SetPrice(ctx, provider, primary, actor, manual, PriceInput{Mode: "manual", Rates: &Rates{Input: &base, Output: &base}}); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{manual, noRoute} {
+		if err := service.SetPrice(ctx, provider, primary, actor, name, PriceInput{Mode: "manual", Rates: &Rates{Input: &base, Output: &base}}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	view, err := service.Overview(ctx, provider, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	expected := map[string]string{fixed: studentPriceNormal, higher: studentPriceHigher, manual: studentPriceManual,
-		unverified: studentPriceRatePending, noRoute: studentPriceNoRoute}
+		unverified: studentPriceRatePending, noRoute: studentPriceNoRoute, missing: studentPriceNoBase,
+		candidateMissing: studentPriceNoRoute}
 	for _, row := range view.ModelCatalog {
 		if want, ok := expected[row.Model]; ok {
 			if row.StudentPrice.Status != want || row.StudentPrice.Reason == "" {
@@ -93,6 +105,32 @@ SELECT credential_id,$2,'upstream','base','panel',1000000,1000000,0,0,effective_
 			if statuses[primary] != studentPriceNoBase || statuses[backup] != studentPriceNormal {
 				t.Errorf("expected primary missing price and priced backup, got %+v", row.BoundRoutes)
 			}
+			if !row.PriceCovered || row.ModelAvailability.Availability == catalog.AvailabilityUnavailable {
+				t.Errorf("the priced backup must cover the model: %+v", row)
+			}
+		}
+		switch row.Model {
+		case missing:
+			if !row.Published || !row.Active || row.ReadyCount != 2 || row.PriceCovered || row.PriceState != "missing" ||
+				row.ModelAvailability.Availability != catalog.AvailabilityUnavailable || row.ModelAvailability.ProbeState != "passed" ||
+				row.PriceBlocker == nil || row.PriceBlocker.Code != "missing_price" {
+				t.Errorf("unpriced model must stay published and show unavailable: %+v", row)
+			}
+		case manual:
+			if !row.Published || !row.Active || !row.PriceCovered || row.PriceState != "manual" ||
+				row.ModelAvailability.Availability != catalog.AvailabilityAvailable {
+				t.Errorf("manual price must cover the ready route: %+v", row)
+			}
+		case noRoute:
+			if row.Published || row.Active || !row.PriceCovered || !strings.Contains(row.StudentPrice.Reason, "尚未发布") {
+				t.Errorf("priced candidate must explain why it has no student route: %+v", row)
+			}
+		case candidateMissing:
+			if row.Published || row.Active || row.PriceCovered || row.PriceState != "missing" ||
+				row.PriceBlocker == nil || row.ModelAvailability.Availability != "not_published" ||
+				row.StudentPrice.Status != studentPriceNoRoute {
+				t.Errorf("an unpublished model without a price must stay not_published: %+v", row)
+			}
 		}
 	}
 	if len(expected) != 0 {
@@ -104,7 +142,7 @@ SELECT credential_id,$2,'upstream','base','panel',1000000,1000000,0,0,effective_
 				*row.SchoolRates.Input != "50000000" || row.SchoolRates.CacheRead == nil || *row.SchoolRates.CacheRead != "0") {
 			t.Errorf("expected 50 base credits and exact zero cache price: %+v", row)
 		}
-		if row.Model == higher && (row.QuoteEffectiveMultiplier == nil || *row.QuoteEffectiveMultiplier != "0.5") {
+		if row.Model == higher && (!row.QuoteUsable || row.QuoteEffectiveMultiplier == nil || *row.QuoteEffectiveMultiplier != "0.5") {
 			t.Errorf("conditional quote has no effective rate: %+v", row)
 		}
 	}
@@ -116,6 +154,121 @@ SELECT credential_id,$2,'upstream','base','panel',1000000,1000000,0,0,effective_
 		if err != nil || got != "0.55" {
 			t.Errorf("%s should cost 0.55 yuan (55 credits) per 1M output, got %q: %v", name, got, err)
 		}
+	}
+	capabilities, err := catalog.ReadBeichenCapabilities(ctx, db, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, route := range capabilities.Capabilities {
+		if route.Model == missing && (!route.Published || route.Availability != catalog.AvailabilityUnavailable ||
+			route.PriceCovered || route.BindingState != "ready" || route.RecommendedProtocol != nil) {
+			t.Errorf("capability must preserve the unpriced publication and ready binding: %+v", route)
+		}
+		if route.Model == candidateMissing && (route.Published || route.PriceCovered ||
+			route.Availability != "not_published") {
+			t.Errorf("unpublished missing-price capability must stay not_published: %+v", route)
+		}
+	}
+}
+
+func TestOverviewClaudeQuoteRenewalPostgres(t *testing.T) {
+	f := newAccountRateJobFixture(t)
+	key, provider, model := f.job.credential, f.job.provider, accountRateFixtureModel
+	f.rates = `{"16":0.5}`
+	f.quote = websiteGroupFixture(16, "0.6", `{"name":"claude-sonnet-5-5","pricing":{
+ "billing_mode":"token","input_price":0.000001,"output_price":0.000002,"cache_read_price":0,
+ "cache_write_price":0.000003,"cache_write_1h_price":0.000004}}`)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		execCatalogTestSQL(t, f.ctx, f.db, query, args...)
+	}
+	refresh := func() {
+		t.Helper()
+		f.at = time.Now().UTC().Truncate(time.Microsecond)
+		f.syncBilling()
+	}
+	refresh()
+	exec(`WITH school AS (
+ INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+ VALUES(gen_random_uuid(),$3::text,$3::text,'active',1000,now(),now()) RETURNING id
+)
+INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,status,priority,created_at,updated_at)
+SELECT gen_random_uuid(),id,$1,$2,$3,'anthropic','active',1,now(),now() FROM school`, provider, key, model)
+	exec(`UPDATE beichen_multiplier_versions SET effective_at=effective_at-interval '22 minutes' WHERE credential_id=$1`, key)
+	ageQuote := func(minutes int) {
+		t.Helper()
+		exec(`UPDATE beichen_panel_snapshots s
+SET effective_at=effective_at-$2::int*interval '1 minute', expires_at=expires_at-$2::int*interval '1 minute'
+WHERE credential_id=$1 AND effective_at=(SELECT max(effective_at) FROM beichen_panel_snapshots WHERE credential_id=s.credential_id)`, key, minutes)
+		exec(`UPDATE beichen_datasets SET last_success=last_success-$2::int*interval '1 minute'
+WHERE credential_id=$1 AND kind IN ('prices','billing')`, key, minutes)
+	}
+	read := func(wantBlocker string) Dataset {
+		t.Helper()
+		view, err := f.service.Overview(f.ctx, provider, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		i := slices.IndexFunc(view.ModelCatalog, func(row CatalogModel) bool { return row.Model == model })
+		j := slices.IndexFunc(view.Models, func(row Model) bool { return row.Model == model && row.CredentialID == key })
+		if i < 0 || j < 0 {
+			t.Fatal("missing Claude catalog or quote for the bound Key")
+		}
+		row, quote := view.ModelCatalog[i], view.Models[j]
+		if !row.Published || !row.Active || len(row.BoundRoutes) != 1 || !row.BoundRoutes[0].BindingReady || !quote.RouteReady {
+			t.Fatalf("quote expiry changed the published binding: %+v", row)
+		}
+		if wantBlocker == "" {
+			if row.PriceState != "conditional" || !row.PriceCovered || row.StudentPrice.Status != studentPriceNormal ||
+				!quote.QuoteUsable || quote.StudentPrice.Status != studentPriceNormal || quote.SchoolRates != nil ||
+				quote.QuoteEffectiveMultiplier == nil || *quote.QuoteEffectiveMultiplier != "0.5" ||
+				quote.PriceConditionsExact["input_price"] != "0.000001" || quote.PriceConditionsExact["cache_write_1h_price"] != "0.000004" {
+				t.Fatalf("Claude must have the same Key's calculable conditional quote: %+v, %+v", row, quote)
+			}
+		} else if row.PriceBlocker == nil || row.PriceBlocker.Code != wantBlocker ||
+			row.ModelAvailability.Availability != catalog.AvailabilityUnavailable || row.PriceCovered || quote.QuoteUsable ||
+			row.StudentPrice.Status != studentPriceNoBase || quote.QuoteEffectiveMultiplier != nil || quote.SchoolRates != nil {
+			t.Fatalf("Claude should be unavailable with %s: %+v, %+v", wantBlocker, row, quote)
+		}
+		return datasetForCredential(t, view, key, "prices")
+	}
+	ageQuote(22)
+	read("price_snapshot_expired")
+
+	refresh()
+	var scheduledBeforeExpiry, bounded bool
+	err := f.db.QueryRowContext(f.ctx, `
+SELECT d.next_attempt < s.expires_at, s.expires_at=m.observed_at+interval '20 minutes'
+FROM beichen_panel_snapshots s JOIN beichen_multiplier_versions m ON m.id=s.multiplier_version
+JOIN beichen_datasets d ON d.credential_id=s.credential_id AND d.kind='billing'
+WHERE s.credential_id=$1 ORDER BY s.effective_at DESC LIMIT 1`, key).Scan(&scheduledBeforeExpiry, &bounded)
+	if err != nil || !scheduledBeforeExpiry || !bounded {
+		t.Fatalf("successful renewal must be bounded and schedule a refresh before expiry: %v", err)
+	}
+	prices := read("")
+	if prices.LastSuccess == nil || prices.LastError != nil || prices.RefreshError != nil {
+		t.Fatalf("the successful renewal must clear errors: %+v", prices)
+	}
+	ageQuote(17)
+	const refreshError = "fixture price refresh failed"
+	exec(`UPDATE beichen_datasets SET last_error=$2 WHERE credential_id=$1 AND kind='prices'`, key, refreshError)
+	prices = read("")
+	if prices.LastSuccess == nil || prices.LastError != nil || prices.RefreshError == nil || *prices.RefreshError != refreshError {
+		t.Fatalf("a failed attempt must remain visible without blocking the usable quote: %+v", prices)
+	}
+	ageQuote(4)
+	prices = read("price_snapshot_expired")
+	if prices.LastError == nil || *prices.LastError != refreshError || prices.RefreshError != nil {
+		t.Fatalf("an expired quote must no longer suppress its sync error: %+v", prices)
+	}
+
+	refresh()
+	f.quote = websiteGroupFixture(16, "0.6", `{"name":"claude-sonnet-5-5","pricing":null}`)
+	if _, err := f.service.runJob(f.ctx, f.job, true); !errors.Is(err, errPanelEmpty) {
+		t.Fatalf("a verified missing price must stop the prior quote: %v", err)
+	}
+	if prices = read("missing_price"); !prices.OfficialPriceMissing || prices.LastError == nil {
+		t.Fatalf("missing official quote must keep its diagnostic: %+v", prices)
 	}
 }
 
@@ -305,20 +458,30 @@ FROM provider_credentials c JOIN beichen_multiplier_versions mv ON mv.credential
 	for _, name := range append(slices.Clone(gpt), deepseek...) {
 		row := read(name)
 		owner, groupID, routes := g3, int64(10), 2
+		wantAvailability, wantPriceCovered := catalog.AvailabilityUnavailable, false
 		if slices.Contains(deepseek, name) {
 			owner, groupID, routes = gm1, 6, 1
+			if name == deepseek[0] {
+				wantAvailability, wantPriceCovered = catalog.AvailabilityAvailable, true
+			}
 		}
 		if row.BoundKeyCount != 1 || row.CoveredBoundKeyCount != 1 || row.ReadyCount != routes || len(row.BoundRoutes) != routes ||
-			row.ModelAvailability.Availability != "available" || row.BindingIssue != nil ||
+			row.ModelAvailability.ProbeState != "passed" || row.ModelAvailability.Availability != wantAvailability ||
+			row.PriceCovered != wantPriceCovered || row.BindingIssue != nil ||
 			*row.BoundRoutes[0].CredentialID != owner || *row.BoundRoutes[0].GroupID != groupID {
 			t.Fatalf("绑定证据不应混入其他 Key: %+v", row)
 		}
+	}
+	if row := read(deepseek[0]); row.ModelAvailability.Availability != catalog.AvailabilityAvailable ||
+		row.ModelAvailability.ProbeState != "passed" || !row.PriceCovered {
+		t.Fatalf("deepseek-v4-pro must stay available with its conditional price: %+v", row)
 	}
 	if row, cap := read(deepseek[0]), capability(deepseek[0], gm1); !row.PriceCovered || !cap.PriceCovered ||
 		row.PriceState != "conditional" || cap.PriceState != row.PriceState {
 		t.Fatalf("可计算的条件价应同时计入两个入口: %+v %+v", row, cap)
 	}
-	if row := read(deepseek[1]); row.PriceCovered || row.PriceState != "missing" {
+	if row := read(deepseek[1]); row.PriceCovered || row.PriceState != "missing" ||
+		!row.Published || row.ModelAvailability.Availability != catalog.AvailabilityUnavailable {
 		t.Fatalf("缺价应保留: %+v", row)
 	}
 
@@ -413,17 +576,19 @@ VALUES(gen_random_uuid(),$1,$2,$3,$4,clock_timestamp())`, provider, gm1, deepsee
 	}
 	scan(gm1, deepseek, chat)
 	if row := read(deepseek[0]); row.CoveredBoundKeyCount != 1 || row.ReadyCount != 1 || row.LastProbeAt != nil || row.PriceCovered ||
-		row.ModelAvailability.Availability != "unverified" {
+		row.ModelAvailability.Availability != catalog.AvailabilityUnavailable {
 		t.Fatalf("新目录不应恢复旧探活或报价: %+v", row)
 	}
 	probe(gm1, deepseek[0], chat)
-	if row := read(deepseek[0]); row.LastProbeAt != nil || row.ModelAvailability.Availability != "unverified" {
+	if row := read(deepseek[0]); row.LastProbeAt != nil || row.ModelAvailability.ProbeState != "unprobed" ||
+		row.ModelAvailability.Availability != catalog.AvailabilityUnavailable {
 		t.Fatalf("换组前发起的探活即使随后保存通过，也应等待当前组复核: %+v", row)
 	}
 	probeAttempt()
 	probe(gm1, deepseek[0], chat)
-	if row := read(deepseek[0]); row.ModelAvailability.Availability != "available" || row.PriceCovered {
-		t.Fatalf("同组新探活只恢复可用性: %+v", row)
+	if row := read(deepseek[0]); row.ModelAvailability.Availability != catalog.AvailabilityUnavailable ||
+		row.ModelAvailability.ProbeState != "passed" || row.PriceCovered {
+		t.Fatalf("同组新探活只恢复探活状态，仍需补价: %+v", row)
 	}
 	exec("UPDATE beichen_datasets SET last_success=now()-interval '31 minutes' WHERE credential_id=$1 AND kind='catalog'", gm1)
 	if row, cap := read(deepseek[0]), capability(deepseek[0], gm1); !row.BoundCatalogPending || row.CoveredBoundKeyCount != 0 ||

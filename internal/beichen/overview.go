@@ -21,6 +21,7 @@ type Dataset struct {
 	Kind                    string       `json:"kind"`
 	LastSuccess             *time.Time   `json:"last_success"`
 	LastError               *string      `json:"last_error"`
+	RefreshError            *string      `json:"refresh_error,omitempty"`
 	EffectiveMultiplier     *json.Number `json:"effective_multiplier"`
 	EffectiveMultiplierText string       `json:"effective_multiplier_text,omitempty"`
 	AccountRate             *json.Number `json:"account_rate_multiplier,omitempty"`
@@ -62,6 +63,8 @@ type Model struct {
 	QuoteEffectiveMultiplier              *string      `json:"quote_effective_multiplier"`
 	StudentPrice                          StudentPrice `json:"student_price"`
 	PriceCovered                          bool         `json:"price_covered"`
+	// QuoteUsable describes an official quote with its own verified rate.
+	QuoteUsable bool `json:"quote_usable"`
 
 	available          bool
 	currentKey         bool // the saved row belongs to this revision of the credential
@@ -71,6 +74,7 @@ type Model struct {
 	lastProbeAt        *time.Time
 	credentialRejected bool
 	priceReadiness     activationPrice
+	schoolMultiplier   string
 }
 
 // The effective multiplier can yield fractions of a micro-unit. Decimal
@@ -153,6 +157,8 @@ type CredentialSummary struct {
 
 type CatalogModel struct {
 	CanEnable            bool                      `json:"can_enable"`
+	Published            bool                      `json:"published"`
+	Active               bool                      `json:"active"` // At least one published binding has current Key evidence.
 	Retired              bool                      `json:"retired,omitempty"`
 	SchoolStatus         string                    `json:"school_status"`
 	SchoolModel          string                    `json:"school_model,omitempty"`
@@ -278,10 +284,15 @@ func (s *Service) Overview(ctx context.Context, providerID uuid.UUID, day string
 	if err == nil {
 		err = readCatalogDifferences(ctx, tx, providerID, &view)
 		for i := range view.ModelCatalog {
-			if item := &view.ModelCatalog[i]; item.StudentPrice.Status == "" || item.Retired {
+			item := &view.ModelCatalog[i]
+			switch {
+			case item.Retired:
 				item.StudentPrice = noStudentPriceRoute("")
+			case item.StudentPrice.Status == "":
+				item.StudentPrice = unpublishedStudentPrice()
 			}
 		}
+		view.projectPriceRefreshErrors()
 	}
 	if err == nil {
 		view.ProbeRun, err = readProbeRun(ctx, tx, providerID)
@@ -525,6 +536,7 @@ ORDER BY k.credential_id, k.model_id`, providerID)
 			stringifyPriceNumbers(model.PriceConditionsExact)
 		}
 		model.priceReadiness = routePriceReadiness(fixedPrice, terms)
+		usableConditions := model.priceReadiness.ready() && model.priceReadiness.conditional && model.PriceSource != derivedPriceSource
 		if upstream.Input != nil && upstream.Output != nil {
 			model.PriceStatus = "confirmed"
 			if model.PriceSource == derivedPriceSource {
@@ -534,7 +546,7 @@ ORDER BY k.credential_id, k.model_id`, providerID)
 		} else if model.priceReadiness.conditional || fixedPrice && conditionalPanelPricing(terms) {
 			model.PriceStatus = "conditional"
 		}
-		if school.Input != nil || school.Output != nil {
+		if !usableConditions && (school.Input != nil || school.Output != nil) {
 			model.SchoolRates = &school
 			model.SchoolRatesIncludeEffectiveMultiplier = true
 		}
@@ -655,11 +667,15 @@ func readPreferredRoutes(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, 
 		row := &view.Models[i]
 		name := strings.ToLower(row.Model)
 		row.RouteReady, row.PriceCovered = false, false
-		row.StudentPrice = noStudentPriceRoute("")
+		row.StudentPrice = unpublishedStudentPrice()
+		row.schoolMultiplier = view.SchoolMultipliers[row.CredentialID]
 		for _, route := range capabilities[name] {
 			if route.CredentialID != nil && *route.CredentialID == row.CredentialID {
 				row.RouteReady, row.PriceCovered = route.BindingState == "ready", route.PriceCovered
-				row.StudentPrice = studentPriceForRoute(row, route, row.RouteReady)
+				row.QuoteUsable = route.PriceCovered && row.QuoteEffectiveMultiplier != nil &&
+					(route.PriceState == "conditional" && row.priceReadiness.conditional && row.priceReadiness.ready() ||
+						route.PriceState == "confirmed" && row.PriceSource == "panel")
+				row.StudentPrice = studentPriceForRoute(row, route, route.Published, row.RouteReady)
 				break
 			}
 		}
@@ -688,6 +704,23 @@ func readPreferredRoutes(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, 
 	}
 	markRetiredCatalogModels(view, snapshot.RetiredModels)
 	return nil
+}
+
+// The console uses the prices dataset error to gate price calculations.
+// Report renewal failures separately while a published route has a usable quote.
+func (view *Overview) projectPriceRefreshErrors() {
+	usableQuotes := make(map[uuid.UUID]bool)
+	for _, model := range view.Models {
+		if model.RouteReady && model.QuoteUsable {
+			usableQuotes[model.CredentialID] = true
+		}
+	}
+	for i := range view.Datasets {
+		dataset := &view.Datasets[i]
+		if dataset.Kind == "prices" && dataset.LastError != nil && usableQuotes[dataset.CredentialID] {
+			dataset.RefreshError, dataset.LastError = dataset.LastError, nil
+		}
+	}
 }
 
 // Each configured school model is a separate catalog identity. The activation
@@ -721,11 +754,10 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 	item.Blockers = []CatalogBlocker{}
 	item.Protocols = []string{}
 	item.BoundRoutes = []CatalogBoundRoute{}
-	hasPublishedSchool := false
 	for _, school := range m.schools {
-		hasPublishedSchool = hasPublishedSchool || school.status == "active"
+		item.Published = item.Published || school.status == "active"
 	}
-	priceStates := item.applyRouteEvidence(capabilities, records, hasPublishedSchool)
+	priceStates := item.applyRouteEvidence(capabilities, records)
 	switch {
 	case len(priceStates) > 1:
 		item.PriceState = "mixed"
@@ -790,12 +822,14 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 		item.Blockers = appendCatalogBlocker(item.Blockers, blocker)
 	}
 	if price.blocker != nil {
-		item.PriceBlocker = price.blocker
+		if item.PriceBlocker == nil || item.PriceBlocker.Code != "price_snapshot_expired" || price.blocker.Code != "missing_price" {
+			item.PriceBlocker = price.blocker
+		}
 		code := blockerPriceMissing
 		if price.conditional {
 			code = "conditional_price"
 		}
-		item.Blockers = appendCatalogBlocker(item.Blockers, CatalogBlocker{code, price.blocker.Message})
+		item.Blockers = appendCatalogBlocker(item.Blockers, CatalogBlocker{code, item.PriceBlocker.Message})
 	}
 	for _, id := range m.keys {
 		if syncFailed[id] {
@@ -816,7 +850,7 @@ func appendCatalogBlocker(blockers []CatalogBlocker, blocker CatalogBlocker) []C
 }
 
 func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability,
-	records map[string]map[uuid.UUID]*Model, publishedSchool bool) map[string]bool {
+	records map[string]map[uuid.UUID]*Model) map[string]bool {
 	type routeKey struct {
 		credential uuid.UUID
 		protocol   string
@@ -836,13 +870,13 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability,
 				candidateProtocols = append(candidateProtocols, option)
 			}
 		}
-		priceBasis := !publishedSchool && len(row.Bindings) > 0 && current
+		priceBasis := !item.Published && len(row.Bindings) > 0 && current
 		for _, b := range row.Bindings {
 			var record *Model
 			if row.CredentialID != nil {
 				record = records[strings.ToLower(row.Model)][*row.CredentialID]
 			}
-			studentPrice := studentPriceForRoute(record, row, b.BindingReady)
+			studentPrice := studentPriceForRoute(record, row, b.Published, b.BindingReady)
 			item.BoundRoutes = append(item.BoundRoutes, CatalogBoundRoute{
 				BeichenBinding: b, UpstreamModel: row.Model, CredentialID: row.CredentialID, CredentialLabel: row.CredentialLabel,
 				GroupID: row.GroupID, GroupStatus: row.GroupStatus, GroupCheckedAt: row.GroupCheckedAt, KeyEnabled: row.KeyEnabled,
@@ -876,8 +910,9 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability,
 	}
 	item.BoundKeyCount, item.CoveredBoundKeyCount = len(bound), len(covered)
 	item.RouteCount, item.ReadyCount = len(candidates), len(ready)
+	item.Active = item.Published && item.ReadyCount > 0
 
-	if publishedSchool {
+	if item.Published {
 		item.ModelAvailability = catalog.SummarizeModelAvailability(item.Model, "active", publishedProtocols)
 		if invalidBinding || item.ReadyCount == 0 {
 			item.BindingIssue = &CatalogBlocker{"no_ready_binding", "请检查已启用的北辰线路和绑定 Key。"}
@@ -903,6 +938,7 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability,
 			item.StudentPrice.Reason = item.BindingIssue.Message
 		}
 	} else {
+		item.StudentPrice = unpublishedStudentPrice()
 		item.ModelAvailability = catalog.SummarizeModelAvailability(item.Model, "active", candidateProtocols)
 		item.ModelAvailability.Availability = "not_published"
 		item.ModelAvailability.AvailabilityReason = ""
@@ -919,12 +955,21 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability,
 		item.ProbeState = "unprobed"
 	}
 	switch {
-	case item.ModelAvailability.Availability == "available":
+	case item.Published && !item.PriceCovered && item.PriceBlocker != nil:
+		item.ModelAvailability.Availability = catalog.AvailabilityUnavailable
+		item.ModelAvailability.AvailabilityReason = item.PriceBlocker.Message
+		item.ModelAvailability.RecommendedProtocol = nil
+		item.ActionHint = "请同步相关 Key 的官网报价，或设置手动价。"
+	case item.ModelAvailability.Availability == catalog.AvailabilityAvailable:
 		item.ActionHint = "可使用推荐协议接入。"
 	case item.ReadyCount > 0 && item.ProbeState == "unprobed":
 		item.ActionHint = "发起探活以确认已发布协议。"
 	}
 	return priceStates
+}
+
+func unpublishedStudentPrice() StudentPrice {
+	return StudentPrice{studentPriceNoRoute, "老师尚未发布该模型"}
 }
 
 func noStudentPriceRoute(groupStatus string) StudentPrice {
@@ -954,34 +999,42 @@ func (price StudentPrice) rank() int {
 	return 0
 }
 
-func studentPriceForRoute(model *Model, route catalog.ModelCapability, ready bool) StudentPrice {
+func studentPriceForRoute(model *Model, route catalog.ModelCapability, published, ready bool) StudentPrice {
+	if !published {
+		return unpublishedStudentPrice()
+	}
 	if !ready {
 		return noStudentPriceRoute(route.GroupStatus)
 	}
-	if model != nil {
+	if model != nil && route.PriceCovered {
+		if model.schoolMultiplier == "" {
+			return StudentPrice{studentPriceRatePending, "当前线路的学校系数待同步"}
+		}
 		fixed := model.SchoolRates != nil && model.SchoolRates.Input != nil && model.SchoolRates.Output != nil
-		switch {
-		case fixed && model.Mode == "manual":
-			return StudentPrice{studentPriceManual, "使用教师设置的基础单价和学校系数"}
-		case model.PriceSource == derivedPriceSource:
-			return StudentPrice{studentPriceNoBase, "历史流水反推价待核对"}
-		case route.PriceState == "conditional":
-			if model.QuoteEffectiveMultiplier == nil {
+		switch route.PriceState {
+		case "manual":
+			if fixed {
+				return StudentPrice{studentPriceManual, "使用教师设置的基础单价和学校系数"}
+			}
+		case "conditional":
+			if !model.QuoteUsable {
 				return StudentPrice{studentPriceRatePending, "该条件价缺少同一报价快照的生效倍率"}
 			}
 			if onlyHigherPriceTiers(model.PriceConditions, model.PriceConditionsExact) {
 				return StudentPrice{studentPriceHigher, "官网只提供较高输入 Token 档位的单价"}
 			}
 			return StudentPrice{studentPriceNormal, "使用当前线路的官网条件价"}
-		case fixed:
-			return StudentPrice{studentPriceNormal, "使用当前线路已应用生效倍率的单价"}
+		case "confirmed":
+			if fixed {
+				return StudentPrice{studentPriceNormal, "使用当前线路已应用生效倍率的单价"}
+			}
 		}
+	}
+	if route.PriceBlocker != nil && (route.PriceBlocker.Code != "missing_price" || route.MultiplierState == "current") {
+		return StudentPrice{studentPriceNoBase, route.PriceBlocker.Message}
 	}
 	if route.MultiplierState != "current" {
 		return StudentPrice{studentPriceRatePending, "当前线路的生效倍率待核对"}
-	}
-	if route.PriceBlocker != nil {
-		return StudentPrice{studentPriceNoBase, route.PriceBlocker.Message}
 	}
 	return StudentPrice{studentPriceNoBase, "当前线路缺少可用的基础单价"}
 }

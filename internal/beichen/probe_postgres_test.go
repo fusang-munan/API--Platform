@@ -429,7 +429,7 @@ VALUES(gen_random_uuid(),$1,$2,'inactive-key-model',now(),now(),now(),now())`, p
 }
 
 func TestBeichenProbeFailureAttributionPostgres(t *testing.T) {
-	ctx, db, provider, _, keys := newActionsPostgres(t)
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
 	t.Setenv("BEICHEN_PROBE_DAILY_LIMIT", "500")
 	manager := switchTestManager(t)
 	ciphertext, err := manager.EncryptCredential("fixture-attribution")
@@ -454,6 +454,9 @@ func TestBeichenProbeFailureAttributionPostgres(t *testing.T) {
  VALUES(gen_random_uuid(),$3::text,$3::text,'active',1000,now(),now()) RETURNING id)
 INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
 SELECT gen_random_uuid(),id,$1,$2,$3,'openai_compatible',7,now(),now() FROM school`, provider, key, name)
+		execCatalogTestSQL(t, ctx, db, `INSERT INTO beichen_price_versions
+ (credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+VALUES($1,$2,'school','manual','teacher',$3,1000000,1000000)`, key, name, actor)
 		execCatalogTestSQL(t, ctx, db, `INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,duration_ms,checked_at,last_passed_at)
 VALUES($1,$2,$3,'openai_compatible',200,1,statement_timestamp(),statement_timestamp())`, provider, key, name)
 	}

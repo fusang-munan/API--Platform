@@ -39,6 +39,7 @@ type ModelCapability struct {
 	GroupStatus         string               `json:"group_status,omitempty"`
 	GroupCheckedAt      *time.Time           `json:"group_checked_at,omitempty"`
 	KeyEnabled          bool                 `json:"key_enabled"`
+	Published           bool                 `json:"published"`
 	Bindings            []BeichenBinding     `json:"bindings"`
 	SupportedProtocols  []string             `json:"supported_protocols"`
 	AvailableProtocols  []string             `json:"available_protocols"`
@@ -83,6 +84,7 @@ type RetiredBeichenModel struct {
 // not move that boundary.
 const BeichenKeyEvidenceSQL = `SELECT c.id AS credential_id, c.updated_at AS revision,
    cat.last_success AS catalog_at, cat.last_error AS catalog_error,
+   mv.effective_at AS multiplier_at, mv.stale_at AS multiplier_stale_at,
    GREATEST(c.updated_at, changed.group_at, history.group_at,
      CASE WHEN identity.key_id IS NOT NULL AND
           (observed.key_id <> identity.key_id OR access.upstream_key_id <> identity.key_id)
@@ -207,10 +209,13 @@ const BeichenCurrentProbeSQL = `(r.checked_at>=e.evidence_since AND (e.evidence_
 const beichenCurrentLastPassSQL = `(r.last_passed_at>=e.evidence_since AND (e.evidence_since=e.revision OR
  COALESCE((` + beichenProbeAttemptSQL + `r.last_passed_at ORDER BY a.checked_at DESC LIMIT 1),r.last_passed_at)>=e.evidence_since))`
 
-const BeichenPanelQuoteCurrentSQL = `(snap.expires_at>statement_timestamp()
- AND COALESCE(snap.credential_ciphertext_sha256=sha256(c.credential_ciphertext),snap.credential_revision=c.updated_at)
+const beichenPanelQuoteIdentitySQL = `(COALESCE(snap.credential_ciphertext_sha256=sha256(c.credential_ciphertext),snap.credential_revision=c.updated_at)
  AND (e.group_id IS NULL OR snap.group_id=e.group_id)
  AND (e.evidence_since=e.revision OR snap.effective_at>=e.evidence_since))`
+
+const BeichenPanelQuoteCurrentSQL = `(snap.expires_at>statement_timestamp() AND ` + beichenPanelQuoteIdentitySQL + `
+ AND e.multiplier_at<=snap.effective_at
+ AND (e.multiplier_stale_at IS NULL OR e.multiplier_stale_at>statement_timestamp()))`
 
 const BeichenFollowPriceCurrentSQL = `((version.source NOT IN ('panel','derived_from_usage') OR ` + BeichenPanelQuoteCurrentSQL + `)
  AND (e.evidence_since=e.revision OR version.effective_at>=e.evidence_since))`
@@ -303,7 +308,8 @@ SELECT COALESCE(k.model_id::text,b.model,w.model),n.credential_id,COALESCE(c.lab
  price.mode,COALESCE(` + BeichenFixedPriceSQL + `,false),
  COALESCE(version.source='derived_from_usage' AND ` + BeichenPanelQuoteCurrentSQL + `,false),
  CASE WHEN ` + BeichenPanelQuoteCurrentSQL + ` THEN snap.model_pricing->k.model_id::text END,
- COALESCE(snap.expires_at<=statement_timestamp() AND snap.model_pricing ? k.model_id::text,false),
+ COALESCE(snap.expires_at<=statement_timestamp() AND ` + beichenPanelQuoteIdentitySQL + `
+   AND NULLIF(snap.model_pricing->k.model_id::text,'null'::jsonb) IS NOT NULL,false),
  COALESCE(e.multiplier_state,'not_applicable')
 FROM names n JOIN providers p ON p.id=$1
 LEFT JOIN provider_credentials c ON c.id=n.credential_id AND c.provider_id=p.id
@@ -330,12 +336,12 @@ ORDER BY n.name_key,c.label,c.id`
 
 type capabilityRow struct {
 	ModelCapability
-	hasCredential, keyListed, websiteListed, catalogCurrent, hadCatalog, activeSchool bool
-	groupAllowed, groupBlocked                                                        bool
-	fixedPrice, derivedPrice, priceExpired                                            bool
-	priceMode                                                                         string
-	priceTerms                                                                        []byte
-	entryRaw, declaredJSON, bindingsJSON, probesJSON                                  []byte
+	hasCredential, keyListed, websiteListed, catalogCurrent, hadCatalog bool
+	groupAllowed, groupBlocked                                          bool
+	fixedPrice, derivedPrice, priceExpired                              bool
+	priceMode                                                           string
+	priceTerms                                                          []byte
+	entryRaw, declaredJSON, bindingsJSON, probesJSON                    []byte
 }
 
 func ReadBeichenCapabilities(ctx context.Context, db *sql.DB, providerID uuid.UUID) (BeichenCapabilities, error) {
@@ -470,7 +476,7 @@ func readCapabilityRows(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, v
 		if err := rows.Scan(&row.Model, &row.CredentialID, &row.CredentialLabel,
 			&row.KeyEnabled, &row.hasCredential, &row.GroupID, &row.GroupStatus, &row.GroupCheckedAt, &row.groupAllowed, &row.groupBlocked,
 			&row.keyListed, &row.websiteListed, &row.catalogCurrent, &row.hadCatalog,
-			&row.entryRaw, &row.declaredJSON, &row.activeSchool, &row.bindingsJSON, &row.probesJSON,
+			&row.entryRaw, &row.declaredJSON, &row.Published, &row.bindingsJSON, &row.probesJSON,
 			&row.priceMode, &row.fixedPrice, &row.derivedPrice, &row.priceTerms, &row.priceExpired, &row.MultiplierState); err != nil {
 			return err
 		}
@@ -549,7 +555,7 @@ func (row *capabilityRow) evaluate(view *BeichenCapabilities) error {
 		if row.ActionHint == "" {
 			row.addGap(view, "binding", "binding_unverified", "绑定 Key 的分组待核实。", rescan)
 		}
-	case row.activeSchool:
+	case row.Published:
 		row.BindingState = "invalid"
 		action := "检查渠道 Key 与模型协议，再预览并确认重绑。"
 		switch {
@@ -607,10 +613,16 @@ func (row *capabilityRow) evaluate(view *BeichenCapabilities) error {
 		row.Availability = AvailabilityMaintenance
 		row.AvailabilityReason = "维护中。当前线路的协议最近一次探活均失败。"
 	case !row.keyListed || !row.KeyEnabled:
-		row.Availability = "unavailable"
+		row.Availability = AvailabilityUnavailable
 	}
 	row.reportProbeGaps(view, whole)
 	row.reportPriceGaps(view, routeCurrent)
+	if row.Published && row.BindingState == "ready" && row.PriceBlocker != nil && !row.PriceCovered {
+		row.Availability = AvailabilityUnavailable
+		row.AvailabilityReason = row.PriceBlocker.Message
+		row.RecommendedProtocol = nil
+		row.ActionHint = row.PriceBlocker.ActionHint
+	}
 	if row.ActionHint == "" {
 		switch row.Availability {
 		case "available":

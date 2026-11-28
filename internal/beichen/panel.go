@@ -22,7 +22,7 @@ import (
 
 const (
 	panelURL      = "https://beichenapi.com/api/v1/channels/available"
-	panelQuoteTTL = 16 * time.Minute
+	panelQuoteTTL = 20 * time.Minute // Includes four minutes of renewal grace beyond the original 16-minute window.
 	panelRateUnit = "beichen_micros_per_million_tokens"
 )
 
@@ -293,6 +293,8 @@ func panelExpiry(info billingInfo, now time.Time) (time.Time, error) {
 	if info.ObservedAt.Before(now.Add(-jobTimeout)) || info.ObservedAt.After(now) || info.PeakEnabled == nil {
 		return time.Time{}, badTime
 	}
+	// Billing normally refreshes every 15 minutes. Give a verified quote
+	// extra time for the next sweep without extending it past a peak change.
 	expires := info.ObservedAt.Add(panelQuoteTTL)
 	if !*info.PeakEnabled {
 		return expires, nil
@@ -664,7 +666,7 @@ func saveBillingObservation(ctx context.Context, tx *sql.Tx, credentialID uuid.U
 		// A failed read retains the last quote only while this round can still
 		// verify its group and the complete multiplier rule.
 		if billingErr != nil || errors.Is(quote.err, errPanelGroupNotFound) || errors.Is(quote.err, errPanelRulesConflict) ||
-			(quote.verifiedKeyModels && errors.Is(quote.err, errPanelEmpty)) {
+			((quote.verifiedKeyModels || quote.websiteModels != nil) && errors.Is(quote.err, errPanelEmpty)) {
 			group = 0
 		}
 		if err := invalidateChangedPanelQuote(ctx, tx, credentialID, revision, effectiveAt, group, true); err != nil {
