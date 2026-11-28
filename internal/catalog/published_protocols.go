@@ -33,7 +33,7 @@ const publishedProtocolRouteSQL = `(
  JOIN providers p ON p.id=c.provider_id AND p.status='active'
  LEFT JOIN upstream_probes r ON r.provider_id=p.id AND r.credential_id=c.id
   AND r.model=k.model_id::text AND r.protocol=%[3]s AND ` + currentProbeRevisionSQL + `
-  AND k.catalog_source = 'key' AND ` + publishedBeichenProviderSQL + `
+  AND k.catalog_source IN ` + BeichenKeyCatalogSourcesSQL + ` AND ` + publishedBeichenProviderSQL + `
  WHERE k.provider_id=%[1]s AND (%[2]s IS NULL OR c.id=%[2]s) AND k.status='active'
   AND (NOT (` + publishedBeichenProviderSQL + `) OR k.last_seen_at>=c.updated_at)
   AND lower(k.model_id::text)=lower(btrim(%[4]s))

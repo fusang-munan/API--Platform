@@ -176,12 +176,16 @@ const BeichenKeyEvidenceCTE = `beichen_key_evidence AS (
  ` + BeichenKeyEvidenceSQL + ` WHERE c.provider_id=$1
 )`
 
+// both is accepted on read as Key-backed evidence. Existing writers persist
+// key or website, while imported or externally maintained rows may say both.
+const BeichenKeyCatalogSourcesSQL = `('key','both')`
+
 const BeichenCatalogCurrentSQL = `(e.catalog_error IS NULL AND
  COALESCE(e.catalog_at>=e.evidence_since AND e.catalog_at>statement_timestamp()-interval '30 minutes',false))`
 
 // A dated raw Key list also supplies evidence for older imports that predate the
 // catalog dataset marker. Website entries never establish a Key's coverage.
-const BeichenKeyListsModelSQL = `(k.catalog_source='key' AND k.last_seen_at>=e.evidence_since AND
+const BeichenKeyListsModelSQL = `(k.catalog_source IN ` + BeichenKeyCatalogSourcesSQL + ` AND k.last_seen_at>=e.evidence_since AND
  e.catalog_error IS NULL AND COALESCE(e.catalog_at,k.last_seen_at)>=e.evidence_since AND
  COALESCE(e.catalog_at,k.last_seen_at)>statement_timestamp()-interval '30 minutes')`
 
@@ -267,12 +271,12 @@ WITH ` + BeichenKeyEvidenceCTE + `, entries AS (
        AND lower(btrim(a.upstream_model))=k.name_key
      ORDER BY a.credential_id NULLS LAST,a.created_at DESC,a.id DESC LIMIT 1
    ) key_alias ON true
-   WHERE k.credential_id=w.credential_id AND k.catalog_source='key'
+   WHERE k.credential_id=w.credential_id AND k.catalog_source IN ` + BeichenKeyCatalogSourcesSQL + `
      AND (translate(k.name_key,'.','-')=translate(w.name_key,'.','-')
        OR COALESCE(key_alias.name_key,k.name_key)=COALESCE(web_alias.name_key,w.name_key))
      AND NOT EXISTS (
        SELECT 1 FROM entries exact WHERE exact.credential_id=w.credential_id
-         AND exact.name_key=w.name_key AND exact.catalog_source='key'
+         AND exact.name_key=w.name_key AND exact.catalog_source IN ` + BeichenKeyCatalogSourcesSQL + `
      )
  ) matched ON true
  GROUP BY w.credential_id,COALESCE(matched.name_key,w.name_key)
@@ -287,8 +291,8 @@ SELECT COALESCE(k.model_id::text,b.model,w.model),n.credential_id,COALESCE(c.lab
  COALESCE(` + BeichenGroupUnavailableSQL + `,false),
  COALESCE(` + BeichenKeyListsModelSQL + `,false),w.model IS NOT NULL,
  COALESCE(` + BeichenCatalogCurrentSQL + ` AND
-   (k.model_id IS NULL OR (k.catalog_source='key' AND k.last_seen_at>=e.evidence_since)),false),
- COALESCE(k.catalog_source='key' OR e.catalog_error IS NOT NULL
+   (k.model_id IS NULL OR (k.catalog_source IN ` + BeichenKeyCatalogSourcesSQL + ` AND k.last_seen_at>=e.evidence_since)),false),
+ COALESCE(k.catalog_source IN ` + BeichenKeyCatalogSourcesSQL + ` OR e.catalog_error IS NOT NULL
    OR (e.catalog_at IS NOT NULL AND k.catalog_source IS DISTINCT FROM 'website'),false),
  COALESCE(k.raw_entry,'{}'::jsonb),COALESCE(to_jsonb(k.supported_protocols),'[]'::jsonb),
  COALESCE(b.active_school,false) OR EXISTS (
@@ -414,7 +418,7 @@ WHERE NOT EXISTS (
 )
 AND NOT EXISTS (
  SELECT 1 FROM upstream_model_aliases a
- JOIN provider_model_catalog k ON k.provider_id=a.provider_id AND k.status='active' AND k.catalog_source='key'
+ JOIN provider_model_catalog k ON k.provider_id=a.provider_id AND k.status='active' AND k.catalog_source IN `+BeichenKeyCatalogSourcesSQL+`
    AND k.model_id=btrim(a.upstream_model)::citext AND (a.credential_id IS NULL OR a.credential_id=k.credential_id)
  JOIN provider_credentials c ON c.id=k.credential_id AND c.status='active'
  JOIN providers p ON p.id=k.provider_id AND p.status='active'

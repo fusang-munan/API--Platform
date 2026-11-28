@@ -56,7 +56,7 @@ func FindProbeCatalogCredential(ctx context.Context, database *sql.DB, client *e
 		FROM provider_model_catalog m
 		JOIN provider_credentials c ON c.id=m.credential_id AND c.provider_id=m.provider_id
 		JOIN providers p ON p.id=m.provider_id
-		WHERE m.provider_id=$1 AND m.status='active' AND m.catalog_source='key'
+		WHERE m.provider_id=$1 AND m.status='active' AND m.catalog_source IN `+BeichenKeyCatalogSourcesSQL+`
 		  AND c.status='active' AND p.status='active'
 		  AND (lower(m.model_id::text)=lower($2) OR lower(m.model_id::text)=lower($3))`,
 		providerID, first, second)

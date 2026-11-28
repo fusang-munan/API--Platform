@@ -464,7 +464,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 北辰接口限老师访问，凭据必须属于指定的北辰供应商。教师通过 `POST /api/v1/teacher/providers/{provider_id}/credentials` 新增凭据时，可提交 `channel` 登记独立的 `CC1`、`G3`、`GM1` 或 `Gemini` 渠道，或提交 `replaces_credential_id` 接替原渠道，两字段互斥。有官网 Key ID `12098`、Gemini 登记或 0065 实际退役记录的停用凭据，可通过 `PATCH .../credentials/{credential_id}` 一并提交新 `credential` 和 `status: "active"` 原地恢复。仅有退役时间窗线索时，教师核实后须加上 `"confirm_retired_channel": "Gemini"`，否则响应 `400 VALIDATION_ERROR` 并提示待确认。创建凭据及携带新 Key 的更新需要可信 HTTPS，响应设置 `Cache-Control: no-store`。有凭据的北辰供应商保留北辰接口地址。
 
-手动同步接受空请求体或 `{}`。概览中的 `datasets`、`models`、`comparison` 分别提供同步状态、报价和当日对账。`models[].catalog_source` 返回该目录行的来源（`key` 或 `website`）。成本的 `_micros` 字段以百万分之一北辰余额单位表示。`trial_credits` 和 `charged_credits` 用十进制字符串分别返回试算与实际结算积分，`pending_review_calls` 给出待核账笔数。未知值为 `null`，可确认的零单独返回。原有 `trial_credit_milli` 保留千分之一积分精度。
+手动同步接受空请求体或 `{}`。概览中的 `datasets`、`models`、`comparison` 分别提供同步状态、报价和当日对账。`models[].catalog_source` 返回该目录行的来源（`key`、`website` 或 `both`）。`both` 只有在当前 Key 目录、分组和探活证据有效时才作为 Key 线路候选。成本的 `_micros` 字段以百万分之一北辰余额单位表示。`trial_credits` 和 `charged_credits` 用十进制字符串分别返回试算与实际结算积分，`pending_review_calls` 给出待核账笔数。未知值为 `null`，可确认的零单独返回。原有 `trial_credit_milli` 保留千分之一积分精度。
 
 `credentials[].health` 包含 `credential`、`catalog`、`pricing`、`probe` 四个维度，各返回 `state`（`available`、`unavailable` 或 `pending`）和说明 `message`。`available_dimensions` 统计可用项。报价维度按当前可计算报价数判断。探活维度按有至少一种协议通过的模型占可探活模型的比例判断。
 
@@ -492,7 +492,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 带上下文倍率的官网报价保留 `intervals` 中的四项倍率和档位标签。`price_conditions_exact` 将倍率应用到基础单价，并使用下限包含、上限不包含的边界。未命中该类档位时使用基础价。`website_directory.price_unit` 为「元（北辰余额单位）」。官网报价按 1:1 读取，界面上的 `$` 不触发货币换算。
 
-`website_directory` 返回完整官网目录状态、`last_success` 和 `last_error`。`fresh` 表示近期完整采集，`stale` 表示当前使用部分更新或保留的快照，`unverified` 表示等待取得官网目录。`model_catalog` 合并官网与启用 Key 的目录，并保留已发布但失去目录覆盖的模型。`source` 为 `website`、`key` 或 `both`。`catalog_state` 为 `key_listed`、`website_only`、`published_unavailable` 或 `catalog_missing`。`key_count` 等于 `current_key_count`，只统计当前 `/v1/models` 的 Key 目录证据；`current_key_count` 按 `catalog_keys[].state=listed` 且非陈旧的 Key 去重，`stale_key_count` 统计扫描失败或超过 30 分钟未刷新、沿用上次结果的 Key，两者为零时省略。`catalog_keys[].stale` 标记这些保留条目；这些条目保留供核对，退出 `current_key_count` 和 `key_count`。每条线路的探活状态取该线路当前有效的证据。目录表 `provider_model_catalog.catalog_source` 区分 `key` 和 `website`，迁移 `0061_provider_catalog_source.sql` 新增非空列并默认 `key`，同时把旧 `raw_entry->>'source'='beichen_website_group'` 的行回填为 `website`。
+`website_directory` 返回完整官网目录状态、`last_success` 和 `last_error`。`fresh` 表示近期完整采集，`stale` 表示当前使用部分更新或保留的快照，`unverified` 表示等待取得官网目录。`model_catalog` 合并官网与启用 Key 的目录，并保留已发布但失去目录覆盖的模型。`source` 为 `website`、`key` 或 `both`。`catalog_state` 为 `key_listed`、`website_only`、`published_unavailable` 或 `catalog_missing`。`key_count` 等于 `current_key_count`，只统计当前 `/v1/models` 的 Key 目录证据；`current_key_count` 按 `catalog_keys[].state=listed` 且非陈旧的 Key 去重，`stale_key_count` 统计扫描失败或超过 30 分钟未刷新、沿用上次结果的 Key，两者为零时省略。`catalog_keys[].stale` 标记这些保留条目；这些条目保留供核对，退出 `current_key_count` 和 `key_count`。每条线路的探活状态取该线路当前有效的证据。目录表 `provider_model_catalog.catalog_source` 的写入值为 `key` 或 `website`，迁移 `0061_provider_catalog_source.sql` 新增非空列并默认 `key`，同时把旧 `raw_entry->>'source'='beichen_website_group'` 的行回填为 `website`。读取端同时接受 `both`，并按 Key 证据处理；`website` 仍须已有活动绑定才能进入启用预览。
 
 `catalog_state=published_unavailable` 表示该模型曾发布（校内模型已启用、存在绑定或保留的绑定异常），但当前启用的渠道 Key 都没有在 `/v1/models` 列出它。学校仍需排查的记录保留在主表异常筛选，`binding_issue.code` 通常为 `catalog_missing` 或 `catalog_stale`，后者表示只剩陈旧的 Key 目录记录。`website_only` 型号汇总在 `website_only_models`。
 
