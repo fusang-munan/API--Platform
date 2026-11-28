@@ -65,9 +65,8 @@ type activationBinding struct {
 }
 
 type activationWrite struct {
-	id     uuid.UUID
 	route  PreferredRoute
-	before *PreferredRoute
+	before *activationBinding
 }
 
 type activationPlan struct {
@@ -577,7 +576,10 @@ func (s *activationSchool) published() bool {
 	return s.status == "active" && s.multiplier != nil && *s.multiplier > 0
 }
 
-func (m *activationModel) alreadyPublished(s *activationSchool) bool {
+func (m *activationModel) alreadyPublished(s *activationSchool, plan activationPlan) bool {
+	if len(plan.writes) > 0 || plan.blocker.Code == blockerAuthFailed || plan.blocker.Code == blockerMultiCandidate {
+		return false
+	}
 	return s.published() && slices.ContainsFunc(s.bindings, func(b activationBinding) bool {
 		return b.active && b.route.ProviderID == m.provider
 	})
@@ -611,14 +613,12 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 		rank  int
 	}
 	choices := map[string]choice{}
-	hasNorth := false
+	hasActiveNorth := false
+	inactiveNorth := map[string]activationBinding{}
 	lastPriority := map[string]int{}
 	for _, b := range s.bindings {
 		r := b.route
 		north := r.ProviderID == m.provider
-		if north {
-			hasNorth = true
-		}
 		if r.Priority > lastPriority[r.Adapter] {
 			lastPriority[r.Adapter] = r.Priority
 		}
@@ -627,6 +627,7 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 		}
 		rank := 0
 		if north && b.active {
+			hasActiveNorth = true
 			switch {
 			case b.authFailedActiveKey:
 				plan.setBlocker(CatalogBlocker{blockerAuthFailed, authFailedRebindMessage})
@@ -637,9 +638,7 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 					plan.catalogBlocked = true
 				} else {
 					next.Priority = r.Priority
-					before := r
-					before.CredentialID = b.credential
-					plan.writes = append(plan.writes, activationWrite{id: b.id, route: next, before: &before})
+					plan.writes = append(plan.writes, activationWrite{route: next, before: &b})
 					plan.northRoutes = append(plan.northRoutes, next)
 					r, rank = next, 2
 				}
@@ -648,6 +647,8 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 				plan.setBlocker(CatalogBlocker{blockerNoCandidate, pinnedRouteNotReady})
 				plan.catalogBlocked = true
 			}
+		} else if north {
+			inactiveNorth[r.Adapter] = b
 		}
 		if b.active && b.reachable {
 			rank = 2
@@ -664,27 +665,29 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 			choices[r.Adapter] = choice{r, rank}
 		}
 	}
-	// Configure new North routes only for this school identity. An existing
-	// North binding keeps its Key and protocol until the teacher rebinds it.
-	if !hasNorth {
+	// With no active North binding, first publication can restore a
+	// retired protocol slot using the newly selected route.
+	if !hasActiveNorth {
 		defaults, blocker := m.defaultRoutes(s)
 		if blocker.Code != "" {
 			plan.setBlocker(blocker)
 		}
 		for _, r := range defaults {
 			adapter := r.Adapter
-			if c, exists := choices[adapter]; exists {
+			var before *activationBinding
+			if b, exists := inactiveNorth[adapter]; exists {
+				r.Priority = b.route.Priority
+				before = &b
+			} else if _, exists := choices[adapter]; exists {
 				if lastPriority[adapter] == math.MaxInt32 {
 					continue
 				}
 				r.Priority = max(r.Priority, lastPriority[adapter]+1)
-				if c.rank == 0 {
-					choices[adapter] = choice{r, 2}
-				}
-			} else {
+			}
+			if choices[adapter].rank == 0 {
 				choices[adapter] = choice{r, 2}
 			}
-			plan.writes = append(plan.writes, activationWrite{route: r})
+			plan.writes = append(plan.writes, activationWrite{route: r, before: before})
 			plan.northRoutes = append(plan.northRoutes, r)
 		}
 	}
@@ -1077,9 +1080,6 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 		return enabled, nil, err
 	}
 	skip := func(reason, code, message string, diagnostic ...map[string]any) (BatchEnabledModel, *BatchSkippedModel, error) {
-		if target != nil && target.id != uuid.Nil {
-			seenSchools[target.id] = true
-		}
 		var details map[string]any
 		if len(diagnostic) != 0 {
 			details = diagnostic[0]
@@ -1100,7 +1100,8 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 		return skip("duplicate_school_model", "", "本批已处理同一个校内模型 ID")
 	}
 	plan := m.plan(target)
-	if plan.blocker.Code != blockerAuthFailed && m.alreadyPublished(target) {
+	if m.alreadyPublished(target, plan) {
+		seenSchools[target.id] = true
 		return skip("already_active", "", "模型已启用")
 	}
 	if plan.blocker.Code != "" {
@@ -1171,7 +1172,7 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 		return uuid.Nil, activationBlockerError(CatalogBlocker{blockerMultiSchool, multiSchoolMessage}, nil)
 	}
 	plan := m.plan(target)
-	if plan.blocker.Code != blockerAuthFailed && m.alreadyPublished(target) {
+	if m.alreadyPublished(target, plan) {
 		return target.id, nil
 	}
 	if plan.blocker.Code != "" {
@@ -1205,7 +1206,8 @@ func applyActivationPlan(ctx context.Context, tx *sql.Tx, provider, actor uuid.U
 	}
 	for _, write := range plan.writes {
 		r := write.route
-		if write.id == uuid.Nil {
+		before := write.before
+		if before == nil {
 			result, execErr := tx.ExecContext(ctx, `INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
  VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,now(),now()) ON CONFLICT(model_id,provider_id,adapter) DO NOTHING`, target.id, provider, r.CredentialID, r.UpstreamModel, r.Adapter, r.Priority)
 			if execErr != nil {
@@ -1216,15 +1218,16 @@ func applyActivationPlan(ctx context.Context, tx *sql.Tx, provider, actor uuid.U
 			}
 			continue
 		}
-		if write.before == nil {
-			return uuid.Nil, domain.NewError(domain.CodeInvalidTransition, "绑定已变化，请刷新后重新选择")
+		status := modelbinding.StatusInactive
+		if before.active {
+			status = modelbinding.StatusActive
 		}
 		result, execErr := tx.ExecContext(ctx, `
-UPDATE model_bindings SET credential_id=$2,upstream_model_name=$3,updated_at=now()
-WHERE id=$1 AND provider_id=$4 AND model_id=$5 AND adapter=$6 AND status='active'
-  AND credential_id IS NOT DISTINCT FROM $7::uuid AND upstream_model_name=$8 AND priority=$9`,
-			write.id, r.CredentialID, r.UpstreamModel, provider, target.id, r.Adapter,
-			write.before.CredentialID, write.before.UpstreamModel, write.before.Priority)
+UPDATE model_bindings SET credential_id=$2,upstream_model_name=$3,status='active',updated_at=now()
+WHERE id=$1 AND provider_id=$4 AND model_id=$5 AND adapter=$6 AND status=$7
+  AND credential_id IS NOT DISTINCT FROM $8::uuid AND upstream_model_name=$9 AND priority=$10`,
+			before.id, r.CredentialID, r.UpstreamModel, provider, target.id, r.Adapter, status,
+			before.credential, before.route.UpstreamModel, before.route.Priority)
 		if execErr != nil {
 			return uuid.Nil, execErr
 		}

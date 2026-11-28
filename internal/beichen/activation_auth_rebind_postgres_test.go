@@ -205,3 +205,36 @@ func TestEnableModelKeepsHealthyExistingRoutePostgres(t *testing.T) {
 		t.Fatalf("healthy existing route was replaced: before=%+v after=%+v", before, after)
 	}
 }
+
+func TestEnableModelRepairsPublishedUnreachableBindingsPostgres(t *testing.T) {
+	for _, mode := range []string{"single", "batch"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newFirstConnectFixture(t)
+			oldKey := f.keys[1]
+			school := f.pendingSchool(t, "school-published-repair", &oldKey)
+			f.readyKey(t, oldKey)
+			f.bindKey(t, school, oldKey)
+			if id, err := f.service.EnableModel(f.ctx, f.provider, f.actor, firstConnectUpstream, school.String()); err != nil || id != school {
+				t.Fatalf("initial publication failed: id=%s err=%v", id, err)
+			}
+			bindingIDs := f.assertPublished(t, school, oldKey, firstConnectAdapters)
+			execCatalogTestSQL(t, f.ctx, f.db, `UPDATE provider_model_catalog SET last_seen_at=now()-interval '1 hour'
+WHERE credential_id=$1 AND model_id=$2`, oldKey, firstConnectUpstream)
+
+			if mode == "single" {
+				if id, err := f.service.EnableModel(f.ctx, f.provider, f.actor, firstConnectUpstream, school.String()); err != nil || id != school {
+					t.Fatalf("repair failed: id=%s err=%v", id, err)
+				}
+			} else {
+				result, err := f.service.EnableModelsBatch(f.ctx, f.provider, f.actor, []string{school.String()})
+				if err != nil || len(result.Enabled) != 1 || result.Enabled[0].ModelID != school || len(result.Skipped) != 0 {
+					t.Fatalf("batch repair was skipped: %+v, %v", result, err)
+				}
+			}
+			if after := f.assertPublished(t, school, f.keys[0], firstConnectAdapters); after != bindingIDs {
+				t.Fatalf("repair replaced binding IDs: before=%s after=%s", bindingIDs, after)
+			}
+			f.assertSkipped(t, "already_active", "", "模型已启用", school.String())
+		})
+	}
+}

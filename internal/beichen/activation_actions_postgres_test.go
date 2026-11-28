@@ -157,6 +157,53 @@ CREATE TRIGGER reject_action_fixture BEFORE INSERT ON models FOR EACH ROW EXECUT
 	}
 }
 
+func TestEnableModelsBatchRetriesSchoolAfterSkippedSelectorPostgres(t *testing.T) {
+	for _, tc := range []struct{ reason, code string }{
+		{"no_price", blockerPriceMissing},
+		{"route_not_ready", blockerNoCandidate},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			ctx, db, provider, actor, keys := newActionsPostgres(t)
+			service := New(db, nil)
+			const unready = "unready-upstream"
+			schoolName := "priced-school"
+			school := uuid.New()
+			execCatalogTestSQL(t, ctx, db, `INSERT INTO models(id,model_id,display_name,created_at,updated_at)
+VALUES($1,$2::text,$2::text,now(),now())`, school, schoolName)
+			saveCatalogFixture(t, ctx, db, provider, keys[0], []catalog.ProviderEntry{
+				{ID: unready, SupportedProtocols: []string{"openai_responses"}},
+				{ID: schoolName, SupportedProtocols: []string{"openai_responses"}},
+			}, nil)
+			if err := service.PutModelAlias(ctx, provider, actor, &keys[0], unready, &schoolName); err != nil {
+				t.Fatal(err)
+			}
+			execCatalogTestSQL(t, ctx, db, `INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+VALUES($1,$2,'school','manual','teacher',$3,1000000,2000000)`, keys[0], schoolName, actor)
+			if tc.reason == "route_not_ready" {
+				execCatalogTestSQL(t, ctx, db, `UPDATE provider_model_catalog SET last_seen_at=now()-interval '1 hour'
+WHERE credential_id=$1 AND model_id=$2`, keys[0], unready)
+			}
+
+			result, err := service.EnableModelsBatch(ctx, provider, actor, []string{unready, schoolName, school.String()})
+			if err != nil || len(result.Enabled) != 1 || len(result.Skipped) != 2 ||
+				result.Enabled[0].Model != schoolName || result.Enabled[0].ModelID != school ||
+				result.Skipped[0].Model != unready || result.Skipped[0].Reason != tc.reason || result.Skipped[0].Code != tc.code ||
+				result.Skipped[1].Model != school.String() || result.Skipped[1].Reason != "duplicate_school_model" {
+				t.Fatalf("the skipped selector prevented the valid one from enabling the same school: %+v, %v", result, err)
+			}
+			var published bool
+			err = db.QueryRowContext(ctx, `SELECT m.status='active'
+  AND (SELECT count(*) FROM model_multiplier_audits a WHERE a.model_id=m.id)=1
+  AND (SELECT count(*) FROM model_bindings b WHERE b.model_id=m.id AND b.provider_id=$2
+    AND b.credential_id=$3 AND b.adapter='openai_responses' AND b.upstream_model_name=$4 AND b.status='active')=1
+FROM models m WHERE m.id=$1`, school, provider, keys[0], schoolName).Scan(&published)
+			if err != nil || !published {
+				t.Fatalf("the valid selector did not publish one route and one audit: %v", err)
+			}
+		})
+	}
+}
+
 func TestEnableModelsBatchLeavesAmbiguousSchoolBindingsPostgres(t *testing.T) {
 	ctx, db, provider, actor, keys := newActionsPostgres(t)
 	const upstream = "shared-upstream"
@@ -380,9 +427,7 @@ VALUES($1,$2,'school','manual','teacher',$3,1000000,2000000)`, key, upstream, ac
 		t.Fatalf("repair changed or duplicated the school identity: %v", err)
 	}
 
-	// A second viable Key makes the choice ambiguous. The teacher must use the
-	// explicit rebind preview instead of having a route picked automatically.
-	exec("UPDATE models SET status='inactive' WHERE id=$1", modelID)
+	// A second viable Key makes repair ambiguous even after publication.
 	exec("UPDATE provider_credentials SET status='active' WHERE id=$1", secondReplacement)
 	exec(`UPDATE model_bindings SET credential_id=$2,status='active' WHERE model_id=$1 AND adapter='openai_responses'`,
 		modelID, oldKey)
@@ -391,8 +436,13 @@ VALUES($1,$2,'school','manual','teacher',$3,1000000,2000000)`, key, upstream, ac
 		t.Fatalf("multiple replacement Keys must be ambiguous: %+v", ambiguous)
 	}
 	if id, err := service.EnableModel(ctx, provider, actor, upstream, ""); id != uuid.Nil ||
-		!strings.Contains(err.Error(), "多个候选线路") {
+		activationErrorCode(err) != blockerMultiCandidate {
 		t.Fatalf("ambiguous replacement was not rejected: %s %v", id, err)
+	}
+	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{modelID.String()})
+	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
+		result.Skipped[0].Reason != "route_not_ready" || result.Skipped[0].Code != blockerMultiCandidate {
+		t.Fatalf("batch did not surface the ambiguous repair: %+v, %v", result, err)
 	}
 	var unchanged bool
 	err = db.QueryRowContext(ctx, `SELECT count(*)=1 AND bool_and(credential_id=$2)

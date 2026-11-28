@@ -122,6 +122,60 @@ func TestEnableModelCatalogSourceBothPostgres(t *testing.T) {
 	}
 }
 
+func TestEnableModelRestoresInactiveProtocolSlotsPostgres(t *testing.T) {
+	for _, mode := range []string{"single-name", "batch-uuid"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newFirstConnectFixture(t)
+			school := f.configureProductionBothTarget(t)
+			oldKey := f.keys[1]
+			f.bindKey(t, school, oldKey)
+			execCatalogTestSQL(t, f.ctx, f.db, "UPDATE provider_credentials SET status='inactive',retired_at=now() WHERE id=$1", oldKey)
+			execCatalogTestSQL(t, f.ctx, f.db, "UPDATE provider_model_catalog SET status='inactive' WHERE credential_id=$1", oldKey)
+			execCatalogTestSQL(t, f.ctx, f.db, "UPDATE model_bindings SET status='inactive' WHERE model_id=$1 AND provider_id=$2", school, f.provider)
+			before := f.bindingSnapshot(t, school)
+
+			row := f.catalogRow(t, school)
+			if row.Source != "both" || row.SchoolStatus != "pending_configuration" || row.Activation != "ready" || !row.CanEnable ||
+				row.PriceState != "confirmed" || row.ProbeState != "passed" || len(row.PreferredRoutes) != len(firstConnectAdapters) {
+				t.Fatalf("inactive slots should allow first connect: %+v", row)
+			}
+			for _, route := range row.PreferredRoutes {
+				if route.CredentialID == nil || *route.CredentialID != f.keys[0] ||
+					route.EffectiveMultiplier == nil || route.EffectiveMultiplier.String() != "0.5" {
+					t.Fatalf("expected both protocols on the current Gemini Key: %+v", route)
+				}
+			}
+
+			if mode == "single-name" {
+				if id, err := f.service.EnableModel(f.ctx, f.provider, f.actor, firstConnectUpstream, ""); err != nil || id != school {
+					t.Fatalf("first connect did not restore the slots: id=%s err=%v", id, err)
+				}
+			} else {
+				result, err := f.service.EnableModelsBatch(f.ctx, f.provider, f.actor, []string{school.String()})
+				if err != nil || len(result.Enabled) != 1 || result.Enabled[0].ModelID != school || len(result.Skipped) != 0 {
+					t.Fatalf("batch first connect did not restore the slots: %+v, %v", result, err)
+				}
+			}
+			if id, err := f.service.EnableModel(f.ctx, f.provider, f.actor, firstConnectUpstream, school.String()); err != nil || id != school {
+				t.Fatalf("repeated enable: id=%s err=%v", id, err)
+			}
+			f.assertSkipped(t, "already_active", "", "模型已启用", school.String())
+			f.assertPublished(t, school, f.keys[0], firstConnectAdapters)
+			if after := f.bindingSnapshot(t, school); after.bindingIDs != before.bindingIDs {
+				t.Fatalf("restore replaced binding IDs: before=%s after=%s", before.bindingIDs, after.bindingIDs)
+			}
+			for i, adapter := range firstConnectAdapters {
+				var priority int
+				err := f.db.QueryRowContext(f.ctx, `
+SELECT priority FROM model_bindings WHERE model_id=$1 AND provider_id=$2 AND adapter=$3`, school, f.provider, adapter).Scan(&priority)
+				if err != nil || priority != 10+i {
+					t.Fatalf("restore changed %s priority: got %d, err=%v", adapter, priority, err)
+				}
+			}
+		})
+	}
+}
+
 func TestActivationCatalogSourceNeedsKeyEvidencePostgres(t *testing.T) {
 	for _, evidence := range []string{"catalog not current", "group denied"} {
 		t.Run(evidence, func(t *testing.T) {
