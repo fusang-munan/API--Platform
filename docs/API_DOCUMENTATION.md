@@ -482,7 +482,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `GET .../beichen/capabilities` 按 Key 和原始上游型号返回 `bindings`、`supported_protocols`、`available_protocols`、`responses_ready`、`recommended_protocol`、`availability` 和报价字段。`responses_ready` 表示存在当前已发布的 Responses 绑定。只有通过当轮探活的协议出现在 `available_protocols`。教师 `/api/v1/teacher/models` 的北辰线路复用同一协议判定。概览的 `route_availability` 汇总已发布线路，缺少当前绑定或探活证据时显示待核实。探活和报价都核对当前凭据版本及已知换组时间。陈旧目录保留供核对，`price_covered` 为 `false`，等待符合当前证据的探活。
 
-已发布型号的 `price_covered` 表示至少一条当前已发布且就绪的线路有可计算报价。待配置型号按绑定或可用的 Key 目录判断。手动价及可按 Token 计算的 `conditional` 都计入。通过缺价字段可核查反推价和缺字段的档位。批量启用逐条验证启用后的线路。
+已发布型号的 `price_covered` 表示至少一条当前有效的 Key 线路证据有可计算报价，不要求该线路已有就绪绑定；没有就绪绑定但当前 Key 有手动价或可按 Token 计算的 `conditional` 时也可为 `true`。待配置型号按绑定或可用的 Key 目录判断。手动价及可按 Token 计算的 `conditional` 都计入。通过缺价字段可核查反推价和缺字段的档位。批量启用逐条验证启用后的线路。
 
 `model_catalog[].published` 表示校内模型已发布，`active` 表示已发布且至少一条北辰线路就绪。已发布型号即使没有就绪绑定，也按当前 Key 条目判断报价覆盖。当前报价状态为 `missing` 或 `derived`，且没有手动价、可计算条件价或有价备用线路时，`route_availability.availability` 返回 `unavailable`，`blockers[].code` 为 `price_missing`，`price_blocker.code` 为 `missing_price`。存在手动价、可计算条件价或有价备用时不返回 `unavailable`。未发布缺价型号返回 `not_published`。能力记录也返回 `published`。可用于学生价的官网报价通过 `models[].quote_usable` 标识。采价续期失败时，仍有可用官网报价的 Key 在 `datasets[].refresh_error` 显示失败原因。
 
