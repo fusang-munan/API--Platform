@@ -356,6 +356,10 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 #### 教师目录的校内模型身份
 
+新 Key 已匹配且报价和探活正常，启用仍返回 `route_not_ready` 时，检查该上游名称在教师概览的 `school_model_id`、`preferred_routes` 和 `bound_routes`。旧版会漏掉尚无直接校内关联的新 Key。新版在上游名称只有一个校内目标、候选来自同一把 Key 时，允许教师启用并建立各可用协议的绑定。发现多个校内目标或多个候选 Key 时，先确认校内目标和线路。
+
+设置独立的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run '^TestEnableModelFirstConnect.*Postgres$' -count=1 -v`。用例覆盖概览、按名称和 UUID 的单个及批量首次启用、重复启用、保留已有绑定，以及多目标、多候选、401/403、缺价和其他供应商线路无校内倍率时的阻断。
+
 教师概览的同上游型号必须按校内模型分别显示。设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test -p 1 ./internal/beichen -run TestBeichenTeacherCoveragePostgres -count=1 -v`。用例构造 8 个目录行，断言每行都有非空且唯一的 `school_model_id`；其中同一上游名绑定两个校内模型时返回两行，两个 UUID 不同，专属 `preferred_routes` 不混入另一校内模型。两行都必须得到官网和 Key 目录证据，状态均为 `key_listed` 而不是 `published_unavailable`；各自只保留 CC1 或 G3 的 `catalog_keys` 和 `credential_ids`，不再出现两行共享全部 Key 的宽范围结果。其余 6 个现行型号的计数、价格、Key 覆盖和分组继续由同一用例核对。
 
 在 `frontend` 下运行 `npm test -- BeichenSchoolModels BeichenModelUsageDrawer`。现有用例核对目录按 `school_model_id` 精确取用同名上游的校内费用，也核对旧响应缺少该字段时使用校内名称和唯一线路回退，无法唯一确认时显示待确认。字段是新增的可空属性，旧接口响应仍可消费。
