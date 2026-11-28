@@ -870,7 +870,10 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability,
 				candidateProtocols = append(candidateProtocols, option)
 			}
 		}
-		priceBasis := !item.Published && len(row.Bindings) > 0 && current
+		// Price coverage is evidence from current Key entries even before a
+		// binding is ready. Otherwise a published model with no ready binding
+		// is stuck at maintenance instead of the missing-price state.
+		priceBasis := current
 		for _, b := range row.Bindings {
 			var record *Model
 			if row.CredentialID != nil {
@@ -955,11 +958,19 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability,
 		item.ProbeState = "unprobed"
 	}
 	switch {
-	case item.Published && !item.PriceCovered && item.PriceBlocker != nil:
+	case item.Published && !item.PriceCovered && (priceStates["missing"] || priceStates["derived"]):
+		if item.PriceBlocker == nil {
+			item.PriceBlocker = &CatalogBlocker{
+				Code:    blockerPriceMissing,
+				Message: "当前线路缺少可结算报价，请同步官网报价或设置手动价。",
+			}
+		}
 		item.ModelAvailability.Availability = catalog.AvailabilityUnavailable
 		item.ModelAvailability.AvailabilityReason = item.PriceBlocker.Message
 		item.ModelAvailability.RecommendedProtocol = nil
 		item.ActionHint = "请同步相关 Key 的官网报价，或设置手动价。"
+		item.Blockers = appendCatalogBlocker(item.Blockers,
+			CatalogBlocker{blockerPriceMissing, item.PriceBlocker.Message})
 	case item.ModelAvailability.Availability == catalog.AvailabilityAvailable:
 		item.ActionHint = "可使用推荐协议接入。"
 	case item.ReadyCount > 0 && item.ProbeState == "unprobed":

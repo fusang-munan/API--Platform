@@ -26,12 +26,14 @@ func TestOverviewStudentPriceDiagnosticsPostgres(t *testing.T) {
 	primary, backup, pending := keys[1], keys[2], keys[3]
 	const fixed, higher, manual, unverified, noRoute = "fixture-fixed", "fixture-higher", "fixture-manual", "fixture-unverified", "fixture-no-route"
 	const missing, candidateMissing = "gemini-3.5-flash-lite", "fixture-candidate-missing"
+	const publishedMissing, publishedManual = "fixture-published-missing", "fixture-published-manual"
 	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
 	for _, item := range []struct {
 		key   uuid.UUID
 		names []string
 	}{
-		{primary, []string{fixed, manual, noRoute, missing, candidateMissing}}, {backup, []string{fixed, higher, missing}}, {pending, []string{unverified}},
+		{primary, []string{fixed, manual, noRoute, missing, candidateMissing, publishedMissing, publishedManual}},
+		{backup, []string{fixed, higher, missing}}, {pending, []string{unverified}},
 	} {
 		entries := make([]catalog.ProviderEntry, 0, len(item.names))
 		for _, name := range item.names {
@@ -40,7 +42,8 @@ func TestOverviewStudentPriceDiagnosticsPostgres(t *testing.T) {
 		saveCatalogFixture(t, ctx, db, provider, item.key, entries, nil)
 	}
 	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
-SELECT gen_random_uuid(),n,n,'active',1000,now(),now() FROM unnest($1::text[]) n`, []string{fixed, higher, manual, unverified, missing})
+SELECT gen_random_uuid(),n,n,'active',1000,now(),now() FROM unnest($1::text[]) n`,
+		[]string{fixed, higher, manual, unverified, missing, publishedMissing, publishedManual})
 	for _, route := range []struct {
 		key      uuid.UUID
 		name     string
@@ -78,7 +81,7 @@ SELECT credential_id,$2,'upstream','base','panel',1000000,1000000,0,0,effective_
 		backup, fixed)
 	service := New(db, nil)
 	base := int64(50_000_000)
-	for _, name := range []string{manual, noRoute} {
+	for _, name := range []string{manual, noRoute, publishedManual} {
 		if err := service.SetPrice(ctx, provider, primary, actor, name, PriceInput{Mode: "manual", Rates: &Rates{Input: &base, Output: &base}}); err != nil {
 			t.Fatal(err)
 		}
@@ -89,7 +92,7 @@ SELECT credential_id,$2,'upstream','base','panel',1000000,1000000,0,0,effective_
 	}
 	expected := map[string]string{fixed: studentPriceNormal, higher: studentPriceHigher, manual: studentPriceManual,
 		unverified: studentPriceRatePending, noRoute: studentPriceNoRoute, missing: studentPriceNoBase,
-		candidateMissing: studentPriceNoRoute}
+		candidateMissing: studentPriceNoRoute, publishedMissing: studentPriceNoRoute, publishedManual: studentPriceNoRoute}
 	for _, row := range view.ModelCatalog {
 		if want, ok := expected[row.Model]; ok {
 			if row.StudentPrice.Status != want || row.StudentPrice.Reason == "" {
@@ -131,6 +134,18 @@ SELECT credential_id,$2,'upstream','base','panel',1000000,1000000,0,0,effective_
 				row.StudentPrice.Status != studentPriceNoRoute {
 				t.Errorf("an unpublished model without a price must stay not_published: %+v", row)
 			}
+		case publishedMissing:
+			if !row.Published || row.Active || row.ReadyCount != 0 || row.PriceCovered ||
+				row.PriceState != "missing" || row.ModelAvailability.Availability != catalog.AvailabilityUnavailable ||
+				row.PriceBlocker == nil || row.PriceBlocker.Code != "missing_price" ||
+				!slices.ContainsFunc(row.Blockers, func(blocker CatalogBlocker) bool { return blocker.Code == "price_missing" }) {
+				t.Errorf("a published model without a ready binding or price must be unavailable: %+v", row)
+			}
+		case publishedManual:
+			if !row.Published || row.Active || row.ReadyCount != 0 || !row.PriceCovered ||
+				row.PriceState != "manual" || row.ModelAvailability.Availability == catalog.AvailabilityUnavailable {
+				t.Errorf("a manual price must keep the published route out of unavailable: %+v", row)
+			}
 		}
 	}
 	if len(expected) != 0 {
@@ -167,6 +182,15 @@ SELECT credential_id,$2,'upstream','base','panel',1000000,1000000,0,0,effective_
 		if route.Model == candidateMissing && (route.Published || route.PriceCovered ||
 			route.Availability != "not_published") {
 			t.Errorf("unpublished missing-price capability must stay not_published: %+v", route)
+		}
+		if route.Model == publishedMissing && (!route.Published || route.PriceCovered ||
+			route.PriceState != "missing" || route.Availability != catalog.AvailabilityUnavailable ||
+			route.PriceBlocker == nil || route.PriceBlocker.Code != "missing_price") {
+			t.Errorf("published missing-price capability must stay unavailable: %+v", route)
+		}
+		if route.Model == publishedManual && (!route.Published || !route.PriceCovered ||
+			route.PriceState != "manual" || route.Availability == catalog.AvailabilityUnavailable) {
+			t.Errorf("manual-price capability must not be unavailable: %+v", route)
 		}
 	}
 }
