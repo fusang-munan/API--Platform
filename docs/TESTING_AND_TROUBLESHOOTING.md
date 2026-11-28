@@ -358,7 +358,11 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 新 Key 已匹配且报价和探活正常，启用仍返回 `route_not_ready` 时，核对教师概览的 `school_model_id`、`preferred_routes`、`bound_routes` 与 `blockers`。同名的 `inactive` 历史目标可能使旧版误判为多目标。修复后，缺少校内关联或仍指向历史目标的候选可接入唯一已确认的当前 UUID。预览应显示同一把 Key 的可用协议，启用后在 `bound_routes` 核对每条协议和原 UUID。没有现有绑定时，可直接使用启用操作，重建绑定预览主要核对已有线路。
 
+概览显示 `model_catalog.source=both`、`catalog_keys.state=listed` 且已有官网目录，但启用仍返回 `no_candidate` 时，查询该行的 `provider_model_catalog.catalog_source`。旧读取只接受 `key`，若生产行为 `both`，整条候选记录会从启用预览消失。修复后 `key|both` 统一作为 Key 载体，`both` 仍必须通过 Key 目录新鲜度、分组和探活检查；`website` 仍要求已有活动绑定。目录、定价、线路能力、探活和发布协议使用同一读取口径。
+
 设置独立的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run '^TestEnableModel(FirstConnect.*|RetiredSameName.*|MultipleLiveTargets|PrioritizesAuthFailure)Postgres$' -count=1 -v`。用例覆盖一把 Gemini Key 的两个协议、确认报价、成功探活、未关联或旧目标关联、按名称和 UUID 启用、重复启用，以及多目标、多候选、跨 Key 拼协议、缺价和缺少校内倍率时的阻断。查看单个响应的 `error.details.code`、批量的 `skipped[].code` 或教师概览的 `blockers` 定位具体原因。多个活跃校内目标拆成两行时，两行的阻断码和提示均与单模型、批量一致，均为 `multi_school`。
+
+运行 `go test ./internal/beichen -run '^(TestEnableModelCatalogSourceBoth|TestActivationCatalogSourceNeedsKeyEvidence|TestActivationCatalogSourceWebsiteOnlyNeedsBinding)Postgres$' -count=1 -v` 验证 `both`。生产形状使用组 `31`、倍率 `0.5`、确认价格、两种协议探活成功和唯一当前校内目标；同时覆盖 Key 目录过期、分组拒绝与 `website` 无绑定。
 
 测试中刚写入的 Key 目录被判为陈旧时，核对目录观测时间是否早于凭据版本或分组变更。构造当前目录的测试数据使用 PostgreSQL 时钟，避免 Windows 上应用与数据库的时钟精度差异影响时间先后。
 

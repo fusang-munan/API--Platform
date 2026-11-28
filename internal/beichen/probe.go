@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 )
 
 type ProbeRun struct {
@@ -49,7 +50,7 @@ const activeProbeCatalog = `EXISTS (
   SELECT 1 FROM provider_model_catalog m JOIN provider_credentials c
     ON c.id = m.credential_id AND c.provider_id = m.provider_id
   WHERE m.provider_id = p.id AND m.status = 'active' AND c.status = 'active'
-    AND m.catalog_source = 'key' AND m.last_seen_at >= c.updated_at
+    AND m.catalog_source IN ` + catalog.BeichenKeyCatalogSourcesSQL + ` AND m.last_seen_at >= c.updated_at
 )`
 
 // RequestProbes uses requested_at as the durable marker for a forced sweep.
@@ -157,7 +158,7 @@ JOIN providers p ON p.id = r.provider_id AND p.status = 'active'
 JOIN provider_credentials c ON c.id = r.credential_id AND c.provider_id = p.id AND c.status = 'active'
 JOIN provider_model_catalog m ON m.provider_id = p.id AND m.credential_id = c.id
   AND m.model_id = r.model::citext AND m.model_id::text = r.model AND m.status = 'active'
-WHERE r.provider_id = $1 AND r.checked_at >= c.updated_at AND m.catalog_source = 'key' AND m.last_seen_at >= c.updated_at
+WHERE r.provider_id = $1 AND r.checked_at >= c.updated_at AND m.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AND m.last_seen_at >= c.updated_at
   AND (cardinality(m.supported_protocols) = 0 OR r.protocol = ANY(m.supported_protocols))
 ORDER BY r.checked_at DESC, r.credential_id, r.model, r.protocol
 LIMIT 100`, providerID)

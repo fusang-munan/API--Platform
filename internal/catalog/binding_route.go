@@ -45,7 +45,7 @@ const BeichenCatalogAuthFailureSQL = `EXISTS (
 const BeichenCatalogAuthReadySQL = `NOT (` + BeichenCatalogAuthFailureSQL + `)`
 
 const BeichenCurrentCatalogProbeSQL = `r.provider_id=k.provider_id AND r.credential_id=k.credential_id
-  AND r.model=k.model_id::text AND k.status='active' AND k.catalog_source='key'
+  AND r.model=k.model_id::text AND k.status='active' AND k.catalog_source IN ` + BeichenKeyCatalogSourcesSQL + `
   AND ` + BeichenCurrentProbeSQL
 
 // BindingRouteReady checks catalog coverage and confirmed upstream restrictions.

@@ -547,7 +547,7 @@ ORDER BY k.credential_id, k.model_id`, providerID)
 func readCredentials(ctx context.Context, tx *sql.Tx, providerID uuid.UUID, view *Overview) error {
 	keyModels := make([]Model, 0, len(view.Models))
 	for _, row := range view.Models {
-		if row.CatalogSource == "key" {
+		if beichenKeyCatalogSource(row.CatalogSource) {
 			keyModels = append(keyModels, row)
 		}
 	}

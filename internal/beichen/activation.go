@@ -122,7 +122,7 @@ const activationSchoolSourcesSQL = `school_sources AS (
 func readActivationCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID, source string, schoolID *uuid.UUID) ([]*activationModel, error) {
 	query := `
 WITH ` + catalog.BeichenKeyEvidenceCTE + `, ` + activationSchoolSourcesSQL + `
-SELECT k.model_id::text,k.raw_entry,p.name::text,c.id,c.label::text,k.catalog_source='key',
+SELECT k.model_id::text,k.raw_entry,p.name::text,c.id,c.label::text,k.catalog_source IN ` + catalog.BeichenKeyCatalogSourcesSQL + `,
  p.status='active' AND c.status='active' AND k.last_seen_at>=c.updated_at,
  ` + catalog.BeichenKeyListsModelSQL + ` AND ` + catalog.BeichenGroupAllowsRouteSQL + ` AND octet_length(c.credential_ciphertext)>0,
  CASE WHEN billing.last_error IS NULL AND billing.last_success>=c.updated_at
@@ -147,7 +147,7 @@ LEFT JOIN LATERAL (SELECT multiplier,stale_at,group_id FROM beichen_multiplier_v
  AND effective_at<=statement_timestamp()
  ORDER BY effective_at DESC,id DESC LIMIT 1) mv ON true
 WHERE p.id=$1 AND ` + beichenProvider + ` AND k.status='active'
- AND (k.catalog_source='key' OR (k.catalog_source='website' AND EXISTS (
+ AND (k.catalog_source IN ` + catalog.BeichenKeyCatalogSourcesSQL + ` OR (k.catalog_source='website' AND EXISTS (
    SELECT 1 FROM model_bindings b JOIN models s ON s.id=b.model_id
    WHERE b.provider_id=k.provider_id AND btrim(b.upstream_model_name)::citext=k.model_id
      AND (b.credential_id IS NULL OR b.credential_id=k.credential_id)
@@ -240,19 +240,19 @@ ORDER BY lower(k.model_id::text),c.id`
 WITH `+catalog.BeichenKeyEvidenceCTE+`, `+activationSchoolSourcesSQL+`, north AS (
  SELECT DISTINCT k.model_id FROM provider_model_catalog k
  WHERE k.provider_id=$1 AND ($2::text='' OR k.model_id=$2::citext)
-   AND ((k.status='active' AND k.catalog_source='key')
+   AND ((k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+`)
      OR ($2::text='' AND EXISTS (SELECT 1 FROM models s WHERE s.model_id=k.model_id)))
  UNION
  SELECT btrim(b.upstream_model_name)::citext FROM model_bindings b JOIN models s ON s.id = b.model_id
  WHERE b.provider_id=$1 AND s.status='active' AND btrim(b.upstream_model_name)<>''
    AND ($2::text='' OR btrim(b.upstream_model_name)::citext=$2::citext)
 ), school_names AS (
- SELECT n.model_id AS upstream,m.id,k.status='active' AND k.catalog_source='key' AS key_or_binding
+ SELECT n.model_id AS upstream,m.id,k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AS key_or_binding
  FROM north n JOIN provider_model_catalog k ON k.provider_id=$1 AND k.model_id=n.model_id
  CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
  `+joinModelAliasSQL+`
  JOIN models m ON m.model_id=COALESCE(alias.school_model,a.model)::citext
- WHERE (k.status='active' AND k.catalog_source='key') OR $2::text=''
+ WHERE (k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+`) OR $2::text=''
  UNION ALL
  SELECT n.model_id,b.model_id,true FROM north n JOIN model_bindings b ON b.provider_id=$1 AND lower(btrim(b.upstream_model_name))=lower(n.model_id::text)
 ), names AS (

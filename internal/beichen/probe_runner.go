@@ -282,7 +282,7 @@ CROSS JOIN LATERAL (
   WHERE r.provider_id = p.id AND r.credential_id = c.id AND r.model = m.model_id::text
 ) prior
 WHERE p.id = $1 AND `+beichenProvider+` AND p.status = 'active' AND c.status = 'active' AND m.status = 'active'
-  AND m.catalog_source = 'key'
+  AND m.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+`
   AND m.last_seen_at >= c.updated_at
 ORDER BY c.id, m.model_id`, job.provider, job.startedAt, job.force)
 	if err != nil {
@@ -441,7 +441,7 @@ SELECT c.id FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
 WHERE p.id = $1 AND `+beichenProvider+` AND p.status = 'active' AND c.id = $2 AND c.status = 'active' AND c.updated_at = $3
   AND EXISTS (SELECT 1 FROM provider_model_catalog m
     WHERE m.provider_id=p.id AND m.credential_id=c.id AND m.model_id::text=$4
-      AND m.status='active' AND m.catalog_source='key' AND m.last_seen_at>=c.updated_at)
+      AND m.status='active' AND m.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AND m.last_seen_at>=c.updated_at)
 FOR SHARE OF p FOR NO KEY UPDATE OF c`, job.provider, target.credential, target.revision, target.model).Scan(&key)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
@@ -463,7 +463,7 @@ WITH saved AS (
     CASE WHEN NULLIF($6, '') IS NULL AND $5 BETWEEN 200 AND 299 THEN statement_timestamp() END
   FROM provider_model_catalog m
   WHERE m.provider_id = $1 AND m.credential_id = $2 AND m.model_id = $3::citext
-    AND m.model_id::text = $3::text AND m.status = 'active' AND m.catalog_source = 'key'
+    AND m.model_id::text = $3::text AND m.status = 'active' AND m.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+`
   ON CONFLICT (provider_id, credential_id, model, protocol) DO UPDATE SET status_code = EXCLUDED.status_code,
     error_code = EXCLUDED.error_code, duration_ms = EXCLUDED.duration_ms, checked_at = EXCLUDED.checked_at, detail = EXCLUDED.detail,
     last_passed_at = COALESCE(EXCLUDED.last_passed_at,

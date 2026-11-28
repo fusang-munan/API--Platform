@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
@@ -100,7 +101,7 @@ SELECT c.id, c.label::text, COALESCE(school.channel,''), COALESCE(c.group_hint,'
   COALESCE(w.group_id,a.group_id), w.group_id, w.checked_at, to_json(w.models),
   `+keyCatalogCurrentSQL+`, d.last_error IS NOT NULL, d.last_success IS NOT NULL,
   to_json(ARRAY(SELECT m.model_id::text FROM provider_model_catalog m
-    WHERE m.credential_id=c.id AND m.status='active' AND m.catalog_source<>'key'))
+    WHERE m.credential_id=c.id AND m.status='active' AND m.catalog_source NOT IN `+catalog.BeichenKeyCatalogSourcesSQL+`))
 FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
 LEFT JOIN beichen_datasets d ON d.credential_id = c.id AND d.kind = 'catalog'
 LEFT JOIN beichen_website_catalogs w ON w.credential_id = c.id AND w.credential_revision = c.updated_at
@@ -295,7 +296,7 @@ func indexDiscoveryKeys(models []Model, keys []discoveryKey, aliases []ModelAlia
 		if row.CatalogSource == "" && key.nonKeyNames != nil && !slices.Contains(key.nonKeyNames, row.Model) {
 			row.CatalogSource = "key"
 		}
-		if row.CatalogSource != "key" {
+		if !beichenKeyCatalogSource(row.CatalogSource) {
 			continue
 		}
 		if key.State == "missing" {
@@ -319,6 +320,10 @@ func indexDiscoveryKeys(models []Model, keys []discoveryKey, aliases []ModelAlia
 		}
 		key.matcher = newCatalogNameMatcher(slices.Collect(maps.Keys(key.models)), mapping)
 	}
+}
+
+func beichenKeyCatalogSource(source string) bool {
+	return source == "key" || source == "both"
 }
 
 func websiteGroupCatalog(platforms []directoryPlatform, groupID *int64) ([]string, *time.Time) {
