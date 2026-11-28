@@ -1,6 +1,7 @@
 package beichen
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/domain"
 )
 
 const ProvisionActorID = "01953422-b1f7-7c50-81b1-734f142827bb"
@@ -322,6 +324,155 @@ func (s *Service) SetPanelAccess(ctx context.Context, provider, credential, acto
 	return s.write(ctx, provider, credential, func(tx *sql.Tx) error {
 		return s.WritePanelAccessTx(ctx, tx, credential, actor, input)
 	})
+}
+
+// SetTeacherPanelAccess is the teacher-facing write path. A manually supplied
+// upstream Key ID must match the current Key inventory and the same
+// cross-credential evidence ranking used by automatic discovery.
+func (s *Service) SetTeacherPanelAccess(ctx context.Context, provider, credential, actor uuid.UUID, input PanelAccessInput) error {
+	if err := input.validate(); err != nil {
+		return err
+	}
+	if actor == uuid.Nil {
+		return invalid("需要有效的教师 ID")
+	}
+	if input.UpstreamKeyID == nil {
+		return s.SetPanelAccess(ctx, provider, credential, actor, input)
+	}
+	// Check the supplied panel bearer against the inventory used by discovery
+	// before taking any database locks.
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	target, err := readPanelKeyTarget(ctx, s.db, provider, credential)
+	if err != nil {
+		return err
+	}
+	unverified := invalid("无法核对推理 Key、官网 Key ID 和分组的归属，请使用自动发现")
+	secret, err := s.crypto.DecryptCredential(target.encrypted)
+	if err != nil || secret == input.Token {
+		return unverified
+	}
+	keys, err := s.accountKeys(ctx, input.Token)
+	if err != nil {
+		return unverified
+	}
+	key, err := s.manualPanelKey(ctx, s.db, provider, credential, keys)
+	if err != nil || key.ID != *input.UpstreamKeyID || key.GroupID != input.GroupID {
+		return unverified
+	}
+	return s.write(ctx, provider, credential, func(tx *sql.Tx) error {
+		current, err := readPanelKeyTarget(ctx, tx, provider, credential)
+		if err != nil {
+			return err
+		}
+		if !target.revision.Equal(current.revision) || target.label != current.label || target.channel != current.channel ||
+			!bytes.Equal(target.encrypted, current.encrypted) {
+			return domain.NewError(domain.CodeInvalidTransition, "北辰凭据或渠道信息已变更，请重新核对后提交")
+		}
+		key, err := s.manualPanelKey(ctx, tx, provider, credential, keys)
+		if err != nil || key.ID != *input.UpstreamKeyID || key.GroupID != input.GroupID {
+			return unverified
+		}
+		available, err := panelKeyAvailableTx(ctx, tx, credential, key.ID)
+		if err != nil {
+			return err
+		}
+		if !available {
+			return domain.NewError(domain.CodeNameConflict, "该官网 Key 已绑定其他校内渠道")
+		}
+		if err := s.WritePanelAccessTx(ctx, tx, credential, actor, input); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `
+UPDATE beichen_provision_channels SET upstream_user_id=$2,checked_at=$3,discovery_error=NULL
+WHERE credential_id=$1`, credential, key.UserID, key.checkedAt)
+		return err
+	})
+}
+
+type panelKeyTargetReader interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func readPanelKeyTarget(ctx context.Context, db panelKeyTargetReader, provider, credential uuid.UUID) (discoveryJob, error) {
+	target := discoveryJob{provider: provider, credential: credential}
+	err := db.QueryRowContext(ctx, `
+SELECT c.label::text,COALESCE(j.channel,''),c.credential_ciphertext,c.updated_at
+FROM provider_credentials c JOIN providers p ON p.id=c.provider_id
+LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
+WHERE p.id=$1 AND c.id=$2 AND p.status='active' AND c.status='active' AND `+beichenProvider,
+		provider, credential).Scan(&target.label, &target.channel, &target.encrypted, &target.revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return target, invalid("该北辰凭据已停用或不属于此供应商")
+	}
+	if err != nil {
+		return target, unavailable("读取北辰 Key 归属失败", err)
+	}
+	return target, nil
+}
+
+func panelKeyAvailableTx(ctx context.Context, tx *sql.Tx, credential uuid.UUID, key int64) (bool, error) {
+	var available bool
+	err := tx.QueryRowContext(ctx, `SELECT beichen_upstream_key_available($1,$2)`, key, credential).Scan(&available)
+	return available, err
+}
+
+type panelKeyReader interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+// manualPanelKey applies the inventory's cross-credential evidence ranking.
+// A masked match on this credential cannot beat a stronger match on another.
+func (s *Service) manualPanelKey(ctx context.Context, db panelKeyReader, provider, credential uuid.UUID, keys []listedKey) (listedKey, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT c.id,c.credential_ciphertext,c.label::text,COALESCE(j.channel,c.label::text)
+FROM provider_credentials c
+LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
+WHERE c.provider_id=$1 AND c.status='active'
+ORDER BY c.id FOR NO KEY UPDATE OF c`, provider)
+	if err != nil {
+		return listedKey{}, unavailable("读取北辰渠道归属证据失败", err)
+	}
+	defer rows.Close()
+	claims := make([]websiteKeyClaim, len(keys))
+	var targetCandidates []int
+	targetStrength := 0
+	found := false
+	for rows.Next() {
+		var id uuid.UUID
+		var encrypted []byte
+		var label, channel string
+		if err := rows.Scan(&id, &encrypted, &label, &channel); err != nil {
+			return listedKey{}, unavailable("读取北辰渠道归属证据失败", err)
+		}
+		secret, err := s.crypto.DecryptCredential(encrypted)
+		if err != nil {
+			return listedKey{}, invalid("无法核对北辰推理 Key 的归属证据")
+		}
+		candidates, strength := websiteKeyCandidates(keys, secret, channel, label)
+		for _, i := range candidates {
+			claim := &claims[i]
+			if strength > claim.strength {
+				*claim = websiteKeyClaim{strength: strength, count: 1}
+			} else if strength == claim.strength {
+				claim.count++
+			}
+		}
+		if id == credential {
+			found, targetCandidates, targetStrength = true, candidates, strength
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return listedKey{}, unavailable("读取北辰渠道归属证据失败", err)
+	}
+	if !found || len(targetCandidates) != 1 {
+		return listedKey{}, errKeyMatch
+	}
+	i := targetCandidates[0]
+	if claims[i].strength != targetStrength || claims[i].count != 1 {
+		return listedKey{}, errKeyMatch
+	}
+	return keys[i], nil
 }
 
 // PanelSourceMatches compares a stored source without logging in while holding DB locks.

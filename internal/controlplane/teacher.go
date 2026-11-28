@@ -456,7 +456,11 @@ func (s *Service) UpdateProvider(ctx context.Context, id uuid.UUID, input Provid
 		return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "start provider update transaction", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	current, err := tx.Provider.Query().Where(provider.IDEQ(id)).Only(ctx)
+	query := tx.Provider.Query().Where(provider.IDEQ(id))
+	if input.BaseURL != "" {
+		query.ForUpdate()
+	}
+	current, err := query.Only(ctx)
 	if ent.IsNotFound(err) {
 		return ProviderView{}, domain.NewError(domain.CodeNotFound, "provider not found")
 	}
@@ -476,7 +480,21 @@ func (s *Service) UpdateProvider(ctx context.Context, id uuid.UUID, input Provid
 		if err != nil {
 			return ProviderView{}, err
 		}
-		builder.SetBaseURL(baseURL)
+		if catalog.IsBeichenBaseURL(current.BaseURL) && catalog.IsBeichenBaseURL(baseURL) {
+			// Different official URL spellings use the same upstream.
+			input.BaseURL = ""
+		} else if baseURL != current.BaseURL {
+			if catalog.IsBeichenBaseURL(current.BaseURL) {
+				exists, err := current.QueryCredentials().Exist(ctx)
+				if err != nil {
+					return ProviderView{}, domain.WrapError(domain.CodeDependencyUnavailable, "核对北辰凭据失败", err)
+				}
+				if exists {
+					return ProviderView{}, domain.NewError(domain.CodeInvalidTransition, "供应商已有北辰凭据，不能修改接口地址")
+				}
+			}
+			builder.SetBaseURL(baseURL)
+		}
 	}
 	if input.Status != nil {
 		status, err := resourceStatus(input.Status, "")

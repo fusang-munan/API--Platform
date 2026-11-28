@@ -116,7 +116,8 @@ VALUES ($1,'billing',$2,clock_timestamp()+interval '1 minute')`, claude, oldLeas
 	}
 	if gemini.CredentialID == nil || *gemini.CredentialID != credentials[0] || gemini.Rate == nil || *gemini.Rate != "0.3" ||
 		gm.GroupName == nil || *gm.GroupName != "GM1" || gm.CredentialID == nil || *gm.CredentialID != credentials[1] ||
-		gm.Rate != nil || gpt.GroupID != nil || gpt.Enabled == nil || *gpt.Enabled || gpt.CredentialID == nil || *gpt.CredentialID != credentials[2] {
+		gm.Rate != nil || gpt.GroupID != nil || gpt.Enabled == nil || *gpt.Enabled || gpt.CredentialID != nil ||
+		gpt.MatchStatus != "unmatched" {
 		t.Fatal("other Keys did not preserve their own group, status and missing facts")
 	}
 	encoded, err := json.Marshal(view)
@@ -172,7 +173,7 @@ FROM beichen_multiplier_versions m WHERE m.credential_id=$1 ORDER BY m.effective
 	}
 	responseState.Store(2)
 	view = refresh("current")
-	if view.Keys[0].GroupID != nil || view.Keys[0].Rate != nil || view.Keys[0].MatchStatus != "matched" {
+	if view.Keys[0].GroupID != nil || view.Keys[0].Rate != nil || view.Keys[0].MatchStatus != "unmatched" {
 		t.Fatal("missing group inherited old data or lost the Key match")
 	}
 	assertVersionCount()

@@ -251,16 +251,16 @@ func websiteKeyMatchStrength(key listedKey, secret string, digest [sha256.Size]b
 	return 0
 }
 
-func websiteKeyCandidates(keys []listedKey, secret, channel, label string) []int {
+func websiteKeyCandidates(keys []listedKey, secret, channel, label string) ([]int, int) {
 	if secret == "" {
-		return nil
+		return nil, 0
 	}
 	digest := sha256.Sum256([]byte(secret))
 	var candidates []int
-	best := 1
+	best := 0
 	for i, key := range keys {
 		strength := websiteKeyMatchStrength(key, secret, digest, channel, label)
-		if strength < best {
+		if strength == 0 || strength < best {
 			continue
 		}
 		if strength > best {
@@ -268,5 +268,5 @@ func websiteKeyCandidates(keys []listedKey, secret, channel, label string) []int
 		}
 		candidates = append(candidates, i)
 	}
-	return candidates
+	return candidates, best
 }
