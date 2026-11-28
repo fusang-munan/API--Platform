@@ -46,8 +46,8 @@ it('展示 CC2 的官网分组和单 Key 流水，在弹层按倍率核对选中
   expect(view.text()).toContain('北辰 Key 42')
   // 账号余额属于账号级数据，不能出现在单 Key 能力卡片里。
   expect(view.text()).not.toContain('4.974')
-  expect(view.text()).toContain('单日原价 0.11 元 · 实付 0.066 元')
-  expect(view.get('.key-day-usage > small').text()).toBe('北辰原始币种标记 USD')
+  expect(view.text()).toContain('原价 0.11 元 · 实付 0.066 元')
+  expect(view.get('.key-day-usage > small').text()).toBe('原币 USD')
   expect(view.text()).toContain('缓存读取 — · 缓存写入 0')
   expect(view.get('a').text()).toBe('打开北辰核对分组')
   expect(view.find('form').exists()).toBe(false)
@@ -128,6 +128,7 @@ it.each(['unknown', null, 'CNY'])('日金额统一用元，分开列出 Key 清�
   expect(table.findAll('tbody tr')[0].findAll('td').map(cell => cell.text())).toEqual(['1', '—', '0 元', '0.6×'])
   expect(table.findAll('tbody tr')[1].findAll('td').map(cell => cell.text())).toEqual(['2', '0.11 元', '0.066 元', '0.6×与已存偏差超过 5%'])
   expect(view.text()).toContain('实付 0.066 元')
+  expect(view.get('.key-day-usage > small').text()).toBe('原币 ' + (day_unit ?? 'unknown'))
   expect(view.text()).not.toMatch(/币种待核|原始币种标记/)
   view.unmount()
 })

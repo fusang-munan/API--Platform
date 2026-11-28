@@ -1,5 +1,6 @@
 import { DOMWrapper, enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { defineComponent } from 'vue'
+import { readFileSync } from 'node:fs'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { APIError } from '../../api/client'
 import type { BeichenActivationDiagnostics, BeichenBatchEnableResult, BeichenModelUsage, BeichenPriceConditions, BeichenRebindPlan, BeichenUsageRange, BeichenUsageTotals, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../../api/types'
@@ -8,6 +9,7 @@ import BeichenPriceDrawer from '../../components/BeichenPriceDrawer.vue'
 import BeichenSchoolModels from './BeichenSchoolModels.vue'
 import { indexWebsiteKeyGroups, schoolCatalog, schoolTokenPriceAt, type TeacherBoundRoute, type TeacherCatalogModel, type TeacherOverview } from '../../utils/beichenModels'
 import componentSource from './BeichenSchoolModels.vue?raw'
+const beichenStyleSource = readFileSync('src/styles-beichen.css', 'utf8')
 
 const api = vi.hoisted(() => ({
   beichenOverview: vi.fn(), beichenWebsiteKeys: vi.fn(), refreshBeichenWebsiteKeys: vi.fn(),
@@ -2069,6 +2071,105 @@ describe('北辰模型管理', () => {
     expect(incomplete.get('[data-testid="price-missing"]').text()).toContain('缺价')
   })
 
+  it('历史反推价只作参考，缺价且无可结算覆盖时调用不可用', async () => {
+    const model = 'lab/derived-only'
+    const key = 'key-' + model
+    const data = overview([{ model, active: true, catalog: {
+      catalog_state: 'key_listed', activation: 'active', price_state: 'derived', price_covered: false,
+      ready_count: 1, bound_key_count: 1, covered_bound_key_count: 1,
+      bound_routes: [boundRoute(model, key, 10, { price_state: 'derived', price_covered: false })],
+      catalog_keys: [{ credential_id: key, label: 'G3', group_id: 10, state: 'listed', upstream_model: model }],
+      route_availability: responsesAvailable,
+    } }])
+    Object.assign(data.models![0], {
+      price_status: 'derived', price_source: 'derived_from_usage', price_observed_at: '2026-11-21T12:14:00Z',
+      price_conditions_exact: { billing_mode: 'token', input_price: '0.000004', output_price: '0.00002' },
+    })
+    data.datasets = [{ kind: 'billing', credential_id: key, group_id: 10, group_rate: '0.5',
+      group_status: 'assigned', billing_state: 'current', effective_multiplier: '0.5', observed_at: quoteObservedAt }]
+    api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(websiteKeys({
+      credential_id: key, group_id: 10, group_name: 'G3', rate: '0.5', observed_at: keyObservedAt,
+    }))
+    const wrapper = view()
+    await flushPromises()
+
+    const row = wrapper.get(`[data-model="${model}"]`)
+    expect(row.get('[data-testid="model-publication"]').text()).toBe('已启用')
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('不可用')
+    expect(row.get('[data-testid="price-missing"]').text()).toContain('历史反推价待核对')
+    expect(row.get('[data-testid="recommended-protocol"]').text()).toBe('推荐协议待核实')
+    expect(row.findAll('.model-statuses dt').map(cell => cell.text())).toEqual(['发布', '调用', '报价'])
+  })
+
+  it('合并不同上游都缺结算价时按报价显示不可用，不按探活推荐协议', async () => {
+    const school = 'lab/merged-school'
+    const schoolId = '00000000-0000-4000-8000-000000000201'
+    const models = ['lab/merged-missing-a', 'lab/merged-missing-b']
+    const data = overview(models.map((model, index) => ({
+      model, active: true, catalog: {
+        school_model: school, school_model_id: schoolId, catalog_state: 'key_listed', activation: 'active',
+        ready_count: 1, bound_key_count: 1, covered_bound_key_count: 1, price_state: 'missing', price_covered: false,
+        bound_routes: [boundRoute(model, 'key-' + model, 10 + index, {
+          school_model: school, price_state: 'missing', price_covered: false,
+          protocol: index ? 'openai_compatible' : 'openai_responses',
+        })],
+        route_availability: {
+          ...responsesAvailable, availability: 'unavailable', available_protocols: [],
+          protocols: ['openai_responses', 'openai_compatible'],
+          recommended_protocol: index ? 'openai_compatible' : 'openai_responses',
+        },
+      },
+    })))
+    api.beichenOverview.mockResolvedValue(data)
+    const wrapper = view()
+    await flushPromises()
+
+    const row = wrapper.get(`[data-catalog-key="${schoolId}"]`)
+    expect(row.get('[data-testid="model-publication"]').text()).toBe('已启用')
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('不可用')
+    expect(row.get('[data-testid="price-missing"]').text()).toContain('缺价')
+    expect(row.get('[data-testid="recommended-protocol"]').text()).toBe('推荐协议待核实')
+    expect(row.findAll('.model-statuses dt').map(cell => cell.text())).toEqual(['发布', '调用', '报价'])
+  })
+
+  it.each([
+    ['固定价', { price_state: 'confirmed', price_covered: true }],
+    ['手动价', { price_state: 'manual', price_covered: false, student_price: { status: 'manual', reason: '手动价可结算' } }],
+    ['条件价', { price_state: 'conditional', price_covered: true }],
+  ] as const)('合并不同上游时，%s备用线路仍可结算', async (_label, pricedRoute) => {
+    const school = 'lab/merged-priced-school'
+    const schoolId = '00000000-0000-4000-8000-000000000202'
+    const missing = 'lab/merged-priced-missing'
+    const priced = 'lab/merged-priced-route'
+    const data = overview([
+      { model: missing, active: true, catalog: {
+        school_model: school, school_model_id: schoolId, catalog_state: 'key_listed', activation: 'active',
+        ready_count: 1, bound_key_count: 1, covered_bound_key_count: 1, price_state: 'missing', price_covered: false,
+        bound_routes: [boundRoute(missing, 'key-missing', 12, {
+          school_model: school, price_state: 'missing', price_covered: false, protocol: 'openai_responses',
+        })],
+        route_availability: { ...responsesAvailable, availability: 'unavailable', available_protocols: [] },
+      } },
+      { model: priced, active: true, catalog: {
+        school_model: school, school_model_id: schoolId, catalog_state: 'key_listed', activation: 'active',
+        ready_count: 1, bound_key_count: 1, covered_bound_key_count: 1, price_state: pricedRoute.price_state, price_covered: pricedRoute.price_covered,
+        bound_routes: [boundRoute(priced, 'key-priced', 1, {
+          school_model: school, protocol: 'openai_compatible', ...pricedRoute,
+        })],
+        route_availability: responsesAvailable,
+      } },
+    ])
+    api.beichenOverview.mockResolvedValue(data)
+    const wrapper = view()
+    await flushPromises()
+
+    const row = wrapper.get(`[data-catalog-key="${schoolId}"]`)
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('可用')
+    expect(row.find('[data-testid="price-missing"]').exists()).toBe(false)
+    expect(row.get('[data-testid="recommended-protocol"]').text()).toBe('推荐 OpenAI Chat')
+  })
+
   it('价格表使用当前 Key 分组的完整官网价和采集时间', async () => {
     const data = overview([{ model: 'lab/a', catalog: { website_locations: [{
       name: 'lab/a', observed_at: '2026-11-21T11:30:00Z', groups: [{ id: 2, name: '分组 2', rate_multiplier: '0.1' }],
@@ -2451,6 +2552,11 @@ describe('北辰模型管理', () => {
     expect(row.find('[data-testid="current-group-missing"]').exists()).toBe(false)
     expect(componentSource).toContain('@container (max-width: 60rem)')
     expect(componentSource).not.toContain('overflow-x: auto')
+    expect(componentSource).toContain('.model-statuses dd { min-width: 0;')
+    expect(componentSource).toContain('.model-price, .model-price-content { min-width: 0; overflow: hidden; }')
+    expect(componentSource).toContain('class="beichen-stack tier-dialog"')
+    expect(beichenStyleSource).toContain('.dialog-content:has(> .tier-dialog)')
+    expect(beichenStyleSource).toContain('.tier-dialog .condition-tier-table-wrap { width: 100%; overflow-x: auto; }')
   })
 
   it.each([

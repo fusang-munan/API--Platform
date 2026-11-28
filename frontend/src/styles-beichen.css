@@ -73,6 +73,7 @@
 /* Keep both price rows aligned under the same billing items on the teacher model page. */
 .beichen-models .current-group-prices .group-price-table-wrap,
 .condition-tier-table-wrap { min-width: 0; overflow-x: auto; }
+.beichen-models .current-group-prices { grid-template-columns: minmax(0, 1fr); width: 100%; max-width: 100%; }
 .beichen-models .current-group-prices .group-price-table,
 .condition-tier-table-wrap .condition-tier-table { display: table; width: 100%; min-width: 27rem; }
 .beichen-models .current-group-prices .group-price-table thead,
@@ -87,3 +88,11 @@
 .beichen-models .current-group-prices .group-price-table th:first-child { width: 5.8rem; padding-inline-start: 0; }
 .beichen-models .current-group-prices .group-price-table td.numeric-cell::before { content: none; }
 .condition-tier-table-wrap .condition-tier-table .numeric-cell { text-align: right; }
+
+/* The tier dialog must keep its fixed width on narrow screens; only the table scrolls. */
+.dialog-content:has(> .tier-dialog) { width: min(920px, calc(100% - 24px)); max-width: calc(100vw - 24px); overflow-x: hidden; }
+.tier-dialog { grid-template-columns: minmax(0, 1fr); width: 100%; max-width: 100%; min-width: 0; }
+.tier-dialog > *, .tier-dialog .condition-quote, .tier-dialog .condition-tier,
+.tier-dialog .condition-tier-table-wrap { min-width: 0; max-width: 100%; }
+.tier-dialog .condition-quote, .tier-dialog .condition-tier { overflow: hidden; }
+.tier-dialog .condition-tier-table-wrap { width: 100%; overflow-x: auto; }

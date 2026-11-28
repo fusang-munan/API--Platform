@@ -26,9 +26,8 @@ function dayAmount(value?: string | null) {
   return amount === '—' ? amount : amount + ' 元'
 }
 
-function reportedUnit(unit?: string | null) {
-  const value = unit?.trim()
-  return value && !['unknown', 'cny', 'rmb', '元', '人民币'].includes(value.toLowerCase()) ? value : ''
+function originalCurrency(unit?: string | null) {
+  return unit?.trim() || 'unknown'
 }
 
 function tokenParts(usage: BeichenKeyUsageMetric) {
@@ -106,10 +105,10 @@ onBeforeUnmount(() => { disposed = true })
         <section v-if="key.daily_usage || key.model_stats.length || key.model_stats_fetched_at" class="key-day-usage" aria-label="账日用量">
           <div v-if="key.daily_usage" class="key-day-total">
             <strong>{{ key.daily_usage.date }} · {{ formatTokens(key.daily_usage.requests) }} 笔</strong>
-            <p>单日原价 {{ dayAmount(key.daily_usage.cost) }} · 实付 {{ dayAmount(key.daily_usage.actual_cost) }}</p>
+            <p>原价 {{ dayAmount(key.daily_usage.cost) }} · 实付 {{ dayAmount(key.daily_usage.actual_cost) }}</p>
             <p class="beichen-note">{{ tokenParts(key.daily_usage) }}</p>
           </div>
-          <small v-if="reportedUnit(key.day_unit)" class="beichen-note">北辰原始币种标记 {{ reportedUnit(key.day_unit) }}</small>
+          <small class="beichen-note">原币 {{ originalCurrency(key.day_unit) }}</small>
           <div v-if="key.model_stats.length || key.model_stats_fetched_at" class="key-usage-models">
             <h5>账日有记录 {{ formatTokens(key.model_stats.length) }} 个</h5>
             <p class="beichen-note">
@@ -164,7 +163,7 @@ onBeforeUnmount(() => { disposed = true })
 </template>
 
 <style scoped>
-.key-evidence { display: grid; gap: 10px; min-width: 0; padding: 14px; border: 1px solid var(--line); border-radius: 12px; overflow-wrap: anywhere; }
+.key-evidence { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; width: 100%; max-width: 100%; min-width: 0; padding: 14px; border: 1px solid var(--line); border-radius: 12px; overflow-wrap: anywhere; }
 .key-evidence p, h3, .key-evidence h4, .key-evidence h5 { margin: 0; }
 .key-evidence-head { align-items: center; }
 .key-identity { min-width: 0; display: grid; gap: 3px; }
@@ -176,12 +175,13 @@ onBeforeUnmount(() => { disposed = true })
 .key-evidence-details { border-top: 1px solid var(--line); padding-top: 10px; min-width: 0; }
 .key-evidence-details summary { cursor: pointer; font-size: 13px; font-weight: 700; }
 .key-evidence-details[open] summary { margin-bottom: 10px; }
+.key-evidence-details:not([open]) > :not(summary) { display: none; }
 .key-models { display: flex; flex-wrap: wrap; gap: 5px 26px; margin: 0; padding: 0 0 0 18px; }
-.key-day-usage { display: grid; gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); min-width: 0; }
-.key-day-total, .key-usage-models { display: grid; gap: 5px; min-width: 0; }
+.key-day-usage { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; width: 100%; max-width: 100%; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); min-width: 0; }
+.key-day-total, .key-usage-models { display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; width: 100%; max-width: 100%; min-width: 0; }
 .key-day-total, .key-usage-models h5 { font-size: 13px; }
 .key-day-total p { font-variant-numeric: tabular-nums; }
-.model-observations { min-width: 0; overflow-x: auto; }
+.model-observations { width: 100%; max-width: 100%; min-width: 0; overflow-x: auto; }
 .model-observations table { width: 100%; min-width: 30rem; border-collapse: collapse; font-size: 12px; }
 .model-observations th, .model-observations td { padding: 8px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: right; }
 .model-observations :is(th, td):first-child { text-align: left; padding-inline-start: 0; }

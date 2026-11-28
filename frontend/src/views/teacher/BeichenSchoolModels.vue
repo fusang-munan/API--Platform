@@ -411,6 +411,13 @@ function remainingRouteAvailability(routes: TeacherBoundRoute[], previousRecomme
       : '维护中。当前线路的协议最近一次探活均失败。', actionHint: '请核对剩余线路并重新探活。' }
 }
 
+function routeHasSettlementPrice(route: TeacherBoundRoute) {
+  if (!route.binding_ready) return false
+  const status = route.student_price?.status
+  if (status) return ['normal', 'manual', 'only_higher'].includes(status)
+  return route.price_covered && ['confirmed', 'manual', 'conditional'].includes(route.price_state)
+}
+
 function catalogRowCredentialIds(entry: TeacherCatalogModel) {
   const ids = new Set<string>()
   const hasBindings = Boolean(entry.bound_routes?.length)
@@ -509,8 +516,14 @@ const catalog = computed(() => {
     const readyRoutes = boundRoutes.filter(route => route.binding_ready)
     const bindingIssue = retired ? undefined : entry.binding_issue
     const primaryGroupDenial = bindingIssue?.code === 'group_not_allowed'
+    const pricedRoutes = readyRoutes.filter(routeHasSettlementPrice)
     const recomputeAvailability = changedGroup || Boolean(entry.upstreamEntries?.length && readyRoutes.length)
-    const remaining = recomputeAvailability ? remainingRouteAvailability(readyRoutes, entry.route_availability?.recommended_protocol) : undefined
+    const routeProbe = recomputeAvailability ? remainingRouteAvailability(readyRoutes, entry.route_availability?.recommended_protocol) : undefined
+    const remaining = recomputeAvailability ? (readyRoutes.length && !pricedRoutes.length
+      ? { ...routeProbe!, recommendedProtocol: undefined, availability: 'unavailable',
+        availabilityReason: '没有可结算的线路报价。历史反推价只作参考，请同步正式价或设置手动价。',
+        actionHint: '请同步价格或设置手动价。' }
+      : remainingRouteAvailability(pricedRoutes, entry.route_availability?.recommended_protocol)) : undefined
     const legacyBoundIds = preferred.filter(route => route.state === 'ready').map(route => route.credential_id!)
     const boundIds = new Set(entry.bound_routes
       ? boundRoutes.filter(route => route.key_enabled && route.credential_id).map(route => route.credential_id!)
@@ -530,8 +543,14 @@ const catalog = computed(() => {
     const reportedMissingPrice = !changedGroup && entry.price_state === 'missing'
     const priceBlocker = changedGroup ? undefined : entry.price_blocker?.message.trim()
     const legacyManualPrice = entry.bound_routes == null && row.quotes.some(quote => quote.mode === 'manual' && quote.priceReady)
-    const priceCovered = !retired && !websiteOnly && (readyRoutes.some(route => route.price_covered) || legacyManualPrice ||
-      !changedGroup && (entry.price_covered ?? (!reportedMissingPrice && row.priceReady)))
+    const legacyQuotePrice = entry.bound_routes == null && row.quotes.some(quote =>
+      quote.priceReady && quote.status !== 'derived' &&
+      (quote.mode === 'manual' || quote.status === 'confirmed' || quote.status === 'conditional'))
+    const legacyEntryPrice = entry.bound_routes == null && entry.price_covered === true &&
+      entry.price_state !== 'derived' && entry.price_state !== 'missing'
+    const priceCovered = !retired && !websiteOnly && (entry.bound_routes?.length
+      ? pricedRoutes.length > 0
+      : legacyManualPrice || legacyQuotePrice || legacyEntryPrice)
     const routeBlocked = routeCount === 0 || entry.blockers?.some(blocker => routeBlockerCodes.has(blocker.code)) === true
     const blockerMessages = (entry.blockers ?? [])
       .filter(blocker => !routeBlocked || !priceBlockerCodes.has(blocker.code))
@@ -602,6 +621,7 @@ const catalog = computed(() => {
       boundRoutes.some(route => route.published && routeGroupIssues.get(route)))
     const availability = remaining?.availability ?? entry.route_availability?.availability
     const availabilityState = remaining ? undefined : entry.route_availability?.availability_state
+    const routeState = routeProbe?.availability ?? entry.route_availability?.availability
     const reportedPriceUnavailable = availability === 'price_unavailable' || availabilityState === 'price_unavailable'
     const unavailable = availability === 'unavailable' || availabilityState === 'unavailable'
     const anomaly = !retired && !websiteOnly && (!partialGroupCheck &&
@@ -610,12 +630,15 @@ const catalog = computed(() => {
     const active = !retired && !anomaly && published && row.status !== 'pending_configuration' && readyCount > 0
     const availableProtocols = remaining ? readyRoutes.map(route => route.protocol) : entry.route_availability?.protocols ?? []
     const protocolNames = remaining || availableProtocols.length ? availableProtocols : entry.protocols ?? []
-    const priceMissing = !retired && !websiteOnly && !priceCovered && (reportedPriceUnavailable || reportedMissingPrice ||
+    const derivedOnly = !priceCovered && priceState === 'derived'
+    const priceMissing = !retired && !websiteOnly && !priceCovered && (reportedPriceUnavailable || reportedMissingPrice || derivedOnly ||
+      readyRoutes.length > 0 && !pricedRoutes.length ||
       priceState !== 'unverified' && priceState !== 'conditional' &&
       (priceState === 'missing' || priceState === 'derived' || Boolean(priceBlocker)) &&
       (entry.price_covered === false || Boolean(priceBlocker) || !websiteTerms ||
         missingPriceDetailLabels(websiteTerms).some(label => !label.startsWith('缓存'))))
-    const priceUnavailable = reportedPriceUnavailable || priceMissing && reportedMissingPrice
+    const priceUnavailable = reportedPriceUnavailable || priceMissing &&
+      (routeState !== 'maintenance' || !primaryGroupDenial)
     return {
       ...row, retired, active, anomaly, published, activation, canDisable: row.canDisable,
       enableSelector: entry.school_model_id?.trim() || row.model,
@@ -630,9 +653,11 @@ const catalog = computed(() => {
       upstreams: [...new Set((entry.upstreamEntries ?? [entry]).map(item => item.model))],
       protocolLabels: [...new Set(protocolNames)].map(protocolLabel),
       probeState: remaining?.probeState ?? entry.probe_state,
-      recommendedProtocol: remaining ? remaining.recommendedProtocol : entry.route_availability?.recommended_protocol,
+      recommendedProtocol: priceUnavailable ? undefined : remaining ? remaining.recommendedProtocol : entry.route_availability?.recommended_protocol,
       availability, unavailable, priceUnavailable,
-      availabilityReason: primaryGroupDenial ? undefined : remaining?.availabilityReason ?? entry.route_availability?.availability_reason,
+      routeState,
+      availabilityReason: primaryGroupDenial ? undefined : remaining?.availabilityReason ??
+        (derivedOnly ? '历史反推价只作参考，当前没有可结算价。' : entry.route_availability?.availability_reason),
       actionHint: priceUnavailable && availability === 'available' ? '请同步价格或设置手动价。' : remaining?.actionHint ?? entry.action_hint,
       protocolMissing: !primaryGroupDenial && !catalogPending && (routeCount === 0 || entry.protocols?.length === 0 && !availableProtocols.length),
       lastProbeAt: remaining ? remaining.lastProbeAt : entry.last_probe_at,
@@ -1216,8 +1241,10 @@ function withYuan(text: string, factor?: string) {
 function missingPriceLabel(row: CatalogRow) {
   const terms = row.groupPrices.website?.price_conditions_exact ?? row.detailQuotes[0]?.conditions
   const labels = missingPriceDetailLabels(terms)
+  const derived = row.priceState === 'derived' && !row.priceCovered ? '历史反推价待核对' : ''
   const detail = row.priceBlocker || (row.groupPrices.officialPriceMissing ? '官方价表缺失' : labels.join('、'))
-  return detail ? '缺价 · ' + detail : '缺价'
+  const reasons = [derived, detail].filter((value, index, values) => value && values.indexOf(value) === index)
+  return reasons.length ? '缺价 · ' + reasons.join(' · ') : '缺价'
 }
 
 function usageLookup(row: CatalogRow) {
@@ -1519,7 +1546,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
                     <dt>发布</dt>
                     <dd><strong :class="{ 'published-state': row.published }" data-testid="model-publication">{{ publicationLabel(row) }}</strong></dd>
                   </div>
-                  <div v-if="rowAvailability(row) === 'unavailable' && routeAvailability(row) === 'maintenance'">
+                  <div v-if="rowAvailability(row) === 'unavailable' && ['maintenance', 'degraded'].includes(row.routeState ?? '')">
                     <dt>线路</dt>
                     <dd><span class="status-pill danger" data-testid="model-maintenance">维护中</span></dd>
                   </div>
@@ -1715,7 +1742,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
   </AppDialog>
   <AppDialog :open="Boolean(conditionsRow)" :title="(conditionsRow?.model ?? '模型') + ' · 计价档位'" description="查看计价条件、结算价及学生价。"
     wide @update:open="open => { if (!open) conditionsModel = undefined }">
-    <div class="beichen-stack">
+    <div class="beichen-stack tier-dialog">
       <p v-if="conditionsRow && (conditionsRow.routeBlocked || conditionsRow.bindingIssue)" class="beichen-note" data-testid="tier-route-reason">
         {{ conditionsRow.bindingIssue?.message ?? (conditionsRow.blockers.join('；') || '线路未就绪，请刷新模型或检查渠道配置') }}
       </p>
@@ -1789,8 +1816,9 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .model-diagnostics > summary { cursor: pointer; font-weight: 700; }
 .model-diagnostics > summary .status-pill { margin-inline-start: 8px; }
 .diagnostic-content { margin-top: 12px; }
-.model-list { container-type: inline-size; }
-.model-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+.model-list { container-type: inline-size; min-width: 0; overflow-x: hidden; }
+.model-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; min-width: 0; overflow-x: hidden; }
+.model-table > tbody { min-width: 0; overflow-x: hidden; }
 .model-col { width: 13%; } .state-col { width: 17%; } .price-col { width: 50%; } .usage-col { width: 9%; } .action-col { width: 11%; }
 .model-table > thead > tr > th { color: var(--ink-soft); font-size: 11px; }
 .model-table > :is(thead, tbody) > tr > :is(th, td) {
@@ -1798,6 +1826,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 }
 .model-state { font-size: 12px; line-height: 1.75; }
 .model-state-summary span { white-space: nowrap; }
+.model-price, .model-price-content { min-width: 0; overflow: hidden; }
 .model-price-content { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
 .model-price-mode { justify-self: start; }
 .group-price-note, .group-missing-note { color: var(--ink-soft); font-size: 12px; }
@@ -1805,15 +1834,16 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .catalog-evidence { margin-top: 4px; font-size: 12px; color: var(--ink-soft); }
 .catalog-evidence summary { cursor: pointer; }
 .catalog-evidence ul { margin: 4px 0; padding-inline-start: 18px; overflow-wrap: anywhere; }
+.model-state, .model-capability, .model-statuses, .model-capability-notes { min-width: 0; }
 .model-capability { display: grid; gap: 8px; margin-top: 8px; }
-.model-statuses { display: grid; gap: 5px; margin: 0; }
-.model-statuses > div { display: grid; grid-template-columns: 2.5em minmax(0, 1fr); align-items: baseline; gap: 4px; }
+.model-statuses { display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; margin: 0; }
+.model-statuses > div { display: grid; grid-template-columns: 2.5em minmax(0, 1fr); align-items: baseline; gap: 4px; min-width: 0; }
 .model-statuses dt { font-size: 11px; color: var(--ink-soft); }
-.model-statuses dd { min-width: 0; margin: 0; }
+.model-statuses dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
 .model-capability-notes { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
 .model-capability .chip { padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #f1f4f9; color: var(--ink-soft); }
 .model-capability .chip.recommend { background: #f3efff; color: #5b3ea8; }
-.model-capability .status-pill { white-space: normal; }
+.model-capability .status-pill { max-width: 100%; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .price-blocker-note { color: #835615; }
 .published-state { color: #16765e; }
 .binding-issue { color: var(--danger, #b42318); }
