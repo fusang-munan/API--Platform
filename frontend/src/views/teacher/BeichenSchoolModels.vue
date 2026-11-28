@@ -542,13 +542,14 @@ const catalog = computed(() => {
       : entry.price_state ?? oldPriceState(row)
     const reportedMissingPrice = !changedGroup && entry.price_state === 'missing'
     const priceBlocker = changedGroup ? undefined : entry.price_blocker?.message.trim()
-    const legacyManualPrice = entry.bound_routes == null && row.quotes.some(quote => quote.mode === 'manual' && quote.priceReady)
-    const legacyQuotePrice = entry.bound_routes == null && row.quotes.some(quote =>
+    const hasBindingSnapshot = Boolean(entry.bound_routes?.length)
+    const legacyManualPrice = !hasBindingSnapshot && row.quotes.some(quote => quote.mode === 'manual' && quote.priceReady)
+    const legacyQuotePrice = !hasBindingSnapshot && row.quotes.some(quote =>
       quote.priceReady && quote.status !== 'derived' &&
       (quote.mode === 'manual' || quote.status === 'confirmed' || quote.status === 'conditional'))
-    const legacyEntryPrice = entry.bound_routes == null && entry.price_covered === true &&
+    const legacyEntryPrice = !hasBindingSnapshot && entry.price_covered === true &&
       entry.price_state !== 'derived' && entry.price_state !== 'missing'
-    const priceCovered = !retired && !websiteOnly && (entry.bound_routes?.length
+    const priceCovered = !retired && !websiteOnly && (hasBindingSnapshot
       ? pricedRoutes.length > 0
       : legacyManualPrice || legacyQuotePrice || legacyEntryPrice)
     const routeBlocked = routeCount === 0 || entry.blockers?.some(blocker => routeBlockerCodes.has(blocker.code)) === true
@@ -637,8 +638,8 @@ const catalog = computed(() => {
       (priceState === 'missing' || priceState === 'derived' || Boolean(priceBlocker)) &&
       (entry.price_covered === false || Boolean(priceBlocker) || !websiteTerms ||
         missingPriceDetailLabels(websiteTerms).some(label => !label.startsWith('缓存'))))
-    const priceUnavailable = reportedPriceUnavailable || priceMissing &&
-      (routeState !== 'maintenance' || !primaryGroupDenial)
+    const priceUnavailable = published && (reportedPriceUnavailable || priceMissing &&
+      (routeState !== 'maintenance' || !primaryGroupDenial))
     return {
       ...row, retired, active, anomaly, published, activation, canDisable: row.canDisable,
       enableSelector: entry.school_model_id?.trim() || row.model,
@@ -773,7 +774,23 @@ const healthLabels: Record<BeichenHealthDimension['state'], string> = { availabl
 const keyHealth = computed(() => (overview.value?.credentials ?? []).flatMap(key => key.health ? [{
   id: key.credential_id, label: key.label, count: key.health.available_dimensions, health: key.health,
 }] : []))
-const diagnosticsPending = computed(() => websiteKeysNeedRefresh.value || keyHealth.value.some(key => key.count < 4) ||
+const priceRefreshWarnings = computed(() => {
+  const data = overview.value
+  if (!data) return []
+  const labels = new Map((data.credentials ?? []).map(key => [key.credential_id, key.label]))
+  const rows = [
+    ...(data.datasets ?? []).filter(row => row.kind === 'prices'),
+    ...(data.models ?? []),
+  ]
+  const warnings = rows.flatMap(row => {
+    const message = row.refresh_error?.trim()
+    if (!message) return []
+    const label = labels.get(row.credential_id)
+    return [label ? label + ' · ' + message : message]
+  })
+  return [...new Set(warnings)]
+})
+const diagnosticsPending = computed(() => priceRefreshWarnings.value.length > 0 || websiteKeysNeedRefresh.value || keyHealth.value.some(key => key.count < 4) ||
   Boolean(websiteDirectory.value && websiteDirectory.value.state !== 'fresh') || currentModels.value.some(row => row.anomaly))
 const lastSync = computed(() => overview.value?.website_sync?.price_last_seen ??
   (overview.value?.datasets ?? []).filter(row => row.kind === 'prices' && row.last_success).map(row => row.last_success!).sort().at(-1))
@@ -872,6 +889,8 @@ function routeAvailability(row: CatalogRow) {
   return row.published || row.routeCount > 0 ? 'unverified' : 'not_published'
 }
 function rowAvailability(row: CatalogRow) {
+  if (row.websiteOnly) return 'website_only'
+  if (!row.published) return 'not_published'
   return row.unavailable || row.priceUnavailable ? 'unavailable' : routeAvailability(row)
 }
 function availabilityLabel(row: CatalogRow) {
@@ -1380,6 +1399,9 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
     <details v-if="overview" class="beichen-card model-diagnostics">
       <summary>诊断信息 <span v-if="diagnosticsPending" class="status-pill pending">有项目待核对</span></summary>
       <div class="beichen-stack diagnostic-content">
+    <p v-if="priceRefreshWarnings.length" class="beichen-note price-refresh-warning" role="status" data-testid="price-refresh-warning">
+      <strong>续期失败，沿用旧报价</strong> · {{ priceRefreshWarnings.join('；') }}
+    </p>
     <section v-if="keyHealth.length" class="beichen-card key-health" aria-label="Key 健康">
       <h3>Key 健康</h3>
       <details v-for="key in keyHealth" :key="key.id">
@@ -1845,6 +1867,7 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
 .model-capability .chip.recommend { background: #f3efff; color: #5b3ea8; }
 .model-capability .status-pill { max-width: 100%; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .price-blocker-note { color: #835615; }
+.price-refresh-warning { color: #835615; }
 .published-state { color: #16765e; }
 .binding-issue { color: var(--danger, #b42318); }
 .binding-issue-row { background: color-mix(in srgb, var(--danger, #b42318) 5%, transparent); }
