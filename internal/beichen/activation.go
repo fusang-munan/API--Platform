@@ -398,7 +398,18 @@ ORDER BY lower(k.model_id::text),c.id`
 		return nil, err
 	}
 	if len(models) == 0 && !legacyPublished && source != "" && schoolID == nil {
-		return models, nil
+		// A website directory entry keeps its published bindings without any
+		// Key-backed catalog row, so named lookups must still load them.
+		var boundRoutes bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+SELECT 1 FROM model_bindings b JOIN models m ON m.id=b.model_id
+WHERE b.provider_id=$1 AND b.status='active' AND m.status='active'
+  AND btrim(b.upstream_model_name)<>'' AND btrim(b.upstream_model_name)::citext=$2::citext)`, provider, source).Scan(&boundRoutes); err != nil {
+			return nil, err
+		}
+		if !boundRoutes {
+			return models, nil
+		}
 	}
 	// An unpinned binding can still display a reachable Key during transition.
 	// Publication requires evidence for the first Key the gateway will pick.

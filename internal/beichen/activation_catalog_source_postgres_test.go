@@ -194,6 +194,47 @@ WHERE credential_id=$1 AND kind='catalog'`, f.keys[0])
 	}
 }
 
+// A website directory entry keeps its published bindings without any Key
+// backed catalog row. Named and UUID lookups must both report it as active.
+func TestEnableWebsiteOnlyPublishedRouteIsAlreadyActivePostgres(t *testing.T) {
+	f := newFirstConnectFixture(t)
+	oldKey := f.keys[1]
+	school := f.pendingSchool(t, "school-website-published", &oldKey)
+	f.readyKey(t, oldKey)
+	f.bindKey(t, school, oldKey)
+	if id, err := f.service.EnableModel(f.ctx, f.provider, f.actor, firstConnectUpstream, school.String()); err != nil || id != school {
+		t.Fatalf("initial publication failed: id=%s err=%v", id, err)
+	}
+	bindingIDs := f.assertPublished(t, school, oldKey, firstConnectAdapters)
+
+	// The directory entry is website-only and older than the Key revision, so
+	// loading it yields no candidate while the gateway still serves the
+	// published bindings.
+	execCatalogTestSQL(t, f.ctx, f.db, `UPDATE provider_model_catalog
+SET catalog_source='website', raw_entry='{"source":"beichen_website_group"}', last_seen_at=now()-interval '1 hour'
+WHERE credential_id=$1 AND model_id=$2`, oldKey, firstConnectUpstream)
+	// No other Key lists the upstream, so the name has no candidate rows.
+	execCatalogTestSQL(t, f.ctx, f.db, `UPDATE provider_model_catalog SET status='inactive' WHERE credential_id=$1 AND model_id=$2`, f.keys[0], firstConnectUpstream)
+	before := f.bindingSnapshot(t, school)
+
+	if id, err := f.service.EnableModel(f.ctx, f.provider, f.actor, firstConnectUpstream, ""); err != nil || id != school {
+		t.Fatalf("website-only published route should stay active: id=%s err=%v", id, err)
+	}
+	for _, selector := range []string{firstConnectUpstream, school.String()} {
+		result, err := f.service.EnableModelsBatch(f.ctx, f.provider, f.actor, []string{selector})
+		if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
+			result.Skipped[0].Model != selector || result.Skipped[0].Reason != "already_active" {
+			t.Fatalf("batch selector %q: %+v, %v", selector, result, err)
+		}
+	}
+	if after := f.bindingSnapshot(t, school); !before.equal(after) {
+		t.Fatalf("idempotent enable changed the published model: before=%+v after=%+v", before, after)
+	}
+	if after := f.assertPublished(t, school, oldKey, firstConnectAdapters); after != bindingIDs {
+		t.Fatalf("idempotent enable replaced bindings: before=%s after=%s", bindingIDs, after)
+	}
+}
+
 func TestActivationCatalogSourceWebsiteOnlyNeedsBindingPostgres(t *testing.T) {
 	f := newFirstConnectFixture(t)
 	school := f.unmappedSchool(t)
