@@ -34,6 +34,21 @@ func modelViewEnabledForStudents(item ModelView) bool {
 	return true
 }
 
+// studentModelAddable is the single add-eligibility rule for the shared
+// directory, its counts and the catalog rows. It matches the Key authorization
+// check: published, priced, routed and not under maintenance.
+func studentModelAddable(item ModelView) bool {
+	if !modelViewEnabledForStudents(item) {
+		return false
+	}
+	switch item.AvailabilityState {
+	case catalog.AvailabilityAvailable, catalog.AvailabilityDegraded, catalog.AvailabilityUnverified:
+		return true
+	default:
+		return false
+	}
+}
+
 func modelMatchesStudentQuery(row *ent.Model, query string) bool {
 	if query == "" {
 		return true
@@ -60,7 +75,7 @@ func modelCatalogCandidateFromPlatformModel(view ModelView) ModelCatalogCandidat
 			"recommended_protocol": view.RecommendedProtocol, "probe_state": view.ProbeState,
 			"availability": view.Availability, "availability_state": view.AvailabilityState,
 			"availability_reason": view.AvailabilityReason, "last_probe_at": view.LastProbeAt,
-			"route_ready": view.RouteReady,
+			"route_ready": view.RouteReady, "addable": studentModelAddable(view),
 		},
 	}
 	if view.DisplayName != "" {
@@ -269,17 +284,29 @@ type studentCatalogDirectoryModel struct {
 	ModelCatalogCandidate
 	WithGrant    string `json:"with_grant"`
 	WithoutGrant string `json:"without_grant"`
+	Addable      bool   `json:"addable"`
 }
 
 // The catalog endpoint has no student ID. Publish the two directory outcomes
 // without exposing any grants. The Key endpoint supplies the caller's grants.
 func studentDirectoryModel(model ModelView) studentCatalogDirectoryModel {
-	item := studentCatalogDirectoryModel{ModelCatalogCandidate: modelCatalogCandidateFromPlatformModel(model)}
+	item := studentCatalogDirectoryModel{
+		ModelCatalogCandidate: modelCatalogCandidateFromPlatformModel(model),
+		Addable:               studentModelAddable(model),
+	}
 	switch model.AvailabilityState {
 	case catalog.AvailabilityAvailable, catalog.AvailabilityDegraded:
-		item.WithGrant, item.WithoutGrant = "callable", "addable"
+		item.WithGrant = "callable"
+		if item.Addable {
+			item.WithoutGrant = "addable"
+		} else {
+			item.WithoutGrant = "maintenance"
+		}
 	case catalog.AvailabilityUnverified:
 		item.WithGrant, item.WithoutGrant = "unverified", "unverified"
+		if item.Addable {
+			item.WithoutGrant = "addable"
+		}
 	default:
 		item.WithGrant, item.WithoutGrant = "historical", "maintenance"
 	}
@@ -345,8 +372,6 @@ func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, 
 			ready := modelViewEnabledForStudents(view)
 			if ready {
 				published = append(published, publishedModel{id: row.ID, index: len(models)})
-			}
-			if ready || result.Directory != nil {
 				models = append(models, view)
 			}
 		}

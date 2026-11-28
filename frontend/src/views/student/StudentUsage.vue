@@ -18,6 +18,7 @@ import {
   formatUsageCacheRate,
   formatUsageCount,
   formatUsageCredits,
+  formatUsageModelNotes,
   formatUsagePendingReview,
   formatUsageTokenCount,
   hasStudentUsageModels,
@@ -140,16 +141,6 @@ function cacheCoverage(metrics: StudentUsageFields) {
   return coverage ? `${label} · ${coverage}` : label
 }
 
-function modelNotes(model: StudentModelUsageFields) {
-  const notes: string[] = []
-  const unclassified = tokenSample(model.token_coverage?.unclassified_tokens)
-  if (unclassified !== '无样本' && unclassified !== '0') notes.push(`未分类 ${unclassified} Token`)
-  if (model.calls && formatUsageCredits(model.credits) === '0') notes.push('零额已结算')
-  const review = formatUsagePendingReview(model)
-  if (review) notes.push(review)
-  return notes.join(' · ')
-}
-
 const modelColumns: Array<{
   label: string
   value: (model: StudentModelUsageFields) => string
@@ -157,7 +148,11 @@ const modelColumns: Array<{
   numeric?: boolean
 }> = [
   { label: '已扣积分', value: model => formatUsageCredits(model.credits), numeric: true },
-  { label: '调用次数', value: model => formatUsageCount(model.calls ?? 0), numeric: true },
+  {
+    label: '调用次数',
+    value: model => isUsageCount(model.calls) ? formatUsageCount(model.calls) : '未回报',
+    numeric: true,
+  },
   { label: 'Token', value: model => tokenSample(model.tokens?.total), detail: tokenCoverage, numeric: true },
   {
     label: '缓存命中率',
@@ -165,7 +160,7 @@ const modelColumns: Array<{
     detail: cacheCoverage,
     numeric: true,
   },
-  { label: '说明', value: modelNotes },
+  { label: '说明', value: formatUsageModelNotes },
 ]
 
 function keySectionId(projectId: string, keyId: string) {

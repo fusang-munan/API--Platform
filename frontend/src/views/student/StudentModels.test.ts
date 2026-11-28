@@ -242,7 +242,8 @@ describe('StudentModels key model states', () => {
     vi.mocked(studentAPI.addKeyModels).mockResolvedValueOnce({ model_ids: ['claude-sonnet-4-5'], added_model_ids: ['claude-sonnet-4-5'] })
     const wrapper = mountPage()
     await flushPromises()
-    await showGroup(wrapper, 'unverified')
+    // 未授权且可添加的待核验型号先计入“可添加”，加入后才进入“待核验”。
+    await showGroup(wrapper, 'addable')
 
     const card = wrapper.get('[data-model="claude-sonnet-4-5"]')
     expect(card.get('[data-testid="model-availability"]').text()).toBe('待核验')
@@ -251,9 +252,11 @@ describe('StudentModels key model states', () => {
     await flushPromises()
 
     expect(studentAPI.addKeyModels).toHaveBeenLastCalledWith('key-1', ['claude-sonnet-4-5'])
-    expect(card.get('[data-testid="model-key-status"]').text()).toBe('已加入 · 待核验')
-    expect(card.get('[data-testid="model-key-status"]').classes()).toContain('warn')
     expect(wrapper.get('[role="status"]').text()).toContain('还未完成探活')
+    await showGroup(wrapper, 'unverified')
+    const joined = wrapper.get('[data-model="claude-sonnet-4-5"]')
+    expect(joined.get('[data-testid="model-key-status"]').text()).toBe('已加入 · 待核验')
+    expect(joined.get('[data-testid="model-key-status"]').classes()).toContain('warn')
     wrapper.unmount()
   })
 
@@ -431,7 +434,7 @@ describe('StudentModels availability groups', () => {
         with_grant: 'callable', without_grant: 'addable' },
       { model_id: 'pending-verification', credit_multiplier: '1.00',
         raw_entry: { availability_state: 'unverified', availability_reason: '等待新一轮渠道核验。' },
-        with_grant: 'unverified', without_grant: 'unverified' },
+        with_grant: 'unverified', without_grant: 'addable', addable: true },
     ] } })
     vi.mocked(studentAPI.addKeyModels).mockResolvedValueOnce({ model_ids: [original.model_id, historical.model_id, 'unseen-model'], added_model_ids: ['unseen-model'] })
     const wrapper = mountPage()
@@ -439,18 +442,20 @@ describe('StudentModels availability groups', () => {
     const group = (name: string) => wrapper.get(`[data-testid="model-group-${name}"]`).text()
     expect(request).toHaveBeenCalledWith('/api/v1/student/model-catalog?page_size=1', { signal: expect.any(AbortSignal) })
     expect([group('callable'), group('addable'), group('unverified'), group('historical')])
-      .toEqual(['可调用1', '可添加1', '待核验1', '历史授权1'])
+      .toEqual(['可调用1', '可添加2', '待核验0', '历史授权1'])
     await showGroup(wrapper, 'historical')
     expect(wrapper.get('[data-model="teacher-disabled"]').text()).toContain('老师已停用该模型')
-    await showGroup(wrapper, 'unverified')
-    expect(wrapper.get('[data-model="pending-verification"]').text()).toContain('等待新一轮渠道核验')
     await showGroup(wrapper, 'addable')
+    const unverifiedAddable = wrapper.get('[data-model="pending-verification"]')
+    expect(unverifiedAddable.text()).toContain('等待新一轮渠道核验')
+    expect(unverifiedAddable.get('[data-testid="model-availability"]').text()).toBe('待核验')
+    expect(unverifiedAddable.get('[data-testid="sync-key-model"]').attributes('disabled')).toBeUndefined()
     await wrapper.get('[data-model="unseen-model"] [data-testid="sync-key-model"]').trigger('click')
     await flushPromises()
     expect(studentAPI.addKeyModels).toHaveBeenCalledWith('key-1', ['unseen-model'])
-    expect([group('callable'), group('addable')]).toEqual(['可调用2', '可添加0'])
+    expect([group('callable'), group('addable')]).toEqual(['可调用2', '可添加1'])
     await wrapper.get('[data-testid="current-key"]').setValue('key-2')
-    expect([group('callable'), group('addable'), group('historical')]).toEqual(['可调用0', '可添加2', '历史授权0'])
+    expect([group('callable'), group('addable'), group('historical')]).toEqual(['可调用0', '可添加3', '历史授权0'])
     wrapper.unmount()
   })
 

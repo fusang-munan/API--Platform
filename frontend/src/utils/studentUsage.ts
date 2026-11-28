@@ -76,21 +76,14 @@ export function formatUsagePendingReview(metrics?: StudentUsageFields | null): s
 
 export function formatUsageModelNotes(model: StudentModelUsageFields): string {
   const notes: string[] = []
-  const coverage = model.token_coverage
-  if (model.completeness === 'unknown') notes.push('无回报')
-  if (model.completeness === 'partial') {
-    notes.push(isUsageCount(coverage?.complete_calls) && isUsageCount(coverage?.calls)
-      ? `部分回报（${formatTokens(coverage.complete_calls)}/${formatTokens(coverage.calls)} 笔完整）`
-      : '部分回报')
-  }
-  const unclassified = formatUsageTokenCount(coverage?.unclassified_tokens)
+  const unclassified = formatUsageTokenCount(model.token_coverage?.unclassified_tokens)
   if (unclassified !== '—' && unclassified !== '0') {
     notes.push(`未分类 ${unclassified} Token`)
   }
   if (isUsageCount(model.calls) && model.calls > 0 && formatUsageCredits(model.credits) === '0') notes.push('零额已结算')
   const review = formatUsagePendingReview(model)
   if (review) notes.push(review)
-  return notes.join(' · ') || '—'
+  return notes.join(' · ')
 }
 
 type ModelUsageLabel = Pick<StudentModelUsageFields, 'credits' | 'calls' | 'pending_review_calls'>

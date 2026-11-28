@@ -124,8 +124,9 @@ const groupedModels = computed<Record<ModelGroup, StudentModel[]>>(() => {
   const directoryIDs = new Set<string>()
   for (const item of directory.value) {
     directoryIDs.add(modelKey(item.model_id))
-    const group = keyHasModel(item.model_id) ? item.with_grant : item.without_grant
-    buckets[group].push(modelFromCatalog(item))
+    // The same add-eligibility drives the group count and the add button.
+    const model = modelFromCatalog(item)
+    buckets[modelGroupFor(model)].push(model)
   }
   for (const model of key.models) {
     if (!directoryIDs.has(modelKey(model.model_id))) buckets.historical.push(model)
@@ -286,14 +287,14 @@ function modelAvailability(model: StudentModel): ModelAvailability {
     state, label, available: false, addable: false, reason: studentSafeReason(reason, fallback),
   })
   switch (state) {
-    case 'available': return { state, label: '可用', available: true, addable: true, reason: '' }
+    case 'available': return { state, label: '可用', available: true, addable: model.addable ?? true, reason: '' }
     case 'degraded': return {
-      state, label: '可用 · 探活异常', available: true, addable: true,
+      state, label: '可用 · 探活异常', available: true, addable: model.addable ?? true,
       reason: studentSafeReason(reason, '最近一次探活失败，仍可尝试调用。'),
     }
     case 'unverified': return {
       ...blocked('待核验', '线路尚未完成连通测试，调用可能失败。'),
-      addable: model.route_ready && model.availability !== 'maintenance',
+      addable: model.addable ?? (model.route_ready && model.availability !== 'maintenance'),
     }
     case 'channel_unavailable':
       return blocked(keyHasModel(model.model_id) ? '当前渠道未开放 · 历史授权' : '当前渠道未开放', '当前渠道目录未列出该模型。')
@@ -317,11 +318,16 @@ function keyHasModel(modelID: string) {
 }
 
 function modelGroupFor(model: StudentModel): ModelGroup {
-  const state = modelAvailability(model).state
+  const availability = modelAvailability(model)
+  const state = availability.state
   const inKey = keyHasModel(model.model_id)
-  if (state === 'available' || state === 'degraded') return inKey ? 'callable' : 'addable'
-  if (state === 'unverified') return 'unverified'
-  return inKey ? 'historical' : 'maintenance'
+  if (inKey) {
+    if (state === 'available' || state === 'degraded') return 'callable'
+    if (state === 'unverified') return 'unverified'
+    return 'historical'
+  }
+  if (availability.addable) return 'addable'
+  return state === 'unverified' ? 'unverified' : 'maintenance'
 }
 
 function keyCoverage(model: StudentModel): KeyCoverage {
@@ -370,6 +376,7 @@ function modelFromCatalog(item: StudentModelCandidate): StudentModel {
     availability: stringField('availability') ?? known?.availability,
     availability_state: (stringField('availability_state') as StudentAvailabilityState | undefined) ?? known?.availability_state,
     availability_reason: stringField('availability_reason') ?? known?.availability_reason,
+    addable: typeof field('addable') === 'boolean' ? field('addable') as boolean : known?.addable,
   }
 }
 

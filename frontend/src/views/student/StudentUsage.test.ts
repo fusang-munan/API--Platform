@@ -288,7 +288,7 @@ describe('StudentUsage', () => {
     expect(rows[0].get('td[data-label="缓存命中率"]').text()).toContain('37.5%')
     expect(rows[0].get('td[data-label="缓存命中率"] small').text()).toBe('完整 · 覆盖 2/2 笔')
     expect(rows[1].get('td[data-label="Token"]').text()).toContain('130')
-    expect(rows[1].get('td[data-label="调用次数"]').text()).toBe('0')
+    expect(rows[1].get('td[data-label="调用次数"]').text()).toBe('未回报')
     expect(rows[1].get('td[data-label="Token"] small').text()).toBe('部分回报（0/1 笔完整）')
     expect(rows[1].get('td[data-label="说明"]').text()).toContain('未分类 126 Token')
     expect(rows[1].get('td[data-label="说明"]').text()).toContain('待核 1 笔（预留 10 积分）')
@@ -448,7 +448,8 @@ describe('StudentUsage', () => {
       sample_calls: 1, cache_read_tokens: '0', input_with_cache_read_tokens: '100',
     } }
     const totalOnly = { ...pendingModel, tokens: { ...blankMetrics.tokens, total: '130' } }
-    mountUsage({ ...currentUsage, models: [zeroHit, totalOnly, zeroModel] })
+    const trueZero = { ...zeroModel, id: 'zero-calls', calls: 0 }
+    mountUsage({ ...currentUsage, models: [zeroHit, totalOnly, zeroModel, trueZero] })
     await flushPromises()
     const rows = wrapper.get('[data-testid="student-model-summary"]').findAll('tbody tr')
     expect(rows[0].get('[data-label="缓存命中率"]').text()).toContain('0%')
@@ -456,6 +457,8 @@ describe('StudentUsage', () => {
     expect(rows[1].get('[data-label="Token"]').text()).toContain('130')
     expect(rows[1].get('[data-label="Token"]').text()).toContain('部分回报')
     expect(rows[1].get('[data-label="缓存命中率"]').text()).toContain('无样本')
+    expect(rows[1].get('[data-label="调用次数"]').text()).toBe('未回报')
+    expect(rows[3].get('[data-label="调用次数"]').text()).toBe('0')
     expect(rows[2].get('[data-label="Token"]').text()).toBe('无样本')
   })
 
