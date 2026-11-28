@@ -180,6 +180,7 @@ export type TeacherCatalogModel = Omit<BeichenCatalogModel, 'price_state'> & {
     available_protocols: string[]
     recommended_protocol: string | null
     availability: string
+    availability_state?: string
     availability_reason?: string
   }
   action_hint?: string

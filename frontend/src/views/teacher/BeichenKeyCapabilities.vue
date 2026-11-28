@@ -5,7 +5,7 @@ import { apiErrorMessage } from '../../api/client'
 import type { BeichenKeyCapability, BeichenKeyUsageMetric } from '../../api/types'
 import AppDialog from '../../components/AppDialog.vue'
 import { keyGroupIssue } from '../../utils/beichenModels'
-import { formatTokens } from '../../utils/credits'
+import { formatPriceDetail, formatTokens } from '../../utils/credits'
 
 const props = defineProps<{ providerId: string; capabilities: BeichenKeyCapability[]; disabled?: boolean }>()
 const emit = defineEmits<{ refresh: [] }>()
@@ -21,9 +21,14 @@ function groupIssue(key: BeichenKeyCapability) {
     || (key.website_group ? '' : '分组待同步')
 }
 
-function usageUnit(unit?: string | null) {
-  if (unit == null || unit === 'unknown') return '币种待核'
-  return unit === 'mixed' ? '多币种' : unit
+function dayAmount(value?: string | null) {
+  const amount = formatPriceDetail(value)
+  return amount === '—' ? amount : amount + ' 元'
+}
+
+function reportedUnit(unit?: string | null) {
+  const value = unit?.trim()
+  return value && !['unknown', 'cny', 'rmb', '元', '人民币'].includes(value.toLowerCase()) ? value : ''
 }
 
 function tokenParts(usage: BeichenKeyUsageMetric) {
@@ -65,14 +70,14 @@ onBeforeUnmount(() => { disposed = true })
   <section class="beichen-card beichen-stack" aria-label="Key 实际能力">
     <h3>Key 实际能力</h3>
     <article v-for="key in capabilities" :key="key.credential_id" class="key-evidence">
-      <div class="beichen-section-head">
-        <div>
-          <strong>{{ key.label }}</strong>
-          <small class="muted" :title="key.credential_id"> · 渠道编号 {{ key.credential_id.slice(0, 8) }}</small>
+      <header class="beichen-section-head key-evidence-head">
+        <div class="key-identity">
+          <h4>{{ key.label }}</h4>
+          <small :title="key.credential_id">渠道编号 {{ key.credential_id.slice(0, 8) }}</small>
         </div>
-        <span v-if="key.models_fetched_at && !groupIssue(key)">{{ key.models.length }} 个模型</span>
-        <span v-else class="muted">模型待核</span>
-      </div>
+        <span v-if="key.models_fetched_at && !groupIssue(key)" class="key-model-count">Key 清单 {{ formatTokens(key.models.length) }} 个</span>
+        <span v-else class="beichen-note">Key 清单待核</span>
+      </header>
       <p class="beichen-note">
         <template v-if="key.website_group">
           <strong>{{ key.website_group.name || '官网分组' }}</strong> · 分组 {{ key.website_group.id }}
@@ -81,7 +86,6 @@ onBeforeUnmount(() => { disposed = true })
         </template>
         <span v-if="groupIssue(key)" role="status">{{ groupIssue(key) }}</span>
         <template v-if="key.website_key_id"> · 北辰 Key {{ key.website_key_id }}</template>
-        <template v-if="key.daily_usage"> · {{ key.daily_usage.date }} · {{ formatTokens(key.daily_usage.requests) }} 笔</template>
       </p>
       <p class="rate-line" :class="{ 'rate-warning': key.daily_usage?.multiplier_diff }">
         账单实付比值 {{ rateText(key.daily_usage?.observed_multiplier) }} · 已存计费倍率 {{ rateText(key.stored_multiplier) }}
@@ -93,27 +97,44 @@ onBeforeUnmount(() => { disposed = true })
         <template v-if="key.models_error && key.models_error !== groupIssue(key)"> · {{ key.models_error }}</template>
         <template v-if="key.usage_error && key.usage_error !== key.models_error && key.usage_error !== groupIssue(key)"> · {{ key.usage_error }}</template>
       </p>
-      <details>
-        <summary>可用模型与用量明细</summary>
-        <ul v-if="key.models.length && !groupIssue(key)" class="key-models">
+      <details class="key-evidence-details">
+        <summary>Key 清单与账日用量</summary>
+        <ul v-if="key.models.length && !groupIssue(key)" class="key-models" aria-label="Key 清单">
           <li v-for="name in key.models" :key="name">{{ name }}</li>
         </ul>
         <p v-else-if="!groupIssue(key)" class="beichen-note">{{ key.models_fetched_at ? '官网分组没有列出模型。' : '等待北辰返回分组模型清单。' }}</p>
-        <p v-if="key.daily_usage" class="beichen-note">
-          {{ tokenParts(key.daily_usage) }}<br />
-          单日原价 {{ key.daily_usage.cost ?? '—' }} · 实付 {{ key.daily_usage.actual_cost ?? '—' }}（{{ usageUnit(key.day_unit) }}）
-        </p>
-        <template v-if="key.model_stats.length">
-          <p class="beichen-note">{{ key.model_stats_day ? key.model_stats_day + ' 模型用量' : '模型用量的日期待核实' }} · 抓取于 {{ fetched(key.model_stats_fetched_at) }}。观测倍率为实付金额除以原价。</p>
-          <ul class="model-observations">
-            <li v-for="model in key.model_stats" :key="model.model">
-              <strong>{{ model.model }}</strong> · {{ formatTokens(model.requests) }} 笔 · 原价 {{ model.cost ?? '—' }}
-              · 实付 {{ model.actual_cost ?? '—' }}（{{ usageUnit(key.day_unit) }}）
-              · 观测 {{ rateText(model.observed_multiplier) }}<strong v-if="model.multiplier_diff" class="rate-warning">（与已存偏差超过 5%）</strong>
-              <br />{{ tokenParts(model) }}
-            </li>
-          </ul>
-        </template>
+        <section v-if="key.daily_usage || key.model_stats.length || key.model_stats_fetched_at" class="key-day-usage" aria-label="账日用量">
+          <div v-if="key.daily_usage" class="key-day-total">
+            <strong>{{ key.daily_usage.date }} · {{ formatTokens(key.daily_usage.requests) }} 笔</strong>
+            <p>单日原价 {{ dayAmount(key.daily_usage.cost) }} · 实付 {{ dayAmount(key.daily_usage.actual_cost) }}</p>
+            <p class="beichen-note">{{ tokenParts(key.daily_usage) }}</p>
+          </div>
+          <small v-if="reportedUnit(key.day_unit)" class="beichen-note">北辰原始币种标记 {{ reportedUnit(key.day_unit) }}</small>
+          <div v-if="key.model_stats.length || key.model_stats_fetched_at" class="key-usage-models">
+            <h5>账日有记录 {{ formatTokens(key.model_stats.length) }} 个</h5>
+            <p class="beichen-note">
+              {{ key.model_stats_day ?? '模型用量的日期待核实' }} · 抓取于 {{ fetched(key.model_stats_fetched_at) }}
+              <template v-if="key.model_stats.length"> · 观测倍率为实付金额除以原价</template>
+            </p>
+            <div v-if="key.model_stats.length" class="model-observations">
+              <table>
+                <caption class="sr-only">账日模型用量</caption>
+                <thead>
+                  <tr><th scope="col">模型</th><th scope="col">笔数</th><th scope="col">原价</th><th scope="col">实付</th><th scope="col">观测倍率</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="model in key.model_stats" :key="model.model">
+                    <th scope="row">{{ model.model }}<small class="beichen-note">{{ tokenParts(model) }}</small></th>
+                    <td>{{ formatTokens(model.requests) }}</td>
+                    <td>{{ dayAmount(model.cost) }}</td>
+                    <td>{{ dayAmount(model.actual_cost) }}</td>
+                    <td>{{ rateText(model.observed_multiplier) }}<small v-if="model.multiplier_diff" class="rate-warning">与已存偏差超过 5%</small></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
       </details>
       <div class="actions key-check">
         <AppDialog :open="reviewKey === key.credential_id" :title="'核对这个 Key · ' + key.label"
@@ -143,14 +164,31 @@ onBeforeUnmount(() => { disposed = true })
 </template>
 
 <style scoped>
-.key-evidence { display: grid; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
-.key-evidence p, h3 { margin: 0; }
-.key-evidence summary { cursor: pointer; }
+.key-evidence { display: grid; gap: 10px; min-width: 0; padding: 14px; border: 1px solid var(--line); border-radius: 12px; overflow-wrap: anywhere; }
+.key-evidence p, h3, .key-evidence h4, .key-evidence h5 { margin: 0; }
+.key-evidence-head { align-items: center; }
+.key-identity { min-width: 0; display: grid; gap: 3px; }
+.key-identity h4 { font-size: 15px; }
+.key-identity small { color: var(--ink-soft); font-size: 11px; }
+.key-model-count { background: var(--primary-soft); color: var(--primary-strong); border-radius: 8px; padding: 4px 8px; font-size: 12px; font-weight: 650; }
 .rate-line { font-weight: 600; }
 .rate-warning { color: #9a3815; }
-.key-models { display: flex; flex-wrap: wrap; column-gap: 26px; }
-.key-models, .model-observations { margin: 8px 0; padding-inline-start: 22px; }
-.key-check { flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.key-evidence-details { border-top: 1px solid var(--line); padding-top: 10px; min-width: 0; }
+.key-evidence-details summary { cursor: pointer; font-size: 13px; font-weight: 700; }
+.key-evidence-details[open] summary { margin-bottom: 10px; }
+.key-models { display: flex; flex-wrap: wrap; gap: 5px 26px; margin: 0; padding: 0 0 0 18px; }
+.key-day-usage { display: grid; gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); min-width: 0; }
+.key-day-total, .key-usage-models { display: grid; gap: 5px; min-width: 0; }
+.key-day-total, .key-usage-models h5 { font-size: 13px; }
+.key-day-total p { font-variant-numeric: tabular-nums; }
+.model-observations { min-width: 0; overflow-x: auto; }
+.model-observations table { width: 100%; min-width: 30rem; border-collapse: collapse; font-size: 12px; }
+.model-observations th, .model-observations td { padding: 8px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: right; }
+.model-observations :is(th, td):first-child { text-align: left; padding-inline-start: 0; }
+.model-observations thead th { color: var(--ink-soft); font-size: 11px; }
+.model-observations td { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.model-observations small { display: block; margin-top: 3px; font-weight: 400; white-space: normal; }
+.key-check { justify-content: flex-start; margin-top: 2px; gap: 8px 12px; }
 .key-review { display: grid; gap: 12px; justify-items: start; }
 .key-review label { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .key-review input[name=target] { width: 6.5em; }

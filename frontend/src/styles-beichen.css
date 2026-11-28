@@ -69,3 +69,21 @@
   .range-switch{width:100%;justify-content:space-between}
   .range-switch button{flex:1}
 }
+
+/* Keep both price rows aligned under the same billing items on the teacher model page. */
+.beichen-models .current-group-prices .group-price-table-wrap,
+.condition-tier-table-wrap { min-width: 0; overflow-x: auto; }
+.beichen-models .current-group-prices .group-price-table,
+.condition-tier-table-wrap .condition-tier-table { display: table; width: 100%; min-width: 27rem; }
+.beichen-models .current-group-prices .group-price-table thead,
+.condition-tier-table-wrap .condition-tier-table thead { display: table-header-group; }
+.beichen-models .current-group-prices .group-price-table tbody,
+.condition-tier-table-wrap .condition-tier-table tbody { display: table-row-group; }
+.beichen-models .current-group-prices .group-price-table :is(thead, tbody) > tr,
+.condition-tier-table-wrap .condition-tier-table tr { display: table-row; }
+.beichen-models .current-group-prices .group-price-table th,
+.beichen-models .current-group-prices .group-price-table td.numeric-cell,
+.condition-tier-table-wrap .condition-tier-table :is(th, td) { display: table-cell; width: auto; padding: 6px 5px; border-bottom: 1px solid var(--line); }
+.beichen-models .current-group-prices .group-price-table th:first-child { width: 5.8rem; padding-inline-start: 0; }
+.beichen-models .current-group-prices .group-price-table td.numeric-cell::before { content: none; }
+.condition-tier-table-wrap .condition-tier-table .numeric-cell { text-align: right; }
