@@ -432,6 +432,25 @@ describe('北辰模型管理', () => {
     expect(wrapper.findAll('[data-model]')).toHaveLength(0)
   })
 
+  it('条件价续期失败沿用旧报价时，诊断区显示 refresh_error', async () => {
+    const { data, inventory } = routedConditionalQuotes([conditionalQuoteCases[3]])
+    data.datasets = [...(data.datasets ?? []), {
+      credential_id: 'G3', kind: 'prices', effective_multiplier: null,
+      last_success: quoteObservedAt, last_error: null, refresh_error: '北辰网页会话续期失败',
+    }]
+    api.beichenOverview.mockResolvedValue(data)
+    api.beichenWebsiteKeys.mockResolvedValue(inventory)
+    const wrapper = view()
+    await flushPromises()
+
+    const row = wrapper.get('[data-model="gpt-6.1-sol"]')
+    expect(currentGroupAmounts(row, 'cache5m')).toEqual(['2.5', '55'])
+    const diagnostics = wrapper.get('.model-diagnostics')
+    expect(diagnostics.get('summary').text()).toContain('有项目待核对')
+    expect(diagnostics.text()).toContain('续期失败，沿用旧报价')
+    expect(diagnostics.text()).toContain('北辰网页会话续期失败')
+  })
+
   it('只有 500000 起高档的旧式条件价不伪造基础档，499999 无价、500000 起用高档', async () => {
     const model = 'lab/high-only'
     const key = 'key-' + model
@@ -2013,13 +2032,45 @@ describe('北辰模型管理', () => {
   })
 
   it('缺价徽章逐项写出缺失字段，不再只写缺价', async () => {
-    api.beichenOverview.mockResolvedValue(overview([{ model: 'lab/missing', priced: false,
+    api.beichenOverview.mockResolvedValue(overview([{ model: 'lab/missing', active: true, priced: false,
       catalog: { price_state: 'missing', price_covered: false } }]))
     const wrapper = view()
     await flushPromises()
     expect(wrapper.get('[data-testid="price-missing"]').text())
       .toBe('缺价 · 输入、输出、缓存写入(5m)、缓存写入(1h)、缓存读取')
     expect(wrapper.get('[data-testid="model-availability"]').text()).toBe('不可用')
+  })
+
+  it('未发布且缺价时调用状态显示未发布，不显示不可用', async () => {
+    api.beichenOverview.mockResolvedValue(overview([{ model: 'lab/unpublished-missing', priced: false, catalog: {
+      school_status: 'pending_configuration', activation: 'blocked', catalog_state: 'key_listed',
+      price_state: 'missing', price_covered: false, bound_routes: [], route_count: 0, ready_count: 0,
+      route_availability: { availability: 'not_published', protocols: [], available_protocols: [], recommended_protocol: null },
+    } }]))
+    const wrapper = view()
+    await flushPromises()
+
+    const row = wrapper.get('[data-model="lab/unpublished-missing"]')
+    expect(row.get('[data-testid="model-publication"]').text()).toBe('待配置')
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('未发布')
+    expect(row.get('[data-testid="model-availability"]').text()).not.toBe('不可用')
+    expect(row.get('[data-testid="price-missing"]').text()).toContain('缺价')
+  })
+
+  it('未发布但有价模型按 price_covered 和 price_state 计入报价覆盖', async () => {
+    api.beichenOverview.mockResolvedValue(overview([{ model: 'lab/unpublished-priced', catalog: {
+      school_status: 'pending_configuration', activation: 'blocked', catalog_state: 'key_listed',
+      price_state: 'confirmed', price_covered: true, bound_routes: [], route_count: 0, ready_count: 0,
+      route_availability: { availability: 'not_published', protocols: [], available_protocols: [], recommended_protocol: null },
+    } }]))
+    const wrapper = view()
+    await flushPromises()
+
+    expect(wrapper.get('.model-summary').text()).toContain('报价覆盖1 / 1')
+    const row = wrapper.get('[data-model="lab/unpublished-priced"]')
+    expect(row.get('[data-testid="model-publication"]').text()).toBe('待配置')
+    expect(row.get('[data-testid="model-availability"]').text()).toBe('未发布')
+    expect(row.find('[data-testid="price-missing"]').exists()).toBe(false)
   })
 
   it.each([
