@@ -742,3 +742,147 @@ SET status_code=EXCLUDED.status_code,error_code=EXCLUDED.error_code,checked_at=E
 	execCatalogTestSQL(t, ctx, db, "UPDATE provider_credentials SET updated_at=clock_timestamp() WHERE id=$1", key)
 	check(&binding, key) // The denial and probe belong to the previous Key version.
 }
+
+func TestCatalogAuthFailureBlocksGatewayUntilSuccessfulScanPostgres(t *testing.T) {
+	ctx, db, provider, _, keys := newActionsPostgres(t)
+	client := ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	manager := switchTestManager(t)
+	const upstream = "auth-routed-model"
+	key := keys[1]
+	ciphertext, err := manager.EncryptCredential("fixture-auth-routing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	execCatalogTestSQL(t, ctx, db, "UPDATE provider_credentials SET credential_ciphertext=$2 WHERE id=$1", key, ciphertext)
+	entries := []catalog.ProviderEntry{{ID: upstream, SupportedProtocols: []string{"openai_responses"}}}
+	saveCatalogFixture(t, ctx, db, provider, key, entries, nil)
+	var revision time.Time
+	if err := db.QueryRowContext(ctx, "SELECT updated_at FROM provider_credentials WHERE id=$1", key).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	binding := &ent.ModelBinding{ProviderID: provider, CredentialID: &key, UpstreamModelName: upstream,
+		Adapter: modelbinding.AdapterOpenaiResponses, Status: modelbinding.StatusActive}
+	check := func(want bool) {
+		t.Helper()
+		ready, err := catalog.BindingRouteReady(ctx, client, binding)
+		if err != nil || ready != want {
+			t.Fatalf("route readiness = %t, want %t (%v)", ready, want, err)
+		}
+		credential, id, err := catalog.ResolveBindingCredential(ctx, client, manager, binding)
+		if err != nil || (credential != "") != want || (id != uuid.Nil) != want {
+			t.Fatalf("gateway credential = %q/%s, want ready=%t (%v)", credential, id, want, err)
+		}
+	}
+	scan := func(snapshot catalog.BeichenModelSnapshot, fetchErr error) {
+		t.Helper()
+		lease, err := catalog.AcquireBeichenDatasetLease(ctx, db, key, "billing", true)
+		if err != nil || lease == uuid.Nil {
+			t.Fatalf("catalog lease: %s %v", lease, err)
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		current, err := catalog.LockBeichenScan(ctx, tx, provider, key, "billing", lease, revision)
+		if err != nil || !current {
+			t.Fatalf("catalog scan lock: current=%t %v", current, err)
+		}
+		if _, err := catalog.SaveBeichenKeyScan(ctx, tx, provider, key, revision, time.Now().UTC(), snapshot, fetchErr); err != nil {
+			t.Fatal(err)
+		}
+		if err := catalog.ReleaseBeichenDatasetLease(ctx, tx, key, "billing"); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(true)
+	scan(catalog.BeichenModelSnapshot{}, catalog.BeichenHTTPStatus(http.StatusUnauthorized))
+	check(false)
+	var marker bool
+	if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM maintenance_state
+WHERE name='beichen_catalog_auth/'||$1::text)`, key).Scan(&marker); err != nil || !marker {
+		t.Fatalf("missing credential-version auth marker: %t %v", marker, err)
+	}
+	// A later transient failure cannot disprove the earlier 401.
+	scan(catalog.BeichenModelSnapshot{}, catalog.BeichenHTTPStatus(http.StatusTooManyRequests))
+	check(false)
+	if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM maintenance_state
+WHERE name='beichen_catalog_auth/'||$1::text)`, key).Scan(&marker); err != nil || !marker {
+		t.Fatalf("transient scan cleared auth marker: %t %v", marker, err)
+	}
+	scan(catalog.BeichenModelSnapshot{Entries: entries, Complete: true}, nil)
+	check(true)
+	if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM maintenance_state
+WHERE name='beichen_catalog_auth/'||$1::text)`, key).Scan(&marker); err != nil || marker {
+		t.Fatalf("successful scan did not clear auth marker: %t %v", marker, err)
+	}
+}
+
+func TestGroupDenialExpiresAfterObservedGroupChangePostgres(t *testing.T) {
+	ctx, db, provider, _, keys := newActionsPostgres(t)
+	client := ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	const upstream = "group-scoped-model"
+	key := keys[1]
+	saveCatalogFixture(t, ctx, db, provider, key, []catalog.ProviderEntry{
+		{ID: upstream, SupportedProtocols: []string{"openai_responses"}},
+	}, nil)
+	school := uuid.New()
+	execCatalogTestSQL(t, ctx, db, `
+INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES($1,$2::text,$2::text,'active',1000,now(),now())`, school, upstream)
+	execCatalogTestSQL(t, ctx, db, `
+INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,$3,$4,'openai_responses',7,now(),now())`,
+		school, provider, key, upstream)
+	execCatalogTestSQL(t, ctx, db, `
+INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+VALUES($1,0.15,15,statement_timestamp()-interval '2 minutes')`, key)
+	var revision time.Time
+	if err := db.QueryRowContext(ctx, "SELECT updated_at FROM provider_credentials WHERE id=$1", key).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, "SELECT c.id FROM provider_credentials c WHERE c.id=$1 FOR UPDATE", key); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveBeichenProbeGroupDenial(ctx, tx, key, revision, upstream, "openai_responses", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	state := func() catalog.ModelCapability {
+		t.Helper()
+		view, err := catalog.ReadBeichenCapabilities(ctx, db, provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range view.Capabilities {
+			if row.Model == upstream && row.CredentialID != nil && *row.CredentialID == key {
+				return row
+			}
+		}
+		t.Fatal("missing group-scoped capability")
+		return catalog.ModelCapability{}
+	}
+	if row := state(); row.GroupStatus != "not_allowed" || row.BindingState != "invalid" {
+		t.Fatalf("current group denial was not applied: %+v", row)
+	}
+	execCatalogTestSQL(t, ctx, db, `
+INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+VALUES($1,0.6,60,statement_timestamp()-interval '1 minute')`, key)
+	if row := state(); row.GroupStatus == "not_allowed" || row.BindingState != "ready" {
+		t.Fatalf("previous group denial survived the observed group change: %+v", row)
+	}
+	binding := &ent.ModelBinding{ProviderID: provider, CredentialID: &key, UpstreamModelName: upstream,
+		Adapter: modelbinding.AdapterOpenaiResponses, Status: modelbinding.StatusActive}
+	if ready, err := catalog.BindingRouteReady(ctx, client, binding); err != nil || !ready {
+		t.Fatalf("gateway route kept the previous group denial: ready=%t %v", ready, err)
+	}
+}

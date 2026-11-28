@@ -162,6 +162,44 @@ FROM beichen_datasets WHERE credential_id=$1 AND kind='billing'`, job.credential
 	}
 }
 
+func TestScheduledCatalogWorkerHonorsRetryAfterPostgres(t *testing.T) {
+	ctx, db, service, job := newKeyScanFixture(t)
+	reads := 0
+	originalTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	http.DefaultTransport = panelTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != modelsPath {
+			return nil, errors.New("unexpected fixture request")
+		}
+		reads++
+		if r.URL.Query().Has("pageToken") {
+			resp := scanResponse(http.StatusTooManyRequests, "")
+			resp.Header.Set("Retry-After", "172800")
+			return resp, nil
+		}
+		return scanResponse(http.StatusOK, `{"data":[{"id":"first-page"}],"nextPageToken":"second"}`), nil
+	})
+	runner := catalog.ProviderSyncRunner{DB: db, Ent: ent.NewClient(), Decrypt: service.crypto.DecryptCredential}
+	if _, err := runner.SyncActiveProviders(ctx); err == nil {
+		t.Fatal("incomplete catalog read should report failure")
+	}
+	if reads != 2 {
+		t.Fatalf("first scheduled read = %d requests, want 2", reads)
+	}
+	var deferred bool
+	if err := db.QueryRowContext(ctx, `
+SELECT next_attempt > clock_timestamp() + interval '1 day'
+FROM beichen_datasets WHERE credential_id=$1 AND kind='catalog'`, job.credential).Scan(&deferred); err != nil || !deferred {
+		t.Fatalf("scheduled catalog did not store the long Retry-After: %t %v", deferred, err)
+	}
+	if _, err := runner.SyncActiveProviders(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if reads != 2 {
+		t.Fatalf("scheduled worker ignored the shared backoff: %d requests", reads)
+	}
+}
+
 func TestKeyCatalogGroupDenialRecoveryPostgres(t *testing.T) {
 	ctx, db, service, job := newKeyScanFixture(t)
 	const model = "gpt-fixture-group-denial"

@@ -43,13 +43,21 @@ type activationSchool struct {
 }
 
 type activationBinding struct {
+	id                uuid.UUID
+	credential        *uuid.UUID
 	route             PreferredRoute
 	active, reachable bool
 }
 
+type activationWrite struct {
+	id     uuid.UUID
+	route  PreferredRoute
+	before *PreferredRoute
+}
+
 type activationPlan struct {
 	routes, northRoutes       []PreferredRoute
-	writes                    []PreferredRoute
+	writes                    []activationWrite
 	northReady, foreignActive bool
 	catalogBlocked, ambiguous bool
 }
@@ -157,8 +165,9 @@ ORDER BY lower(k.model_id::text),c.id`
 			if slices.Contains(blockedProtocols, protocol) {
 				continue
 			}
+			keyID := key
 			candidate := activationCandidate{route: PreferredRoute{UpstreamModel: modelID, ProviderName: providerName, CredentialLabel: &label,
-				Adapter: protocol, ProviderID: provider, CredentialID: &key, Priority: catalog.DefaultBindingPriority(modelbinding.Adapter(protocol)),
+				Adapter: protocol, ProviderID: provider, CredentialID: &keyID, Priority: catalog.DefaultBindingPriority(modelbinding.Adapter(protocol)),
 				State: "candidate", EffectiveMultiplier: rates[key]}}
 			if targetID != nil {
 				candidate.schoolID = *targetID
@@ -198,7 +207,7 @@ WITH `+catalog.BeichenKeyEvidenceCTE+`, north AS (
  SELECT n.model_id,b.model_id FROM north n JOIN model_bindings b ON b.provider_id=$1 AND lower(btrim(b.upstream_model_name))=lower(n.model_id::text)
 )
 SELECT n.upstream::text,m.id,m.model_id::text,m.status,m.credit_multiplier_milli,b.id,b.adapter,b.upstream_model_name,
- b.provider_id,p.name::text,b.priority,b.status='active',
+ b.provider_id,p.name::text,b.priority,b.status='active',b.credential_id,
  p.status='active' AND COALESCE(picked.reachable AND (b.provider_id<>$1 OR picked.catalog_current),false),
  CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.id END,
  CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.label::text END
@@ -233,8 +242,9 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 		var adapter, upstream, providerName, label *string
 		var priority *int
 		var active, reachable *bool
+		var bindingKey *uuid.UUID
 		if err := bound.Scan(&source, &school.id, &school.name, &school.status, &school.multiplier, &id, &adapter, &upstream, &owner, &providerName,
-			&priority, &active, &reachable, &key, &label); err != nil {
+			&priority, &active, &bindingKey, &reachable, &key, &label); err != nil {
 			return nil, err
 		}
 		m := modelFor(source)
@@ -251,7 +261,7 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 		}
 		s := m.schools[school.id]
 		s.bindings = append(s.bindings, activationBinding{
-			route: r, active: *active, reachable: *reachable,
+			id: *id, credential: bindingKey, route: r, active: *active, reachable: *reachable,
 		})
 	}
 	sort.Slice(models, func(i, j int) bool { return strings.ToLower(models[i].name) < strings.ToLower(models[j].name) })
@@ -332,6 +342,22 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 			plan.foreignActive = true
 		}
 		rank := 0
+		repair := false
+		if north && b.active && !b.reachable && b.credential != nil {
+			next, candidates, ambiguous := m.repairRoute(s, b.route.Adapter, b.route.UpstreamModel)
+			plan.ambiguous = plan.ambiguous || ambiguous
+			if candidates == 1 {
+				next.SchoolModel = s.name
+				next.Priority = b.route.Priority
+				before := b.route
+				before.CredentialID = b.credential
+				plan.writes = append(plan.writes, activationWrite{id: b.id, route: next, before: &before})
+				plan.northRoutes = append(plan.northRoutes, next)
+				plan.northReady, r, rank, repair = true, next, 2, true
+			} else {
+				plan.catalogBlocked = true
+			}
+		}
 		if b.active && b.reachable {
 			rank = 2
 			if s.status == "active" {
@@ -344,7 +370,7 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 			}
 		}
 		// Activating the school model publishes its retained gateway bindings too.
-		if north && !s.published() && b.active && !b.reachable {
+		if north && !s.published() && b.active && !b.reachable && !repair {
 			plan.catalogBlocked = true
 		}
 		// Bindings arrive in gateway priority and ID order.
@@ -370,7 +396,7 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 			} else {
 				choices[adapter] = choice{r, 2}
 			}
-			plan.writes = append(plan.writes, r)
+			plan.writes = append(plan.writes, activationWrite{route: r})
 			plan.northRoutes = append(plan.northRoutes, r)
 			plan.northReady = true
 		}
@@ -379,6 +405,35 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 		plan.routes = append(plan.routes, v.route)
 	}
 	return plan
+}
+
+// repairRoute selects a replacement Key only when the school model has one
+// distinct candidate for the protocol. The teacher still has to preview and
+// submit the existing activation action; ambiguous candidates stay blocked.
+func (m *activationModel) repairRoute(s *activationSchool, adapter, upstream string) (PreferredRoute, int, bool) {
+	var picked PreferredRoute
+	count, ambiguous := 0, false
+	for _, candidate := range m.defaults[adapter] {
+		mapped := candidate.schoolID == s.id
+		sameUpstream := candidate.schoolID == uuid.Nil && len(m.schools) == 1 &&
+			strings.EqualFold(candidate.route.UpstreamModel, upstream)
+		if !mapped && !sameUpstream {
+			continue
+		}
+		route := candidate.route
+		route.SchoolModel = s.name
+		if count == 0 {
+			picked = route
+		} else if route.UpstreamModel != picked.UpstreamModel || route.CredentialID == nil ||
+			picked.CredentialID == nil || *route.CredentialID != *picked.CredentialID {
+			ambiguous = true
+		}
+		count++
+	}
+	if ambiguous {
+		return PreferredRoute{}, 0, true
+	}
+	return picked, count, false
 }
 
 func (m *activationModel) defaultRoutes(s *activationSchool) ([]PreferredRoute, bool) {
@@ -810,17 +865,32 @@ func applyActivationPlan(ctx context.Context, tx *sql.Tx, provider, actor uuid.U
 			return uuid.Nil, err
 		}
 	}
-	for _, r := range plan.writes {
-		result, err := tx.ExecContext(ctx, `INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+	for _, write := range plan.writes {
+		r := write.route
+		if write.id == uuid.Nil {
+			result, execErr := tx.ExecContext(ctx, `INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
  VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,now(),now()) ON CONFLICT(model_id,provider_id,adapter) DO NOTHING`, target.id, provider, r.CredentialID, r.UpstreamModel, r.Adapter, r.Priority)
-		if err != nil {
-			return uuid.Nil, err
+			if execErr != nil {
+				return uuid.Nil, execErr
+			}
+			if count, rowsErr := result.RowsAffected(); rowsErr != nil || count != 1 {
+				return uuid.Nil, domain.NewError(domain.CodeInvalidTransition, "绑定已变化，请刷新后重新选择")
+			}
+			continue
 		}
-		count, err := result.RowsAffected()
-		if err != nil {
-			return uuid.Nil, err
+		if write.before == nil {
+			return uuid.Nil, domain.NewError(domain.CodeInvalidTransition, "绑定已变化，请刷新后重新选择")
 		}
-		if count != 1 {
+		result, execErr := tx.ExecContext(ctx, `
+UPDATE model_bindings SET credential_id=$2,upstream_model_name=$3,updated_at=now()
+WHERE id=$1 AND provider_id=$4 AND model_id=$5 AND adapter=$6 AND status='active'
+  AND credential_id IS NOT DISTINCT FROM $7::uuid AND upstream_model_name=$8 AND priority=$9`,
+			write.id, r.CredentialID, r.UpstreamModel, provider, target.id, r.Adapter,
+			write.before.CredentialID, write.before.UpstreamModel, write.before.Priority)
+		if execErr != nil {
+			return uuid.Nil, execErr
+		}
+		if count, rowsErr := result.RowsAffected(); rowsErr != nil || count != 1 {
 			return uuid.Nil, domain.NewError(domain.CodeInvalidTransition, "绑定已变化，请刷新后重新选择")
 		}
 	}

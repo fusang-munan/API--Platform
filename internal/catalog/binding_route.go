@@ -87,6 +87,11 @@ func bindingRouteCredential(ctx context.Context, client *ent.Client, binding *en
 					WriteString(s.C(providercredential.FieldID)).WriteString(`) e
 WHERE NOT (` + BeichenGroupUnavailableSQL + `)
   AND NOT EXISTS (
+    SELECT 1 FROM maintenance_state s
+    WHERE s.name='` + beichenCatalogAuthKey + `'||e.credential_id::text
+      AND (s.last_error::jsonb->>'credential_revision')::timestamptz=e.revision
+  )
+  AND NOT EXISTS (
     SELECT 1 FROM upstream_probes r
     JOIN provider_model_catalog k ON k.provider_id=r.provider_id AND k.credential_id=r.credential_id
       AND k.model_id=r.model::citext AND k.model_id::text=r.model

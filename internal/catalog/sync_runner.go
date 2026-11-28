@@ -19,6 +19,7 @@ const (
 	BeichenScanTimeout      = 25 * time.Second
 	BeichenShrinkRounds     = 3
 	beichenGroupDenialKey   = "beichen_group_denial/"
+	beichenCatalogAuthKey   = "beichen_catalog_auth/"
 )
 
 type ProviderSyncRunner struct {
@@ -103,6 +104,17 @@ ORDER BY lower(p.name), p.name, lower(pc.label), pc.label`)
 }
 
 func (r *ProviderSyncRunner) syncBeichenCredential(ctx context.Context, row activeCredentialRow) (bool, error) {
+	// The independent daily worker shares the catalog row's Retry-After backoff
+	// with scheduled billing jobs. A manual rescan remains an explicit override.
+	var nextAttempt sql.NullTime
+	err := r.DB.QueryRowContext(ctx, `
+SELECT next_attempt FROM beichen_datasets WHERE credential_id=$1 AND kind='catalog'`, row.ID).Scan(&nextAttempt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	if err == nil && nextAttempt.Valid && nextAttempt.Time.After(r.now()) {
+		return false, nil
+	}
 	lease, err := AcquireBeichenDatasetLease(ctx, r.DB, row.ID, "billing", true)
 	if lease == uuid.Nil || err != nil {
 		return false, err
@@ -220,16 +232,22 @@ func SaveBeichenKeyScan(ctx context.Context, tx *sql.Tx, provider, credential uu
 	snapshot BeichenModelSnapshot, fetchErr error) (error, error) {
 	if fetchErr != nil {
 		if errors.Is(fetchErr, ErrBeichenKeyGroupNotAllowed) {
-			if err := saveBeichenGroupDenial(ctx, tx, credential, revision, "", true); err != nil {
+			if err := saveBeichenGroupDenial(ctx, tx, provider, credential, revision, "", true); err != nil {
+				return nil, err
+			}
+		} else if beichenCatalogAuthFailure(fetchErr) {
+			// A definitive 401/403 is evidence about this Key revision. Later
+			// transient failures cannot disprove it; only a successful scan can.
+			if err := saveBeichenCatalogAuth(ctx, tx, credential, revision, true); err != nil {
 				return nil, err
 			}
 		}
-		_, err := tx.ExecContext(ctx, `
-INSERT INTO beichen_datasets (credential_id,kind,last_error) VALUES ($1,'catalog',$2)
-ON CONFLICT (credential_id,kind) DO UPDATE SET last_error=EXCLUDED.last_error`, credential, fetchErr.Error())
-		return fetchErr, err
+		return fetchErr, recordBeichenCatalogFailure(ctx, tx, credential, fetchErr)
 	}
-	if err := saveBeichenGroupDenial(ctx, tx, credential, revision, "", false); err != nil {
+	if err := saveBeichenGroupDenial(ctx, tx, provider, credential, revision, "", false); err != nil {
+		return nil, err
+	}
+	if err := saveBeichenCatalogAuth(ctx, tx, credential, revision, false); err != nil {
 		return nil, err
 	}
 	if err := confirmBeichenCatalogRemovals(ctx, tx, provider, credential, revision, at, snapshot); err != nil {
@@ -250,10 +268,61 @@ WHERE k.provider_id=$1 AND k.credential_id=$2 AND k.status='active' AND k.catalo
 		provider, credential, revision, at); err != nil {
 		return nil, err
 	}
+	return nil, recordBeichenCatalogSuccess(ctx, tx, credential)
+}
+
+func recordBeichenCatalogFailure(ctx context.Context, tx *sql.Tx, credential uuid.UUID, fetchErr error) error {
 	_, err := tx.ExecContext(ctx, `
-INSERT INTO beichen_datasets (credential_id,kind,last_success) VALUES ($1,'catalog',clock_timestamp())
-ON CONFLICT (credential_id,kind) DO UPDATE SET last_success=EXCLUDED.last_success,last_error=NULL`, credential)
-	return nil, err
+INSERT INTO beichen_datasets (credential_id,kind,last_error) VALUES ($1,'catalog',$2)
+ON CONFLICT (credential_id,kind) DO UPDATE SET last_error=EXCLUDED.last_error`, credential, fetchErr.Error())
+	if err != nil {
+		return err
+	}
+	retryAt := BeichenRetryAt(fetchErr)
+	if retryAt.IsZero() {
+		return nil
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO beichen_datasets (credential_id,kind,next_attempt) VALUES ($1,'catalog',$2)
+ON CONFLICT (credential_id,kind) DO UPDATE SET next_attempt=GREATEST(
+  COALESCE(beichen_datasets.next_attempt,'-infinity'::timestamptz),EXCLUDED.next_attempt)`, credential, retryAt)
+	return err
+}
+
+func recordBeichenCatalogSuccess(ctx context.Context, tx *sql.Tx, credential uuid.UUID) error {
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO beichen_datasets (credential_id,kind,last_success,next_attempt) VALUES ($1,'catalog',clock_timestamp(),clock_timestamp())
+ON CONFLICT (credential_id,kind) DO UPDATE SET last_success=EXCLUDED.last_success,last_error=NULL,
+  next_attempt=LEAST(COALESCE(beichen_datasets.next_attempt,clock_timestamp()),clock_timestamp())`, credential)
+	return err
+}
+
+func beichenCatalogAuthFailure(err error) bool {
+	return errors.Is(err, BeichenHTTPStatus(401)) || errors.Is(err, BeichenHTTPStatus(403))
+}
+
+type beichenCatalogAuth struct {
+	Revision time.Time `json:"credential_revision"`
+}
+
+// A definitive authentication failure belongs to the current credential
+// revision. A later successful scan proves the Key can read its directory.
+func saveBeichenCatalogAuth(ctx context.Context, tx *sql.Tx, credential uuid.UUID, revision time.Time, failed bool) error {
+	name := beichenCatalogAuthKey + credential.String()
+	if !failed {
+		_, err := tx.ExecContext(ctx, "DELETE FROM maintenance_state WHERE name=$1", name)
+		return err
+	}
+	raw, err := json.Marshal(beichenCatalogAuth{Revision: revision})
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO maintenance_state (id,name,last_error,created_at,updated_at)
+VALUES ($1,$2,$3,clock_timestamp(),clock_timestamp())
+ON CONFLICT (name) DO UPDATE SET last_error=EXCLUDED.last_error,updated_at=EXCLUDED.updated_at`,
+		uuid.Must(uuid.NewV7()), name, string(raw))
+	return err
 }
 
 type beichenGroupDenial struct {
@@ -261,16 +330,27 @@ type beichenGroupDenial struct {
 	Revision    time.Time       `json:"credential_revision"`
 	Catalog     *bool           `json:"catalog_denied"`
 	ProbeRoutes map[string]bool `json:"probe_routes,omitempty"`
+	GroupID     *int64          `json:"group_id,omitempty"`
 }
 
 // Catalog and probe observations can clear only the denial they can recheck.
 // The caller holds the credential row lock for the observed revision.
 func SaveBeichenProbeGroupDenial(ctx context.Context, tx *sql.Tx, credential uuid.UUID, revision time.Time,
 	model, protocol string, denied bool) error {
-	return saveBeichenGroupDenial(ctx, tx, credential, revision, protocol+"/"+model, denied)
+	provider, err := beichenCredentialProvider(ctx, tx, credential)
+	if err != nil {
+		return err
+	}
+	return saveBeichenGroupDenial(ctx, tx, provider, credential, revision, protocol+"/"+model, denied)
 }
 
-func saveBeichenGroupDenial(ctx context.Context, tx *sql.Tx, credential uuid.UUID, revision time.Time, route string, denied bool) error {
+func beichenCredentialProvider(ctx context.Context, tx *sql.Tx, credential uuid.UUID) (uuid.UUID, error) {
+	var provider uuid.UUID
+	err := tx.QueryRowContext(ctx, "SELECT provider_id FROM provider_credentials WHERE id=$1", credential).Scan(&provider)
+	return provider, err
+}
+
+func saveBeichenGroupDenial(ctx context.Context, tx *sql.Tx, provider, credential uuid.UUID, revision time.Time, route string, denied bool) error {
 	name := beichenGroupDenialKey + credential.String()
 	var saved sql.NullString
 	err := tx.QueryRowContext(ctx, "SELECT last_error FROM maintenance_state WHERE name=$1", name).Scan(&saved)
@@ -279,13 +359,20 @@ func saveBeichenGroupDenial(ctx context.Context, tx *sql.Tx, credential uuid.UUI
 	}
 	var state beichenGroupDenial
 	current := json.Unmarshal([]byte(saved.String), &state) == nil && state.Revision.Equal(revision)
-	if !current {
-		state = beichenGroupDenial{Code: "GROUP_NOT_ALLOWED", Revision: revision}
+	groupID, err := beichenKnownGroup(ctx, tx, credential)
+	if err != nil {
+		return err
+	}
+	reset := !current || !sameBeichenGroup(state.GroupID, groupID)
+	if reset {
+		state = beichenGroupDenial{Code: "GROUP_NOT_ALLOWED", Revision: revision, GroupID: groupID}
+	} else {
+		state.GroupID = groupID
 	}
 	// Old denial markers predate probes and represent a denied catalog read.
-	catalogDenied := current && (state.Catalog == nil || *state.Catalog)
+	catalogDenied := !reset && current && (state.Catalog == nil || *state.Catalog)
 	if route == "" {
-		if !denied && !catalogDenied && current {
+		if !denied && !catalogDenied && !reset {
 			return nil
 		}
 		catalogDenied = denied
@@ -296,7 +383,7 @@ func saveBeichenGroupDenial(ctx context.Context, tx *sql.Tx, credential uuid.UUI
 		state.ProbeRoutes[route] = true
 	} else if state.ProbeRoutes[route] {
 		delete(state.ProbeRoutes, route)
-	} else {
+	} else if !reset {
 		return nil
 	}
 	if !catalogDenied && len(state.ProbeRoutes) == 0 {
@@ -316,6 +403,23 @@ INSERT INTO maintenance_state (id,name,last_error,created_at,updated_at)
 VALUES ($1,$2,$3,clock_timestamp(),clock_timestamp())
 ON CONFLICT (name) DO UPDATE SET last_error=EXCLUDED.last_error,updated_at=EXCLUDED.updated_at`, uuid.Must(uuid.NewV7()), name, string(raw))
 	return err
+}
+
+func beichenKnownGroup(ctx context.Context, tx *sql.Tx, credential uuid.UUID) (*int64, error) {
+	var group sql.NullInt64
+	err := tx.QueryRowContext(ctx, `
+SELECT e.group_id FROM (`+BeichenKeyEvidenceSQL+` WHERE c.id=$1) e`, credential).Scan(&group)
+	if err != nil {
+		return nil, err
+	}
+	if !group.Valid {
+		return nil, nil
+	}
+	return &group.Int64, nil
+}
+
+func sameBeichenGroup(a, b *int64) bool {
+	return a == nil && b == nil || a != nil && b != nil && *a == *b
 }
 
 func confirmBeichenCatalogRemovals(ctx context.Context, tx *sql.Tx, provider, credential uuid.UUID,

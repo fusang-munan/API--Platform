@@ -267,6 +267,7 @@ VALUES(gen_random_uuid(),$1,$2,$3,ARRAY['openai_responses'],now(),now(),now(),no
 	// listing and alias must not repair or replace that binding during enable.
 	exec("UPDATE models SET status='inactive' WHERE id=$1", first)
 	exec("UPDATE provider_model_catalog SET status='inactive' WHERE credential_id=$1 AND model_id=$2", keys[0], shared)
+	exec("UPDATE provider_model_catalog SET status='inactive' WHERE credential_id=$1 AND model_id=$2", keys[1], extra)
 	result, err = service.EnableModelsBatch(ctx, provider, actor, []string{first.String()})
 	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
 		!strings.Contains(result.Skipped[0].Message, "原绑定线路尚未就绪") {
@@ -318,6 +319,85 @@ VALUES($1,$2,'school','manual','teacher',$3,1000000,1000000)`, keys[0], model, a
   (SELECT count(*) FROM model_multiplier_audits WHERE model_id=$1)`, a.id, provider).Scan(&bindings, &audits)
 	if err != nil || bindings != 1 || audits != 1 {
 		t.Fatalf("expected one binding and one publication audit, got %d and %d (%v)", bindings, audits, err)
+	}
+}
+
+func TestTeacherEnableRepairsRetiredKeyOnlyWithOneCandidatePostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	oldKey, replacement, secondReplacement := keys[1], keys[0], keys[2]
+	const upstream = "retired-key-school"
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	saveCatalogFixture(t, ctx, db, provider, oldKey, []catalog.ProviderEntry{
+		{ID: upstream, SupportedProtocols: []string{"openai_responses"}},
+	}, nil)
+	modelID := uuid.New()
+	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES($1,$2::text,$2::text,'inactive',1000,now(),now())`, modelID, upstream)
+	exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,$3,$4,'openai_responses',19,now(),now())`, modelID, provider, oldKey, upstream)
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", oldKey)
+	for _, key := range []uuid.UUID{replacement, secondReplacement} {
+		saveCatalogFixture(t, ctx, db, provider, key, []catalog.ProviderEntry{
+			{ID: upstream, SupportedProtocols: []string{"openai_responses"}},
+		}, nil)
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+VALUES($1,$2,'school','manual','teacher',$3,1000000,2000000)`, key, upstream, actor)
+	}
+	exec("UPDATE provider_credentials SET status='inactive' WHERE id=$1", secondReplacement)
+	service := New(db, nil)
+	row := func() CatalogModel {
+		t.Helper()
+		view, err := service.Overview(ctx, provider, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range view.ModelCatalog {
+			if item.Model == upstream {
+				return item
+			}
+		}
+		t.Fatal("missing catalog row")
+		return CatalogModel{}
+	}
+	first := row()
+	if !first.CanEnable || first.SchoolModelID == nil || *first.SchoolModelID != modelID ||
+		len(first.PreferredRoutes) != 1 || first.PreferredRoutes[0].CredentialID == nil ||
+		*first.PreferredRoutes[0].CredentialID != replacement {
+		t.Fatalf("single replacement should be previewed without changing the school model: %+v", first)
+	}
+	if id, err := service.EnableModel(ctx, provider, actor, upstream, ""); err != nil || id != modelID {
+		t.Fatalf("explicit enable did not preserve the school model: %s %v", id, err)
+	}
+	var repaired bool
+	err := db.QueryRowContext(ctx, `SELECT
+  (SELECT status='active' FROM models WHERE id=$1)
+  AND (SELECT count(*)=1 FROM models WHERE model_id=$2)
+  AND (SELECT count(*)=1 FROM model_bindings WHERE model_id=$1 AND provider_id=$3
+    AND adapter='openai_responses' AND status='active' AND credential_id=$4 AND priority=19)`,
+		modelID, upstream, provider, replacement).Scan(&repaired)
+	if err != nil || !repaired {
+		t.Fatalf("repair changed or duplicated the school identity: %v", err)
+	}
+
+	// A second viable Key makes the choice ambiguous. The teacher must use the
+	// explicit rebind preview instead of having a route picked automatically.
+	exec("UPDATE models SET status='inactive' WHERE id=$1", modelID)
+	exec("UPDATE provider_credentials SET status='active' WHERE id=$1", secondReplacement)
+	exec(`UPDATE model_bindings SET credential_id=$2,status='active' WHERE model_id=$1 AND adapter='openai_responses'`,
+		modelID, oldKey)
+	ambiguous := row()
+	if ambiguous.CanEnable {
+		t.Fatalf("multiple replacement Keys must be ambiguous: %+v", ambiguous)
+	}
+	if id, err := service.EnableModel(ctx, provider, actor, upstream, ""); id != uuid.Nil ||
+		!strings.Contains(err.Error(), "多个候选线路") {
+		t.Fatalf("ambiguous replacement was not rejected: %s %v", id, err)
+	}
+	var unchanged bool
+	err = db.QueryRowContext(ctx, `SELECT count(*)=1 AND bool_and(credential_id=$2)
+FROM model_bindings WHERE model_id=$1 AND adapter='openai_responses'`, modelID, oldKey).Scan(&unchanged)
+	if err != nil || !unchanged {
+		t.Fatalf("ambiguous enable changed a binding: %v", err)
 	}
 }
 

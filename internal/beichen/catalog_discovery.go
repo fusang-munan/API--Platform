@@ -333,7 +333,10 @@ func (key discoveryKey) diagnoseGroup(locations []WebsiteLocation, missingModel 
 			}
 		}
 	}
-	if missingModel && hasOtherGroup && !hasCurrentGroup {
+	// A retained historical row is not current group evidence. When the
+	// selected group does not list the model at all, the model is outside the
+	// group even if an older snapshot still carries its price.
+	if hasOtherGroup && !hasCurrentGroup {
 		return "model_outside_key_group"
 	}
 	if !missingModel && hasCurrentGroup && key.priceError != nil && *key.priceError == errPanelRulesConflict.Error() {
