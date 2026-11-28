@@ -48,6 +48,18 @@ function press(root: Pick<DOMWrapper<Element>, 'findAll'>, label: string) {
 }
 
 describe('北辰模型用量明细', () => {
+  it('每次打开都请求重查，切换时段和型号只更新当前视图', async () => {
+    const wrapper = drawer({ open: false, usage: usage() })
+    expect(wrapper.emitted('retry')).toBeUndefined()
+    await wrapper.setProps({ open: true, initialModel: 'lab/a' })
+    expect(wrapper.emitted('retry')).toEqual([[]])
+    await wrapper.setProps({ range: 'day', initialModel: 'lab/b' })
+    expect(wrapper.emitted('retry')).toEqual([[]])
+    await wrapper.setProps({ open: false })
+    await wrapper.setProps({ open: true, range: 'month' })
+    expect(wrapper.emitted('retry')).toEqual([[], []])
+  })
+
   it('按模型显示完整性和待核，展开后同一账号的项目用量精确合计', async () => {
     const wrapper = drawer({ usage: usage() })
     expect(wrapper.findAll('tbody tr')).toHaveLength(3)
@@ -131,10 +143,11 @@ describe('北辰模型用量明细', () => {
 
   it('加载、读取失败和空集分别展示，旧数据没有核对字段时显示待确认', async () => {
     const wrapper = drawer({ loading: true })
-    expect(wrapper.get('[role="status"]').text()).toContain('正在读取用量')
+    expect(wrapper.get('[role="status"]').text()).toBe('正在读取本月用量…')
     await wrapper.setProps({ loading: false, error: '用量暂不可用' })
+    expect(wrapper.get('[role="alert"]').text()).toContain('用量暂不可用')
     await press(wrapper, '重试读取用量')
-    expect(wrapper.emitted('retry')).toHaveLength(1)
+    expect(wrapper.emitted('retry')).toHaveLength(2)
     await wrapper.setProps({ error: '', usage: {
       ...usage(), models: [], students: [],
       totals: metrics('0', 0, { cache_hit_rate: null, completeness: null, tokens_missing: null }),

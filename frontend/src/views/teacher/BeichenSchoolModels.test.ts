@@ -2,6 +2,7 @@ import { DOMWrapper, enableAutoUnmount, flushPromises, mount } from '@vue/test-u
 import { defineComponent } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BeichenBatchEnableResult, BeichenModelUsage, BeichenPriceConditions, BeichenRebindPlan, BeichenUsageRange, BeichenUsageTotals, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../../api/types'
+import BeichenModelUsageDrawer from '../../components/BeichenModelUsageDrawer.vue'
 import BeichenPriceDrawer from '../../components/BeichenPriceDrawer.vue'
 import BeichenSchoolModels from './BeichenSchoolModels.vue'
 import { indexWebsiteKeyGroups, schoolCatalog, schoolTokenPriceAt, type TeacherBoundRoute, type TeacherCatalogModel, type TeacherOverview } from '../../utils/beichenModels'
@@ -511,6 +512,7 @@ describe('北辰模型管理', () => {
     expect(rowA.get('.model-usage').text()).not.toContain('88.050178513')
     expect(rowB.get('.model-usage').text()).toContain('88.050178513')
     await rowA.get('button[aria-label="查看 gemini-4-terra 用量"]').trigger('click')
+    await flushPromises()
     const dialog = wrapper.get('[role="dialog"]')
     expect(dialog.get('[aria-label="用量汇总"]').text()).toContain('本月已扣积分1.6844212')
     await button(dialog, '按 Key').trigger('click')
@@ -586,6 +588,7 @@ describe('北辰模型管理', () => {
       expect(row.text()).toBe('待确认')
     }
     await wrapper.get('[data-catalog-key="terra-a"] button[aria-label="查看 gemini-4-terra 用量"]').trigger('click')
+    await flushPromises()
     const dialog = wrapper.get('[role="dialog"]')
     expect(dialog.get('[data-testid="usage-identity-ambiguous"]').text()).toContain('同名上游未归属')
     expect(dialog.text()).not.toContain('89.734599713')
@@ -623,6 +626,7 @@ describe('北辰模型管理', () => {
     expect(wrapper.get(`[data-catalog-key="${first.id}"] .model-usage`).text()).toContain('1.6844212 积分')
     expect(wrapper.get(`[data-catalog-key="${second.id}"] .model-usage`).text()).toBe('本月无校内调用')
     await wrapper.get(`[data-catalog-key="${first.id}"] button[aria-label="查看 gemini-4-terra 用量"]`).trigger('click')
+    await flushPromises()
     expect(wrapper.get('[role="dialog"] [aria-label="用量汇总"]').text()).toContain('本月已扣积分1.6844212')
   })
 
@@ -1914,25 +1918,72 @@ describe('北辰模型管理', () => {
     await flushPromises()
     day.resolve({ ...usage('day'), totals: total('500') })
     await flushPromises()
-    expect(api.modelUsage.mock.calls).toEqual([['month', 'north'], ['day', 'north'], ['all', 'north']])
+    expect(api.modelUsage.mock.calls).toEqual([['month', 'north'], ['month', 'north'], ['day', 'north'], ['all', 'north']])
     expect(api.beichenOverview).toHaveBeenCalledTimes(1)
     expect(dialog.get('[aria-label="用量汇总"]').text()).toContain('总计已扣积分999')
     expect(summary.findAll('dd > span').map(cell => cell.text())).toEqual(['33.00000000000000000001', '2,000', '12.5%', '3'])
   })
 
-  it('每 60 秒轮询模型概览和 Key 清单，模型行打开本月学生用量', async () => {
+  it('概览轮询后打开模型抽屉会重查本月，失败可重试并显示新结果', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const request = deferred<BeichenModelUsage>()
+    const fresh = usage()
+    fresh.models[0].credits = '77.5'
+    api.modelUsage.mockResolvedValueOnce(usage()).mockReturnValueOnce(request.promise).mockResolvedValueOnce(fresh)
     const wrapper = view()
     await flushPromises()
     await vi.advanceTimersByTimeAsync(60_000)
     expect(api.beichenOverview).toHaveBeenCalledTimes(2)
     expect(api.beichenWebsiteKeys).toHaveBeenCalledTimes(2)
-    expect(api.modelUsage).toHaveBeenCalledTimes(1)
+    expect(api.modelUsage).toHaveBeenCalledExactlyOnceWith('month', 'north')
+    expect(wrapper.get('.model-usage').text()).toContain('11 积分')
     await wrapper.get('button[aria-label="查看 lab/a 用量"]').trigger('click')
     const dialog = wrapper.get('[role="dialog"]')
+    expect(api.modelUsage.mock.calls).toEqual([['month', 'north'], ['month', 'north']])
+    expect(dialog.get('.model-usage-panel').attributes('aria-busy')).toBe('true')
+    expect(dialog.get('[role="status"]').text()).toBe('正在读取本月用量…')
+    expect(dialog.find('[aria-label="用量汇总"]').exists()).toBe(false)
+
+    request.reject(new Error('读取失败'))
+    await flushPromises()
+    expect(dialog.get('[role="alert"]').text()).toContain('读取用量失败')
+    expect(dialog.get('.model-usage-panel').attributes('aria-busy')).toBe('false')
+    expect(dialog.find('[aria-label="用量汇总"]').exists()).toBe(false)
+    await button(dialog, '重试读取用量').trigger('click')
+    await flushPromises()
+    expect(api.modelUsage).toHaveBeenCalledTimes(3)
+    expect(api.modelUsage).toHaveBeenLastCalledWith('month', 'north')
+    expect(dialog.find('[role="alert"]').exists()).toBe(false)
+    expect(dialog.get('[aria-label="用量汇总"]').text()).toContain('本月已扣积分77.5')
     expect(dialog.get('button[aria-expanded="true"]').text()).toContain('lab/a')
     expect(dialog.get('tbody').text()).toContain('学生甲')
     expect(dialog.get('tbody').text()).not.toMatch(/学生乙|lab\/b/)
+  })
+
+  it('从当天明细关闭后再打开会重查本月，迟到的旧结果不会覆盖新结果', async () => {
+    const oldRequest = deferred<BeichenModelUsage>()
+    api.modelUsage.mockResolvedValueOnce(usage())
+      .mockReturnValueOnce(oldRequest.promise)
+      .mockResolvedValueOnce(usage('day'))
+      .mockResolvedValueOnce({ ...usage(), totals: total('60') })
+    const wrapper = view()
+    await flushPromises()
+    await button(wrapper, '查看全部明细').trigger('click')
+    const dialog = wrapper.get('[role="dialog"]')
+    await button(dialog.get('[aria-label="用量时间范围"]'), '当天').trigger('click')
+    await flushPromises()
+    expect(dialog.get('[aria-label="用量汇总"]').text()).toContain('当天已扣积分')
+    wrapper.getComponent(BeichenModelUsageDrawer).vm.$emit('update:open', false)
+    await flushPromises()
+    await button(wrapper, '查看全部明细').trigger('click')
+    await flushPromises()
+    expect(api.modelUsage.mock.calls).toEqual([['month', 'north'], ['month', 'north'], ['day', 'north'], ['month', 'north']])
+    oldRequest.resolve({ ...usage(), totals: total('99') })
+    await flushPromises()
+
+    const reopened = wrapper.get('[role="dialog"]')
+    expect(reopened.get('[aria-pressed="true"]').text()).toBe('本月')
+    expect(reopened.get('[aria-label="用量汇总"]').text()).toContain('本月已扣积分60')
   })
 
   it('本月逐行区分读取中、无校内调用、零额、未回报 Token 和待核', async () => {
@@ -1966,6 +2017,7 @@ describe('北辰模型管理', () => {
     expect(row(names[4]).text()).not.toContain('零额')
     expect(wrapper.get('[aria-label="本月用量汇总"]').text()).toContain('未归类 Token 40')
     await row(names[0]).get('button').trigger('click')
+    await flushPromises()
     expect(wrapper.get('[role="dialog"]').text()).toContain('本月无校内调用')
   })
 
@@ -1977,7 +2029,7 @@ describe('北辰模型管理', () => {
       pending_calls: 2, pending_review_calls: 2, pending_review_credits: '17',
       token_missing_calls: 2, tokens_missing: 7, completeness: 'partial' as const,
     }
-    api.modelUsage.mockResolvedValueOnce({
+    api.modelUsage.mockResolvedValue({
       ...usage(), totals: { ...metrics, cache_hit_rate: null }, models: [{ model: name, ...metrics }],
     })
     const wrapper = view()
@@ -1990,6 +2042,7 @@ describe('北辰模型管理', () => {
     expect(wrapper.get('[data-model="' + name + '"] .model-usage').text()).toContain('0 积分 · 3 次（零额）')
 
     await wrapper.get('button[aria-label="查看 ' + name + ' 用量"]').trigger('click')
+    await flushPromises()
     const dialog = wrapper.get('[role="dialog"]')
     expect(dialog.get('td[data-label="已扣积分"]').text()).toContain('派发 5 笔 · 已结算 3 笔 · 零额 3 笔')
     expect(dialog.get('td[data-label="Token"]').text()).toContain('2 笔未回报 Token · 未归类 Token 7')
@@ -2008,6 +2061,7 @@ describe('北辰模型管理', () => {
     const wrapper = view()
     await flushPromises()
     await wrapper.get(`button[aria-label="查看 ${terra} 用量"]`).trigger('click')
+    await flushPromises()
     const dialog = wrapper.get('[role="dialog"]')
     await button(dialog, '按 Key').trigger('click')
     expect(dialog.get('[aria-label="用量汇总"]').text()).toContain('本月已扣积分1.6844212')
