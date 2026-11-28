@@ -5,8 +5,8 @@ import App from '../App.vue'
 import router from '../router'
 import { token } from '../api/client'
 import { useAuthStore } from '../store/auth'
-import type { BeichenModel, BeichenModelUsage, BeichenOverview, BeichenPriceConditions, ProjectUsage, Role } from '../api/types'
-import { indexWebsiteKeyGroups, schoolCatalog } from '../utils/beichenModels'
+import type { BeichenModel, BeichenModelUsage, BeichenPriceConditions, ProjectUsage, Role } from '../api/types'
+import { indexWebsiteKeyGroups, schoolCatalog, type TeacherOverview } from '../utils/beichenModels'
 import { schoolDay, schoolMonth } from '../utils/format'
 
 vi.mock('../api/client', async original => ({
@@ -94,6 +94,7 @@ async function fetchFixture(url: string, init?: RequestInit) {
     ],
   })
   if (path.endsWith('/beichen')) return reply({
+    school_multipliers: { chosen: '1.10', cheap: '1.10', stale: '1.10' },
     web_login_required: true,
     maintenance_workspace: { launch_url: workspaceUrl },
     website_sync: {
@@ -230,7 +231,7 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   expect(shared.findAll('[data-testid="model-price-table"]')).toHaveLength(1)
   expect(visiblePrices(shared)).toEqual([
     ['上游基础价', '0.1', '0.2', '未列', '未列', '0'],
-    ['学生实价', '23.375000000000000000000011', '46.750000000000000000000022', '—', '—', '0'],
+    ['学生实价', '23.375', '46.75', '—', '—', '0'],
   ])
   expect(shared.get('[data-testid="group-prices"]').attributes('data-price-source')).toBe('website')
   expect(shared.text()).not.toContain('上下文分档')
@@ -319,12 +320,12 @@ it('教师从目录直接启用未配置模型，失败后可重试，后台成�
 const discoveredModel = 'catalog/new-from-key'
 type PriceSnapshot = Pick<BeichenModel, 'price_status' | 'price_conditions' | 'price_conditions_exact' | 'upstream_rates'>
 
-function discoveredOverview(price: PriceSnapshot | null, multiplier: string | null = '0.125'): BeichenOverview {
+function discoveredOverview(price: PriceSnapshot | null, multiplier: string | null = '0.125'): TeacherOverview {
   keyRate = multiplier ?? '0.125'
   const terms = price?.price_conditions_exact
   const complete = Boolean(terms && (price?.price_status === 'confirmed' || price?.price_status === 'conditional'))
   return {
-    datasets: [], comparison: [],
+    datasets: [], comparison: [], school_multipliers: { chosen: '1.10', cheap: '1.10' },
     model_catalog: [{
       model: discoveredModel, school_status: 'not_configured', can_enable: true,
       source: 'both', catalog_state: 'key_listed', credential_ids: ['chosen'], key_count: 1,
@@ -353,7 +354,7 @@ function verifiedGroups(multiplier = keyRate) {
   })
 }
 
-function withVerifiedRate(data: BeichenOverview, multiplier = keyRate) {
+function withVerifiedRate(data: TeacherOverview, multiplier = keyRate) {
   data.datasets = [{ kind: 'billing', credential_id: 'chosen', group_id: 11, group_rate: multiplier,
     group_status: 'assigned', billing_state: 'current', effective_multiplier: multiplier,
     observed_at: '2026-11-21T13:05:00Z' }]
@@ -367,7 +368,7 @@ it('教师页自动发现目录里的新模型，等待当前 Key 的报价并�
   const table = widget.get('[aria-label="北辰模型目录"]')
   expect(table.text()).not.toContain(discoveredModel)
   const before = request.mock.calls.length
-  const update = async (snapshot: BeichenOverview) => {
+  const update = async (snapshot: TeacherOverview) => {
     withVerifiedRate(snapshot)
     request.mockResolvedValueOnce(reply(snapshot))
     await vi.advanceTimersByTimeAsync(60_000)

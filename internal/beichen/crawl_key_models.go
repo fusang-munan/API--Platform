@@ -103,8 +103,10 @@ type crawlKeyModelTarget struct {
 }
 
 type crawlKeyRate struct {
-	groupID int64
-	info    *billingInfo
+	groupID      int64
+	info         *billingInfo
+	groupDefault *json.Number
+	conflict     error
 }
 
 // The website inventory establishes which provisioned credentials belong to
@@ -149,10 +151,11 @@ ORDER BY p.channel`, provider)
 		return results, ""
 	}
 	var rates map[int64]json.Number
+	var rateErr error
 	keys, err := readWithWebsiteKeySession(ctx, s, provider, panelToken, func(auth panelAuthorization) ([]listedKey, error) {
 		keys, err := s.accountKeys(ctx, auth.bearer)
 		if err == nil {
-			rates, _ = s.fetchWebsiteAccountRates(ctx, auth.bearer)
+			rates, rateErr = s.fetchWebsiteAccountRates(ctx, auth.bearer)
 		}
 		return keys, err
 	})
@@ -179,14 +182,38 @@ ORDER BY p.channel`, provider)
 		}()
 	}
 	round.Wait()
-	fallbackRates := make(map[int64]*billingInfo)
-	for _, checked := range checkedRates {
-		if checked.groupID != 0 && (checked.info != nil || fallbackRates[checked.groupID] == nil) {
-			fallbackRates[checked.groupID] = checked.info
+	fallbackRates := mergeCrawlKeyRates(checkedRates)
+	crawl.applyAccountRates(rates, fallbackRates, rateErr)
+	return results, ""
+}
+
+// Any conflicting Key makes its whole group inconclusive. A later verified
+// Key or group default must never replace that evidence.
+func mergeCrawlKeyRates(checked []crawlKeyRate) map[int64]crawlKeyRate {
+	merged := make(map[int64]crawlKeyRate)
+	for _, evidence := range checked {
+		if evidence.groupID == 0 {
+			continue
+		}
+		prior, exists := merged[evidence.groupID]
+		if !exists || crawlKeyRatePriority(evidence) > crawlKeyRatePriority(prior) {
+			merged[evidence.groupID] = evidence
 		}
 	}
-	crawl.applyAccountRates(rates, fallbackRates)
-	return results, ""
+	return merged
+}
+
+func crawlKeyRatePriority(evidence crawlKeyRate) int {
+	switch {
+	case evidence.conflict != nil:
+		return 3
+	case evidence.info != nil:
+		return 2
+	case evidence.groupDefault != nil:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // The website renders these logged-in account rates next to group defaults.
@@ -207,29 +234,33 @@ func (s *Service) fetchWebsiteAccountRates(ctx context.Context, bearer string) (
 	if err != nil {
 		return nil, err
 	}
-	var raw map[string]json.Number
+	var raw map[string]json.RawMessage
 	var invalidRates = errors.New("北辰官网账户倍率格式无效")
 	if json.Unmarshal(data, &raw) != nil || raw == nil {
 		return nil, invalidRates
 	}
 	rates := make(map[int64]json.Number, len(raw))
+	var invalid error
 	for id, rate := range raw {
 		groupID, err := strconv.ParseInt(id, 10, 64)
-		if err != nil || !validWebsiteGroupID(groupID) || strconv.FormatInt(groupID, 10) != id || websiteGroupRate(rate) == nil {
-			return nil, invalidRates
+		var value json.Number
+		if err != nil || !validWebsiteGroupID(groupID) || strconv.FormatInt(groupID, 10) != id ||
+			json.Unmarshal(rate, &value) != nil || websiteGroupRate(value) == nil {
+			invalid = invalidRates
+			continue
 		}
-		rates[groupID] = rate
+		rates[groupID] = value
 	}
-	return rates, nil
+	return rates, invalid
 }
 
-func (crawl *directoryCrawl) applyAccountRates(rates map[int64]json.Number, fallback map[int64]*billingInfo) {
-	crawl.accountRatesVerified = rates != nil
+func (crawl *directoryCrawl) applyAccountRates(rates map[int64]json.Number, fallback map[int64]crawlKeyRate, readErr error) {
+	crawl.accountRatesVerified = rates != nil && readErr == nil
 	crawl.AccountRateError = ""
-	if rates == nil {
+	if !crawl.accountRatesVerified {
 		crawl.AccountRateError = websiteAccountRatesReadFailure
-		return
 	}
+	var conflictReason string
 	for i := range crawl.platforms {
 		for j := range crawl.platforms[i].Groups {
 			group := &crawl.platforms[i].Groups[j]
@@ -238,12 +269,25 @@ func (crawl *directoryCrawl) applyAccountRates(rates map[int64]json.Number, fall
 			}
 			if rate, ok := rates[group.ID]; ok {
 				group.AccountRate, group.AccountRateSource, group.AccountRateKeyID = &rate, "", 0
-			} else if info, checked := fallback[group.ID]; info != nil {
-				group.setKeyAccountRate(*info)
-			} else if !setGroupAccountRate(group) && checked {
-				crawl.AccountRateError = "部分北辰渠道的账户倍率未核实"
+			} else if evidence, checked := fallback[group.ID]; checked {
+				switch {
+				case evidence.conflict != nil:
+					if conflictReason == "" {
+						conflictReason = evidence.conflict.Error()
+					}
+				case evidence.info != nil:
+					group.setKeyAccountRate(*evidence.info)
+				case evidence.groupDefault != nil:
+					rate := *evidence.groupDefault
+					group.AccountRate, group.AccountRateSource, group.AccountRateKeyID = &rate, groupRateSource, 0
+				case crawl.AccountRateError == "":
+					crawl.AccountRateError = "部分北辰渠道的账户倍率未核实"
+				}
 			}
 		}
+	}
+	if conflictReason != "" {
+		crawl.AccountRateError = conflictReason
 	}
 }
 
@@ -266,16 +310,24 @@ func (s *Service) checkCrawlKeyModels(ctx context.Context, result *CrawlKeyModel
 		return crawlKeyRate{}
 	}
 	group := result.compare(crawl, entries, identity.GroupID)
-	if _, listed := rates[group.ID]; rates == nil || listed || group.ID == 0 {
+	if _, listed := rates[group.ID]; listed || group.ID == 0 {
 		return crawlKeyRate{}
 	}
 	checked := crawlKeyRate{groupID: group.ID}
+	info, _, err := s.fetchVerifiedKeyAccountRate(ctx, target.credential, key, identity, group)
+	if errors.Is(err, errKeyGroupNotAllowed) {
+		result.State, result.Error = "unavailable", err.Error()
+		return crawlKeyRate{}
+	}
+	if errors.Is(err, errAccountRateConflict) {
+		result.Error = err.Error()
+		return crawlKeyRate{groupID: group.ID, conflict: err}
+	}
 	// A shared directory rate must not be attributed to multiple Keys.
-	if keysPerGroup[group.ID] == 1 {
-		info, _, err := s.fetchVerifiedKeyAccountRate(ctx, target.credential, key, identity, group)
-		if err == nil {
-			checked.info = &info
-		}
+	if err == nil && keysPerGroup[group.ID] == 1 {
+		checked.info = &info
+	} else if setGroupAccountRate(&group, identity) {
+		checked.groupDefault = group.AccountRate
 	}
 	return checked
 }

@@ -17,12 +17,18 @@ const (
 	websiteAccountRatesReadFailure = "官网账户倍率表读取失败"
 	keyBillingDefaultRateMismatch  = "Key 账单默认倍率与官网分组不一致"
 	keyBillingPeakMismatch         = "Key 账单高峰状态与官网分组不一致"
+	keyBillingEffectiveMismatch    = "Key 账单生效倍率与官网分组默认倍率不一致"
 )
 
 var errWebsiteAccountRateUnverified = errors.New("北辰官网账户倍率未核实，分组倍率仅供参考")
+var errAccountRateConflict = errors.New("北辰账户倍率证据冲突")
 
 func accountRateUnverified(reason string) error {
 	return fmt.Errorf("%w：%s", errWebsiteAccountRateUnverified, reason)
+}
+
+func accountRateConflict(reason string) error {
+	return fmt.Errorf("%w：%w：%s", errWebsiteAccountRateUnverified, errAccountRateConflict, reason)
 }
 
 func accountRateReadFailed(reason string, err error) error {
@@ -40,8 +46,11 @@ func (group *WebsiteGroup) setKeyAccountRate(info billingInfo) {
 	group.AccountRateKeyID = info.APIKeyID
 }
 
-func setGroupAccountRate(group *directoryGroup) bool {
-	if group.Subscription != "standard" || group.Rate == nil || websiteGroupRate(*group.Rate) == nil || group.PeakEnabled == nil {
+func setGroupAccountRate(group *directoryGroup, identity listedKey) bool {
+	if group.ID != identity.GroupID || !validWebsiteGroupID(group.ID) || !validWebsiteGroupID(identity.ID) ||
+		group.Subscription != "standard" || group.Rate == nil || websiteGroupRate(*group.Rate) == nil || group.PeakEnabled == nil ||
+		*group.PeakEnabled ||
+		keyBillingIdentityIssue(billingInfo{GroupRate: *group.Rate, PeakEnabled: group.PeakEnabled}, identity) != "" {
 		return false
 	}
 	rate := *group.Rate
@@ -49,29 +58,31 @@ func setGroupAccountRate(group *directoryGroup) bool {
 	return true
 }
 
-// The caller must have identified the live Key and confirmed that a
-// successful account rates response omitted this website-listed group.
+// The caller has identified the live Key but has no verified account-table
+// entry for its group.
 func (s *Service) fetchVerifiedKeyAccountRate(ctx context.Context, credential uuid.UUID, key string,
 	identity listedKey, group directoryGroup) (billingInfo, time.Time, error) {
+	if group.ID != identity.GroupID || !validWebsiteGroupID(group.ID) || !validWebsiteGroupID(identity.ID) {
+		return billingInfo{}, time.Time{}, accountRateUnverified("官网分组身份或默认倍率无法核对")
+	}
 	if group.Subscription != "standard" {
 		return billingInfo{}, time.Time{}, accountRateUnverified("官网分组不是标准余额计费")
 	}
 	if group.PeakEnabled == nil || *group.PeakEnabled {
 		return billingInfo{}, time.Time{}, accountRateUnverified("官网分组未确认关闭高峰计费")
 	}
-	if group.ID != identity.GroupID || !validWebsiteGroupID(group.ID) || !validWebsiteGroupID(identity.ID) ||
-		group.Rate == nil || websiteGroupRate(*group.Rate) == nil {
+	if group.Rate == nil || websiteGroupRate(*group.Rate) == nil {
 		return billingInfo{}, time.Time{}, accountRateUnverified("官网分组身份或默认倍率无法核对")
 	}
 	info, err := s.fetchKeyBillingInfo(ctx, key, identity.GroupID)
+	if errors.Is(err, errKeyGroupNotAllowed) {
+		return billingInfo{}, time.Time{}, err
+	}
 	if err != nil {
 		var readErr keyBillingReadError
-		switch {
-		case errors.Is(err, errKeyGroupNotAllowed):
-			return billingInfo{}, time.Time{}, err
-		case errors.As(err, &readErr):
+		if errors.As(err, &readErr) {
 			err = accountRateReadFailed("Key 账单读取失败", readErr.cause)
-		default:
+		} else {
 			err = accountRateUnverified("Key 账单格式或生效倍率无效")
 		}
 		return billingInfo{}, time.Time{}, err
@@ -82,26 +93,39 @@ func (s *Service) fetchVerifiedKeyAccountRate(ctx context.Context, credential uu
 		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少分组号（group_id 未提供或为 0）")
 	}
 	if reason := keyBillingIdentityIssue(info, identity); reason != "" {
-		return billingInfo{}, time.Time{}, accountRateUnverified(reason)
+		return billingInfo{}, time.Time{}, accountRateConflict(reason)
 	}
 	if info.APIKeyID == 0 {
 		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少 Key 编号（api_key_id 未提供或为 0）")
 	}
 	if info.GroupRate == "" {
-		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少分组默认倍率")
+		// A standard response may omit the default while still naming the
+		// same group. Without an effective rate there is no account evidence.
+		if info.Multiplier == "" {
+			return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少分组默认倍率")
+		}
 	}
-	if !samePanelRate(*group.Rate, info.GroupRate) {
-		return billingInfo{}, time.Time{}, accountRateUnverified(keyBillingDefaultRateMismatch)
+	if info.GroupRate != "" && !samePanelRate(*group.Rate, info.GroupRate) {
+		return billingInfo{}, time.Time{}, accountRateConflict(keyBillingDefaultRateMismatch)
+	}
+	if info.Multiplier == "" {
+		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少生效倍率")
+	}
+	// A parsed billing response with a different effective rate is evidence,
+	// even when recent usage cannot independently confirm that sample. It
+	// cannot be replaced by the group default.
+	if !samePanelRate(*group.Rate, info.Multiplier) {
+		return billingInfo{}, time.Time{}, accountRateConflict(keyBillingEffectiveMismatch)
 	}
 	if info.PeakEnabled == nil {
 		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少高峰状态")
 	}
 	if *info.PeakEnabled || (info.AppliedPeak != "" && !samePanelRate(info.AppliedPeak, "1")) {
-		return billingInfo{}, time.Time{}, accountRateUnverified(keyBillingPeakMismatch)
+		return billingInfo{}, time.Time{}, accountRateConflict(keyBillingPeakMismatch)
 	}
 	if (info.UserRate != nil && !samePanelRate(*info.UserRate, info.Multiplier)) ||
 		(info.ResolvedRate != "" && !samePanelRate(info.ResolvedRate, info.Multiplier)) {
-		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单的账户倍率与生效倍率不一致")
+		return billingInfo{}, time.Time{}, accountRateConflict("Key 账单的账户倍率与生效倍率不一致")
 	}
 	at, err := s.currentKeyBillingAt(ctx, info)
 	if errors.Is(err, errKeyBillingSampleExpired) {

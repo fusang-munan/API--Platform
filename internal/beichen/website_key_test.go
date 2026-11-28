@@ -22,37 +22,55 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 	const keyFields = `"group_id":16,"api_key_id":12094,"group_rate_multiplier":0.60,"effective_rate_multiplier":0.6,"peak_rate_enabled":false`
 	const usage = `{"date":"2026-11-22","group_id":16,"requests":2,"cost":0.01,"actual_cost":0.006}`
 	for _, test := range []struct {
-		name        string
-		rates       string
-		ratesStatus int
-		keyFields   string
-		keyStatus   int
-		sampleAge   time.Duration
-		usage       string
-		peakGroup   bool
-		unknownPeak bool
-		nonStandard bool
-		wantRate    json.Number
-		wantReason  string
-		rejectKey   string
-		wantKeyRead bool
+		name              string
+		rates             string
+		ratesStatus       int
+		keyFields         string
+		keyStatus         int
+		sampleAge         time.Duration
+		usage             string
+		peakGroup         bool
+		unknownPeak       bool
+		nonStandard       bool
+		wantRate          json.Number
+		wantReason        string
+		rejectKey         string
+		wantKeyRead       bool
+		wantConflict      bool
+		wantGroupFallback bool
 	}{
 		{name: "website account rate wins", rates: `{"16":0.50}`, wantRate: "0.50"},
+		{name: "billing 0.8 conflicts with an outage", ratesStatus: http.StatusServiceUnavailable,
+			keyFields:    strings.Replace(keyFields, `"effective_rate_multiplier":0.6`, `"effective_rate_multiplier":0.8`, 1),
+			wantConflict: true, wantKeyRead: true},
+		{name: "billing 0.8 conflicts with an invalid table", rates: "null",
+			keyFields:    strings.Replace(keyFields, `"effective_rate_multiplier":0.6`, `"effective_rate_multiplier":0.8`, 1),
+			wantConflict: true, wantKeyRead: true},
+		{name: "billing 0.8 conflicts with another malformed group",
+			rates:        `{"6":"invalid"}`,
+			keyFields:    strings.Replace(keyFields, `"effective_rate_multiplier":0.6`, `"effective_rate_multiplier":0.8`, 1),
+			wantConflict: true, wantKeyRead: true},
+		{name: "billing 0.2 conflicts with a reverse rate", ratesStatus: http.StatusServiceUnavailable,
+			keyFields:    strings.Replace(keyFields, `"effective_rate_multiplier":0.6`, `"effective_rate_multiplier":0.2`, 1),
+			wantConflict: true, wantKeyRead: true},
+		{name: "billing group 17 conflicts with Key group 16", ratesStatus: http.StatusServiceUnavailable,
+			keyFields:    strings.Replace(keyFields, `"group_id":16`, `"group_id":17`, 1),
+			wantConflict: true, wantKeyRead: true},
 		{name: "peak uses the website account rate", rates: `{"16":0.20}`, peakGroup: true, wantRate: "0.4"},
 		{name: "CC1 explicit fields and exact evidence", usage: usage, wantRate: "0.6", wantKeyRead: true},
-		{name: "effective rate can differ from the default",
-			keyFields: strings.Replace(keyFields, `"effective_rate_multiplier":0.6`, `"effective_rate_multiplier":0.5`, 1),
-			usage:     strings.Replace(usage, "0.006", "0.005", 1), wantRate: "0.5", wantKeyRead: true},
-		{name: "account rates outage skips Key billing", ratesStatus: http.StatusServiceUnavailable,
-			wantReason: "官网账户倍率表读取失败（HTTP 503）"},
-		{name: "invalid account rates response skips Key billing", rates: "null",
-			wantReason: "官网账户倍率表读取失败"},
-		{name: "subscription group skips Key billing", nonStandard: true,
+		{name: "effective 0.5 conflicts with the default",
+			keyFields:    strings.Replace(keyFields, `"effective_rate_multiplier":0.6`, `"effective_rate_multiplier":0.5`, 1),
+			wantConflict: true, wantKeyRead: true},
+		{name: "account rates outage allows the verified group default", ratesStatus: http.StatusServiceUnavailable,
+			keyStatus: http.StatusNotFound, wantKeyRead: true, rejectKey: "Key 账单读取失败（HTTP 404）"},
+		{name: "invalid account rates response still prefers verified Key billing", rates: "null",
+			usage: usage, wantRate: "0.6", wantKeyRead: true},
+		{name: "subscription group cannot sign the default rate", nonStandard: true,
 			wantReason: "官网分组不是标准余额计费"},
 		{name: "unknown peak state does not allow the default rate", unknownPeak: true,
 			wantReason: "官网分组未确认关闭高峰计费"},
-		{name: "peak group uses the default rate with the active peak multiplier", peakGroup: true, wantRate: "1.2",
-			rejectKey: "官网分组未确认关闭高峰计费"},
+		{name: "peak group cannot use the default rate", peakGroup: true,
+			wantReason: "官网分组未确认关闭高峰计费"},
 		{name: "Key billing HTTP 404 falls back to the group default", keyStatus: http.StatusNotFound, wantKeyRead: true,
 			rejectKey: "Key 账单读取失败（HTTP 404）"},
 		{name: "omitted group is distinct from a conflicting group", keyFields: strings.TrimPrefix(keyFields, `"group_id":16,`),
@@ -60,23 +78,26 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 		{name: "zero group is missing", keyFields: strings.Replace(keyFields, `"group_id":16`, `"group_id":0`, 1),
 			rejectKey: "Key 账单缺少分组号（group_id 未提供或为 0）", wantKeyRead: true},
 		{name: "different group", keyFields: strings.Replace(keyFields, `"group_id":16`, `"group_id":17`, 1),
-			rejectKey: "Key 账单分组号与官网不一致", wantKeyRead: true},
+			wantConflict: true, wantKeyRead: true},
 		{name: "different API Key", keyFields: strings.Replace(keyFields, `"api_key_id":12094`, `"api_key_id":12093`, 1),
-			rejectKey: "Key 账单中的 Key 编号与官网不一致", wantKeyRead: true},
+			wantConflict: true, wantKeyRead: true},
 		{name: "legacy key_id cannot supply api_key_id", keyFields: strings.Replace(keyFields, "api_key_id", "key_id", 1),
 			rejectKey: "Key 账单缺少 Key 编号（api_key_id 未提供或为 0）", wantKeyRead: true},
 		{name: "different group default", keyFields: strings.Replace(keyFields, `"group_rate_multiplier":0.60`, `"group_rate_multiplier":0.59`, 1),
-			rejectKey: "Key 账单默认倍率与官网分组不一致", wantKeyRead: true},
+			wantConflict: true, wantKeyRead: true},
 		{name: "missing group default is not filled from the Key list", keyFields: strings.Replace(keyFields, `"group_rate_multiplier":0.60,`, "", 1),
-			rejectKey: "Key 账单缺少分组默认倍率", wantKeyRead: true},
+			rejectKey: "近 30 分钟用量读取失败", wantKeyRead: true, wantGroupFallback: true},
+		{name: "billing without effective rate uses group default",
+			keyFields: strings.Replace(keyFields, `"effective_rate_multiplier":0.6,`, "", 1),
+			rejectKey: "Key 账单格式或生效倍率无效", wantKeyRead: true, wantGroupFallback: true},
 		{name: "different peak flag", keyFields: strings.Replace(keyFields, `"peak_rate_enabled":false`, `"peak_rate_enabled":true`, 1),
-			rejectKey: "Key 账单高峰状态与官网分组不一致", wantKeyRead: true},
+			wantConflict: true, wantKeyRead: true},
 		{name: "missing peak flag", keyFields: strings.TrimSuffix(keyFields, `,"peak_rate_enabled":false`),
 			rejectKey: "Key 账单缺少高峰状态", wantKeyRead: true},
 		{name: "effective rate out of range", keyFields: strings.Replace(keyFields, `"effective_rate_multiplier":0.6`, `"effective_rate_multiplier":1001`, 1),
 			rejectKey: "Key 账单格式或生效倍率无效", wantKeyRead: true},
 		{name: "different resolved rate", keyFields: keyFields + `,"resolved_rate_multiplier":0.59`,
-			rejectKey: "Key 账单的账户倍率与生效倍率不一致", wantKeyRead: true},
+			wantConflict: true, wantKeyRead: true},
 		{name: "expired sample", sampleAge: panelQuoteTTL + time.Second,
 			rejectKey: "Key 账单采样时段已结束", wantKeyRead: true},
 		{name: "future sample", sampleAge: -2 * time.Second,
@@ -110,7 +131,7 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 					at.Add(-keyUsageFreshness), at).WillReturnRows(rows)
 			}
 			expectUsage()
-			if test.wantReason == "" {
+			if test.wantReason == "" && !test.wantConflict {
 				mock.ExpectQuery("SELECT EXISTS").WithArgs(job.provider, groupID).
 					WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 			}
@@ -174,7 +195,13 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 				t.Fatal(err)
 			}
 			info, quote, err := directory.billing()
-			if test.wantReason != "" {
+			if test.wantConflict {
+				if err == nil || !errors.Is(err, errAccountRateConflict) || !errors.Is(err, errWebsiteAccountRateUnverified) ||
+					directory.group.AccountRate != nil || directory.group.AccountRateSource != "" ||
+					info.accountRateSource != "" || len(quote.terms) != 0 {
+					t.Fatalf("billing evidence conflict must block the group fallback: info=%+v quote=%v error=%v", info, quote.terms, err)
+				}
+			} else if test.wantReason != "" {
 				want := "北辰官网账户倍率未核实，分组倍率仅供参考：" + test.wantReason
 				if !errors.Is(err, errWebsiteAccountRateUnverified) || err.Error() != want ||
 					directory.group.AccountRate != nil || info.accountRateSource != "" || len(quote.terms) != 0 {
@@ -184,6 +211,8 @@ func TestWebsiteKeyBillingAccountRates(t *testing.T) {
 				wantRate, wantSource, wantID := test.wantRate, "", int64(0)
 				wantObservation := at
 				switch {
+				case test.wantGroupFallback:
+					wantSource, wantRate = groupRateSource, "0.60"
 				case test.rejectKey != "":
 					wantSource = groupRateSource
 					if wantRate == "" {
@@ -242,8 +271,10 @@ func TestDirectoryAccountRateCoverage(t *testing.T) {
 		{WebsiteGroup: WebsiteGroup{ID: 4, Rate: &defaultRate}, Subscription: "standard"},
 	}}}}
 	rates := map[int64]json.Number{1: "0.4"}
-	fallback := map[int64]*billingInfo{1: nil, 2: {Multiplier: "0.5", APIKeyID: 42}, 3: nil}
-	crawl.applyAccountRates(rates, fallback)
+	fallback := map[int64]crawlKeyRate{1: {groupID: 1},
+		2: {groupID: 2, info: &billingInfo{Multiplier: "0.5", APIKeyID: 42}},
+		3: {groupID: 3, groupDefault: &defaultRate}}
+	crawl.applyAccountRates(rates, fallback, nil)
 	groups := crawl.platforms[0].Groups
 	if crawl.AccountRateError != "" || !matchesAccountRate(&groups[0].WebsiteGroup, "0.4", "", 0) ||
 		!matchesAccountRate(&groups[1].WebsiteGroup, "0.5", keyBillingRateSource, 42) ||
@@ -256,11 +287,43 @@ func TestDirectoryAccountRateCoverage(t *testing.T) {
 		t.Fatal("the fallback rate must be independent of the default rate")
 	}
 
-	fallback[4] = nil
-	crawl.applyAccountRates(rates, fallback)
+	fallback[4] = crawlKeyRate{groupID: 4}
+	crawl.applyAccountRates(rates, fallback, nil)
 	if crawl.AccountRateError != "部分北辰渠道的账户倍率未核实" ||
 		!matchesAccountRate(&groups[3].WebsiteGroup, "", "", 0) {
 		t.Fatalf("directory did not report a checked group without verified evidence: %s", crawl.AccountRateError)
+	}
+}
+
+func TestCrawlAccountRateGroupConflictPriority(t *testing.T) {
+	rate := json.Number("0.5")
+	conflict := accountRateConflict("Key 账单生效倍率与官网分组默认倍率不一致")
+	merged := mergeCrawlKeyRates([]crawlKeyRate{
+		{groupID: 16, conflict: conflict},
+		{groupID: 16, info: &billingInfo{Multiplier: "0.5", APIKeyID: 12094}},
+		{groupID: 16, groupDefault: &rate},
+		{groupID: 17, conflict: conflict},
+		{groupID: 17, conflict: accountRateConflict("Key 账单分组号与官网不一致")},
+		{groupID: 18, groupDefault: &rate},
+		{groupID: 18, groupDefault: &rate},
+	})
+	crawl := directoryCrawl{platforms: []directoryPlatform{{Groups: []directoryGroup{
+		{WebsiteGroup: WebsiteGroup{ID: 16}}, {WebsiteGroup: WebsiteGroup{ID: 17}},
+		{WebsiteGroup: WebsiteGroup{ID: 18}},
+	}}}}
+	crawl.applyAccountRates(nil, merged, errors.New("rate table unavailable"))
+	groups := crawl.platforms[0].Groups
+	for _, group := range groups[:2] {
+		if group.AccountRate != nil || group.AccountRateSource != "" {
+			t.Fatalf("group %d published a rate despite a conflicting Key: %+v", group.ID, group)
+		}
+	}
+	if !matchesAccountRate(&groups[2].WebsiteGroup, "0.5", groupRateSource, 0) {
+		t.Fatalf("conflict-free group did not receive the group fallback: %+v", groups[2].WebsiteGroup)
+	}
+	if !strings.Contains(crawl.AccountRateError, "证据冲突") ||
+		strings.Contains(crawl.AccountRateError, "官网账户倍率表读取失败") {
+		t.Fatalf("group conflict reason was not retained: %q", crawl.AccountRateError)
 	}
 }
 

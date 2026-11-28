@@ -2,9 +2,11 @@
 import { computed, onBeforeUnmount, reactive, ref, shallowRef, useId, watch } from 'vue'
 import { teacherAPI } from '../api/teacher'
 import { apiErrorMessage } from '../api/client'
-import type { BeichenModel, BeichenModelPriceUpdate, BeichenOverview } from '../api/types'
-import { manualPriceDetail, priceFields, ratesPriceDetail, scaledNumber, webPriceDetail, type PriceSource, type SchoolCatalogRow } from '../utils/beichenModels'
-import { multiplyDecimal, shiftDecimal } from '../utils/credits'
+import type { BeichenModel, BeichenModelPriceUpdate } from '../api/types'
+import { baseSchoolRates, manualPriceDetail, priceFields, ratesPriceDetail, scaledNumber, schoolConditionalPrice,
+  schoolPriceMultiplier, schoolTokenPriceAt, studentPriceAmount, studentPriceLabels, webPriceDetail, type PriceSource,
+  type SchoolCatalogRow, type TeacherOverview, type TeacherPriceModel } from '../utils/beichenModels'
+import { formatPriceAmount, formatPriceDetail, shiftDecimal } from '../utils/credits'
 import { schoolDay } from '../utils/format'
 import AppDialog from './AppDialog.vue'
 import BeichenPriceDetail from './BeichenPriceDetail.vue'
@@ -13,7 +15,6 @@ const props = defineProps<{ open: boolean; providerId: string; row?: SchoolCatal
 const emit = defineEmits<{ 'update:open': [open: boolean]; saved: [] }>()
 type RateKey = typeof priceFields[number]['key']
 type Channel = { credential_id: string; label: string }
-type PriceOverview = BeichenOverview & { credentials?: Array<Channel & { status?: string }> | null }
 type SaveOutcome =
   | { status: 'saved'; count: number }
   | { status: 'different'; missing: Channel[]; extra: Channel[] }
@@ -24,7 +25,7 @@ const mode = ref<'follow' | 'manual'>('follow')
 const scope = ref<'all' | 'credentials'>('all')
 const selectedIds = ref<string[]>([])
 const rates = reactive<Record<RateKey, string>>({ input: '', output: '', cache_read: '', cache_write: '' })
-const overview = shallowRef<PriceOverview>()
+const overview = shallowRef<TeacherOverview>()
 const overviewLoading = ref(false)
 const overviewError = ref('')
 const saving = ref(false)
@@ -34,13 +35,26 @@ const error = ref('')
 const decimalPattern = /^\d+(?:\.\d{1,6})?$/
 let openVersion = 0
 
-const modelName = computed(() => props.row?.model.trim().toLowerCase())
-const catalogEntry = computed(() => overview.value?.model_catalog?.find(entry => entry.model.trim().toLowerCase() === modelName.value))
+const upstream = ref('')
+const modelOptions = computed(() => [...new Set([props.row?.model ?? '', ...(props.row?.upstreams ?? [])].filter(Boolean))])
+const modelName = computed(() => upstream.value.trim().toLowerCase())
+const matchingEntries = computed(() => (overview.value?.model_catalog ?? [])
+  .filter(entry => entry.model.trim().toLowerCase() === modelName.value))
+const catalogEntry = computed(() => matchingEntries.value.find(entry =>
+  props.row?.schoolModelId ? entry.school_model_id === props.row.schoolModelId : true))
+const splitIdentity = computed(() => Boolean(props.row?.schoolModelId && matchingEntries.value.some(entry =>
+  entry.school_model_id && entry.school_model_id !== props.row?.schoolModelId)))
+const identityKeys = computed(() => {
+  const entry = catalogEntry.value
+  return new Set([...(entry?.credential_ids ?? []), ...(entry?.bound_routes ?? []).map(route => route.credential_id)])
+})
 const retired = computed(() => catalogEntry.value?.retired === true)
 const modelPrices = computed(() => {
-  const prices = new Map<string, BeichenModel>()
+  const prices = new Map<string, TeacherPriceModel>()
   for (const record of overview.value?.models ?? []) {
-    if (record.model.trim().toLowerCase() === modelName.value) prices.set(record.credential_id, record)
+    if (record.model.trim().toLowerCase() === modelName.value && (!splitIdentity.value || identityKeys.value.has(record.credential_id))) {
+      prices.set(record.credential_id, record)
+    }
   }
   return prices
 })
@@ -51,15 +65,17 @@ const modelKeys = computed(() => {
   for (const route of entry?.preferred_routes ?? []) {
     if (route.provider_id !== props.providerId || !route.credential_id) continue
     if (route.upstream_model && route.upstream_model.trim().toLowerCase() !== modelName.value) continue
-    ids.add(route.credential_id)
+    if (!splitIdentity.value || identityKeys.value.has(route.credential_id)) ids.add(route.credential_id)
     if (route.credential_label) labels.set(route.credential_id, route.credential_label)
   }
+  for (const id of identityKeys.value) if (id) ids.add(id)
   for (const id of modelPrices.value.keys()) ids.add(id)
   const credentials = new Map(overview.value?.credentials?.map(key => [key.credential_id, key]))
   return Array.from(ids, id => ({
     credential_id: id,
     label: credentials.get(id)?.label || labels.get(id) || `Key 编号 ${id}`,
     inactive: credentials.get(id)?.status === 'inactive',
+    schoolMultiplier: schoolPriceMultiplier(overview.value, id),
   }))
 })
 const affectedKeys = computed(() => {
@@ -88,20 +104,39 @@ const manualDetail = computed(() => manualPriceDetail({
   cache_read: manualPrices.value.find(field => field.key === 'cache_read')?.value,
   cache_write: manualPrices.value.find(field => field.key === 'cache_write')?.value,
 }))
+const manualFactors = computed(() => {
+  const byFactor = new Map<string | null, string[]>()
+  for (const key of affectedKeys.value) {
+    const labels = byFactor.get(key.schoolMultiplier) ?? []
+    labels.push(key.label)
+    byFactor.set(key.schoolMultiplier, labels)
+  }
+  return Array.from(byFactor, ([factor, labels]) => ({ factor, label: byFactor.size > 1 ? labels.join('、') : '' }))
+})
 const priceDatasets = computed(() => new Map((overview.value?.datasets ?? [])
   .filter(dataset => dataset.kind === 'prices').map(dataset => [dataset.credential_id, dataset])))
 const followPrices = computed(() => affectedKeys.value.map(key => {
   const record = modelPrices.value.get(key.credential_id)
-  const upstream = record?.upstream_rates
+  const fixedRates = upstreamCredits(record?.upstream_rates)
   const conditions = record?.price_conditions_exact ?? record?.price_conditions ?? null
   const derived = record?.price_source === 'derived_from_usage' || record?.price_status === 'derived'
   const source: PriceSource = derived ? 'derived' : 'website'
-  const observedAt = derived ? record?.price_observed_at ?? null : priceDatasets.value.get(key.credential_id)?.last_success ?? null
+  const observedAt = record?.price_observed_at ?? priceDatasets.value.get(key.credential_id)?.last_success ?? null
+  const useConditions = record?.price_status === 'conditional' ||
+    record?.price_status === 'confirmed' && Boolean(conditions?.intervals?.length)
+  const conditional = conditions && useConditions
+    ? schoolConditionalPrice(conditions, record?.quote_effective_multiplier ?? null, key.schoolMultiplier, observedAt, record?.price_conditions)
+    : undefined
+  const base = conditional ? schoolTokenPriceAt(conditional, 0n) : null
   // 已应用渠道倍率的上游报价以百万分之一元返回，再乘 100 换成积分。
-  return { ...key, derived, detail: conditions
+  return { ...key, derived, conditional, status: record?.student_price, detail: conditions
       ? webPriceDetail(conditions, null, source, observedAt)
-      : ratesPriceDetail(upstreamCredits(upstream), source, observedAt),
-    prices: priceFields.map(field => ({ ...field, value: scaledNumber(upstream?.[field.key], 4) })) }
+      : ratesPriceDetail(fixedRates, source, observedAt),
+    prices: priceFields.map(field => ({
+      ...field, value: conditional
+        ? base?.rows.find(row => row.key === (field.key === 'cache_write' ? 'cache_write_5m' : field.key))?.settlement ?? null
+        : fixedRates[field.key],
+    })) }
 }))
 const hasDerived = computed(() => followPrices.value.some(quote => quote.derived) ||
   (props.row?.quotes.some(quote => quote.status === 'derived') ?? false))
@@ -109,11 +144,11 @@ const followLabel = computed(() => hasDerived.value ? '自动计价' : '跟随�
 const importableQuote = computed(() => followPrices.value.find(({ prices }) =>
   prices.every(field => field.value == null ? field.key.startsWith('cache_') : decimalPattern.test(field.value))))
 const confirmationPrices = computed(() => mode.value === 'manual'
-  ? [{ credential_id: 'manual', label: '手动价', prices: manualPrices.value, detail: manualDetail.value }]
-  : followPrices.value)
+  ? [{ credential_id: 'manual', label: '手动价', prices: manualPrices.value, detail: manualDetail.value, schoolMultiplier: null }]
+  : followPrices.value.filter(quote => !quote.conditional))
 const missingPriceFields = computed(() => {
   const labels = new Set<string>()
-  const details = mode.value === 'manual' ? [manualDetail.value] : followPrices.value.map(quote => quote.detail)
+  const details = mode.value === 'manual' ? [manualDetail.value] : confirmationPrices.value.map(quote => quote.detail)
   for (const detail of details) for (const row of detail.rows) if (row.missing) labels.add(row.label)
   return [...labels]
 })
@@ -125,7 +160,10 @@ function upstreamCredits(rates: BeichenModel['upstream_rates']) {
   }
 }
 
-watch([() => props.open, () => props.providerId, () => props.row?.model], () => {
+watch([() => props.open, () => props.row?.catalogKey, () => props.row?.model], () => {
+  upstream.value = props.row?.model ?? ''
+}, { immediate: true })
+watch([() => props.open, () => props.providerId, () => props.row?.catalogKey, upstream], () => {
   openVersion++
   overview.value = undefined
   overviewLoading.value = false
@@ -137,9 +175,8 @@ watch([() => props.open, () => props.providerId, () => props.row?.model], () => 
   selectedIds.value = []
   attempted.value = false
   error.value = ''
-  mode.value = props.row?.mode === 'follow' && props.row.priceReady &&
-    props.row.quotes.every(quote => quote.status !== 'conditional') ? 'follow' : 'manual'
-  const quotes = props.row?.quotes.filter(quote => quote.actualRates)
+  mode.value = props.row?.mode === 'follow' && props.row.priceReady ? 'follow' : 'manual'
+  const quotes = props.row?.quotes.filter(quote => quote.actualRates && (!quote.upstreamModel || quote.upstreamModel === modelName.value))
   const current = quotes?.find(quote => quote.mode === 'manual') ?? quotes?.[0]
   for (const { key } of priceFields) rates[key] = current?.actualRates?.[key] ?? ''
   if (props.row) void loadOverview()
@@ -159,11 +196,17 @@ async function loadOverview() {
     selectedIds.value = selectedIds.value.filter(id => selectableIds.has(id))
     if (firstLoad) {
       const state = catalogEntry.value?.price_state
-      if (state && state !== 'confirmed' && state !== 'derived') mode.value = 'manual'
-      const current = Array.from(modelPrices.value.values()).filter(record => record.school_rates)
-      const source = (current.find(record => record.mode === 'manual') ?? current[0])?.school_rates
+      const current = Array.from(modelPrices.value.values()).filter(record => baseSchoolRates(record))
+      const manual = current.find(record => record.mode === 'manual')
+      if (state === 'conditional') mode.value = manual ? 'manual' : 'follow'
+      else if (state && state !== 'confirmed' && state !== 'derived') mode.value = 'manual'
+      if (splitIdentity.value) {
+        scope.value = 'credentials'
+        selectedIds.value = [...selectableIds]
+      }
+      const source = baseSchoolRates(manual ?? current[0])
       if (source) {
-        for (const { key } of priceFields) rates[key] = scaledNumber(source[key], 6) ?? ''
+        for (const { key } of priceFields) rates[key] = source[key] ?? ''
       }
     }
   } catch {
@@ -195,8 +238,8 @@ async function save() {
     ? { scope: 'all' as const }
     : { scope: 'credentials' as const, credential_ids: selected.map(key => key.credential_id) }
   const body: BeichenModelPriceUpdate = mode.value === 'follow'
-    ? { model: props.row.model, mode: 'follow', ...selection }
-    : { model: props.row.model, mode: 'manual', ...selection, rates: {
+    ? { model: upstream.value, mode: 'follow', ...selection }
+    : { model: upstream.value, mode: 'manual', ...selection, rates: {
       input: rates.input.trim(), output: rates.output.trim(),
       cache_read: rates.cache_read.trim() || '0', cache_write: rates.cache_write.trim() || '0',
     } }
@@ -232,6 +275,11 @@ async function save() {
   <AppDialog :open="open" :title="`${row?.model ?? '模型'} · 价格设置`"
     description="选择价格和生效范围，保存前核对受影响的 Key。" @update:open="close">
     <form class="price-drawer beichen-stack" :aria-busy="saving" novalidate @submit.prevent="save">
+      <label v-if="modelOptions.length > 1">上游型号
+        <select v-model="upstream" :disabled="saving || Boolean(outcome)">
+          <option v-for="model in modelOptions" :key="model" :value="model">{{ model }}</option>
+        </select>
+      </label>
       <p v-if="retired" class="beichen-note" role="status">该模型已作废，价格无法修改。</p>
       <fieldset class="price-mode" :disabled="editingDisabled">
         <legend>计价方式</legend>
@@ -240,7 +288,7 @@ async function save() {
       </fieldset>
       <fieldset class="price-mode" :disabled="editingDisabled || !modelKeys.length">
         <legend>生效范围</legend>
-        <label><input v-model="scope" type="radio" value="all" :name="fieldId + '-scope'">全部 Key</label>
+        <label v-if="!splitIdentity"><input v-model="scope" type="radio" value="all" :name="fieldId + '-scope'">全部 Key</label>
         <label><input v-model="scope" type="radio" value="credentials" :name="fieldId + '-scope'">仅选中的 Key</label>
       </fieldset>
       <fieldset v-if="scope === 'credentials'" class="price-mode" :disabled="editingDisabled">
@@ -270,7 +318,13 @@ async function save() {
               :aria-describedby="fieldId + '-' + field.key + '-hint'">
             <p :id="fieldId + '-' + field.key + '-hint'" class="price-hint">
               <span v-if="attempted && validation[field.key]" class="error">{{ validation[field.key] }}</span>
-              <span v-else-if="field.value != null">× 1.10 后预估扣 {{ multiplyDecimal(field.value, '1.10') }} 积分</span>
+              <template v-else-if="field.value != null && manualFactors.length">
+                <span v-for="item in manualFactors" :key="item.factor ?? 'unknown'" class="price-hint-factor">
+                  <template v-if="item.label">{{ item.label }} · </template>
+                  <template v-if="item.factor">× {{ item.factor }} 后预估扣 {{ formatPriceAmount(studentPriceAmount(field.value, item.factor)) }} 积分</template>
+                  <template v-else>学校系数待同步</template>
+                </span>
+              </template>
               <span v-else>非负数字，最多 6 位小数</span>
             </p>
           </div>
@@ -292,20 +346,46 @@ async function save() {
       <section v-if="overview && !overviewLoading" class="price-confirmation" :aria-labelledby="fieldId + '-preview'">
         <h3 :id="fieldId + '-preview'">报价预览</h3>
         <div v-if="mode === 'follow'" class="price-detail-cards">
-          <BeichenPriceDetail v-for="quote in followPrices" :key="quote.credential_id" :detail="quote.detail"
-            :title="quote.label + ' · ' + (quote.derived ? '反推基础价详情' : '官网基础价详情')" />
+          <template v-for="quote in followPrices" :key="quote.credential_id">
+            <section v-if="quote.conditional" class="price-confirmation">
+              <h4>{{ quote.label }} · 条件价</h4>
+              <p v-if="quote.conditional.onlyHigher" class="beichen-note">仅高档 · 基础档缺价</p>
+              <p v-if="(quote.conditional.intervals[0] ?? quote.conditional.base)?.effortMultiplier"
+                class="beichen-note" data-testid="drawer-effort-multiplier">
+                默认推理强度 {{ (quote.conditional.intervals[0] ?? quote.conditional.base)?.effortLabel }} ·
+                × {{ (quote.conditional.intervals[0] ?? quote.conditional.base)?.effortMultiplier }}
+              </p>
+              <table v-for="band in [quote.conditional.base, ...quote.conditional.intervals].filter(band => band != null)"
+                :key="band.label" class="confirmation-rates" data-testid="drawer-price-tier">
+                <caption>{{ band.label }} / 百万 Token</caption>
+                <thead><tr><th scope="col">用量项</th><th scope="col">官网价（元）</th><th scope="col">结算价（积分）</th><th scope="col">学生价（积分）</th></tr></thead>
+                <tbody>
+                  <tr v-for="item in band.rows" :key="item.key">
+                    <th scope="row">{{ item.label }}</th>
+                    <td>{{ formatPriceDetail(item.yuan, '缺价') }}</td>
+                    <td>{{ formatPriceDetail(item.settlement, item.yuan == null ? '缺价' : '倍率待核实') }}</td>
+                    <td :data-student-price="item.key">{{ formatPriceDetail(item.student,
+                      item.yuan == null ? '缺价' : item.settlement == null ? '倍率待核实' : '学校系数待同步') }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </section>
+            <BeichenPriceDetail v-else :detail="quote.detail"
+              :title="quote.label + ' · ' + (quote.derived ? '反推基础价详情' : '官网基础价详情')" />
+          </template>
         </div>
         <BeichenPriceDetail v-else :detail="manualDetail" title="手动价详情" />
         <p v-if="missingPriceFields.length" class="beichen-note price-missing-summary">
           缺价字段：{{ missingPriceFields.join('、') }}
         </p>
-        <p class="beichen-note">跟随官网时，下表为已乘渠道倍率的执行价。手动价为乘学校扣分系数前的基础价。</p>
+        <p class="beichen-note">{{ mode === 'follow' ? '结算价已应用渠道倍率。学生价再乘该 Key 的学校系数。' : '手动基础价乘该 Key 的学校系数后得到学生价。' }}</p>
         <table v-if="confirmationPrices.length" class="confirmation-rates">
           <caption>基础单价 / 百万 Token（1 元 = 100 积分）</caption>
-          <thead><tr><th scope="col">用量项</th><th scope="col">元</th><th scope="col">积分</th></tr></thead>
+          <thead><tr><th scope="col">用量项</th><th scope="col">元</th><th scope="col">积分</th>
+            <th v-if="mode === 'follow'" scope="col">学生价（积分）</th></tr></thead>
           <tbody v-for="quote in confirmationPrices" :key="quote.credential_id">
             <tr v-if="quote.label" class="confirmation-channel">
-              <th colspan="3" scope="rowgroup">
+              <th :colspan="mode === 'follow' ? 4 : 3" scope="rowgroup">
                 {{ quote.label }}
                 <span class="status-pill price-source" :data-source="quote.detail.source">{{ quote.detail.sourceLabel }}</span>
                 <small class="price-observed">observed_at {{ quote.detail.observedLabel }}</small>
@@ -313,12 +393,16 @@ async function save() {
             </tr>
             <tr class="billing-mode-row">
               <th scope="row">计费模式</th>
-              <td colspan="2">{{ quote.detail.billingModeLabel }}</td>
+              <td :colspan="mode === 'follow' ? 3 : 2">{{ quote.detail.billingModeLabel }}</td>
             </tr>
             <tr v-for="field in quote.prices" :key="field.key">
               <th scope="row">{{ field.label }}</th>
-              <td>{{ field.value == null ? (mode === 'follow' ? '缺价' : '—') : shiftDecimal(field.value, -2) }}</td>
-              <td>{{ field.value == null ? (mode === 'follow' ? '缺价' : '—') : field.value }}</td>
+              <td>{{ formatPriceDetail(field.value == null ? null : shiftDecimal(field.value, -2), mode === 'follow' ? '缺价' : '—') }}</td>
+              <td>{{ formatPriceDetail(field.value, mode === 'follow' ? '缺价' : '—') }}</td>
+              <td v-if="mode === 'follow'" :data-student-price="field.key">
+                {{ 'derived' in quote && quote.derived ? '反推价待核对' : formatPriceDetail(studentPriceAmount(field.value, quote.schoolMultiplier),
+                  field.value != null ? '学校系数待同步' : 'status' in quote && quote.status ? studentPriceLabels[quote.status.status] : '缺价') }}
+              </td>
             </tr>
           </tbody>
         </table>

@@ -2,8 +2,8 @@ import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { defineComponent } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { APIError } from '../api/client'
-import type { BeichenCatalogModel, BeichenModel, BeichenPreferredRoute } from '../api/types'
-import type { SchoolCatalogRow } from '../utils/beichenModels'
+import type { BeichenCatalogModel, BeichenPreferredRoute } from '../api/types'
+import type { SchoolCatalogRow, TeacherPriceModel } from '../utils/beichenModels'
 import BeichenPriceDrawer from './BeichenPriceDrawer.vue'
 
 const api = vi.hoisted(() => ({ beichenOverview: vi.fn(), setBeichenModelPrice: vi.fn() }))
@@ -33,7 +33,7 @@ function overview() {
       { ...route, upstream_model: 'lab/other', credential_id: 'unrelated' },
     ],
   }]
-  const models: BeichenModel[] = [
+  const models: TeacherPriceModel[] = [
     { credential_id: 'one', model: 'lab/model', mode: 'follow', price_status: 'confirmed',
       school_rates: { input: '500000', output: '125000001', cache_read: '0', cache_write: null },
       upstream_rates: { input: '5000', output: '1250000.01', cache_read: '0', cache_write: null } },
@@ -47,6 +47,7 @@ function overview() {
       { credential_id: 'idle', label: '无此模型的渠道' }, { credential_id: 'unrelated', label: '无关模型渠道' },
     ],
     model_catalog, datasets: [], comparison: [], models,
+    school_multipliers: { one: '1.10', two: '1.10', three: '1.10', four: '1.10' },
   }
 }
 
@@ -77,13 +78,100 @@ function summary(wrapper: Drawer) {
 function priceRows(wrapper: Drawer, group = 0) {
   return wrapper.findAll('tbody')[group].findAll('tr:has(td)')
     .filter(row => !row.classes('billing-mode-row'))
-    .map(row => row.findAll('th, td').map(cell => cell.text()))
+    .map(row => row.findAll('th, td').slice(0, 3).map(cell => cell.text()))
 }
 
 beforeEach(() => {
   api.beichenOverview.mockReset().mockResolvedValue(overview())
   api.setBeichenModelPrice.mockReset().mockResolvedValue({
     saved: true, credentials: [], applied_credential_ids: ['four', 'two', 'one', 'three'],
+  })
+})
+
+it('按条件报价和后端系数显示 55 积分，零价与缺价分别展示', async () => {
+  const data = overview()
+  data.model_catalog[0].price_state = 'conditional'
+  data.models[0] = {
+    credential_id: 'one', model: 'lab/model', mode: 'follow', price_status: 'conditional',
+    quote_effective_multiplier: '0.5',
+    price_conditions_exact: { billing_mode: 'token', intervals: [
+      { min_tokens: '500000', max_tokens: null, input_price: '0.000001', output_price: '0', cache_read_price: null },
+    ] },
+  }
+  api.beichenOverview.mockResolvedValue(data)
+  const wrapper = await view()
+  const tier = wrapper.get('[data-testid="drawer-price-tier"]')
+  expect(tier.get('caption').text()).toContain('500,000')
+  expect(tier.get('[data-student-price="input"]').text()).toBe('55')
+  expect(tier.get('[data-student-price="output"]').text()).toBe('0')
+  expect(tier.get('[data-student-price="cache_read"]').text()).toBe('缺价')
+  expect(wrapper.text()).toContain('仅高档 · 基础档缺价')
+})
+
+it('条件价按默认推理强度中档系数和 12 小时缓存展示，与账本同口径', async () => {
+  const data = overview()
+  data.model_catalog[0].price_state = 'conditional'
+  data.models[0] = {
+    credential_id: 'one', model: 'lab/model', mode: 'follow', price_status: 'conditional',
+    quote_effective_multiplier: '0.5',
+    price_conditions_exact: {
+      billing_mode: 'token', input_price: '0.000001', output_price: '0.000001',
+      cache_write_12h_price: '0.000001',
+      reasoning_effort_multipliers: { medium: '2' },
+    },
+  }
+  api.beichenOverview.mockResolvedValue(data)
+  const wrapper = await view()
+  expect(wrapper.get('[data-testid="drawer-effort-multiplier"]').text()).toContain('默认推理强度 中 · × 2')
+  const tier = wrapper.get('[data-testid="drawer-price-tier"]')
+  expect(tier.find('[data-student-price="input"]').text()).toBe('110')
+  expect(tier.find('[data-student-price="output"]').text()).toBe('110')
+  expect(tier.find('[data-student-price="cache_write_12h"]').text()).toBe('110')
+})
+
+it('同一组百万输入的长小数在抽屉与账本均为 550.00000000000000055 积分', async () => {
+  const data = overview()
+  data.model_catalog[0].price_state = 'conditional'
+  data.models[0] = {
+    credential_id: 'one', model: 'lab/model', mode: 'follow', price_status: 'conditional',
+    quote_effective_multiplier: '2.5',
+    price_conditions_exact: {
+      billing_mode: 'token', input_price: '0.000001000000000000000001',
+      output_price: '0.000001000000000000000001',
+      reasoning_effort_multipliers: { medium: '2' },
+    },
+  }
+  api.beichenOverview.mockResolvedValue(data)
+  const wrapper = await view()
+  expect(wrapper.get('[data-testid="drawer-price-tier"] [data-student-price="input"]').text())
+    .toBe('550.00000000000000055')
+})
+
+it('手动价按每把 Key 的学校系数预览一次', async () => {
+  const data = overview()
+  data.school_multipliers.two = '1'
+  api.beichenOverview.mockResolvedValue(data)
+  const wrapper = await view()
+  await manual(wrapper)
+  await wrapper.get('input[name="input"]').setValue('50')
+  const hint = wrapper.get('.price-input .price-hint')
+  expect(hint.text()).toContain('× 1.10 后预估扣 55 积分')
+  expect(hint.text()).toContain('教学二号 · × 1 后预估扣 50 积分')
+})
+
+it('同名型号的定价抽屉使用当前校内 UUID 和绑定 Key', async () => {
+  const data = overview()
+  data.model_catalog = [
+    { model: 'lab/model', school_model_id: 'first', credential_ids: ['one'], key_count: 1 },
+    { model: 'lab/model', school_model_id: 'second', credential_ids: ['four'], key_count: 1 },
+  ]
+  api.beichenOverview.mockResolvedValue(data)
+  const wrapper = await view({ ...row(), schoolModelId: 'second' })
+  expect(affected(wrapper)).toEqual(['仅报价渠道'])
+  await wrapper.get('form').trigger('submit')
+  await flushPromises()
+  expect(api.setBeichenModelPrice).toHaveBeenCalledWith('north', {
+    model: 'lab/model', mode: 'follow', scope: 'credentials', credential_ids: ['four'],
   })
 })
 

@@ -16,7 +16,107 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
+	"github.com/starprince1234/Nebula-api/internal/usage"
 )
+
+func TestOverviewStudentPriceDiagnosticsPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	primary, backup, pending := keys[1], keys[2], keys[3]
+	const fixed, higher, manual, unverified, noRoute = "fixture-fixed", "fixture-higher", "fixture-manual", "fixture-unverified", "fixture-no-route"
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	for _, item := range []struct {
+		key   uuid.UUID
+		names []string
+	}{
+		{primary, []string{fixed, manual, noRoute}}, {backup, []string{fixed, higher}}, {pending, []string{unverified}},
+	} {
+		entries := make([]catalog.ProviderEntry, 0, len(item.names))
+		for _, name := range item.names {
+			entries = append(entries, catalog.ProviderEntry{ID: name, SupportedProtocols: []string{"openai_compatible"}})
+		}
+		saveCatalogFixture(t, ctx, db, provider, item.key, entries, nil)
+	}
+	exec(`INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+SELECT gen_random_uuid(),n,n,'active',1000,now(),now() FROM unnest($1::text[]) n`, []string{fixed, higher, manual, unverified})
+	for _, route := range []struct {
+		key      uuid.UUID
+		name     string
+		priority int
+		adapter  string
+	}{{primary, fixed, 1, "openai_compatible"}, {backup, fixed, 2, "openai_responses"}, {backup, higher, 1, "openai_compatible"},
+		{primary, manual, 1, "openai_compatible"}, {pending, unverified, 1, "openai_compatible"}} {
+		exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,status,priority,created_at,updated_at)
+SELECT gen_random_uuid(),id,$1,$2,model_id,$5,'active',$4,now(),now() FROM models WHERE model_id=$3`,
+			provider, route.key, route.name, route.priority, route.adapter)
+	}
+	exec(`INSERT INTO beichen_provision_channels(credential_id,channel,key_fingerprint,discover_ids)
+SELECT id,n,sha256(credential_ciphertext || convert_to(n,'UTF8')),false
+FROM (VALUES ($1::uuid,'GM1'),($2::uuid,'G3')) k(id,n)
+JOIN provider_credentials c USING (id)`, primary, backup)
+	exec(`INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+VALUES($1,0.5,10,clock_timestamp()),($2,0.5,10,clock_timestamp())`, primary, backup)
+	exec(`INSERT INTO beichen_datasets(credential_id,kind,last_success)
+VALUES($1,'billing',now()),($2,'billing',now())
+ON CONFLICT(credential_id,kind) DO UPDATE SET last_success=EXCLUDED.last_success`, primary, backup)
+	exec(`INSERT INTO beichen_panel_snapshots(credential_id,effective_at,credential_revision,group_id,expires_at,multiplier_version,model_pricing)
+SELECT c.id,clock_timestamp(),c.updated_at,10,now()+interval '1 hour',mv.id,$2::jsonb
+FROM provider_credentials c JOIN beichen_multiplier_versions mv ON mv.credential_id=c.id WHERE c.id=$1`, backup,
+		`{"fixture-fixed":{"billing_mode":"token","input_price":0.000001,"output_price":0.000001,"cache_read_price":0,"cache_write_price":0},
+ "fixture-higher":{"billing_mode":"token","intervals":[{"min_tokens":500000,"input_price":0.000001,"output_price":0.000001}]}}`)
+	exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,input_rate,output_rate,cache_read_rate,cache_write_rate,effective_at)
+SELECT credential_id,$2,'upstream','base','panel',1000000,1000000,0,0,effective_at FROM beichen_panel_snapshots WHERE credential_id=$1`,
+		backup, fixed)
+	service := New(db, nil)
+	base := int64(50_000_000)
+	if err := service.SetPrice(ctx, provider, primary, actor, manual, PriceInput{Mode: "manual", Rates: &Rates{Input: &base, Output: &base}}); err != nil {
+		t.Fatal(err)
+	}
+	view, err := service.Overview(ctx, provider, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string]string{fixed: studentPriceNormal, higher: studentPriceHigher, manual: studentPriceManual,
+		unverified: studentPriceRatePending, noRoute: studentPriceNoRoute}
+	for _, row := range view.ModelCatalog {
+		if want, ok := expected[row.Model]; ok {
+			if row.StudentPrice.Status != want || row.StudentPrice.Reason == "" {
+				t.Errorf("%s student price = %+v, want %s", row.Model, row.StudentPrice, want)
+			}
+			delete(expected, row.Model)
+		}
+		if row.Model == fixed {
+			statuses := make(map[uuid.UUID]string)
+			for _, route := range row.BoundRoutes {
+				statuses[*route.CredentialID] = route.StudentPrice.Status
+			}
+			if statuses[primary] != studentPriceNoBase || statuses[backup] != studentPriceNormal {
+				t.Errorf("expected primary missing price and priced backup, got %+v", row.BoundRoutes)
+			}
+		}
+	}
+	if len(expected) != 0 {
+		t.Fatalf("missing overview rows: %+v", expected)
+	}
+	for _, row := range view.Models {
+		if row.CredentialID == backup && row.Model == fixed &&
+			(!row.SchoolRatesIncludeEffectiveMultiplier || row.SchoolRates == nil || row.SchoolRates.Input == nil ||
+				*row.SchoolRates.Input != "50000000" || row.SchoolRates.CacheRead == nil || *row.SchoolRates.CacheRead != "0") {
+			t.Errorf("expected 50 base credits and exact zero cache price: %+v", row)
+		}
+		if row.Model == higher && (row.QuoteEffectiveMultiplier == nil || *row.QuoteEffectiveMultiplier != "0.5") {
+			t.Errorf("conditional quote has no effective rate: %+v", row)
+		}
+	}
+	if view.SchoolMultipliers[primary] != "1.10" || view.SchoolMultipliers[backup] != "1.10" || view.SchoolMultipliers[pending] != "1" {
+		t.Fatalf("unexpected school coefficients: %+v", view.SchoolMultipliers)
+	}
+	for name, key := range map[string]uuid.UUID{fixed: backup, manual: primary} {
+		got, err := usage.NewStore(db).BeichenOutputPrice(ctx, usage.CallRoute{CredentialID: key, ProviderID: provider, UpstreamModelName: name})
+		if err != nil || got != "0.55" {
+			t.Errorf("%s should cost 0.55 yuan (55 credits) per 1M output, got %q: %v", name, got, err)
+		}
+	}
+}
 
 func TestBeichenOverviewRetiredCatalogPostgres(t *testing.T) {
 	ctx, db, provider, actor, keys := newActionsPostgres(t)
@@ -359,7 +459,8 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 		t.Skip("requires a disposable local nebula_test database")
 	}
 	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil || cfg.Host != "127.0.0.1" || (cfg.User != "nebula_qa" && cfg.User != "nebula_test") || !isIsolatedTestDatabase(cfg.Database) ||
+	if err != nil || cfg.Host != "127.0.0.1" || (cfg.User != "nebula_qa" && cfg.User != "nebula_test") ||
+		(!isIsolatedTestDatabase(cfg.Database) && cfg.Database != "nebula_test_hjb") ||
 		cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
 		t.Fatal("requires a loopback-only nebula_test database and test role with sslmode=disable")
 	}

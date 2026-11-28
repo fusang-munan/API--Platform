@@ -58,16 +58,19 @@ func (s *Service) fetchBillingCatalog(ctx context.Context, job syncJob, token, k
 		return directory, nil
 	}
 	if job.kind == "billing" && directory.group.AccountRate == nil {
-		if rateErr != nil {
-			directory.accountRateErr = accountRateReadFailed(websiteAccountRatesReadFailure, rateErr)
-			return directory, nil
-		}
 		info, at, err := s.fetchVerifiedKeyAccountRate(ctx, job.credential, key, identity, directory.group)
-		if err == nil {
+		switch {
+		case err == nil:
 			directory.group.setKeyAccountRate(info)
 			directory.keyBillingSampleAt, directory.at = info.ObservedAt, at
-		} else if errors.Is(err, errKeyGroupNotAllowed) || !setGroupAccountRate(&directory.group) {
+		case errors.Is(err, errKeyGroupNotAllowed), errors.Is(err, errAccountRateConflict):
 			directory.accountRateErr = err
+			return directory, nil
+		case !setGroupAccountRate(&directory.group, identity):
+			directory.accountRateErr = err
+			if rateErr != nil {
+				directory.accountRateErr = errors.Join(accountRateReadFailed(websiteAccountRatesReadFailure, rateErr), err)
+			}
 			return directory, nil
 		}
 	}

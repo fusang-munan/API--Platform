@@ -1,6 +1,6 @@
 import type { BeichenPriceConditions, BeichenWebsiteGroup, BeichenWebsiteLocation } from '../api/types'
-import { keyGroupRate, priceDetailRows } from './beichenModels'
-import { multiplyDecimal, trimDecimal } from './credits'
+import { keyGroupRate, priceDetailRows, studentPriceAmount, type StudentPrice } from './beichenModels'
+import { formatPriceAmount, shiftDecimal } from './credits'
 
 /** 五项 Token 单价，按每 1M Token 展示。 */
 export type GroupPriceValues = {
@@ -31,7 +31,8 @@ export type GroupPriceRow = {
   /** 学生实价，单位：积分 / 1M Token。没有官网基础价时五项均为 null。 */
   student: GroupPriceValues
   /** 学生价所依据的基础价来源；没有官网基础价时为 null。 */
-  student_source: 'website' | null
+  student_source: 'website' | 'manual' | null
+  student_status?: StudentPrice
   /** 基础价来自哪个官网分组。当前分组自己的完整报价时与 group_id 相同。 */
   base_group_id: number | null
   base_group_name: string | null
@@ -62,6 +63,7 @@ export type GroupPriceRowOptions = {
   keyGroup?: GroupPriceKeyGroup | null
   /** 没有官网基础价时，只用于页面小字参考，不参与主价计算。 */
   derived?: BeichenPriceConditions | null
+  schoolMultiplier?: string | null
 }
 
 type ValueKey = keyof GroupPriceValues
@@ -82,21 +84,13 @@ function emptyValues(): GroupPriceValues {
 
 function decimalText(value: string | number | null | undefined) {
   if (value == null) return null
-  const text = trimDecimal(value, 30)
+  const text = shiftDecimal(value, 0)
   return text === '—' ? null : text
 }
 
-function priceFactor(rate: string | null, accountRate: string | null) {
-  const effectiveRate = accountRate ?? rate
-  if (!effectiveRate) return null
-  const factor = multiplyDecimal(effectiveRate, '1.10')
-  return factor === '—' ? null : factor
-}
-
 function pickValues(terms: BeichenPriceConditions | null | undefined, unit: 'official' | 'student',
-  rate: string | null, accountRate: string | null): GroupPriceValues {
+  factor: string | null): GroupPriceValues {
   if (!terms) return emptyValues()
-  const factor = unit === 'student' ? priceFactor(rate, accountRate) : null
   if (unit === 'student' && !factor) return emptyValues()
   const rows = priceDetailRows(terms, factor)
   const values = emptyValues()
@@ -181,8 +175,9 @@ export function buildCurrentGroupPriceRow(locations: BeichenWebsiteLocation[],
   const current = chooseComplete(locations, groupID)
   const fallback = current ? undefined : chooseComplete(locations, null, true)
   const source = current ?? fallback
-  const official = pickValues(source?.price_conditions_exact, 'official', null, null)
-  const student = source ? pickValues(source.price_conditions_exact, 'student', rate, accountRate) : emptyValues()
+  const official = pickValues(source?.price_conditions_exact, 'official', null)
+  const student = pickValues(source?.price_conditions_exact, 'student',
+    studentPriceAmount(accountRate ?? rate, options.schoolMultiplier))
   const baseGroup = source ? sourceGroup(source) : undefined
   const baseFromOtherGroup = Boolean(source && !current)
   const effectiveRate = accountRate ?? rate
@@ -235,6 +230,6 @@ export function buildCurrentGroupPriceRow(locations: BeichenWebsiteLocation[],
 export function priceReferenceText(terms: BeichenPriceConditions | null | undefined) {
   const rows = priceDetailRows(terms, null)
     .filter(row => !row.notApplicable && row.yuan != null)
-    .map(row => `${row.label} ${row.yuan} 元`)
+    .map(row => `${row.label} ${formatPriceAmount(row.yuan)} 元`)
   return rows.length ? rows.join('、') : null
 }

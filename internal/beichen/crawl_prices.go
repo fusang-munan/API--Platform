@@ -40,7 +40,9 @@ func websitePriceObservations(crawl directoryCrawl) []groupPriceObservation {
 				if len(pricing) != 0 && pricing[0] != '{' {
 					pricing = nil
 				}
-				rows = append(rows, groupPriceObservation{group.ID, entry.ID, directory.at, rules, pricing, crawl.accountRatesVerified})
+				// Rates are read and validated per group. One malformed entry
+				// in another group must not suppress this group's observation.
+				rows = append(rows, groupPriceObservation{group.ID, entry.ID, directory.at, rules, pricing, group.AccountRate != nil})
 			}
 		}
 	}

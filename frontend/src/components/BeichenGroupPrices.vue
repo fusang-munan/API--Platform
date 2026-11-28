@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { trimDecimal } from '../utils/credits'
+import { formatPriceAmount } from '../utils/credits'
+import { studentPriceLabels } from '../utils/beichenModels'
 import type { GroupPriceRow, GroupPriceValues } from '../utils/groupPriceRows'
 
 const props = withDefaults(defineProps<{
@@ -26,17 +27,14 @@ const hasOfficial = computed(() => Boolean(props.row && priceColumns.some(column
 const source = computed(() => props.row?.student_source ?? 'none')
 const basisNote = computed(() => props.note ?? props.row?.base_note ?? '')
 const rateNote = computed(() => props.row?.rate_note ?? '')
-
-function amount(value: string | null | undefined, empty: string) {
-  return value == null ? empty : trimDecimal(value, 30)
-}
+const studentStatus = computed(() => props.row?.student_status)
 
 function officialAmount(row: GroupPriceRow, key: keyof GroupPriceValues) {
-  return amount(row.official[key], '未列')
+  return formatPriceAmount(row.official[key], '未列')
 }
 
 function studentAmount(row: GroupPriceRow, key: keyof GroupPriceValues) {
-  return amount(row.student[key], '—')
+  return formatPriceAmount(row.student[key])
 }
 </script>
 
@@ -78,6 +76,10 @@ function studentAmount(row: GroupPriceRow, key: keyof GroupPriceValues) {
           </tbody>
         </table>
       </div>
+      <p v-if="studentStatus && studentStatus.status !== 'normal' && studentStatus.status !== 'manual'"
+        class="group-prices-note" data-testid="student-price-status" :data-status="studentStatus.status">
+        {{ studentPriceLabels[studentStatus.status] }} · {{ studentStatus.reason }}
+      </p>
       <p v-if="derivedNote" class="group-price-derived" data-testid="derived-reference">{{ derivedNote }}</p>
     </template>
   </section>
