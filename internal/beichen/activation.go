@@ -65,6 +65,9 @@ type activationBinding struct {
 	// websiteListed keeps a published legacy directory route usable until the
 	// first Key sync supplies current Key evidence for the upstream model.
 	websiteListed bool
+	// repairable marks an upstream that another current Key already lists, so
+	// the website route can be replaced instead of staying as it is.
+	repairable bool
 }
 
 type activationWrite struct {
@@ -464,6 +467,20 @@ SELECT n.upstream::text,m.id,m.model_id::text,m.status,m.credit_multiplier_milli
      AND w.catalog_source='website' AND wc.status='active'
      AND btrim(w.model_id::text)::citext=btrim(b.upstream_model_name)::citext
  ) AND NOT (`+catalog.BeichenGroupUnavailableSQL+`) AND `+catalog.BeichenCatalogAuthReadySQL+`, false),
+ COALESCE(EXISTS (
+   SELECT 1 FROM provider_model_catalog k
+   JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
+   JOIN beichen_key_evidence e ON e.credential_id=c.id
+   WHERE k.provider_id=b.provider_id AND k.model_id=btrim(b.upstream_model_name)::citext
+     AND k.status='active' AND c.status='active' AND octet_length(c.credential_ciphertext)>0
+     AND `+catalog.BeichenKeyListsModelSQL+`
+     AND `+catalog.BeichenGroupAllowsRouteSQL+`
+     AND NOT EXISTS (
+       SELECT 1 FROM upstream_probes r
+       WHERE r.provider_id=k.provider_id AND r.credential_id=k.credential_id AND r.model=k.model_id::text
+         AND r.protocol=b.adapter AND `+catalog.BeichenCurrentProbeSQL+` AND `+catalog.BeichenProbeBlocksRouteSQL+`
+     )
+ ), false),
  CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.id END,
  CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.label::text END
 FROM names n JOIN models m ON m.id=n.id
@@ -497,10 +514,10 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 		var id, owner, key *uuid.UUID
 		var adapter, upstream, providerName, label *string
 		var priority *int
-		var active, authFailedActiveKey, reachable, websiteListed *bool
+		var active, authFailedActiveKey, reachable, websiteListed, repairable *bool
 		var bindingKey *uuid.UUID
 		if err := bound.Scan(&source, &school.id, &school.name, &school.status, &school.multiplier, &school.hasActivationMapping, &school.websiteOnly, &id, &adapter, &upstream, &owner, &providerName,
-			&priority, &active, &bindingKey, &authFailedActiveKey, &reachable, &websiteListed, &key, &label); err != nil {
+			&priority, &active, &bindingKey, &authFailedActiveKey, &reachable, &websiteListed, &repairable, &key, &label); err != nil {
 			return nil, err
 		}
 		m := modelFor(source)
@@ -518,7 +535,7 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 		s := m.schools[school.id]
 		s.bindings = append(s.bindings, activationBinding{
 			id: *id, credential: bindingKey, route: r, active: *active, reachable: *reachable,
-			authFailedActiveKey: *authFailedActiveKey, websiteListed: *websiteListed,
+			authFailedActiveKey: *authFailedActiveKey, websiteListed: *websiteListed, repairable: *repairable,
 		})
 	}
 	if err := bound.Err(); err != nil {
@@ -615,7 +632,7 @@ func (m *activationModel) alreadyPublished(s *activationSchool, plan activationP
 
 func (m *activationModel) legacyWebsiteRoute(s *activationSchool) bool {
 	return slices.ContainsFunc(s.bindings, func(b activationBinding) bool {
-		return b.active && b.websiteListed && b.route.ProviderID == m.provider
+		return b.active && b.websiteListed && !b.repairable && b.route.ProviderID == m.provider
 	})
 }
 
