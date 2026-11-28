@@ -617,7 +617,14 @@ func (row *capabilityRow) evaluate(view *BeichenCapabilities) error {
 	}
 	row.reportProbeGaps(view, whole)
 	row.reportPriceGaps(view, routeCurrent)
-	if row.Published && row.BindingState == "ready" && row.PriceBlocker != nil && !row.PriceCovered {
+	if row.Published && !row.PriceCovered && (row.PriceState == "missing" || row.PriceState == "derived") {
+		if row.PriceBlocker == nil {
+			row.PriceBlocker = &CapabilityIssue{
+				Code:       "missing_price",
+				Message:    "当前线路缺少可结算报价，请同步官网报价或设置手动价。",
+				ActionHint: "请同步该 Key 的官网报价，或在模型管理中设置手动价。",
+			}
+		}
 		row.Availability = AvailabilityUnavailable
 		row.AvailabilityReason = row.PriceBlocker.Message
 		row.RecommendedProtocol = nil
