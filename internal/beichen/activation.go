@@ -41,10 +41,10 @@ type activationCandidate struct {
 }
 
 func (c activationCandidate) matchesSchool(id uuid.UUID) bool {
-	if c.fallbackSchoolID != uuid.Nil {
-		return c.fallbackSchoolID == id
+	if c.schoolID == id && !c.unresolvedAlias {
+		return true
 	}
-	return c.schoolID == id && !c.unresolvedAlias
+	return c.fallbackSchoolID != uuid.Nil && c.fallbackSchoolID == id
 }
 
 type activationSchool struct {
@@ -52,6 +52,7 @@ type activationSchool struct {
 	name, status         string
 	multiplier           *int64
 	hasActivationMapping bool
+	websiteOnly          bool
 	bindings             []activationBinding
 }
 
@@ -96,12 +97,17 @@ const (
 	diagnosticTargetMissing  = "target_missing"
 	diagnosticKeyListed      = "key_listed"
 	diagnosticGroupAllowed   = "group_allowed"
+	diagnosticCandidateRows  = "candidate_rows"
+	diagnosticMatchingSchool = "matching_school"
+	diagnosticFallbackSchool = "fallback_school"
+	diagnosticSchools        = "schools"
 )
 
 func newActivationDiagnostics() map[string]int {
 	return map[string]int{
 		diagnosticRows: 0, diagnosticAvailable: 0, diagnosticCatalogCurrent: 0,
 		diagnosticAliasMissing: 0, diagnosticTargetMissing: 0, diagnosticKeyListed: 0, diagnosticGroupAllowed: 0,
+		diagnosticCandidateRows: 0, diagnosticMatchingSchool: 0, diagnosticFallbackSchool: 0, diagnosticSchools: 0,
 	}
 }
 
@@ -121,6 +127,64 @@ func (m *activationModel) blockerDiagnostics(blocker CatalogBlocker) map[string]
 		return m.noCandidateDiagnostics()
 	}
 	return nil
+}
+
+func (m *activationModel) fallbackSchool() *activationSchool {
+	if schools := m.selectableSchools(); len(schools) == 1 {
+		target := schools[0]
+		if !target.websiteOnly {
+			return target
+		}
+	} else if len(schools) == 0 && len(m.schools) == 1 {
+		// A sole disabled target can still repair its existing route.
+		for _, school := range m.schools {
+			if school.hasActivationMapping {
+				return school
+			}
+		}
+	}
+	return nil
+}
+
+func (m *activationModel) applyFallbackSchools() {
+	fallback := m.fallbackSchool()
+	if fallback == nil {
+		return
+	}
+	for _, candidates := range m.defaults {
+		for i := range candidates {
+			if candidates[i].schoolID == fallback.id {
+				candidates[i].fallbackSchoolID = uuid.Nil
+			} else {
+				candidates[i].fallbackSchoolID = fallback.id
+			}
+		}
+	}
+}
+
+func (m *activationModel) updateCandidateDiagnostics() {
+	if m.diagnostics == nil {
+		return
+	}
+	m.diagnostics[diagnosticCandidateRows] = 0
+	m.diagnostics[diagnosticMatchingSchool] = 0
+	m.diagnostics[diagnosticFallbackSchool] = 0
+	m.diagnostics[diagnosticSchools] = len(m.selectableSchools())
+	target := m.target("")
+	for _, candidates := range m.defaults {
+		for _, candidate := range candidates {
+			m.diagnostics[diagnosticCandidateRows]++
+			if target == nil || target.id == uuid.Nil {
+				continue
+			}
+			if candidate.schoolID == target.id {
+				m.diagnostics[diagnosticMatchingSchool]++
+			}
+			if candidate.fallbackSchoolID == target.id {
+				m.diagnostics[diagnosticFallbackSchool]++
+			}
+		}
+	}
 }
 
 func activationBlockerError(blocker CatalogBlocker, diagnostics map[string]int) error {
@@ -159,6 +223,15 @@ const activationSchoolSourcesSQL = `school_sources AS (
  WHERE b.provider_id=$1 AND b.model_id=$3 AND btrim(b.upstream_model_name)<>''
 )`
 
+const activationCatalogSourceAllowedSQL = `(k.status='active' AND (
+  k.catalog_source IN ` + catalog.BeichenKeyCatalogSourcesSQL + ` OR (k.catalog_source='website' AND EXISTS (
+    SELECT 1 FROM model_bindings b JOIN models s ON s.id=b.model_id
+    WHERE b.provider_id=k.provider_id AND btrim(b.upstream_model_name)::citext=k.model_id
+      AND (b.credential_id IS NULL OR b.credential_id=k.credential_id)
+      AND b.status='active' AND s.status='active'
+  ))
+))`
+
 func readActivationCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID, source string, schoolID *uuid.UUID) ([]*activationModel, error) {
 	query := `
 WITH ` + catalog.BeichenKeyEvidenceCTE + `, ` + activationSchoolSourcesSQL + `
@@ -189,13 +262,7 @@ LEFT JOIN beichen_datasets billing ON billing.credential_id=c.id AND billing.kin
 LEFT JOIN LATERAL (SELECT multiplier,stale_at,group_id FROM beichen_multiplier_versions WHERE credential_id=c.id
  AND effective_at<=statement_timestamp()
  ORDER BY effective_at DESC,id DESC LIMIT 1) mv ON true
-WHERE p.id=$1 AND ` + beichenProvider + ` AND k.status='active'
- AND (k.catalog_source IN ` + catalog.BeichenKeyCatalogSourcesSQL + ` OR (k.catalog_source='website' AND EXISTS (
-   SELECT 1 FROM model_bindings b JOIN models s ON s.id=b.model_id
-   WHERE b.provider_id=k.provider_id AND btrim(b.upstream_model_name)::citext=k.model_id
-     AND (b.credential_id IS NULL OR b.credential_id=k.credential_id)
-     AND b.status='active' AND s.status='active'
- )))
+WHERE p.id=$1 AND ` + beichenProvider + ` AND ` + activationCatalogSourceAllowedSQL + `
  AND ($2::text='' OR k.model_id=$2::citext)
  AND ($3::uuid IS NULL OR k.model_id IN (SELECT upstream FROM school_sources))
 ORDER BY lower(k.model_id::text),c.id`
@@ -327,26 +394,28 @@ WITH `+catalog.BeichenKeyEvidenceCTE+`, `+activationSchoolSourcesSQL+`, north AS
  WHERE b.provider_id=$1 AND s.status='active' AND btrim(b.upstream_model_name)<>''
    AND ($2::text='' OR btrim(b.upstream_model_name)::citext=$2::citext)
 ), school_names AS (
- SELECT n.model_id AS upstream,alias_target.id,k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AS key_or_binding
+ SELECT n.model_id AS upstream,alias_target.id,k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AS key_or_binding,
+   k.catalog_source='website' AS website_source
  FROM north n JOIN provider_model_catalog k ON k.provider_id=$1 AND k.model_id=n.model_id
  CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
  `+joinModelAliasSQL+`
  JOIN models alias_target ON alias_target.model_id=alias.school_model::citext
  WHERE (k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+`) OR $2::text=''
  UNION
- SELECT n.model_id AS upstream,upstream_target.id,k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AS key_or_binding
+ SELECT n.model_id AS upstream,upstream_target.id,k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AS key_or_binding,
+   k.catalog_source='website' AS website_source
  FROM north n JOIN provider_model_catalog k ON k.provider_id=$1 AND k.model_id=n.model_id
  CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
  JOIN models upstream_target ON upstream_target.model_id=a.model::citext
  WHERE (k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+`) OR $2::text=''
  UNION ALL
- SELECT n.model_id,b.model_id,true FROM north n JOIN model_bindings b ON b.provider_id=$1 AND lower(btrim(b.upstream_model_name))=lower(n.model_id::text)
+ SELECT n.model_id,b.model_id,true,false FROM north n JOIN model_bindings b ON b.provider_id=$1 AND lower(btrim(b.upstream_model_name))=lower(n.model_id::text)
 ), names AS (
- SELECT upstream,id,bool_or(key_or_binding) AS key_or_binding FROM school_names
+ SELECT upstream,id,bool_or(key_or_binding) AS key_or_binding,bool_or(website_source) AS website_source FROM school_names
  WHERE $3::uuid IS NULL OR upstream IN (SELECT upstream FROM school_sources)
  GROUP BY upstream,id
 )
-SELECT n.upstream::text,m.id,m.model_id::text,m.status,m.credit_multiplier_milli,n.key_or_binding,b.id,b.adapter,b.upstream_model_name,
+SELECT n.upstream::text,m.id,m.model_id::text,m.status,m.credit_multiplier_milli,n.key_or_binding,n.website_source AND NOT n.key_or_binding,b.id,b.adapter,b.upstream_model_name,
  b.provider_id,p.name::text,b.priority,b.status='active',b.credential_id,
  COALESCE(b.credential_id IS NOT NULL AND bc.status='active' AND bc.retired_at IS NULL AND (
    `+catalog.BeichenCatalogAuthFailureSQL+` OR EXISTS (
@@ -393,7 +462,7 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 		var priority *int
 		var active, authFailedActiveKey, reachable *bool
 		var bindingKey *uuid.UUID
-		if err := bound.Scan(&source, &school.id, &school.name, &school.status, &school.multiplier, &school.hasActivationMapping, &id, &adapter, &upstream, &owner, &providerName,
+		if err := bound.Scan(&source, &school.id, &school.name, &school.status, &school.multiplier, &school.hasActivationMapping, &school.websiteOnly, &id, &adapter, &upstream, &owner, &providerName,
 			&priority, &active, &bindingKey, &authFailedActiveKey, &reachable, &key, &label); err != nil {
 			return nil, err
 		}
@@ -427,25 +496,11 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 			}
 		}
 	}
-	// A same-name retired school is not a second activation target. Let the
-	// unique live target receive candidates whose old mapping is nil or stale.
-	// Archived website-only entries cannot establish that mapping.
+	// A sole selectable target receives every default candidate, including
+	// candidates that still point at an older school UUID.
 	for _, m := range models {
-		school := m.target("")
-		if school == nil || !school.hasActivationMapping {
-			continue
-		}
-		for _, candidates := range m.defaults {
-			for i := range candidates {
-				candidate := &candidates[i]
-				mapped := m.schools[candidate.schoolID]
-				// A sole disabled school can still use an unmapped Key to repair its route.
-				unmapped := candidate.schoolID == uuid.Nil && !candidate.unresolvedAlias
-				if unmapped || school.selectable() && (mapped == nil || !mapped.selectable()) {
-					candidate.fallbackSchoolID = school.id
-				}
-			}
-		}
+		m.applyFallbackSchools()
+		m.updateCandidateDiagnostics()
 	}
 	sort.Slice(models, func(i, j int) bool { return strings.ToLower(models[i].name) < strings.ToLower(models[j].name) })
 	return models, nil
@@ -653,10 +708,18 @@ func (m *activationModel) repairRoute(s *activationSchool, adapter, upstream str
 
 func (m *activationModel) defaultRoutes(s *activationSchool) ([]PreferredRoute, CatalogBlocker) {
 	var routes []PreferredRoute
+	unique := uuid.Nil
+	if !m.multiSchoolTargets {
+		if fallback := m.fallbackSchool(); fallback != nil {
+			unique = fallback.id
+		}
+	}
 	for _, adapter := range slices.Sorted(maps.Keys(m.defaults)) {
 		var selected *PreferredRoute
 		for _, candidate := range m.defaults[adapter] {
-			if !candidate.matchesSchool(s.id) {
+			if !(candidate.schoolID == s.id && !candidate.unresolvedAlias) &&
+				!(candidate.fallbackSchoolID != uuid.Nil && candidate.fallbackSchoolID == s.id) &&
+				!(candidate.schoolID == uuid.Nil && !m.multiSchoolTargets && unique != uuid.Nil && unique == s.id) {
 				continue
 			}
 			route := candidate.route
@@ -939,6 +1002,9 @@ func selectBatchActivation(ctx context.Context, tx *sql.Tx, provider uuid.UUID, 
 		for protocol, routes := range model.defaults {
 			combined.defaults[protocol] = append(combined.defaults[protocol], routes...)
 		}
+	}
+	if combined == nil && len(models) == 1 {
+		return models[0], nil, nil
 	}
 	return combined, target, nil
 }

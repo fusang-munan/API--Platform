@@ -360,13 +360,13 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 概览显示 `model_catalog.source=both`、`catalog_keys.state=listed` 且已有官网目录，但启用仍返回 `no_candidate` 时，查询该行的 `provider_model_catalog.catalog_source`。旧读取只接受 `key`，若生产行为 `both`，整条候选记录会从启用预览消失。修复后 `key|both` 统一作为 Key 载体，`both` 仍必须通过 Key 目录新鲜度、分组和探活检查；`website` 仍要求已有活动绑定。目录、定价、线路能力、探活和发布协议使用同一读取口径。
 
-`catalog_source` 已确认为 `both` 且 Key 目录、价格和探活都正常，启用仍为 `no_candidate` 时，检查 `upstream_model_aliases.school_model` 是否指向不存在的 `models.model_id`。旧读取只按 `COALESCE(alias.school_model, upstream_model)` 解析，别名失效会同时丢掉别名和上游名两个有效路径。修复后别名目标存在时优先，目标不存在时回退上游名；别名与上游名指向两个不同的活跃或待配置模型时返回 `multi_school`。概览的两个目标行都显示该阻断并关闭启用，单模型或批量即使提交 alias UUID 也不会写入绑定或审计，必须先修正映射。`no_candidate` 的 `error.details` 或批量 `skipped[].details` 提供 `rows`、`available`、`catalog_current`、`alias_missing`、`target_missing`、`key_listed`、`group_allowed` 整数计数。
+`catalog_source` 已确认为 `both` 且 Key 目录、价格和探活都正常，启用仍为 `no_candidate` 时，检查 `upstream_model_aliases.school_model` 是否指向不存在的 `models.model_id`。旧读取只按 `COALESCE(alias.school_model, upstream_model)` 解析，别名失效会同时丢掉别名和上游名两个有效路径。修复后别名目标存在时优先，目标不存在时回退上游名；别名与上游名指向两个不同的活跃或待配置模型时返回 `multi_school`。概览的两个目标行都显示该阻断并关闭启用，单模型或批量即使提交 alias UUID 也不会写入绑定或审计，必须先修正映射。`no_candidate` 的 `error.details` 或批量 `skipped[].details` 提供 `rows`、`available`、`catalog_current`、`alias_missing`、`target_missing`、`key_listed`、`group_allowed` 以及候选匹配阶段的 `candidate_rows`、`matching_school`、`fallback_school`、`schools` 整数计数。
 
 设置独立的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test ./internal/beichen -run '^TestEnableModel(FirstConnect.*|RetiredSameName.*|MultipleLiveTargets|PrioritizesAuthFailure)Postgres$' -count=1 -v`。用例覆盖一把 Gemini Key 的两个协议、确认报价、成功探活、未关联或旧目标关联、按名称和 UUID 启用、重复启用，以及多目标、多候选、跨 Key 拼协议、缺价和缺少校内倍率时的阻断。查看单个响应的 `error.details.code`、批量的 `skipped[].code` 或教师概览的 `blockers` 定位具体原因。多个活跃校内目标拆成两行时，两行的阻断码和提示均与单模型、批量一致，均为 `multi_school`。
 
 运行 `go test ./internal/beichen -run '^(TestEnableModelCatalogSourceBoth|TestActivationCatalogSourceNeedsKeyEvidence|TestActivationCatalogSourceWebsiteOnlyNeedsBinding)Postgres$' -count=1 -v` 验证 `both`。生产形状使用组 `31`、倍率 `0.5`、确认价格、两种协议探活成功和唯一当前校内目标；同时覆盖 Key 目录过期、分组拒绝与 `website` 无绑定。
 
-运行 `go test ./internal/beichen -run '^(TestEnableModel(MissingAliasFallsBackToUpstream|AliasAndUpstreamDifferentLiveTargets|ValidAliasTakesPriority)|TestActivationNoCandidateDiagnostics)Postgres$' -count=1 -v` 验证别名路径和诊断计数。用例覆盖失效别名回退、有效别名优先、active 与 pending 两种冲突目标、概览两行关闭启用、按 alias UUID 仍阻断、无绑定或审计写入，以及单模型和批量诊断字段。
+运行 `go test ./internal/beichen -run '^(TestEnableModel(StaleCandidateFallsBackToUniqueSelectableTarget|MissingAliasFallsBackToUpstream|AliasAndUpstreamDifferentLiveTargets|ValidAliasTakesPriority)|TestActivationNoCandidateDiagnostics|TestDefaultRoutesUniqueNilCandidateUsesFallback|TestActivationFallbackDiagnosticsExcludeDirectMatches)Postgres?$' -count=1 -v` 验证别名路径、唯一目标回退和诊断计数。用例覆盖旧 UUID 与空 UUID 候选在唯一目标下回退、`hasActivationMapping=false`、website-only 拒绝回退、active 与 pending 两种冲突目标、概览两行关闭启用、按 alias UUID 仍阻断、无绑定或审计写入，以及 direct 与 fallback 混合时的计数。
 
 测试中刚写入的 Key 目录被判为陈旧时，核对目录观测时间是否早于凭据版本或分组变更。构造当前目录的测试数据使用 PostgreSQL 时钟，避免 Windows 上应用与数据库的时钟精度差异影响时间先后。
 

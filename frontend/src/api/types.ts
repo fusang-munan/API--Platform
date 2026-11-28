@@ -144,6 +144,10 @@ export type ApiErrorDetails = {
   target_missing?: number
   key_listed?: number
   group_allowed?: number
+  candidate_rows?: number
+  matching_school?: number
+  fallback_school?: number
+  schools?: number
 } | Array<{ field: string; reason: string }>
 export type ApiError = { error?: { code?: string; message?: string; details?: ApiErrorDetails }; request_id?: string }
 
@@ -674,6 +678,10 @@ export type BeichenActivationDiagnostics = {
   target_missing: number
   key_listed: number
   group_allowed: number
+  candidate_rows: number
+  matching_school: number
+  fallback_school: number
+  schools: number
 }
 export type BeichenBatchEnableResult = {
   enabled: Array<{ model: string; model_id: string }>
