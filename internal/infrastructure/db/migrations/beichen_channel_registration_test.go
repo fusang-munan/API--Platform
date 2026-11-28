@@ -361,7 +361,7 @@ VALUES ($1,$2,'教师自定义 Gemini 名称',$3,'inactive',now()-interval '1 da
 	f.exec(t, `
 INSERT INTO beichen_credential_retirements
  (credential_id,provider_id,channel,reason,evidence,retired_at,source_updated_at,source_retired_at)
-SELECT id,provider_id,'Gemini','0065_beichen_gemini','0065_window',retired_at,updated_at,NULL
+SELECT id,provider_id,'Gemini','0065_beichen_gemini','upstream_key_12098',retired_at,updated_at,retired_at
 FROM provider_credentials WHERE id=$1`, legacy)
 	const rotated = "sk-local-custom-rotated-gemini"
 	raw := `[{"channel":"GM1","status":"disabled"},{"channel":"G3","status":"disabled"},
@@ -619,6 +619,155 @@ SELECT c.status='active' AND c.retired_at IS NULL,
 FROM provider_credentials c WHERE c.id=$1`, legacy).Scan(&history, &ownChannel, &storedCost)
 	if err != nil || !history || !ownChannel || storedCost != "0.35" {
 		t.Fatalf("真旧 Gemini 恢复未保留历史或渠道登记: %v", err)
+	}
+}
+
+func TestBeichenUpgradeChainBackfilledGeminiShape(t *testing.T) {
+	ctx, client, db := newUpgradeChannelFixture(t, "0072_")
+	material := bytes.Repeat([]byte{59}, 32)
+	manager, err := security.NewManager(material, material, material, material, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var provider uuid.UUID
+	var appliedAt time.Time
+	if err := db.QueryRowContext(ctx, `
+SELECT p.id,m.applied_at FROM providers p
+JOIN schema_migrations m ON m.version='0065_retire_beichen_gemini_credential.sql'
+WHERE p.base_url='https://api.beichenapi.com'`).Scan(&provider, &appliedAt); err != nil {
+		t.Fatal(err)
+	}
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacy, retiredSurvivor, ordinary := uuid.New(), uuid.New(), uuid.New()
+	legacyCipher, err := manager.EncryptCredential("sk-upgrade-backfilled-gemini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinaryCipher, err := manager.EncryptCredential("sk-upgrade-backfilled-ordinary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(`INSERT INTO provider_credentials
+ (id,provider_id,label,group_hint,credential_ciphertext,status,created_at,updated_at,retired_at)
+VALUES
+ ($1,$4,'哈吉米','5',$5,'inactive',$6,$7,$7),
+ ($2,$4,'G3',NULL,'fixture','inactive',$6,$7,$7),
+ ($3,$4,'普通凭据','5',$8,'inactive',$9,$10,$10)`,
+		legacy, retiredSurvivor, ordinary, provider, legacyCipher,
+		appliedAt.Add(-24*time.Hour), appliedAt, ordinaryCipher,
+		appliedAt.Add(time.Minute), appliedAt.Add(2*time.Minute))
+	exec(`INSERT INTO beichen_upstream_usage_rows
+ (upstream_user_id,row_id,upstream_key_id,provider_id,credential_id,channel,model,occurred_at,actual_cost,cost_details)
+VALUES (88,1,888,$1,$2,'Gemini','gemini-backfilled',now()-interval '1 day',0.45,'{}')`, provider, legacy)
+
+	strongProvider, strong, strongSurvivor := uuid.New(), uuid.New(), uuid.New()
+	user := uuid.New()
+	exec(`INSERT INTO users(id,name,email,password_hash,role,status,created_at,updated_at)
+VALUES($1,'强证据教师','strong@example.test','!','teacher','active',now(),now())`, user)
+	exec(`INSERT INTO providers(id,name,base_url,status,created_at,updated_at)
+VALUES($1,'强证据北辰','https://api.beichenapi.com/v1','active',now(),now())`, strongProvider)
+	strongCipher, err := manager.EncryptCredential("sk-upgrade-strong-gemini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(`INSERT INTO provider_credentials
+ (id,provider_id,label,group_hint,credential_ciphertext,status,created_at,updated_at,retired_at)
+VALUES
+ ($1,$3,'Gemini',NULL,$4,'inactive',$5,$6,$6),
+ ($2,$3,'CC1',NULL,'fixture','active',now(),now(),NULL)`,
+		strong, strongSurvivor, strongProvider, strongCipher, appliedAt.Add(-24*time.Hour), appliedAt)
+	exec(`INSERT INTO beichen_panel_access
+ (credential_id,group_id,upstream_key_id,token_ciphertext,updated_by,updated_at)
+VALUES($1,1,12098,'fixture',$2,$3)`, strong, user, appliedAt)
+
+	upgrade, err := os.ReadFile("0072_beichen_channel_identity.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(string(upgrade))
+	var weakEvidence, strongEvidence string
+	var retiredCount, ordinaryRetired int
+	err = db.QueryRowContext(ctx, `
+SELECT
+ (SELECT evidence FROM beichen_credential_retirements WHERE credential_id=$1),
+ (SELECT evidence FROM beichen_credential_retirements WHERE credential_id=$2),
+ (SELECT count(*) FROM beichen_credential_retirements),
+ (SELECT count(*) FROM beichen_credential_retirements WHERE credential_id=$3)`,
+		legacy, strong, ordinary).Scan(&weakEvidence, &strongEvidence, &retiredCount, &ordinaryRetired)
+	if err != nil || weakEvidence != "0065_window" || strongEvidence != "upstream_key_12098" ||
+		retiredCount != 2 || ordinaryRetired != 0 {
+		t.Fatalf("真实回填形状漏种或误种: weak=%s strong=%s total=%d ordinary=%d (%v)",
+			weakEvidence, strongEvidence, retiredCount, ordinaryRetired, err)
+	}
+
+	service := controlplane.NewService(client, db, nil, manager, nil, controlplane.Config{})
+	active, inactive := "active", "inactive"
+	ordinaryReplacement := "sk-upgrade-backfilled-ordinary-new"
+	exec(`INSERT INTO beichen_credential_retirements
+ (credential_id,provider_id,channel,reason,evidence,retired_at,source_updated_at,source_retired_at)
+SELECT id,provider_id,'Gemini','legacy_bad_row','0065_window',retired_at,updated_at,retired_at
+FROM provider_credentials WHERE id=$1`, ordinary)
+	if _, err := service.UpdateProviderCredential(ctx, provider, ordinary,
+		controlplane.ProviderCredentialInput{Credential: &ordinaryReplacement, Status: &active}); err == nil ||
+		!strings.Contains(err.Error(), "停用的 Gemini") {
+		t.Fatal("0065 后创建的普通凭据被错误记录带入 Gemini 恢复")
+	}
+	exec("DELETE FROM beichen_credential_retirements WHERE credential_id=$1", ordinary)
+	if _, err := service.UpdateProviderCredential(ctx, provider, ordinary,
+		controlplane.ProviderCredentialInput{Status: &active}); err != nil {
+		t.Fatal(err)
+	}
+	ordinaryCall := insertChannelCall(t, channelFixture{ctx: ctx, db: db}, "backfilled-ordinary-dispatch")
+	if err := usage.NewStore(db).PrepareDispatch(ctx, ordinaryCall, usage.CallRoute{
+		Beichen: true, ProviderID: provider, CredentialID: ordinary, UpstreamModelName: "ordinary",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var multiplier string
+	if err := db.QueryRowContext(ctx, "SELECT trim_scale(beichen_school_multiplier)::text FROM gateway_calls WHERE id=$1", ordinaryCall).
+		Scan(&multiplier); err != nil || multiplier != "1" {
+		t.Fatalf("普通凭据错误应用学校系数: %s (%v)", multiplier, err)
+	}
+	if _, err := service.UpdateProviderCredential(ctx, provider, ordinary,
+		controlplane.ProviderCredentialInput{Status: &inactive}); err != nil {
+		t.Fatal(err)
+	}
+
+	rotated := "sk-upgrade-backfilled-gemini-rotated"
+	view, err := service.UpdateProviderCredential(ctx, provider, legacy,
+		controlplane.ProviderCredentialInput{Credential: &rotated, Status: &active})
+	if err != nil || view.ID != legacy.String() {
+		t.Fatalf("回填形状的旧 Gemini 未复用原编号: %v", err)
+	}
+	geminiCall := insertChannelCall(t, channelFixture{ctx: ctx, db: db}, "backfilled-gemini-dispatch")
+	if err := usage.NewStore(db).PrepareDispatch(ctx, geminiCall, usage.CallRoute{
+		Beichen: true, ProviderID: provider, CredentialID: legacy, UpstreamModelName: "gemini-backfilled",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var geminiMultiplier, storedCost string
+	var registered bool
+	err = db.QueryRowContext(ctx, `
+SELECT trim_scale(beichen_school_multiplier)::text,
+       (SELECT trim_scale(actual_cost)::text FROM beichen_upstream_usage_rows
+        WHERE credential_id=$1 AND upstream_key_id=888 AND row_id=1),
+       EXISTS (SELECT 1 FROM beichen_provision_channels WHERE credential_id=$1 AND channel='Gemini')
+FROM gateway_calls WHERE id=$2`, legacy, geminiCall).Scan(&geminiMultiplier, &storedCost, &registered)
+	if err != nil || geminiMultiplier != "1.1" || storedCost != "0.45" || !registered {
+		t.Fatalf("旧 Gemini 恢复未保留历史或学校系数: %s/%s/%v (%v)",
+			geminiMultiplier, storedCost, registered, err)
+	}
+
+	strongRotated := "sk-upgrade-strong-gemini-rotated"
+	strongView, err := service.UpdateProviderCredential(ctx, strongProvider, strong,
+		controlplane.ProviderCredentialInput{Credential: &strongRotated, Status: &active})
+	if err != nil || strongView.ID != strong.String() {
+		t.Fatalf("12098 强证据 Gemini 未恢复原编号: %v", err)
 	}
 }
 

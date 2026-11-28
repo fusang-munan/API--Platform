@@ -252,7 +252,15 @@ SELECT COALESCE(c.status='inactive' AND (
               WHERE r.credential_id=c.id AND r.provider_id=c.provider_id AND r.channel='Gemini'
                 AND r.source_updated_at=c.updated_at
                 AND (
-                  r.evidence='0065_window' AND r.source_retired_at IS NULL
+                  r.evidence='0065_window'
+                    AND (r.source_retired_at IS NULL OR r.source_retired_at=r.source_updated_at)
+                    AND EXISTS (
+                      SELECT 1 FROM schema_migrations applied
+                      WHERE applied.version='0065_retire_beichen_gemini_credential.sql'
+                        AND c.created_at < applied.applied_at
+                        AND c.updated_at BETWEEN applied.applied_at - interval '10 minutes'
+                                             AND applied.applied_at + interval '10 minutes'
+                    )
                   OR r.evidence='upstream_key_12098'
                 ))
    OR EXISTS (SELECT 1 FROM beichen_panel_access a WHERE a.credential_id=c.id AND a.upstream_key_id=12098)

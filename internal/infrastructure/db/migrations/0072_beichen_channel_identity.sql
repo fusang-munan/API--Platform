@@ -1,5 +1,7 @@
 -- A credential may retain its billing channel while a replacement is prepared.
 -- Only one active credential holds the registration for a provider and channel.
+-- This revision is intended for environments that have not yet applied 0072.
+-- If an earlier 0072 was already recorded, repair it with a forward 0073.
 ALTER TABLE beichen_provision_channels ADD COLUMN registration_provider_id uuid;
 ALTER TABLE beichen_provision_channels ADD CONSTRAINT beichen_one_channel_registration
   UNIQUE (registration_provider_id, channel);
@@ -52,32 +54,26 @@ DO $$
 BEGIN
   IF to_regclass('schema_migrations') IS NOT NULL THEN
     EXECUTE $weak$
-      WITH matched AS (
+      WITH applied AS (
+        SELECT applied_at FROM schema_migrations
+        WHERE version = '0065_retire_beichen_gemini_credential.sql'
+      ), matched AS (
         SELECT c.id, c.provider_id, c.updated_at
         FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
+        CROSS JOIN applied
         WHERE lower(btrim(p.base_url)) IN ('https://api.beichenapi.com', 'https://api.beichenapi.com/',
                                            'https://api.beichenapi.com/v1', 'https://api.beichenapi.com/v1/')
-          AND c.retired_at IS NULL
           AND (c.group_hint = '5' OR c.label = '哈吉米')
-          AND EXISTS (
-            SELECT 1 FROM schema_migrations applied
-            WHERE applied.version = '0065_retire_beichen_gemini_credential.sql'
-              AND c.updated_at BETWEEN applied.applied_at - interval '10 minutes'
-                                   AND applied.applied_at + interval '10 minutes'
-          )
-      ), targets AS (
-        SELECT m.id, m.provider_id FROM matched m
-        WHERE EXISTS (
-          SELECT 1 FROM provider_credentials c
-          WHERE c.provider_id = m.provider_id AND c.status = 'active'
-            AND NOT EXISTS (SELECT 1 FROM matched other WHERE other.id = c.id)
-        )
+          AND (c.retired_at IS NULL OR c.retired_at = c.updated_at)
+          AND c.created_at < applied.applied_at
+          AND c.updated_at BETWEEN applied.applied_at - interval '10 minutes'
+                               AND applied.applied_at + interval '10 minutes'
       )
       INSERT INTO beichen_credential_retirements
         (credential_id,provider_id,channel,reason,evidence,retired_at,source_updated_at,source_retired_at)
-      SELECT t.id,t.provider_id,'Gemini','0065_beichen_gemini','0065_window',
+      SELECT m.id,m.provider_id,'Gemini','0065_beichen_gemini','0065_window',
              COALESCE(c.retired_at,c.updated_at),c.updated_at,c.retired_at
-      FROM targets t JOIN provider_credentials c ON c.id=t.id
+      FROM matched m JOIN provider_credentials c ON c.id=m.id
       WHERE c.status='inactive'
       ON CONFLICT (credential_id) DO NOTHING
     $weak$;
