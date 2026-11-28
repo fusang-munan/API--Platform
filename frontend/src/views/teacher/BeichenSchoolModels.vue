@@ -778,10 +778,7 @@ const priceRefreshWarnings = computed(() => {
   const data = overview.value
   if (!data) return []
   const labels = new Map((data.credentials ?? []).map(key => [key.credential_id, key.label]))
-  const rows = [
-    ...(data.datasets ?? []).filter(row => row.kind === 'prices'),
-    ...(data.models ?? []),
-  ]
+  const rows = (data.datasets ?? []).filter(row => row.kind === 'prices')
   const warnings = rows.flatMap(row => {
     const message = row.refresh_error?.trim()
     if (!message) return []

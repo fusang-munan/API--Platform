@@ -386,7 +386,7 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 缺价时同时核对发布状态、`price_blocker` 和可用性。已发布且没有可用报价的型号显示 `unavailable`，未发布缺价显示 `not_published`。Claude 报价刷新失败时，检查当前 Key、分组和倍率版本，以及从成功观测起算的 20 分钟有效窗口。运行 `go test -p 1 ./internal/beichen -run '^TestOverview(StudentPriceDiagnostics|ClaudeQuoteRenewal)Postgres$' -count=1`，复查宽限、过期和学生价。基础单价每百万 Token 1 元时，乘渠道倍率 0.5 和学校系数 1.10 后为每百万 Token 55 积分。
 
-教师页的未发布型号显示「未发布」，不应因缺价变成「不可用」。待配置但已有 `price_covered=true` 的型号计入报价覆盖，例如单项页面显示 `1 / 1`。`datasets[].refresh_error` 或 `models[].refresh_error` 非空时，诊断区的「续期失败，沿用旧报价」显示 Key 标签和具体原因。在 `frontend` 运行 `npm test -- BeichenSchoolModels`，核对未发布缺价、待发布有价覆盖和续期失败诊断。
+教师页的未发布型号显示「未发布」，不应因缺价变成「不可用」。待配置但已有 `price_covered=true` 的型号计入报价覆盖，例如单项页面显示 `1 / 1`。采价续期失败时，`datasets[].refresh_error` 非空，诊断区的「续期失败，沿用旧报价」显示 Key 标签和具体原因。在 `frontend` 运行 `npm test -- BeichenSchoolModels`，核对未发布缺价、待发布有价覆盖和续期失败诊断。
 
 教师页金额或启用反馈异常时，在 `frontend` 运行 `npm test -- BeichenSchoolModels BeichenKeyCapabilities`。用例核对 Key 清单与账日记录分开计数、金额显示元及原币、一键启用的跳过和失败分类，以及单项和批量 `no_candidate` 的诊断计数。浏览器复查 390、520、1024 和 1280 像素宽度下的状态列、报价表和档位弹窗，窄屏的宽表在容器内横向滚动。
 

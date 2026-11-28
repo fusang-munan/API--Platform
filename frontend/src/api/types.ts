@@ -222,7 +222,6 @@ export type BeichenModel = {
   upstream_rates?: BeichenDisplayRates | null
   school_rates?: BeichenDisplayRates | null
   price_covered?: boolean
-  refresh_error?: string | null
 }
 export type BeichenComparison = {
   credential_id: string

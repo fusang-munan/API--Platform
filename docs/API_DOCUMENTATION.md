@@ -591,7 +591,7 @@ Key 证据不足时，只有标准余额计费、分组默认倍率有效且高�
 
 已有线路的 Key 仍为 `active`，且当前 Key 版本被目录认证或探活确认 401/403 时，启用以 `auth_failed` 阻断并提示教师显式重绑。停用或退役 Key 可按唯一候选修复，多个候选会阻断修复。
 
-首次启用选中有旧 `inactive` 绑定的协议时原地恢复该绑定。已发布且仍有当前网站目录证据的旧线路支持幂等启用，批量返回 `already_active`。同批按校内模型 UUID 去重，事务成功提交或确认 `already_active` 后占用去重位置。
+首次启用选中有旧 `inactive` 绑定的协议时原地恢复该绑定。已发布且仍有当前网站目录证据的旧线路，只在没有任何可接替的当前 Key 目录时支持幂等启用，批量返回 `already_active`。存在可接替的当前 Key 时，名称或陈旧别名查询返回 `no_candidate` / `route_not_ready`，且不占批量去重位；同一校内 UUID 随后可按 Key 候选修复绑定，并保留原绑定 UUID 和优先级。同批按校内模型 UUID 去重，事务成功提交或确认 `already_active` 后占用去重位置。
 
 单个启用被阻断时，HTTP `400 VALIDATION_ERROR` 的 `error.details.code` 返回具体原因。批量启用在 `skipped[].code` 返回相同的阻断码，教师概览的 `model_catalog[].blockers[].code` 使用同一组阻断码和提示。`no_candidate` 表示没有符合当前目标的线路，`multi_school` 表示按上游名称无法唯一选中当前校内目标，`multi_candidate` 表示候选线路不唯一，`auth_failed` 表示原绑定认证失败，`price_missing` 表示缺少可用报价或校内倍率。上游名称有多个活跃或待配置目标时，拆分的各阻断行返回 `multi_school`，提示“该上游名称对应多个活跃校内模型，请指定校内模型 ID”。
 
