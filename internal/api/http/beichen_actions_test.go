@@ -145,6 +145,7 @@ func TestBeichenActionsNotFoundAndBatchEnvelope(t *testing.T) {
 	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM providers p`).WithArgs(provider).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT k.model_id::text,k.raw_entry`).WithArgs(provider, "absent", nil).WillReturnRows(sqlmock.NewRows([]string{"model"}))
+	mock.ExpectQuery(`SELECT EXISTS \(\s*SELECT 1 FROM model_bindings b`).WithArgs(provider, "absent").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectRollback()
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest("POST", "/providers/"+provider.String()+"/enable-batch", strings.NewReader(`{"models":["absent","ABSENT"]}`)))
