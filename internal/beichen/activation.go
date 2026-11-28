@@ -45,10 +45,11 @@ type activationSchool struct {
 }
 
 type activationBinding struct {
-	id                uuid.UUID
-	credential        *uuid.UUID
-	route             PreferredRoute
-	active, reachable bool
+	id                  uuid.UUID
+	credential          *uuid.UUID
+	route               PreferredRoute
+	active, reachable   bool
+	authFailedActiveKey bool
 }
 
 type activationWrite struct {
@@ -62,12 +63,14 @@ type activationPlan struct {
 	writes                    []activationWrite
 	northReady, foreignActive bool
 	catalogBlocked            bool
+	rebindRequired            bool
 	ambiguity                 string
 }
 
 const (
 	ambiguousProtocolRoutes = "同一个校内模型的同一协议有多个候选线路，请先确认并绑定线路"
 	ambiguousFirstRoutes    = "首次启用有多个候选上游线路，请先确认并绑定线路"
+	authFailedRebindMessage = "原线路 Key 已被上游拒绝认证，请由教师显式重绑"
 )
 
 func loadActivationCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID, source string) ([]*activationModel, error) {
@@ -231,11 +234,22 @@ WITH `+catalog.BeichenKeyEvidenceCTE+`, `+activationSchoolSourcesSQL+`, north AS
 )
 SELECT n.upstream::text,m.id,m.model_id::text,m.status,m.credit_multiplier_milli,n.key_or_binding,b.id,b.adapter,b.upstream_model_name,
  b.provider_id,p.name::text,b.priority,b.status='active',b.credential_id,
+ COALESCE(b.credential_id IS NOT NULL AND bc.status='active' AND bc.retired_at IS NULL AND (
+   `+catalog.BeichenCatalogAuthFailureSQL+` OR EXISTS (
+     SELECT 1 FROM upstream_probes r
+     WHERE r.provider_id=b.provider_id AND r.credential_id=b.credential_id
+       AND btrim(r.model)::citext=btrim(b.upstream_model_name)::citext
+       AND r.protocol=b.adapter AND `+catalog.BeichenCurrentProbeSQL+`
+       AND `+catalog.BeichenProbeAuthFailureSQL+`
+   )
+ ),false),
  p.status='active' AND COALESCE(picked.reachable AND (b.provider_id<>$1 OR picked.catalog_current),false),
  CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.id END,
  CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.label::text END
 FROM names n JOIN models m ON m.id=n.id
 LEFT JOIN model_bindings b ON b.model_id=m.id LEFT JOIN providers p ON p.id=b.provider_id
+LEFT JOIN provider_credentials bc ON bc.id=b.credential_id AND bc.provider_id=b.provider_id
+LEFT JOIN beichen_key_evidence e ON e.credential_id=b.credential_id
 LEFT JOIN LATERAL (
  SELECT c.id,c.label,count(*) OVER() AS count,
    (b.provider_id<>$1 OR k.last_seen_at>=c.updated_at) AS reachable,
@@ -263,10 +277,10 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 		var id, owner, key *uuid.UUID
 		var adapter, upstream, providerName, label *string
 		var priority *int
-		var active, reachable *bool
+		var active, authFailedActiveKey, reachable *bool
 		var bindingKey *uuid.UUID
 		if err := bound.Scan(&source, &school.id, &school.name, &school.status, &school.multiplier, &school.hasActivationMapping, &id, &adapter, &upstream, &owner, &providerName,
-			&priority, &active, &bindingKey, &reachable, &key, &label); err != nil {
+			&priority, &active, &bindingKey, &authFailedActiveKey, &reachable, &key, &label); err != nil {
 			return nil, err
 		}
 		m := modelFor(source)
@@ -284,6 +298,7 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 		s := m.schools[school.id]
 		s.bindings = append(s.bindings, activationBinding{
 			id: *id, credential: bindingKey, route: r, active: *active, reachable: *reachable,
+			authFailedActiveKey: *authFailedActiveKey,
 		})
 	}
 	if err := bound.Err(); err != nil {
@@ -386,7 +401,11 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 		}
 		rank := 0
 		repair := false
-		if north && b.active && !b.reachable && b.credential != nil {
+		if north && b.active && b.authFailedActiveKey {
+			plan.catalogBlocked = true
+			plan.rebindRequired = true
+		}
+		if north && b.active && !b.reachable && b.credential != nil && !b.authFailedActiveKey {
 			next, candidates, ambiguous := m.repairRoute(s, b.route.Adapter, b.route.UpstreamModel)
 			if ambiguous {
 				plan.ambiguity = ambiguousProtocolRoutes
@@ -820,6 +839,9 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 		return skip("already_active", "模型已启用")
 	}
 	plan := m.plan(target)
+	if plan.rebindRequired {
+		return skip("route_not_ready", authFailedRebindMessage)
+	}
 	if plan.ambiguity != "" {
 		return skip("route_not_ready", plan.ambiguity)
 	}
@@ -893,6 +915,9 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 		return target.id, nil
 	}
 	plan := m.plan(target)
+	if plan.rebindRequired {
+		return uuid.Nil, invalid(authFailedRebindMessage)
+	}
 	if plan.ambiguity != "" {
 		return uuid.Nil, invalid(plan.ambiguity)
 	}
