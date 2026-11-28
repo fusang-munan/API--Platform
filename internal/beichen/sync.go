@@ -58,9 +58,9 @@ type fetchResult struct {
 }
 
 type keyCatalogScan struct {
-	entries []catalog.ProviderEntry
-	at      time.Time
-	err     error
+	snapshot catalog.BeichenModelSnapshot
+	at       time.Time
+	err      error
 }
 
 var errBillingKeyBindingChanged = errors.New("同步期间北辰官网 Key 或分组已变化")
@@ -351,8 +351,8 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 }
 
 func (s *Service) fetchKeyCatalogJob(ctx context.Context, key string) *keyCatalogScan {
-	entries, err := s.fetchKeyCatalog(ctx, key)
-	return &keyCatalogScan{entries: entries, at: s.now().UTC(), err: err}
+	snapshot, err := catalog.FetchBeichenModelSnapshot(ctx, key, s.client)
+	return &keyCatalogScan{snapshot: snapshot, at: s.now().UTC(), err: err}
 }
 
 func (s *Service) fetchKeyCatalog(ctx context.Context, key string) ([]catalog.ProviderEntry, error) {
@@ -538,7 +538,7 @@ func (s *Service) finishJob(ctx context.Context, job syncJob, lease uuid.UUID, c
 	if result.catalog != nil {
 		scan := result.catalog
 		observationErr, err := catalog.SaveBeichenKeyScan(ctx, tx, job.provider, job.credential, credential.updatedAt,
-			scan.at, scan.entries, scan.err)
+			scan.at, scan.snapshot, scan.err)
 		if err != nil {
 			return err
 		}
@@ -584,6 +584,12 @@ func (s *Service) finishJob(ctx context.Context, job syncJob, lease uuid.UUID, c
 		missingFields = &value
 	}
 	var failures int
+	var retryAt *time.Time
+	if result.catalog != nil {
+		if at := catalog.BeichenRetryAt(result.catalog.err); !at.IsZero() {
+			retryAt = &at
+		}
+	}
 	err = tx.QueryRowContext(ctx, `
 WITH completed AS (SELECT clock_timestamp() AS at)
 UPDATE beichen_datasets SET
@@ -595,7 +601,7 @@ UPDATE beichen_datasets SET
       || jsonb_strip_nulls(jsonb_build_object('billing_account_rate', $7::jsonb || jsonb_build_object('last_success',completed.at),
         'key_billing_missing_fields', $8::jsonb)) END,
   last_error = $4, failure_count = CASE WHEN $6 THEN failure_count WHEN $4::text IS NULL THEN 0 ELSE LEAST(failure_count + 1, 6) END,
-  next_attempt = CASE
+  next_attempt = GREATEST($9::timestamptz, CASE
     WHEN $6 THEN next_attempt
     WHEN $4 IS NULL AND kind = 'billing' THEN LEAST(
       clock_timestamp() + CASE WHEN EXISTS (
@@ -604,13 +610,13 @@ UPDATE beichen_datasets SET
       (SELECT CASE WHEN expires_at > clock_timestamp() THEN expires_at END
         FROM beichen_panel_snapshots WHERE credential_id = $1 ORDER BY effective_at DESC LIMIT 1))
     WHEN $4 IS NULL OR kind = 'usage' THEN clock_timestamp() + $5::int * interval '1 minute'
-    ELSE clock_timestamp() + power(2, LEAST(failure_count, 6)) * interval '1 minute' END,
+    ELSE clock_timestamp() + power(2, LEAST(failure_count, 6)) * interval '1 minute' END),
   lease_id = NULL, lease_until = NULL
 FROM completed
 WHERE credential_id = $1 AND kind = $2
 RETURNING failure_count`, job.credential, job.kind,
 		(result.save != nil && job.kind == "usage") || result.err == nil, message, refreshMinutes(job.kind), manual && job.kind == "usage",
-		accountRate, missingFields).Scan(&failures)
+		accountRate, missingFields, retryAt).Scan(&failures)
 	if err != nil {
 		return err
 	}

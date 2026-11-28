@@ -553,12 +553,17 @@ func probeTargetURL(baseURL, requestPath string) (string, error) {
 
 func AdaptersFromCatalogSignals(entry ProviderEntry) []modelbinding.Adapter {
 	adapters := AdaptersFromSignals(EndpointSignals(entry)...)
+	protocols := entry.SupportedProtocols
+	if len(protocols) == 0 {
+		protocols = extractStringSlice(entry.Raw, "supported_protocols")
+	}
+	declared := AdaptersFromSignals(protocols...)
 	native := modelbinding.AdapterGoogleGeminiV1beta
 	// A model name alone does not prove the native route. Keep the existing
 	// Chat/Responses baseline until the catalog or a probe confirms v1beta.
-	if slices.Contains(adapters, native) || slices.Contains(entry.SupportedProtocols, string(native)) {
-		if len(entry.SupportedProtocols) > 0 {
-			adapters = AdaptersFromSignals(entry.SupportedProtocols...)
+	if slices.Contains(adapters, native) || slices.Contains(declared, native) {
+		if len(protocols) > 0 {
+			adapters = declared
 		}
 		return expandChatGatewayAdapters(entry.ID, adapters)
 	}

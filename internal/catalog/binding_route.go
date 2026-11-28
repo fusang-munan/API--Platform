@@ -11,6 +11,7 @@ import (
 	"context"
 	"strings"
 
+	entsql "entgo.io/ent/dialect/sql"
 	"github.com/google/uuid"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
@@ -24,56 +25,96 @@ func normalizeUpstreamModelID(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
-// BindingRouteReady reports whether a binding can reach upstream through an active provider key catalog entry.
+// BeichenProbeBlocksRouteSQL reads both historical status codes and the current
+// structured classification. The caller checks the Key/group evidence version.
+const BeichenProbeBlocksRouteSQL = `(r.status_code IN (401,403) OR r.error_code='credential_unreadable'
+ OR r.detail->>'failure_code' IN ('GROUP_NOT_ALLOWED','credential_invalid'))`
+
+// BindingRouteReady checks catalog coverage and confirmed upstream restrictions.
 func BindingRouteReady(ctx context.Context, client *ent.Client, binding *ent.ModelBinding) (bool, error) {
+	credential, err := bindingRouteCredential(ctx, client, binding)
+	return credential != nil, err
+}
+
+func bindingRouteCredential(ctx context.Context, client *ent.Client, binding *ent.ModelBinding) (*ent.ProviderCredential, error) {
 	if binding == nil || binding.Status != modelbinding.StatusActive {
-		return false, nil
+		return nil, nil
+	}
+	upstream := strings.TrimSpace(binding.UpstreamModelName)
+	if upstream == "" {
+		return nil, nil
 	}
 	providerRow, err := client.Provider.Get(ctx, binding.ProviderID)
 	if err != nil {
 		if ent.IsNotFound(err) {
-			return false, nil
+			return nil, nil
 		}
-		return false, err
+		return nil, err
 	}
 	if providerRow.Status != provider.StatusActive {
-		return false, nil
-	}
-	upstream := normalizeUpstreamModelID(binding.UpstreamModelName)
-	if upstream == "" {
-		return false, nil
-	}
-	if binding.CredentialID != nil {
-		return credentialOwnsCatalogModel(ctx, client, *binding.CredentialID, upstream)
-	}
-	_, found, err := FindActiveCatalogCredential(ctx, client, binding.ProviderID, upstream, uuid.Nil)
-	return found, err
-}
-
-// ResolveBindingCredential checks the same local route and credential state for
-// the gateway and for model authorization. An unavailable binding returns no credential.
-func ResolveBindingCredential(ctx context.Context, client *ent.Client, manager *security.Manager, binding *ent.ModelBinding) (string, uuid.UUID, error) {
-	ready, err := BindingRouteReady(ctx, client, binding)
-	if err != nil || !ready {
-		return "", uuid.Nil, err
+		return nil, nil
 	}
 	credentialID := binding.CredentialID
 	if credentialID == nil {
 		var found bool
-		credentialID, found, err = FindActiveCatalogCredential(ctx, client, binding.ProviderID, binding.UpstreamModelName, uuid.Nil)
-		if err != nil || !found || credentialID == nil {
-			return "", uuid.Nil, err
+		credentialID, found, err = FindActiveCatalogCredential(ctx, client, binding.ProviderID, upstream, uuid.Nil)
+		if err != nil || !found {
+			return nil, err
 		}
 	}
-	row, err := client.ProviderCredential.Query().Where(
+	query := client.ProviderCredential.Query().Where(
 		providercredential.IDEQ(*credentialID),
 		providercredential.ProviderIDEQ(binding.ProviderID),
 		providercredential.StatusEQ(providercredential.StatusActive),
-	).Only(ctx)
-	if ent.IsNotFound(err) {
-		return "", uuid.Nil, nil
+		providercredential.HasProviderWith(provider.StatusEQ(provider.StatusActive)),
+		providercredential.HasModelCatalogEntriesWith(
+			providermodelcatalog.ProviderIDEQ(binding.ProviderID),
+			providermodelcatalog.StatusEQ(providermodelcatalog.StatusActive),
+			func(s *entsql.Selector) {
+				s.Where(entsql.P(func(b *entsql.Builder) {
+					b.WriteString("btrim(").WriteString(s.C(providermodelcatalog.FieldModelID)).
+						WriteString("::text)::citext = ").Arg(upstream).WriteString("::citext")
+				}))
+			},
+		),
+	)
+	if IsBeichenBaseURL(providerRow.BaseURL) {
+		// Check the chosen credential and its denial evidence in one read.
+		// A blocked legacy binding must not pick a different Key underneath.
+		query.Where(func(s *entsql.Selector) {
+			s.Where(entsql.P(func(b *entsql.Builder) {
+				b.WriteString("EXISTS (SELECT 1 FROM (" + BeichenKeyEvidenceSQL + " WHERE c.id=").
+					WriteString(s.C(providercredential.FieldID)).WriteString(`) e
+WHERE NOT (` + BeichenGroupUnavailableSQL + `)
+  AND NOT EXISTS (
+    SELECT 1 FROM maintenance_state s
+    WHERE s.name='` + beichenCatalogAuthKey + `'||e.credential_id::text
+      AND (s.last_error::jsonb->>'credential_revision')::timestamptz=e.revision
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM upstream_probes r
+    JOIN provider_model_catalog k ON k.provider_id=r.provider_id AND k.credential_id=r.credential_id
+      AND k.model_id=r.model::citext AND k.model_id::text=r.model
+    WHERE r.provider_id=`).Arg(binding.ProviderID).WriteString(` AND r.credential_id=e.credential_id
+      AND r.protocol=`).Arg(binding.Adapter).WriteString(` AND btrim(k.model_id::text)::citext=`).Arg(upstream).WriteString(`::citext
+      AND k.status='active' AND k.catalog_source='key' AND ` + BeichenCurrentProbeSQL + `
+      AND ` + BeichenProbeBlocksRouteSQL + `
+  ))`)
+			}))
+		})
 	}
-	if err != nil {
+	row, err := query.Only(ctx)
+	if ent.IsNotFound(err) {
+		return nil, nil
+	}
+	return row, err
+}
+
+// ResolveBindingCredential uses the same route check before decrypting the
+// credential that will actually be sent upstream.
+func ResolveBindingCredential(ctx context.Context, client *ent.Client, manager *security.Manager, binding *ent.ModelBinding) (string, uuid.UUID, error) {
+	row, err := bindingRouteCredential(ctx, client, binding)
+	if err != nil || row == nil {
 		return "", uuid.Nil, err
 	}
 	credential, err := manager.DecryptCredential(row.CredentialCiphertext)

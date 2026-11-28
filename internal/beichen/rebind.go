@@ -70,25 +70,53 @@ type rebindCatalogEntry struct {
 	protocols                []string
 }
 
+type bindingRestore struct {
+	schoolModelID, credentialID uuid.UUID
+}
+
+func (r bindingRestore) tokenPrefix() string {
+	return "restore/" + r.schoolModelID.String() + "/" + r.credentialID.String()
+}
+
 func (s *Service) Rebind(ctx context.Context, provider, actor uuid.UUID, preview bool, token string) (RebindPlan, error) {
 	if provider == uuid.Nil || actor == uuid.Nil {
 		return RebindPlan{}, invalid("需要有效的供应商和教师 ID")
 	}
+	var restore *bindingRestore
+	digest := token
+	if strings.HasPrefix(token, "restore/") {
+		parts := strings.SplitN(token, "/", 4)
+		if preview && len(parts) != 3 || !preview && len(parts) != 4 {
+			return RebindPlan{}, invalid("请指定要恢复的校内模型和接替渠道")
+		}
+		modelID, modelErr := uuid.Parse(parts[1])
+		credentialID, keyErr := uuid.Parse(parts[2])
+		if modelErr != nil || keyErr != nil || modelID == uuid.Nil || credentialID == uuid.Nil {
+			return RebindPlan{}, invalid("需要有效的校内模型和接替渠道 ID")
+		}
+		restore = &bindingRestore{schoolModelID: modelID, credentialID: credentialID}
+		if !preview {
+			digest = parts[3]
+		}
+	}
 	if !preview {
-		if _, err := hex.DecodeString(token); len(token) != sha256.Size*2 || err != nil {
+		if _, err := hex.DecodeString(digest); len(digest) != sha256.Size*2 || err != nil {
 			return RebindPlan{}, invalid("请先预览绑定重建，再确认执行")
 		}
 	}
+	if s.db == nil {
+		return RebindPlan{}, unavailable("北辰绑定重建未配置", nil)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	plan, err := s.rebind(ctx, provider, actor, preview, token)
+	plan, err := s.rebind(ctx, provider, actor, preview, token, restore)
 	if !preview && activationRetryable(err) {
 		return RebindPlan{}, domain.WrapError(domain.CodeInvalidTransition, "北辰目录或绑定正在更新，请重新预览", err)
 	}
 	return plan, err
 }
 
-func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview bool, token string) (RebindPlan, error) {
+func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview bool, token string, restore *bindingRestore) (RebindPlan, error) {
 	options := &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
 	if !preview {
 		options = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
@@ -115,15 +143,19 @@ func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview
 			return RebindPlan{}, err
 		}
 	}
-	bindings, priorities, err := readRebindBindings(ctx, tx, provider, !preview)
+	var school, credential *uuid.UUID
+	if restore != nil {
+		school, credential = &restore.schoolModelID, &restore.credentialID
+	}
+	bindings, priorities, err := readRebindBindings(ctx, tx, provider, school, !preview)
 	if err != nil {
 		return RebindPlan{}, unavailable("读取北辰绑定失败", err)
 	}
-	entries, err := readRebindCatalog(ctx, tx, provider)
+	entries, err := readRebindCatalog(ctx, tx, provider, credential)
 	if err != nil {
 		return RebindPlan{}, unavailable("读取北辰重建目录失败", err)
 	}
-	versions, ready, err := readRebindEvidence(ctx, tx, provider)
+	versions, ready, err := readRebindEvidence(ctx, tx, provider, credential)
 	if err != nil {
 		return RebindPlan{}, unavailable("核对北辰渠道目录失败", err)
 	}
@@ -131,7 +163,15 @@ func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview
 		return RebindPlan{}, domain.NewError(domain.CodeInvalidTransition,
 			"目录或分组待复核，请核对启用渠道的分组权限并重扫目录后重新预览")
 	}
-	changes := planRebind(bindings, entries, priorities)
+	var changes []RebindChange
+	if restore == nil {
+		changes, err = planRebind(bindings, entries, priorities)
+	} else {
+		changes, err = planBindingRestore(bindings, entries, *restore)
+	}
+	if err != nil {
+		return RebindPlan{}, err
+	}
 	raw, err := json.Marshal(struct {
 		EvidenceVersions []RebindEvidenceVersion
 		Changes          []RebindChange
@@ -139,7 +179,14 @@ func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview
 	if err != nil {
 		return RebindPlan{}, unavailable("生成北辰重建预览失败", err)
 	}
-	fingerprint := fmt.Sprintf("%x", sha256.Sum256(append([]byte(provider.String()), raw...)))
+	scope := provider.String()
+	if restore != nil {
+		scope += "/" + restore.tokenPrefix()
+	}
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256(append([]byte(scope), raw...)))
+	if restore != nil {
+		fingerprint = restore.tokenPrefix() + "/" + fingerprint
+	}
 	view := RebindPlan{Preview: preview, PreviewToken: fingerprint, EvidenceVersions: versions, Changes: changes}
 	if !preview {
 		if token != fingerprint {
@@ -150,7 +197,7 @@ func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview
 		}
 		// A fresh statement also catches evidence committed by a writer outside
 		// the application locks while the binding statements were running.
-		current, ready, err := readRebindEvidence(ctx, tx, provider)
+		current, ready, err := readRebindEvidence(ctx, tx, provider, credential)
 		if err != nil {
 			return RebindPlan{}, unavailable("重新核对北辰渠道目录失败", err)
 		}
@@ -168,21 +215,21 @@ func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview
 	return view, nil
 }
 
-func readRebindEvidence(ctx context.Context, tx *sql.Tx, provider uuid.UUID) ([]RebindEvidenceVersion, bool, error) {
+func readRebindEvidence(ctx context.Context, tx *sql.Tx, provider uuid.UUID, credential *uuid.UUID) ([]RebindEvidenceVersion, bool, error) {
 	var ready bool
 	var raw []byte
 	err := tx.QueryRowContext(ctx, `
 WITH `+catalog.BeichenKeyEvidenceCTE+`
-SELECT p.status='active' AND COALESCE(bool_and(`+catalog.BeichenCatalogCurrentSQL+`
+SELECT p.status='active' AND ($2::uuid IS NULL OR count(c.id)=1) AND COALESCE(bool_and(`+catalog.BeichenCatalogCurrentSQL+`
   AND `+catalog.BeichenGroupAllowsRouteSQL+`) FILTER (WHERE c.id IS NOT NULL),true),
   COALESCE(jsonb_agg(jsonb_build_object(
     'credential_id', c.id, 'credential_revision', e.revision, 'group_id', e.group_id,
     'catalog_observed_at', e.catalog_at, 'evidence_since', e.evidence_since
   ) ORDER BY c.id) FILTER (WHERE c.id IS NOT NULL),'[]'::jsonb)
 FROM providers p
-LEFT JOIN provider_credentials c ON c.provider_id=p.id AND c.status='active'
+LEFT JOIN provider_credentials c ON c.provider_id=p.id AND c.status='active' AND ($2::uuid IS NULL OR c.id=$2)
 LEFT JOIN beichen_key_evidence e ON e.credential_id=c.id
-WHERE p.id=$1 GROUP BY p.id`, provider).Scan(&ready, &raw)
+WHERE p.id=$1 GROUP BY p.id`, provider, credential).Scan(&ready, &raw)
 	if err != nil || !ready {
 		return nil, ready, err
 	}
@@ -252,11 +299,11 @@ func (s *Service) ConfirmCredentialSwitch(ctx context.Context, provider, actor u
 }
 
 func readCredentialRebind(ctx context.Context, tx *sql.Tx, provider uuid.UUID, from, to SwitchCredential, lock bool) (SwitchPreview, error) {
-	bindings, _, err := readRebindBindings(ctx, tx, provider, lock)
+	bindings, _, err := readRebindBindings(ctx, tx, provider, nil, lock)
 	if err != nil {
 		return SwitchPreview{}, err
 	}
-	entries, err := readRebindCatalog(ctx, tx, provider)
+	entries, err := readRebindCatalog(ctx, tx, provider, &to.CredentialID)
 	if err != nil {
 		return SwitchPreview{}, err
 	}
@@ -363,17 +410,17 @@ func replacementRoute(binding RebindChange, entries []rebindCatalogEntry, priced
 	return picked, nil
 }
 
-func readRebindBindings(ctx context.Context, tx *sql.Tx, provider uuid.UUID, lock bool) (map[rebindSlot]RebindChange, map[rebindSlot]int, error) {
+func readRebindBindings(ctx context.Context, tx *sql.Tx, provider uuid.UUID, school *uuid.UUID, lock bool) (map[rebindSlot]RebindChange, map[rebindSlot]int, error) {
 	query := `
 SELECT b.id, b.model_id, m.model_id::text, b.adapter, b.credential_id, c.label::text,
   b.upstream_model_name, b.priority, b.status
 FROM model_bindings b JOIN models m ON m.id=b.model_id
 LEFT JOIN provider_credentials c ON c.id=b.credential_id AND c.provider_id=b.provider_id
-WHERE b.provider_id=$1 ORDER BY b.id`
+WHERE b.provider_id=$1 AND ($2::uuid IS NULL OR b.model_id=$2) ORDER BY b.id`
 	if lock {
 		query += " FOR UPDATE OF b"
 	}
-	rows, err := tx.QueryContext(ctx, query, provider)
+	rows, err := tx.QueryContext(ctx, query, provider, school)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -391,6 +438,9 @@ WHERE b.provider_id=$1 ORDER BY b.id`
 	}
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
+	}
+	if school != nil {
+		return bindings, nil, nil
 	}
 	rows, err = tx.QueryContext(ctx, `
 SELECT model_id,adapter,max(priority) FROM model_bindings
@@ -411,11 +461,12 @@ WHERE provider_id<>$1 AND status='active' GROUP BY model_id,adapter`, provider)
 	return bindings, priorities, rows.Err()
 }
 
-func readRebindCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID) ([]rebindCatalogEntry, error) {
+func readRebindCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID, credential *uuid.UUID) ([]rebindCatalogEntry, error) {
 	rows, err := tx.QueryContext(ctx, `
 WITH `+catalog.BeichenKeyEvidenceCTE+`
 SELECT a.model,k.credential_id,c.label::text,k.raw_entry,to_json(k.supported_protocols),
-  `+catalog.BeichenKeyListsModelSQL+` AND `+catalog.BeichenCatalogCurrentSQL+` AND `+catalog.BeichenGroupAllowsRouteSQL+`,
+  `+catalog.BeichenKeyListsModelSQL+` AND `+catalog.BeichenCatalogCurrentSQL+` AND `+catalog.BeichenGroupAllowsRouteSQL+`
+    AND octet_length(c.credential_ciphertext)>0,
   alias.school_model IS NOT NULL,m.id,m.model_id::text
 FROM provider_model_catalog k
 JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
@@ -423,7 +474,8 @@ JOIN beichen_key_evidence e ON e.credential_id=c.id
 CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
 `+joinModelAliasSQL+`
 LEFT JOIN models m ON m.model_id=COALESCE(alias.school_model,a.model)::citext
-WHERE k.provider_id=$1 AND k.status='active' AND c.status='active' ORDER BY k.credential_id,a.model`, provider)
+WHERE k.provider_id=$1 AND k.status='active' AND c.status='active'
+  AND ($2::uuid IS NULL OR c.id=$2) ORDER BY k.credential_id,a.model`, provider, credential)
 	if err != nil {
 		return nil, err
 	}
@@ -452,90 +504,146 @@ WHERE k.provider_id=$1 AND k.status='active' AND c.status='active' ORDER BY k.cr
 	return entries, rows.Err()
 }
 
-func planRebind(bindings map[rebindSlot]RebindChange, entries []rebindCatalogEntry, priorities map[rebindSlot]int) []RebindChange {
-	type upstreamProtocol struct {
-		model, adapter string
-	}
-	// Preserve an older hand-configured name for the protocol it actually
-	// bound. Only an alias or an exact school name may add new protocols.
-	legacy := map[upstreamProtocol][]rebindSchool{}
+// A provider rebuild operates on school models with an active binding.
+// Explicit aliases can change those routes. Directory omissions alone leave
+// the bindings in place.
+func planRebind(bindings map[rebindSlot]RebindChange, entries []rebindCatalogEntry, priorities map[rebindSlot]int) ([]RebindChange, error) {
+	schools := map[uuid.UUID]rebindSchool{}
+	anchors := map[string][]RebindChange{}
 	for _, b := range bindings {
-		model := strings.ToLower(strings.TrimSpace(b.Before.UpstreamModel))
-		slot := upstreamProtocol{model, b.Adapter}
-		legacy[slot] = append(legacy[slot], rebindSchool{b.ModelID, b.SchoolModel})
+		if b.Before.Status == "active" {
+			schools[b.ModelID] = rebindSchool{b.ModelID, b.SchoolModel}
+			name := strings.ToLower(strings.TrimSpace(b.Before.UpstreamModel))
+			anchors[name] = append(anchors[name], b)
+		}
 	}
 	type rankedChange struct {
-		change RebindChange
-		rank   int
+		change    RebindChange
+		rank      int
+		ambiguous bool
 	}
 	chosen := map[rebindSlot]rankedChange{}
 	for _, entry := range entries {
+		if !entry.catalogCurrent {
+			continue
+		}
+		targets := map[uuid.UUID]bool{}
+		for _, anchor := range anchors[strings.ToLower(entry.route.UpstreamModel)] {
+			if sameRouteKey(anchor.Before.CredentialID, entry.route.CredentialID) || anchor.Before.CredentialID == nil {
+				targets[anchor.ModelID] = anchor.Before.CredentialID != nil || targets[anchor.ModelID]
+			}
+		}
+		if entry.explicit && schools[entry.school.id].id != uuid.Nil {
+			targets[entry.school.id] = targets[entry.school.id]
+		}
 		for _, adapter := range entry.protocols {
-			var targets []rebindSchool
-			if entry.catalogCurrent && entry.school.id != uuid.Nil {
-				targets = append(targets, entry.school)
-			}
-			if !entry.explicit || !entry.catalogCurrent {
-				targets = append(targets, legacy[upstreamProtocol{strings.ToLower(entry.route.UpstreamModel), adapter}]...)
-			}
-			for _, school := range targets {
-				slot := rebindSlot{school.id, adapter}
+			for id, pinned := range targets {
+				school := schools[id]
+				slot := rebindSlot{id, adapter}
 				change := bindings[slot]
 				route := entry.route
-				// A transition row can keep the existing binding exactly as it is.
-				if !entry.catalogCurrent {
-					before := change.Before
-					if before == nil || before.Status != "active" ||
-						(before.CredentialID != nil && !sameRouteKey(before.CredentialID, route.CredentialID)) {
+				explicit := entry.explicit && entry.school.id == id
+				rank := 1
+				if explicit {
+					rank = 4
+				}
+				if before := change.Before; before != nil {
+					if before.Status != "active" {
 						continue
 					}
-					route = *before
-				}
-				rank := 0
-				if entry.explicit && entry.catalogCurrent {
-					rank += 4
-				}
-				if change.Before != nil {
-					route.Priority = change.Before.Priority
-					if strings.EqualFold(strings.TrimSpace(change.Before.UpstreamModel), route.UpstreamModel) {
-						rank++
-						if sameRouteKey(change.Before.CredentialID, route.CredentialID) {
-							rank++
-						}
-					}
 					change.Action = "update"
-					if change.Before.Status != "active" {
-						change.Action = "enable"
+					route.Priority = before.Priority
+					if strings.EqualFold(strings.TrimSpace(before.UpstreamModel), route.UpstreamModel) &&
+						(before.CredentialID == nil || sameRouteKey(before.CredentialID, route.CredentialID)) {
+						route, rank = *before, 3
+						if explicit {
+							rank = 5
+						}
+					} else if !explicit {
+						continue
 					}
 				} else {
+					if entry.explicit && !explicit || !pinned && !explicit {
+						continue
+					}
+					if pinned && !explicit {
+						rank = 2
+					}
 					priority := min(priorities[slot], math.MaxInt32-1) + 1
 					route.Priority = max(catalog.DefaultBindingPriority(modelbinding.Adapter(adapter)), priority)
 					change = RebindChange{ModelID: school.id, SchoolModel: school.name, Adapter: adapter, Action: "add"}
 				}
 				change.After = route
 				if previous, exists := chosen[slot]; !exists || previous.rank < rank {
-					chosen[slot] = rankedChange{change, rank}
+					chosen[slot] = rankedChange{change: change, rank: rank}
+				} else if previous.rank == rank && !sameRebindRoute(previous.change.After, route) {
+					previous.ambiguous = true
+					chosen[slot] = previous
 				}
 			}
 		}
 	}
 	changes := []RebindChange{}
 	for _, candidate := range chosen {
+		if candidate.ambiguous {
+			return nil, domain.NewError(domain.CodeInvalidTransition, "重建包含无法唯一确认的线路，请按校内模型和渠道定向处理")
+		}
 		c := candidate.change
-		if c.Before == nil || c.Before.Status != c.After.Status || c.Before.UpstreamModel != c.After.UpstreamModel ||
-			!sameRouteKey(c.Before.CredentialID, c.After.CredentialID) {
+		if c.Before == nil || !sameRebindRoute(*c.Before, c.After) {
 			changes = append(changes, c)
 		}
 	}
-	for slot, change := range bindings {
-		if _, kept := chosen[slot]; !kept && change.Before.Status == "active" {
-			change.Action, change.After = "disable", *change.Before
-			change.After.Status = "inactive"
-			changes = append(changes, change)
+	slices.SortFunc(changes, compareRebindChanges)
+	return changes, nil
+}
+
+func planBindingRestore(bindings map[rebindSlot]RebindChange, entries []rebindCatalogEntry, scope bindingRestore) ([]RebindChange, error) {
+	changes := []RebindChange{}
+	for _, b := range bindings {
+		if b.ModelID != scope.schoolModelID || b.Before.Status != "inactive" || sameRouteKey(b.Before.CredentialID, &scope.credentialID) {
+			continue
+		}
+		var route RebindRoute
+		best, ambiguous := 0, false
+		for _, entry := range entries {
+			if !entry.catalogCurrent || !sameRouteKey(entry.route.CredentialID, &scope.credentialID) ||
+				!slices.Contains(entry.protocols, b.Adapter) || entry.explicit && entry.school.id != b.ModelID {
+				continue
+			}
+			rank := 0
+			if entry.school.id == b.ModelID {
+				rank = 1
+			}
+			if strings.EqualFold(strings.TrimSpace(b.Before.UpstreamModel), entry.route.UpstreamModel) {
+				rank = 2
+			}
+			if entry.explicit {
+				rank += 3
+			}
+			if rank > best {
+				route, best, ambiguous = entry.route, rank, false
+			} else if rank > 0 && rank == best && !sameRebindRoute(route, entry.route) {
+				ambiguous = true
+			}
+		}
+		if ambiguous {
+			return nil, domain.NewError(domain.CodeInvalidTransition, "接替渠道有多个匹配型号，请先核对该校内模型的别名")
+		}
+		if best > 0 {
+			route.Priority = b.Before.Priority
+			b.Action, b.After = "enable", route
+			changes = append(changes, b)
 		}
 	}
+	if len(changes) == 0 {
+		return nil, domain.NewError(domain.CodeInvalidTransition, "所选模型没有可在接替渠道恢复的停用线路")
+	}
 	slices.SortFunc(changes, compareRebindChanges)
-	return changes
+	return changes, nil
+}
+
+func sameRebindRoute(a, b RebindRoute) bool {
+	return a.UpstreamModel == b.UpstreamModel && a.Status == b.Status && sameRouteKey(a.CredentialID, b.CredentialID)
 }
 
 func compareRebindChanges(a, b RebindChange) int {
@@ -565,7 +673,10 @@ VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,now(),now()) ON CONFLICT(model_id,pro
 		} else {
 			result, err = tx.ExecContext(ctx, `
 UPDATE model_bindings SET credential_id=$2,upstream_model_name=$3,status=$4,updated_at=now()
-WHERE id=$1 AND provider_id=$5`, *c.BindingID, r.CredentialID, r.UpstreamModel, r.Status, provider)
+WHERE id=$1 AND provider_id=$5 AND model_id=$6 AND adapter=$7 AND status=$8
+  AND credential_id IS NOT DISTINCT FROM $9::uuid AND upstream_model_name=$10 AND priority=$11`,
+				*c.BindingID, r.CredentialID, r.UpstreamModel, r.Status, provider, c.ModelID, c.Adapter, c.Before.Status,
+				c.Before.CredentialID, c.Before.UpstreamModel, c.Before.Priority)
 		}
 		if err != nil {
 			return unavailable("保存北辰重建绑定失败", err)

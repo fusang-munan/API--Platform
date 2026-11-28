@@ -40,7 +40,8 @@ func IsBeichenBaseURL(baseURL string) bool {
 
 func FetchProviderModels(ctx context.Context, baseURL, credential string, client *http.Client) ([]ProviderEntry, error) {
 	if IsBeichenBaseURL(baseURL) {
-		return fetchBeichenModelPages(ctx, credential, client)
+		snapshot, err := FetchBeichenModelSnapshot(ctx, credential, client)
+		return snapshot.Entries, err
 	}
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
@@ -74,10 +75,16 @@ const (
 	beichenMaxPages   = 100
 )
 
-func fetchBeichenModelPages(ctx context.Context, credential string, client *http.Client) ([]ProviderEntry, error) {
+// BeichenModelSnapshot separates positive listings from evidence of absence.
+type BeichenModelSnapshot struct {
+	Entries  []ProviderEntry
+	Complete bool
+}
+
+func FetchBeichenModelSnapshot(ctx context.Context, credential string, client *http.Client) (BeichenModelSnapshot, error) {
 	credential = strings.TrimSpace(credential)
 	if credential == "" || len(credential) > 4096 || strings.ContainsAny(credential, "\r\n") {
-		return nil, errors.New("北辰凭据格式无效")
+		return BeichenModelSnapshot{}, errors.New("北辰凭据格式无效")
 	}
 	if client == nil {
 		client = &http.Client{Timeout: 8 * time.Second}
@@ -87,8 +94,8 @@ func fetchBeichenModelPages(ctx context.Context, credential string, client *http
 	all := []ProviderEntry{}
 	total, totalPages, bytesRead := -1, 0, 0
 	for page := 1; ; page++ {
-		fail := func(err error) ([]ProviderEntry, error) {
-			return nil, fmt.Errorf("北辰模型目录第 %d 页不完整：%w", page, err)
+		fail := func(err error) (BeichenModelSnapshot, error) {
+			return BeichenModelSnapshot{}, fmt.Errorf("北辰模型目录第 %d 页不完整：%w", page, err)
 		}
 		pageKey := current.Query().Encode()
 		if page > beichenMaxPages || seenPages[pageKey] {
@@ -149,7 +156,9 @@ func fetchBeichenModelPages(ctx context.Context, credential string, client *http
 			if total >= 0 && len(all) != total {
 				return fail(errors.New("已读型号数量与公布总数不一致"))
 			}
-			return all, nil
+			complete := page > 1 || total >= 0 || totalPages > 0 || paging.HasMore != nil ||
+				paging.NextPageToken != nil || paging.NextPageTokenCamel != nil
+			return BeichenModelSnapshot{Entries: all, Complete: complete}, nil
 		}
 		if len(entries) == 0 {
 			return fail(errors.New("续页前返回空清单"))
@@ -159,60 +168,73 @@ func fetchBeichenModelPages(ctx context.Context, credential string, client *http
 }
 
 type beichenModelPaging struct {
-	HasMore    *bool  `json:"has_more"`
-	Next       string `json:"next"`
-	NextCursor string `json:"next_cursor"`
-	LastID     string `json:"last_id"`
-	Page       *int   `json:"page"`
-	Pages      *int   `json:"pages"`
-	TotalPages *int   `json:"total_pages"`
-	Total      *int   `json:"total"`
+	HasMore            *bool           `json:"has_more"`
+	Next               string          `json:"next"`
+	NextCursor         string          `json:"next_cursor"`
+	NextPageToken      json.RawMessage `json:"next_page_token"`
+	NextPageTokenCamel json.RawMessage `json:"nextPageToken"`
+	LastID             string          `json:"last_id"`
+	Page               *int            `json:"page"`
+	Pages              *int            `json:"pages"`
+	TotalPages         *int            `json:"total_pages"`
+	Total              *int            `json:"total"`
 }
 
 func decodeBeichenModelPaging(body []byte) (beichenModelPaging, error) {
-	var envelope struct {
-		beichenModelPaging
-		Pagination *beichenModelPaging `json:"pagination"`
-	}
 	if bytes.HasPrefix(bytes.TrimSpace(body), []byte("[")) {
 		return beichenModelPaging{}, nil
 	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil {
 		return beichenModelPaging{}, errors.New("分页字段格式无效")
 	}
-	if envelope.Pagination != nil {
-		nested := *envelope.Pagination
-		if nested.Total == nil {
-			nested.Total = envelope.Total
-		} else if envelope.Total != nil && *nested.Total != *envelope.Total {
-			return beichenModelPaging{}, errors.New("分页公布的型号总数冲突")
+	levels := []map[string]json.RawMessage{root}
+	if bytes.HasPrefix(bytes.TrimSpace(root["data"]), []byte("{")) {
+		var data map[string]json.RawMessage
+		if err := json.Unmarshal(root["data"], &data); err != nil {
+			return beichenModelPaging{}, errors.New("分页字段格式无效")
 		}
-		if nested.HasMore == nil {
-			nested.HasMore = envelope.HasMore
-		} else if envelope.HasMore != nil && *nested.HasMore != *envelope.HasMore {
-			return beichenModelPaging{}, errors.New("分页结束标志冲突")
-		}
-		if nested.Next == "" {
-			nested.Next = envelope.Next
-		}
-		if nested.NextCursor == "" {
-			nested.NextCursor = envelope.NextCursor
-		}
-		if nested.LastID == "" {
-			nested.LastID = envelope.LastID
-		}
-		if nested.Page == nil {
-			nested.Page = envelope.Page
-		}
-		if nested.Pages == nil {
-			nested.Pages = envelope.Pages
-		}
-		if nested.TotalPages == nil {
-			nested.TotalPages = envelope.TotalPages
-		}
-		return nested, nil
+		levels = append(levels, data)
 	}
-	return envelope.beichenModelPaging, nil
+	for _, level := range levels {
+		if raw := level["pagination"]; raw != nil {
+			var nested map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &nested); err != nil {
+				return beichenModelPaging{}, errors.New("分页字段格式无效")
+			}
+			levels = append(levels, nested)
+		}
+	}
+	fields := map[string]json.RawMessage{}
+	for _, level := range levels {
+		for name, raw := range level {
+			switch name {
+			case "hasMore":
+				name = "has_more"
+			case "nextCursor":
+				name = "next_cursor"
+			case "next_url", "nextUrl":
+				name = "next"
+			case "lastId":
+				name = "last_id"
+			case "totalPages":
+				name = "total_pages"
+			case "has_more", "next", "next_cursor", "next_page_token", "nextPageToken", "last_id", "page", "pages", "total_pages", "total":
+			default:
+				continue
+			}
+			if prior := fields[name]; prior != nil && !bytes.Equal(prior, raw) {
+				return beichenModelPaging{}, errors.New("不同层级的分页字段冲突")
+			}
+			fields[name] = raw
+		}
+	}
+	var paging beichenModelPaging
+	raw, err := json.Marshal(fields)
+	if err != nil || json.Unmarshal(raw, &paging) != nil {
+		return beichenModelPaging{}, errors.New("分页字段格式无效")
+	}
+	return paging, nil
 }
 
 var (
@@ -247,6 +269,18 @@ func (p *beichenModelPaging) checkPage(page, size int, totalPages *int) error {
 }
 
 func (p beichenModelPaging) nextURL(current *url.URL, headers http.Header, page int) (*url.URL, error) {
+	var camelToken, snakeToken string
+	if (p.NextPageTokenCamel != nil && json.Unmarshal(p.NextPageTokenCamel, &camelToken) != nil) ||
+		(p.NextPageToken != nil && json.Unmarshal(p.NextPageToken, &snakeToken) != nil) {
+		return nil, errors.New("续页令牌格式无效")
+	}
+	if p.NextPageTokenCamel != nil && p.NextPageToken != nil && camelToken != snakeToken {
+		return nil, errors.New("存在冲突的续页令牌")
+	}
+	token, tokenParam := snakeToken, "page_token"
+	if p.NextPageTokenCamel != nil {
+		token, tokenParam = camelToken, "pageToken"
+	}
 	next := p.Next
 	for _, value := range headers.Values("Link") {
 		for _, link := range modelPageLink.FindAllStringSubmatch(value, -1) {
@@ -262,8 +296,9 @@ func (p beichenModelPaging) nextURL(current *url.URL, headers http.Header, page 
 	}
 	moreByPage := p.Pages != nil && *p.Pages > page
 	moreByFlag := p.HasMore != nil && *p.HasMore
-	if (p.HasMore != nil && !*p.HasMore && (moreByPage || next != "" || p.NextCursor != "")) ||
-		(p.Pages != nil && !moreByPage && (moreByFlag || next != "" || p.NextCursor != "")) {
+	hasContinuation := next != "" || p.NextCursor != "" || token != ""
+	if (p.HasMore != nil && !*p.HasMore && (moreByPage || hasContinuation)) ||
+		(p.Pages != nil && !moreByPage && (moreByFlag || hasContinuation)) {
 		return nil, errors.New("分页结束标志冲突")
 	}
 	if next != "" {
@@ -277,6 +312,13 @@ func (p beichenModelPaging) nextURL(current *url.URL, headers http.Header, page 
 	target := *current
 	query := target.Query()
 	switch {
+	case token != "":
+		if len(token) > 4096 {
+			return nil, errors.New("续页令牌超过长度上限")
+		}
+		query.Del("pageToken")
+		query.Del("page_token")
+		query.Set(tokenParam, token)
 	case p.NextCursor != "":
 		if len(p.NextCursor) > 4096 {
 			return nil, errors.New("续页游标超过长度上限")
@@ -285,6 +327,9 @@ func (p beichenModelPaging) nextURL(current *url.URL, headers http.Header, page 
 	case moreByPage:
 		query.Set("page", strconv.Itoa(page+1))
 	case moreByFlag && p.LastID != "":
+		if len(p.LastID) > 4096 {
+			return nil, errors.New("续页型号标识超过长度上限")
+		}
 		query.Set("after", p.LastID)
 	case moreByFlag:
 		return nil, errors.New("声明还有续页，但缺少游标或链接")
@@ -303,6 +348,30 @@ func (status BeichenHTTPStatus) Error() string {
 
 var ErrBeichenKeyGroupNotAllowed = errors.New("账号无分组权限")
 
+type beichenRateLimit struct{ retryAt time.Time }
+
+func (e *beichenRateLimit) Error() string { return e.Unwrap().Error() }
+func (e *beichenRateLimit) Unwrap() error { return BeichenHTTPStatus(http.StatusTooManyRequests) }
+
+// BeichenRetryAt reads the upstream Retry-After deadline through wrapped errors.
+func BeichenRetryAt(err error) time.Time {
+	var limit *beichenRateLimit
+	if errors.As(err, &limit) {
+		return limit.retryAt
+	}
+	return time.Time{}
+}
+
+func beichenRetryAt(header string, now time.Time) time.Time {
+	header = strings.TrimSpace(header)
+	const maxSeconds = int64((1<<63 - 1) / time.Second)
+	if seconds, err := strconv.ParseInt(header, 10, 64); err == nil && seconds >= 0 && seconds <= maxSeconds {
+		return now.Add(time.Duration(seconds) * time.Second)
+	}
+	at, _ := http.ParseTime(header)
+	return at
+}
+
 // ReadBeichenGET retries read-only requests once within the caller's time budget.
 func ReadBeichenGET(client *http.Client, req *http.Request, limit int) ([]byte, http.Header, error) {
 	noRedirect := *client
@@ -314,17 +383,7 @@ func ReadBeichenGET(client *http.Client, req *http.Request, limit int) ([]byte, 
 	if req.Method != http.MethodGet || (!rateLimited && !timedOut) || req.Context().Err() != nil {
 		return body, headers, err
 	}
-	delay := 200 * time.Millisecond
-	if header := headers.Get("Retry-After"); rateLimited && header != "" {
-		if seconds, parseErr := strconv.Atoi(header); parseErr == nil && seconds >= 0 {
-			if seconds > 2 {
-				return nil, headers, err
-			}
-			delay = max(delay, time.Duration(seconds)*time.Second)
-		} else if retryAt, parseErr := http.ParseTime(header); parseErr == nil {
-			delay = max(delay, time.Until(retryAt))
-		}
-	}
+	delay := max(200*time.Millisecond, time.Until(BeichenRetryAt(err)))
 	if deadline, ok := req.Context().Deadline(); delay > 2*time.Second || (ok && time.Until(deadline) <= delay) {
 		return nil, headers, err
 	}
@@ -354,8 +413,13 @@ func readBeichenGET(client *http.Client, req *http.Request, limit int) ([]byte, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusForbidden && req.URL.Host == "api.beichenapi.com" && beichenGroupDenied(resp.Body) {
+		if resp.StatusCode == http.StatusForbidden && req.URL.Host == "api.beichenapi.com" && BeichenGroupDenied(resp.Body) {
 			return nil, resp.Header, ErrBeichenKeyGroupNotAllowed
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if at := beichenRetryAt(resp.Header.Get("Retry-After"), time.Now()); !at.IsZero() {
+				return nil, resp.Header, &beichenRateLimit{retryAt: at}
+			}
 		}
 		return nil, resp.Header, BeichenHTTPStatus(resp.StatusCode)
 	}
@@ -383,10 +447,12 @@ func safeBeichenReadError(err error) error {
 	return errors.New("北辰网络请求或读取响应失败")
 }
 
-func beichenGroupDenied(reader io.Reader) bool {
-	const maxErrorBytes = 4096
-	body, err := io.ReadAll(io.LimitReader(reader, maxErrorBytes+1))
-	if err != nil || len(body) > maxErrorBytes {
+const BeichenErrorBodyLimit = 4096
+
+// BeichenGroupDenied recognizes a structured denial without exposing the body.
+func BeichenGroupDenied(reader io.Reader) bool {
+	body, err := io.ReadAll(io.LimitReader(reader, BeichenErrorBodyLimit+1))
+	if err != nil || len(body) > BeichenErrorBodyLimit {
 		return false
 	}
 	type errorCode struct {
@@ -434,6 +500,14 @@ func parseProviderModels(body []byte, beichen bool) ([]ProviderEntry, error) {
 		}
 	}
 	records := modelRecords(payload)
+	if envelope, ok := payload.(map[string]any); beichen && ok && records == nil {
+		if data, ok := envelope["data"].(map[string]any); ok {
+			records = modelRecords(data)
+			if records == nil {
+				records, _ = data["items"].([]any)
+			}
+		}
+	}
 	if beichen && records != nil {
 		if len(records) == 0 {
 			return []ProviderEntry{}, nil

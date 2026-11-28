@@ -29,17 +29,21 @@ func (s *ProviderCatalogSyncer) UpsertCredentialEntries(ctx context.Context, pro
 		return 0, err
 	}
 	defer tx.Rollback()
+	var count int
 	if revision != nil {
 		var baseURL string
-		err := tx.QueryRowContext(ctx, `
+		checkErr := tx.QueryRowContext(ctx, `
 SELECT p.base_url FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
 WHERE c.id = $1 AND p.id = $2 AND c.updated_at = $3 AND c.status = 'active' AND p.status = 'active'
 FOR SHARE OF p FOR NO KEY UPDATE OF c`, credentialID, providerID, *revision).Scan(&baseURL)
-		if err != nil || !IsBeichenBaseURL(baseURL) {
+		if checkErr != nil || !IsBeichenBaseURL(baseURL) {
 			return 0, fmt.Errorf("北辰目录写入时无法确认供应商或凭据版本")
 		}
+		// Callers without completeness evidence may safely add observed rows.
+		count, err = upsertCredentialEntries(ctx, tx, providerID, credentialID, entries, syncedAt)
+	} else {
+		count, err = ReplaceCredentialEntries(ctx, tx, providerID, credentialID, entries, syncedAt)
 	}
-	count, err := ReplaceCredentialEntries(ctx, tx, providerID, credentialID, entries, syncedAt)
 	if err != nil {
 		return 0, err
 	}
@@ -51,9 +55,14 @@ FOR SHARE OF p FOR NO KEY UPDATE OF c`, credentialID, providerID, *revision).Sca
 
 // ReplaceCredentialEntries applies a complete per-key snapshot in the caller's transaction.
 func ReplaceCredentialEntries(ctx context.Context, tx *sql.Tx, providerID, credentialID uuid.UUID, entries []ProviderEntry, syncedAt time.Time) (int, error) {
-	if _, err := tx.ExecContext(ctx, `UPDATE provider_model_catalog SET status='inactive',synced_at=$1,updated_at=$1 WHERE credential_id=$2`, syncedAt, credentialID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE provider_model_catalog SET status='inactive',synced_at=$1,updated_at=$1
+WHERE credential_id=$2 AND provider_id=$3`, syncedAt, credentialID, providerID); err != nil {
 		return 0, err
 	}
+	return upsertCredentialEntries(ctx, tx, providerID, credentialID, entries, syncedAt)
+}
+
+func upsertCredentialEntries(ctx context.Context, tx *sql.Tx, providerID, credentialID uuid.UUID, entries []ProviderEntry, syncedAt time.Time) (int, error) {
 	count := 0
 	for _, entry := range entries {
 		raw, _ := json.Marshal(entry.Raw)

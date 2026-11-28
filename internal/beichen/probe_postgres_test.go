@@ -7,16 +7,23 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
+	"github.com/starprince1234/Nebula-api/internal/dataplane"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
+	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 )
 
 func TestManualProbeRefreshesRecentFailureOnItsCatalogKeyPostgres(t *testing.T) {
@@ -136,9 +143,8 @@ FROM provider_model_catalog WHERE provider_id=$1 AND credential_id=$2`, provider
 	status = http.StatusBadRequest
 	requestManual()
 	for _, result := range checkManual().Results {
-		if result.StatusCode != 400 || result.LastPassedAt == nil ||
-			!result.LastPassedAt.Equal(passes[result.Model]) || !result.CheckedAt.After(passes[result.Model]) {
-			t.Fatalf("failed retry should preserve the same key's success time: %+v", result)
+		if result.StatusCode != 400 || result.LastPassedAt != nil || !result.CheckedAt.After(passes[result.Model]) {
+			t.Fatalf("definitive HTTP feedback should invalidate sticky availability: %+v", result)
 		}
 	}
 	exec("UPDATE provider_credentials SET updated_at = clock_timestamp() WHERE id = $1", gm1)
@@ -161,7 +167,7 @@ FROM provider_model_catalog WHERE provider_id=$1 AND credential_id=$2`, provider
 	}
 	var failures int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM beichen_probe_usage WHERE credential_id=$1 AND job_id IS NOT NULL
-		AND status_code=400 AND error_code='http_error' AND input_tokens IS NULL AND output_tokens IS NULL
+		AND status_code=400 AND error_code='http_400' AND input_tokens IS NULL AND output_tokens IS NULL
 		AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL`, gm1).Scan(&failures); err != nil || failures != 4 {
 		t.Fatalf("failure ledger rows %d, err %v", failures, err)
 	}
@@ -313,7 +319,7 @@ VALUES(gen_random_uuid(),$1,$2,'inactive-key-model',now(),now(),now(),now())`, p
 	for _, result := range recent.Results {
 		if result.ErrorCode != nil {
 			failures++
-			if *result.ErrorCode != "invalid_response" && *result.ErrorCode != "http_error" {
+			if *result.ErrorCode != "invalid_response" && *result.ErrorCode != "credential_invalid" {
 				t.Fatal("unexpected probe failure")
 			}
 		}
@@ -419,5 +425,465 @@ VALUES(gen_random_uuid(),$1,$2,'inactive-key-model',now(),now(),now(),now())`, p
 	}
 	if _, err := s.LatestProbes(context.Background(), keys[3]); domain.ErrorCode(err) != domain.CodeNotFound {
 		t.Fatal("unexpected provider scope")
+	}
+}
+
+func TestBeichenProbeFailureAttributionPostgres(t *testing.T) {
+	ctx, db, provider, _, keys := newActionsPostgres(t)
+	t.Setenv("BEICHEN_PROBE_DAILY_LIMIT", "500")
+	manager := switchTestManager(t)
+	ciphertext, err := manager.EncryptCredential("fixture-attribution")
+	if err != nil {
+		t.Fatal(err)
+	}
+	execCatalogTestSQL(t, ctx, db, "UPDATE provider_credentials SET credential_ciphertext=$1 WHERE provider_id=$2", ciphertext, provider)
+	for i, name := range []string{"recover-429", "denied-403", "missing-404", "temporary-503", "invalid-401"} {
+		key := keys[i%len(keys)]
+		saveCatalogFixture(t, ctx, db, provider, key, []catalog.ProviderEntry{
+			{ID: name, SupportedProtocols: []string{"openai_compatible"}},
+		}, nil)
+		// The 429 recovery and the 401 both use the first Key.
+		if i == len(keys) {
+			saveCatalogFixture(t, ctx, db, provider, key, []catalog.ProviderEntry{
+				{ID: "recover-429", SupportedProtocols: []string{"openai_compatible"}},
+				{ID: name, SupportedProtocols: []string{"openai_compatible"}},
+			}, nil)
+		}
+		execCatalogTestSQL(t, ctx, db, `WITH school AS (
+ INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+ VALUES(gen_random_uuid(),$3::text,$3::text,'active',1000,now(),now()) RETURNING id)
+INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+SELECT gen_random_uuid(),id,$1,$2,$3,'openai_compatible',7,now(),now() FROM school`, provider, key, name)
+		execCatalogTestSQL(t, ctx, db, `INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,duration_ms,checked_at,last_passed_at)
+VALUES($1,$2,$3,'openai_compatible',200,1,statement_timestamp(),statement_timestamp())`, provider, key, name)
+	}
+
+	service := New(db, manager)
+	var mu sync.Mutex
+	calls := map[string]int{}
+	groupRecovered := false
+	service.client.Transport = panelTransport(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && req.URL.Path == modelsPath {
+			return scanResponse(http.StatusOK, `{"data":[{"id":"denied-403","supported_protocols":["openai_compatible"]}],"total":1}`), nil
+		}
+		var payload struct{ Model string }
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		calls[payload.Model]++
+		switch payload.Model {
+		case "recover-429":
+			if calls[payload.Model] == 1 {
+				return scanResponse(http.StatusTooManyRequests, "{}"), nil
+			}
+		case "denied-403":
+			if !groupRecovered {
+				return scanResponse(http.StatusForbidden, `{"error":{"reason":"GROUP_NOT_ALLOWED","message":"fixture private detail"}}`), nil
+			}
+		case "missing-404":
+			return scanResponse(http.StatusNotFound, "{}"), nil
+		case "temporary-503":
+			return scanResponse(http.StatusServiceUnavailable, "{}"), nil
+		case "invalid-401":
+			return scanResponse(http.StatusUnauthorized, "{}"), nil
+		default:
+			return nil, errors.New("unexpected fixture model")
+		}
+		return scanResponse(http.StatusOK, `{"choices":[{}]}`), nil
+	})
+	if _, err := service.RequestProbes(ctx, provider); err != nil {
+		t.Fatal(err)
+	}
+	job, err := service.claimProbeJob(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, _, err := service.listProbeTargets(ctx, job)
+	if err != nil || len(targets) != 5 {
+		t.Fatalf("targets=%d error=%v", len(targets), err)
+	}
+	round := func(ctx context.Context, batch []probeTarget) ([]probeObservation, error) {
+		return service.runProbeRound(ctx, job, batch)
+	}
+	observations, err := round(ctx, targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := retryFailedProbes(ctx, observations, 0, round); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.saveProbeBatch(ctx, job, observations); err != nil {
+		t.Fatal(err)
+	}
+	recent, err := service.LatestProbes(ctx, provider)
+	if err != nil || len(recent.Results) != 5 {
+		t.Fatalf("probe report: %+v error=%v", recent, err)
+	}
+	wantCodes := map[string]string{
+		"recover-429": "", "denied-403": "GROUP_NOT_ALLOWED", "missing-404": "endpoint_unsupported",
+		"temporary-503": "upstream_error", "invalid-401": "credential_invalid",
+	}
+	for _, result := range recent.Results {
+		var code string
+		if result.ErrorCode != nil {
+			code = *result.ErrorCode
+		}
+		if code != wantCodes[result.Model] {
+			t.Fatalf("%s attribution = %q, want %q", result.Model, code, wantCodes[result.Model])
+		}
+	}
+	if calls["recover-429"] != 2 || calls["temporary-503"] != 3 ||
+		calls["denied-403"] != 1 || calls["missing-404"] != 1 || calls["invalid-401"] != 1 {
+		t.Fatalf("retries did not match the error classes: %v", calls)
+	}
+	state := func() map[string]catalog.ModelCapability {
+		t.Helper()
+		view, err := catalog.ReadBeichenCapabilities(ctx, db, provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		results := map[string]catalog.ModelCapability{}
+		for _, row := range view.Capabilities {
+			if row.CredentialID != nil {
+				results[row.Model] = row
+			}
+		}
+		return results
+	}
+	current := state()
+	if current["recover-429"].Availability != "available" || current["temporary-503"].Availability != "degraded" ||
+		current["missing-404"].Availability != "maintenance" || current["invalid-401"].Availability != "maintenance" ||
+		current["denied-403"].CatalogState != "group_blocked" || current["denied-403"].BindingState != "invalid" {
+		t.Fatal("availability did not distinguish the recovered, temporary, and definitive results")
+	}
+	overview, err := service.Overview(ctx, provider, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantReason := map[string]string{"missing-404": "上游未提供该协议端点", "temporary-503": "HTTP 503", "invalid-401": "未通过上游认证"}
+	for _, row := range overview.ModelCatalog {
+		if reason := wantReason[row.Model]; reason != "" && !strings.Contains(row.ModelAvailability.AvailabilityReason, reason) {
+			t.Fatalf("%s missing specific availability explanation: %s", row.Model, row.ModelAvailability.AvailabilityReason)
+		}
+	}
+	if err := service.RescanCatalog(ctx, provider, keys[1]); err != nil || state()["denied-403"].CatalogState != "group_blocked" {
+		t.Fatalf("a catalog read should not clear its generation probe's group denial: %v", err)
+	}
+	mu.Lock()
+	groupRecovered = true
+	mu.Unlock()
+	for _, target := range targets {
+		if target.model == "denied-403" {
+			observations, err = round(ctx, []probeTarget{target})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.saveProbeBatch(ctx, job, observations); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if row := state()["denied-403"]; row.Availability != "available" || row.BindingState != "ready" {
+		t.Fatal("a passing generation probe should clear its group denial")
+	}
+}
+
+func TestBindingRouteBlocksConfirmedBeichenFailuresPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	client := ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	manager := switchTestManager(t)
+	ciphertext, err := manager.EncryptCredential("fixture-route-resolution")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const upstream = "routed-model"
+	key, alternate := keys[1], keys[0] // A legacy binding sorts this Key first.
+	for _, id := range []uuid.UUID{key, alternate} {
+		execCatalogTestSQL(t, ctx, db, "UPDATE provider_credentials SET credential_ciphertext=$2 WHERE id=$1", id, ciphertext)
+		saveCatalogFixture(t, ctx, db, provider, id, []catalog.ProviderEntry{
+			{ID: upstream, SupportedProtocols: []string{"openai_responses", "openai_compatible"}},
+		}, nil)
+	}
+	binding := ent.ModelBinding{ProviderID: provider, CredentialID: &key, UpstreamModelName: " Routed-Model ",
+		Adapter: modelbinding.AdapterOpenaiResponses, Status: modelbinding.StatusActive}
+	const school = "school-routed"
+	modelID := uuid.New()
+	execCatalogTestSQL(t, ctx, db, `INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES($1,$2::text,$2::text,'active',1000,now(),now())`, modelID, school)
+	execCatalogTestSQL(t, ctx, db, `INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,$3,$4,'openai_responses',7,now(),now())`, modelID, provider, key, binding.UpstreamModelName)
+	var project uuid.UUID
+	if err := db.QueryRowContext(ctx, `
+WITH org AS (INSERT INTO organizations(id,name,created_at,updated_at)
+  VALUES(gen_random_uuid(),'route fixture',now(),now()) RETURNING id)
+INSERT INTO projects(id,organization_id,name,created_at,updated_at)
+SELECT gen_random_uuid(),id,'fixture project',now(),now() FROM org RETURNING id`).Scan(&project); err != nil {
+		t.Fatal(err)
+	}
+	const studentKey = "fixture-route-student-key"
+	execCatalogTestSQL(t, ctx, db, `
+WITH issued AS (INSERT INTO api_keys(id,owner_user_id,project_id,name,status,key_hash,key_prefix,claimed_at,created_at,updated_at)
+  VALUES(gen_random_uuid(),$1,$2,'fixture','active',$3,'fixture',now(),now(),now()) RETURNING id)
+INSERT INTO api_key_models(id,api_key_id,model_id,created_at) SELECT gen_random_uuid(),id,$4,now() FROM issued`,
+		actor, project, manager.HashAPIKey(studentKey), modelID)
+	// Denied routes stop before reserving usage or opening an upstream connection.
+	gateway := dataplane.NewGateway(client, nil, nil, manager, dataplane.Config{MaxRequestBytes: 4096})
+	checkRequestBlocked := func() {
+		t.Helper()
+		body := strings.NewReader(`{"model":"` + school + `","input":"fixture"}`)
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", body).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer "+studentKey)
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		gateway.ServeHTTP(response, req)
+		if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "model_unavailable") {
+			t.Fatalf("gateway should reject the authorized model's blocked route: HTTP %d", response.Code)
+		}
+	}
+	check := func(route *ent.ModelBinding, want uuid.UUID) {
+		t.Helper()
+		ready, err := catalog.BindingRouteReady(ctx, client, route)
+		if err != nil || ready != (want != uuid.Nil) {
+			t.Fatalf("readiness=%t want=%t (%v)", ready, want != uuid.Nil, err)
+		}
+		credential, got, err := catalog.ResolveBindingCredential(ctx, client, manager, route)
+		if err != nil || got != want || (credential != "") != (want != uuid.Nil) {
+			t.Fatalf("gateway resolved Key ID %s, want %s (%v)", got, want, err)
+		}
+	}
+	recordProbe := func(code int, failure bool) {
+		t.Helper()
+		execCatalogTestSQL(t, ctx, db, `
+INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,error_code,duration_ms,checked_at,last_passed_at)
+VALUES($1,$2,$3,'openai_responses',$4,CASE WHEN $5 THEN 'http_error' END,1,statement_timestamp(),statement_timestamp())
+ON CONFLICT(provider_id,credential_id,model,protocol) DO UPDATE
+SET status_code=EXCLUDED.status_code,error_code=EXCLUDED.error_code,checked_at=EXCLUDED.checked_at`,
+			provider, key, upstream, code, failure)
+	}
+	checkStudent := func(availability, state, reason string) {
+		t.Helper()
+		protocols, err := catalog.LoadPublishedProtocols(ctx, client, []uuid.UUID{modelID}, manager)
+		if err != nil {
+			t.Fatal(err)
+		}
+		channels, err := ReadStudentModelCatalog(ctx, db, []string{school})
+		if err != nil {
+			t.Fatal(err)
+		}
+		view := catalog.SummarizeModelAvailability(school, entmodel.StatusActive, protocols[modelID])
+		view.SetStudentState(school, entmodel.StatusActive, channels[school])
+		if view.Availability != availability || view.AvailabilityState != state || !strings.Contains(view.AvailabilityReason, reason) {
+			t.Fatalf("student state = %+v, want %s/%s with %q", view, availability, state, reason)
+		}
+	}
+	check(&binding, key)
+	recordProbe(401, true)
+	check(&binding, uuid.Nil)
+	checkRequestBlocked()
+	checkStudent("maintenance", "probe_failed", "未通过上游认证")
+	other := binding
+	other.CredentialID = &alternate
+	check(&other, alternate)
+	other = binding
+	other.Adapter = modelbinding.AdapterOpenaiCompatible
+	check(&other, key)
+	legacy := binding
+	legacy.CredentialID = nil
+	check(&legacy, uuid.Nil)
+	for _, status := range []int{403, 404, 429, 503, 200} {
+		recordProbe(status, status != 200)
+		expected := key
+		if status == 403 {
+			expected = uuid.Nil
+		}
+		check(&binding, expected)
+		switch status {
+		case 404:
+			checkStudent("maintenance", "probe_failed", "HTTP 404")
+		case 429, 503:
+			checkStudent("degraded", "degraded", "可能请求失败")
+		}
+	}
+	// The directory/group marker blocks the Key even on another adapter
+	// which has no failed generation probe.
+	denial := func(denied bool) {
+		t.Helper()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		var revision time.Time
+		if err := tx.QueryRowContext(ctx, "SELECT updated_at FROM provider_credentials WHERE id=$1 FOR UPDATE", key).Scan(&revision); err != nil {
+			t.Fatal(err)
+		}
+		if err := catalog.SaveBeichenProbeGroupDenial(ctx, tx, key, revision, upstream, "openai_responses", denied); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	denial(true)
+	check(&binding, uuid.Nil)
+	checkRequestBlocked()
+	checkStudent("maintenance", "channel_unavailable", "分组权限")
+	check(&other, uuid.Nil)
+	check(&legacy, uuid.Nil)
+	alternateRoute := binding
+	alternateRoute.CredentialID = &alternate
+	check(&alternateRoute, alternate)
+	denial(false)
+	check(&legacy, key)
+	checkStudent("available", "available", "")
+	denial(true)
+	recordProbe(401, true)
+	execCatalogTestSQL(t, ctx, db, "UPDATE provider_credentials SET updated_at=clock_timestamp() WHERE id=$1", key)
+	check(&binding, key) // The denial and probe belong to the previous Key version.
+}
+
+func TestCatalogAuthFailureBlocksGatewayUntilSuccessfulScanPostgres(t *testing.T) {
+	ctx, db, provider, _, keys := newActionsPostgres(t)
+	client := ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	manager := switchTestManager(t)
+	const upstream = "auth-routed-model"
+	key := keys[1]
+	ciphertext, err := manager.EncryptCredential("fixture-auth-routing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	execCatalogTestSQL(t, ctx, db, "UPDATE provider_credentials SET credential_ciphertext=$2 WHERE id=$1", key, ciphertext)
+	entries := []catalog.ProviderEntry{{ID: upstream, SupportedProtocols: []string{"openai_responses"}}}
+	saveCatalogFixture(t, ctx, db, provider, key, entries, nil)
+	var revision time.Time
+	if err := db.QueryRowContext(ctx, "SELECT updated_at FROM provider_credentials WHERE id=$1", key).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	binding := &ent.ModelBinding{ProviderID: provider, CredentialID: &key, UpstreamModelName: upstream,
+		Adapter: modelbinding.AdapterOpenaiResponses, Status: modelbinding.StatusActive}
+	check := func(want bool) {
+		t.Helper()
+		ready, err := catalog.BindingRouteReady(ctx, client, binding)
+		if err != nil || ready != want {
+			t.Fatalf("route readiness = %t, want %t (%v)", ready, want, err)
+		}
+		credential, id, err := catalog.ResolveBindingCredential(ctx, client, manager, binding)
+		if err != nil || (credential != "") != want || (id != uuid.Nil) != want {
+			t.Fatalf("gateway credential = %q/%s, want ready=%t (%v)", credential, id, want, err)
+		}
+	}
+	scan := func(snapshot catalog.BeichenModelSnapshot, fetchErr error) {
+		t.Helper()
+		lease, err := catalog.AcquireBeichenDatasetLease(ctx, db, key, "billing", true)
+		if err != nil || lease == uuid.Nil {
+			t.Fatalf("catalog lease: %s %v", lease, err)
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		current, err := catalog.LockBeichenScan(ctx, tx, provider, key, "billing", lease, revision)
+		if err != nil || !current {
+			t.Fatalf("catalog scan lock: current=%t %v", current, err)
+		}
+		if _, err := catalog.SaveBeichenKeyScan(ctx, tx, provider, key, revision, time.Now().UTC(), snapshot, fetchErr); err != nil {
+			t.Fatal(err)
+		}
+		if err := catalog.ReleaseBeichenDatasetLease(ctx, tx, key, "billing"); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(true)
+	scan(catalog.BeichenModelSnapshot{}, catalog.BeichenHTTPStatus(http.StatusUnauthorized))
+	check(false)
+	var marker bool
+	if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM maintenance_state
+WHERE name='beichen_catalog_auth/'||$1::text)`, key).Scan(&marker); err != nil || !marker {
+		t.Fatalf("missing credential-version auth marker: %t %v", marker, err)
+	}
+	// A later transient failure cannot disprove the earlier 401.
+	scan(catalog.BeichenModelSnapshot{}, catalog.BeichenHTTPStatus(http.StatusTooManyRequests))
+	check(false)
+	if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM maintenance_state
+WHERE name='beichen_catalog_auth/'||$1::text)`, key).Scan(&marker); err != nil || !marker {
+		t.Fatalf("transient scan cleared auth marker: %t %v", marker, err)
+	}
+	scan(catalog.BeichenModelSnapshot{Entries: entries, Complete: true}, nil)
+	check(true)
+	if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM maintenance_state
+WHERE name='beichen_catalog_auth/'||$1::text)`, key).Scan(&marker); err != nil || marker {
+		t.Fatalf("successful scan did not clear auth marker: %t %v", marker, err)
+	}
+}
+
+func TestGroupDenialExpiresAfterObservedGroupChangePostgres(t *testing.T) {
+	ctx, db, provider, _, keys := newActionsPostgres(t)
+	client := ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	const upstream = "group-scoped-model"
+	key := keys[1]
+	saveCatalogFixture(t, ctx, db, provider, key, []catalog.ProviderEntry{
+		{ID: upstream, SupportedProtocols: []string{"openai_responses"}},
+	}, nil)
+	school := uuid.New()
+	execCatalogTestSQL(t, ctx, db, `
+INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES($1,$2::text,$2::text,'active',1000,now(),now())`, school, upstream)
+	execCatalogTestSQL(t, ctx, db, `
+INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,$3,$4,'openai_responses',7,now(),now())`,
+		school, provider, key, upstream)
+	execCatalogTestSQL(t, ctx, db, `
+INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+VALUES($1,0.15,15,statement_timestamp()-interval '2 minutes')`, key)
+	var revision time.Time
+	if err := db.QueryRowContext(ctx, "SELECT updated_at FROM provider_credentials WHERE id=$1", key).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, "SELECT c.id FROM provider_credentials c WHERE c.id=$1 FOR UPDATE", key); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveBeichenProbeGroupDenial(ctx, tx, key, revision, upstream, "openai_responses", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	state := func() catalog.ModelCapability {
+		t.Helper()
+		view, err := catalog.ReadBeichenCapabilities(ctx, db, provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range view.Capabilities {
+			if row.Model == upstream && row.CredentialID != nil && *row.CredentialID == key {
+				return row
+			}
+		}
+		t.Fatal("missing group-scoped capability")
+		return catalog.ModelCapability{}
+	}
+	if row := state(); row.GroupStatus != "not_allowed" || row.BindingState != "invalid" {
+		t.Fatalf("current group denial was not applied: %+v", row)
+	}
+	execCatalogTestSQL(t, ctx, db, `
+INSERT INTO beichen_multiplier_versions(credential_id,multiplier,group_id,effective_at)
+VALUES($1,0.6,60,statement_timestamp()-interval '1 minute')`, key)
+	if row := state(); row.GroupStatus == "not_allowed" || row.BindingState != "ready" {
+		t.Fatalf("previous group denial survived the observed group change: %+v", row)
+	}
+	binding := &ent.ModelBinding{ProviderID: provider, CredentialID: &key, UpstreamModelName: upstream,
+		Adapter: modelbinding.AdapterOpenaiResponses, Status: modelbinding.StatusActive}
+	if ready, err := catalog.BindingRouteReady(ctx, client, binding); err != nil || !ready {
+		t.Fatalf("gateway route kept the previous group denial: ready=%t %v", ready, err)
 	}
 }
