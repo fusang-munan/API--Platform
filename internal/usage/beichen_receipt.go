@@ -130,6 +130,18 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 	if err != nil {
 		return false, err
 	}
+	var receiptRecorded bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM beichen_call_receipts WHERE call_id=$1 AND response_id=$2
+	)`, callID, receipt.ResponseID).Scan(&receiptRecorded); err != nil {
+		return false, err
+	}
+	if receiptRecorded {
+		// A replay must not construct and validate another receipt row. In
+		// particular, a capped supplement stores a base that differs from
+		// actual_cost, and that row would violate the check before ON CONFLICT.
+		return false, nil
+	}
 	applied := state == "pending_review"
 	var charge beichenCharge
 	if applied {

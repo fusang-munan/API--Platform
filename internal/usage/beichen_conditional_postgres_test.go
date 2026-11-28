@@ -403,5 +403,16 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 		if cappedTotal != "0.035" {
 			t.Fatalf("receipt supplement exceeded the dispatch cap: %s", cappedTotal)
 		}
+		if applied, err := store.ApplyBeichenReceipt(ctx, supplementCredential, receipt); err != nil || applied {
+			t.Fatalf("capped receipt replay applied=%t, err=%v; want quiet false,nil", applied, err)
+		}
+		var cappedTotalAfter string
+		if err := db.QueryRowContext(ctx, `SELECT trim_scale(student_credits)::text
+			FROM gateway_calls WHERE id=$1`, capped.CallID).Scan(&cappedTotalAfter); err != nil {
+			t.Fatal(err)
+		}
+		if cappedTotalAfter != "0.035" {
+			t.Fatalf("capped receipt replay changed the total to %s", cappedTotalAfter)
+		}
 	})
 }
