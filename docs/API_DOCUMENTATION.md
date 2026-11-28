@@ -484,7 +484,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 已发布型号的 `price_covered` 表示至少一条当前已发布且就绪的线路有可计算报价。待配置型号按绑定或可用的 Key 目录判断。手动价及可按 Token 计算的 `conditional` 都计入。通过缺价字段可核查反推价和缺字段的档位。批量启用逐条验证启用后的线路。
 
-`model_catalog[].published` 表示校内模型已发布，`active` 表示已发布且至少一条北辰线路就绪。已发布型号的就绪线路均缺少可用报价时，`route_availability.availability` 返回 `unavailable` 并附报价阻断原因。未发布缺价型号返回 `not_published`。能力记录也返回 `published`。可用于学生价的官网报价通过 `models[].quote_usable` 标识。采价续期失败时，仍有可用官网报价的 Key 在 `datasets[].refresh_error` 显示失败原因。
+`model_catalog[].published` 表示校内模型已发布，`active` 表示已发布且至少一条北辰线路就绪。已发布型号即使没有就绪绑定，也按当前 Key 条目判断报价覆盖。当前报价状态为 `missing` 或 `derived`，且没有手动价、可计算条件价或有价备用线路时，`route_availability.availability` 返回 `unavailable`，`blockers[].code` 为 `price_missing`，`price_blocker.code` 为 `missing_price`。存在手动价、可计算条件价或有价备用时不返回 `unavailable`。未发布缺价型号返回 `not_published`。能力记录也返回 `published`。可用于学生价的官网报价通过 `models[].quote_usable` 标识。采价续期失败时，仍有可用官网报价的 Key 在 `datasets[].refresh_error` 显示失败原因。
 
 线路就绪且报价阻止启用时，`model_catalog[].price_blocker` 返回 `{code, message}`，其中 `message` 说明涉及的字段及适用的档位号。常见代码包括 `missing_price`、`billing_mode_non_token`、`price_conditions_invalid`、`tier_missing_input`、`tier_missing_output`、`tier_range_invalid` 和 `effort_multiplier_invalid`。概览的 `blockers` 使用 `price_missing` 或 `conditional_price` 汇总报价原因，并显示线路原因 `no_candidate`、`multi_candidate` 或 `auth_failed`。
 
