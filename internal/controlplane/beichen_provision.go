@@ -209,6 +209,7 @@ ORDER BY id LIMIT 2 FOR UPDATE`)
 type provisionCredential struct {
 	id                     uuid.UUID
 	label, status, channel string
+	retirement             bool
 	encrypted, fingerprint []byte
 	revision               time.Time
 	actor                  uuid.NullUUID
@@ -220,9 +221,11 @@ type provisionCredential struct {
 func (s *Service) provisionCredentials(ctx context.Context, tx *sql.Tx, provider uuid.UUID) ([]provisionCredential, error) {
 	rows, err := tx.QueryContext(ctx, `
 SELECT c.id,c.label,c.credential_ciphertext,c.status,c.updated_at,
-       a.updated_by,a.group_id,a.upstream_key_id,a.token_ciphertext,a.updated_at,j.key_fingerprint,COALESCE(j.channel,'')
+       a.updated_by,a.group_id,a.upstream_key_id,a.token_ciphertext,a.updated_at,j.key_fingerprint,
+       COALESCE(j.channel,r.channel,''),r.credential_id IS NOT NULL
 FROM provider_credentials c LEFT JOIN beichen_panel_access a ON a.credential_id=c.id
 LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
+LEFT JOIN beichen_credential_retirements r ON r.credential_id=c.id
 WHERE c.provider_id=$1 ORDER BY c.id FOR UPDATE OF c`, provider)
 	if err != nil {
 		return nil, errors.New("读取北辰现有凭据失败")
@@ -232,7 +235,7 @@ WHERE c.provider_id=$1 ORDER BY c.id FOR UPDATE OF c`, provider)
 	for rows.Next() {
 		var row provisionCredential
 		if err := rows.Scan(&row.id, &row.label, &row.encrypted, &row.status, &row.revision, &row.actor, &row.group,
-			&row.upstreamID, &row.panelToken, &row.panelRevision, &row.fingerprint, &row.channel); err != nil {
+			&row.upstreamID, &row.panelToken, &row.panelRevision, &row.fingerprint, &row.channel, &row.retirement); err != nil {
 			return nil, errors.New("读取北辰现有凭据失败")
 		}
 		records = append(records, row)
@@ -245,50 +248,118 @@ WHERE c.provider_id=$1 ORDER BY c.id FOR UPDATE OF c`, provider)
 
 func (s *Service) provisionChannel(ctx context.Context, tx *sql.Tx, provider uuid.UUID, records []provisionCredential, c *provisionChannel) (disabled bool, err error) {
 	fingerprint := sha256.Sum256([]byte(c.APIKey))
-	var current, registered *provisionCredential
-	archivedKey := false
+	var activeChannel, retiredChannel, labelMatches, sameKey []*provisionCredential
 	for i := range records {
 		r := &records[i]
 		label := strings.TrimSpace(r.label)
-		sameKey := bytes.Equal(r.fingerprint, fingerprint[:])
-		if strings.EqualFold(label, c.Channel) || strings.EqualFold(label, beichenAliases[c.Channel]) {
-			if current != nil {
-				return false, errors.New("渠道名称与历史标签命中多条凭据")
+		keyMatches := s.provisionKeyMatches(r, fingerprint)
+		if r.channel == c.Channel {
+			if r.status == "active" {
+				activeChannel = append(activeChannel, r)
+			} else {
+				retiredChannel = append(retiredChannel, r)
 			}
-			if r.channel != "" && r.channel != c.Channel {
-				return false, errors.New("同名凭据已登记到其他学校渠道")
-			}
-			current = r
-		} else if r.status == "active" && r.channel == c.Channel && sameKey {
-			registered = r
-		} else if r.status != "active" && r.channel == c.Channel && sameKey {
-			archivedKey = true
-		} else if sameKey || (c.UpstreamKeyID != 0 && r.upstreamID.Int64 == c.UpstreamKeyID &&
-			!(r.status == "inactive" && r.actor.UUID == provisionActor && label == c.archivedLabel(r.id))) {
+		}
+		if r.channel == "" && (strings.EqualFold(label, c.Channel) || strings.EqualFold(label, beichenAliases[c.Channel])) {
+			labelMatches = append(labelMatches, r)
+		}
+		if keyMatches {
+			sameKey = append(sameKey, r)
+		}
+		if r.channel != "" && r.channel != c.Channel &&
+			(strings.EqualFold(label, c.Channel) || strings.EqualFold(label, beichenAliases[c.Channel])) {
+			return false, errors.New("同名凭据已登记到其他学校渠道")
+		}
+		if !keyMatches && c.UpstreamKeyID != 0 && r.upstreamID.Int64 == c.UpstreamKeyID &&
+			!(r.status == "inactive" && r.actor.UUID == provisionActor && label == c.archivedLabel(r.id)) {
 			return false, errors.New("此推理 Key 或上游 Key ID 已绑定到其他凭据")
 		}
 	}
-	if registered != nil {
-		if current != nil && (current.status == "active" || c.Restore) {
-			return false, errors.New("同名渠道与已登记 Key 指向不同凭据")
+
+	// A registered active channel is the teacher's current choice. An old
+	// deployment value may reuse that same Key, but it must never replace it.
+	if len(activeChannel) > 0 {
+		var matching []*provisionCredential
+		for _, r := range activeChannel {
+			if s.provisionKeyMatches(r, fingerprint) {
+				matching = append(matching, r)
+			}
 		}
-		current = registered
-	}
-	if archivedKey {
-		if current != nil && current.status != "active" && c.Channel == "Gemini" {
-			return false, errors.New("部署 Key 已归档至另一条凭据，无法恢复此停用的 Gemini 渠道")
+		if len(matching) == 1 {
+			if matching[0].actor.Valid && matching[0].actor.UUID != provisionActor && !matching[0].group.Valid {
+				return true, nil
+			}
+			return false, s.bindProvisionPanel(ctx, tx, provider, *matching[0], c)
 		}
-		if current == nil || current.status != "active" {
+		if len(matching) > 1 {
+			return false, errors.New("同一学校渠道有多条启用凭据，请核对")
+		}
+		if len(sameKey) > 0 {
+			return false, errors.New("旧部署配置引用已归档 Key，请保留当前渠道凭据")
+		}
+		if c.Channel == "Gemini" {
+			return false, errors.New("已有启用的 Gemini 渠道 Key 不同，请核对教师配置")
+		}
+		if len(activeChannel) != 1 {
+			return false, errors.New("同一学校渠道有多条启用凭据，请核对")
+		}
+		current := activeChannel[0]
+		if current.actor.Valid && current.actor.UUID != provisionActor && !current.group.Valid {
 			return true, nil
 		}
-		return false, errors.New("旧部署配置引用已归档 Key，请保留当前渠道凭据")
+		if c.Restore || current.actor.UUID != provisionActor {
+			return false, errors.New("已有渠道推理 Key 不同，请核对教师配置")
+		}
+		if err := retireProvisionCredential(ctx, tx, current, c); err != nil {
+			return false, err
+		}
 	}
-	if current != nil {
-		if current.status != "active" {
+
+	if len(activeChannel) == 0 {
+		var candidates []*provisionCredential
+		for _, r := range retiredChannel {
+			if s.provisionKeyMatches(r, fingerprint) {
+				candidates = append(candidates, r)
+			}
+		}
+		if c.Restore && len(candidates) == 0 {
+			candidates = retiredChannel
+		}
+		if len(candidates) > 1 {
+			return false, errors.New("停用的学校渠道命中多条凭据，请明确恢复对象")
+		}
+		if len(candidates) == 1 {
+			current := candidates[0]
 			if c.Channel != "Gemini" {
 				return true, nil
 			}
+			if !c.Restore && !current.retirement {
+				return true, nil
+			}
 			return false, s.restoreProvisionGemini(ctx, tx, provider, current, c, fingerprint)
+		}
+		if c.Channel == "Gemini" && len(retiredChannel) > 0 {
+			return false, errors.New("停用的 Gemini 凭据与部署 Key 不一致，确认需恢复后请配置 restore=true")
+		}
+		if len(sameKey) == 1 && sameKey[0].channel != "" && sameKey[0].channel != c.Channel {
+			return false, errors.New("此推理 Key 已绑定到其他学校渠道")
+		}
+		if len(sameKey) > 1 {
+			return false, errors.New("此推理 Key 已绑定到多条凭据")
+		}
+	}
+
+	var current *provisionCredential
+	if len(labelMatches) > 1 {
+		return false, errors.New("渠道名称与历史标签命中多条凭据")
+	}
+	if len(labelMatches) == 1 {
+		current = labelMatches[0]
+	}
+	if current != nil {
+		if current.status != "active" {
+			// Labels are not durable proof of the retired Gemini identity.
+			return true, nil
 		}
 		if current.actor.Valid && current.actor.UUID != provisionActor && !current.group.Valid {
 			return true, nil
@@ -303,17 +374,8 @@ func (s *Service) provisionChannel(ctx context.Context, tx *sql.Tx, provider uui
 		if c.Restore || current.actor.UUID != provisionActor {
 			return false, errors.New("已有渠道推理 Key 不同，请核对教师配置")
 		}
-		// New upstream credentials need their own UUID for historical usage, prices
-		// and receipts. Explicit model bindings retain their original owner.
-		if _, err := tx.ExecContext(ctx, `
-UPDATE provider_credentials
-SET label=$2,status='inactive',updated_at=clock_timestamp(),retired_at=clock_timestamp()
-WHERE id=$1`,
-			current.id, c.archivedLabel(current.id)); err != nil {
-			return false, errors.New("旧凭据归档失败，请检查标签冲突")
-		}
-		if err := beichen.RetireCredentialCatalogTx(ctx, tx, current.id); err != nil {
-			return false, errors.New("旧凭据目录停用失败")
+		if err := retireProvisionCredential(ctx, tx, current, c); err != nil {
+			return false, err
 		}
 	}
 	id, err := uuid.NewV7()
@@ -336,6 +398,32 @@ VALUES ($1,$2,$3,$4,'active',clock_timestamp(),clock_timestamp())`, id, provider
 		return false, errors.New("安排新北辰凭据同步失败")
 	}
 	return false, nil
+}
+
+func (s *Service) provisionKeyMatches(r *provisionCredential, fingerprint [sha256.Size]byte) bool {
+	if len(r.fingerprint) == sha256.Size {
+		return bytes.Equal(r.fingerprint, fingerprint[:])
+	}
+	key, err := s.security.DecryptCredential(r.encrypted)
+	if err != nil {
+		return false
+	}
+	return sha256.Sum256([]byte(key)) == fingerprint
+}
+
+// New upstream credentials need their own UUID for historical usage, prices
+// and receipts. Explicit model bindings retain their original owner.
+func retireProvisionCredential(ctx context.Context, tx *sql.Tx, current *provisionCredential, c *provisionChannel) error {
+	if _, err := tx.ExecContext(ctx, `
+UPDATE provider_credentials
+SET label=$2,status='inactive',updated_at=clock_timestamp(),retired_at=clock_timestamp()
+WHERE id=$1`, current.id, c.archivedLabel(current.id)); err != nil {
+		return errors.New("旧凭据归档失败，请检查标签冲突")
+	}
+	if err := beichen.RetireCredentialCatalogTx(ctx, tx, current.id); err != nil {
+		return errors.New("旧凭据目录停用失败")
+	}
+	return nil
 }
 
 func (s *Service) restoreProvisionGemini(ctx context.Context, tx *sql.Tx, provider uuid.UUID, existing *provisionCredential, c *provisionChannel, fingerprint [sha256.Size]byte) error {

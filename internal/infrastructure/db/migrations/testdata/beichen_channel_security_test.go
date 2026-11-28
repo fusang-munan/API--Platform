@@ -124,7 +124,7 @@ func TestBeichenChannelManualPanelOwnership(t *testing.T) {
 	wrongID := PanelAccessInput{Enabled: true, GroupID: group, Token: leftToken, UpstreamKeyID: &otherID}
 	wrongGroup := PanelAccessInput{Enabled: true, GroupID: group + 1, Token: leftToken, UpstreamKeyID: &keyID}
 	for _, input := range []PanelAccessInput{wrongID, wrongGroup, {Enabled: true, GroupID: group, Token: "fixture-unknown-bearer", UpstreamKeyID: &keyID}} {
-		err := f.service.SetPanelAccess(f.ctx, f.provider, left, f.teacher, input)
+		err := f.service.SetTeacherPanelAccess(f.ctx, f.provider, left, f.teacher, input)
 		if err == nil || !strings.Contains(err.Error(), "请使用自动发现") {
 			t.Fatal("无法核对归属的手工 Key ID 未被拒绝")
 		}
@@ -140,7 +140,7 @@ func TestBeichenChannelManualPanelOwnership(t *testing.T) {
 	claims := make(chan result, 2)
 	for id, token := range map[uuid.UUID]string{left: leftToken, right: rightToken} {
 		go func() {
-			err := f.service.SetPanelAccess(f.ctx, f.provider, id, f.teacher,
+			err := f.service.SetTeacherPanelAccess(f.ctx, f.provider, id, f.teacher,
 				PanelAccessInput{Enabled: true, GroupID: group, Token: token, UpstreamKeyID: &keyID})
 			claims <- result{id: id, err: err}
 		}()
@@ -232,5 +232,31 @@ FROM provider_credentials c WHERE k.provider_id=$1 AND k.upstream_key_id=4 AND c
 	if err != nil || len(cached.Keys) != 7 || cached.Keys[3].ID != 4 ||
 		cached.Keys[3].MatchStatus != "unmatched" || cached.Keys[3].CredentialID != nil {
 		t.Fatal("读取旧清单时恢复了已停用 Key 的错误归属")
+	}
+}
+
+func TestBeichenTeacherPanelRejectsWeakerKeyEvidence(t *testing.T) {
+	f := newChannelSecurityFixture(t)
+	const weakKey, strongKey = "sk-common-AAAA-1111", "sk-common-BBBB-1111"
+	weak := f.key(t, "弱渠道", weakKey)
+	strong := f.key(t, "名称一致", strongKey)
+	const token = "fixture-cross-credential-panel"
+	f.website(t, map[string][]byte{token: listChannelSafetyKeys(
+		channelSafetyKey(901, "名称一致", "sk-common****1111", "active", 31),
+	)})
+	keyID := int64(901)
+	weakInput := PanelAccessInput{Enabled: true, GroupID: 31, Token: token, UpstreamKeyID: &keyID}
+	if err := f.service.SetTeacherPanelAccess(f.ctx, f.provider, weak, f.teacher, weakInput); err == nil ||
+		!strings.Contains(err.Error(), "请使用自动发现") {
+		t.Fatal("弱遮罩证据抢占了有名称佐证的官网 Key")
+	}
+	if err := f.service.SetTeacherPanelAccess(f.ctx, f.provider, strong, f.teacher, weakInput); err != nil {
+		t.Fatalf("强证据渠道无法认领官网 Key：%v", err)
+	}
+	var owner uuid.UUID
+	if err := f.db.QueryRowContext(f.ctx, `
+SELECT credential_id FROM beichen_receipt_active_bindings WHERE upstream_key_id=$1`, keyID).Scan(&owner); err != nil ||
+		owner != strong {
+		t.Fatalf("官网 Key 未归属强证据渠道：%v", err)
 	}
 }

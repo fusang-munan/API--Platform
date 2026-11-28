@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	httpapi "github.com/starprince1234/Nebula-api/internal/api/http"
 	"github.com/starprince1234/Nebula-api/internal/controlplane"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
@@ -274,6 +275,9 @@ VALUES (99,1,12098,$1,$2,'Gemini','gemini-fixture',now()-interval '1 day',0.25,'
 	}
 	f.exec(t, string(retirement))
 	f.exec(t, "UPDATE provider_credentials SET retired_at=updated_at WHERE id=$1 AND status='inactive'", legacy)
+	f.exec(t, `
+INSERT INTO beichen_credential_retirements(credential_id,provider_id,channel,reason,retired_at)
+SELECT id,provider_id,'Gemini','0065_beichen_gemini',retired_at FROM provider_credentials WHERE id=$1`, legacy)
 	raw := func(secret, override string) string {
 		return `[{"channel":"GM1","status":"disabled"},{"channel":"G3","status":"disabled"},
 {"channel":"CC1","status":"disabled"},{"channel":"Gemini","api_key":"` + secret + `"` + override + `}]`
@@ -325,4 +329,187 @@ WHERE c.id=$1 AND c.status='active' AND c.retired_at IS NULL`, legacy, f.provide
 	}
 	assertActive(finalKey)
 	f.request(t, http.MethodPatch, patch, "tls", body, http.StatusBadRequest, "停用的 Gemini")
+	var before []byte
+	if err := f.row("SELECT credential_ciphertext FROM provider_credentials WHERE id=$1", legacy).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.ProvisionBeichenChannels(f.ctx, raw(rotated, ""), ""); err == nil ||
+		!strings.Contains(err.Error(), "Key 不同") {
+		t.Fatal("旧部署配置覆盖了教师原地轮换后的 Gemini 渠道")
+	}
+	var after []byte
+	if err := f.row("SELECT credential_ciphertext FROM provider_credentials WHERE id=$1", legacy).Scan(&after); err != nil ||
+		!bytes.Equal(before, after) {
+		t.Fatal("旧部署配置改写了教师已确认的 Gemini Key")
+	}
+}
+
+func TestBeichenRestoresCustomLabelRetirementInPlace(t *testing.T) {
+	f := newChannelFixture(t)
+	const initial = "sk-local-custom-retired-gemini"
+	ciphertext, err := f.crypto.EncryptCredential(initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := uuid.New()
+	f.exec(t, `
+INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,status,created_at,updated_at,retired_at)
+VALUES ($1,$2,'教师自定义 Gemini 名称',$3,'inactive',now()-interval '1 day',now(),now())`, legacy, f.provider, ciphertext)
+	f.exec(t, `
+INSERT INTO beichen_credential_retirements(credential_id,provider_id,channel,reason,retired_at)
+VALUES ($1,$2,'Gemini','0065_beichen_gemini',now())`, legacy, f.provider)
+	const rotated = "sk-local-custom-rotated-gemini"
+	raw := `[{"channel":"GM1","status":"disabled"},{"channel":"G3","status":"disabled"},
+{"channel":"CC1","status":"disabled"},{"channel":"Gemini","api_key":"` + rotated + `","restore":true}]`
+	if _, err := f.service.ProvisionBeichenChannels(f.ctx, raw, ""); err != nil {
+		t.Fatal(err)
+	}
+	var active bool
+	var updated []byte
+	if err := f.row("SELECT status='active',credential_ciphertext FROM provider_credentials WHERE id=$1", legacy).
+		Scan(&active, &updated); err != nil || !active {
+		t.Fatalf("自定义标签的旧 Gemini 没有复用原编号：%v", err)
+	}
+	if got, err := f.crypto.DecryptCredential(updated); err != nil || got != rotated {
+		t.Fatal("自定义标签的旧 Gemini 未轮换到新 Key")
+	}
+}
+
+func TestBeichenOrdinaryCredentialCannotBecomeGemini(t *testing.T) {
+	f := newChannelFixture(t)
+	ordinary := f.request(t, http.MethodPost, "/credentials", "tls", map[string]any{
+		"label": "普通 Gemini 名称", "credential": "sk-local-ordinary-original",
+	}, http.StatusCreated, "")
+	path := "/credentials/" + ordinary.ID
+	f.request(t, http.MethodPatch, path, "tls", map[string]any{"status": "inactive"}, http.StatusOK, "")
+	f.request(t, http.MethodPatch, path, "tls", map[string]any{"status": "active"}, http.StatusOK, "")
+	var registered bool
+	if err := f.row("SELECT EXISTS(SELECT 1 FROM beichen_provision_channels WHERE credential_id=$1)",
+		uuid.MustParse(ordinary.ID)).Scan(&registered); err != nil || registered {
+		t.Fatal("普通凭据重新启用后被登记成学校渠道")
+	}
+	call := insertChannelCall(t, f, "ordinary-dispatch")
+	if err := usage.NewStore(f.db).PrepareDispatch(f.ctx, call, usage.CallRoute{
+		Beichen: true, ProviderID: f.provider, CredentialID: uuid.MustParse(ordinary.ID), UpstreamModelName: "ordinary",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var multiplier string
+	if err := f.row("SELECT trim_scale(beichen_school_multiplier)::text FROM gateway_calls WHERE id=$1", call).Scan(&multiplier); err != nil ||
+		multiplier != "1" {
+		t.Fatalf("普通凭据错误应用了学校系数：%s (%v)", multiplier, err)
+	}
+	f.request(t, http.MethodPatch, path, "tls", map[string]any{"status": "inactive"}, http.StatusOK, "")
+	f.request(t, http.MethodPatch, path, "tls", map[string]any{
+		"status": "active", "credential": "sk-local-ordinary-replacement",
+	}, http.StatusBadRequest, "停用的 Gemini")
+}
+
+func TestBeichenScheduledMaterializeDoesNotActivateRoutes(t *testing.T) {
+	f := newChannelFixture(t)
+	credential := f.request(t, http.MethodPost, "/credentials", "tls", map[string]any{
+		"label": "定时目录 G3", "credential": "sk-local-scheduled-g3", "channel": "G3",
+	}, http.StatusCreated, "")
+	id := uuid.MustParse(credential.ID)
+	model := uuid.New()
+	f.exec(t, `
+INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES ($1,'scheduled-model','Scheduled Model','pending_configuration',1000,now(),now())`, model)
+	f.exec(t, `
+INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,supported_protocols,last_seen_at,synced_at,created_at,updated_at)
+VALUES (gen_random_uuid(),$1,$2,'scheduled-model',ARRAY['openai_compatible'],now(),now(),now(),now())`, f.provider, id)
+	f.exec(t, `
+INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,status,created_at,updated_at)
+VALUES (gen_random_uuid(),$1,$2,$3,'scheduled-model','openai_compatible',10,'inactive',now(),now())`, model, f.provider, id)
+	if err := f.service.MaterializeBeichenCatalogs(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	if err := f.row("SELECT status FROM model_bindings WHERE model_id=$1 AND credential_id=$2", model, id).Scan(&status); err != nil ||
+		status != "inactive" {
+		t.Fatalf("定时目录任务自动恢复了旧线路：%s (%v)", status, err)
+	}
+}
+
+func TestBeichenChannelMigrationKeepsUniqueOffBeichenBinding(t *testing.T) {
+	dsn := os.Getenv("NEBULA_CHANNEL_TEST_POSTGRES")
+	if dsn == "" {
+		t.Skip("需要单独的本机 nebula_test_* PostgreSQL 测试库")
+	}
+	config, err := pgx.ParseConfig(dsn)
+	if err != nil || config.Host != "127.0.0.1" || !strings.HasPrefix(config.Database, "nebula_test_") ||
+		config.TLSConfig != nil || len(config.Fallbacks) != 0 || config.Password != "" {
+		t.Fatal("只允许无密码、回环地址、sslmode=disable 的独立 nebula_test_* 库")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	admin := stdlib.OpenDB(*config)
+	defer admin.Close()
+	schema := pgx.Identifier{"channel_upgrade_" + uuid.NewString()}.Sanitize()
+	if _, err := admin.ExecContext(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer admin.ExecContext(context.Background(), "DROP SCHEMA "+schema+" CASCADE")
+	config.RuntimeParams["search_path"] = schema + ",public"
+	db := stdlib.OpenDB(*config)
+	defer db.Close()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".sql") || name >= "0072_" {
+			continue
+		}
+		script, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, string(script)); err != nil {
+			t.Fatalf("应用升级前迁移 %s: %v", name, err)
+		}
+	}
+	beichen, other, actor := uuid.New(), uuid.New(), uuid.New()
+	left, right, moved := uuid.New(), uuid.New(), uuid.New()
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec("INSERT INTO users(id,name,email,password_hash,role,status,created_at,updated_at) VALUES($1,'迁移审计','migration@example.test','!','student','disabled',now(),now())", actor)
+	exec(`INSERT INTO providers(id,name,base_url,status,created_at,updated_at)
+VALUES($1,'北辰升级','https://api.beichenapi.com','active',now(),now()),
+      ($2,'已迁出','https://other.invalid','active',now(),now())`, beichen, other)
+	for _, item := range []struct {
+		id, provider uuid.UUID
+		label        string
+	}{{left, beichen, "左渠道"}, {right, beichen, "右渠道"}, {moved, other, "已迁出渠道"}} {
+		exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,status,created_at,updated_at)
+VALUES($1,$2,$3,'fixture','active',now(),now())`, item.id, item.provider, item.label)
+	}
+	exec(`INSERT INTO beichen_panel_access(credential_id,group_id,upstream_key_id,token_ciphertext,updated_by,updated_at)
+SELECT c.id,1,CASE WHEN c.id=$1 OR c.id=$2 THEN 902 ELSE 901 END,'fixture',$4,c.updated_at
+FROM provider_credentials c WHERE c.id IN ($1,$2,$3)`,
+		left, right, moved, actor)
+	upgrade, err := os.ReadFile("0072_beichen_channel_identity.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, string(upgrade)); err != nil {
+		t.Fatalf("应用升级迁移: %v", err)
+	}
+	var movedKey, leftKey, rightKey, saved int
+	err = db.QueryRowContext(ctx, `
+SELECT
+  (SELECT COUNT(*) FROM beichen_panel_access WHERE credential_id=$1 AND upstream_key_id=901),
+  (SELECT COUNT(*) FROM beichen_panel_access WHERE credential_id=$2 AND upstream_key_id IS NULL),
+  (SELECT COUNT(*) FROM beichen_panel_access WHERE credential_id=$3 AND upstream_key_id IS NULL),
+  (SELECT COUNT(*) FROM beichen_cleared_panel_keys WHERE upstream_key_id=902)`,
+		moved, left, right).Scan(&movedKey, &leftKey, &rightKey, &saved)
+	if err != nil || movedKey != 1 || leftKey != 1 || rightKey != 1 || saved != 2 {
+		t.Fatalf("升级保留了唯一迁出绑定=%d，清理同号冲突=%d/%d，回退记录=%d: %v",
+			movedKey, leftKey, rightKey, saved, err)
+	}
 }

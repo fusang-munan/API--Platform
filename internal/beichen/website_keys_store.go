@@ -331,7 +331,8 @@ func (s *Service) applyWebsiteKeys(ctx context.Context, provider, lease uuid.UUI
 			key.CredentialID, key.MatchStatus = &credential.id, "matched"
 			digest := sha256.Sum256(credential.ciphertext)
 			ciphertextDigest = digest[:]
-		} else if claims[i].count != 0 && listedKey.Status == "active" && validWebsiteGroupID(listedKey.GroupID) {
+		} else if claims[i].count > 1 ||
+			(claims[i].count != 0 && listedKey.Status == "active" && validWebsiteGroupID(listedKey.GroupID)) {
 			key.MatchStatus = "ambiguous"
 		}
 		_, err := tx.ExecContext(ctx, `
@@ -410,6 +411,11 @@ WHERE c.provider_id=$1 AND c.status='active' ORDER BY c.id FOR NO KEY UPDATE OF 
 				if credential.strength > claim.strength {
 					*claim = websiteKeyClaim{strength: credential.strength, count: 1}
 				} else if credential.strength == claim.strength {
+					claim.count++
+				}
+				// One credential matching multiple equally strong rows is
+				// already ambiguous, even though it is a single claimant.
+				if len(credential.candidates) > 1 {
 					claim.count++
 				}
 			}

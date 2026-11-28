@@ -442,6 +442,26 @@ func (s *Service) materializeStoredProviderCatalog(ctx context.Context, provider
 	return nil
 }
 
+// Scheduled Beichen catalog materialization may create or refresh platform
+// models, but it never activates a route. Restoring a route requires the
+// teacher-confirmed rebind flow.
+func (s *Service) materializeStoredBeichenCatalog(ctx context.Context, providerID uuid.UUID) error {
+	credentials, err := catalog.ActiveCredentials(ctx, s.db, &providerID)
+	if err != nil {
+		return err
+	}
+	for _, credential := range credentials {
+		entries, err := catalog.LoadActiveCatalogEntries(ctx, s.db, credential.ID)
+		if err != nil {
+			return err
+		}
+		if err := catalog.MaterializeCredentialModels(ctx, s.db, providerID, credential.ID, entries, false, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // MaterializeBeichenCatalogs folds the freshest per-Key Beichen catalog rows
 // into platform models and bindings without resetting teacher governance. The
 // scheduled Beichen jobs already refresh provider_model_catalog every few
@@ -465,12 +485,9 @@ func (s *Service) MaterializeBeichenCatalogs(ctx context.Context) error {
 		if !catalog.IsBeichenBaseURL(row.BaseURL) {
 			continue
 		}
-		if err := s.materializeStoredProviderCatalog(ctx, row.ID, false); err != nil {
+		if err := s.materializeStoredBeichenCatalog(ctx, row.ID); err != nil {
 			failures = append(failures, fmt.Errorf("provider %s: %w", row.ID, err))
 			continue
-		}
-		if err := catalog.ReconcileProviderBindingRoutes(ctx, s.db, row.ID); err != nil {
-			failures = append(failures, fmt.Errorf("provider %s: %w", row.ID, err))
 		}
 	}
 	return errors.Join(failures...)

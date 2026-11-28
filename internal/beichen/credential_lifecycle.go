@@ -246,11 +246,14 @@ WHERE (beichen_provision_channels.key_fingerprint,beichen_provision_channels.dis
 func (s *Service) RestoreGeminiCredentialTx(ctx context.Context, tx *sql.Tx, provider, credential uuid.UUID, edit CredentialEdit) error {
 	var eligible bool
 	err := tx.QueryRowContext(ctx, `
-SELECT c.status='inactive' AND COALESCE(j.channel='Gemini',
-   c.label IN ('哈吉米','Gemini') OR COALESCE(c.group_hint='5',false)
+SELECT COALESCE(c.status='inactive' AND (
+   j.channel='Gemini'
+   OR EXISTS (SELECT 1 FROM beichen_credential_retirements r
+              WHERE r.credential_id=c.id AND r.provider_id=c.provider_id AND r.channel='Gemini')
    OR EXISTS (SELECT 1 FROM beichen_panel_access a WHERE a.credential_id=c.id AND a.upstream_key_id=12098)
    OR EXISTS (SELECT 1 FROM beichen_website_keys k
-              WHERE k.credential_id=c.id AND k.provider_id=c.provider_id AND k.upstream_key_id=12098))
+              WHERE k.credential_id=c.id AND k.provider_id=c.provider_id AND k.upstream_key_id=12098)
+ ), false)
 FROM provider_credentials c LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
 WHERE c.id=$1 AND c.provider_id=$2 FOR NO KEY UPDATE OF c`, credential, provider).Scan(&eligible)
 	if err != nil {
