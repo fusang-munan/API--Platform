@@ -2,13 +2,10 @@ package catalog
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -110,11 +107,11 @@ func (r *ProviderSyncRunner) syncBeichenCredential(ctx context.Context, row acti
 	if lease == uuid.Nil || err != nil {
 		return false, err
 	}
-	var entries []ProviderEntry
+	var snapshot BeichenModelSnapshot
 	secret, fetchErr := r.Decrypt(row.CredentialCiphertext)
 	if fetchErr == nil {
 		read, cancel := context.WithTimeout(ctx, BeichenScanTimeout)
-		entries, fetchErr = FetchProviderModels(read, row.BaseURL, secret, nil)
+		snapshot, fetchErr = FetchBeichenModelSnapshot(read, secret, nil)
 		cancel()
 	} else {
 		fetchErr = errors.New("北辰凭据解密失败")
@@ -133,7 +130,7 @@ func (r *ProviderSyncRunner) syncBeichenCredential(ctx context.Context, row acti
 	}
 	var outcome error
 	if current {
-		outcome, err = SaveBeichenKeyScan(save, tx, row.ProviderID, row.ID, row.UpdatedAt, r.now().UTC(), entries, fetchErr)
+		outcome, err = SaveBeichenKeyScan(save, tx, row.ProviderID, row.ID, row.UpdatedAt, r.now().UTC(), snapshot, fetchErr)
 	} else {
 		outcome = errors.New("同步期间北辰凭据或供应商已变化")
 	}
@@ -211,98 +208,179 @@ WHERE credential_id=$1 AND kind=$2`, credential, kind)
 	return err
 }
 
-type beichenShrinkCandidate struct {
-	Revision    time.Time `json:"revision"`
-	Fingerprint string    `json:"fingerprint"`
-	Rounds      int       `json:"rounds"`
+type beichenCatalogRemovals struct {
+	Revision time.Time      `json:"revision"`
+	Missing  map[string]int `json:"missing"`
 }
 
-// SaveBeichenKeyScan stages a sharp drop under the billing lease. The first
-// error describes the observed result; the second requires a rollback.
+// SaveBeichenKeyScan applies positive listings and confirms removals under the
+// billing lease. The first error describes the observation; the second
+// requires a rollback.
 func SaveBeichenKeyScan(ctx context.Context, tx *sql.Tx, provider, credential uuid.UUID, revision, at time.Time,
-	entries []ProviderEntry, fetchErr error) (error, error) {
-	stateName := "beichen_catalog_shrink/" + credential.String()
-	var candidate *beichenShrinkCandidate
-	observationErr := fetchErr
-	if fetchErr == nil {
-		// A successful read establishes access even when its model coverage
-		// needs more observations before we can replace the saved directory.
-		if _, err := tx.ExecContext(ctx, "DELETE FROM maintenance_state WHERE name=$1", beichenGroupDenialKey+credential.String()); err != nil {
-			return nil, err
-		}
-		var previousCount int
-		err := tx.QueryRowContext(ctx, `
-SELECT count(*) FROM provider_model_catalog
-WHERE credential_id=$1 AND status='active' AND catalog_source='key'`, credential).Scan(&previousCount)
-		if err != nil {
-			return nil, err
-		}
-		if BeichenSnapshotShrank(previousCount, len(entries)) {
-			var priorText sql.NullString
-			err := tx.QueryRowContext(ctx, "SELECT last_error FROM maintenance_state WHERE name=$1", stateName).Scan(&priorText)
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return nil, err
-			}
-			var prior beichenShrinkCandidate
-			_ = json.Unmarshal([]byte(priorText.String), &prior)
-			names := make([]string, 0, len(entries))
-			for _, entry := range entries {
-				names = append(names, strings.ToLower(entry.ID))
-			}
-			slices.Sort(names)
-			raw, _ := json.Marshal(names)
-			fingerprint := fmt.Sprintf("%x", sha256.Sum256(raw))
-			rounds := 1
-			if prior.Revision.Equal(revision) && prior.Fingerprint == fingerprint && prior.Rounds > 0 && prior.Rounds < BeichenShrinkRounds {
-				rounds = prior.Rounds + 1
-			}
-			if rounds < BeichenShrinkRounds {
-				candidate = &beichenShrinkCandidate{Revision: revision, Fingerprint: fingerprint, Rounds: rounds}
-				observationErr = fmt.Errorf("北辰 Key 模型目录待核验：由 %d 个降至 %d 个，连续一致 %d/%d，沿用上次目录",
-					previousCount, len(entries), rounds, BeichenShrinkRounds)
-			}
-		}
-	}
-	if candidate == nil {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM maintenance_state WHERE name=$1", stateName); err != nil {
-			return nil, err
-		}
-	} else {
-		raw, err := json.Marshal(candidate)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO maintenance_state (id,name,last_error,created_at,updated_at)
-VALUES ($1,$2,$3,clock_timestamp(),clock_timestamp())
-ON CONFLICT (name) DO UPDATE SET last_error=EXCLUDED.last_error,updated_at=EXCLUDED.updated_at`,
-			uuid.Must(uuid.NewV7()), stateName, string(raw)); err != nil {
-			return nil, err
-		}
-	}
-	if observationErr != nil {
+	snapshot BeichenModelSnapshot, fetchErr error) (error, error) {
+	if fetchErr != nil {
 		if errors.Is(fetchErr, ErrBeichenKeyGroupNotAllowed) {
-			if _, err := tx.ExecContext(ctx, `
-INSERT INTO maintenance_state (id,name,last_error,created_at,updated_at)
-VALUES ($1,$2,jsonb_build_object('code','GROUP_NOT_ALLOWED','credential_revision',$3::timestamptz)::text,
-  statement_timestamp(),statement_timestamp())
-ON CONFLICT (name) DO UPDATE SET last_error=EXCLUDED.last_error,updated_at=EXCLUDED.updated_at`,
-				uuid.Must(uuid.NewV7()), beichenGroupDenialKey+credential.String(), revision); err != nil {
+			if err := saveBeichenGroupDenial(ctx, tx, credential, revision, "", true); err != nil {
 				return nil, err
 			}
 		}
 		_, err := tx.ExecContext(ctx, `
 INSERT INTO beichen_datasets (credential_id,kind,last_error) VALUES ($1,'catalog',$2)
-ON CONFLICT (credential_id,kind) DO UPDATE SET last_error=EXCLUDED.last_error`, credential, observationErr.Error())
-		return observationErr, err
+ON CONFLICT (credential_id,kind) DO UPDATE SET last_error=EXCLUDED.last_error`, credential, fetchErr.Error())
+		return fetchErr, err
 	}
-	if _, err := ReplaceCredentialEntries(ctx, tx, provider, credential, entries, at); err != nil {
+	if err := saveBeichenGroupDenial(ctx, tx, credential, revision, "", false); err != nil {
+		return nil, err
+	}
+	if err := confirmBeichenCatalogRemovals(ctx, tx, provider, credential, revision, at, snapshot); err != nil {
+		return nil, err
+	}
+	if _, err := upsertCredentialEntries(ctx, tx, provider, credential, snapshot.Entries, at); err != nil {
+		return nil, err
+	}
+	// Website discovery has its own snapshot. Remove only duplicate legacy
+	// website rows after ensuring no active binding still needs them.
+	if _, err := tx.ExecContext(ctx, `
+UPDATE provider_model_catalog k SET status='inactive',synced_at=$4,updated_at=$4
+WHERE k.provider_id=$1 AND k.credential_id=$2 AND k.status='active' AND k.catalog_source='website'
+  AND EXISTS (SELECT 1 FROM beichen_website_catalogs w,unnest(w.models) models(model_id)
+    WHERE w.credential_id=k.credential_id AND w.credential_revision=$3 AND btrim(models.model_id)::citext=k.model_id)
+  AND NOT EXISTS (SELECT 1 FROM model_bindings b WHERE b.provider_id=k.provider_id AND b.status='active'
+    AND (b.credential_id=k.credential_id OR b.credential_id IS NULL) AND btrim(b.upstream_model_name)::citext=k.model_id)`,
+		provider, credential, revision, at); err != nil {
 		return nil, err
 	}
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO beichen_datasets (credential_id,kind,last_success) VALUES ($1,'catalog',clock_timestamp())
 ON CONFLICT (credential_id,kind) DO UPDATE SET last_success=EXCLUDED.last_success,last_error=NULL`, credential)
 	return nil, err
+}
+
+type beichenGroupDenial struct {
+	Code        string          `json:"code"`
+	Revision    time.Time       `json:"credential_revision"`
+	Catalog     *bool           `json:"catalog_denied"`
+	ProbeRoutes map[string]bool `json:"probe_routes,omitempty"`
+}
+
+// Catalog and probe observations can clear only the denial they can recheck.
+// The caller holds the credential row lock for the observed revision.
+func SaveBeichenProbeGroupDenial(ctx context.Context, tx *sql.Tx, credential uuid.UUID, revision time.Time,
+	model, protocol string, denied bool) error {
+	return saveBeichenGroupDenial(ctx, tx, credential, revision, protocol+"/"+model, denied)
+}
+
+func saveBeichenGroupDenial(ctx context.Context, tx *sql.Tx, credential uuid.UUID, revision time.Time, route string, denied bool) error {
+	name := beichenGroupDenialKey + credential.String()
+	var saved sql.NullString
+	err := tx.QueryRowContext(ctx, "SELECT last_error FROM maintenance_state WHERE name=$1", name).Scan(&saved)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var state beichenGroupDenial
+	current := json.Unmarshal([]byte(saved.String), &state) == nil && state.Revision.Equal(revision)
+	if !current {
+		state = beichenGroupDenial{Code: "GROUP_NOT_ALLOWED", Revision: revision}
+	}
+	// Old denial markers predate probes and represent a denied catalog read.
+	catalogDenied := current && (state.Catalog == nil || *state.Catalog)
+	if route == "" {
+		if !denied && !catalogDenied && current {
+			return nil
+		}
+		catalogDenied = denied
+	} else if denied {
+		if state.ProbeRoutes == nil {
+			state.ProbeRoutes = map[string]bool{}
+		}
+		state.ProbeRoutes[route] = true
+	} else if state.ProbeRoutes[route] {
+		delete(state.ProbeRoutes, route)
+	} else {
+		return nil
+	}
+	if !catalogDenied && len(state.ProbeRoutes) == 0 {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		_, err := tx.ExecContext(ctx, "DELETE FROM maintenance_state WHERE name=$1", name)
+		return err
+	}
+	state.Catalog = &catalogDenied
+	raw, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO maintenance_state (id,name,last_error,created_at,updated_at)
+VALUES ($1,$2,$3,clock_timestamp(),clock_timestamp())
+ON CONFLICT (name) DO UPDATE SET last_error=EXCLUDED.last_error,updated_at=EXCLUDED.updated_at`, uuid.Must(uuid.NewV7()), name, string(raw))
+	return err
+}
+
+func confirmBeichenCatalogRemovals(ctx context.Context, tx *sql.Tx, provider, credential uuid.UUID,
+	revision, at time.Time, snapshot BeichenModelSnapshot) error {
+	stateName := "beichen_catalog_shrink/" + credential.String()
+	var saved sql.NullString
+	err := tx.QueryRowContext(ctx, "SELECT last_error FROM maintenance_state WHERE name=$1", stateName).Scan(&saved)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var previous beichenCatalogRemovals
+	if json.Unmarshal([]byte(saved.String), &previous) != nil || !previous.Revision.Equal(revision) {
+		previous.Missing = nil
+	}
+	var raw []byte
+	err = tx.QueryRowContext(ctx, `
+SELECT COALESCE(json_agg(lower(btrim(model_id::text))), '[]')
+FROM provider_model_catalog WHERE provider_id=$1 AND credential_id=$2 AND status='active'`,
+		provider, credential).Scan(&raw)
+	if err != nil {
+		return err
+	}
+	var active []string
+	if err := json.Unmarshal(raw, &active); err != nil {
+		return err
+	}
+	seen := upstreamNameSet(snapshot.Entries)
+	pending := beichenCatalogRemovals{Revision: revision, Missing: map[string]int{}}
+	var confirmed []string
+	for _, model := range active {
+		if _, present := seen[model]; present {
+			continue
+		}
+		rounds := previous.Missing[model]
+		if snapshot.Complete {
+			rounds++
+		}
+		if rounds >= BeichenShrinkRounds {
+			confirmed = append(confirmed, model)
+		} else if rounds > 0 {
+			pending.Missing[model] = rounds
+		}
+	}
+	if len(confirmed) > 0 {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE provider_model_catalog SET status='inactive',synced_at=$3,updated_at=$3
+WHERE provider_id=$1 AND credential_id=$2 AND status='active' AND lower(btrim(model_id::text))=ANY($4::text[])`,
+			provider, credential, at, confirmed); err != nil {
+			return err
+		}
+	}
+	if len(pending.Missing) == 0 {
+		_, err := tx.ExecContext(ctx, "DELETE FROM maintenance_state WHERE name=$1", stateName)
+		return err
+	}
+	raw, err = json.Marshal(pending)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO maintenance_state (id,name,last_error,created_at,updated_at)
+VALUES ($1,$2,$3,clock_timestamp(),clock_timestamp())
+ON CONFLICT (name) DO UPDATE SET last_error=EXCLUDED.last_error,updated_at=EXCLUDED.updated_at`,
+		uuid.Must(uuid.NewV7()), stateName, string(raw))
+	return err
 }
 
 func BeichenSnapshotShrank(previous, current int) bool {

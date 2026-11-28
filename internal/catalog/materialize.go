@@ -7,15 +7,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/apikeymodel"
-	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/gatewaycall"
+	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelmultiplieraudit"
 )
 
 // MaterializeProviderModels upserts platform models from upstream catalog entries.
 // When resetGovernance is true (Reset Catalog), multiplier/common/status are cleared.
-// When touchBindings is true, heuristic bindings are synced; keep false unless applying a full catalog import.
+// Candidate refreshes leave existing governed models and all bindings alone.
 func MaterializeProviderModels(ctx context.Context, client *ent.Client, providerID uuid.UUID, entries []ProviderEntry, resetGovernance, touchBindings bool) error {
 	return materializeProviderEntries(ctx, client, providerID, uuid.Nil, entries, resetGovernance, touchBindings)
 }
@@ -52,6 +52,9 @@ func materializeProviderEntries(ctx context.Context, client *ent.Client, provide
 		} else if queryErr != nil {
 			return queryErr
 		} else {
+			if !touchBindings && !resetGovernance && row.Status != entmodel.StatusPendingConfiguration {
+				continue
+			}
 			update := row.Update().
 				SetDisplayName(displayName).
 				SetUpstreamMetadata(upstream)
@@ -76,6 +79,9 @@ func materializeProviderEntries(ctx context.Context, client *ent.Client, provide
 				return err
 			}
 		}
+	}
+	if !touchBindings {
+		return nil
 	}
 	if resetGovernance {
 		if credentialID != uuid.Nil {

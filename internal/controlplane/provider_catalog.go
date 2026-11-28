@@ -324,6 +324,10 @@ func (s *Service) syncProviderCatalog(ctx context.Context, providerID uuid.UUID,
 	if row.Status != provider.StatusActive {
 		return ProviderCatalogSyncView{}, domain.NewError(domain.CodeValidation, "provider must be active")
 	}
+	isBeichen := catalog.IsBeichenBaseURL(row.BaseURL)
+	if isBeichen && resetGovernance {
+		return ProviderCatalogSyncView{}, domain.NewError(domain.CodeInvalidTransition, "北辰目录支持同步候选，已发布线路请由教师启用或重绑")
+	}
 	syncedAt := s.now().UTC()
 	total, err := s.fetchAndStoreProviderCatalog(ctx, row, syncedAt)
 	if err != nil {
@@ -337,10 +341,10 @@ func (s *Service) syncProviderCatalog(ctx context.Context, providerID uuid.UUID,
 	}
 	// Each Beichen key may list the same model. Refreshing a catalog must
 	// not move a teacher's binding to the last key or publish a model.
-	if catalog.IsBeichenBaseURL(row.BaseURL) && !resetGovernance {
+	if isBeichen {
 		return view, nil
 	}
-	if err := s.materializeStoredProviderCatalog(ctx, providerID, resetGovernance); err != nil {
+	if err := s.materializeStoredProviderCatalog(ctx, providerID, resetGovernance, true); err != nil {
 		return ProviderCatalogSyncView{}, domain.WrapError(domain.CodeDependencyUnavailable, "materialize synced models", err)
 	}
 	if err := catalog.ReconcileProviderBindingRoutes(ctx, s.db, providerID); err != nil {
@@ -398,7 +402,7 @@ func (s *Service) fetchAndStoreProviderCatalog(ctx context.Context, providerRow 
 	return total, nil
 }
 
-func (s *Service) materializeStoredProviderCatalog(ctx context.Context, providerID uuid.UUID, resetGovernance bool) error {
+func (s *Service) materializeStoredProviderCatalog(ctx context.Context, providerID uuid.UUID, resetGovernance, touchBindings bool) error {
 	credentials, err := catalog.ActiveCredentials(ctx, s.db, &providerID)
 	if err != nil {
 		return err
@@ -408,18 +412,15 @@ func (s *Service) materializeStoredProviderCatalog(ctx context.Context, provider
 		if loadErr != nil {
 			return loadErr
 		}
-		if err := catalog.MaterializeCredentialModels(ctx, s.db, providerID, credential.ID, entries, resetGovernance, true); err != nil {
+		if err := catalog.MaterializeCredentialModels(ctx, s.db, providerID, credential.ID, entries, resetGovernance, touchBindings); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// MaterializeBeichenCatalogs folds the freshest per-Key Beichen catalog rows
-// into platform models and bindings without resetting teacher governance. The
-// scheduled Beichen jobs already refresh provider_model_catalog every few
-// minutes; this pass makes newly probed models visible as candidates instead of
-// leaving them stranded in the raw catalog table.
+// MaterializeBeichenCatalogs makes scanned entries visible as candidates.
+// The catalog and probe jobs own the health evidence for published bindings.
 func (s *Service) MaterializeBeichenCatalogs(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return nil
@@ -438,11 +439,7 @@ func (s *Service) MaterializeBeichenCatalogs(ctx context.Context) error {
 		if !catalog.IsBeichenBaseURL(row.BaseURL) {
 			continue
 		}
-		if err := s.materializeStoredProviderCatalog(ctx, row.ID, false); err != nil {
-			failures = append(failures, fmt.Errorf("provider %s: %w", row.ID, err))
-			continue
-		}
-		if err := catalog.ReconcileProviderBindingRoutes(ctx, s.db, row.ID); err != nil {
+		if err := s.materializeStoredProviderCatalog(ctx, row.ID, false, false); err != nil {
 			failures = append(failures, fmt.Errorf("provider %s: %w", row.ID, err))
 		}
 	}

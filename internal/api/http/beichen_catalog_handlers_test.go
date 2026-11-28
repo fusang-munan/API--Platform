@@ -42,6 +42,7 @@ func TestBeichenCatalogMaintenanceRejectsInvalidRequests(t *testing.T) {
 		{"POST", "/rebind", `{}`},
 		{"POST", "/rebind", `{"preview":false}`},
 		{"POST", "/rebind", `{"preview":false,"preview_token":"invalid"}`},
+		{"POST", "/rebind", `{"preview":true,"preview_token":"restore/invalid"}`},
 		{"POST", "/rebind?preview=other", ``},
 		{"POST", "/rebind?preview=true&preview=false", ``},
 		{"POST", "/rebind?preview=false", `{"preview":true}`},
@@ -107,12 +108,12 @@ func TestBeichenCatalogMaintenanceAliasAndPreviewContracts(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT p.id FROM providers p").WithArgs(provider).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(provider))
-	mock.ExpectQuery("SELECT b.id, b.model_id").WithArgs(provider).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectQuery("SELECT b.id, b.model_id").WithArgs(provider, nil).WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectQuery("SELECT model_id,adapter,max").WithArgs(provider).WillReturnRows(sqlmock.NewRows([]string{"model_id"}))
-	mock.ExpectQuery("SELECT a.model,k.credential_id").WithArgs(provider).WillReturnRows(sqlmock.NewRows([]string{"model"}))
+	mock.ExpectQuery("SELECT a.model,k.credential_id").WithArgs(provider, nil).WillReturnRows(sqlmock.NewRows([]string{"model"}))
 	evidence := `[{"credential_id":"` + credential.String() + `","credential_revision":"2026-11-27T07:00:00Z","group_id":10,
 		"catalog_observed_at":"2026-11-27T07:01:00Z","evidence_since":"2026-11-27T07:00:00Z"}]`
-	mock.ExpectQuery("SELECT p.status='active' AND COALESCE").WithArgs(provider).
+	mock.ExpectQuery("SELECT p.status='active' AND .*COALESCE").WithArgs(provider, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"ready", "versions"}).AddRow(true, []byte(evidence)))
 	mock.ExpectCommit()
 	w = httptest.NewRecorder()
@@ -121,6 +122,28 @@ func TestBeichenCatalogMaintenanceAliasAndPreviewContracts(t *testing.T) {
 		!strings.Contains(w.Body.String(), `"changes":[]`) || !strings.Contains(w.Body.String(), `"evidence_versions":[`) ||
 		!strings.Contains(w.Body.String(), `"group_id":10,"catalog_observed_at":"2026-11-27T07:01:00Z"`) {
 		t.Fatalf("绑定重建预览响应契约错误: %d %s", w.Code, w.Body.String())
+	}
+
+	school, binding := uuid.New(), uuid.New()
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT p.id FROM providers p").WithArgs(provider).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(provider))
+	mock.ExpectQuery("SELECT b.id, b.model_id").WithArgs(provider, school).
+		WillReturnRows(sqlmock.NewRows([]string{"binding", "model", "school", "adapter", "key", "label", "upstream", "priority", "status"}).
+			AddRow(binding, school, "school", "openai_responses", uuid.New(), "old fixture", "one", 7, "inactive"))
+	mock.ExpectQuery("SELECT a.model,k.credential_id").WithArgs(provider, credential).
+		WillReturnRows(sqlmock.NewRows([]string{"upstream", "key", "label", "raw", "protocols", "current", "alias", "school", "name"}).
+			AddRow("one", credential, "new fixture", []byte("{}"), []byte(`["openai_responses"]`), true, false, nil, nil))
+	mock.ExpectQuery("SELECT p.status='active' AND .*COALESCE").WithArgs(provider, credential).
+		WillReturnRows(sqlmock.NewRows([]string{"ready", "versions"}).AddRow(true, []byte(evidence)))
+	mock.ExpectCommit()
+	selector := "restore/" + school.String() + "/" + credential.String()
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, prefix+"/rebind",
+		strings.NewReader(`{"preview":true,"preview_token":"`+selector+`"}`)))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"action":"enable"`) ||
+		!strings.Contains(w.Body.String(), `"preview_token":"`+selector+"/") {
+		t.Fatalf("定向恢复预览响应契约错误: %d", w.Code)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

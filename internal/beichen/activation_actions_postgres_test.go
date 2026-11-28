@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 )
 
@@ -23,8 +24,10 @@ func newActionsPostgres(t *testing.T) (context.Context, *sql.DB, uuid.UUID, uuid
 		t.Skip("需要隔离的本机 nebula_test PostgreSQL")
 	}
 	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil || cfg.Host != "127.0.0.1" || cfg.Database != "nebula_test" || cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
-		t.Fatal("仅允许连接 sslmode=disable 的本机 nebula_test 测试数据库")
+	if err != nil || cfg.Host != "127.0.0.1" ||
+		(cfg.Database != "nebula_test" && !(cfg.Database == "nebula_test_hjc2" && cfg.User == "nebula_qa")) ||
+		cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
+		t.Fatal("仅允许连接指定的本机 PostgreSQL 测试数据库，且须使用 sslmode=disable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	t.Cleanup(cancel)
@@ -150,6 +153,36 @@ CREATE TRIGGER reject_action_fixture BEFORE INSERT ON models FOR EACH ROW EXECUT
 	}
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM models WHERE model_id='unpriced'`).Scan(&unpriced); err != nil || unpriced != 0 {
 		t.Fatalf("无价格项不应创建模型: %d, %v", unpriced, err)
+	}
+}
+
+func TestEnableModelsBatchLeavesAmbiguousSchoolBindingsPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	const upstream = "shared-upstream"
+	schools := []uuid.UUID{uuid.New(), uuid.New()}
+	for i, school := range schools {
+		saveCatalogFixture(t, ctx, db, provider, keys[i], []catalog.ProviderEntry{
+			{ID: upstream, SupportedProtocols: []string{"openai_responses"}},
+		}, nil)
+		execCatalogTestSQL(t, ctx, db, `INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES($1,$2,'shared display name','pending_configuration',1000,now(),now())`, school, []string{"school-a", "school-b"}[i])
+		execCatalogTestSQL(t, ctx, db, `INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,$3,$4,'openai_responses',11,now(),now())`, school, provider, keys[i], upstream)
+	}
+	service := New(db, nil)
+	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{upstream, strings.ToUpper(upstream)})
+	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 || result.Skipped[0].Reason != "route_not_ready" {
+		t.Fatalf("an upstream-only request must not choose between distinct school models: %+v %v", result, err)
+	}
+	var intact bool
+	err = db.QueryRowContext(ctx, `SELECT
+  (SELECT count(*)=2 FROM model_bindings WHERE provider_id=$1 AND upstream_model_name=$2)
+  AND (SELECT count(*)=2 FROM model_bindings b JOIN models m ON m.id=b.model_id
+    WHERE b.provider_id=$1 AND b.upstream_model_name=$2 AND b.adapter='openai_responses' AND b.priority=11
+      AND m.status='pending_configuration' AND ((m.id=$3 AND b.credential_id=$5) OR (m.id=$4 AND b.credential_id=$6)))`,
+		provider, upstream, schools[0], schools[1], keys[0], keys[1]).Scan(&intact)
+	if err != nil || !intact {
+		t.Fatalf("batch request overwrote or published one of the same-name routes: %v", err)
 	}
 }
 

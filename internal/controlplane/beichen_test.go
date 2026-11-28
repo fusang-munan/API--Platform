@@ -5,7 +5,6 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -56,8 +55,6 @@ func TestBeichenRefreshStoresOnlyActualCatalog(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT p.base_url FROM provider_credentials").WithArgs(key.ID, provider.ID, key.UpdatedAt).
 		WillReturnRows(sqlmock.NewRows([]string{"base_url"}).AddRow(provider.BaseURL))
-	mock.ExpectExec(regexp.QuoteMeta("UPDATE provider_model_catalog SET status='inactive',synced_at=$1,updated_at=$1 WHERE credential_id=$2")).
-		WithArgs(syncedAt, key.ID).WillReturnResult(sqlmock.NewResult(0, 1))
 	for _, model := range []struct{ id, protocols string }{
 		{"gemini-test", `["google_gemini_v1beta"]`},
 		{"other-family", `["openai_responses"]`},

@@ -136,9 +136,8 @@ FROM provider_model_catalog WHERE provider_id=$1 AND credential_id=$2`, provider
 	status = http.StatusBadRequest
 	requestManual()
 	for _, result := range checkManual().Results {
-		if result.StatusCode != 400 || result.LastPassedAt == nil ||
-			!result.LastPassedAt.Equal(passes[result.Model]) || !result.CheckedAt.After(passes[result.Model]) {
-			t.Fatalf("failed retry should preserve the same key's success time: %+v", result)
+		if result.StatusCode != 400 || result.LastPassedAt != nil || !result.CheckedAt.After(passes[result.Model]) {
+			t.Fatalf("definitive HTTP feedback should invalidate sticky availability: %+v", result)
 		}
 	}
 	exec("UPDATE provider_credentials SET updated_at = clock_timestamp() WHERE id = $1", gm1)
@@ -161,7 +160,7 @@ FROM provider_model_catalog WHERE provider_id=$1 AND credential_id=$2`, provider
 	}
 	var failures int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM beichen_probe_usage WHERE credential_id=$1 AND job_id IS NOT NULL
-		AND status_code=400 AND error_code='http_error' AND input_tokens IS NULL AND output_tokens IS NULL
+		AND status_code=400 AND error_code='http_400' AND input_tokens IS NULL AND output_tokens IS NULL
 		AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL`, gm1).Scan(&failures); err != nil || failures != 4 {
 		t.Fatalf("failure ledger rows %d, err %v", failures, err)
 	}
@@ -312,7 +311,7 @@ VALUES(gen_random_uuid(),$1,$2,'inactive-key-model',now(),now(),now(),now())`, p
 	for _, result := range recent.Results {
 		if result.ErrorCode != nil {
 			failures++
-			if *result.ErrorCode != "invalid_response" && *result.ErrorCode != "http_error" {
+			if *result.ErrorCode != "invalid_response" && *result.ErrorCode != "credential_invalid" {
 				t.Fatal("unexpected probe failure")
 			}
 		}
@@ -418,5 +417,167 @@ VALUES(gen_random_uuid(),$1,$2,'inactive-key-model',now(),now(),now(),now())`, p
 	}
 	if _, err := s.LatestProbes(context.Background(), keys[3]); domain.ErrorCode(err) != domain.CodeNotFound {
 		t.Fatal("unexpected provider scope")
+	}
+}
+
+func TestBeichenProbeFailureAttributionPostgres(t *testing.T) {
+	ctx, db, provider, _, keys := newActionsPostgres(t)
+	t.Setenv("BEICHEN_PROBE_DAILY_LIMIT", "500")
+	manager := switchTestManager(t)
+	ciphertext, err := manager.EncryptCredential("fixture-attribution")
+	if err != nil {
+		t.Fatal(err)
+	}
+	execCatalogTestSQL(t, ctx, db, "UPDATE provider_credentials SET credential_ciphertext=$1 WHERE provider_id=$2", ciphertext, provider)
+	for i, name := range []string{"recover-429", "denied-403", "missing-404", "temporary-503", "invalid-401"} {
+		key := keys[i%len(keys)]
+		saveCatalogFixture(t, ctx, db, provider, key, []catalog.ProviderEntry{
+			{ID: name, SupportedProtocols: []string{"openai_compatible"}},
+		}, nil)
+		// The 429 recovery and the 401 both use the first Key.
+		if i == len(keys) {
+			saveCatalogFixture(t, ctx, db, provider, key, []catalog.ProviderEntry{
+				{ID: "recover-429", SupportedProtocols: []string{"openai_compatible"}},
+				{ID: name, SupportedProtocols: []string{"openai_compatible"}},
+			}, nil)
+		}
+		execCatalogTestSQL(t, ctx, db, `WITH school AS (
+ INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+ VALUES(gen_random_uuid(),$3::text,$3::text,'active',1000,now(),now()) RETURNING id)
+INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+SELECT gen_random_uuid(),id,$1,$2,$3,'openai_compatible',7,now(),now() FROM school`, provider, key, name)
+		execCatalogTestSQL(t, ctx, db, `INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,duration_ms,checked_at,last_passed_at)
+VALUES($1,$2,$3,'openai_compatible',200,1,statement_timestamp(),statement_timestamp())`, provider, key, name)
+	}
+
+	service := New(db, manager)
+	var mu sync.Mutex
+	calls := map[string]int{}
+	groupRecovered := false
+	service.client.Transport = panelTransport(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && req.URL.Path == modelsPath {
+			return scanResponse(http.StatusOK, `{"data":[{"id":"denied-403","supported_protocols":["openai_compatible"]}],"total":1}`), nil
+		}
+		var payload struct{ Model string }
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		calls[payload.Model]++
+		switch payload.Model {
+		case "recover-429":
+			if calls[payload.Model] == 1 {
+				return scanResponse(http.StatusTooManyRequests, "{}"), nil
+			}
+		case "denied-403":
+			if !groupRecovered {
+				return scanResponse(http.StatusForbidden, `{"error":{"reason":"GROUP_NOT_ALLOWED","message":"fixture private detail"}}`), nil
+			}
+		case "missing-404":
+			return scanResponse(http.StatusNotFound, "{}"), nil
+		case "temporary-503":
+			return scanResponse(http.StatusServiceUnavailable, "{}"), nil
+		case "invalid-401":
+			return scanResponse(http.StatusUnauthorized, "{}"), nil
+		default:
+			return nil, errors.New("unexpected fixture model")
+		}
+		return scanResponse(http.StatusOK, `{"choices":[{}]}`), nil
+	})
+	if _, err := service.RequestProbes(ctx, provider); err != nil {
+		t.Fatal(err)
+	}
+	job, err := service.claimProbeJob(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, _, err := service.listProbeTargets(ctx, job)
+	if err != nil || len(targets) != 5 {
+		t.Fatalf("targets=%d error=%v", len(targets), err)
+	}
+	round := func(ctx context.Context, batch []probeTarget) ([]probeObservation, error) {
+		return service.runProbeRound(ctx, job, batch)
+	}
+	observations, err := round(ctx, targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := retryFailedProbes(ctx, observations, 0, round); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.saveProbeBatch(ctx, job, observations); err != nil {
+		t.Fatal(err)
+	}
+	recent, err := service.LatestProbes(ctx, provider)
+	if err != nil || len(recent.Results) != 5 {
+		t.Fatalf("probe report: %+v error=%v", recent, err)
+	}
+	wantCodes := map[string]string{
+		"recover-429": "", "denied-403": "GROUP_NOT_ALLOWED", "missing-404": "endpoint_unsupported",
+		"temporary-503": "upstream_error", "invalid-401": "credential_invalid",
+	}
+	for _, result := range recent.Results {
+		var code string
+		if result.ErrorCode != nil {
+			code = *result.ErrorCode
+		}
+		if code != wantCodes[result.Model] {
+			t.Fatalf("%s attribution = %q, want %q", result.Model, code, wantCodes[result.Model])
+		}
+	}
+	if calls["recover-429"] != 2 || calls["temporary-503"] != 3 ||
+		calls["denied-403"] != 1 || calls["missing-404"] != 1 || calls["invalid-401"] != 1 {
+		t.Fatalf("retries did not match the error classes: %v", calls)
+	}
+	state := func() map[string]catalog.ModelCapability {
+		t.Helper()
+		view, err := catalog.ReadBeichenCapabilities(ctx, db, provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		results := map[string]catalog.ModelCapability{}
+		for _, row := range view.Capabilities {
+			if row.CredentialID != nil {
+				results[row.Model] = row
+			}
+		}
+		return results
+	}
+	current := state()
+	if current["recover-429"].Availability != "available" || current["temporary-503"].Availability != "degraded" ||
+		current["missing-404"].Availability != "maintenance" || current["invalid-401"].Availability != "maintenance" ||
+		current["denied-403"].CatalogState != "group_blocked" || current["denied-403"].BindingState != "invalid" {
+		t.Fatal("availability did not distinguish the recovered, temporary, and definitive results")
+	}
+	overview, err := service.Overview(ctx, provider, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantReason := map[string]string{"missing-404": "上游未提供该协议端点", "temporary-503": "HTTP 503", "invalid-401": "未通过上游认证"}
+	for _, row := range overview.ModelCatalog {
+		if reason := wantReason[row.Model]; reason != "" && !strings.Contains(row.ModelAvailability.AvailabilityReason, reason) {
+			t.Fatalf("%s missing specific availability explanation: %s", row.Model, row.ModelAvailability.AvailabilityReason)
+		}
+	}
+	if err := service.RescanCatalog(ctx, provider, keys[1]); err != nil || state()["denied-403"].CatalogState != "group_blocked" {
+		t.Fatalf("a catalog read should not clear its generation probe's group denial: %v", err)
+	}
+	mu.Lock()
+	groupRecovered = true
+	mu.Unlock()
+	for _, target := range targets {
+		if target.model == "denied-403" {
+			observations, err = round(ctx, []probeTarget{target})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.saveProbeBatch(ctx, job, observations); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if row := state()["denied-403"]; row.Availability != "available" || row.BindingState != "ready" {
+		t.Fatal("a passing generation probe should clear its group denial")
 	}
 }

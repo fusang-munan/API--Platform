@@ -51,21 +51,25 @@ WHERE credential_id=$1 AND status='active'`, credential).Scan(&names); err != ni
 
 func TestBeichenScanRobustnessKeySnapshotPostgres(t *testing.T) {
 	ctx, db, s, job := newKeyScanFixture(t)
-	const full = `{"data":[{"id":"m1"},{"id":"m2"},{"id":"m3"},{"id":"m4"}]}`
-	const empty = `{"data":[]}`
-	const two = `{"data":[{"id":"m1"},{"id":"m2"}]}`
+	const full = `{"data":[{"id":"m1"},{"id":"m2"},{"id":"m3"},{"id":"m4"},{"id":"m5"},{"id":"m6"},{"id":"m7"},{"id":"m8"}],"total":8}`
+	const seven = `{"data":[{"id":"m1"},{"id":"m2"},{"id":"m3"},{"id":"m4"},{"id":"m5"},{"id":"m6"},{"id":"m7"}],"total":7}`
+	const replace = `{"data":[{"id":"m1"},{"id":"m2"},{"id":"m3"},{"id":"m4"},{"id":"m5"},{"id":"m6"},{"id":"m7"},{"id":"m9"}],"total":8}`
 	body := full
+	secondPageReads := 0
 	s.client.Transport = panelTransport(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path != modelsPath {
 			t.Errorf("unexpected URL path %s", r.URL.Path)
 			return nil, errors.New("unexpected request")
 		}
-		if r.URL.Query().Has("cursor") {
-			return scanResponse(http.StatusBadGateway, ""), nil
+		if r.URL.Query().Has("pageToken") {
+			secondPageReads++
+			resp := scanResponse(http.StatusTooManyRequests, "")
+			resp.Header.Set("Retry-After", "120")
+			return resp, nil
 		}
 		return scanResponse(http.StatusOK, body), nil
 	})
-	run := func(want string, reason string) {
+	run := func(want string, reason string) time.Time {
 		t.Helper()
 		err := s.RescanCatalog(ctx, job.provider, job.credential)
 		if (err != nil) != (reason != "") {
@@ -75,33 +79,87 @@ func TestBeichenScanRobustnessKeySnapshotPostgres(t *testing.T) {
 			t.Errorf("active models: %q, want %q", got, want)
 		}
 		var failure sql.NullString
-		if err := db.QueryRowContext(ctx, "SELECT last_error FROM beichen_datasets WHERE credential_id=$1 AND kind='catalog'", job.credential).Scan(&failure); err != nil {
+		var success time.Time
+		if err := db.QueryRowContext(ctx, "SELECT last_error,last_success FROM beichen_datasets WHERE credential_id=$1 AND kind='catalog'", job.credential).Scan(&failure, &success); err != nil {
 			t.Fatal(err)
 		}
 		if reason == "" && failure.Valid || reason != "" && !strings.Contains(failure.String, reason) {
 			t.Errorf("stored scan failure: %q, want %q", failure.String, reason)
 		}
+		return success
 	}
-	const old = "m1,m2,m3,m4"
+	const old = "m1,m2,m3,m4,m5,m6,m7,m8"
+	const retained = old + ",m9"
+	lastSuccess := run(old, "")
+	execCatalogTestSQL(t, ctx, db, `INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES(gen_random_uuid(),'m8','published','active',1000,now(),now())`)
+	execCatalogTestSQL(t, ctx, db, `INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+SELECT gen_random_uuid(),id,$1,$2,'m8','openai_compatible',5,now(),now() FROM models WHERE model_id='m8'`, job.provider, job.credential)
+	body = `{"data":[{"id":"partial"}],"nextPageToken":"second"}`
+	if got := run(old, "第 2 页"); !got.Equal(lastSuccess) || secondPageReads != 1 {
+		t.Fatalf("429 advanced the accepted listing or retried immediately: last_success=%v reads=%d", got, secondPageReads)
+	}
+	body = `{"data":[{"id":"m1"}]}`
+	for range 3 {
+		run(old, "")
+	}
+	body = `{"data":[]}`
+	for range 3 {
+		run(old, "")
+	}
+	body = seven
 	run(old, "")
-	body = empty
-	run(old, "1/3")
-	body = `{"data":[{"id":"m1"}],"next_cursor":"page2"}`
-	run(old, "第 2 页")
-	body = two
-	run(old, "1/3")
-	body = `{"data":[{"id":"m1"},{"id":"m3"}]}`
-	run(old, "1/3")
-	body = two
-	run(old, "1/3")
-	body = `{"data":[{"id":"M2"},{"id":"m1"}]}`
-	run(old, "2/3")
-	body = two
-	run("m1,m2", "")
-	body = empty
-	run("m1,m2", "1/3")
-	run("m1,m2", "2/3")
-	run("", "")
+	body = full
+	run(old, "") // A fresh sighting resets confirmation for m8.
+	body = replace
+	run(retained, "") // 8 to 8 with changed membership still retains the published entry.
+	body = seven
+	run(retained, "")
+	body = replace
+	run("m1,m2,m3,m4,m5,m6,m7,m9", "") // Only m8 has been absent three complete times.
+	var status string
+	if err := db.QueryRowContext(ctx, "SELECT status FROM model_bindings WHERE provider_id=$1 AND credential_id=$2", job.provider, job.credential).Scan(&status); err != nil || status != "active" {
+		t.Fatalf("catalog removal changed the teacher's binding: %s %v", status, err)
+	}
+	newKey := uuid.New()
+	execCatalogTestSQL(t, ctx, db, `INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
+SELECT $1,provider_id,'new fixture',credential_ciphertext,now(),now() FROM provider_credentials WHERE id=$2`, newKey, job.credential)
+	body = `{"data":[]}`
+	if err := s.RescanCatalog(ctx, job.provider, newKey); err != nil {
+		t.Fatal(err)
+	}
+	if readScanModels(t, ctx, db, newKey) != "" || readScanModels(t, ctx, db, job.credential) != "m1,m2,m3,m4,m5,m6,m7,m9" {
+		t.Fatal("the first empty snapshot affected another Key")
+	}
+}
+
+func TestBeichenScanRobustnessLongRetryAfterSchedulesNextBillingRoundPostgres(t *testing.T) {
+	ctx, db, service, job := newKeyScanFixture(t)
+	saveCatalogFixture(t, ctx, db, job.provider, job.credential, []catalog.ProviderEntry{{ID: "last-good"}}, nil)
+	secondPageReads := 0
+	service.client.Transport = panelTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != modelsPath {
+			return nil, errors.New("billing fixture unavailable")
+		}
+		if r.URL.Query().Has("page_token") {
+			secondPageReads++
+			resp := scanResponse(http.StatusTooManyRequests, "")
+			resp.Header.Set("Retry-After", "3600")
+			return resp, nil
+		}
+		return scanResponse(http.StatusOK, `{"data":[{"id":"first-page-only"}],"next_page_token":"second"}`), nil
+	})
+	job.kind = "billing"
+	if busy, err := service.runJob(ctx, job, false); busy || !errors.Is(err, catalog.BeichenHTTPStatus(http.StatusTooManyRequests)) {
+		t.Fatalf("expected an incomplete catalog observation: busy=%t error=%v", busy, err)
+	}
+	var scheduled bool
+	err := db.QueryRowContext(ctx, `
+SELECT next_attempt>=clock_timestamp()+interval '59 minutes' AND lease_id IS NULL
+FROM beichen_datasets WHERE credential_id=$1 AND kind='billing'`, job.credential).Scan(&scheduled)
+	if err != nil || !scheduled || secondPageReads != 1 || readScanModels(t, ctx, db, job.credential) != "last-good" {
+		t.Fatalf("long Retry-After lost the previous snapshot or did not defer the scheduled retry: %v", err)
+	}
 }
 
 func TestKeyCatalogGroupDenialRecoveryPostgres(t *testing.T) {
@@ -109,7 +167,7 @@ func TestKeyCatalogGroupDenialRecoveryPostgres(t *testing.T) {
 	const model = "gpt-fixture-group-denial"
 	const route = `{"id":"gpt-fixture-group-denial","supported_protocols":["openai_responses"]}`
 	const listed = `{"data":[` + route + `,{"id":"m2"},{"id":"m3"},{"id":"m4"}]}`
-	const shrunk = `{"data":[` + route + `,{"id":"m2"}]}`
+	const shrunk = `{"data":[` + route + `,{"id":"m2"}],"total":2}`
 	const denied = `{"error":{"type":"GROUP_NOT_ALLOWED","message":"private upstream detail"}}`
 	const other = `{"error":{"type":"IP_NOT_ALLOWED","message":"GROUP_NOT_ALLOWED"}}`
 	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
@@ -212,20 +270,20 @@ SELECT EXISTS (
 	}
 	assertDenialStored(true)
 	status, body = http.StatusOK, shrunk
-	if err := rescan(); err == nil || !strings.Contains(err.Error(), "1/3") {
-		t.Fatalf("expected a successful response with shrink confirmation pending: %v", err)
+	if err := rescan(); err != nil {
+		t.Fatalf("positive entries should refresh while missing entries are being confirmed: %v", err)
 	}
 	assertDenialStored(false)
-	if row := groupState(); row.GroupStatus != "assigned" || row.CatalogState != "catalog_stale" || row.BindingState != "unverified" {
-		t.Fatalf("recovered group should retain the pending catalog separately: %+v", row)
+	if row := groupState(); row.GroupStatus != "assigned" || row.CatalogState != "key_listed" || row.BindingState != "ready" {
+		t.Fatalf("recovered group should recognize the current positive evidence: %+v", row)
 	}
 	row = overviewRow()
-	if !row.BoundCatalogPending || len(row.BoundRoutes) != 1 || row.BoundRoutes[0].GroupStatus != "assigned" ||
-		row.BindingIssue == nil || row.BindingIssue.Code != "catalog_stale" {
-		t.Fatalf("teacher overview should now show pending catalog verification: %+v", row)
+	if row.BoundCatalogPending || len(row.BoundRoutes) != 1 || row.BoundRoutes[0].GroupStatus != "assigned" ||
+		row.BindingIssue != nil {
+		t.Fatalf("teacher overview should recognize the refreshed route: %+v", row)
 	}
-	if !lastSuccess().Equal(savedAt) || readScanModels(t, ctx, db, job.credential) != model+",m2,m3,m4" {
-		t.Fatal("pending shrink changed the accepted directory or its success time")
+	if !lastSuccess().After(savedAt) || readScanModels(t, ctx, db, job.credential) != model+",m2,m3,m4" {
+		t.Fatal("pending removals should retain missing models while advancing successful observations")
 	}
 
 	status, body = http.StatusOK, listed
