@@ -29,6 +29,7 @@ type activationModel struct {
 	defaults           map[string][]activationCandidate
 	schools            map[uuid.UUID]*activationSchool
 	multiSchoolTargets bool
+	aliasConflict      bool
 	diagnostics        map[string]int
 }
 
@@ -209,6 +210,7 @@ ORDER BY lower(k.model_id::text),c.id`
 	var models []*activationModel
 	index := map[string]*activationModel{}
 	diagnostics := map[string]map[string]int{}
+	conflictTargets := map[string][][2]uuid.UUID{}
 	diagnosticsFor := func(source string) map[string]int {
 		name := strings.ToLower(source)
 		if diagnostics[name] == nil {
@@ -259,6 +261,10 @@ ORDER BY lower(k.model_id::text),c.id`
 		}
 		if aliasTargetID == nil && upstreamTargetID == nil {
 			diagnostic[diagnosticTargetMissing]++
+		}
+		if aliasTargetID != nil && upstreamTargetID != nil && *aliasTargetID != *upstreamTargetID {
+			name := strings.ToLower(modelID)
+			conflictTargets[name] = append(conflictTargets[name], [2]uuid.UUID{*aliasTargetID, *upstreamTargetID})
 		}
 		if available && rate != nil {
 			n := json.Number(*rate)
@@ -411,6 +417,15 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 	}
 	if err := bound.Err(); err != nil {
 		return nil, err
+	}
+	for _, m := range models {
+		for _, pair := range conflictTargets[strings.ToLower(m.name)] {
+			alias, upstream := m.schools[pair[0]], m.schools[pair[1]]
+			if alias != nil && upstream != nil && alias.selectable() && upstream.selectable() {
+				m.aliasConflict = true
+				break
+			}
+		}
 	}
 	// A same-name retired school is not a second activation target. Let the
 	// unique live target receive candidates whose old mapping is nil or stale.
@@ -917,6 +932,7 @@ func selectBatchActivation(ctx context.Context, tx *sql.Tx, provider uuid.UUID, 
 			target = school
 		}
 		maps.Copy(combined.schools, model.schools)
+		combined.aliasConflict = combined.aliasConflict || model.aliasConflict
 		for key, value := range model.diagnostics {
 			combined.diagnostics[key] += value
 		}
@@ -955,6 +971,9 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 	if target == nil {
 		blocker := m.targetBlocker("")
 		return skip("route_not_ready", blocker.Code, blocker.Message, m.blockerDiagnostics(blocker))
+	}
+	if m.aliasConflict {
+		return skip("route_not_ready", blockerMultiSchool, multiSchoolMessage)
 	}
 	if seenSchools[target.id] {
 		return skip("duplicate_school_model", "", "本批已处理同一个校内模型 ID")
@@ -1026,6 +1045,9 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 	if target == nil {
 		blocker := m.targetBlocker(school)
 		return uuid.Nil, activationBlockerError(blocker, m.blockerDiagnostics(blocker))
+	}
+	if m.aliasConflict {
+		return uuid.Nil, activationBlockerError(CatalogBlocker{blockerMultiSchool, multiSchoolMessage}, nil)
 	}
 	plan := m.plan(target)
 	if plan.blocker.Code != blockerAuthFailed && m.alreadyPublished(target) {

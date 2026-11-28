@@ -1,6 +1,7 @@
 package beichen
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/google/uuid"
@@ -49,20 +50,45 @@ FROM models m WHERE m.id=$1`, school, f.provider, f.keys[0], firstConnectUpstrea
 }
 
 func TestEnableModelAliasAndUpstreamDifferentLiveTargetsPostgres(t *testing.T) {
-	f := newFirstConnectFixture(t)
-	upstreamSchool := f.addSchoolModel(t, firstConnectUpstream, "active")
-	aliasSchool := f.addSchoolModel(t, "alias-live-school", "active")
-	f.configureProductionBothCatalog(t)
-	f.putCatalogAlias(t, f.keys[0], "alias-live-school")
+	for _, status := range []string{"active", "pending_configuration"} {
+		t.Run(status, func(t *testing.T) {
+			f := newFirstConnectFixture(t)
+			upstreamSchool := f.addSchoolModel(t, firstConnectUpstream, status)
+			aliasSchool := f.addSchoolModel(t, "alias-live-school", status)
+			f.configureProductionBothCatalog(t)
+			f.putCatalogAlias(t, f.keys[0], "alias-live-school")
 
-	f.assertEnableRejected(t, "", blockerMultiSchool, multiSchoolMessage)
-	f.assertSkipped(t, "route_not_ready", blockerMultiSchool, multiSchoolMessage, firstConnectUpstream)
-	var bindings, audits int
-	if err := f.db.QueryRowContext(f.ctx, `SELECT
+			view, err := f.service.Overview(f.ctx, f.provider, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			seen := map[uuid.UUID]bool{}
+			for _, row := range view.ModelCatalog {
+				if row.SchoolModelID == nil || (*row.SchoolModelID != upstreamSchool && *row.SchoolModelID != aliasSchool) {
+					continue
+				}
+				seen[*row.SchoolModelID] = true
+				if row.CanEnable || row.Activation != "blocked" ||
+					!slices.Contains(row.Blockers, CatalogBlocker{blockerMultiSchool, multiSchoolMessage}) {
+					t.Fatalf("%s target escaped the alias conflict: %+v", status, row)
+				}
+			}
+			if !seen[upstreamSchool] || !seen[aliasSchool] {
+				t.Fatalf("expected both conflicted targets in overview: %+v", view.ModelCatalog)
+			}
+
+			f.assertEnableRejected(t, "", blockerMultiSchool, multiSchoolMessage)
+			f.assertSkipped(t, "route_not_ready", blockerMultiSchool, multiSchoolMessage, firstConnectUpstream)
+			f.assertEnableRejected(t, aliasSchool.String(), blockerMultiSchool, multiSchoolMessage)
+			f.assertSkipped(t, "route_not_ready", blockerMultiSchool, multiSchoolMessage, aliasSchool.String())
+			var bindings, audits int
+			if err := f.db.QueryRowContext(f.ctx, `SELECT
  (SELECT count(*) FROM model_bindings WHERE model_id IN ($1,$2) AND provider_id=$3),
  (SELECT count(*) FROM model_multiplier_audits WHERE model_id IN ($1,$2))`, upstreamSchool, aliasSchool, f.provider).
-		Scan(&bindings, &audits); err != nil || bindings != 0 || audits != 0 {
-		t.Fatalf("ambiguous alias changed a target: bindings=%d audits=%d err=%v", bindings, audits, err)
+				Scan(&bindings, &audits); err != nil || bindings != 0 || audits != 0 {
+				t.Fatalf("ambiguous alias changed a target: bindings=%d audits=%d err=%v", bindings, audits, err)
+			}
+		})
 	}
 }
 
