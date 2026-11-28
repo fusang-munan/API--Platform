@@ -144,12 +144,25 @@ func TestBeichenActionsNotFoundAndBatchEnvelope(t *testing.T) {
 	}
 	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM providers p`).WithArgs(provider).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT k.model_id::text,k.raw_entry`).WithArgs(provider, "absent").WillReturnRows(sqlmock.NewRows([]string{"model"}))
+	mock.ExpectQuery(`SELECT k.model_id::text,k.raw_entry`).WithArgs(provider, "absent", nil).WillReturnRows(sqlmock.NewRows([]string{"model"}))
 	mock.ExpectRollback()
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest("POST", "/providers/"+provider.String()+"/enable-batch", strings.NewReader(`{"models":["absent","ABSENT"]}`)))
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"enabled":[]`) || !strings.Contains(w.Body.String(), `"reason":"not_found"`) || strings.Count(w.Body.String(), `"model":`) != 1 {
 		t.Fatalf("批量跳过响应错误: %d, %s", w.Code, w.Body.String())
+	}
+	schoolID := uuid.New()
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM providers p`).WithArgs(provider).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT k.model_id::text,k.raw_entry`).WithArgs(provider, "", schoolID).WillReturnRows(sqlmock.NewRows([]string{"model"}))
+	mock.ExpectQuery(`SELECT n.upstream::text,m.id`).WithArgs(provider, "", schoolID).WillReturnRows(sqlmock.NewRows([]string{"model"}))
+	mock.ExpectRollback()
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest("POST", "/providers/"+provider.String()+"/enable-batch",
+		strings.NewReader(`{"models":["`+schoolID.String()+`"]}`)))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"model":"`+schoolID.String()+`"`) ||
+		!strings.Contains(w.Body.String(), `"reason":"not_found"`) {
+		t.Fatalf("批量接口应接受校内 UUID 并按其查找模型: %d, %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

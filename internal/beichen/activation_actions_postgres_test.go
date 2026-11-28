@@ -165,13 +165,16 @@ func TestEnableModelsBatchLeavesAmbiguousSchoolBindingsPostgres(t *testing.T) {
 			{ID: upstream, SupportedProtocols: []string{"openai_responses"}},
 		}, nil)
 		execCatalogTestSQL(t, ctx, db, `INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
-VALUES($1,$2,'shared display name','pending_configuration',1000,now(),now())`, school, []string{"school-a", "school-b"}[i])
+VALUES($1,$2,'shared display name','pending_configuration',1000,now(),now())`, school, []string{upstream, "school-b"}[i])
 		execCatalogTestSQL(t, ctx, db, `INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
 VALUES(gen_random_uuid(),$1,$2,$3,$4,'openai_responses',11,now(),now())`, school, provider, keys[i], upstream)
+		execCatalogTestSQL(t, ctx, db, `INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+VALUES($1,$2,'school','manual','teacher',$3,1000000,2000000)`, keys[i], upstream, actor)
 	}
 	service := New(db, nil)
 	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{upstream, strings.ToUpper(upstream)})
-	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 || result.Skipped[0].Reason != "route_not_ready" {
+	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
+		!strings.Contains(result.Skipped[0].Message, "对应多个校内模型") {
 		t.Fatalf("an upstream-only request must not choose between distinct school models: %+v %v", result, err)
 	}
 	var intact bool
@@ -183,6 +186,138 @@ VALUES(gen_random_uuid(),$1,$2,$3,$4,'openai_responses',11,now(),now())`, school
 		provider, upstream, schools[0], schools[1], keys[0], keys[1]).Scan(&intact)
 	if err != nil || !intact {
 		t.Fatalf("batch request overwrote or published one of the same-name routes: %v", err)
+	}
+	result, err = service.EnableModelsBatch(ctx, provider, actor, []string{schools[0].String(), schools[1].String()})
+	if err != nil || len(result.Enabled) != 2 || len(result.Skipped) != 0 ||
+		result.Enabled[0].ModelID != schools[0] || result.Enabled[1].ModelID != schools[1] {
+		t.Fatalf("the two explicit school IDs must enable independently: %+v %v", result, err)
+	}
+	err = db.QueryRowContext(ctx, `SELECT count(*)=2 FROM model_bindings b JOIN models m ON m.id=b.model_id
+WHERE b.provider_id=$1 AND b.upstream_model_name=$2 AND b.adapter='openai_responses' AND b.priority=11
+  AND m.status='active' AND ((m.id=$3 AND b.credential_id=$5) OR (m.id=$4 AND b.credential_id=$6))`,
+		provider, upstream, schools[0], schools[1], keys[0], keys[1]).Scan(&intact)
+	if err != nil || !intact {
+		t.Fatalf("enabling both school IDs did not preserve separate bindings: %v", err)
+	}
+}
+
+func TestEnableModelsBatchScopesCandidateRoutesToSchoolIDsPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	service := New(db, nil)
+	const shared, extra, ambiguous = "same-alias", "another-alias", "ambiguous-route"
+	first, second, unresolved := uuid.New(), uuid.New(), uuid.New()
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
+	exec(`INSERT INTO models(id,model_id,display_name,status,created_at,updated_at)
+VALUES($1,'school-one','shared name','pending_configuration',now(),now()),
+      ($2,'school-two','shared name','pending_configuration',now(),now()),
+      ($3,$4::text,$4::text,'pending_configuration',now(),now())`, first, second, unresolved, ambiguous)
+	for i, name := range []string{"school-one", "school-two"} {
+		key := keys[i]
+		saveCatalogFixture(t, ctx, db, provider, key, []catalog.ProviderEntry{
+			{ID: shared, SupportedProtocols: []string{"openai_responses"}},
+			{ID: ambiguous, SupportedProtocols: []string{"openai_responses"}},
+		}, nil)
+		if err := service.PutModelAlias(ctx, provider, actor, &key, shared, &name); err != nil {
+			t.Fatal(err)
+		}
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+VALUES($1,$2,'school','manual','teacher',$4,1000000,1000000),
+      ($1,$3,'school','manual','teacher',$4,1000000,1000000)`, key, shared, ambiguous, actor)
+	}
+	view, err := service.Overview(ctx, provider, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[uuid.UUID]uuid.UUID{first: keys[0], second: keys[1]}
+	for _, row := range view.ModelCatalog {
+		if row.Model != shared {
+			continue
+		}
+		if row.SchoolModelID == nil || len(row.PreferredRoutes) != 1 || !row.CanEnable ||
+			row.PreferredRoutes[0].CredentialID == nil || *row.PreferredRoutes[0].CredentialID != want[*row.SchoolModelID] {
+			t.Fatalf("candidate used a Key for a different school model: %+v", row)
+		}
+		delete(want, *row.SchoolModelID)
+	}
+	if len(want) != 0 {
+		t.Fatal("missing separately scoped candidate rows")
+	}
+
+	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{shared, unresolved.String(), first.String(), second.String()})
+	if err != nil || len(result.Enabled) != 2 || len(result.Skipped) != 2 ||
+		result.Enabled[0].ModelID != first || result.Enabled[1].ModelID != second ||
+		!strings.Contains(result.Skipped[0].Message, "对应多个校内模型") ||
+		!strings.Contains(result.Skipped[1].Message, "同一协议有多个候选线路") {
+		t.Fatalf("unexpected batch selection results: %+v %v", result, err)
+	}
+	// A second upstream name pointing to the same school ID is a duplicate,
+	// even though it is a distinct name in the request.
+	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,supported_protocols,last_seen_at,synced_at,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,$3,ARRAY['openai_responses'],now(),now(),now(),now())`, provider, keys[1], extra)
+	school := "school-one"
+	if err := service.PutModelAlias(ctx, provider, actor, &keys[1], extra, &school); err != nil {
+		t.Fatal(err)
+	}
+	result, err = service.EnableModelsBatch(ctx, provider, actor, []string{first.String(), extra})
+	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 2 ||
+		result.Skipped[0].Reason != "already_active" || result.Skipped[1].Reason != "duplicate_school_model" {
+		t.Fatalf("same school must be processed once: %+v %v", result, err)
+	}
+	// The first school's pinned Key is unavailable. The other Key's same-name
+	// listing and alias must not repair or replace that binding during enable.
+	exec("UPDATE models SET status='inactive' WHERE id=$1", first)
+	exec("UPDATE provider_model_catalog SET status='inactive' WHERE credential_id=$1 AND model_id=$2", keys[0], shared)
+	result, err = service.EnableModelsBatch(ctx, provider, actor, []string{first.String()})
+	if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 1 ||
+		!strings.Contains(result.Skipped[0].Message, "原绑定线路尚未就绪") {
+		t.Fatalf("unavailable pinned route should require a teacher rebind: %+v %v", result, err)
+	}
+	if id, err := service.EnableModel(ctx, provider, actor, shared, school); id != uuid.Nil || domain.ErrorCode(err) != domain.CodeValidation {
+		t.Fatalf("single enable should also keep the pinned route: %s %v", id, err)
+	}
+	var intact bool
+	err = db.QueryRowContext(ctx, `SELECT count(*)=2 FROM model_bindings b JOIN models m ON m.id=b.model_id
+WHERE b.provider_id=$1 AND b.upstream_model_name=$2 AND b.adapter='openai_responses' AND b.status='active'
+  AND ((m.id=$3 AND m.status='inactive' AND b.credential_id=$5) OR (m.id=$4 AND m.status='active' AND b.credential_id=$6))`,
+		provider, shared, first, second, keys[0], keys[1]).Scan(&intact)
+	if err != nil || !intact {
+		t.Fatalf("published selectors did not preserve independent routes: %v", err)
+	}
+}
+
+func TestConcurrentEnableKeepsOneBindingPerProtocolPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	const model = "concurrent-new"
+	saveCatalogFixture(t, ctx, db, provider, keys[0], []catalog.ProviderEntry{
+		{ID: model, SupportedProtocols: []string{"openai_responses"}},
+	}, nil)
+	execCatalogTestSQL(t, ctx, db, `INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+VALUES($1,$2,'school','manual','teacher',$3,1000000,1000000)`, keys[0], model, actor)
+	service := New(db, nil)
+	type outcome struct {
+		id  uuid.UUID
+		err error
+	}
+	start := make(chan struct{})
+	results := make(chan outcome, 2)
+	for range 2 {
+		go func() {
+			<-start
+			id, err := service.EnableModel(ctx, provider, actor, model, "")
+			results <- outcome{id, err}
+		}()
+	}
+	close(start)
+	a, b := <-results, <-results
+	if a.err != nil || b.err != nil || a.id == uuid.Nil || a.id != b.id {
+		t.Fatalf("concurrent enable did not converge on the same school ID: %+v %+v", a, b)
+	}
+	var bindings, audits int
+	err := db.QueryRowContext(ctx, `SELECT
+  (SELECT count(*) FROM model_bindings WHERE model_id=$1 AND provider_id=$2 AND adapter='openai_responses'),
+  (SELECT count(*) FROM model_multiplier_audits WHERE model_id=$1)`, a.id, provider).Scan(&bindings, &audits)
+	if err != nil || bindings != 1 || audits != 1 {
+		t.Fatalf("expected one binding and one publication audit, got %d and %d (%v)", bindings, audits, err)
 	}
 }
 

@@ -7,16 +7,23 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
+	"github.com/starprince1234/Nebula-api/internal/dataplane"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
+	entmodel "github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/model"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 )
 
 func TestManualProbeRefreshesRecentFailureOnItsCatalogKeyPostgres(t *testing.T) {
@@ -580,4 +587,158 @@ VALUES($1,$2,$3,'openai_compatible',200,1,statement_timestamp(),statement_timest
 	if row := state()["denied-403"]; row.Availability != "available" || row.BindingState != "ready" {
 		t.Fatal("a passing generation probe should clear its group denial")
 	}
+}
+
+func TestBindingRouteBlocksConfirmedBeichenFailuresPostgres(t *testing.T) {
+	ctx, db, provider, actor, keys := newActionsPostgres(t)
+	client := ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	manager := switchTestManager(t)
+	ciphertext, err := manager.EncryptCredential("fixture-route-resolution")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const upstream = "routed-model"
+	key, alternate := keys[1], keys[0] // A legacy binding sorts this Key first.
+	for _, id := range []uuid.UUID{key, alternate} {
+		execCatalogTestSQL(t, ctx, db, "UPDATE provider_credentials SET credential_ciphertext=$2 WHERE id=$1", id, ciphertext)
+		saveCatalogFixture(t, ctx, db, provider, id, []catalog.ProviderEntry{
+			{ID: upstream, SupportedProtocols: []string{"openai_responses", "openai_compatible"}},
+		}, nil)
+	}
+	binding := ent.ModelBinding{ProviderID: provider, CredentialID: &key, UpstreamModelName: " Routed-Model ",
+		Adapter: modelbinding.AdapterOpenaiResponses, Status: modelbinding.StatusActive}
+	const school = "school-routed"
+	modelID := uuid.New()
+	execCatalogTestSQL(t, ctx, db, `INSERT INTO models(id,model_id,display_name,status,credit_multiplier_milli,created_at,updated_at)
+VALUES($1,$2::text,$2::text,'active',1000,now(),now())`, modelID, school)
+	execCatalogTestSQL(t, ctx, db, `INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
+VALUES(gen_random_uuid(),$1,$2,$3,$4,'openai_responses',7,now(),now())`, modelID, provider, key, binding.UpstreamModelName)
+	var project uuid.UUID
+	if err := db.QueryRowContext(ctx, `
+WITH org AS (INSERT INTO organizations(id,name,created_at,updated_at)
+  VALUES(gen_random_uuid(),'route fixture',now(),now()) RETURNING id)
+INSERT INTO projects(id,organization_id,name,created_at,updated_at)
+SELECT gen_random_uuid(),id,'fixture project',now(),now() FROM org RETURNING id`).Scan(&project); err != nil {
+		t.Fatal(err)
+	}
+	const studentKey = "fixture-route-student-key"
+	execCatalogTestSQL(t, ctx, db, `
+WITH issued AS (INSERT INTO api_keys(id,owner_user_id,project_id,name,status,key_hash,key_prefix,claimed_at,created_at,updated_at)
+  VALUES(gen_random_uuid(),$1,$2,'fixture','active',$3,'fixture',now(),now(),now()) RETURNING id)
+INSERT INTO api_key_models(id,api_key_id,model_id,created_at) SELECT gen_random_uuid(),id,$4,now() FROM issued`,
+		actor, project, manager.HashAPIKey(studentKey), modelID)
+	// Denied routes stop before reserving usage or opening an upstream connection.
+	gateway := dataplane.NewGateway(client, nil, nil, manager, dataplane.Config{MaxRequestBytes: 4096})
+	checkRequestBlocked := func() {
+		t.Helper()
+		body := strings.NewReader(`{"model":"` + school + `","input":"fixture"}`)
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", body).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer "+studentKey)
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		gateway.ServeHTTP(response, req)
+		if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "model_unavailable") {
+			t.Fatalf("gateway should reject the authorized model's blocked route: HTTP %d", response.Code)
+		}
+	}
+	check := func(route *ent.ModelBinding, want uuid.UUID) {
+		t.Helper()
+		ready, err := catalog.BindingRouteReady(ctx, client, route)
+		if err != nil || ready != (want != uuid.Nil) {
+			t.Fatalf("readiness=%t want=%t (%v)", ready, want != uuid.Nil, err)
+		}
+		credential, got, err := catalog.ResolveBindingCredential(ctx, client, manager, route)
+		if err != nil || got != want || (credential != "") != (want != uuid.Nil) {
+			t.Fatalf("gateway resolved Key ID %s, want %s (%v)", got, want, err)
+		}
+	}
+	recordProbe := func(code int, failure bool) {
+		t.Helper()
+		execCatalogTestSQL(t, ctx, db, `
+INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,error_code,duration_ms,checked_at,last_passed_at)
+VALUES($1,$2,$3,'openai_responses',$4,CASE WHEN $5 THEN 'http_error' END,1,statement_timestamp(),statement_timestamp())
+ON CONFLICT(provider_id,credential_id,model,protocol) DO UPDATE
+SET status_code=EXCLUDED.status_code,error_code=EXCLUDED.error_code,checked_at=EXCLUDED.checked_at`,
+			provider, key, upstream, code, failure)
+	}
+	checkStudent := func(availability, state, reason string) {
+		t.Helper()
+		protocols, err := catalog.LoadPublishedProtocols(ctx, client, []uuid.UUID{modelID}, manager)
+		if err != nil {
+			t.Fatal(err)
+		}
+		channels, err := ReadStudentModelCatalog(ctx, db, []string{school})
+		if err != nil {
+			t.Fatal(err)
+		}
+		view := catalog.SummarizeModelAvailability(school, entmodel.StatusActive, protocols[modelID])
+		view.SetStudentState(school, entmodel.StatusActive, channels[school])
+		if view.Availability != availability || view.AvailabilityState != state || !strings.Contains(view.AvailabilityReason, reason) {
+			t.Fatalf("student state = %+v, want %s/%s with %q", view, availability, state, reason)
+		}
+	}
+	check(&binding, key)
+	recordProbe(401, true)
+	check(&binding, uuid.Nil)
+	checkRequestBlocked()
+	checkStudent("maintenance", "probe_failed", "未通过上游认证")
+	other := binding
+	other.CredentialID = &alternate
+	check(&other, alternate)
+	other = binding
+	other.Adapter = modelbinding.AdapterOpenaiCompatible
+	check(&other, key)
+	legacy := binding
+	legacy.CredentialID = nil
+	check(&legacy, uuid.Nil)
+	for _, status := range []int{403, 404, 429, 503, 200} {
+		recordProbe(status, status != 200)
+		expected := key
+		if status == 403 {
+			expected = uuid.Nil
+		}
+		check(&binding, expected)
+		switch status {
+		case 404:
+			checkStudent("maintenance", "probe_failed", "HTTP 404")
+		case 429, 503:
+			checkStudent("degraded", "degraded", "可能请求失败")
+		}
+	}
+	// The directory/group marker blocks the Key even on another adapter
+	// which has no failed generation probe.
+	denial := func(denied bool) {
+		t.Helper()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		var revision time.Time
+		if err := tx.QueryRowContext(ctx, "SELECT updated_at FROM provider_credentials WHERE id=$1 FOR UPDATE", key).Scan(&revision); err != nil {
+			t.Fatal(err)
+		}
+		if err := catalog.SaveBeichenProbeGroupDenial(ctx, tx, key, revision, upstream, "openai_responses", denied); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	denial(true)
+	check(&binding, uuid.Nil)
+	checkRequestBlocked()
+	checkStudent("maintenance", "channel_unavailable", "分组权限")
+	check(&other, uuid.Nil)
+	check(&legacy, uuid.Nil)
+	alternateRoute := binding
+	alternateRoute.CredentialID = &alternate
+	check(&alternateRoute, alternate)
+	denial(false)
+	check(&legacy, key)
+	checkStudent("available", "available", "")
+	denial(true)
+	recordProbe(401, true)
+	execCatalogTestSQL(t, ctx, db, "UPDATE provider_credentials SET updated_at=clock_timestamp() WHERE id=$1", key)
+	check(&binding, key) // The denial and probe belong to the previous Key version.
 }

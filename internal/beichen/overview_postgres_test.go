@@ -659,9 +659,9 @@ VALUES($1,'catalog',$3,NULL,0,'-infinity'),
 		models[strings.ToLower(model.Model)] = model
 	}
 	mixed := models["mixed"]
-	if mixed.Activation != "ready" || mixed.PriceState != "mixed" || mixed.KeyCount != 2 ||
-		mixed.RouteCount != 4 || mixed.ReadyCount != 0 || mixed.Blockers == nil || len(mixed.Blockers) != 0 {
-		t.Errorf("首选 Key 有价时，备用 Key 缺价不应阻止启用: %+v", mixed)
+	if mixed.Activation != "blocked" || mixed.CanEnable || mixed.PriceState != "mixed" || mixed.KeyCount != 2 ||
+		mixed.RouteCount != 4 || mixed.ReadyCount != 0 || len(mixed.PreferredRoutes) != 0 {
+		t.Errorf("同一协议的两把候选 Key 需要教师确定线路: %+v", mixed)
 	}
 	manual := models["manual"]
 	if manual.PriceState != "manual" || manual.Activation != "ready" {
@@ -684,16 +684,18 @@ VALUES($1,'catalog',$3,NULL,0,'-infinity'),
 		t.Fatalf("仅关联停用渠道的历史型号应退出启用预览: %+v", offline)
 	}
 	result, err := service.EnableModelsBatch(ctx, provider, actor, []string{mixed.Model, manual.Model})
-	if err != nil || len(result.Enabled) != 2 || len(result.Skipped) != 0 {
-		t.Fatalf("标为可启用的模型未通过批量启用: %+v, %v", result, err)
+	if err != nil || len(result.Enabled) != 1 || result.Enabled[0].Model != manual.Model ||
+		len(result.Skipped) != 1 || result.Skipped[0].Model != mixed.Model ||
+		!strings.Contains(result.Skipped[0].Message, "同一协议有多个候选线路") {
+		t.Fatalf("批量启用应保留歧义并发布已就绪模型: %+v, %v", result, err)
 	}
 	view, err = service.Overview(ctx, provider, "2026-01-01")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, model := range view.ModelCatalog {
-		if strings.EqualFold(model.Model, mixed.Model) && (model.Activation != "active" || model.RouteCount != 4 || model.ReadyCount != 2) {
-			t.Errorf("发布后的候选和就绪线路数有误: %+v", model)
+		if strings.EqualFold(model.Model, mixed.Model) && (model.Activation != "blocked" || model.RouteCount != 4 || model.ReadyCount != 0) {
+			t.Errorf("跳过歧义时应保留所有候选线路: %+v", model)
 		}
 	}
 }
