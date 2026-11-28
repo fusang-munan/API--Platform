@@ -25,18 +25,24 @@ func normalizeUpstreamModelID(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
+// BeichenProbeAuthFailureSQL is a definitive rejection of the Key rather than
+// a transient catalog or pricing failure.
+const BeichenProbeAuthFailureSQL = `(r.status_code IN (401,403) OR r.error_code='credential_unreadable'
+ OR r.detail->>'failure_code'='credential_invalid')`
+
 // BeichenProbeBlocksRouteSQL reads both historical status codes and the current
 // structured classification. The caller checks the Key/group evidence version.
-const BeichenProbeBlocksRouteSQL = `(r.status_code IN (401,403) OR r.error_code='credential_unreadable'
- OR r.detail->>'failure_code' IN ('GROUP_NOT_ALLOWED','credential_invalid'))`
+const BeichenProbeBlocksRouteSQL = `(` + BeichenProbeAuthFailureSQL + `
+ OR r.detail->>'failure_code'='GROUP_NOT_ALLOWED')`
 
-// These predicates use the same Key evidence (e), catalog row (k), and probe
-// (r) in gateway routing and teacher rebind.
-const BeichenCatalogAuthReadySQL = `NOT EXISTS (
+// These predicates use the same Key evidence (e) in gateway routing.
+const BeichenCatalogAuthFailureSQL = `EXISTS (
   SELECT 1 FROM maintenance_state s
   WHERE s.name='` + beichenCatalogAuthKey + `'||e.credential_id::text
     AND (s.last_error::jsonb->>'credential_revision')::timestamptz=e.revision
 )`
+
+const BeichenCatalogAuthReadySQL = `NOT (` + BeichenCatalogAuthFailureSQL + `)`
 
 const BeichenCurrentCatalogProbeSQL = `r.provider_id=k.provider_id AND r.credential_id=k.credential_id
   AND r.model=k.model_id::text AND k.status='active' AND k.catalog_source='key'

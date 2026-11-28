@@ -31,22 +31,25 @@ type activationModel struct {
 }
 
 type activationCandidate struct {
-	schoolID uuid.UUID
-	route    PreferredRoute
+	schoolID         uuid.UUID
+	fallbackSchoolID uuid.UUID
+	route            PreferredRoute
 }
 
 type activationSchool struct {
-	id           uuid.UUID
-	name, status string
-	multiplier   *int64
-	bindings     []activationBinding
+	id                   uuid.UUID
+	name, status         string
+	multiplier           *int64
+	hasActivationMapping bool
+	bindings             []activationBinding
 }
 
 type activationBinding struct {
-	id                uuid.UUID
-	credential        *uuid.UUID
-	route             PreferredRoute
-	active, reachable bool
+	id                  uuid.UUID
+	credential          *uuid.UUID
+	route               PreferredRoute
+	active, reachable   bool
+	authFailedActiveKey bool
 }
 
 type activationWrite struct {
@@ -59,16 +62,38 @@ type activationPlan struct {
 	routes, northRoutes       []PreferredRoute
 	writes                    []activationWrite
 	northReady, foreignActive bool
-	catalogBlocked, ambiguous bool
+	catalogBlocked            bool
+	rebindRequired            bool
+	ambiguity                 string
 }
+
+const (
+	ambiguousProtocolRoutes = "同一个校内模型的同一协议有多个候选线路，请先确认并绑定线路"
+	ambiguousFirstRoutes    = "首次启用有多个候选上游线路，请先确认并绑定线路"
+	authFailedRebindMessage = "原线路 Key 已被上游拒绝认证，请由教师显式重绑"
+)
 
 func loadActivationCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID, source string) ([]*activationModel, error) {
 	return readActivationCatalog(ctx, tx, provider, source, nil)
 }
 
+// Scope a school UUID request by upstream name so each name keeps all of its
+// school targets and eligible candidates when deciding whether it is unique.
+const activationSchoolSourcesSQL = `school_sources AS (
+ SELECT k.model_id AS upstream
+ FROM provider_model_catalog k
+ CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
+ ` + joinModelAliasSQL + `
+ JOIN models s ON s.id=$3 AND s.model_id=COALESCE(alias.school_model,a.model)::citext
+ WHERE k.provider_id=$1
+ UNION
+ SELECT btrim(b.upstream_model_name)::citext FROM model_bindings b
+ WHERE b.provider_id=$1 AND b.model_id=$3 AND btrim(b.upstream_model_name)<>''
+)`
+
 func readActivationCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID, source string, schoolID *uuid.UUID) ([]*activationModel, error) {
 	query := `
-WITH ` + catalog.BeichenKeyEvidenceCTE + `
+WITH ` + catalog.BeichenKeyEvidenceCTE + `, ` + activationSchoolSourcesSQL + `
 SELECT k.model_id::text,k.raw_entry,p.name::text,c.id,c.label::text,k.catalog_source='key',
  p.status='active' AND c.status='active' AND k.last_seen_at>=c.updated_at,
  ` + catalog.BeichenKeyListsModelSQL + ` AND ` + catalog.BeichenGroupAllowsRouteSQL + ` AND octet_length(c.credential_ciphertext)>0,
@@ -101,10 +126,7 @@ WHERE p.id=$1 AND ` + beichenProvider + ` AND k.status='active'
      AND b.status='active' AND s.status='active'
  )))
  AND ($2::text='' OR k.model_id=$2::citext)
- AND ($3::uuid IS NULL OR target.id=$3 OR EXISTS (
-   SELECT 1 FROM model_bindings b WHERE b.model_id=$3 AND b.provider_id=k.provider_id
-     AND btrim(b.upstream_model_name)::citext=k.model_id
- ))
+ AND ($3::uuid IS NULL OR k.model_id IN (SELECT upstream FROM school_sources))
 ORDER BY lower(k.model_id::text),c.id`
 	if source != "" || schoolID != nil {
 		query += " FOR SHARE OF p,c,k"
@@ -187,7 +209,7 @@ ORDER BY lower(k.model_id::text),c.id`
 	// An unpinned binding can still display a reachable Key during transition.
 	// Publication requires evidence for the first Key the gateway will pick.
 	bound, err := tx.QueryContext(ctx, `
-WITH `+catalog.BeichenKeyEvidenceCTE+`, north AS (
+WITH `+catalog.BeichenKeyEvidenceCTE+`, `+activationSchoolSourcesSQL+`, north AS (
  SELECT DISTINCT k.model_id FROM provider_model_catalog k
  WHERE k.provider_id=$1 AND ($2::text='' OR k.model_id=$2::citext)
    AND ((k.status='active' AND k.catalog_source='key')
@@ -196,23 +218,38 @@ WITH `+catalog.BeichenKeyEvidenceCTE+`, north AS (
  SELECT btrim(b.upstream_model_name)::citext FROM model_bindings b JOIN models s ON s.id = b.model_id
  WHERE b.provider_id=$1 AND s.status='active' AND btrim(b.upstream_model_name)<>''
    AND ($2::text='' OR btrim(b.upstream_model_name)::citext=$2::citext)
-), names AS (
- SELECT n.model_id AS upstream,m.id
+), school_names AS (
+ SELECT n.model_id AS upstream,m.id,k.status='active' AND k.catalog_source='key' AS key_or_binding
  FROM north n JOIN provider_model_catalog k ON k.provider_id=$1 AND k.model_id=n.model_id
  CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
  `+joinModelAliasSQL+`
  JOIN models m ON m.model_id=COALESCE(alias.school_model,a.model)::citext
  WHERE (k.status='active' AND k.catalog_source='key') OR $2::text=''
- UNION
- SELECT n.model_id,b.model_id FROM north n JOIN model_bindings b ON b.provider_id=$1 AND lower(btrim(b.upstream_model_name))=lower(n.model_id::text)
+ UNION ALL
+ SELECT n.model_id,b.model_id,true FROM north n JOIN model_bindings b ON b.provider_id=$1 AND lower(btrim(b.upstream_model_name))=lower(n.model_id::text)
+), names AS (
+ SELECT upstream,id,bool_or(key_or_binding) AS key_or_binding FROM school_names
+ WHERE $3::uuid IS NULL OR upstream IN (SELECT upstream FROM school_sources)
+ GROUP BY upstream,id
 )
-SELECT n.upstream::text,m.id,m.model_id::text,m.status,m.credit_multiplier_milli,b.id,b.adapter,b.upstream_model_name,
+SELECT n.upstream::text,m.id,m.model_id::text,m.status,m.credit_multiplier_milli,n.key_or_binding,b.id,b.adapter,b.upstream_model_name,
  b.provider_id,p.name::text,b.priority,b.status='active',b.credential_id,
+ COALESCE(b.credential_id IS NOT NULL AND bc.status='active' AND bc.retired_at IS NULL AND (
+   `+catalog.BeichenCatalogAuthFailureSQL+` OR EXISTS (
+     SELECT 1 FROM upstream_probes r
+     WHERE r.provider_id=b.provider_id AND r.credential_id=b.credential_id
+       AND btrim(r.model)::citext=btrim(b.upstream_model_name)::citext
+       AND r.protocol=b.adapter AND `+catalog.BeichenCurrentProbeSQL+`
+       AND `+catalog.BeichenProbeAuthFailureSQL+`
+   )
+ ),false),
  p.status='active' AND COALESCE(picked.reachable AND (b.provider_id<>$1 OR picked.catalog_current),false),
  CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.id END,
  CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.label::text END
 FROM names n JOIN models m ON m.id=n.id
 LEFT JOIN model_bindings b ON b.model_id=m.id LEFT JOIN providers p ON p.id=b.provider_id
+LEFT JOIN provider_credentials bc ON bc.id=b.credential_id AND bc.provider_id=b.provider_id
+LEFT JOIN beichen_key_evidence e ON e.credential_id=b.credential_id
 LEFT JOIN LATERAL (
  SELECT c.id,c.label,count(*) OVER() AS count,
    (b.provider_id<>$1 OR k.last_seen_at>=c.updated_at) AS reachable,
@@ -229,7 +266,6 @@ LEFT JOIN LATERAL (
    AND (b.credential_id IS NULL OR c.id=b.credential_id)
  ORDER BY c.id LIMIT 1
 ) picked ON true
-WHERE ($3::uuid IS NULL OR m.id=$3)
 ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 	if err != nil {
 		return nil, err
@@ -241,10 +277,10 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 		var id, owner, key *uuid.UUID
 		var adapter, upstream, providerName, label *string
 		var priority *int
-		var active, reachable *bool
+		var active, authFailedActiveKey, reachable *bool
 		var bindingKey *uuid.UUID
-		if err := bound.Scan(&source, &school.id, &school.name, &school.status, &school.multiplier, &id, &adapter, &upstream, &owner, &providerName,
-			&priority, &active, &bindingKey, &reachable, &key, &label); err != nil {
+		if err := bound.Scan(&source, &school.id, &school.name, &school.status, &school.multiplier, &school.hasActivationMapping, &id, &adapter, &upstream, &owner, &providerName,
+			&priority, &active, &bindingKey, &authFailedActiveKey, &reachable, &key, &label); err != nil {
 			return nil, err
 		}
 		m := modelFor(source)
@@ -262,10 +298,32 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 		s := m.schools[school.id]
 		s.bindings = append(s.bindings, activationBinding{
 			id: *id, credential: bindingKey, route: r, active: *active, reachable: *reachable,
+			authFailedActiveKey: *authFailedActiveKey,
 		})
 	}
+	if err := bound.Err(); err != nil {
+		return nil, err
+	}
+	// Record the only known target before Overview or a batch request narrows
+	// the view. Archived website-only entries cannot establish that mapping.
+	for _, m := range models {
+		if len(m.schools) != 1 {
+			continue
+		}
+		school := m.target("")
+		if !school.hasActivationMapping {
+			continue
+		}
+		for _, candidates := range m.defaults {
+			for i := range candidates {
+				if candidates[i].schoolID == uuid.Nil {
+					candidates[i].fallbackSchoolID = school.id
+				}
+			}
+		}
+	}
 	sort.Slice(models, func(i, j int) bool { return strings.ToLower(models[i].name) < strings.ToLower(models[j].name) })
-	return models, bound.Err()
+	return models, nil
 }
 
 func (m *activationModel) target(name string) *activationSchool {
@@ -343,9 +401,15 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 		}
 		rank := 0
 		repair := false
-		if north && b.active && !b.reachable && b.credential != nil {
+		if north && b.active && b.authFailedActiveKey {
+			plan.catalogBlocked = true
+			plan.rebindRequired = true
+		}
+		if north && b.active && !b.reachable && b.credential != nil && !b.authFailedActiveKey {
 			next, candidates, ambiguous := m.repairRoute(s, b.route.Adapter, b.route.UpstreamModel)
-			plan.ambiguous = plan.ambiguous || ambiguous
+			if ambiguous {
+				plan.ambiguity = ambiguousProtocolRoutes
+			}
 			if candidates == 1 {
 				next.SchoolModel = s.name
 				next.Priority = b.route.Priority
@@ -381,8 +445,8 @@ func (m *activationModel) plan(s *activationSchool) activationPlan {
 	// Configure new North routes only for this school identity. An existing
 	// North binding keeps its Key and protocol until the teacher rebinds it.
 	if !hasNorth {
-		defaults, ambiguous := m.defaultRoutes(s)
-		plan.ambiguous = ambiguous
+		defaults, ambiguity := m.defaultRoutes(s)
+		plan.ambiguity = ambiguity
 		for _, r := range defaults {
 			adapter := r.Adapter
 			if c, exists := choices[adapter]; exists {
@@ -415,7 +479,7 @@ func (m *activationModel) repairRoute(s *activationSchool, adapter, upstream str
 	count, ambiguous := 0, false
 	for _, candidate := range m.defaults[adapter] {
 		mapped := candidate.schoolID == s.id
-		sameUpstream := candidate.schoolID == uuid.Nil && len(m.schools) == 1 &&
+		sameUpstream := candidate.fallbackSchoolID != uuid.Nil && candidate.fallbackSchoolID == s.id &&
 			strings.EqualFold(candidate.route.UpstreamModel, upstream)
 		if !mapped && !sameUpstream {
 			continue
@@ -436,19 +500,23 @@ func (m *activationModel) repairRoute(s *activationSchool, adapter, upstream str
 	return picked, count, false
 }
 
-func (m *activationModel) defaultRoutes(s *activationSchool) ([]PreferredRoute, bool) {
+func (m *activationModel) defaultRoutes(s *activationSchool) ([]PreferredRoute, string) {
 	var routes []PreferredRoute
+	var fallback *PreferredRoute
 	for _, adapter := range slices.Sorted(maps.Keys(m.defaults)) {
 		var selected *PreferredRoute
 		for _, candidate := range m.defaults[adapter] {
-			if candidate.schoolID != s.id {
+			matchesFallback := candidate.fallbackSchoolID != uuid.Nil && candidate.fallbackSchoolID == s.id
+			if candidate.schoolID != s.id && !matchesFallback {
 				continue
 			}
 			route := candidate.route
 			route.SchoolModel = s.name
-			if selected != nil && (route.UpstreamModel != selected.UpstreamModel ||
-				*route.CredentialID != *selected.CredentialID) {
-				return nil, true
+			if selected != nil && !sameActivationSource(route, *selected) {
+				return nil, ambiguousProtocolRoutes
+			}
+			if matchesFallback {
+				fallback = &route
 			}
 			selected = &route
 		}
@@ -456,11 +524,22 @@ func (m *activationModel) defaultRoutes(s *activationSchool) ([]PreferredRoute, 
 			routes = append(routes, *selected)
 		}
 	}
-	return routes, false
+	// A single unmapped Key can supply several protocols for the same model.
+	// A second Key or upstream model needs explicit teacher selection.
+	if fallback != nil && slices.ContainsFunc(routes, func(route PreferredRoute) bool {
+		return !sameActivationSource(route, *fallback)
+	}) {
+		return nil, ambiguousFirstRoutes
+	}
+	return routes, ""
+}
+
+func sameActivationSource(a, b PreferredRoute) bool {
+	return a.UpstreamModel == b.UpstreamModel && sameRouteKey(a.CredentialID, b.CredentialID)
 }
 
 func (p activationPlan) allowed(s *activationSchool) bool {
-	return p.northReady && !p.catalogBlocked && !p.ambiguous && (!p.foreignActive || s.multiplier != nil && *s.multiplier > 0)
+	return p.northReady && !p.catalogBlocked && p.ambiguity == "" && (!p.foreignActive || s.multiplier != nil && *s.multiplier > 0)
 }
 
 type activationPrice struct {
@@ -760,8 +839,11 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 		return skip("already_active", "模型已启用")
 	}
 	plan := m.plan(target)
-	if plan.ambiguous {
-		return skip("route_not_ready", "同一个校内模型的同一协议有多个候选线路，请先确认并绑定线路")
+	if plan.rebindRequired {
+		return skip("route_not_ready", authFailedRebindMessage)
+	}
+	if plan.ambiguity != "" {
+		return skip("route_not_ready", plan.ambiguity)
 	}
 	if plan.catalogBlocked {
 		return skip("route_not_ready", "原绑定线路尚未就绪，请同步该渠道或由教师明确重绑")
@@ -833,8 +915,11 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 		return target.id, nil
 	}
 	plan := m.plan(target)
-	if plan.ambiguous {
-		return uuid.Nil, invalid("同一个校内模型的同一协议有多个候选线路，请先确认并绑定线路")
+	if plan.rebindRequired {
+		return uuid.Nil, invalid(authFailedRebindMessage)
+	}
+	if plan.ambiguity != "" {
+		return uuid.Nil, invalid(plan.ambiguity)
 	}
 	if !plan.allowed(target) {
 		return uuid.Nil, invalid("当前北辰 Key 目录、已配置的路线或其他供应商计价不支持直接启用")
