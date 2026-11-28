@@ -132,7 +132,19 @@ export type MentorCandidate = { id: string; name: string; email: string; is_memb
 export type Session = { access_token: string; token_type: string; expires_in: number; user: User; identity: Role }
 export type PageMeta = { next_cursor?: string | null }
 export type Envelope<T> = { data: T; meta?: PageMeta; request_id?: string }
-export type ApiErrorDetails = { model_ids?: string[]; operation?: string; state_changed?: boolean } | Array<{ field: string; reason: string }>
+export type ApiErrorDetails = {
+  code?: string
+  model_ids?: string[]
+  operation?: string
+  state_changed?: boolean
+  rows?: number
+  available?: number
+  catalog_current?: number
+  alias_missing?: number
+  target_missing?: number
+  key_listed?: number
+  group_allowed?: number
+} | Array<{ field: string; reason: string }>
 export type ApiError = { error?: { code?: string; message?: string; details?: ApiErrorDetails }; request_id?: string }
 
 export type OrganizationCreate = { name: string; description?: string; status?: ResourceStatus }
@@ -654,9 +666,18 @@ export type BeichenModelPriceUpdate = { model: string } & BeichenPriceScope & (
   { mode: 'follow' } | { mode: 'manual'; rates: { input: string; output: string; cache_read: string; cache_write: string } }
 )
 export type BeichenActivationBlockerCode = 'no_candidate' | 'multi_school' | 'multi_candidate' | 'auth_failed' | 'price_missing'
+export type BeichenActivationDiagnostics = {
+  rows: number
+  available: number
+  catalog_current: number
+  alias_missing: number
+  target_missing: number
+  key_listed: number
+  group_allowed: number
+}
 export type BeichenBatchEnableResult = {
   enabled: Array<{ model: string; model_id: string }>
-  skipped: Array<{ model: string; reason: string; code?: BeichenActivationBlockerCode; message: string }>
+  skipped: Array<{ model: string; reason: string; code?: BeichenActivationBlockerCode; details?: BeichenActivationDiagnostics; message: string }>
 }
 export type BeichenModelPriceResult = {
   saved: boolean

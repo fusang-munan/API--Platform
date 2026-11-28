@@ -12,9 +12,8 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 )
 
-func (f firstConnectFixture) configureProductionBothTarget(t *testing.T) uuid.UUID {
+func (f firstConnectFixture) configureProductionBothCatalog(t *testing.T) {
 	t.Helper()
-	school := f.unmappedSchool(t)
 	key := f.keys[0]
 	var revision time.Time
 	if err := f.db.QueryRowContext(f.ctx, "SELECT updated_at FROM provider_credentials WHERE id=$1", key).Scan(&revision); err != nil {
@@ -39,6 +38,12 @@ func (f firstConnectFixture) configureProductionBothTarget(t *testing.T) uuid.UU
 	execCatalogTestSQL(t, f.ctx, f.db, "UPDATE beichen_multiplier_versions SET group_id=31,multiplier=0.5 WHERE credential_id=$1", key)
 	execCatalogTestSQL(t, f.ctx, f.db, "UPDATE beichen_panel_snapshots SET group_id=31 WHERE credential_id=$1", key)
 	execCatalogTestSQL(t, f.ctx, f.db, "UPDATE beichen_price_versions SET group_id=31 WHERE credential_id=$1 AND model=$2", key, firstConnectUpstream)
+}
+
+func (f firstConnectFixture) configureProductionBothTarget(t *testing.T) uuid.UUID {
+	t.Helper()
+	school := f.unmappedSchool(t)
+	f.configureProductionBothCatalog(t)
 	return school
 }
 

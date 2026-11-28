@@ -746,6 +746,11 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 
 	if item.ReadyCount > 0 {
 		item.Activation = "active"
+		if m.aliasConflict {
+			item.CanEnable = false
+			item.Activation = "blocked"
+			item.Blockers = appendCatalogBlocker(item.Blockers, CatalogBlocker{blockerMultiSchool, multiSchoolMessage})
+		}
 		if plan.blocker.Code == blockerAuthFailed {
 			item.Blockers = append(item.Blockers, plan.blocker)
 		}
@@ -758,17 +763,20 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 		if err != nil {
 			return CatalogModel{}, err
 		}
-		if price.ready() {
+		if price.ready() && !m.aliasConflict {
 			item.Activation = "ready"
 			return item, nil
 		}
 	}
 
 	item.Activation = "blocked"
+	if m.aliasConflict {
+		item.CanEnable = false
+	}
 	if target != nil && target.status == "not_configured" {
 		item.Blockers = append(item.Blockers, CatalogBlocker{"not_configured", "请确认此目录模型对应的校内模型和线路"})
 	}
-	if !item.CanEnable && m.multiSchoolTargets {
+	if !item.CanEnable && (m.aliasConflict || m.multiSchoolTargets) {
 		item.Blockers = append(item.Blockers, CatalogBlocker{blockerMultiSchool, multiSchoolMessage})
 	}
 	if !item.CanEnable {
@@ -776,7 +784,7 @@ func (m *activationModel) overviewWithStatus(ctx context.Context, tx *sql.Tx,
 		if blocker.Code == "" {
 			blocker = m.targetBlocker("")
 		}
-		if m.multiSchoolTargets && blocker.Code == blockerNoCandidate {
+		if (m.aliasConflict || m.multiSchoolTargets) && blocker.Code == blockerNoCandidate {
 			blocker = CatalogBlocker{blockerMultiSchool, multiSchoolMessage}
 		}
 		item.Blockers = appendCatalogBlocker(item.Blockers, blocker)
