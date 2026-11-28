@@ -16,6 +16,7 @@ const (
 	AvailabilityDegraded    = "degraded"
 	AvailabilityUnverified  = "unverified"
 	AvailabilityMaintenance = "maintenance"
+	AvailabilityUnavailable = "unavailable"
 )
 
 // stickyAvailabilityWindow keeps a model listed after one failed sweep when it

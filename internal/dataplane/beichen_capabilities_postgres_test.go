@@ -92,6 +92,8 @@ func TestBeichenCapabilitiesAndGatewayPostgres(t *testing.T) {
  VALUES($1,$2::text,$2::text,'active',1000,now(),now())`, school, l.model)
 		exec(`INSERT INTO api_key_models(id,api_key_id,model_id,created_at)
  VALUES(gen_random_uuid(),$1,$2,now())`, keyID, school)
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,actor_id,input_rate,output_rate)
+ VALUES($1,$2,'school','manual','teacher',$3,1000000,1000000)`, l.id, l.model, teacher)
 		for _, protocol := range l.protocols {
 			exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,priority,created_at,updated_at)
  VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,100,now(),now())`, school, provider, l.id, l.model, protocol)
@@ -316,6 +318,7 @@ func TestBeichenCapabilitiesAndGatewayPostgres(t *testing.T) {
 	})
 	t.Run("D/actionable coverage report", func(t *testing.T) {
 		l := lines[1]
+		exec("DELETE FROM beichen_price_versions WHERE credential_id=$1 AND model=$2", l.id, l.model)
 		exec("INSERT INTO beichen_multiplier_versions(credential_id,multiplier) VALUES($1,1.25)", l.id)
 		exec("INSERT INTO beichen_datasets(credential_id,kind,last_success) VALUES($1,'billing',now()-interval '1 hour')", l.id)
 		exec("UPDATE model_bindings SET status='inactive' WHERE provider_id=$1 AND credential_id=$2", provider, l.id)
