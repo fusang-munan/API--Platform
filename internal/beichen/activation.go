@@ -62,6 +62,9 @@ type activationBinding struct {
 	route               PreferredRoute
 	active, reachable   bool
 	authFailedActiveKey bool
+	// websiteListed keeps a published legacy directory route usable until the
+	// first Key sync supplies current Key evidence for the upstream model.
+	websiteListed bool
 }
 
 type activationWrite struct {
@@ -443,6 +446,13 @@ SELECT n.upstream::text,m.id,m.model_id::text,m.status,m.credit_multiplier_milli
    )
  ),false),
  p.status='active' AND COALESCE(picked.reachable AND (b.provider_id<>$1 OR picked.catalog_current),false),
+ COALESCE(EXISTS (
+   SELECT 1 FROM provider_model_catalog w
+   JOIN provider_credentials wc ON wc.id=w.credential_id AND wc.provider_id=w.provider_id
+   WHERE w.provider_id=b.provider_id AND w.credential_id=b.credential_id AND w.status='active'
+     AND w.catalog_source='website' AND wc.status='active'
+     AND btrim(w.model_id::text)::citext=btrim(b.upstream_model_name)::citext
+ ) AND NOT (`+catalog.BeichenGroupUnavailableSQL+`) AND `+catalog.BeichenCatalogAuthReadySQL+`, false),
  CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.id END,
  CASE WHEN picked.reachable AND (b.credential_id IS NOT NULL OR b.provider_id=$1 OR picked.count=1) THEN picked.label::text END
 FROM names n JOIN models m ON m.id=n.id
@@ -476,10 +486,10 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 		var id, owner, key *uuid.UUID
 		var adapter, upstream, providerName, label *string
 		var priority *int
-		var active, authFailedActiveKey, reachable *bool
+		var active, authFailedActiveKey, reachable, websiteListed *bool
 		var bindingKey *uuid.UUID
 		if err := bound.Scan(&source, &school.id, &school.name, &school.status, &school.multiplier, &school.hasActivationMapping, &school.websiteOnly, &id, &adapter, &upstream, &owner, &providerName,
-			&priority, &active, &bindingKey, &authFailedActiveKey, &reachable, &key, &label); err != nil {
+			&priority, &active, &bindingKey, &authFailedActiveKey, &reachable, &websiteListed, &key, &label); err != nil {
 			return nil, err
 		}
 		m := modelFor(source)
@@ -497,7 +507,7 @@ ORDER BY n.upstream,m.id,b.priority,b.id`, provider, source, schoolID)
 		s := m.schools[school.id]
 		s.bindings = append(s.bindings, activationBinding{
 			id: *id, credential: bindingKey, route: r, active: *active, reachable: *reachable,
-			authFailedActiveKey: *authFailedActiveKey,
+			authFailedActiveKey: *authFailedActiveKey, websiteListed: *websiteListed,
 		})
 	}
 	if err := bound.Err(); err != nil {
@@ -576,12 +586,25 @@ func (s *activationSchool) published() bool {
 	return s.status == "active" && s.multiplier != nil && *s.multiplier > 0
 }
 
+// A published school is already active only when its plan needs no writes and
+// either the plan is ready or the route is still backed by the current website
+// directory, which keeps serving until the first Key sync. Any other blocker
+// must be reported or repaired, so single and batch share this check.
 func (m *activationModel) alreadyPublished(s *activationSchool, plan activationPlan) bool {
-	if len(plan.writes) > 0 || plan.blocker.Code == blockerAuthFailed || plan.blocker.Code == blockerMultiCandidate {
+	if len(plan.writes) > 0 || !s.published() {
 		return false
 	}
-	return s.published() && slices.ContainsFunc(s.bindings, func(b activationBinding) bool {
+	if plan.blocker.Code != "" && (plan.blocker.Code != blockerNoCandidate || !m.legacyWebsiteRoute(s)) {
+		return false
+	}
+	return slices.ContainsFunc(s.bindings, func(b activationBinding) bool {
 		return b.active && b.route.ProviderID == m.provider
+	})
+}
+
+func (m *activationModel) legacyWebsiteRoute(s *activationSchool) bool {
+	return slices.ContainsFunc(s.bindings, func(b activationBinding) bool {
+		return b.active && b.websiteListed && b.route.ProviderID == m.provider
 	})
 }
 

@@ -637,14 +637,18 @@ WHERE credential_id=$1 AND kind='catalog'`, key, tc.minutesAgo, tc.lastError)
 				!view.ModelCatalog[i].BoundCatalogPending || view.ModelCatalog[i].ModelAvailability.Availability != "unverified" {
 				t.Fatalf("the published binding should wait for current catalog evidence: %+v", view.ModelCatalog)
 			}
-			if id, err := service.EnableModel(ctx, provider, actor, "published", ""); err != nil || id != published {
-				t.Fatalf("the published model should still resolve to %s: %s (%v)", published, id, err)
+			// The published route loses its verified evidence, so single and
+			// batch both report the route blocker instead of claiming it is
+			// usable. Nothing is rewritten on the published model.
+			if id, err := service.EnableModel(ctx, provider, actor, "published", ""); id != uuid.Nil ||
+				domain.ErrorCode(err) != domain.CodeValidation || activationErrorCode(err) != blockerNoCandidate {
+				t.Fatalf("the published model should report its stale route: %s (%v)", id, err)
 			}
 			result, err := service.EnableModelsBatch(ctx, provider, actor, models)
 			if err != nil || len(result.Enabled) != 0 || len(result.Skipped) != 4 {
 				t.Fatalf("unexpected batch result: %+v (%v)", result, err)
 			}
-			for i, reason := range []string{"route_not_ready", "route_not_ready", "route_not_ready", "already_active"} {
+			for i, reason := range []string{"route_not_ready", "route_not_ready", "route_not_ready", "route_not_ready"} {
 				if result.Skipped[i].Model != models[i] || result.Skipped[i].Reason != reason {
 					t.Fatalf("unexpected batch skip: %+v", result.Skipped[i])
 				}
