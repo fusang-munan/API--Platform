@@ -21,6 +21,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/controlplane"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	store "github.com/starprince1234/Nebula-api/internal/infrastructure/db"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
@@ -276,8 +277,10 @@ VALUES (99,1,12098,$1,$2,'Gemini','gemini-fixture',now()-interval '1 day',0.25,'
 	f.exec(t, string(retirement))
 	f.exec(t, "UPDATE provider_credentials SET retired_at=updated_at WHERE id=$1 AND status='inactive'", legacy)
 	f.exec(t, `
-INSERT INTO beichen_credential_retirements(credential_id,provider_id,channel,reason,retired_at)
-SELECT id,provider_id,'Gemini','0065_beichen_gemini',retired_at FROM provider_credentials WHERE id=$1`, legacy)
+INSERT INTO beichen_credential_retirements
+ (credential_id,provider_id,channel,reason,evidence,retired_at,source_updated_at,source_retired_at)
+SELECT id,provider_id,'Gemini','0065_beichen_gemini','upstream_key_12098',retired_at,updated_at,retired_at
+FROM provider_credentials WHERE id=$1`, legacy)
 	raw := func(secret, override string) string {
 		return `[{"channel":"GM1","status":"disabled"},{"channel":"G3","status":"disabled"},
 {"channel":"CC1","status":"disabled"},{"channel":"Gemini","api_key":"` + secret + `"` + override + `}]`
@@ -356,8 +359,10 @@ func TestBeichenRestoresCustomLabelRetirementInPlace(t *testing.T) {
 INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,status,created_at,updated_at,retired_at)
 VALUES ($1,$2,'教师自定义 Gemini 名称',$3,'inactive',now()-interval '1 day',now(),now())`, legacy, f.provider, ciphertext)
 	f.exec(t, `
-INSERT INTO beichen_credential_retirements(credential_id,provider_id,channel,reason,retired_at)
-VALUES ($1,$2,'Gemini','0065_beichen_gemini',now())`, legacy, f.provider)
+INSERT INTO beichen_credential_retirements
+ (credential_id,provider_id,channel,reason,evidence,retired_at,source_updated_at,source_retired_at)
+SELECT id,provider_id,'Gemini','0065_beichen_gemini','0065_window',retired_at,updated_at,NULL
+FROM provider_credentials WHERE id=$1`, legacy)
 	const rotated = "sk-local-custom-rotated-gemini"
 	raw := `[{"channel":"GM1","status":"disabled"},{"channel":"G3","status":"disabled"},
 {"channel":"CC1","status":"disabled"},{"channel":"Gemini","api_key":"` + rotated + `","restore":true}]`
@@ -428,6 +433,192 @@ VALUES (gen_random_uuid(),$1,$2,$3,'scheduled-model','openai_compatible',10,'ina
 	if err := f.row("SELECT status FROM model_bindings WHERE model_id=$1 AND credential_id=$2", model, id).Scan(&status); err != nil ||
 		status != "inactive" {
 		t.Fatalf("定时目录任务自动恢复了旧线路：%s (%v)", status, err)
+	}
+}
+
+func newUpgradeChannelFixture(t *testing.T, before string) (context.Context, *ent.Client, *sql.DB) {
+	t.Helper()
+	dsn := os.Getenv("NEBULA_CHANNEL_TEST_POSTGRES")
+	if dsn == "" {
+		t.Skip("需要单独的本机 nebula_test_* PostgreSQL 测试库")
+	}
+	config, err := pgx.ParseConfig(dsn)
+	if err != nil || config.Host != "127.0.0.1" || !strings.HasPrefix(config.Database, "nebula_test_") ||
+		config.TLSConfig != nil || len(config.Fallbacks) != 0 || config.Password != "" {
+		t.Fatal("只允许无密码、回环地址、sslmode=disable 的独立 nebula_test_* 库")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	t.Cleanup(cancel)
+	admin := stdlib.OpenDB(*config)
+	t.Cleanup(func() { admin.Close() })
+	schema := pgx.Identifier{"channel_upgrade_" + uuid.NewString()}.Sanitize()
+	if _, err := admin.ExecContext(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = admin.ExecContext(context.Background(), "DROP SCHEMA "+schema+" CASCADE") })
+	raw, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := raw.Query()
+	params.Set("search_path", schema+",public")
+	raw.RawQuery = params.Encode()
+	client, db, err := store.Open(ctx, raw.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	db.SetMaxOpenConns(1)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec("CREATE TABLE schema_migrations(version varchar(128) PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".sql") || name >= before {
+			continue
+		}
+		script, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec(string(script))
+		exec("INSERT INTO schema_migrations(version) VALUES($1)", name)
+	}
+	db.SetMaxOpenConns(6)
+	return ctx, client, db
+}
+
+func TestBeichenUpgradeChainSeparatesRetiredGemini(t *testing.T) {
+	ctx, client, db := newUpgradeChannelFixture(t, "0072_")
+	material := bytes.Repeat([]byte{53}, 32)
+	manager, err := security.NewManager(material, material, material, material, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var provider uuid.UUID
+	if err := db.QueryRowContext(ctx, "SELECT id FROM providers WHERE base_url='https://api.beichenapi.com'").
+		Scan(&provider); err != nil {
+		t.Fatal(err)
+	}
+	legacy, survivor, ordinary := uuid.New(), uuid.New(), uuid.New()
+	const legacyKey = "sk-upgrade-legacy-gemini"
+	encrypted, err := manager.EncryptCredential(legacyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`INSERT INTO provider_credentials(id,provider_id,label,group_hint,credential_ciphertext,status,created_at,updated_at)
+VALUES ($1,$3,'哈吉米','5',$4,'active',now()-interval '1 day',now()),
+       ($2,$3,'G3',NULL,'fixture','active',now()-interval '1 hour',now())`, legacy, survivor, provider, encrypted)
+	exec(`INSERT INTO beichen_upstream_usage_rows(upstream_user_id,row_id,upstream_key_id,provider_id,credential_id,
+ channel,model,occurred_at,actual_cost,cost_details)
+VALUES (77,1,12098,$1,$2,'Gemini','gemini-upgrade',now()-interval '1 day',0.35,'{}')`, provider, legacy)
+	retirement, err := os.ReadFile("0065_retire_beichen_gemini_credential.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(string(retirement))
+	exec(`INSERT INTO schema_migrations(version,applied_at)
+VALUES ('0065_retire_beichen_gemini_credential.sql',clock_timestamp())
+ON CONFLICT(version) DO UPDATE SET applied_at=excluded.applied_at`)
+	ordinaryKey := "sk-upgrade-ordinary"
+	ordinaryCipher, err := manager.EncryptCredential(ordinaryKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(`INSERT INTO provider_credentials(id,provider_id,label,group_hint,credential_ciphertext,status,created_at,updated_at)
+VALUES ($1,$2,'普通凭据','5',$3,'active',clock_timestamp(),clock_timestamp())`, ordinary, provider, ordinaryCipher)
+	exec(`UPDATE provider_credentials SET status='inactive',retired_at=clock_timestamp(),updated_at=clock_timestamp()
+WHERE id=$1`, ordinary)
+	upgrade, err := os.ReadFile("0072_beichen_channel_identity.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(string(upgrade))
+
+	var retired, retiredCount, ordinaryRetired int
+	var retiredEvidence string
+	err = db.QueryRowContext(ctx, `
+SELECT
+  (SELECT count(*) FROM beichen_credential_retirements WHERE credential_id=$1 AND evidence='0065_window'),
+  (SELECT evidence FROM beichen_credential_retirements WHERE credential_id=$1),
+  (SELECT count(*) FROM beichen_credential_retirements),
+  (SELECT count(*) FROM beichen_credential_retirements WHERE credential_id=$2)`,
+		legacy, ordinary).Scan(&retired, &retiredEvidence, &retiredCount, &ordinaryRetired)
+	if err != nil || retired != 1 || retiredEvidence != "0065_window" || retiredCount != 1 || ordinaryRetired != 0 {
+		t.Fatalf("0072 退役种子误收普通凭据或漏掉旧 Gemini: legacy=%d evidence=%s total=%d ordinary=%d (%v)",
+			retired, retiredEvidence, retiredCount, ordinaryRetired, err)
+	}
+
+	service := controlplane.NewService(client, db, nil, manager, nil, controlplane.Config{})
+	active := "active"
+	inactive := "inactive"
+	replacement := "sk-upgrade-ordinary-new"
+	// Even a legacy bad row must not turn a teacher-retired credential into
+	// Gemini: its recorded source was already retired by the teacher.
+	exec(`INSERT INTO beichen_credential_retirements
+	  (credential_id,provider_id,channel,reason,evidence,retired_at,source_updated_at,source_retired_at)
+	SELECT id,provider_id,'Gemini','legacy_bad_row','0065_window',retired_at,updated_at,retired_at
+	FROM provider_credentials WHERE id=$1`, ordinary)
+	if _, err := service.UpdateProviderCredential(ctx, provider, ordinary,
+		controlplane.ProviderCredentialInput{Credential: &replacement, Status: &active}); err == nil ||
+		!strings.Contains(err.Error(), "停用的 Gemini") {
+		t.Fatal("普通凭据被旧的错误退役记录带入了 Gemini 恢复")
+	}
+	exec("DELETE FROM beichen_credential_retirements WHERE credential_id=$1", ordinary)
+	if _, err := service.UpdateProviderCredential(ctx, provider, ordinary,
+		controlplane.ProviderCredentialInput{Status: &active}); err != nil {
+		t.Fatal(err)
+	}
+	call := insertChannelCall(t, channelFixture{ctx: ctx, db: db}, "upgrade-ordinary-dispatch")
+	if err := usage.NewStore(db).PrepareDispatch(ctx, call, usage.CallRoute{
+		Beichen: true, ProviderID: provider, CredentialID: ordinary, UpstreamModelName: "ordinary",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var multiplier string
+	if err := db.QueryRowContext(ctx, "SELECT trim_scale(beichen_school_multiplier)::text FROM gateway_calls WHERE id=$1", call).
+		Scan(&multiplier); err != nil || multiplier != "1" {
+		t.Fatalf("普通凭据错误应用学校系数: %s (%v)", multiplier, err)
+	}
+	if _, err := service.UpdateProviderCredential(ctx, provider, ordinary,
+		controlplane.ProviderCredentialInput{Status: &inactive}); err != nil {
+		t.Fatal(err)
+	}
+
+	rotated := "sk-upgrade-legacy-rotated"
+	view, err := service.UpdateProviderCredential(ctx, provider, legacy,
+		controlplane.ProviderCredentialInput{Credential: &rotated, Status: &active})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.ID != legacy.String() {
+		t.Fatal("真旧 Gemini 恢复时更换了凭据编号")
+	}
+	var ownChannel, history bool
+	var storedCost string
+	err = db.QueryRowContext(ctx, `
+SELECT c.status='active' AND c.retired_at IS NULL,
+       EXISTS (SELECT 1 FROM beichen_provision_channels j
+               WHERE j.credential_id=c.id AND j.channel='Gemini'),
+       (SELECT trim_scale(actual_cost)::text FROM beichen_upstream_usage_rows
+        WHERE credential_id=c.id AND upstream_key_id=12098 AND row_id=1)
+FROM provider_credentials c WHERE c.id=$1`, legacy).Scan(&history, &ownChannel, &storedCost)
+	if err != nil || !history || !ownChannel || storedCost != "0.35" {
+		t.Fatalf("真旧 Gemini 恢复未保留历史或渠道登记: %v", err)
 	}
 }
 

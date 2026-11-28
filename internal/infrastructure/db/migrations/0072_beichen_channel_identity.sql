@@ -11,18 +11,22 @@ CREATE TABLE beichen_credential_retirements (
   provider_id uuid NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
   channel text NOT NULL CHECK (channel IN ('Gemini')),
   reason text NOT NULL,
-  retired_at timestamptz NOT NULL
+  evidence text NOT NULL CHECK (evidence IN ('upstream_key_12098','0065_window')),
+  retired_at timestamptz NOT NULL,
+  source_updated_at timestamptz NOT NULL,
+  source_retired_at timestamptz
 );
 
+-- A live 12098 mapping is durable evidence even when 0067 has already
+-- backfilled retired_at for the old row.
 WITH matched AS (
-  SELECT c.id, c.provider_id
+  SELECT c.id, c.provider_id, c.updated_at
   FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
   WHERE lower(btrim(p.base_url)) IN ('https://api.beichenapi.com', 'https://api.beichenapi.com/',
                                      'https://api.beichenapi.com/v1', 'https://api.beichenapi.com/v1/')
     AND (
-      c.group_hint = '5' OR c.label = '哈吉米'
-      OR EXISTS (SELECT 1 FROM beichen_panel_access a
-                 WHERE a.credential_id = c.id AND a.upstream_key_id = 12098)
+      EXISTS (SELECT 1 FROM beichen_panel_access a
+              WHERE a.credential_id = c.id AND a.upstream_key_id = 12098)
       OR EXISTS (SELECT 1 FROM beichen_website_keys k
                  WHERE k.credential_id = c.id AND k.provider_id = c.provider_id AND k.upstream_key_id = 12098)
     )
@@ -34,11 +38,61 @@ WITH matched AS (
       AND NOT EXISTS (SELECT 1 FROM matched other WHERE other.id = c.id)
   )
 )
-INSERT INTO beichen_credential_retirements(credential_id,provider_id,channel,reason,retired_at)
-SELECT t.id,t.provider_id,'Gemini','0065_beichen_gemini',COALESCE(c.retired_at,c.updated_at)
+INSERT INTO beichen_credential_retirements
+  (credential_id,provider_id,channel,reason,evidence,retired_at,source_updated_at,source_retired_at)
+SELECT t.id,t.provider_id,'Gemini','0065_beichen_gemini','upstream_key_12098',
+  COALESCE(c.retired_at,c.updated_at),c.updated_at,c.retired_at
 FROM targets t JOIN provider_credentials c ON c.id=t.id
 WHERE c.status='inactive'
 ON CONFLICT (credential_id) DO NOTHING;
+
+-- Older databases always have schema_migrations. A few direct-SQL fixtures do
+-- not, so this branch is evaluated dynamically only when that ledger exists.
+DO $$
+BEGIN
+  IF to_regclass('schema_migrations') IS NOT NULL THEN
+    EXECUTE $weak$
+      WITH matched AS (
+        SELECT c.id, c.provider_id, c.updated_at
+        FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
+        WHERE lower(btrim(p.base_url)) IN ('https://api.beichenapi.com', 'https://api.beichenapi.com/',
+                                           'https://api.beichenapi.com/v1', 'https://api.beichenapi.com/v1/')
+          AND c.retired_at IS NULL
+          AND (c.group_hint = '5' OR c.label = '哈吉米')
+          AND EXISTS (
+            SELECT 1 FROM schema_migrations applied
+            WHERE applied.version = '0065_retire_beichen_gemini_credential.sql'
+              AND c.updated_at BETWEEN applied.applied_at - interval '10 minutes'
+                                   AND applied.applied_at + interval '10 minutes'
+          )
+      ), targets AS (
+        SELECT m.id, m.provider_id FROM matched m
+        WHERE EXISTS (
+          SELECT 1 FROM provider_credentials c
+          WHERE c.provider_id = m.provider_id AND c.status = 'active'
+            AND NOT EXISTS (SELECT 1 FROM matched other WHERE other.id = c.id)
+        )
+      )
+      INSERT INTO beichen_credential_retirements
+        (credential_id,provider_id,channel,reason,evidence,retired_at,source_updated_at,source_retired_at)
+      SELECT t.id,t.provider_id,'Gemini','0065_beichen_gemini','0065_window',
+             COALESCE(c.retired_at,c.updated_at),c.updated_at,c.retired_at
+      FROM targets t JOIN provider_credentials c ON c.id=t.id
+      WHERE c.status='inactive'
+      ON CONFLICT (credential_id) DO NOTHING
+    $weak$;
+  END IF;
+END $$;
+
+CREATE FUNCTION keep_beichen_retirement_revision() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE beichen_credential_retirements SET source_updated_at=NEW.updated_at
+  WHERE credential_id=NEW.id;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER beichen_retirement_revision AFTER UPDATE OF updated_at ON provider_credentials
+FOR EACH ROW EXECUTE FUNCTION keep_beichen_retirement_revision();
 
 WITH registrations AS (
   SELECT DISTINCT ON (c.provider_id, j.channel) c.id, c.provider_id

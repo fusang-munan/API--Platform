@@ -249,7 +249,12 @@ func (s *Service) RestoreGeminiCredentialTx(ctx context.Context, tx *sql.Tx, pro
 SELECT COALESCE(c.status='inactive' AND (
    j.channel='Gemini'
    OR EXISTS (SELECT 1 FROM beichen_credential_retirements r
-              WHERE r.credential_id=c.id AND r.provider_id=c.provider_id AND r.channel='Gemini')
+              WHERE r.credential_id=c.id AND r.provider_id=c.provider_id AND r.channel='Gemini'
+                AND r.source_updated_at=c.updated_at
+                AND (
+                  r.evidence='0065_window' AND r.source_retired_at IS NULL
+                  OR r.evidence='upstream_key_12098'
+                ))
    OR EXISTS (SELECT 1 FROM beichen_panel_access a WHERE a.credential_id=c.id AND a.upstream_key_id=12098)
    OR EXISTS (SELECT 1 FROM beichen_website_keys k
               WHERE k.credential_id=c.id AND k.provider_id=c.provider_id AND k.upstream_key_id=12098)
