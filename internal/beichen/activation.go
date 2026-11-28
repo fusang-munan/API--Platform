@@ -29,6 +29,7 @@ type activationModel struct {
 	defaults           map[string][]activationCandidate
 	schools            map[uuid.UUID]*activationSchool
 	multiSchoolTargets bool
+	diagnostics        map[string]int
 }
 
 type activationCandidate struct {
@@ -86,11 +87,49 @@ const (
 	noCandidateMessage      = "没有与唯一活跃校内目标匹配的北辰候选线路，请检查 Key 目录、分组和路线配置"
 	multiSchoolMessage      = "该上游名称对应多个活跃校内模型，请指定校内模型 ID"
 	pinnedRouteNotReady     = "原绑定线路尚未就绪，请同步该渠道或由教师明确重绑"
+
+	diagnosticRows           = "rows"
+	diagnosticAvailable      = "available"
+	diagnosticCatalogCurrent = "catalog_current"
+	diagnosticAliasMissing   = "alias_missing"
+	diagnosticTargetMissing  = "target_missing"
+	diagnosticKeyListed      = "key_listed"
+	diagnosticGroupAllowed   = "group_allowed"
 )
 
-func activationBlockerError(blocker CatalogBlocker) error {
-	return &domain.Error{Code: domain.CodeValidation, Message: blocker.Message,
-		Details: map[string]string{"code": blocker.Code}}
+func newActivationDiagnostics() map[string]int {
+	return map[string]int{
+		diagnosticRows: 0, diagnosticAvailable: 0, diagnosticCatalogCurrent: 0,
+		diagnosticAliasMissing: 0, diagnosticTargetMissing: 0, diagnosticKeyListed: 0, diagnosticGroupAllowed: 0,
+	}
+}
+
+func (m *activationModel) noCandidateDiagnostics() map[string]int {
+	if m == nil || m.diagnostics == nil {
+		return nil
+	}
+	details := make(map[string]int, len(m.diagnostics))
+	for key, value := range m.diagnostics {
+		details[key] = value
+	}
+	return details
+}
+
+func (m *activationModel) blockerDiagnostics(blocker CatalogBlocker) map[string]int {
+	if blocker.Code == blockerNoCandidate {
+		return m.noCandidateDiagnostics()
+	}
+	return nil
+}
+
+func activationBlockerError(blocker CatalogBlocker, diagnostics map[string]int) error {
+	details := map[string]any{"code": blocker.Code}
+	if blocker.Code == blockerNoCandidate {
+		for key, value := range diagnostics {
+			details[key] = value
+		}
+	}
+	return &domain.Error{Code: domain.CodeValidation, Message: blocker.Message, Details: details}
 }
 
 func (p *activationPlan) setBlocker(blocker CatalogBlocker) {
@@ -112,7 +151,7 @@ const activationSchoolSourcesSQL = `school_sources AS (
  FROM provider_model_catalog k
  CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
  ` + joinModelAliasSQL + `
- JOIN models s ON s.id=$3 AND s.model_id=COALESCE(alias.school_model,a.model)::citext
+ JOIN models s ON s.id=$3 AND (s.model_id=alias.school_model::citext OR s.model_id=a.model::citext)
  WHERE k.provider_id=$1
  UNION
  SELECT btrim(b.upstream_model_name)::citext FROM model_bindings b
@@ -124,19 +163,22 @@ func readActivationCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID, 
 WITH ` + catalog.BeichenKeyEvidenceCTE + `, ` + activationSchoolSourcesSQL + `
 SELECT k.model_id::text,k.raw_entry,p.name::text,c.id,c.label::text,k.catalog_source IN ` + catalog.BeichenKeyCatalogSourcesSQL + `,
  p.status='active' AND c.status='active' AND k.last_seen_at>=c.updated_at,
+ ` + catalog.BeichenKeyListsModelSQL + `,
+ ` + catalog.BeichenGroupAllowsRouteSQL + `,
  ` + catalog.BeichenKeyListsModelSQL + ` AND ` + catalog.BeichenGroupAllowsRouteSQL + ` AND octet_length(c.credential_ciphertext)>0,
  CASE WHEN billing.last_error IS NULL AND billing.last_success>=c.updated_at
    AND billing.last_success>statement_timestamp()-interval '16 minutes'
    AND billing.last_success>=e.evidence_since AND mv.stale_at IS NULL
    AND (e.group_id IS NULL OR mv.group_id=e.group_id)
  THEN mv.multiplier::text END, to_json(k.supported_protocols),
- target.id, alias.school_model IS NOT NULL, COALESCE(to_json(blocked.protocols),'[]'::json)
+ alias_target.id, upstream_target.id, alias.school_model IS NOT NULL, COALESCE(to_json(blocked.protocols),'[]'::json)
 FROM provider_model_catalog k JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
 JOIN providers p ON p.id=c.provider_id
 JOIN beichen_key_evidence e ON e.credential_id=c.id
 CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
 ` + joinModelAliasSQL + `
-LEFT JOIN models target ON target.model_id=COALESCE(alias.school_model,a.model)::citext
+LEFT JOIN models alias_target ON alias_target.model_id=alias.school_model::citext
+LEFT JOIN models upstream_target ON upstream_target.model_id=a.model::citext
 LEFT JOIN LATERAL (
  SELECT array_agg(r.protocol) AS protocols FROM upstream_probes r
  WHERE r.provider_id=k.provider_id AND r.credential_id=k.credential_id AND r.model=k.model_id::text
@@ -166,12 +208,20 @@ ORDER BY lower(k.model_id::text),c.id`
 	defer rows.Close()
 	var models []*activationModel
 	index := map[string]*activationModel{}
+	diagnostics := map[string]map[string]int{}
+	diagnosticsFor := func(source string) map[string]int {
+		name := strings.ToLower(source)
+		if diagnostics[name] == nil {
+			diagnostics[name] = newActivationDiagnostics()
+		}
+		return diagnostics[name]
+	}
 	modelFor := func(source string) *activationModel {
 		name := strings.ToLower(source)
 		if m := index[name]; m != nil {
 			return m
 		}
-		m := &activationModel{name: source, provider: provider, defaults: map[string][]activationCandidate{}, schools: map[uuid.UUID]*activationSchool{}}
+		m := &activationModel{name: source, provider: provider, defaults: map[string][]activationCandidate{}, schools: map[uuid.UUID]*activationSchool{}, diagnostics: diagnosticsFor(source)}
 		index[name] = m
 		models = append(models, m)
 		return m
@@ -183,24 +233,44 @@ ORDER BY lower(k.model_id::text),c.id`
 		var raw, protocols, blocked []byte
 		var providerName, label string
 		var key uuid.UUID
-		var targetID *uuid.UUID
-		var keyListed, available, catalogCurrent, aliased bool
+		var aliasTargetID, upstreamTargetID *uuid.UUID
+		var sourceKey, available, keyListed, groupAllowed, catalogCurrent, aliased bool
 		var rate *string
-		if err := rows.Scan(&modelID, &raw, &providerName, &key, &label, &keyListed, &available, &catalogCurrent, &rate,
-			&protocols, &targetID, &aliased, &blocked); err != nil {
+		if err := rows.Scan(&modelID, &raw, &providerName, &key, &label, &sourceKey, &available, &keyListed, &groupAllowed, &catalogCurrent, &rate,
+			&protocols, &aliasTargetID, &upstreamTargetID, &aliased, &blocked); err != nil {
 			return nil, err
+		}
+		diagnostic := diagnosticsFor(modelID)
+		diagnostic[diagnosticRows]++
+		if available {
+			diagnostic[diagnosticAvailable]++
+		}
+		if catalogCurrent {
+			diagnostic[diagnosticCatalogCurrent]++
+		}
+		if keyListed {
+			diagnostic[diagnosticKeyListed]++
+		}
+		if groupAllowed {
+			diagnostic[diagnosticGroupAllowed]++
+		}
+		if aliased && aliasTargetID == nil {
+			diagnostic[diagnosticAliasMissing]++
+		}
+		if aliasTargetID == nil && upstreamTargetID == nil {
+			diagnostic[diagnosticTargetMissing]++
 		}
 		if available && rate != nil {
 			n := json.Number(*rate)
 			rates[key] = &n
 		}
-		if !keyListed {
+		if !sourceKey {
 			legacyPublished = legacyPublished || available
 			continue
 		}
 		m := modelFor(modelID)
 		m.keys = append(m.keys, key)
-		if !available || !catalogCurrent {
+		if !keyListed || !available || !catalogCurrent {
 			continue
 		}
 		entry, err := storedCatalogEntry(modelID, raw, protocols)
@@ -216,6 +286,10 @@ ORDER BY lower(k.model_id::text),c.id`
 				continue
 			}
 			keyID := key
+			targetID := aliasTargetID
+			if targetID == nil {
+				targetID = upstreamTargetID
+			}
 			candidate := activationCandidate{unresolvedAlias: aliased && targetID == nil, route: PreferredRoute{UpstreamModel: modelID, ProviderName: providerName, CredentialLabel: &label,
 				Adapter: protocol, ProviderID: provider, CredentialID: &keyID, Priority: catalog.DefaultBindingPriority(modelbinding.Adapter(protocol)),
 				State: "candidate", EffectiveMultiplier: rates[key]}}
@@ -247,11 +321,17 @@ WITH `+catalog.BeichenKeyEvidenceCTE+`, `+activationSchoolSourcesSQL+`, north AS
  WHERE b.provider_id=$1 AND s.status='active' AND btrim(b.upstream_model_name)<>''
    AND ($2::text='' OR btrim(b.upstream_model_name)::citext=$2::citext)
 ), school_names AS (
- SELECT n.model_id AS upstream,m.id,k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AS key_or_binding
+ SELECT n.model_id AS upstream,alias_target.id,k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AS key_or_binding
  FROM north n JOIN provider_model_catalog k ON k.provider_id=$1 AND k.model_id=n.model_id
  CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
  `+joinModelAliasSQL+`
- JOIN models m ON m.model_id=COALESCE(alias.school_model,a.model)::citext
+ JOIN models alias_target ON alias_target.model_id=alias.school_model::citext
+ WHERE (k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+`) OR $2::text=''
+ UNION
+ SELECT n.model_id AS upstream,upstream_target.id,k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+` AS key_or_binding
+ FROM north n JOIN provider_model_catalog k ON k.provider_id=$1 AND k.model_id=n.model_id
+ CROSS JOIN LATERAL (SELECT k.credential_id,k.model_id::text AS model) a
+ JOIN models upstream_target ON upstream_target.model_id=a.model::citext
  WHERE (k.status='active' AND k.catalog_source IN `+catalog.BeichenKeyCatalogSourcesSQL+`) OR $2::text=''
  UNION ALL
  SELECT n.model_id,b.model_id,true FROM north n JOIN model_bindings b ON b.provider_id=$1 AND lower(btrim(b.upstream_model_name))=lower(n.model_id::text)
@@ -734,6 +814,7 @@ type BatchSkippedModel struct {
 	Model          string          `json:"model"`
 	Reason         string          `json:"reason"`
 	Code           string          `json:"code,omitempty"`
+	Details        map[string]int  `json:"details,omitempty"`
 	Message        string          `json:"message"`
 	SuggestedRates *SuggestedRates `json:"suggested_rates,omitempty"`
 }
@@ -832,10 +913,13 @@ func selectBatchActivation(ctx context.Context, tx *sql.Tx, provider uuid.UUID, 
 			continue
 		}
 		if combined == nil {
-			combined = &activationModel{provider: provider, defaults: map[string][]activationCandidate{}, schools: map[uuid.UUID]*activationSchool{}}
+			combined = &activationModel{provider: provider, defaults: map[string][]activationCandidate{}, schools: map[uuid.UUID]*activationSchool{}, diagnostics: newActivationDiagnostics()}
 			target = school
 		}
 		maps.Copy(combined.schools, model.schools)
+		for key, value := range model.diagnostics {
+			combined.diagnostics[key] += value
+		}
 		for protocol, routes := range model.defaults {
 			combined.defaults[protocol] = append(combined.defaults[protocol], routes...)
 		}
@@ -855,18 +939,22 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 	if err != nil {
 		return enabled, nil, err
 	}
-	skip := func(reason, code, message string) (BatchEnabledModel, *BatchSkippedModel, error) {
+	skip := func(reason, code, message string, diagnostic ...map[string]int) (BatchEnabledModel, *BatchSkippedModel, error) {
 		if target != nil && target.id != uuid.Nil {
 			seenSchools[target.id] = true
 		}
-		return enabled, &BatchSkippedModel{Model: source, Reason: reason, Code: code, Message: message}, nil
+		var details map[string]int
+		if len(diagnostic) != 0 {
+			details = diagnostic[0]
+		}
+		return enabled, &BatchSkippedModel{Model: source, Reason: reason, Code: code, Details: details, Message: message}, nil
 	}
 	if m == nil {
 		return skip("not_found", "", "当前北辰目录中没有此模型")
 	}
 	if target == nil {
 		blocker := m.targetBlocker("")
-		return skip("route_not_ready", blocker.Code, blocker.Message)
+		return skip("route_not_ready", blocker.Code, blocker.Message, m.blockerDiagnostics(blocker))
 	}
 	if seenSchools[target.id] {
 		return skip("duplicate_school_model", "", "本批已处理同一个校内模型 ID")
@@ -876,7 +964,7 @@ func (s *Service) enableBatchModel(ctx context.Context, provider, actor uuid.UUI
 		return skip("already_active", "", "模型已启用")
 	}
 	if plan.blocker.Code != "" {
-		return skip("route_not_ready", plan.blocker.Code, plan.blocker.Message)
+		return skip("route_not_ready", plan.blocker.Code, plan.blocker.Message, m.blockerDiagnostics(plan.blocker))
 	}
 	price, err := plan.priceReadiness(ctx, tx, nil)
 	if err != nil {
@@ -936,21 +1024,22 @@ func (s *Service) enableModel(ctx context.Context, provider, actor uuid.UUID, so
 	m := models[0]
 	target := m.target(school)
 	if target == nil {
-		return uuid.Nil, activationBlockerError(m.targetBlocker(school))
+		blocker := m.targetBlocker(school)
+		return uuid.Nil, activationBlockerError(blocker, m.blockerDiagnostics(blocker))
 	}
 	plan := m.plan(target)
 	if plan.blocker.Code != blockerAuthFailed && m.alreadyPublished(target) {
 		return target.id, nil
 	}
 	if plan.blocker.Code != "" {
-		return uuid.Nil, activationBlockerError(plan.blocker)
+		return uuid.Nil, activationBlockerError(plan.blocker, m.blockerDiagnostics(plan.blocker))
 	}
 	price, err := plan.priceReadiness(ctx, tx, nil)
 	if err != nil {
 		return uuid.Nil, err
 	}
 	if !price.ready() {
-		return uuid.Nil, activationBlockerError(CatalogBlocker{blockerPriceMissing, price.blocker.Message})
+		return uuid.Nil, activationBlockerError(CatalogBlocker{blockerPriceMissing, price.blocker.Message}, nil)
 	}
 	id, err := applyActivationPlan(ctx, tx, provider, actor, target, plan)
 	if err == nil {

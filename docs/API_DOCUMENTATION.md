@@ -585,11 +585,13 @@ Key 证据不足时，只有标准余额计费、分组默认倍率有效且高�
 
 `POST .../beichen/models/enable-batch` 接收 `models` 数组，每批 1 至 200 个模型。每项可传校内模型 UUID（`school_model_id`）或最长 256 字符的上游名称。教师页优先提交 UUID，旧客户端可提交唯一的上游名称。响应的 `model` 使用请求项，成功的 `model_id` 是校内 UUID。
 
-单个和批量启用都支持新 Key 首次接入。候选没有关联 UUID，或关联的是停用、已不存在的校内模型时，可使用同一上游名下唯一已确认的当前校内目标。首次自动建立绑定只使用同一把 Key 和同一上游型号，可覆盖多个协议，并须通过当前目录权限、探活和报价检查。有多个当前目标时须指定校内 UUID，并使用直接关联的候选或已有绑定。
+单个和批量启用都支持新 Key 首次接入。校内别名命中现有模型时优先使用别名目标；别名指向的名称已不在 `models` 中时，回退到同一上游名对应的模型。候选没有关联 UUID，或关联的是停用、已不存在的校内模型时，也可使用同一上游名下唯一已确认的当前校内目标。首次自动建立绑定只使用同一把 Key 和同一上游型号，可覆盖多个协议，并须通过当前目录权限、探活和报价检查。别名目标与上游名目标是两个不同的活跃或待配置模型时，按 `multi_school` 阻断并要求指定校内 UUID，不能任选其一。
 
 已有线路的 Key 仍为 `active`，且当前 Key 版本被目录认证或探活确认 401/403 时，启用以 `auth_failed` 阻断并提示教师显式重绑。停用或退役 Key 可按唯一候选修复，多个候选会阻断修复。
 
 单个启用被阻断时，HTTP `400 VALIDATION_ERROR` 的 `error.details.code` 返回具体原因。批量启用在 `skipped[].code` 返回相同的阻断码，教师概览的 `model_catalog[].blockers[].code` 使用同一组阻断码和提示。`no_candidate` 表示没有符合当前目标的线路，`multi_school` 表示按上游名称无法唯一选中当前校内目标，`multi_candidate` 表示候选线路不唯一，`auth_failed` 表示原绑定认证失败，`price_missing` 表示缺少可用报价或校内倍率。上游名称有多个活跃或待配置目标时，拆分的各阻断行返回 `multi_school`，提示“该上游名称对应多个活跃校内模型，请指定校内模型 ID”。
+
+`no_candidate` 的只读诊断计数同时出现在单个响应的 `error.details` 和批量项的 `skipped[].details`。`rows` 是读取到的候选目录行数，`available` 是通过 Key、供应商和目录新鲜度基础检查的行数，`catalog_current` 是通过完整目录、分组和密钥可读检查的行数，`alias_missing` 是别名存在但目标模型不存在的行数，`target_missing` 是别名与上游名都找不到目标的行数，`key_listed` 是通过当前 Key 目录检查的行数，`group_allowed` 是通过分组权限检查的行数。计数只包含整数，不返回凭据、Key 或上游响应内容。
 
 ```json
 {
@@ -597,6 +599,8 @@ Key 证据不足时，只有标准余额计费、分组默认倍率有效且高�
   "skipped": [{"model": "model-b", "reason": "no_price", "code": "price_missing", "message": "第 2 档缺少输出 Token 单价（output_price）"}]
 }
 ```
+
+`no_candidate` 批量项示例中的 `details` 使用 `{"rows":1,"available":1,"catalog_current":0,"alias_missing":1,"target_missing":0,"key_listed":1,"group_allowed":0}`；其他阻断码不附加计数。
 
 `reason` 包括 `not_found`、`already_active`、`duplicate_school_model`、`route_not_ready`、`no_price` 和 `enable_failed`。各模型独立提交，已健康启用的模型再次提交时返回 `already_active`。可计算的纯 Token 条件价可用于启用，空或省略的 `billing_mode` 默认按 Token 处理。单个启用的错误提示和批量结果的 `message` 使用与概览相同的报价说明。
 

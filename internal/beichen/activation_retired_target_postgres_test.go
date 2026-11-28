@@ -130,12 +130,27 @@ func (f firstConnectFixture) assertProductionOverview(t *testing.T, current uuid
 }
 
 func activationErrorCode(err error) string {
+	details := activationErrorDetails(err)
+	code, _ := details["code"].(string)
+	return code
+}
+
+func activationErrorDetails(err error) map[string]any {
 	var appErr *domain.Error
 	if !errors.As(err, &appErr) {
-		return ""
+		return nil
 	}
-	details, _ := appErr.Details.(map[string]string)
-	return details["code"]
+	switch details := appErr.Details.(type) {
+	case map[string]any:
+		return details
+	case map[string]string:
+		converted := make(map[string]any, len(details))
+		for key, value := range details {
+			converted[key] = value
+		}
+		return converted
+	}
+	return nil
 }
 
 func TestEnableModelRetiredSameNameShapePostgres(t *testing.T) {
