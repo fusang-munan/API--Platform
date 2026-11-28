@@ -316,8 +316,13 @@ func (s *Server) providerCredentials(c *gin.Context) {
 }
 
 func (s *Server) createProviderCredential(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	providerID, ok := pathID(c, "provider_id")
 	if !ok {
+		return
+	}
+	if !panelManagementHTTPS(c.Request, s.config.AllowedOrigin) {
+		writeError(c, domain.NewError(domain.CodeValidation, "请先配置可信 HTTPS 管理入口"))
 		return
 	}
 	var input struct {
@@ -325,6 +330,7 @@ func (s *Server) createProviderCredential(c *gin.Context) {
 		GroupHint            *string    `json:"group_hint"`
 		Credential           string     `json:"credential" binding:"required"`
 		Status               *string    `json:"status"`
+		Channel              *string    `json:"channel"`
 		ReplacesCredentialID *uuid.UUID `json:"replaces_credential_id"`
 	}
 	if !bindJSON(c, &input) {
@@ -332,7 +338,7 @@ func (s *Server) createProviderCredential(c *gin.Context) {
 	}
 	view, err := s.service.CreateProviderCredential(c.Request.Context(), providerID, controlplane.ProviderCredentialInput{
 		Label: input.Label, GroupHint: input.GroupHint, Credential: &input.Credential,
-		Status: input.Status, ReplacesCredentialID: input.ReplacesCredentialID,
+		Status: input.Status, Channel: input.Channel, ReplacesCredentialID: input.ReplacesCredentialID,
 	})
 	if err != nil {
 		writeError(c, err)
@@ -358,6 +364,13 @@ func (s *Server) updateProviderCredential(c *gin.Context) {
 	}
 	if !bindJSON(c, &input) {
 		return
+	}
+	if input.Credential != nil {
+		c.Header("Cache-Control", "no-store")
+		if !panelManagementHTTPS(c.Request, s.config.AllowedOrigin) {
+			writeError(c, domain.NewError(domain.CodeValidation, "请先配置可信 HTTPS 管理入口"))
+			return
+		}
 	}
 	view, err := s.service.UpdateProviderCredential(c.Request.Context(), providerID, credentialID, controlplane.ProviderCredentialInput{
 		Label: input.Label, GroupHint: input.GroupHint, Credential: input.Credential, Status: input.Status,

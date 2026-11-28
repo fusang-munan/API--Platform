@@ -1,6 +1,7 @@
 package beichen
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/starprince1234/Nebula-api/internal/domain"
 )
 
 const ProvisionActorID = "01953422-b1f7-7c50-81b1-734f142827bb"
@@ -319,9 +321,84 @@ func (s *Service) SetPanelAccess(ctx context.Context, provider, credential, acto
 	if actor == uuid.Nil {
 		return invalid("需要有效的教师 ID")
 	}
+	if input.UpstreamKeyID == nil {
+		return s.write(ctx, provider, credential, func(tx *sql.Tx) error {
+			return s.WritePanelAccessTx(ctx, tx, credential, actor, input)
+		})
+	}
+
+	// Check the supplied panel bearer against the inventory used by discovery
+	// before taking any database locks.
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	target, err := readPanelKeyTarget(ctx, s.db, provider, credential)
+	if err != nil {
+		return err
+	}
+	unverified := invalid("无法核对推理 Key、官网 Key ID 和分组的归属，请使用自动发现")
+	secret, err := s.crypto.DecryptCredential(target.encrypted)
+	if err != nil || secret == input.Token {
+		return unverified
+	}
+	keys, err := s.accountKeys(ctx, input.Token)
+	if err != nil {
+		return unverified
+	}
+	key, err := identifyChannel(secret, target.channel, target.label, keys)
+	if err != nil || key.ID != *input.UpstreamKeyID || key.GroupID != input.GroupID {
+		return unverified
+	}
 	return s.write(ctx, provider, credential, func(tx *sql.Tx) error {
-		return s.WritePanelAccessTx(ctx, tx, credential, actor, input)
+		current, err := readPanelKeyTarget(ctx, tx, provider, credential)
+		if err != nil {
+			return err
+		}
+		if !target.revision.Equal(current.revision) || target.label != current.label || target.channel != current.channel ||
+			!bytes.Equal(target.encrypted, current.encrypted) {
+			return domain.NewError(domain.CodeInvalidTransition, "北辰凭据或渠道信息已变更，请重新核对后提交")
+		}
+		available, err := panelKeyAvailableTx(ctx, tx, credential, key.ID)
+		if err != nil {
+			return err
+		}
+		if !available {
+			return domain.NewError(domain.CodeNameConflict, "该官网 Key 已绑定其他校内渠道")
+		}
+		if err := s.WritePanelAccessTx(ctx, tx, credential, actor, input); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `
+UPDATE beichen_provision_channels SET upstream_user_id=$2,checked_at=$3,discovery_error=NULL
+WHERE credential_id=$1`, credential, key.UserID, key.checkedAt)
+		return err
 	})
+}
+
+type panelKeyTargetReader interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func readPanelKeyTarget(ctx context.Context, db panelKeyTargetReader, provider, credential uuid.UUID) (discoveryJob, error) {
+	target := discoveryJob{provider: provider, credential: credential}
+	err := db.QueryRowContext(ctx, `
+SELECT c.label::text,COALESCE(j.channel,''),c.credential_ciphertext,c.updated_at
+FROM provider_credentials c JOIN providers p ON p.id=c.provider_id
+LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
+WHERE p.id=$1 AND c.id=$2 AND p.status='active' AND c.status='active' AND `+beichenProvider,
+		provider, credential).Scan(&target.label, &target.channel, &target.encrypted, &target.revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return target, invalid("该北辰凭据已停用或不属于此供应商")
+	}
+	if err != nil {
+		return target, unavailable("读取北辰 Key 归属失败", err)
+	}
+	return target, nil
+}
+
+func panelKeyAvailableTx(ctx context.Context, tx *sql.Tx, credential uuid.UUID, key int64) (bool, error) {
+	var available bool
+	err := tx.QueryRowContext(ctx, `SELECT beichen_upstream_key_available($1,$2)`, key, credential).Scan(&available)
+	return available, err
 }
 
 // PanelSourceMatches compares a stored source without logging in while holding DB locks.

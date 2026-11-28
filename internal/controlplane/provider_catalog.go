@@ -37,6 +37,7 @@ type ProviderCredentialInput struct {
 	GroupHint            *string
 	Credential           *string
 	Status               *string
+	Channel              *string
 	ReplacesCredentialID *uuid.UUID
 }
 
@@ -108,6 +109,12 @@ func (s *Service) CreateProviderCredential(ctx context.Context, providerID uuid.
 	if input.Credential == nil {
 		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "credential is required")
 	}
+	if input.Channel != nil && !beichen.IsSchoolChannel(*input.Channel) {
+		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "学校渠道须为 CC1、G3、GM1 或 Gemini")
+	}
+	if input.Channel != nil && input.ReplacesCredentialID != nil {
+		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "请在独立登记和接替原 Key 中选择一种方式")
+	}
 	label, err := ValidateName(input.Label, 128)
 	if err != nil {
 		return ProviderCredentialView{}, err
@@ -125,17 +132,23 @@ func (s *Service) CreateProviderCredential(ctx context.Context, providerID uuid.
 			Label: &label, GroupHint: input.GroupHint, Status: &status, Ciphertext: ciphertext,
 			Replaces: input.ReplacesCredentialID,
 		}
-		if edit.Replaces != nil {
-			if *edit.Replaces == uuid.Nil {
-				return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "请选择有效的原渠道")
+		if edit.Replaces != nil && *edit.Replaces == uuid.Nil {
+			return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "请选择有效的原渠道")
+		}
+		if input.Channel != nil {
+			edit.Channel = *input.Channel
+		}
+		if edit.Channel != "" || edit.Replaces != nil {
+			if !validBeichenInferenceKey(*input.Credential) {
+				return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "北辰推理 Key 格式无效")
 			}
 			fingerprint := sha256.Sum256([]byte(*input.Credential))
 			edit.Fingerprint = fingerprint[:]
 		}
 		return s.saveBeichenCredential(ctx, providerID, uuid.Nil, edit)
 	}
-	if input.ReplacesCredentialID != nil {
-		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "选择原渠道仅适用于北辰")
+	if input.Channel != nil || input.ReplacesCredentialID != nil {
+		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "登记或接替学校渠道仅适用于北辰")
 	}
 	builder := s.db.ProviderCredential.Create().
 		SetProviderID(row.ID).
@@ -161,6 +174,9 @@ func (s *Service) CreateProviderCredential(ctx context.Context, providerID uuid.
 }
 
 func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, credentialID uuid.UUID, input ProviderCredentialInput) (ProviderCredentialView, error) {
+	if input.Channel != nil || input.ReplacesCredentialID != nil {
+		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "学校渠道登记或接替须通过新建凭据提交")
+	}
 	row, err := s.db.ProviderCredential.Query().
 		Where(
 			providercredential.IDEQ(credentialID),
@@ -175,9 +191,6 @@ func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, cred
 		return ProviderCredentialView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query provider credential", err)
 	}
 	if row.Edges.Provider != nil && catalog.IsBeichenBaseURL(row.Edges.Provider.BaseURL) {
-		if input.Credential != nil {
-			return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "更换北辰 Key 请在渠道切换向导添加新 Key，以保留原凭据的账单记录")
-		}
 		edit := beichen.CredentialEdit{GroupHint: input.GroupHint}
 		if input.Label != "" {
 			label, err := ValidateName(input.Label, 128)
@@ -192,6 +205,20 @@ func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, cred
 				return ProviderCredentialView{}, err
 			}
 			edit.Status = &status
+		}
+		if input.Credential != nil {
+			if row.Status != providercredential.StatusInactive || edit.Status == nil || *edit.Status != "active" {
+				return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "原地更换 Key 仅适用于重新启用停用的 Gemini 渠道，其他渠道请使用接替向导")
+			}
+			if !validBeichenInferenceKey(*input.Credential) {
+				return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "北辰推理 Key 格式无效")
+			}
+			ciphertext, err := s.security.EncryptCredential(*input.Credential)
+			if err != nil {
+				return ProviderCredentialView{}, domain.WrapError(domain.CodeDependencyUnavailable, "加密北辰推理 Key 失败", err)
+			}
+			fingerprint := sha256.Sum256([]byte(*input.Credential))
+			edit.Ciphertext, edit.Fingerprint = ciphertext, fingerprint[:]
 		}
 		return s.saveBeichenCredential(ctx, providerID, credentialID, edit)
 	}

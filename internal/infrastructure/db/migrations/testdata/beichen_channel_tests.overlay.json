@@ -1,0 +1,5 @@
+{
+  "Replace": {
+    "internal/beichen/beichen_channel_security_test.go": "internal/infrastructure/db/migrations/testdata/beichen_channel_security_test.go"
+  }
+}

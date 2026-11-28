@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { teacherAPI } from '../../api/teacher'
+import { beichenSchoolChannels, teacherAPI } from '../../api/teacher'
+import type { BeichenSchoolChannel } from '../../api/teacher'
 import type { BeichenCatalogDifference, BeichenCredentialSummary, BeichenModelAlias, BeichenModelAliasUpdate, BeichenRebindPlan, BindingAdapter, Provider, ProviderCredential } from '../../api/types'
 import { APIError, get, post } from '../../api/client'
 import StatusBadge from '../../components/StatusBadge.vue'
@@ -48,6 +49,7 @@ type ChannelSwitch = {
   }) | null
 }
 type HealthAction = 'sync' | 'probe' | 'replace'
+type ChannelCreation = 'independent' | 'replacement'
 
 const rows = ref<Provider[]>([])
 const schoolProvider = ref<Provider>()
@@ -70,8 +72,8 @@ const channelError = ref('')
 const channelNotice = ref('')
 const channelBusy = ref(false)
 const channelReading = ref(false)
-const addingChannel = ref(false)
-const newChannel = reactive({ label: '', key: '' })
+const channelCreation = ref<ChannelCreation>()
+const newChannel = reactive({ label: '', key: '', schoolChannel: '' as BeichenSchoolChannel | '' })
 let channelReadVersion = 0
 let channelPoll: number | undefined
 const healthDimensions = [['credential', '凭据'], ['catalog', '目录'], ['pricing', '报价'], ['probe', '探活']] as const
@@ -202,9 +204,7 @@ function closeChannelSwitch() {
   channelFrom.value = ''
   channelTo.value = ''
   channelReading.value = false
-  addingChannel.value = false
-  newChannel.label = ''
-  newChannel.key = ''
+  showChannelCreation()
   channelError.value = ''
   channelNotice.value = ''
 }
@@ -290,19 +290,32 @@ async function runChannelAction(action: (providerID: string) => Promise<void>) {
   }
 }
 
+function showChannelCreation(mode?: ChannelCreation) {
+  channelCreation.value = mode
+  newChannel.label = ''
+  newChannel.key = ''
+  newChannel.schoolChannel = ''
+}
+
 async function addChannel() {
+  const mode = channelCreation.value
   const label = newChannel.label.trim()
   const key = newChannel.key.trim()
-  if (!label || !key) return
+  const schoolChannel = newChannel.schoolChannel
+  const predecessor = channelFrom.value
+  if (!label || !key || !mode || (mode === 'independent' && !schoolChannel) || (mode === 'replacement' && !predecessor)) return
   await runChannelAction(async providerID => {
-    const input = { label, credential: key, status: 'active' as const, replaces_credential_id: channelFrom.value || undefined }
-    const saved = await teacherAPI.createProviderCredential(providerID, input)
+    const input = { label, credential: key, status: 'active' as const }
+    const saved = schoolChannel && mode === 'independent'
+      ? await teacherAPI.createProviderCredential(providerID, { ...input, channel: schoolChannel })
+      : await teacherAPI.createProviderCredential(providerID, { ...input, replaces_credential_id: predecessor })
     updateChannelRow(saved)
+    if (mode === 'independent') channelFrom.value = ''
     channelTo.value = saved.id
-    newChannel.label = ''
-    newChannel.key = ''
-    addingChannel.value = false
-    channelNotice.value = '新 Key 已保存，后台将同步目录、报价、倍率和用量。'
+    showChannelCreation()
+    channelNotice.value = mode === 'independent'
+      ? '学校渠道已登记，后台将同步目录、报价、倍率和用量。'
+      : '接替 Key 已保存，后台将同步目录、报价、倍率和用量。'
   })
 }
 
@@ -365,7 +378,7 @@ function runHealthAction(key: string, action: HealthAction) {
   if (action === 'probe') return probeChannels()
   if (action === 'sync') return syncChannel(key)
   channelFrom.value = key
-  addingChannel.value = true
+  showChannelCreation('replacement')
   selectChannel('from')
 }
 
@@ -728,7 +741,7 @@ onBeforeUnmount(() => { loadVersion++; closeChannelSwitch() })
       </section>
     </LoadingRegion>
 
-    <AppDialog :open="Boolean(channelProvider)" title="渠道切换向导" description="同步接替 Key，检查受影响线路并确认换线。" wide
+    <AppDialog :open="Boolean(channelProvider)" title="渠道切换向导" description="登记学校渠道，或为已有线路准备接替 Key。" wide
       @update:open="open => { if (!open && !channelBusy) closeChannelSwitch() }">
       <section v-if="channelProvider" class="switch-panel" :aria-busy="channelBusy || channelReading">
         <p v-if="channelError" class="error" role="alert">{{ channelError }}</p>
@@ -754,19 +767,32 @@ onBeforeUnmount(() => { loadVersion++; closeChannelSwitch() })
           </select></label>
         </div>
         <div class="actions">
-          <button type="button" class="button secondary" :disabled="channelBusy || channelReading || !channel || (!channelFrom && channel.credentials.length > 0)" @click="addingChannel = !addingChannel">
-            {{ addingChannel ? '收起新 Key 表单' : '添加接替 Key' }}
+          <button type="button" class="button secondary" :disabled="channelBusy || channelReading || !channel"
+            @click="showChannelCreation(channelCreation === 'independent' ? undefined : 'independent')">
+            {{ channelCreation === 'independent' ? '收起独立渠道表单' : '新建独立学校渠道' }}
+          </button>
+          <button type="button" class="button secondary" :disabled="channelBusy || channelReading || !channel || !channelFrom"
+            @click="showChannelCreation(channelCreation === 'replacement' ? undefined : 'replacement')">
+            {{ channelCreation === 'replacement' ? '收起接替 Key 表单' : '添加接替 Key' }}
           </button>
           <button type="button" class="button secondary" :disabled="channelBusy || channelReading || !channelTo" @click="syncChannel()">一键同步</button>
           <button type="button" class="button secondary" :disabled="channelBusy || channelReading || !channelFrom || !channelTo" @click="previewChannel">预览重绑</button>
         </div>
-        <p v-if="channel?.credentials.length && !channelFrom" class="muted">请先选择要替换的原渠道，再添加或选择接替 Key。</p>
-        <form v-if="addingChannel" class="key-panel" aria-label="添加接替 Key" @submit.prevent="addChannel">
+        <p v-if="channel?.credentials.length && !channelFrom && channelCreation !== 'independent'" class="muted">接替已有线路时，请先选择原 Key。</p>
+        <form v-if="channelCreation" class="key-panel" :aria-label="channelCreation === 'independent' ? '新建独立学校渠道' : '添加接替 Key'" @submit.prevent="addChannel">
+          <template v-if="channelCreation === 'independent'">
+            <label>学校渠道<select v-model="newChannel.schoolChannel" required :disabled="channelBusy">
+              <option value="">请选择学校渠道</option>
+              <option v-for="name in beichenSchoolChannels" :key="name" :value="name">{{ name }}</option>
+            </select></label>
+            <p class="muted">保存后登记为学校渠道。通过该渠道发出的调用按学校系数 1.10 计算积分。</p>
+          </template>
           <label>新渠道名称<input v-model="newChannel.label" maxlength="128" required :disabled="channelBusy"></label>
           <label>新 Key<input v-model="newChannel.key" type="password" autocomplete="new-password" required :disabled="channelBusy"></label>
-          <div class="actions"><button type="submit" class="button primary" :disabled="channelBusy || channelReading">保存并同步</button></div>
+          <div class="actions"><button type="submit" class="button primary"
+            :disabled="channelBusy || channelReading || (channelCreation === 'replacement' && !channelFrom)">保存并同步</button></div>
         </form>
-        <div v-if="replacementChannel" class="chip-list" aria-label="接替渠道同步进度">
+        <div v-if="replacementChannel" class="chip-list" :aria-label="channelFrom ? '接替渠道同步进度' : '新渠道同步进度'">
           <span v-for="[kind, title] in syncDimensions" :key="kind" class="chip">{{ title }} · {{ syncLabels[replacementChannel.sync[kind]] }}</span>
           <span v-if="replacementChannel.identity" class="chip">官网账单归属 · {{ syncLabels[replacementChannel.identity] }}</span>
         </div>

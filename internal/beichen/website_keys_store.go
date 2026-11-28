@@ -65,6 +65,7 @@ SELECT k.upstream_key_id,k.name,k.key_prefix,k.group_id,k.group_name,trim_scale(
 FROM beichen_website_keys k
 LEFT JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
  AND c.status='active' AND k.ciphertext_digest=sha256(c.credential_ciphertext)
+ AND k.status='active' AND k.group_id BETWEEN 1 AND 9007199254740991
 LEFT JOIN LATERAL (
   SELECT peak_enabled,peak_rate,peak_start,peak_end,observed_at,changed
   FROM beichen_website_key_rate_versions
@@ -237,6 +238,12 @@ type websiteCredentialMatch struct {
 	ciphertext []byte
 	revision   time.Time
 	candidates []int
+	strength   int
+}
+
+type websiteKeyClaim struct {
+	strength int
+	count    int
 }
 
 func (s *Service) applyWebsiteKeys(ctx context.Context, provider, lease uuid.UUID, observation websiteKeyObservation, observedAt time.Time, recovered bool) ([]WebsiteKey, error) {
@@ -289,15 +296,14 @@ func (s *Service) applyWebsiteKeys(ctx context.Context, provider, lease uuid.UUI
 			issues["insufficient_key_evidence"]++
 		case 1:
 			i := credential.candidates[0]
-			if claims[i] == 1 {
-				key := listed[i]
-				current = websiteKeyView(key)
-				groupID := current.GroupID
-				if groupID == nil && key.GroupID == 0 && key.groupIDKnown {
-					groupID = &key.GroupID
-				}
+			key := listed[i]
+			if claims[i].strength != credential.strength || claims[i].count != 1 {
+				issues["multiple_school_credentials"]++
+			} else if key.Status == "active" && (validWebsiteGroupID(key.GroupID) || key.groupIDKnown && key.GroupID == 0) {
+				// A confirmed missing group is evidence for retiring the old
+				// group, but the Key remains unmatched in the inventory.
 				accepted, err := saveConfirmedKeyBinding(ctx, tx, credential.id, websiteKeyBindingObservation{
-					KeyID: key.ID, GroupID: groupID, CheckedAt: observedAt, Revision: credential.revision,
+					KeyID: key.ID, GroupID: &key.GroupID, CheckedAt: observedAt, Revision: credential.revision,
 				}, true)
 				if err != nil {
 					return nil, err
@@ -305,9 +311,10 @@ func (s *Service) applyWebsiteKeys(ctx context.Context, provider, lease uuid.UUI
 				if !accepted {
 					continue
 				}
-				matched[i] = credential
-			} else {
-				issues["multiple_school_credentials"]++
+				if validWebsiteGroupID(key.GroupID) {
+					current = websiteKeyView(key)
+					matched[i] = credential
+				}
 			}
 		default:
 			issues["tied_website_candidates"]++
@@ -324,7 +331,7 @@ func (s *Service) applyWebsiteKeys(ctx context.Context, provider, lease uuid.UUI
 			key.CredentialID, key.MatchStatus = &credential.id, "matched"
 			digest := sha256.Sum256(credential.ciphertext)
 			ciphertextDigest = digest[:]
-		} else if claims[i] != 0 {
+		} else if claims[i].count != 0 && listedKey.Status == "active" && validWebsiteGroupID(listedKey.GroupID) {
 			key.MatchStatus = "ambiguous"
 		}
 		_, err := tx.ExecContext(ctx, `
@@ -378,7 +385,7 @@ SELECT observed_at,CASE WHEN changed THEN observed_at END FROM previous WHERE NO
 		key.Peak.Start, key.Peak.End, observedAt).Scan(&key.ObservedAt, &key.ChangedAt)
 }
 
-func (s *Service) findWebsiteCredentialMatches(ctx context.Context, tx *sql.Tx, provider uuid.UUID, keys []listedKey) ([]websiteCredentialMatch, []int, error) {
+func (s *Service) findWebsiteCredentialMatches(ctx context.Context, tx *sql.Tx, provider uuid.UUID, keys []listedKey) ([]websiteCredentialMatch, []websiteKeyClaim, error) {
 	rows, err := tx.QueryContext(ctx, `
 SELECT c.id,c.credential_ciphertext,c.updated_at,c.label::text,COALESCE(p.channel,c.label::text)
 FROM provider_credentials c LEFT JOIN beichen_provision_channels p ON p.credential_id=c.id
@@ -388,7 +395,7 @@ WHERE c.provider_id=$1 AND c.status='active' ORDER BY c.id FOR NO KEY UPDATE OF 
 	}
 	defer rows.Close()
 	var credentials []websiteCredentialMatch
-	claims := make([]int, len(keys))
+	claims := make([]websiteKeyClaim, len(keys))
 	for rows.Next() {
 		var credential websiteCredentialMatch
 		var label, channel string
@@ -397,9 +404,14 @@ WHERE c.provider_id=$1 AND c.status='active' ORDER BY c.id FOR NO KEY UPDATE OF 
 		}
 		secret, err := s.crypto.DecryptCredential(credential.ciphertext)
 		if err == nil {
-			credential.candidates = websiteKeyCandidates(keys, secret, channel, label)
+			credential.candidates, credential.strength = websiteKeyCandidates(keys, secret, channel, label)
 			for _, i := range credential.candidates {
-				claims[i]++
+				claim := &claims[i]
+				if credential.strength > claim.strength {
+					*claim = websiteKeyClaim{strength: credential.strength, count: 1}
+				} else if credential.strength == claim.strength {
+					claim.count++
+				}
 			}
 		}
 		credentials = append(credentials, credential)
