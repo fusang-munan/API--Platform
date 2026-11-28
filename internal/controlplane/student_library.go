@@ -60,6 +60,7 @@ func modelCatalogCandidateFromPlatformModel(view ModelView) ModelCatalogCandidat
 			"recommended_protocol": view.RecommendedProtocol, "probe_state": view.ProbeState,
 			"availability": view.Availability, "availability_state": view.AvailabilityState,
 			"availability_reason": view.AvailabilityReason, "last_probe_at": view.LastProbeAt,
+			"route_ready": view.RouteReady,
 		},
 	}
 	if view.DisplayName != "" {
@@ -255,20 +256,54 @@ const (
 	studentCatalogProtocolBatch = 1_024
 )
 
-func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, pageSize int) (ModelCatalogPage, error) {
+type StudentCatalogPage struct {
+	ModelCatalogPage
+	Directory *studentCatalogDirectory `json:"directory,omitempty"`
+}
+
+type studentCatalogDirectory struct {
+	Models []studentCatalogDirectoryModel `json:"models"`
+}
+
+type studentCatalogDirectoryModel struct {
+	ModelCatalogCandidate
+	WithGrant    string `json:"with_grant"`
+	WithoutGrant string `json:"without_grant"`
+}
+
+// The catalog endpoint has no student ID. Publish the two directory outcomes
+// without exposing any grants. The Key endpoint supplies the caller's grants.
+func studentDirectoryModel(model ModelView) studentCatalogDirectoryModel {
+	item := studentCatalogDirectoryModel{ModelCatalogCandidate: modelCatalogCandidateFromPlatformModel(model)}
+	switch model.AvailabilityState {
+	case catalog.AvailabilityAvailable, catalog.AvailabilityDegraded:
+		item.WithGrant, item.WithoutGrant = "callable", "addable"
+	case catalog.AvailabilityUnverified:
+		item.WithGrant, item.WithoutGrant = "unverified", "unverified"
+	default:
+		item.WithGrant, item.WithoutGrant = "historical", "maintenance"
+	}
+	return item
+}
+
+func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, pageSize int) (StudentCatalogPage, error) {
 	if !utf8.ValidString(query) || utf8.RuneCountInString(query) > studentCatalogMaxQueryRunes || strings.ContainsRune(query, 0) {
-		return ModelCatalogPage{}, domain.NewError(domain.CodeValidation, "q 须为 128 字以内的有效文本")
+		return StudentCatalogPage{}, domain.NewError(domain.CodeValidation, "q 须为 128 字以内的有效文本")
 	}
 	if page < 1 || page > studentCatalogMaxPage {
-		return ModelCatalogPage{}, domain.NewError(domain.CodeValidation, "page 须为 1 到 10000 之间的整数")
+		return StudentCatalogPage{}, domain.NewError(domain.CodeValidation, "page 须为 1 到 10000 之间的整数")
 	}
 	if pageSize < 1 || pageSize > studentCatalogMaxPageSize {
-		return ModelCatalogPage{}, domain.NewError(domain.CodeValidation, "page_size 须为 1 到 50 之间的整数")
+		return StudentCatalogPage{}, domain.NewError(domain.CodeValidation, "page_size 须为 1 到 50 之间的整数")
 	}
-	result := ModelCatalogPage{Items: []ModelCatalogCandidate{}, Page: page, PageSize: pageSize}
+	query = strings.ToLower(strings.TrimSpace(query))
+	result := StudentCatalogPage{ModelCatalogPage: ModelCatalogPage{Items: []ModelCatalogCandidate{}, Page: page, PageSize: pageSize}}
+	if query == "" && page == 1 {
+		result.Directory = &studentCatalogDirectory{Models: []studentCatalogDirectoryModel{}}
+	}
 	hasProvider, err := s.hasActiveProvider(ctx)
 	if err != nil {
-		return ModelCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "query active providers", err)
+		return StudentCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "query active providers", err)
 	}
 	if !hasProvider {
 		return result, nil
@@ -282,17 +317,17 @@ func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, 
 		Order(ent.Asc(entmodel.FieldModelID)).
 		All(ctx)
 	if err != nil {
-		return ModelCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "list enabled models", err)
+		return StudentCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "list enabled models", err)
 	}
-	query = strings.ToLower(strings.TrimSpace(query))
 	matches := slices.DeleteFunc(rows, func(row *ent.Model) bool {
 		return !modelMatchesStudentQuery(row, query)
 	})
 	type publishedModel struct {
-		id   uuid.UUID
-		view ModelView
+		id    uuid.UUID
+		index int
 	}
 	published := make([]publishedModel, 0, len(matches))
+	models := make([]ModelView, 0, len(matches))
 	// Route readiness affects the total, so evaluate it before slicing the page.
 	// Keep each batch well within PostgreSQL's bind parameter limit.
 	for batch := range slices.Chunk(matches, studentCatalogProtocolBatch) {
@@ -302,17 +337,29 @@ func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, 
 		}
 		protocols, err := catalog.LoadPublishedProtocols(ctx, s.db, ids, s.security)
 		if err != nil {
-			return ModelCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "query model availability", err)
+			return StudentCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "query model availability", err)
 		}
 		for _, row := range batch {
 			view := modelView(row)
 			view.setAvailability(catalog.SummarizeModelAvailability(row.ModelID, row.Status, protocols[row.ID]))
-			if modelViewEnabledForStudents(view) {
-				published = append(published, publishedModel{id: row.ID, view: view})
+			ready := modelViewEnabledForStudents(view)
+			if ready {
+				published = append(published, publishedModel{id: row.ID, index: len(models)})
+			}
+			if ready || result.Directory != nil {
+				models = append(models, view)
 			}
 		}
 	}
 	result.Total = len(published)
+	if result.Directory != nil {
+		if err := s.setStudentModelStates(ctx, models); err != nil {
+			return StudentCatalogPage{}, err
+		}
+		for _, model := range models {
+			result.Directory.Models = append(result.Directory.Models, studentDirectoryModel(model))
+		}
+	}
 	// The validated bounds keep this multiplication below 500,000.
 	start := (page - 1) * pageSize
 	if start >= result.Total {
@@ -329,7 +376,7 @@ func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, 
 		Order(ent.Asc(modelbinding.FieldPriority), ent.Asc(modelbinding.FieldID)).
 		All(ctx)
 	if err != nil {
-		return ModelCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "query model bindings", err)
+		return StudentCatalogPage{}, domain.WrapError(domain.CodeDependencyUnavailable, "query model bindings", err)
 	}
 	primary := make(map[uuid.UUID]*ent.ModelBinding, len(entries))
 	for _, binding := range bindings {
@@ -337,17 +384,18 @@ func (s *Service) StudentCatalogSearch(ctx context.Context, query string, page, 
 			primary[binding.ModelID] = binding
 		}
 	}
-	models := make([]ModelView, 0, len(entries))
+	pageModels := make([]ModelView, 0, len(entries))
 	for _, entry := range entries {
-		view := entry.view
+		view := models[entry.index]
 		setStudentModelPrimaryBinding(&view, primary[entry.id])
-		models = append(models, view)
+		pageModels = append(pageModels, view)
 	}
-	if err := s.setStudentModelStates(ctx, models); err != nil {
-		return ModelCatalogPage{}, err
+	if result.Directory == nil {
+		if err := s.setStudentModelStates(ctx, pageModels); err != nil {
+			return StudentCatalogPage{}, err
+		}
 	}
-	result.Items = make([]ModelCatalogCandidate, 0, len(models))
-	for _, model := range models {
+	for _, model := range pageModels {
 		result.Items = append(result.Items, modelCatalogCandidateFromPlatformModel(model))
 	}
 	return result, nil

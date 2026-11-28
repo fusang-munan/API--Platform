@@ -8,6 +8,7 @@ import {
 } from '../../api/teacherUsage'
 import type { Project } from '../../api/types'
 import EmptyState from '../../components/EmptyState.vue'
+import { useVisibilityPolling } from '../../composables/useVisibilityPolling'
 import { schoolMonth } from '../../utils/format'
 import TeacherStudentUsageDetails from './TeacherStudentUsageDetail.vue'
 
@@ -61,14 +62,16 @@ function closeDetail() {
   detailLoading.value = false
 }
 
-async function loadList(page: number) {
+async function loadList(page: number, refresh = false) {
   listRequest?.abort()
   const controller = listRequest = new AbortController()
-  closeDetail()
   requestedPage = page
-  loading.value = true
-  report.value = undefined
-  error.value = ''
+  if (!refresh) {
+    closeDetail()
+    loading.value = true
+    report.value = undefined
+    error.value = ''
+  }
   try {
     const result = await teacherUsageAPI.students({ ...appliedFilters, page, page_size: pageSize }, controller.signal)
     if (controller.signal.aborted) return
@@ -78,8 +81,9 @@ async function loadList(page: number) {
       return
     }
     report.value = result
+    if (refresh && expanded.value && !result.items.some(item => item.user_id === expanded.value)) closeDetail()
   } catch (caught) {
-    if (!controller.signal.aborted) error.value = apiErrorMessage(caught, '学生用量加载失败')
+    if (!refresh && !controller.signal.aborted) error.value = apiErrorMessage(caught, '学生用量加载失败')
   } finally {
     if (!controller.signal.aborted) loading.value = false
   }
@@ -90,11 +94,11 @@ function applyFilters() {
   void loadList(1)
 }
 
-async function loadDetail(userId: string) {
+async function loadDetail(userId: string, refresh = false) {
   detailRequest?.abort()
   const controller = detailRequest = new AbortController()
   expanded.value = userId
-  detail.value = undefined
+  if (!refresh) detail.value = undefined
   detailLoading.value = true
   detailError.value = ''
   try {
@@ -111,6 +115,15 @@ function toggleDetail(userId: string) {
   if (expanded.value === userId) closeDetail()
   else void loadDetail(userId)
 }
+
+useVisibilityPolling(async () => {
+  if (loading.value || !report.value) return
+  const userId = expanded.value
+  await Promise.all([
+    loadList(requestedPage, true),
+    userId && !detailLoading.value ? loadDetail(userId, true) : undefined,
+  ])
+}, 60_000)
 
 onMounted(() => {
   void loadProjects()
@@ -207,7 +220,7 @@ onBeforeUnmount(() => {
               </tr>
               <tr v-if="expanded === student.user_id" :id="`details-${student.user_id}`" class="detail-row">
                 <td colspan="7">
-                  <p v-if="detailLoading" class="muted" role="status">正在加载项目、Key 和模型明细…</p>
+                  <p v-if="detailLoading && !detail" class="muted" role="status">正在加载 Key 和模型明细…</p>
                   <div v-else-if="detailError" role="alert">
                     <p class="error">{{ detailError }}</p>
                     <button class="button ghost" type="button" @click="loadDetail(student.user_id)">重试明细</button>

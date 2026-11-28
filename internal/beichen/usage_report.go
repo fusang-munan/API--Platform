@@ -220,8 +220,8 @@ models AS (
  SELECT project_id, user_id, model_key, min(model_label) AS model, ` + modelUsageIdentityJSONSQL + ` || ` + modelUsageMetricsJSONSQL + ` AS item
  FROM report_models GROUP BY project_id, user_id, model_key
 ), key_models AS (
- SELECT api_key_id, model_key, min(model_label) AS model, ` + modelUsageIdentityJSONSQL + ` || ` + modelUsageMetricsJSONSQL + ` AS item
- FROM report_models GROUP BY api_key_id, model_key
+ SELECT project_id, user_id, api_key_id, model_key, min(model_label) AS model, ` + modelUsageIdentityJSONSQL + ` || ` + modelUsageMetricsJSONSQL + ` AS item
+ FROM report_models GROUP BY project_id, user_id, api_key_id, model_key
 ), students AS (
  SELECT project_id, user_id, max(user_name) AS user_name, max(project_name) AS project_name,
    ` + modelUsageMetricsJSONSQL + ` AS metrics
@@ -242,8 +242,9 @@ SELECT jsonb_build_object(
  'keys', COALESCE((SELECT jsonb_agg(jsonb_build_object(
    'api_key_id', k.api_key_id, 'api_key_name', k.api_key_name, 'user_id', k.user_id, 'user_name', k.user_name,
    'project_id', k.project_id, 'project_name', k.project_name,
-   'models', (SELECT jsonb_agg(m.item ORDER BY m.model, m.model_key) FROM key_models m WHERE m.api_key_id = k.api_key_id)) || k.metrics
-   ORDER BY k.api_key_name, k.api_key_id) FROM keys k), '[]'::jsonb))`
+   'models', (SELECT jsonb_agg(m.item ORDER BY m.model, m.model_key) FROM key_models m
+     WHERE m.project_id = k.project_id AND m.user_id = k.user_id AND m.api_key_id = k.api_key_id)) || k.metrics
+   ORDER BY k.api_key_name, k.api_key_id, k.project_id, k.user_id) FROM keys k), '[]'::jsonb))`
 
 func readModelUsage(ctx context.Context, tx *sql.Tx, providerID *uuid.UUID, period ReportPeriod) (ModelUsageReport, error) {
 	var report ModelUsageReport

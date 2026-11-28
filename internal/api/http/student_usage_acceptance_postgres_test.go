@@ -340,6 +340,22 @@ func TestStudentCatalogBatchHTTPPostgres(t *testing.T) {
 		raw["last_probe_at"] == nil {
 		t.Fatalf("page missing stored availability evidence: %+v", raw)
 	}
+	directory := readUsageHTTPData[controlplane.StudentCatalogPage](t, f.get(route+"?page_size=1", token))
+	if len(directory.Items) != 1 || directory.Total != 23 || directory.Directory == nil || len(directory.Directory.Models) != 24 {
+		t.Fatalf("directory coverage changed with page size: %+v", directory)
+	}
+	addable := directory.Directory.Models[22]
+	if addable.ModelID != "batch-23" || addable.WithGrant != "callable" || addable.WithoutGrant != "addable" {
+		t.Fatalf("eligible model beyond the first page is missing its grant outcomes: %+v", addable)
+	}
+	unverified := directory.Directory.Models[0]
+	if unverified.WithGrant != "unverified" || unverified.WithoutGrant != "unverified" || unverified.RawEntry["availability_reason"] == "" {
+		t.Fatalf("unverified model is missing its explanation: %+v", unverified)
+	}
+	offline := directory.Directory.Models[23]
+	if offline.ModelID != "batch-24" || offline.WithGrant != "historical" || offline.WithoutGrant != "maintenance" {
+		t.Fatalf("model with no route is missing its outcomes: %+v", offline)
+	}
 }
 
 func TestStudentCatalogBoundsHTTPPostgres(t *testing.T) {

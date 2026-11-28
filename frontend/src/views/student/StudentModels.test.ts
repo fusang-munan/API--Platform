@@ -1,6 +1,6 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { APIError } from '../../api/client'
+import { APIError, request } from '../../api/client'
 import { studentAPI } from '../../api/student'
 import type { StudentModelCatalogPage, StudentUsageSnapshot } from '../../api/student'
 import StudentModels from './StudentModels.vue'
@@ -42,6 +42,11 @@ const fixture = vi.hoisted(() => {
   })
   return { model, key }
 })
+
+vi.mock('../../api/client', async importOriginal => ({
+  ...await importOriginal<typeof import('../../api/client')>(),
+  request: vi.fn(),
+}))
 
 vi.mock('../../api/student', () => ({
   studentAPI: {
@@ -109,6 +114,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   window.history.replaceState({}, '', '/')
   vi.spyOn(window, 'confirm').mockReturnValue(true)
+  vi.mocked(request).mockReset().mockResolvedValue({})
   vi.mocked(studentAPI.models).mockReset().mockResolvedValue({
     common_models: [fixture.model('gpt-5.3-codex'), fixture.model('claude-sonnet-4-5')],
     library_models: [],
@@ -320,7 +326,7 @@ describe('StudentModels key model states', () => {
     vi.mocked(studentAPI.keys).mockResolvedValueOnce([activeKey([maintenance])] as never)
     const wrapper = mountPage()
     await flushPromises()
-    await showGroup(wrapper, 'maintenance')
+    await showGroup(wrapper, 'historical')
 
     const joined = wrapper.get('[data-model="gpt-5.3-codex"]')
     expect(joined.get('[data-testid="model-key-status"]').text()).toBe('已加入')
@@ -332,6 +338,7 @@ describe('StudentModels key model states', () => {
     expect(joined.find('[data-testid="protocol-mismatch"]').exists()).toBe(false)
     expect(joined.text()).not.toContain('请切换协议')
 
+    await showGroup(wrapper, 'maintenance')
     const notJoined = wrapper.get('[data-model="gemini-2.5-pro"]')
     expect(notJoined.get('[data-testid="sync-key-model"]').text()).toBe('暂不可加入')
     expect(notJoined.get('[data-testid="sync-key-model"]').attributes('disabled')).toBeDefined()
@@ -382,7 +389,7 @@ describe('StudentModels availability groups', () => {
     return mountPage()
   }
 
-  it('shows only callable models by default and separates maintenance and addable groups', async () => {
+  it('preserves Key cards when full directory counts are unavailable', async () => {
     const wrapper = mountPlaza()
     await flushPromises()
 
@@ -391,9 +398,10 @@ describe('StudentModels availability groups', () => {
     expect(cards.map(card => card.attributes('data-model')).sort()).toEqual([...callableIDs].sort())
     expect(wrapper.get('[data-testid="model-summary"]').text())
       .toBe('当前 Key 已授权 9 个模型')
-    expect(wrapper.get('[data-testid="model-group-callable"]').text()).toBe('可调用4')
+    expect(wrapper.get('[data-testid="model-group-callable"]').text()).toBe('可调用')
+    expect(wrapper.text()).toContain('完整目录计数暂不可用')
 
-    await showGroup(wrapper, 'maintenance')
+    await showGroup(wrapper, 'historical')
     const maintained = wrapper.findAll('[data-model]')
     expect(maintained).toHaveLength(5)
     expect(maintained.map(card => card.attributes('data-model')).sort()).toEqual([...maintainedIDs].sort())
@@ -403,6 +411,46 @@ describe('StudentModels availability groups', () => {
 
     await showGroup(wrapper, 'addable')
     expect(wrapper.findAll('[data-model]').map(card => card.attributes('data-model'))).toEqual(['gpt-6.1-terra'])
+    wrapper.unmount()
+  })
+
+  it('counts the complete directory for the selected Key and includes a model outside the plaza and grants', async () => {
+    const original = callableModels()[0]
+    const historical = maintainedModel('teacher-disabled', {
+      availability_state: 'disabled', status: 'inactive', availability_reason: '老师已停用该模型。',
+    })
+    vi.mocked(studentAPI.models).mockResolvedValueOnce({ common_models: [], library_models: [] })
+    vi.mocked(studentAPI.keys).mockResolvedValueOnce([
+      activeKey([original, historical]),
+      fixture.key({ id: 'key-2', name: '另一把 Key', status: 'active', models: [] }),
+    ] as never)
+    vi.mocked(request).mockResolvedValueOnce({ directory: { models: [
+      { model_id: original.model_id, credit_multiplier: '1.00', raw_entry: { availability_state: 'available' },
+        with_grant: 'callable', without_grant: 'addable' },
+      { model_id: 'unseen-model', credit_multiplier: '1.00', raw_entry: { availability_state: 'available' },
+        with_grant: 'callable', without_grant: 'addable' },
+      { model_id: 'pending-verification', credit_multiplier: '1.00',
+        raw_entry: { availability_state: 'unverified', availability_reason: '等待新一轮渠道核验。' },
+        with_grant: 'unverified', without_grant: 'unverified' },
+    ] } })
+    vi.mocked(studentAPI.addKeyModels).mockResolvedValueOnce({ model_ids: [original.model_id, historical.model_id, 'unseen-model'], added_model_ids: ['unseen-model'] })
+    const wrapper = mountPage()
+    await flushPromises()
+    const group = (name: string) => wrapper.get(`[data-testid="model-group-${name}"]`).text()
+    expect(request).toHaveBeenCalledWith('/api/v1/student/model-catalog?page_size=1', { signal: expect.any(AbortSignal) })
+    expect([group('callable'), group('addable'), group('unverified'), group('historical')])
+      .toEqual(['可调用1', '可添加1', '待核验1', '历史授权1'])
+    await showGroup(wrapper, 'historical')
+    expect(wrapper.get('[data-model="teacher-disabled"]').text()).toContain('老师已停用该模型')
+    await showGroup(wrapper, 'unverified')
+    expect(wrapper.get('[data-model="pending-verification"]').text()).toContain('等待新一轮渠道核验')
+    await showGroup(wrapper, 'addable')
+    await wrapper.get('[data-model="unseen-model"] [data-testid="sync-key-model"]').trigger('click')
+    await flushPromises()
+    expect(studentAPI.addKeyModels).toHaveBeenCalledWith('key-1', ['unseen-model'])
+    expect([group('callable'), group('addable')]).toEqual(['可调用2', '可添加0'])
+    await wrapper.get('[data-testid="current-key"]').setValue('key-2')
+    expect([group('callable'), group('addable'), group('historical')]).toEqual(['可调用0', '可添加2', '历史授权0'])
     wrapper.unmount()
   })
 
@@ -419,7 +467,7 @@ describe('StudentModels availability groups', () => {
     })
     const wrapper = mountPage()
     await flushPromises()
-    await showGroup(wrapper, 'maintenance')
+    await showGroup(wrapper, 'historical')
 
     await wrapper.get('[data-testid="cleanup-maintenance"]').trigger('click')
     await flushPromises()
@@ -445,7 +493,7 @@ describe('StudentModels availability groups', () => {
     vi.mocked(studentAPI.removeKeyModels).mockRejectedValueOnce(new APIError('服务暂不可用', 503, 'DEPENDENCY_UNAVAILABLE'))
     const wrapper = mountPage()
     await flushPromises()
-    await showGroup(wrapper, 'maintenance')
+    await showGroup(wrapper, 'historical')
 
     await wrapper.get('[data-testid="cleanup-maintenance"]').trigger('click')
     await flushPromises()
@@ -468,7 +516,7 @@ describe('StudentModels availability groups', () => {
     ])] as never)
     const wrapper = mountPage()
     await flushPromises()
-    await showGroup(wrapper, 'maintenance')
+    await showGroup(wrapper, 'historical')
     const card = wrapper.get('[data-model="gpt-6.1-terra"]')
     expect(card.get('[data-testid="model-availability"]').text()).toBe('当前渠道未开放 · 历史授权')
     expect(card.get('[data-testid="model-unavailable-reason"]').text()).toContain('成功扫描')
@@ -775,9 +823,13 @@ describe('StudentModels catalog dialog', () => {
     const wrapper = mountPage()
     const dialog = await openCatalog(wrapper)
     expect(dialog.get('[data-testid="catalog-key-note"]').text()).toBe('当前 Key 我的 Key')
-    expect(dialog.findAll('table thead th').map(th => th.text()))
-      .toEqual(['模型 / 厂商', '本月用量', '协议', '状态', '操作'])
-    for (const row of dialog.findAll('table tbody tr')) expect(row.findAll('td')).toHaveLength(5)
+    for (const row of dialog.findAll('.catalog-row')) {
+      expect(row.get('.catalog-row-heading strong').text()).toBeTruthy()
+      expect(row.findAll('.catalog-row-meta dt').map(label => label.text()))
+        .toEqual(['厂商', '本月用量', '协议', '状态'])
+      const action = row.find('[data-testid="catalog-add"]')
+      if (action.exists()) expect(action.element.parentElement).toBe(row.get('.catalog-row-heading').element)
+    }
     expect(dialog.get('.catalog-protocol .recommend').text()).toBe('Responses · 推荐')
     const coverage = dialog.findAll('[data-testid="catalog-key-coverage"]')
     expect(coverage.map(chip => chip.text())).toEqual([
@@ -853,7 +905,8 @@ describe('StudentModels catalog dialog', () => {
     vi.mocked(studentAPI.modelCatalog).mockResolvedValueOnce(result(['long-model-name']))
     const wrapper = mountPage()
     const dialog = await openCatalog(wrapper)
-    const row = dialog.get('tbody tr').element
+    const row = dialog.get('.catalog-row').element
+    const metadata = dialog.get('.catalog-row-meta').element
     const button = dialog.get('[data-testid="catalog-add"]').element
     const documentSource = new DOMParser().parseFromString(studentModelsSource, 'text/html')
     const style = document.createElement('style')
@@ -862,12 +915,15 @@ describe('StudentModels catalog dialog', () => {
     try {
       // jsdom parses media rules but does not apply them at a viewport width.
       const narrow = Array.from(style.sheet!.cssRules).find((rule): rule is CSSMediaRule =>
-        rule instanceof CSSMediaRule && rule.conditionText === '(max-width: 740px)')
+        rule instanceof CSSMediaRule && rule.conditionText === '(max-width: 800px)')
       expect(narrow).toBeDefined()
       const rules = Array.from(narrow!.cssRules).filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
-      const card = rules.find(rule => row.matches(rule.selectorText) && rule.style.display === 'grid')
-      expect(card?.style.getPropertyValue('grid-template-areas')).toBe('"model model" "usage protocol" "status action"')
-      expect(rules.some(rule => button.matches(rule.selectorText) && rule.style.getPropertyValue('min-height') === '44px')).toBe(true)
+      const card = rules.find(rule => row.matches(rule.selectorText))
+      expect(card?.style.getPropertyValue('border-radius')).toBe('12px')
+      expect(rules.find(rule => metadata.matches(rule.selectorText))?.style.getPropertyValue('grid-template-columns'))
+        .toBe('repeat(2, minmax(0, 1fr))')
+      expect(getComputedStyle(button).minHeight).toBe('44px')
+      expect(getComputedStyle(button.parentElement!).gridTemplateColumns).toBe('minmax(0, 1fr) auto')
     } finally {
       style.remove()
       wrapper.unmount()

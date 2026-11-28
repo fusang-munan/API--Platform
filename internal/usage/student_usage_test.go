@@ -218,6 +218,33 @@ func TestStudentUsageContractPostgres(t *testing.T) {
 	}
 	checkStudentUsageFields(t, studentUsageJSON(t, empty), map[string]any{"projects": []any{}, "models": []any{}})
 	checkStudentUsageFields(t, studentUsageJSON(t, empty.Totals), map[string]any{"credits": "0.000", "calls": 0.0, "completeness": "unknown"})
+
+	// Leave only the monthly model ledger for the archived model and no quota
+	// bucket for its Key. The Key's charge must still match its models.
+	exec(`DELETE FROM api_key_month_credit_buckets WHERE api_key_id=$1 AND month=$2`, second.key, month)
+	exec(`UPDATE monthly_usage_cube SET charged_milli=1750,charged_count=1,zero_cost_count=0
+		WHERE api_key_id=$1 AND month=$2 AND model_id=$3`, second.key, month, archivedModel)
+	zeroHitModel, totalOnlyModel := makeModel("zero-hit"), makeModel("total-only")
+	addCall(second, zeroHitModel, "openai_responses", "charged", "succeeded", "", 0, month, month,
+		observation{prompt: 100, completion: 0, total: 100, read: 0, miss: 100, write: 0, state: "reported"})
+	addFreeHistory(second, zeroHitModel)
+	addCall(second, totalOnlyModel, "openai_responses", "charged", "succeeded", "", 0, month, month,
+		observation{total: 89, state: "partial"})
+	addFreeHistory(second, totalOnlyModel)
+	projectB := studentUsageRow(t, read()["projects"], "project_id", second.project.String())
+	keyB := studentUsageRow(t, projectB["keys"], "id", second.key.String())
+	checkStudentUsageFields(t, keyB, map[string]any{"used": "1.75040000000000002", "calls": 4.0})
+	checkStudentUsageFields(t, studentUsageRow(t, keyB["models"], "id", "archived"), map[string]any{
+		"credits": "1.750", "calls": 1.0, "completeness": "unknown", "cache_hit_rate": nil,
+	})
+	checkStudentUsageFields(t, studentUsageRow(t, keyB["models"], "id", "total-only"), map[string]any{
+		"completeness": "partial", "cache_hit_rate": nil,
+		"tokens": map[string]any{"input": nil, "output": nil, "cache_read": nil, "cache_write": nil, "total": "89"},
+	})
+	checkStudentUsageFields(t, studentUsageRow(t, keyB["models"], "id", "zero-hit"), map[string]any{
+		"completeness": "complete", "cache_hit_rate": 0.0,
+		"cache_hit_coverage": map[string]any{"sample_calls": 1.0, "cache_read_tokens": "0", "input_with_cache_read_tokens": "100"},
+	})
 }
 
 func studentUsageJSON(t *testing.T, result any) map[string]any {
