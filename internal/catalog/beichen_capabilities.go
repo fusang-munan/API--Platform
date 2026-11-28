@@ -617,7 +617,7 @@ func (row *capabilityRow) evaluate(view *BeichenCapabilities) error {
 	}
 	row.reportProbeGaps(view, whole)
 	row.reportPriceGaps(view, routeCurrent)
-	if routeCurrent && row.PriceBlocker != nil && !row.PriceCovered {
+	if row.Published && row.BindingState == "ready" && row.PriceBlocker != nil && !row.PriceCovered {
 		row.Availability = AvailabilityUnavailable
 		row.AvailabilityReason = row.PriceBlocker.Message
 		row.RecommendedProtocol = nil

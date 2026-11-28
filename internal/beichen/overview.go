@@ -955,7 +955,7 @@ func (item *CatalogModel) applyRouteEvidence(rows []catalog.ModelCapability,
 		item.ProbeState = "unprobed"
 	}
 	switch {
-	case !item.PriceCovered && item.PriceBlocker != nil:
+	case item.Published && !item.PriceCovered && item.PriceBlocker != nil:
 		item.ModelAvailability.Availability = catalog.AvailabilityUnavailable
 		item.ModelAvailability.AvailabilityReason = item.PriceBlocker.Message
 		item.ModelAvailability.RecommendedProtocol = nil

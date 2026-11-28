@@ -25,13 +25,13 @@ func TestOverviewStudentPriceDiagnosticsPostgres(t *testing.T) {
 	ctx, db, provider, actor, keys := newActionsPostgres(t)
 	primary, backup, pending := keys[1], keys[2], keys[3]
 	const fixed, higher, manual, unverified, noRoute = "fixture-fixed", "fixture-higher", "fixture-manual", "fixture-unverified", "fixture-no-route"
-	const missing = "gemini-3.5-flash-lite"
+	const missing, candidateMissing = "gemini-3.5-flash-lite", "fixture-candidate-missing"
 	exec := func(query string, args ...any) { execCatalogTestSQL(t, ctx, db, query, args...) }
 	for _, item := range []struct {
 		key   uuid.UUID
 		names []string
 	}{
-		{primary, []string{fixed, manual, noRoute, missing}}, {backup, []string{fixed, higher, missing}}, {pending, []string{unverified}},
+		{primary, []string{fixed, manual, noRoute, missing, candidateMissing}}, {backup, []string{fixed, higher, missing}}, {pending, []string{unverified}},
 	} {
 		entries := make([]catalog.ProviderEntry, 0, len(item.names))
 		for _, name := range item.names {
@@ -48,11 +48,13 @@ SELECT gen_random_uuid(),n,n,'active',1000,now(),now() FROM unnest($1::text[]) n
 		adapter  string
 	}{{primary, fixed, 1, "openai_compatible"}, {backup, fixed, 2, "openai_responses"}, {backup, higher, 1, "openai_compatible"},
 		{primary, manual, 1, "openai_compatible"}, {pending, unverified, 1, "openai_compatible"},
-		{primary, missing, 1, "openai_compatible"}, {backup, missing, 2, "openai_responses"}} {
+		{primary, missing, 1, "openai_compatible"}, {backup, missing, 2, "openai_responses"},
+		{primary, candidateMissing, 1, "openai_compatible"}} {
 		exec(`INSERT INTO model_bindings(id,model_id,provider_id,credential_id,upstream_model_name,adapter,status,priority,created_at,updated_at)
 SELECT gen_random_uuid(),id,$1,$2,model_id,$5,'active',$4,now(),now() FROM models WHERE model_id=$3`,
 			provider, route.key, route.name, route.priority, route.adapter)
 	}
+	exec(`UPDATE models SET status='pending_configuration' WHERE model_id=$1`, candidateMissing)
 	exec(`INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,duration_ms,checked_at)
 SELECT $1,k,n,p,200,1,clock_timestamp()
 FROM (VALUES ($2::uuid,$4::text,'openai_compatible'),($3::uuid,$4::text,'openai_responses'),
@@ -86,7 +88,8 @@ SELECT credential_id,$2,'upstream','base','panel',1000000,1000000,0,0,effective_
 		t.Fatal(err)
 	}
 	expected := map[string]string{fixed: studentPriceNormal, higher: studentPriceHigher, manual: studentPriceManual,
-		unverified: studentPriceRatePending, noRoute: studentPriceNoRoute, missing: studentPriceNoBase}
+		unverified: studentPriceRatePending, noRoute: studentPriceNoRoute, missing: studentPriceNoBase,
+		candidateMissing: studentPriceNoRoute}
 	for _, row := range view.ModelCatalog {
 		if want, ok := expected[row.Model]; ok {
 			if row.StudentPrice.Status != want || row.StudentPrice.Reason == "" {
@@ -122,6 +125,12 @@ SELECT credential_id,$2,'upstream','base','panel',1000000,1000000,0,0,effective_
 			if row.Published || row.Active || !row.PriceCovered || !strings.Contains(row.StudentPrice.Reason, "尚未发布") {
 				t.Errorf("priced candidate must explain why it has no student route: %+v", row)
 			}
+		case candidateMissing:
+			if row.Published || row.Active || row.PriceCovered || row.PriceState != "missing" ||
+				row.PriceBlocker == nil || row.ModelAvailability.Availability != "not_published" ||
+				row.StudentPrice.Status != studentPriceNoRoute {
+				t.Errorf("an unpublished model without a price must stay not_published: %+v", row)
+			}
 		}
 	}
 	if len(expected) != 0 {
@@ -154,6 +163,10 @@ SELECT credential_id,$2,'upstream','base','panel',1000000,1000000,0,0,effective_
 		if route.Model == missing && (!route.Published || route.Availability != catalog.AvailabilityUnavailable ||
 			route.PriceCovered || route.BindingState != "ready" || route.RecommendedProtocol != nil) {
 			t.Errorf("capability must preserve the unpriced publication and ready binding: %+v", route)
+		}
+		if route.Model == candidateMissing && (route.Published || route.PriceCovered ||
+			route.Availability != "not_published") {
+			t.Errorf("unpublished missing-price capability must stay not_published: %+v", route)
 		}
 	}
 }
@@ -445,14 +458,23 @@ FROM provider_credentials c JOIN beichen_multiplier_versions mv ON mv.credential
 	for _, name := range append(slices.Clone(gpt), deepseek...) {
 		row := read(name)
 		owner, groupID, routes := g3, int64(10), 2
+		wantAvailability, wantPriceCovered := catalog.AvailabilityUnavailable, false
 		if slices.Contains(deepseek, name) {
 			owner, groupID, routes = gm1, 6, 1
+			if name == deepseek[0] {
+				wantAvailability, wantPriceCovered = catalog.AvailabilityAvailable, true
+			}
 		}
 		if row.BoundKeyCount != 1 || row.CoveredBoundKeyCount != 1 || row.ReadyCount != routes || len(row.BoundRoutes) != routes ||
-			row.ModelAvailability.ProbeState != "passed" || row.BindingIssue != nil ||
+			row.ModelAvailability.ProbeState != "passed" || row.ModelAvailability.Availability != wantAvailability ||
+			row.PriceCovered != wantPriceCovered || row.BindingIssue != nil ||
 			*row.BoundRoutes[0].CredentialID != owner || *row.BoundRoutes[0].GroupID != groupID {
 			t.Fatalf("绑定证据不应混入其他 Key: %+v", row)
 		}
+	}
+	if row := read(deepseek[0]); row.ModelAvailability.Availability != catalog.AvailabilityAvailable ||
+		row.ModelAvailability.ProbeState != "passed" || !row.PriceCovered {
+		t.Fatalf("deepseek-v4-pro must stay available with its conditional price: %+v", row)
 	}
 	if row, cap := read(deepseek[0]), capability(deepseek[0], gm1); !row.PriceCovered || !cap.PriceCovered ||
 		row.PriceState != "conditional" || cap.PriceState != row.PriceState {
