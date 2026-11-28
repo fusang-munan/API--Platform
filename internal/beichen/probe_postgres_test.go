@@ -254,7 +254,8 @@ VALUES(gen_random_uuid(),$1,$2,'inactive-key-model',now(),now(),now(),now())`, p
 			}
 			var generation map[string]json.RawMessage
 			_ = json.Unmarshal(body["generationConfig"], &generation)
-			model, maxTokens, response = "shared", generation["maxOutputTokens"], `{"candidates":[{}]}`
+			model, maxTokens, response = "shared", generation["maxOutputTokens"],
+				`{"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"MAX_TOKENS"}]}`
 		default:
 			return nil, errors.New("unregistered protocol requested")
 		}

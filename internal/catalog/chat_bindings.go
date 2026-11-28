@@ -89,9 +89,6 @@ func DefaultAdaptersForModel(modelID string) []modelbinding.Adapter {
 	if IsImageGenerationModel(modelID) {
 		return []modelbinding.Adapter{modelbinding.AdapterOpenaiImages}
 	}
-	if IsGeminiFamilyModel(modelID) {
-		return []modelbinding.Adapter{modelbinding.AdapterGoogleGeminiV1beta}
-	}
 	if IsAnthropicFamilyModel(modelID) {
 		return []modelbinding.Adapter{
 			modelbinding.AdapterAnthropic,

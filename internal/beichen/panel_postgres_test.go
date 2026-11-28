@@ -18,7 +18,7 @@ func TestPanelPostgresPriceLifecycle(t *testing.T) {
 		t.Skip("NEBULA_TEST_POSTGRES requires a disposable local nebula_test database")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || config.Database != "nebula_test" ||
+	if err != nil || config.Host != "127.0.0.1" || !isIsolatedTestDatabase(config.Database) ||
 		config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal("panel test requires a loopback-only nebula_test database with sslmode=disable")
 	}

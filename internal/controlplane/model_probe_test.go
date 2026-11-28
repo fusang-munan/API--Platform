@@ -141,9 +141,9 @@ func TestNativeProbeEndpointsUseCatalogCredential(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/v1beta/models/gemini-fixture:generateContent":
-			_, _ = io.WriteString(w, `{"candidates":[]}`)
+			_, _ = io.WriteString(w, `{"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"MAX_TOKENS"}]}`)
 		case "/v1beta/models/gemini-fixture:streamGenerateContent":
-			_, _ = io.WriteString(w, `[{"candidates":[]}]`)
+			_, _ = io.WriteString(w, `[{"candidates":[{"content":{"parts":[{"text":"OK"}]}}]},{"candidates":[{"finishReason":"MAX_TOKENS"}]}]`)
 		case "/v1beta/models/gemini-fixture:embedContent":
 			_, _ = io.WriteString(w, `{"embedding":{"values":[0.5]}}`)
 		default:
@@ -157,11 +157,17 @@ func TestNativeProbeEndpointsUseCatalogCredential(t *testing.T) {
 		mock.ExpectQuery(`FROM "providers"`).WithArgs(providerID).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "base_url"}).AddRow(providerID, base))
 	}
-	const catalogQuery = `FROM "provider_credentials".*"provider_model_catalog"`
+	const catalogQuery = `SELECT m\.credential_id,array_to_json\(m\.supported_protocols\).*FROM provider_model_catalog`
 	expectOwner := func() {
 		expectProvider(upstream.URL)
 		mock.ExpectQuery(catalogQuery).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "credential_ciphertext"}).AddRow(owner, ciphertext))
+			WithArgs(providerID, "gemini-fixture", "models/gemini-fixture").
+			WillReturnRows(sqlmock.NewRows([]string{"credential_id", "supported_protocols"}).
+				AddRow(owner, `["google_gemini_v1beta"]`))
+		now := time.Now()
+		mock.ExpectQuery(`SELECT .*FROM "provider_credentials".*"providers"`).
+			WillReturnRows(sqlmock.NewRows(providercredential.Columns).
+				AddRow(owner, now, now, providerID, "Gemini", nil, ciphertext, "active"))
 	}
 	endpoints := []string{"generate_content", "stream_generate_content", "embed_content"}
 	expectOwner()
@@ -187,7 +193,7 @@ func TestNativeProbeEndpointsUseCatalogCredential(t *testing.T) {
 
 	for _, preflight := range []bool{false, true} {
 		expectProvider("https://api.beichenapi.com/v1")
-		mock.ExpectQuery(catalogQuery + `.*"catalog_source"`).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+		mock.ExpectQuery(catalogQuery).WillReturnRows(sqlmock.NewRows([]string{"credential_id", "supported_protocols"}))
 		if preflight {
 			_, err = service.ProbeModelBindingRoute(context.Background(), BindingRouteProbeInput{
 				ProviderID: providerID, UpstreamModelName: "gemini-unlisted", Endpoint: "embed_content",

@@ -407,14 +407,14 @@ func GeminiProbeResponseOK(body []byte, endpoint BindingRouteProbeEndpoint) bool
 		if json.Unmarshal(body, &frames) != nil {
 			return false
 		}
-		found := false
+		state := geminiProbeState{}
 		for _, frame := range frames {
 			if !probeResponseObjectOK(frame) {
 				return false
 			}
-			found = found || validTokenProbeResponse(frame, BindingRouteProbeGenerateContent)
+			state.observe(frame)
 		}
-		return found
+		return state.complete()
 	}
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(body, &fields) != nil || !probeResponseObjectOK(fields) {
@@ -424,7 +424,70 @@ func GeminiProbeResponseOK(body []byte, endpoint BindingRouteProbeEndpoint) bool
 		var embedding struct{ Values []float64 }
 		return json.Unmarshal(fields["embedding"], &embedding) == nil && len(embedding.Values) > 0
 	}
-	return validTokenProbeResponse(fields, endpoint)
+	state := geminiProbeState{}
+	state.observe(fields)
+	return state.complete()
+}
+
+type geminiProbeState struct {
+	text     bool
+	seen     map[int]bool
+	finished map[int]bool
+}
+
+func (state *geminiProbeState) observe(fields map[string]json.RawMessage) {
+	if state.seen == nil {
+		state.seen, state.finished = map[int]bool{}, map[int]bool{}
+	}
+	var candidates []map[string]json.RawMessage
+	if json.Unmarshal(fields["candidates"], &candidates) != nil {
+		return
+	}
+	for position, candidate := range candidates {
+		index := position
+		var number float64
+		if json.Unmarshal(candidate["index"], &number) == nil && number >= 0 && number <= 1_000_000 {
+			index = int(number)
+		}
+		state.seen[index] = true
+		reason := rawProbeString(candidate["finishReason"])
+		if reason != "" && reason != "FINISH_REASON_UNSPECIFIED" {
+			state.finished[index] = true
+		}
+		var content map[string]json.RawMessage
+		if json.Unmarshal(candidate["content"], &content) != nil {
+			continue
+		}
+		var parts []map[string]json.RawMessage
+		if json.Unmarshal(content["parts"], &parts) != nil {
+			continue
+		}
+		for _, part := range parts {
+			if rawProbeString(part["text"]) != "" {
+				state.text = true
+			}
+		}
+	}
+}
+
+func (state geminiProbeState) complete() bool {
+	if !state.text || len(state.seen) == 0 {
+		return false
+	}
+	for index := range state.seen {
+		if !state.finished[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func rawProbeString(raw json.RawMessage) string {
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	return strings.TrimSpace(value)
 }
 
 func (p *RouteProbe) Discover(ctx context.Context, upstreamModelID string) ([]modelbinding.Adapter, error) {
@@ -491,7 +554,9 @@ func probeTargetURL(baseURL, requestPath string) (string, error) {
 func AdaptersFromCatalogSignals(entry ProviderEntry) []modelbinding.Adapter {
 	adapters := AdaptersFromSignals(EndpointSignals(entry)...)
 	native := modelbinding.AdapterGoogleGeminiV1beta
-	if IsGeminiFamilyModel(entry.ID) || slices.Contains(adapters, native) || slices.Contains(entry.SupportedProtocols, string(native)) {
+	// A model name alone does not prove the native route. Keep the existing
+	// Chat/Responses baseline until the catalog or a probe confirms v1beta.
+	if slices.Contains(adapters, native) || slices.Contains(entry.SupportedProtocols, string(native)) {
 		if len(entry.SupportedProtocols) > 0 {
 			adapters = AdaptersFromSignals(entry.SupportedProtocols...)
 		}

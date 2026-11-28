@@ -65,7 +65,7 @@ func newUsageHTTPFixture(t *testing.T) *usageHTTPFixture {
 		t.Skip("requires a disposable local nebula_test database")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || config.Database != "nebula_test" ||
+	if err != nil || config.Host != "127.0.0.1" || !isIsolatedTestDatabase(config.Database) ||
 		config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal("requires a loopback-only nebula_test database with sslmode=disable")
 	}
@@ -361,5 +361,13 @@ func TestStudentCatalogBoundsHTTPPostgres(t *testing.T) {
 	view := readUsageHTTPData[controlplane.ModelCatalogPage](t, f.get(route+"?page=10000&page_size=50&q="+withinLimit, token))
 	if view.Total != 0 || view.Page != 10000 || view.PageSize != 50 || view.Items == nil || len(view.Items) != 0 {
 		t.Fatalf("items or pagination metadata incorrect at valid limits: %+v", view)
+	}
+}
+func isIsolatedTestDatabase(name string) bool {
+	switch name {
+	case "nebula_test", "nebula_test_rev_c1", "nebula_test_hjc1":
+		return true
+	default:
+		return false
 	}
 }

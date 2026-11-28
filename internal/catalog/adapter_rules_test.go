@@ -37,21 +37,37 @@ func TestResolveAdapterUsesTokenRules(t *testing.T) {
 func TestGeminiCatalogProtocols(t *testing.T) {
 	for _, tc := range []struct {
 		entry ProviderEntry
-		want  modelbinding.Adapter
+		want  []modelbinding.Adapter
 	}{
-		{ProviderEntry{ID: "gemini-pro"}, modelbinding.AdapterGoogleGeminiV1beta},
-		{ProviderEntry{ID: "gemini-embedding-001"}, modelbinding.AdapterGoogleGeminiV1beta},
+		{ProviderEntry{ID: "gemini-pro"}, []modelbinding.Adapter{modelbinding.AdapterOpenaiResponses, modelbinding.AdapterOpenaiCompatible}},
+		{ProviderEntry{ID: "gemini-embedding-001"}, []modelbinding.Adapter{modelbinding.AdapterOpenaiEmbeddings}},
 		{ProviderEntry{ID: "custom", Raw: map[string]any{"supportedGenerationMethods": []any{"embedContent"}}},
-			modelbinding.AdapterGoogleGeminiV1beta},
+			[]modelbinding.Adapter{modelbinding.AdapterGoogleGeminiV1beta}},
 		{ProviderEntry{ID: "gemini-embedding-001", Raw: map[string]any{"endpoints": []any{"/v1/embeddings"}}},
-			modelbinding.AdapterOpenaiEmbeddings},
+			[]modelbinding.Adapter{modelbinding.AdapterOpenaiEmbeddings}},
 	} {
-		if got := RegisteredProtocols(tc.entry); !slices.Equal(got, []string{string(tc.want)}) {
-			t.Errorf("%s: registered %v, want %s", tc.entry.ID, got, tc.want)
+		protocols := make([]string, 0, len(tc.want))
+		for _, adapter := range tc.want {
+			protocols = append(protocols, string(adapter))
 		}
-		if got := AdaptersFromUpstream(tc.entry); !slices.Equal(got, []modelbinding.Adapter{tc.want}) {
-			t.Errorf("%s: bindings %v, want %s", tc.entry.ID, got, tc.want)
+		if got := RegisteredProtocols(tc.entry); !slices.Equal(got, protocols) {
+			t.Errorf("%s: registered %v, want %v", tc.entry.ID, got, protocols)
 		}
+		if got := AdaptersFromUpstream(tc.entry); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: bindings %v, want %v", tc.entry.ID, got, tc.want)
+		}
+	}
+}
+
+func TestGeminiUndeclaredCatalogKeepsChatBaseline(t *testing.T) {
+	entry := ProviderEntry{ID: "gemini-2.5-flash", Raw: map[string]any{"id": "gemini-2.5-flash", "type": "model"}}
+	want := []modelbinding.Adapter{modelbinding.AdapterOpenaiResponses, modelbinding.AdapterOpenaiCompatible}
+	if got := AdaptersFromUpstream(entry); !slices.Equal(got, want) {
+		t.Fatalf("undeclared Gemini catalog removed Chat baseline: %v", got)
+	}
+	entry.Raw["supportedGenerationMethods"] = []any{"generateContent"}
+	if got := AdaptersFromUpstream(entry); !slices.Equal(got, []modelbinding.Adapter{modelbinding.AdapterGoogleGeminiV1beta}) {
+		t.Fatalf("explicit native method did not enable Gemini: %v", got)
 	}
 }
 
@@ -62,10 +78,10 @@ func TestAdaptersFromUpstreamUsesChatPairForTextModels(t *testing.T) {
 		for _, adapter := range adapters {
 			found[adapter] = true
 		}
-	if !found[modelbinding.AdapterOpenaiCompatible] || !found[modelbinding.AdapterOpenaiResponses] {
-		t.Fatalf("model %q expected chat pair, got %#v", modelID, adapters)
+		if !found[modelbinding.AdapterOpenaiCompatible] || !found[modelbinding.AdapterOpenaiResponses] {
+			t.Fatalf("model %q expected chat pair, got %#v", modelID, adapters)
+		}
 	}
-}
 }
 
 func TestAdaptersFromUpstreamUsesImagesOnlyForImageModels(t *testing.T) {
@@ -102,12 +118,12 @@ func TestParseUpstreamMetadataDoesNotGuessFromModelID(t *testing.T) {
 
 func TestParseUpstreamMetadataReadsAliasedFields(t *testing.T) {
 	meta := ParseUpstreamMetadata(map[string]any{
-		"model_category":    "multimodal",
-		"features":            []any{"vision", "tool_calling"},
-		"input_modes":         []any{"text", "image"},
-		"output_modes":        []any{"text"},
-		"context_length":      200000,
-		"prompt_token_limit":  200000,
+		"model_category":         "multimodal",
+		"features":               []any{"vision", "tool_calling"},
+		"input_modes":            []any{"text", "image"},
+		"output_modes":           []any{"text"},
+		"context_length":         200000,
+		"prompt_token_limit":     200000,
 		"completion_token_limit": 8192,
 	})
 	if meta.Category == nil || string(*meta.Category) != "multimodal" {

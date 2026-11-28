@@ -17,6 +17,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
+	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/provider"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/providercredential"
 )
@@ -312,8 +313,12 @@ func probeTarget(baseURL, requestPath string) (string, error) {
 	return parsed.String(), nil
 }
 
-func (s *Service) catalogProbeCredential(ctx context.Context, providerRow *ent.Provider, model string) (string, error) {
-	row, err := catalog.FindProbeCatalogCredential(ctx, s.db, providerRow.ID, providerRow.BaseURL, model)
+func (s *Service) catalogProbeCredential(ctx context.Context, providerRow *ent.Provider, model string, protocols ...modelbinding.Adapter) (string, error) {
+	required := make([]string, 0, len(protocols))
+	for _, protocol := range protocols {
+		required = append(required, string(protocol))
+	}
+	row, err := catalog.FindProbeCatalogCredential(ctx, s.sqlDB, s.db, providerRow.ID, providerRow.BaseURL, model, required...)
 	if err != nil {
 		return "", domain.WrapError(domain.CodeDependencyUnavailable, "query probe model catalog", err)
 	}
@@ -332,6 +337,17 @@ func (s *Service) ProbeModel(ctx context.Context, input ProbeInput) (ProbeRespon
 	if model == "" {
 		return ProbeResponse{}, domain.NewError(domain.CodeValidation, "upstream_model_name is required")
 	}
+	if input.ProviderID != nil && input.CredentialID == nil && (len(input.Endpoints) < 1 || len(input.Endpoints) > 5) {
+		return ProbeResponse{}, domain.NewError(domain.CodeValidation, "probe endpoints must contain 1 to 5 items")
+	}
+	endpoints := make([]catalog.BindingRouteProbeEndpoint, 0, len(input.Endpoints))
+	for _, endpoint := range input.Endpoints {
+		if _, err := buildProbeRequest(endpoint, model); err != nil {
+			return ProbeResponse{}, err
+		}
+		endpoints = append(endpoints, catalog.BindingRouteProbeEndpoint(endpoint))
+	}
+	protocols := catalog.ProbeProtocolsForEndpoints(endpoints)
 	baseURL, credential := strings.TrimSpace(input.BaseURL), input.Credential
 	client := publicHTTPClient()
 	if input.CredentialID != nil {
@@ -360,7 +376,7 @@ func (s *Service) ProbeModel(ctx context.Context, input ProbeInput) (ProbeRespon
 			return ProbeResponse{}, domain.NewError(domain.CodeNotFound, "provider not found")
 		}
 		baseURL = row.BaseURL
-		credential, err = s.catalogProbeCredential(ctx, row, model)
+		credential, err = s.catalogProbeCredential(ctx, row, model, protocols...)
 		if err != nil {
 			return ProbeResponse{}, err
 		}

@@ -654,13 +654,13 @@ func openBeichenGatewayTestSchema(t *testing.T, ctx context.Context) *sql.DB {
 	const required = "test requires the disposable loopback gateway or rollout test database"
 	u, err := url.Parse(dsn)
 	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") ||
-		u.Hostname() != "127.0.0.1" || u.Port() == "" || (u.Path != "/nebula_test" && u.Path != "/nebula_test_hjc1") ||
+		u.Hostname() != "127.0.0.1" || u.Port() == "" || !isIsolatedTestDatabase(strings.TrimPrefix(u.Path, "/")) ||
 		u.User == nil || (u.User.Username() != "nebula_qa" && u.User.Username() != "nebula_test") ||
 		u.RawQuery != "sslmode=disable" || u.Fragment != "" {
 		t.Fatal(required)
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || "/"+config.Database != u.Path ||
+	if err != nil || config.Host != "127.0.0.1" || !isIsolatedTestDatabase(config.Database) || "/"+config.Database != u.Path ||
 		config.User != u.User.Username() || fmt.Sprint(config.Port) != u.Port() || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal(required)
 	}
@@ -709,4 +709,12 @@ func openBeichenGatewayTestSchema(t *testing.T, ctx context.Context) *sql.DB {
 		}
 	}
 	return db
+}
+func isIsolatedTestDatabase(name string) bool {
+	switch name {
+	case "nebula_test", "nebula_test_rev_c1", "nebula_test_hjc1":
+		return true
+	default:
+		return false
+	}
 }

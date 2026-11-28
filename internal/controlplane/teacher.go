@@ -1049,7 +1049,11 @@ func (s *Service) CreateBinding(ctx context.Context, publicModelID string, input
 	if !providerExists {
 		return BindingView{}, domain.NewError(domain.CodeNotFound, "provider not found")
 	}
-	credentialID, err := s.resolveProbeCredentialID(ctx, input.ProviderID, input.UpstreamModelName)
+	probed, err := probedAdaptersFromInput(input)
+	if err != nil {
+		return BindingView{}, err
+	}
+	credentialID, err := s.resolveProbeCredentialID(ctx, input.ProviderID, input.UpstreamModelName, probed)
 	if err != nil {
 		return BindingView{}, err
 	}
@@ -1146,7 +1150,8 @@ func (s *Service) ProbeModelBindingRoute(ctx context.Context, input BindingRoute
 	if err != nil {
 		return catalog.RouteProbeStep{}, domain.WrapError(domain.CodeDependencyUnavailable, "query provider", err)
 	}
-	credentialPlain, err := s.catalogProbeCredential(ctx, providerRow, upstreamModelName)
+	credentialPlain, err := s.catalogProbeCredential(ctx, providerRow, upstreamModelName,
+		catalog.ProbeProtocolsForEndpoints([]catalog.BindingRouteProbeEndpoint{endpoint})...)
 	if err != nil {
 		return catalog.RouteProbeStep{}, err
 	}
@@ -1155,6 +1160,14 @@ func (s *Service) ProbeModelBindingRoute(ctx context.Context, input BindingRoute
 }
 
 func bindingAdaptersFromInput(modelID string, input BindingInput) ([]modelbinding.Adapter, error) {
+	probed, err := probedAdaptersFromInput(input)
+	if err != nil {
+		return nil, err
+	}
+	return catalog.ExpandChatGatewayAdapters(modelID, probed), nil
+}
+
+func probedAdaptersFromInput(input BindingInput) ([]modelbinding.Adapter, error) {
 	if len(input.ProbedAdapters) == 0 {
 		return nil, domain.NewError(domain.CodeValidation, "probed_adapters is required; run route probe before saving bindings")
 	}
@@ -1174,41 +1187,29 @@ func bindingAdaptersFromInput(modelID string, input BindingInput) ([]modelbindin
 	if len(result) == 0 {
 		return nil, domain.NewError(domain.CodeValidation, "probed_adapters is required; run route probe before saving bindings")
 	}
-	return catalog.ExpandChatGatewayAdapters(modelID, result), nil
+	return result, nil
 }
 
-func (s *Service) resolveProbeCredentialID(ctx context.Context, providerID uuid.UUID, upstreamModelName string) (*uuid.UUID, error) {
-	_, credentialID, err := s.probeCredentialForProvider(ctx, providerID, upstreamModelName)
-	return credentialID, err
-}
-
-func (s *Service) probeCredentialForProvider(ctx context.Context, providerID uuid.UUID, upstreamModelName string) (string, *uuid.UUID, error) {
-	if credentialID, resolveErr := s.ResolveCredentialForUpstream(ctx, providerID, upstreamModelName); resolveErr != nil {
-		return "", nil, resolveErr
-	} else if credentialID != nil {
-		row, err := s.db.ProviderCredential.Get(ctx, *credentialID)
-		if err != nil {
-			return "", nil, domain.WrapError(domain.CodeDependencyUnavailable, "query provider credential", err)
+func (s *Service) resolveProbeCredentialID(ctx context.Context, providerID uuid.UUID, upstreamModelName string, probed []modelbinding.Adapter) (*uuid.UUID, error) {
+	baseURL, err := s.db.Provider.Query().Where(provider.IDEQ(providerID)).Select(provider.FieldBaseURL).String(ctx)
+	if err != nil && !ent.IsNotFound(err) {
+		return nil, domain.WrapError(domain.CodeDependencyUnavailable, "query provider", err)
+	}
+	if catalog.IsBeichenBaseURL(baseURL) {
+		protocols := make([]string, 0, len(probed))
+		for _, adapter := range probed {
+			protocols = append(protocols, string(adapter))
 		}
-		plain, err := s.security.DecryptCredential(row.CredentialCiphertext)
+		row, err := catalog.FindProbeCatalogCredential(ctx, s.sqlDB, s.db, providerID, baseURL, upstreamModelName, protocols...)
 		if err != nil {
-			return "", nil, domain.WrapError(domain.CodeDependencyUnavailable, "decrypt provider credential", err)
+			return nil, domain.WrapError(domain.CodeDependencyUnavailable, "query probe model catalog", err)
 		}
-		return plain, credentialID, nil
+		if row == nil {
+			return nil, domain.NewError(domain.CodeValidation, "模型渠道待核，未找到同时声明所测协议的唯一 Key")
+		}
+		return &row.ID, nil
 	}
-	credentials, err := catalog.ActiveCredentials(ctx, s.db, &providerID)
-	if err != nil {
-		return "", nil, domain.WrapError(domain.CodeDependencyUnavailable, "list active provider credentials", err)
-	}
-	if len(credentials) == 0 {
-		return "", nil, domain.NewError(domain.CodeValidation, "provider has no active credentials")
-	}
-	plain, err := s.security.DecryptCredential(credentials[0].CredentialCiphertext)
-	if err != nil {
-		return "", nil, domain.WrapError(domain.CodeDependencyUnavailable, "decrypt provider credential", err)
-	}
-	id := credentials[0].ID
-	return plain, &id, nil
+	return s.ResolveCredentialForUpstream(ctx, providerID, upstreamModelName)
 }
 
 func (s *Service) UpdateBinding(ctx context.Context, bindingID uuid.UUID, input BindingInput) (BindingView, error) {

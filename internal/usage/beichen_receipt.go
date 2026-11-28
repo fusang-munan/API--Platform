@@ -179,9 +179,108 @@ func (s *Store) ApplyBeichenReceipt(ctx context.Context, credentialID uuid.UUID,
 		if err := bookBeichenCharge(ctx, tx, callID, charge); err != nil {
 			return false, err
 		}
+	} else {
+		supplemented, err := applyReceiptSupplement(ctx, tx, callID, receipt)
+		if err != nil {
+			return false, err
+		}
+		if supplemented {
+			if _, err := tx.ExecContext(ctx, `UPDATE beichen_call_receipts r SET
+				applied=true,credits_booked=r.actual_cost*100,
+				base_credits=COALESCE(c.beichen_base_credits,r.actual_cost*100/COALESCE(r.school_multiplier,1))
+				FROM gateway_calls c WHERE r.call_id=$1 AND c.id=r.call_id`, callID); err != nil {
+				return false, err
+			}
+			applied = true
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	return applied, nil
+}
+
+// applyReceiptSupplement adds only the amount left unknown by an earlier
+// partial charge. The receipt row and response lock make this idempotent.
+func applyReceiptSupplement(ctx context.Context, tx *sql.Tx, callID uuid.UUID, receipt BeichenReceipt) (bool, error) {
+	var supplemented bool
+	var deltaMilli string
+	err := tx.QueryRowContext(ctx, `WITH price AS (
+		SELECT p.* FROM gateway_calls c
+		CROSS JOIN LATERAL beichen_price_at(c.beichen_dispatch_credential_id,
+			c.beichen_dispatch_model,COALESCE(c.beichen_price_at,c.sent_at)) p
+		WHERE c.id=$1
+	), weighted AS (
+		SELECT c.id,
+			COALESCE(c.student_credits,0) AS old_student,
+			COALESCE(c.actual_credits,0) AS old_actual,
+			CASE WHEN c.student_cap_milli IS NOT NULL
+				THEN GREATEST(c.student_cap_milli,0)*0.001::numeric END AS cap,
+			COALESCE(c.beichen_school_multiplier,1) AS school_multiplier,
+			beichen_weighted_tokens($2::bigint,$3::bigint,$4::bigint,$5::bigint,
+				COALESCE(p.school_input,p.upstream_input),
+				COALESCE(p.school_output,p.upstream_output),
+				COALESCE(p.school_cache_read,p.upstream_cache_read),
+				COALESCE(p.school_cache_write,p.upstream_cache_write))
+				* 0.0000000001::numeric / CASE WHEN p.mode='manual' THEN 100 ELSE 1 END AS base
+		FROM gateway_calls c CROSS JOIN price p
+		WHERE c.id=$1 AND c.beichen_state='charged'
+		  AND c.usage_state='partial'
+		  AND COALESCE(c.pricing_detail->>'amount_source','') IN ('confirmed_tokens_only','estimated_unique_amount')
+	), amount AS (
+		SELECT id,old_student,old_actual,base,base*school_multiplier AS actual,
+			LEAST(base*school_multiplier,cap) AS allowed
+		FROM weighted
+	), next AS (
+		SELECT id,old_student,old_actual,base,actual,
+			old_student + GREATEST(0,COALESCE(allowed,actual)-old_student) AS student
+		FROM amount
+	), updated AS (
+		UPDATE gateway_calls c SET
+			beichen_credit_exact=next.student,
+			credit_milli=trunc(next.student*1000)::bigint,
+			student_credits=next.student,
+			actual_credits=GREATEST(next.old_actual,next.actual),
+			school_absorbed_credits=GREATEST(next.old_actual,next.actual)-next.student,
+			beichen_base_credits=CASE WHEN next.student=GREATEST(next.old_actual,next.actual)
+				THEN next.base END,
+			beichen_base_source=CASE WHEN next.student=GREATEST(next.old_actual,next.actual)
+				THEN 'receipt_usage_price' END,
+			pricing_detail=COALESCE(c.pricing_detail,'{}'::jsonb) || jsonb_build_object(
+				'receipt_supplement_credits',trim_scale(next.student-next.old_student)::text,
+				'receipt_supplement_student_credits',trim_scale(next.student)::text)
+		FROM next WHERE c.id=next.id AND next.student>next.old_student
+		RETURNING c.id
+	)
+	SELECT true,trim_scale((next.student-next.old_student)*1000)::text
+	FROM updated JOIN next ON next.id=updated.id`,
+		callID, receipt.InputTokens, receipt.OutputTokens, receipt.CacheReadTokens, receipt.CacheWriteTokens).
+		Scan(&supplemented, &deltaMilli)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := postReceiptSupplement(ctx, tx, callID, deltaMilli); err != nil {
+		return false, err
+	}
+	if err := refreshLedgerTurn(ctx, tx, callID, deltaMilli, true); err != nil {
+		return false, err
+	}
+	return supplemented, nil
+}
+
+func postReceiptSupplement(ctx context.Context, tx *sql.Tx, callID uuid.UUID, milli string) error {
+	if err := postLedgerBuckets(ctx, tx, callID, 0, milli); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE monthly_usage_cube u SET
+		charged_milli=u.charged_milli+trunc(u.charged_milli_remainder+$2::numeric)::bigint,
+		charged_milli_remainder=mod(u.charged_milli_remainder+$2::numeric,1),
+		updated_at=now()
+		FROM gateway_calls c WHERE c.id=$1 AND u.month=c.month
+		  AND u.project_id=c.project_id AND u.user_id=c.user_id
+		  AND u.api_key_id=c.api_key_id AND u.model_id=c.model_id`, callID, milli)
+	return err
 }

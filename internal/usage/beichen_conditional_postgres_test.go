@@ -294,4 +294,114 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 			}
 		}
 	})
+	t.Run("Gemini receipt supplements unknown cache write once", func(t *testing.T) {
+		supplementCredential := uuid.New()
+		exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,status,created_at,updated_at)
+			VALUES($1,$2,'Gemini supplement',decode('0a','hex'),'active',now()-interval '2 hours',now()-interval '2 hours')`,
+			supplementCredential, provider)
+		exec(`INSERT INTO beichen_panel_access(credential_id,group_id,upstream_key_id,token_ciphertext,updated_by,updated_at)
+			SELECT id,1,94,decode('0b','hex'),$2,updated_at FROM provider_credentials WHERE id=$1`,
+			supplementCredential, student)
+		exec(`INSERT INTO beichen_price_versions(credential_id,model,track,basis,source,effective_at,
+			input_rate,output_rate,cache_read_rate,cache_write_rate)
+			VALUES($1,'supplement-model','upstream','effective','billing',now()-interval '1 hour',
+			1000000,0,0,2500000)`, supplementCredential)
+		route := CallRoute{Beichen: true, ProviderID: provider, CredentialID: supplementCredential,
+			UpstreamModelName: "supplement-model"}
+		r, err := store.Reserve(ctx, key, model, uuid.NewString(), "google_gemini_v1beta",
+			"/v1beta/models/supplement-model:generateContent", "", "", CallCorrelation{}, route)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.PrepareDispatch(ctx, r.CallID, route); err != nil {
+			t.Fatal(err)
+		}
+		route.SentAt = time.Now()
+		response := uuid.New()
+		if err := store.RecordBeichenReceiptID(ctx, r.CallID, supplementCredential, response); err != nil {
+			t.Fatal(err)
+		}
+		prompt, zero := int64(347), int64(0)
+		finalize(r, route, CallMetrics{State: UsageReported, PromptTokens: &prompt,
+			CompletionTokens: &zero, CacheHitTokens: &zero})
+		var before bool
+		var countBefore int
+		var local, bucketBefore string
+		if err := db.QueryRowContext(ctx, `SELECT beichen_state='charged',trim_scale(student_credits)::text,
+			(SELECT charged_count FROM monthly_usage_cube WHERE api_key_id=$2),
+			(SELECT trim_scale((charged_milli+charged_milli_remainder)*0.001)::text
+			 FROM api_key_month_credit_buckets WHERE api_key_id=$2)
+			FROM gateway_calls WHERE id=$1`, r.CallID, key).Scan(&before, &local, &countBefore, &bucketBefore); err != nil {
+			t.Fatal(err)
+		}
+		if !before || local != "0.0347" {
+			t.Fatalf("local confirmed charge=%s, want 0.0347", local)
+		}
+		receipt := BeichenReceipt{ResponseID: response, RowID: 942, APIKeyID: 94,
+			Model: route.UpstreamModelName, OccurredAt: route.SentAt, ActualCost: "0.000372",
+			InputTokens: 347, OutputTokens: 0, CacheReadTokens: 0, CacheWriteTokens: 10}
+		for _, expected := range []bool{true, false} {
+			applied, err := store.ApplyBeichenReceipt(ctx, supplementCredential, receipt)
+			if err != nil || applied != expected {
+				t.Fatalf("receipt applied=%t, want %t: %v", applied, expected, err)
+			}
+		}
+		var total, actual, receiptApplied string
+		var countAfter int
+		var receiptCredits string
+		if err := db.QueryRowContext(ctx, `SELECT trim_scale(student_credits)::text,
+			trim_scale(actual_credits)::text,(SELECT charged_count FROM monthly_usage_cube WHERE api_key_id=$2),
+			pricing_detail->>'receipt_supplement_credits'
+			FROM gateway_calls WHERE id=$1`, r.CallID, key).Scan(&total, &actual, &countAfter, &receiptApplied); err != nil {
+			t.Fatal(err)
+		}
+		if total != "0.0372" || actual != "0.0372" || receiptApplied != "0.0025" || countAfter != countBefore {
+			t.Fatalf("supplement total=%s actual=%s delta=%s count=%d/%d",
+				total, actual, receiptApplied, countBefore, countAfter)
+		}
+		if err := db.QueryRowContext(ctx, `SELECT applied::text,trim_scale(credits_booked)::text
+			FROM beichen_call_receipts WHERE call_id=$1`, r.CallID).Scan(&receiptApplied, &receiptCredits); err != nil {
+			t.Fatal(err)
+		}
+		if receiptApplied != "true" || receiptCredits != "0.0372" {
+			t.Fatalf("receipt not marked as applied: applied=%s credits=%s", receiptApplied, receiptCredits)
+		}
+		var bucketDelta string
+		if err := db.QueryRowContext(ctx, `SELECT trim_scale((charged_milli+charged_milli_remainder)*0.001-$2::numeric)::text
+			FROM api_key_month_credit_buckets WHERE api_key_id=$1`, key, bucketBefore).Scan(&bucketDelta); err != nil {
+			t.Fatal(err)
+		}
+		if bucketDelta != "0.0025" {
+			t.Fatalf("receipt supplement changed the key bucket by %s, want 0.0025", bucketDelta)
+		}
+
+		capped, err := store.Reserve(ctx, key, model, uuid.NewString(), "google_gemini_v1beta",
+			"/v1beta/models/supplement-model:generateContent", "", "", CallCorrelation{}, route)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.PrepareDispatch(ctx, capped.CallID, route); err != nil {
+			t.Fatal(err)
+		}
+		route.SentAt = time.Now()
+		cappedResponse := uuid.New()
+		if err := store.RecordBeichenReceiptID(ctx, capped.CallID, supplementCredential, cappedResponse); err != nil {
+			t.Fatal(err)
+		}
+		exec(`UPDATE gateway_calls SET student_cap_milli=35 WHERE id=$1`, capped.CallID)
+		finalize(capped, route, CallMetrics{State: UsageReported, PromptTokens: &prompt,
+			CompletionTokens: &zero, CacheHitTokens: &zero})
+		receipt.ResponseID, receipt.RowID, receipt.OccurredAt = cappedResponse, 943, route.SentAt
+		if applied, err := store.ApplyBeichenReceipt(ctx, supplementCredential, receipt); err != nil || !applied {
+			t.Fatalf("capped receipt supplement applied=%t: %v", applied, err)
+		}
+		var cappedTotal string
+		if err := db.QueryRowContext(ctx, `SELECT trim_scale(student_credits)::text
+			FROM gateway_calls WHERE id=$1`, capped.CallID).Scan(&cappedTotal); err != nil {
+			t.Fatal(err)
+		}
+		if cappedTotal != "0.035" {
+			t.Fatalf("receipt supplement exceeded the dispatch cap: %s", cappedTotal)
+		}
+	})
 }

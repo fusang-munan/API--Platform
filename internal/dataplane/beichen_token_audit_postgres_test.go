@@ -17,6 +17,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/starprince1234/Nebula-api/internal/beichen"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
+	"github.com/starprince1234/Nebula-api/internal/controlplane"
+	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
@@ -37,7 +39,7 @@ func TestBeichenGeminiProbeCatalogKeyPostgres(t *testing.T) {
 		VALUES(gen_random_uuid(),$1,$2,$3,'website',now(),now(),now(),now())`, fx.provider, first, model)
 	find := func() uuid.UUID {
 		t.Helper()
-		owner, err := catalog.FindProbeCatalogCredential(ctx, fx.gateway.db, fx.provider, "https://api.beichenapi.com/v1", model)
+		owner, err := catalog.FindProbeCatalogCredential(ctx, fx.db, fx.gateway.db, fx.provider, "https://api.beichenapi.com/v1", model)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -57,6 +59,146 @@ func TestBeichenGeminiProbeCatalogKeyPostgres(t *testing.T) {
 	exec(`UPDATE provider_credentials SET status='inactive' WHERE id=$1`, fx.credential)
 	if owner := find(); owner != uuid.Nil {
 		t.Fatal("inactive ownership triggered a probe with another Key")
+	}
+}
+
+func TestBeichenProbeCredentialMatchesOperationPostgres(t *testing.T) {
+	ctx := context.Background()
+	fx := newBeichenGatewayFixture(t, ctx)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := fx.db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const model = "gemini-shared"
+	native := uuid.MustParse("00000000-0000-0000-0000-000000000002")
+	exec(`UPDATE provider_model_catalog SET model_id=$2,supported_protocols=ARRAY['openai_compatible','openai_responses']
+		WHERE credential_id=$1`, fx.credential, model)
+	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
+		VALUES($1,$2,'Native Gemini Key',decode('02','hex'),now(),now())`, native, fx.provider)
+	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,catalog_source,
+		supported_protocols,last_seen_at,synced_at,created_at,updated_at)
+		VALUES(gen_random_uuid(),$1,$2,$3,'key',ARRAY['google_gemini_v1beta'],now(),now(),now(),now())`,
+		fx.provider, native, model)
+	find := func(protocols ...string) uuid.UUID {
+		t.Helper()
+		row, err := catalog.FindProbeCatalogCredential(ctx, fx.db, fx.gateway.db, fx.provider,
+			"https://api.beichenapi.com/v1", model, protocols...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row == nil {
+			return uuid.Nil
+		}
+		return row.ID
+	}
+	if owner := find("google_gemini_v1beta"); owner != native {
+		t.Fatal("native operation selected the Chat-only Key")
+	}
+	if owner := find("openai_compatible"); owner != fx.credential {
+		t.Fatal("Chat operation selected the native-only Key")
+	}
+	if owner := find("openai_compatible", "google_gemini_v1beta"); owner != uuid.Nil {
+		t.Fatal("split protocol ownership was treated as one confirmed Key")
+	}
+	exec(`UPDATE provider_model_catalog SET supported_protocols=supported_protocols || ARRAY['google_gemini_v1beta']::text[]
+		WHERE provider_id=$1 AND model_id=$2`, fx.provider, model)
+	if owner := find("google_gemini_v1beta"); owner != uuid.Nil {
+		t.Fatal("multiple native Keys were not held for review")
+	}
+}
+
+func TestBeichenSaveBindingUsesProbedCredentialPostgres(t *testing.T) {
+	ctx := context.Background()
+	fx := newBeichenGatewayFixture(t, ctx)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := fx.db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const model = "gemini-save-shared"
+	native := uuid.MustParse("00000000-0000-0000-0000-000000000003")
+	exec(`UPDATE provider_model_catalog SET model_id=$2,supported_protocols=ARRAY['openai_compatible','openai_responses']
+		WHERE credential_id=$1`, fx.credential, model)
+	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,created_at,updated_at)
+		VALUES($1,$2,'Native save Key',decode('03','hex'),now(),now())`, native, fx.provider)
+	exec(`INSERT INTO provider_model_catalog(id,provider_id,credential_id,model_id,catalog_source,
+		supported_protocols,last_seen_at,synced_at,created_at,updated_at)
+		VALUES(gen_random_uuid(),$1,$2,$3,'key',ARRAY['google_gemini_v1beta'],now(),now(),now(),now())`,
+		fx.provider, native, model)
+	manager, err := security.NewManager(nil, nil, []byte("fixture-key-pepper"), make([]byte, 32), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := controlplane.NewService(fx.gateway.db, fx.db, nil, manager, nil, controlplane.Config{})
+	view, err := service.CreateBinding(ctx, publicModel, controlplane.BindingInput{
+		ProviderID: fx.provider, UpstreamModelName: model, Adapter: "google_gemini_v1beta", Status: "active",
+		ProbedAdapters: []string{"google_gemini_v1beta"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Adapter != "google_gemini_v1beta" || view.CredentialID == nil || *view.CredentialID != native.String() {
+		t.Fatalf("saved binding used another Key: %+v", view)
+	}
+	var chatCredential uuid.UUID
+	if err := fx.db.QueryRowContext(ctx, `SELECT credential_id FROM model_bindings
+		WHERE provider_id=$1 AND adapter='openai_responses' AND status='active'`, fx.provider).Scan(&chatCredential); err != nil {
+		t.Fatal(err)
+	}
+	if chatCredential != fx.credential {
+		t.Fatal("existing Chat route was moved away from its confirmed Key")
+	}
+}
+
+func TestBeichenGeminiIncompleteGenerationStaysPendingPostgres(t *testing.T) {
+	ctx := context.Background()
+	fx := newBeichenGatewayFixture(t, ctx)
+	if _, err := fx.db.ExecContext(ctx, `UPDATE model_bindings SET adapter='google_gemini_v1beta'
+		WHERE id=$1`, fx.binding); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ name, body, contentType string }{
+		{"sse late output without usage", "data: {\"usageMetadata\":{\"promptTokenCount\":10,\"totalTokenCount\":10}}\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"late\"}]},\"finishReason\":\"STOP\"}]}\n\n", "text/event-stream"},
+		{"array one candidate unfinished", `[{"candidates":[{"index":0,"content":{"parts":[{"text":"a"}]}},{"index":1,"content":{"parts":[{"text":"b"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"totalTokenCount":12}},{"candidates":[{"index":0,"finishReason":"STOP"}]}]`, "application/json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx.gateway.client.Transport = beichenGatewayTestTransport(func(r *http.Request) (*http.Response, error) {
+				httptrace.ContextClientTrace(r.Context()).WroteRequest(httptrace.WroteRequestInfo{})
+				return &http.Response{StatusCode: http.StatusOK,
+					Header: http.Header{"Content-Type": {tc.contentType}},
+					Body:   io.NopCloser(strings.NewReader(tc.body))}, nil
+			})
+			requestID := uuid.NewString()
+			req := httptest.NewRequest(http.MethodPost,
+				"/v1beta/models/"+publicModel+":streamGenerateContent?alt=sse",
+				strings.NewReader(`{"contents":[{"parts":[{"text":"hello"}]}]}`)).
+				WithContext(usage.WithRequestID(ctx, requestID))
+			req.Header.Set("Authorization", "Bearer "+studentKey)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			fx.gateway.ServeHTTP(w, req)
+			if w.Code != http.StatusOK || w.Body.String() != tc.body {
+				t.Fatalf("incomplete response was changed: status=%d body=%q", w.Code, w.Body.String())
+			}
+			var state string
+			var charged bool
+			var usageState, reason string
+			if err := fx.db.QueryRowContext(ctx, `SELECT beichen_state,
+				actual_credits IS NOT NULL OR student_credits IS NOT NULL,
+				COALESCE(usage_state,''),COALESCE(usage_reason,'')
+				FROM gateway_calls WHERE request_id=$1`, requestID).Scan(&state, &charged, &usageState, &reason); err != nil {
+				t.Fatal(err)
+			}
+			if state != "pending_review" || charged || usageState != "interrupted" ||
+				(reason != "response_interrupted" && reason != "terminal_usage_incomplete") {
+				t.Fatalf("incomplete Gemini generation was charged: state=%s charged=%t usage=%s reason=%s",
+					state, charged, usageState, reason)
+			}
+		})
 	}
 }
 

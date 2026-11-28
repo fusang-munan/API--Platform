@@ -475,7 +475,7 @@ func (g *Gateway) proxySSE(w http.ResponseWriter, original *http.Request, respon
 		interrupted = observer.failed || observer.incomplete || !observer.terminal
 		if observer.adapter == modelbinding.AdapterGoogleGeminiV1beta {
 			// A Gemini finishReason can precede the final usageMetadata.
-			interrupted = observer.failed || observer.incomplete || !observer.metrics.terminal || readErr != io.EOF
+			interrupted = observer.failed || observer.incomplete || !observer.metrics.geminiTerminalComplete() || readErr != io.EOF
 			if observer.review == "" {
 				observer.review = observer.metrics.beichenGeminiResponseReview(candidate.UpstreamModelName)
 			}

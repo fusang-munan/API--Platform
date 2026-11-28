@@ -134,8 +134,8 @@ func TestGeminiRouteProbeRecordsOnlyRequestedOperation(t *testing.T) {
 			endpoint BindingRouteProbeEndpoint
 			op, body string
 		}{
-			{BindingRouteProbeGenerateContent, "generateContent", `{"candidates":[]}`},
-			{BindingRouteProbeStreamGenerateContent, "streamGenerateContent", `[{"candidates":[{"finishReason":"STOP"}]}]`},
+			{BindingRouteProbeGenerateContent, "generateContent", `{"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"MAX_TOKENS"}]}`},
+			{BindingRouteProbeStreamGenerateContent, "streamGenerateContent", `[{"candidates":[{"content":{"parts":[{"text":"OK"}]}}]},{"candidates":[{"finishReason":"MAX_TOKENS"}]}]`},
 			{BindingRouteProbeEmbedContent, "embedContent", `{"embedding":{"values":[0.5]}}`},
 		} {
 			calls := 0
@@ -171,7 +171,7 @@ func TestGeminiDiscoveryAcceptsOnePassingOperation(t *testing.T) {
 		status, body := http.StatusNotFound, `{}`
 		switch r.URL.Path {
 		case "/v1beta/models/gemini-pro:generateContent":
-			status, body = http.StatusOK, `{"candidates":[]}`
+			status, body = http.StatusOK, `{"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"MAX_TOKENS"}]}`
 		case "/v1beta/models/gemini-pro:streamGenerateContent":
 			status, body = http.StatusOK, `{"wrong":"response shape"}`
 		case "/v1beta/models/gemini-embedding-001:embedContent":
@@ -190,5 +190,29 @@ func TestGeminiDiscoveryAcceptsOnePassingOperation(t *testing.T) {
 	step, err = probe.ProbeTokenStep(context.Background(), "gemini-embedding-001", string(modelbinding.AdapterGoogleGeminiV1beta))
 	if err != nil || step.Endpoint != BindingRouteProbeEmbedContent || !step.OK {
 		t.Fatalf("embedding model probed the wrong operation: %+v %v", step, err)
+	}
+}
+
+func TestGeminiProbeRejectsEmptyOrIncompleteGeneration(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		endpoint BindingRouteProbeEndpoint
+		body     string
+	}{
+		{"empty candidates", BindingRouteProbeGenerateContent, `{"candidates":[]}`},
+		{"text without finish", BindingRouteProbeGenerateContent, `{"candidates":[{"content":{"parts":[{"text":"OK"}]}}]}`},
+		{"stream text without finish", BindingRouteProbeStreamGenerateContent, `[{"candidates":[{"content":{"parts":[{"text":"OK"}]}}]}]`},
+		{"stream finish without text", BindingRouteProbeStreamGenerateContent, `[{"candidates":[{"finishReason":"STOP"}]}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := &RouteProbe{BaseURL: "https://api.beichenapi.com/v1", Credential: "fixture",
+				Client: &http.Client{Transport: modelScanTransport(func(*http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+				})}}
+			step, err := probe.ProbeStep(context.Background(), "gemini-pro", tc.endpoint)
+			if err != nil || step.OK || step.FailureCode != "invalid_response" {
+				t.Fatalf("incomplete response passed the probe: %+v %v", step, err)
+			}
+		})
 	}
 }

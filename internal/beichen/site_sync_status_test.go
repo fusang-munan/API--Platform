@@ -20,7 +20,7 @@ func TestOverviewWebsiteSyncPostgres(t *testing.T) {
 		t.Skip("requires a disposable loopback nebula_test database")
 	}
 	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil || cfg.Host != "127.0.0.1" || cfg.Database != "nebula_test" ||
+	if err != nil || cfg.Host != "127.0.0.1" || !isIsolatedTestDatabase(cfg.Database) ||
 		cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
 		t.Fatal("requires loopback nebula_test with sslmode=disable")
 	}
