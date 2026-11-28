@@ -92,7 +92,7 @@ func newIdentityTestService(t *testing.T) (*Service, sqlmock.Sqlmock, func()) {
 	}
 	driver := entsql.OpenDB(dialect.Postgres, database)
 	client := ent.NewClient(ent.Driver(driver))
-	return &Service{db: client, now: func() time.Time { return time.Now() }}, mock, func() {
+	return &Service{db: client, sqlDB: database, now: func() time.Time { return time.Now() }}, mock, func() {
 		_ = client.Close()
 	}
 }

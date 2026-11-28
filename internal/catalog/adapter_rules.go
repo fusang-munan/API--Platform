@@ -19,9 +19,11 @@ type AdapterRule struct {
 }
 
 var adapterRules = []AdapterRule{
+	{Adapter: modelbinding.AdapterGoogleGeminiV1beta, Priority: 110, AnyTokens: []string{"v1beta-models", "generatecontent", "embedcontent", "generate-content", "embed-content"}},
 	{Adapter: modelbinding.AdapterCohereRerankV2, Priority: 100, AnyTokens: []string{"rerank"}},
+	{Adapter: modelbinding.AdapterGoogleGeminiV1beta, Priority: 92, AnyTokens: []string{"gemini"}, NoneTokens: []string{"openai"}},
 	{Adapter: modelbinding.AdapterOpenaiEmbeddings, Priority: 90, AnyTokens: []string{"embed"}},
-	{Adapter: modelbinding.AdapterGoogleGeminiV1beta, Priority: 85, AnyTokens: []string{"gemini", "v1beta", "generatecontent"}},
+	{Adapter: modelbinding.AdapterGoogleGeminiV1beta, Priority: 85, AnyTokens: []string{"v1beta"}},
 	{Adapter: modelbinding.AdapterAnthropic, Priority: 80, AnyTokens: []string{"anthropic", "claude"}, NoneTokens: []string{"openai"}},
 	{Adapter: modelbinding.AdapterAnthropic, Priority: 79, AllTokens: []string{"message"}, NoneTokens: []string{"openai", "embed", "image"}},
 	{Adapter: modelbinding.AdapterOpenaiResponses, Priority: 70, AnyTokens: []string{"response"}, NoneTokens: []string{"embed"}},
@@ -120,7 +122,7 @@ func RegisteredProtocols(entry ProviderEntry) []string {
 }
 
 func hasDeclaredProtocolList(raw map[string]any) bool {
-	for _, key := range []string{"supported_protocols", "supported_endpoint_types", "endpoints", "endpoint_types"} {
+	for _, key := range []string{"supported_protocols", "supported_endpoint_types", "endpoints", "endpoint_types", "supportedGenerationMethods"} {
 		switch raw[key].(type) {
 		case []any, []string:
 			return true
@@ -133,6 +135,9 @@ func explicitEndpointSignals(entry ProviderEntry) []string {
 	signals := extractStringSlice(entry.Raw, "supported_endpoint_types")
 	if len(signals) == 0 {
 		signals = extractStringSlice(entry.Raw, "endpoints", "endpoint_types")
+	}
+	if len(signals) == 0 {
+		signals = extractStringSlice(entry.Raw, "supportedGenerationMethods")
 	}
 	return cleanStringList(signals)
 }
@@ -151,10 +156,7 @@ func specialtyAdapterFromModelID(modelID string) (modelbinding.Adapter, bool) {
 }
 
 func EndpointSignals(entry ProviderEntry) []string {
-	signals := extractStringSlice(entry.Raw, "supported_endpoint_types")
-	if len(signals) == 0 {
-		signals = extractStringSlice(entry.Raw, "endpoints", "endpoint_types")
-	}
+	signals := explicitEndpointSignals(entry)
 	for _, key := range []string{"endpoint", "endpoint_type", "adapter", "protocol", "type", "object"} {
 		if value, ok := ResolveString(entry.Raw, key); ok {
 			signals = append(signals, value)

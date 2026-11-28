@@ -249,3 +249,34 @@ func TestBeichenUnsplitInputEvidence(t *testing.T) {
 		t.Fatalf("all three unknown: %+v, %s, %s", m, got.Credits, reason)
 	}
 }
+
+func TestBeichenGeminiConfirmedUsage(t *testing.T) {
+	const protocol = "google_gemini_v1beta"
+	const terms = `{"input_price":0.000002,"output_price":0.000004,"cache_read_price":0.000001,"cache_write_1h_price":0.000008}`
+	prompt, candidate, cached, thought, tool, total := int64(10), int64(2), int64(4), int64(3), int64(1), int64(16)
+	m := CallMetrics{State: UsageReported, PromptTokens: &prompt, CompletionTokens: &candidate, CacheHitTokens: &cached,
+		ReasoningTokens: &thought, ToolPromptTokens: &tool, TotalTokens: &total}
+	got := m.ClassifyBeichenUsage(protocol)
+	if got.State != UsagePartial || got.UsageReason != geminiCacheWriteUnreported || !got.CanPriceBeichenUsage(protocol) ||
+		got.CacheWriteTokens != nil || got.CacheMissTokens == nil || *got.CacheMissTokens != 6 {
+		t.Fatalf("wrong evidence: %+v", got)
+	}
+	price, reason := evaluateBeichenConditional(json.RawMessage(terms), got, nil, "", protocol, false)
+	if reason != "" || price.Credits != "0.0038" || !strings.Contains(string(price.Detail), `"cache_write_tokens":null`) {
+		t.Fatalf("wrong partial price: %+v, %s", price, reason)
+	}
+
+	m.CacheHitTokens, m.CompletionTokens = nil, nil
+	zeroOutputTotal := prompt + thought + tool
+	m.TotalTokens = &zeroOutputTotal
+	got = m.ClassifyBeichenUsage(protocol)
+	if got.CacheHitTokens == nil || *got.CacheHitTokens != 0 || got.CompletionTokens == nil ||
+		*got.CompletionTokens != 0 || !got.CanPriceBeichenUsage(protocol) {
+		t.Fatalf("an omitted zero counter blocked Gemini pricing: %+v", got)
+	}
+	m.TotalTokens = &total
+	got = m.ClassifyBeichenUsage(protocol)
+	if got.UsageReason != "inconsistent_token_total" || got.CanPriceBeichenUsage(protocol) {
+		t.Fatalf("inconsistent Gemini usage could be priced: %+v", got)
+	}
+}

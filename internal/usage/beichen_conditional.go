@@ -206,12 +206,13 @@ type beichenConditionalPrice struct {
 }
 
 type beichenBillableTokens struct {
-	Input   *int64 `json:"input_tokens"`
-	Output  int64  `json:"output_tokens"`
-	Read    *int64 `json:"cache_read_tokens"`
-	Write   *int64 `json:"cache_write_tokens"`
-	TotalIn int64  `json:"total_input_tokens"`
-	Unsplit int64  `json:"unsplit_input_tokens,omitempty"`
+	Input             *int64 `json:"input_tokens"`
+	Output            int64  `json:"output_tokens"`
+	Read              *int64 `json:"cache_read_tokens"`
+	Write             *int64 `json:"cache_write_tokens"`
+	TotalIn           int64  `json:"total_input_tokens"`
+	Unsplit           int64  `json:"unsplit_input_tokens,omitempty"`
+	UnconfirmedReason string `json:"unconfirmed_usage_reason,omitempty"`
 }
 
 // evaluateBeichenConditional returns base credits before the upstream group
@@ -252,7 +253,8 @@ func evaluateBeichenConditional(raw json.RawMessage, metrics CallMetrics, effort
 	appliedTTL := ""
 	writePrice := rates.CacheWrite
 	// OpenAI reports implicit cache writes at the base write rate.
-	if (tokens.Write == nil || *tokens.Write > 0) && (protocol == "anthropic" || (protocol == "google_gemini_v1beta" && timedCache)) {
+	if (protocol == "anthropic" && (tokens.Write == nil || *tokens.Write > 0)) ||
+		(protocol == "google_gemini_v1beta" && timedCache && tokens.Write != nil && *tokens.Write > 0) {
 		appliedTTL = beichenCacheTTL(ttl)
 		switch appliedTTL {
 		case "5m":
@@ -341,6 +343,9 @@ func (c beichenPriceConditions) ratesFor(total int64) (beichenPanelRates, string
 }
 
 func (t beichenBillableTokens) amountSource() string {
+	if t.UnconfirmedReason != "" {
+		return "confirmed_tokens_only"
+	}
 	if t.Unsplit > 0 {
 		return "estimated_unique_amount"
 	}
@@ -362,6 +367,9 @@ func priceBeichenTokenParts(t beichenBillableTokens, input, output, read, write 
 		{"input", t.Input, input}, {"output", &t.Output, output},
 		{"cache_read", t.Read, read}, {"cache_write", t.Write, write},
 	} {
+		if part.name == "cache_write" && t.UnconfirmedReason == geminiCacheWriteUnreported {
+			continue
+		}
 		if part.price == nil && part.count != nil && *part.count == 0 && (part.name == "cache_read" || part.name == "cache_write") {
 			continue
 		}

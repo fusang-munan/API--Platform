@@ -9,12 +9,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/starprince1234/Nebula-api/internal/usage"
-
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
+	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
 type RouteProbe struct {
@@ -28,11 +28,13 @@ const bindingProbeTimeout = 8 * time.Second
 type BindingRouteProbeEndpoint string
 
 const (
-	BindingRouteProbeChatCompletions   BindingRouteProbeEndpoint = "chat_completions"
-	BindingRouteProbeResponses         BindingRouteProbeEndpoint = "responses"
-	BindingRouteProbeMessages          BindingRouteProbeEndpoint = "messages"
-	BindingRouteProbeImagesGenerations BindingRouteProbeEndpoint = "images_generations"
-	BindingRouteProbeGenerateContent   BindingRouteProbeEndpoint = "generate_content"
+	BindingRouteProbeChatCompletions       BindingRouteProbeEndpoint = "chat_completions"
+	BindingRouteProbeResponses             BindingRouteProbeEndpoint = "responses"
+	BindingRouteProbeMessages              BindingRouteProbeEndpoint = "messages"
+	BindingRouteProbeImagesGenerations     BindingRouteProbeEndpoint = "images_generations"
+	BindingRouteProbeGenerateContent       BindingRouteProbeEndpoint = "generate_content"
+	BindingRouteProbeStreamGenerateContent BindingRouteProbeEndpoint = "stream_generate_content"
+	BindingRouteProbeEmbedContent          BindingRouteProbeEndpoint = "embed_content"
 )
 
 var bindingRouteProbeOrder = []BindingRouteProbeEndpoint{
@@ -40,6 +42,9 @@ var bindingRouteProbeOrder = []BindingRouteProbeEndpoint{
 	BindingRouteProbeResponses,
 	BindingRouteProbeMessages,
 	BindingRouteProbeImagesGenerations,
+	BindingRouteProbeGenerateContent,
+	BindingRouteProbeStreamGenerateContent,
+	BindingRouteProbeEmbedContent,
 }
 
 // ProbeUsage contains native protocol counts. Missing counters remain nil.
@@ -104,11 +109,22 @@ func BindingRouteProbeEndpointsForModel(modelID string) []BindingRouteProbeEndpo
 	if IsImageGenerationModel(modelID) {
 		return []BindingRouteProbeEndpoint{BindingRouteProbeImagesGenerations}
 	}
-	return []BindingRouteProbeEndpoint{
+	chat := []BindingRouteProbeEndpoint{
 		BindingRouteProbeChatCompletions,
 		BindingRouteProbeResponses,
 		BindingRouteProbeMessages,
 	}
+	if geminiEmbeddingModel(modelID) {
+		return []BindingRouteProbeEndpoint{BindingRouteProbeEmbedContent}
+	}
+	if IsGeminiFamilyModel(modelID) {
+		return append([]BindingRouteProbeEndpoint{BindingRouteProbeGenerateContent, BindingRouteProbeStreamGenerateContent}, chat...)
+	}
+	return chat
+}
+
+func geminiEmbeddingModel(modelID string) bool {
+	return IsGeminiFamilyModel(modelID) && containsToken(NormalizeSignal(modelID), "embed")
 }
 
 func probeHTTPClient(timeout time.Duration) *http.Client {
@@ -181,12 +197,9 @@ func bindingProbeRequests(model string) ([]bindingProbeRequest, error) {
 }
 
 func bindingProbeRequestForEndpoint(model string, endpoint BindingRouteProbeEndpoint) (bindingProbeRequest, error) {
-	if endpoint == BindingRouteProbeGenerateContent {
-		body, err := json.Marshal(map[string]any{
-			"contents":         []any{map[string]any{"role": "user", "parts": []any{map[string]string{"text": "Reply with OK."}}}},
-			"generationConfig": map[string]int{"maxOutputTokens": 1},
-		})
-		path := "/v1beta/models/" + url.PathEscape(strings.TrimPrefix(model, "models/")) + ":generateContent"
+	switch endpoint {
+	case BindingRouteProbeGenerateContent, BindingRouteProbeStreamGenerateContent, BindingRouteProbeEmbedContent:
+		path, body, err := GeminiProbeRequest(model, endpoint)
 		return bindingProbeRequest{path: path, body: body, adapter: modelbinding.AdapterGoogleGeminiV1beta}, err
 	}
 	requests, err := bindingProbeRequests(model)
@@ -207,17 +220,38 @@ func bindingProbeRequestForEndpoint(model string, endpoint BindingRouteProbeEndp
 	}
 }
 
+func GeminiProbeRequest(model string, endpoint BindingRouteProbeEndpoint) (string, []byte, error) {
+	if endpoint == BindingRouteProbeEmbedContent {
+		body, err := json.Marshal(map[string]any{
+			"model":   "models/" + strings.TrimPrefix(model, "models/"),
+			"content": map[string]any{"parts": []map[string]string{{"text": "probe"}}},
+		})
+		return GeminiModelPath(model, "embedContent"), body, err
+	}
+	operation := "generateContent"
+	if endpoint == BindingRouteProbeStreamGenerateContent {
+		operation = "streamGenerateContent"
+	}
+	body, err := json.Marshal(map[string]any{
+		"contents":         []any{map[string]any{"role": "user", "parts": []map[string]string{{"text": "Reply with OK."}}}},
+		"generationConfig": map[string]int{"maxOutputTokens": 1},
+	})
+	return GeminiModelPath(model, operation), body, err
+}
+
 func (p *RouteProbe) ProbeStep(ctx context.Context, upstreamModelID string, endpoint BindingRouteProbeEndpoint) (RouteProbeStep, error) {
 	return p.probeStep(ctx, upstreamModelID, endpoint, false)
 }
 
-// ProbeTokenStep makes exactly one capped request and verifies that a 2xx
-// response is a generation response for the protocol. Upstream error bodies
-// and transport descriptions are never returned from this path.
+// ProbeTokenStep verifies the protocol with one short embedding or one capped
+// generation request. It returns sanitized failures for the scheduler.
 func (p *RouteProbe) ProbeTokenStep(ctx context.Context, upstreamModelID, protocol string) (RouteProbeStep, error) {
 	endpoint, ok := TokenProbeEndpoint(protocol)
 	if !ok {
 		return RouteProbeStep{}, errors.New("protocol does not support a one-token probe")
+	}
+	if endpoint == BindingRouteProbeGenerateContent && geminiEmbeddingModel(upstreamModelID) {
+		endpoint = BindingRouteProbeEmbedContent
 	}
 	return p.probeStep(ctx, upstreamModelID, endpoint, true)
 }
@@ -239,7 +273,13 @@ func (p *RouteProbe) probeStep(ctx context.Context, upstreamModelID string, endp
 	if client == nil {
 		client = NewRouteProbe(p.BaseURL, p.Credential).Client
 	}
-	target, err := probeTargetURL(probeBaseForRequest(p.BaseURL, item.anthropic), item.path)
+	var target string
+	native := item.adapter == modelbinding.AdapterGoogleGeminiV1beta
+	if native {
+		target, err = GeminiUpstreamURL(p.BaseURL, item.path, "")
+	} else {
+		target, err = probeTargetURL(probeBaseForRequest(p.BaseURL, item.anthropic), item.path)
+	}
 	if err != nil {
 		step.Error = err.Error()
 		step.FailureCode = "network_error"
@@ -257,7 +297,7 @@ func (p *RouteProbe) probeStep(ctx context.Context, upstreamModelID string, endp
 	if item.anthropic {
 		req.Header.Set("x-api-key", p.Credential)
 		req.Header.Set("anthropic-version", "2023-06-01")
-	} else if item.adapter == modelbinding.AdapterGoogleGeminiV1beta {
+	} else if native {
 		req.Header.Set("x-goog-api-key", p.Credential)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+p.Credential)
@@ -281,11 +321,11 @@ func (p *RouteProbe) probeStep(ctx context.Context, upstreamModelID string, endp
 		step.FailureCode = "http_error"
 		step.Error = fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)
 	}
-	if validateResponse {
+	if validateResponse || native {
 		const maxBody = 64 << 10
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 		var fields map[string]json.RawMessage
-		if err == nil && len(body) <= maxBody && json.Unmarshal(body, &fields) == nil {
+		if validateResponse && err == nil && len(body) <= maxBody && json.Unmarshal(body, &fields) == nil {
 			raw := fields["usage"]
 			if endpoint == BindingRouteProbeGenerateContent {
 				raw = fields["usageMetadata"]
@@ -304,10 +344,14 @@ func (p *RouteProbe) probeStep(ctx context.Context, upstreamModelID string, endp
 			}
 		}
 		if step.OK {
+			valid := validTokenProbeResponse(fields, endpoint)
+			if native {
+				valid = GeminiProbeResponseOK(body, endpoint)
+			}
 			switch {
 			case err != nil:
 				step.FailureCode = probeTransportError(err)
-			case !validTokenProbeResponse(fields, endpoint):
+			case len(body) > maxBody || !valid:
 				step.FailureCode = "invalid_response"
 			}
 			step.OK = step.FailureCode == ""
@@ -329,8 +373,7 @@ func probeTransportError(err error) string {
 }
 
 func validTokenProbeResponse(fields map[string]json.RawMessage, endpoint BindingRouteProbeEndpoint) bool {
-	if fields == nil ||
-		len(fields["error"]) > 0 && string(fields["error"]) != "null" {
+	if !probeResponseObjectOK(fields) {
 		return false
 	}
 	var field string
@@ -352,6 +395,101 @@ func validTokenProbeResponse(fields map[string]json.RawMessage, endpoint Binding
 	return len(value) > 0 && value[0] == '['
 }
 
+func probeResponseObjectOK(fields map[string]json.RawMessage) bool {
+	return fields != nil && (len(fields["error"]) == 0 || string(fields["error"]) == "null")
+}
+
+// GeminiProbeResponseOK verifies only the operation that received a response.
+// StreamGenerateContent returns a JSON array when alt=sse is omitted.
+func GeminiProbeResponseOK(body []byte, endpoint BindingRouteProbeEndpoint) bool {
+	if endpoint == BindingRouteProbeStreamGenerateContent {
+		var frames []map[string]json.RawMessage
+		if json.Unmarshal(body, &frames) != nil {
+			return false
+		}
+		state := geminiProbeState{}
+		for _, frame := range frames {
+			if !probeResponseObjectOK(frame) {
+				return false
+			}
+			state.observe(frame)
+		}
+		return state.complete()
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || !probeResponseObjectOK(fields) {
+		return false
+	}
+	if endpoint == BindingRouteProbeEmbedContent {
+		var embedding struct{ Values []float64 }
+		return json.Unmarshal(fields["embedding"], &embedding) == nil && len(embedding.Values) > 0
+	}
+	state := geminiProbeState{}
+	state.observe(fields)
+	return state.complete()
+}
+
+type geminiProbeState struct {
+	text     bool
+	seen     map[int]bool
+	finished map[int]bool
+}
+
+func (state *geminiProbeState) observe(fields map[string]json.RawMessage) {
+	if state.seen == nil {
+		state.seen, state.finished = map[int]bool{}, map[int]bool{}
+	}
+	var candidates []map[string]json.RawMessage
+	if json.Unmarshal(fields["candidates"], &candidates) != nil {
+		return
+	}
+	for position, candidate := range candidates {
+		index := position
+		var number float64
+		if json.Unmarshal(candidate["index"], &number) == nil && number >= 0 && number <= 1_000_000 {
+			index = int(number)
+		}
+		state.seen[index] = true
+		reason := rawProbeString(candidate["finishReason"])
+		if reason != "" && reason != "FINISH_REASON_UNSPECIFIED" {
+			state.finished[index] = true
+		}
+		var content map[string]json.RawMessage
+		if json.Unmarshal(candidate["content"], &content) != nil {
+			continue
+		}
+		var parts []map[string]json.RawMessage
+		if json.Unmarshal(content["parts"], &parts) != nil {
+			continue
+		}
+		for _, part := range parts {
+			if rawProbeString(part["text"]) != "" {
+				state.text = true
+			}
+		}
+	}
+}
+
+func (state geminiProbeState) complete() bool {
+	if !state.text || len(state.seen) == 0 {
+		return false
+	}
+	for index := range state.seen {
+		if !state.finished[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func rawProbeString(raw json.RawMessage) string {
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
 func (p *RouteProbe) Discover(ctx context.Context, upstreamModelID string) ([]modelbinding.Adapter, error) {
 	upstreamModelID = strings.TrimSpace(upstreamModelID)
 	if upstreamModelID == "" {
@@ -360,47 +498,25 @@ func (p *RouteProbe) Discover(ctx context.Context, upstreamModelID string) ([]mo
 	if p == nil || p.BaseURL == "" || p.Credential == "" {
 		return nil, errors.New("route probe is not configured")
 	}
-	client := p.Client
-	if client == nil {
-		client = NewRouteProbe(p.BaseURL, p.Credential).Client
+	if _, err := probeTargetURL(p.BaseURL, "/"); err != nil {
+		return nil, err
 	}
 	endpoints := BindingRouteProbeEndpointsForModel(upstreamModelID)
 	seen := map[modelbinding.Adapter]struct{}{}
 	result := make([]modelbinding.Adapter, 0, len(endpoints))
 	for _, endpoint := range endpoints {
-		item, err := bindingProbeRequestForEndpoint(upstreamModelID, endpoint)
+		step, err := p.ProbeStep(ctx, upstreamModelID, endpoint)
 		if err != nil {
 			return nil, err
 		}
-		target, err := probeTargetURL(probeBaseForRequest(p.BaseURL, item.anthropic), item.path)
-		if err != nil {
-			return nil, err
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(item.body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if item.anthropic {
-			req.Header.Set("x-api-key", p.Credential)
-			req.Header.Set("anthropic-version", "2023-06-01")
-		} else {
-			req.Header.Set("Authorization", "Bearer "+p.Credential)
-		}
-		resp, err := client.Do(req)
-		if err != nil {
+		if !step.OK {
 			continue
 		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		_ = resp.Body.Close()
-		if !probeEndpointSuccess(resp.StatusCode) {
+		if _, ok := seen[step.Adapter]; ok {
 			continue
 		}
-		if _, ok := seen[item.adapter]; ok {
-			continue
-		}
-		seen[item.adapter] = struct{}{}
-		result = append(result, item.adapter)
+		seen[step.Adapter] = struct{}{}
+		result = append(result, step.Adapter)
 	}
 	return result, nil
 }
@@ -436,6 +552,16 @@ func probeTargetURL(baseURL, requestPath string) (string, error) {
 }
 
 func AdaptersFromCatalogSignals(entry ProviderEntry) []modelbinding.Adapter {
+	adapters := AdaptersFromSignals(EndpointSignals(entry)...)
+	native := modelbinding.AdapterGoogleGeminiV1beta
+	// A model name alone does not prove the native route. Keep the existing
+	// Chat/Responses baseline until the catalog or a probe confirms v1beta.
+	if slices.Contains(adapters, native) || slices.Contains(entry.SupportedProtocols, string(native)) {
+		if len(entry.SupportedProtocols) > 0 {
+			adapters = AdaptersFromSignals(entry.SupportedProtocols...)
+		}
+		return expandChatGatewayAdapters(entry.ID, adapters)
+	}
 	suggestion := SuggestConfiguration(ProviderEntryItem(entry))
 	switch suggestion.Category {
 	case "image":
@@ -449,11 +575,6 @@ func AdaptersFromCatalogSignals(entry ProviderEntry) []modelbinding.Adapter {
 	case "video":
 		return []modelbinding.Adapter{modelbinding.AdapterOpenaiVideo}
 	}
-	signals := EndpointSignals(entry)
-	if len(signals) == 0 {
-		return nil
-	}
-	adapters := AdaptersFromSignals(signals...)
 	if len(adapters) == 0 {
 		return nil
 	}

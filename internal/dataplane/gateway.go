@@ -482,7 +482,13 @@ func (g *Gateway) upstreamRequest(original *http.Request, replay *replayBody, ca
 	if err != nil {
 		return nil, func() {}, err
 	}
-	target, err := joinUpstreamURL(catalog.UpstreamBaseForAdapter(candidate.Provider.BaseURL, candidate.Binding.Adapter), requestPath, original.URL.RawQuery)
+	baseURL := catalog.UpstreamBaseForAdapter(candidate.Provider.BaseURL, candidate.Binding.Adapter)
+	var target string
+	if candidate.Binding.Adapter == modelbinding.AdapterGoogleGeminiV1beta {
+		target, err = catalog.GeminiUpstreamURL(baseURL, requestPath, original.URL.RawQuery)
+	} else {
+		target, err = joinUpstreamURL(baseURL, requestPath, original.URL.RawQuery)
+	}
 	if err != nil {
 		return nil, func() {}, err
 	}
@@ -1244,8 +1250,8 @@ func upstreamPath(requestPath, upstreamModel string, adapter modelbinding.Adapte
 		if !isGeminiPath(requestPath) {
 			return "", errors.New("invalid Gemini route")
 		}
-		operation := requestPath[strings.LastIndex(requestPath, ":"):]
-		return "/v1beta/models/" + url.PathEscape(strings.TrimPrefix(upstreamModel, "models/")) + operation, nil
+		operation := requestPath[strings.LastIndex(requestPath, ":")+1:]
+		return catalog.GeminiModelPath(upstreamModel, operation), nil
 	default:
 		return requestPath, nil
 	}

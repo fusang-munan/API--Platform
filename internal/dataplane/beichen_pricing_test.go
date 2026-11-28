@@ -49,6 +49,8 @@ func TestBeichenRequestPricingEvidence(t *testing.T) {
 		{"empty cache declaration", "/v1/messages", `{"cache_control":{}}`, "medium", ""},
 		{"similarly named metadata", "/v1/messages", `{"metadata":{"cache_control":{"ttl":"1h"}}}`, "medium", ""},
 		{"OpenAI uses implicit cache", "/v1/chat/completions", `{"cache_control":{"ttl":"1h"}}`, "medium", ""},
+		{"Gemini thinking level", "/v1beta/models/public:generateContent", `{"generationConfig":{"thinkingConfig":{"thinkingLevel":"HIGH"}}}`, "high", ""},
+		{"Gemini snake case thinking level", "/v1beta/models/public:streamGenerateContent", `{"generation_config":{"thinking_config":{"thinking_level":"LOW"}}}`, "low", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -60,6 +62,32 @@ func TestBeichenRequestPricingEvidence(t *testing.T) {
 				t.Fatalf("expected effort %q and TTL %q, got effort %v and TTL %q", tc.effort, tc.ttl, route.ReasoningEffort, route.CacheTTL)
 			}
 		})
+	}
+}
+
+func TestBeichenGeminiTextPricingReview(t *testing.T) {
+	for _, tc := range []struct{ path, payload, want string }{
+		{"generateContent", `{"contents":[{"parts":[{"text":"hello"}]}]}`, ""},
+		{"streamGenerateContent", `{"generationConfig":{"responseModalities":["TEXT"]}}`, ""},
+		{"embedContent", `{"content":{"parts":[{"text":"hello"}]}}`, beichenUnsupportedPrice},
+		{"generateContent", `{"contents":[{"parts":[{"inlineData":{"mimeType":"image/png"}}]}]}`, beichenUnsupportedPrice},
+		{"generateContent", `{"generationConfig":{"responseModalities":["AUDIO"]}}`, beichenUnsupportedPrice},
+	} {
+		var route usage.CallRoute
+		got := beichenHTTPRequestReview("/v1beta/models/public:"+tc.path, &replayBody{memory: []byte(tc.payload)}, &route)
+		if got != tc.want {
+			t.Fatalf("%s %s: review=%q, want %q", tc.path, tc.payload, got, tc.want)
+		}
+	}
+	for _, tc := range []struct{ payload, want string }{
+		{`[{"modelVersion":"models/bound"},{"candidates":[{"finishReason":"STOP"}]}]`, ""},
+		{`[{"modelVersion":"different"},{"modelVersion":"bound"}]`, beichenModelMismatch},
+		{`{"usageMetadata":{"cacheTokensDetails":[{"modality":"IMAGE","tokenCount":2}]}}`, beichenUnsupportedPrice},
+	} {
+		parsed := parseJSONResponseMetrics(modelbinding.AdapterGoogleGeminiV1beta, []byte(tc.payload))
+		if got := parsed.beichenGeminiResponseReview("bound"); got != tc.want {
+			t.Fatalf("review=%q, want %q for %s", got, tc.want, tc.payload)
+		}
 	}
 }
 

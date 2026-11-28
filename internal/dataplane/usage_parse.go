@@ -3,7 +3,6 @@ package dataplane
 import (
 	"bytes"
 	"encoding/json"
-
 	"strings"
 
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent/modelbinding"
@@ -12,8 +11,16 @@ import (
 
 type ResponseMetrics struct {
 	usage.CallMetrics
-	stopExplicit bool
-	terminal     bool
+	stopExplicit  bool
+	terminal      bool
+	geminiModel   string
+	geminiReview  string
+	geminiSeen    map[int]bool
+	geminiDone    map[int]bool
+	geminiUsage   bool
+	geminiOutput  bool
+	geminiLag     bool
+	geminiBlocked bool
 }
 
 func parseJSONResponseMetrics(adapter modelbinding.Adapter, body []byte) ResponseMetrics {
@@ -67,7 +74,11 @@ func (metrics ResponseMetrics) finishedJSON(adapter modelbinding.Adapter, reques
 		result := metrics.CallMetrics
 		result.State = usage.UsageInterrupted
 		if result.UsageReason == "" {
-			result.UsageReason = "terminal_usage_missing"
+			if adapter == modelbinding.AdapterGoogleGeminiV1beta && (metrics.geminiOutput || metrics.geminiLag) {
+				result.UsageReason = "terminal_usage_incomplete"
+			} else {
+				result.UsageReason = "terminal_usage_missing"
+			}
 		}
 		return result
 	}
@@ -99,6 +110,11 @@ func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, paylo
 	if adapter == modelbinding.AdapterGoogleGeminiV1beta {
 		metrics.noteResponseID(payload["responseId"])
 		metrics.MergeProtocolUsage(adapter, payload["usageMetadata"])
+		if len(bytes.TrimSpace(payload["usageMetadata"])) != 0 && string(bytes.TrimSpace(payload["usageMetadata"])) != "null" {
+			metrics.geminiUsage, metrics.geminiLag = true, false
+		}
+		metrics.noteGeminiPricingEvidence(payload)
+		metrics.terminal = metrics.geminiTerminalComplete()
 		return
 	}
 	metrics.noteResponseID(payload["id"])
@@ -118,6 +134,58 @@ func (metrics *ResponseMetrics) applyPayload(adapter modelbinding.Adapter, paylo
 		}
 	}
 	metrics.MergeProtocolUsage(adapter, payload["usage"])
+}
+
+func (metrics ResponseMetrics) geminiTerminalComplete() bool {
+	if !metrics.geminiUsage {
+		return false
+	}
+	if metrics.geminiBlocked {
+		return true
+	}
+	if len(metrics.geminiSeen) == 0 || metrics.geminiLag {
+		return false
+	}
+	for index := range metrics.geminiSeen {
+		if !metrics.geminiDone[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func (metrics *ResponseMetrics) noteGeminiPricingEvidence(payload map[string]json.RawMessage) {
+	for _, field := range []string{"modelVersion", "model"} {
+		if reported := strings.TrimPrefix(rawString(payload[field]), "models/"); reported != "" {
+			if metrics.geminiModel != "" && metrics.geminiModel != reported {
+				metrics.geminiReview = beichenModelMismatch
+			}
+			metrics.geminiModel = reported
+		}
+	}
+	if metrics.geminiReview != "" {
+		return
+	}
+	if payload == nil || (len(payload["error"]) != 0 && !bytes.Equal(bytes.TrimSpace(payload["error"]), []byte("null"))) {
+		metrics.geminiReview = beichenUnsupportedPrice
+		return
+	}
+	for _, field := range []string{"candidates", "usageMetadata"} {
+		var value any
+		if json.Unmarshal(payload[field], &value) == nil && !beichenGeminiTextValue(value) {
+			metrics.geminiReview = beichenUnsupportedPrice
+			return
+		}
+	}
+}
+
+func (metrics ResponseMetrics) beichenGeminiResponseReview(expectedModel string) string {
+	// Gemini binds the model in the dispatched URL. modelVersion, when
+	// present, can invalidate that evidence. It need not appear in every frame.
+	if metrics.geminiModel != "" && metrics.geminiModel != strings.TrimPrefix(expectedModel, "models/") {
+		return beichenModelMismatch
+	}
+	return metrics.geminiReview
 }
 
 // OpenAI's final usage is a snapshot. Earlier counters can still explain a
@@ -157,6 +225,32 @@ func jsonObject(raw json.RawMessage) map[string]json.RawMessage {
 }
 
 func applyReplyState(adapter modelbinding.Adapter, metrics *ResponseMetrics, payload map[string]json.RawMessage) {
+	if adapter == modelbinding.AdapterGoogleGeminiV1beta {
+		if metrics.geminiSeen == nil {
+			metrics.geminiSeen, metrics.geminiDone = map[int]bool{}, map[int]bool{}
+		}
+		var candidates []map[string]json.RawMessage
+		if json.Unmarshal(payload["candidates"], &candidates) == nil {
+			for position, candidate := range candidates {
+				index := position
+				var number float64
+				if json.Unmarshal(candidate["index"], &number) == nil && number >= 0 && number <= 1_000_000 {
+					index = int(number)
+				}
+				metrics.geminiSeen[index] = true
+				if reason := rawString(candidate["finishReason"]); reason != "" && reason != "FINISH_REASON_UNSPECIFIED" {
+					metrics.geminiDone[index] = true
+				}
+				if geminiCandidateHasOutput(candidate) {
+					metrics.geminiOutput, metrics.geminiLag = true, true
+				}
+			}
+		}
+		if reason := rawString(jsonObject(payload["promptFeedback"])["blockReason"]); reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
+			metrics.geminiBlocked = true
+		}
+		return
+	}
 	noteToolRequest(metrics, payload["content"])
 	noteToolRequest(metrics, payload["output"])
 	noteToolRequest(metrics, payload["content_block"])
@@ -186,19 +280,6 @@ func applyReplyState(adapter modelbinding.Adapter, metrics *ResponseMetrics, pay
 			noteToolRequest(metrics, deltaRaw)
 		}
 	}
-	if candidatesRaw, ok := payload["candidates"]; ok && adapter == modelbinding.AdapterGoogleGeminiV1beta {
-		var candidates []map[string]json.RawMessage
-		if json.Unmarshal(candidatesRaw, &candidates) == nil {
-			for _, candidate := range candidates {
-				if reason := rawString(candidate["finishReason"]); reason != "" && reason != "FINISH_REASON_UNSPECIFIED" {
-					metrics.terminal = true
-				}
-			}
-		}
-	}
-	if reason := rawString(jsonObject(payload["promptFeedback"])["blockReason"]); adapter == modelbinding.AdapterGoogleGeminiV1beta && reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
-		metrics.terminal = true
-	}
 	if adapter == modelbinding.AdapterAnthropic {
 		noteStopReason(metrics, rawString(payload["stop_reason"]))
 	} else {
@@ -216,6 +297,24 @@ func applyReplyState(adapter modelbinding.Adapter, metrics *ResponseMetrics, pay
 	if messageStop || responseCompleted || responseStatus {
 		metrics.terminal = true
 	}
+}
+
+func geminiCandidateHasOutput(candidate map[string]json.RawMessage) bool {
+	var content map[string]json.RawMessage
+	if json.Unmarshal(candidate["content"], &content) != nil {
+		return false
+	}
+	var parts []map[string]json.RawMessage
+	if json.Unmarshal(content["parts"], &parts) != nil {
+		return false
+	}
+	for _, part := range parts {
+		if rawString(part["text"]) != "" || len(bytes.TrimSpace(part["functionCall"])) != 0 ||
+			len(bytes.TrimSpace(part["executableCode"])) != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func noteStopReason(metrics *ResponseMetrics, reason string) {

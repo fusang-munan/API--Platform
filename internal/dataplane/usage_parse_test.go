@@ -354,3 +354,47 @@ func TestExtractCallCorrelation(t *testing.T) {
 		t.Fatalf("unexpected correlation: %#v", correlation)
 	}
 }
+
+func TestGeminiRequiresAllCandidatesAndUsageAfterLastOutput(t *testing.T) {
+	const protocol = "google_gemini_v1beta"
+	cases := []struct {
+		name, body string
+		sse        bool
+		complete   bool
+	}{
+		{"JSON usage covers terminal output", `{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"totalTokenCount":12}}`, false, true},
+		{"SSE usage follows text stop", "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":2,\"totalTokenCount\":12}}\n\n", true, true},
+		{"SSE output after input-only usage", "data: {\"usageMetadata\":{\"promptTokenCount\":10,\"totalTokenCount\":10}}\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"late\"}]},\"finishReason\":\"STOP\"}]}\n\n", true, false},
+		{"SSE one of two candidates finished", "data: {\"candidates\":[{\"index\":0,\"content\":{\"parts\":[{\"text\":\"a\"}]}},{\"index\":1,\"content\":{\"parts\":[{\"text\":\"b\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":2,\"totalTokenCount\":12}}\n\ndata: {\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\"}]}\n\n", true, false},
+		{"JSON array one of two candidates finished", `[{"candidates":[{"index":0,"content":{"parts":[{"text":"a"}]}},{"index":1,"content":{"parts":[{"text":"b"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"totalTokenCount":12}},{"candidates":[{"index":0,"finishReason":"STOP"}]}]`, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var metrics usage.CallMetrics
+			if tc.sse {
+				observer := observeSSE(modelbinding.AdapterGoogleGeminiV1beta, []byte(tc.body))
+				if got := observer.metrics.geminiTerminalComplete(); got != tc.complete {
+					t.Fatalf("terminal complete=%t, want %t: %+v", got, tc.complete, observer.metrics)
+				}
+				metrics = observer.metrics.finished(!tc.complete)
+			} else {
+				parsed := parseJSONResponseMetrics(modelbinding.AdapterGoogleGeminiV1beta, []byte(tc.body))
+				if got := parsed.geminiTerminalComplete(); got != tc.complete {
+					t.Fatalf("terminal complete=%t, want %t: %+v", got, tc.complete, parsed)
+				}
+				metrics = parsed.finishedJSON(modelbinding.AdapterGoogleGeminiV1beta, "/v1beta/models/gemini:streamGenerateContent", false)
+			}
+			if tc.complete {
+				if metrics.State != usage.UsageReported {
+					t.Fatalf("complete usage was not reported: %+v", metrics)
+				}
+				return
+			}
+			testResponse := ResponseMetrics{CallMetrics: metrics}
+			if metrics.State != usage.UsageInterrupted || testResponse.geminiTerminalComplete() ||
+				metrics.ClassifyBeichenUsage(protocol).CanPriceBeichenUsage(protocol) {
+				t.Fatalf("incomplete terminal usage could be charged: %+v", metrics)
+			}
+		})
+	}
+}

@@ -328,6 +328,25 @@ func TestGeminiModelAndUpstreamPath(t *testing.T) {
 	}
 }
 
+func TestBeichenGeminiUpstreamRequestUsesNativePath(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ base, want string }{
+		{"https://api.beichenapi.com", "https://api.beichenapi.com/v1beta/models/upstream:streamGenerateContent?alt=sse"},
+		{"https://api.beichenapi.com/v1/", "https://api.beichenapi.com/v1beta/models/upstream:streamGenerateContent?alt=sse"},
+		{"https://other.example/v1", "https://other.example/v1/v1beta/models/upstream:streamGenerateContent?alt=sse"},
+	} {
+		original := httptest.NewRequest(http.MethodPost, "/v1beta/models/public:streamGenerateContent?alt=sse", nil)
+		got, cleanup, err := (&Gateway{}).upstreamRequest(original, nil, route{
+			Binding:  &ent.ModelBinding{UpstreamModelName: "models/upstream", Adapter: modelbinding.AdapterGoogleGeminiV1beta},
+			Provider: &ent.Provider{BaseURL: tc.base},
+		})
+		cleanup()
+		if err != nil || got.URL.String() != tc.want {
+			t.Fatalf("%s: wrong native target, error %v", tc.base, err)
+		}
+	}
+}
+
 func TestCohereRerankUsesV2Upstream(t *testing.T) {
 	t.Parallel()
 	upstream, err := upstreamPath("/v2/rerank", "rerank-v4.0-pro", "cohere_rerank_v2")

@@ -20,7 +20,9 @@ func beichenHTTPRequestReview(path string, replay *replayBody, route *usage.Call
 	switch path {
 	case "/v1/chat/completions", "/v1/responses", "/v1/messages":
 	default:
-		return beichenUnsupportedPrice
+		if !beichenGeminiTextPath(path) {
+			return beichenUnsupportedPrice
+		}
 	}
 	if replay == nil {
 		return beichenUnsupportedPrice
@@ -37,12 +39,17 @@ func beichenHTTPRequestReview(path string, replay *replayBody, route *usage.Call
 	return beichenRequestReview(data, path, route)
 }
 
+func beichenGeminiTextPath(path string) bool {
+	return isGeminiPath(path) && (strings.HasSuffix(path, ":generateContent") || strings.HasSuffix(path, ":streamGenerateContent"))
+}
+
 func beichenRequestReview(data []byte, path string, route *usage.CallRoute) string {
 	var payload map[string]any
 	if json.Unmarshal(data, &payload) != nil || payload == nil {
 		return beichenUnsupportedPrice
 	}
 	var rawEffort any
+	gemini := beichenGeminiTextPath(path)
 	switch path {
 	case "/v1/chat/completions":
 		rawEffort = payload["reasoning_effort"]
@@ -57,6 +64,21 @@ func beichenRequestReview(data []byte, path string, route *usage.CallRoute) stri
 			rawEffort = payload["effort"]
 		}
 		route.CacheTTL = anthropicCacheTTL(payload)
+	default:
+		if gemini {
+			config := objectField(payload, "generationConfig")
+			if config == nil {
+				config = objectField(payload, "generation_config")
+			}
+			thinking := objectField(config, "thinkingConfig")
+			if thinking == nil {
+				thinking = objectField(config, "thinking_config")
+			}
+			rawEffort = thinking["thinkingLevel"]
+			if rawEffort == nil {
+				rawEffort = thinking["thinking_level"]
+			}
+		}
 	}
 	effort := usage.DefaultReasoningEffort
 	if rawEffort != nil {
@@ -75,7 +97,7 @@ func beichenRequestReview(data []byte, path string, route *usage.CallRoute) stri
 		}
 	}
 	route.ReasoningEffort = &effort
-	if !beichenTextValue(payload) {
+	if !beichenTextValue(payload) || (gemini && !beichenGeminiTextValue(payload)) {
 		return beichenUnsupportedPrice
 	}
 	return ""
@@ -252,6 +274,53 @@ func beichenTextValue(value any) bool {
 				}
 			}
 			if !beichenTextValue(child) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// Native generation also carries media in parts and in the token counts by
+// modality. A cached prompt can include media absent from the current request.
+func beichenGeminiTextValue(value any) bool {
+	switch node := value.(type) {
+	case []any:
+		for _, child := range node {
+			if !beichenGeminiTextValue(child) {
+				return false
+			}
+		}
+	case map[string]any:
+		for key, child := range node {
+			switch strings.ToLower(strings.ReplaceAll(key, "_", "")) {
+			case "inlinedata", "filedata":
+				if child != nil {
+					return false
+				}
+			case "responsemodalities":
+				modes, ok := child.([]any)
+				if !ok {
+					return false
+				}
+				for _, mode := range modes {
+					if mode != "TEXT" {
+						return false
+					}
+				}
+			case "prompttokensdetails", "cachetokensdetails", "candidatestokensdetails", "tooluseprompttokensdetails":
+				details, ok := child.([]any)
+				if child != nil && !ok {
+					return false
+				}
+				for _, raw := range details {
+					detail, _ := raw.(map[string]any)
+					if detail["modality"] != "TEXT" && detail["tokenCount"] != float64(0) {
+						return false
+					}
+				}
+			}
+			if !beichenGeminiTextValue(child) {
 				return false
 			}
 		}

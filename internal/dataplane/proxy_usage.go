@@ -351,10 +351,15 @@ func (g *Gateway) proxyHTTPBody(attemptCtx context.Context, w http.ResponseWrite
 			metrics.State, metrics.UsageReason = usage.UsageInterrupted, "response_interrupted"
 		case int64(len(prefix)) <= limit:
 			interrupted := false
+			parsed := parseJSONResponseMetrics(adapter, prefix)
 			if north && review == "" {
-				review = beichenPayloadReview(prefix, candidate.UpstreamModelName, false)
-				if review == "" && !beichenModelReported(jsonObject(prefix), candidate.UpstreamModelName) {
-					review = beichenModelUnconfirmed
+				if adapter == modelbinding.AdapterGoogleGeminiV1beta {
+					review = parsed.beichenGeminiResponseReview(candidate.UpstreamModelName)
+				} else {
+					review = beichenPayloadReview(prefix, candidate.UpstreamModelName, false)
+					if review == "" && !beichenModelReported(jsonObject(prefix), candidate.UpstreamModelName) {
+						review = beichenModelUnconfirmed
+					}
 				}
 			}
 			if north && adapter == modelbinding.AdapterOpenaiResponses {
@@ -362,7 +367,7 @@ func (g *Gateway) proxyHTTPBody(attemptCtx context.Context, w http.ResponseWrite
 				status := rawString(payload["status"])
 				interrupted = (status != "" || ctx.Err() != nil) && status != "completed" && !beichenResponsesOutputLimited(payload)
 			}
-			metrics = parseJSONResponseMetrics(adapter, prefix).finishedJSON(adapter, original.URL.Path, interrupted)
+			metrics = parsed.finishedJSON(adapter, original.URL.Path, interrupted)
 			if isCreation {
 				resourceBody = prefix
 			}
@@ -468,10 +473,16 @@ func (g *Gateway) proxySSE(w http.ResponseWriter, original *http.Request, respon
 		// Once the upstream terminal frame has been observed, a downstream
 		// write error cannot invalidate the final upstream usage.
 		interrupted = observer.failed || observer.incomplete || !observer.terminal
-		metrics := observer.metrics.finished(interrupted)
-		if observer.review == "" && !observer.modelReported {
+		if observer.adapter == modelbinding.AdapterGoogleGeminiV1beta {
+			// A Gemini finishReason can precede the final usageMetadata.
+			interrupted = observer.failed || observer.incomplete || !observer.metrics.geminiTerminalComplete() || readErr != io.EOF
+			if observer.review == "" {
+				observer.review = observer.metrics.beichenGeminiResponseReview(candidate.UpstreamModelName)
+			}
+		} else if observer.review == "" && !observer.modelReported {
 			observer.review = beichenModelUnconfirmed
 		}
+		metrics := observer.metrics.finished(interrupted)
 		metrics, review := beichenReviewMetrics(observer.adapter, metrics, observer.review)
 		if interrupted {
 			category, message := "stream", "Upstream stream did not complete."
