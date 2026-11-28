@@ -108,6 +108,45 @@ it('按条件报价和后端系数显示 55 积分，零价与缺价分别展示
   expect(wrapper.text()).toContain('仅高档 · 基础档缺价')
 })
 
+it('条件价按默认推理强度中档系数和 12 小时缓存展示，与账本同口径', async () => {
+  const data = overview()
+  data.model_catalog[0].price_state = 'conditional'
+  data.models[0] = {
+    credential_id: 'one', model: 'lab/model', mode: 'follow', price_status: 'conditional',
+    quote_effective_multiplier: '0.5',
+    price_conditions_exact: {
+      billing_mode: 'token', input_price: '0.000001', output_price: '0.000001',
+      cache_write_12h_price: '0.000001',
+      reasoning_effort_multipliers: { medium: '2' },
+    },
+  }
+  api.beichenOverview.mockResolvedValue(data)
+  const wrapper = await view()
+  expect(wrapper.get('[data-testid="drawer-effort-multiplier"]').text()).toContain('默认推理强度 中 · × 2')
+  const tier = wrapper.get('[data-testid="drawer-price-tier"]')
+  expect(tier.find('[data-student-price="input"]').text()).toBe('110')
+  expect(tier.find('[data-student-price="output"]').text()).toBe('110')
+  expect(tier.find('[data-student-price="cache_write_12h"]').text()).toBe('110')
+})
+
+it('同一组百万输入的长小数在抽屉与账本均为 550.00000000000000055 积分', async () => {
+  const data = overview()
+  data.model_catalog[0].price_state = 'conditional'
+  data.models[0] = {
+    credential_id: 'one', model: 'lab/model', mode: 'follow', price_status: 'conditional',
+    quote_effective_multiplier: '2.5',
+    price_conditions_exact: {
+      billing_mode: 'token', input_price: '0.000001000000000000000001',
+      output_price: '0.000001000000000000000001',
+      reasoning_effort_multipliers: { medium: '2' },
+    },
+  }
+  api.beichenOverview.mockResolvedValue(data)
+  const wrapper = await view()
+  expect(wrapper.get('[data-testid="drawer-price-tier"] [data-student-price="input"]').text())
+    .toBe('550.00000000000000055')
+})
+
 it('手动价按每把 Key 的学校系数预览一次', async () => {
   const data = overview()
   data.school_multipliers.two = '1'

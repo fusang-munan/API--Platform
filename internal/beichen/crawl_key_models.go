@@ -106,6 +106,7 @@ type crawlKeyRate struct {
 	groupID      int64
 	info         *billingInfo
 	groupDefault *json.Number
+	conflict     error
 }
 
 // The website inventory establishes which provisioned credentials belong to
@@ -246,6 +247,8 @@ func (crawl *directoryCrawl) applyAccountRates(rates map[int64]json.Number, fall
 				group.AccountRate, group.AccountRateSource, group.AccountRateKeyID = &rate, "", 0
 			} else if evidence, checked := fallback[group.ID]; checked {
 				switch {
+				case evidence.conflict != nil:
+					crawl.AccountRateError = evidence.conflict.Error()
 				case evidence.info != nil:
 					group.setKeyAccountRate(*evidence.info)
 				case evidence.groupDefault != nil:
@@ -286,6 +289,10 @@ func (s *Service) checkCrawlKeyModels(ctx context.Context, result *CrawlKeyModel
 	if errors.Is(err, errKeyGroupNotAllowed) {
 		result.State, result.Error = "unavailable", err.Error()
 		return crawlKeyRate{}
+	}
+	if errors.Is(err, errAccountRateConflict) {
+		result.Error = err.Error()
+		return crawlKeyRate{groupID: group.ID, conflict: err}
 	}
 	// A shared directory rate must not be attributed to multiple Keys.
 	if err == nil && keysPerGroup[group.ID] == 1 {

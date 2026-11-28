@@ -16,7 +16,7 @@ import {
   type StudentPrice, type TeacherBoundRoute, type TeacherCatalogModel, type TeacherOverview, type TeacherPriceModel,
 } from '../../utils/beichenModels'
 import { bindingAdapterMeta } from '../../utils/bindingAdapters'
-import { formatPercent, formatPriceAmount, formatTokens, shiftDecimal } from '../../utils/credits'
+import { formatPercent, formatPriceAmount, formatPriceDetail, formatTokens, shiftDecimal } from '../../utils/credits'
 import { buildCurrentGroupPriceRow, priceReferenceText } from '../../utils/groupPriceRows'
 import { schoolDay, statusLabel } from '../../utils/format'
 import AppDialog from '../../components/AppDialog.vue'
@@ -838,7 +838,7 @@ function planBatch(models: string[]) {
     const matches = catalog.value.filter(row => row.model.toLowerCase() === name && !row.retired)
     if (matches.length > 1) return visible.has(name) ? [{ model, active: false, reason: '有多个同名校内型号，请逐行启用' }] : []
     const row = matches[0]
-    if (row?.retired || !visible.has(name) && !row?.active) return []
+    if (!visible.has(name) && !row?.active) return []
     const active = row?.active ?? false
     const reason = active ? '已启用' : row ? canEnableReason(row) : '当前目录中没有此模型'
     return [{ model, active, reason }]
@@ -1114,7 +1114,7 @@ function withYuan(text: string, factor?: string) {
     if (!convertibleUnits.has(unit)) return line
     return [unit, ...amounts.map(amount => amount.replace(/ (\d+(?:\.\d+)?)$/, (_match, credits: string) => {
       const value = factor ? studentPriceAmount(credits, factor) : credits
-      return value == null ? '' : ` ${formatPriceAmount(value)} 积分（${formatPriceAmount(shiftDecimal(value, -2))} 元）`
+      return value == null ? '' : ` ${formatPriceDetail(value)} 积分（${formatPriceDetail(shiftDecimal(value, -2))} 元）`
     }))].join(' · ')
   }).join('\n')
 }
@@ -1613,6 +1613,9 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
           <section v-for="band in [quote.conditionalPrice.base, ...quote.conditionalPrice.intervals].filter(band => band != null)"
             :key="band.label" class="condition-tier" data-testid="conditional-tier">
             <h4>{{ band.label }}</h4>
+            <p v-if="band.effortMultiplier" class="beichen-note" data-testid="tier-effort-multiplier">
+              默认推理强度 {{ band.effortLabel }} · × {{ band.effortMultiplier }}
+            </p>
             <table class="beichen-table condition-tier-table">
               <caption class="sr-only">{{ band.label }}每百万 Token 单价</caption>
               <thead><tr><th scope="col">分项</th><th scope="col">官网价（元 / 1M）</th>
@@ -1620,9 +1623,9 @@ onBeforeUnmount(() => { disposed = true; overviewRequest++ })
               <tbody>
                 <tr v-for="item in band.rows" :key="item.key">
                   <th scope="row">{{ item.label }}</th>
-                  <td class="numeric-cell" data-label="官网价（元 / 1M）">{{ formatPriceAmount(item.yuan) }}</td>
-                  <td class="numeric-cell" data-label="结算价（积分 / 1M）">{{ formatPriceAmount(item.settlement) }}</td>
-                  <td class="numeric-cell" data-label="学生价（积分 / 1M）" :data-student-price="item.key">{{ formatPriceAmount(item.student) }}</td>
+                  <td class="numeric-cell" data-label="官网价（元 / 1M）">{{ formatPriceDetail(item.yuan) }}</td>
+                  <td class="numeric-cell" data-label="结算价（积分 / 1M）">{{ formatPriceDetail(item.settlement) }}</td>
+                  <td class="numeric-cell" data-label="学生价（积分 / 1M）" :data-student-price="item.key">{{ formatPriceDetail(item.student) }}</td>
                 </tr>
               </tbody>
             </table>

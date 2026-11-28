@@ -6,7 +6,7 @@ import type { BeichenModel, BeichenModelPriceUpdate } from '../api/types'
 import { baseSchoolRates, manualPriceDetail, priceFields, ratesPriceDetail, scaledNumber, schoolConditionalPrice,
   schoolPriceMultiplier, schoolTokenPriceAt, studentPriceAmount, studentPriceLabels, webPriceDetail, type PriceSource,
   type SchoolCatalogRow, type TeacherOverview, type TeacherPriceModel } from '../utils/beichenModels'
-import { formatPriceAmount, shiftDecimal } from '../utils/credits'
+import { formatPriceAmount, formatPriceDetail, shiftDecimal } from '../utils/credits'
 import { schoolDay } from '../utils/format'
 import AppDialog from './AppDialog.vue'
 import BeichenPriceDetail from './BeichenPriceDetail.vue'
@@ -350,6 +350,11 @@ async function save() {
             <section v-if="quote.conditional" class="price-confirmation">
               <h4>{{ quote.label }} · 条件价</h4>
               <p v-if="quote.conditional.onlyHigher" class="beichen-note">仅高档 · 基础档缺价</p>
+              <p v-if="(quote.conditional.intervals[0] ?? quote.conditional.base)?.effortMultiplier"
+                class="beichen-note" data-testid="drawer-effort-multiplier">
+                默认推理强度 {{ (quote.conditional.intervals[0] ?? quote.conditional.base)?.effortLabel }} ·
+                × {{ (quote.conditional.intervals[0] ?? quote.conditional.base)?.effortMultiplier }}
+              </p>
               <table v-for="band in [quote.conditional.base, ...quote.conditional.intervals].filter(band => band != null)"
                 :key="band.label" class="confirmation-rates" data-testid="drawer-price-tier">
                 <caption>{{ band.label }} / 百万 Token</caption>
@@ -357,9 +362,9 @@ async function save() {
                 <tbody>
                   <tr v-for="item in band.rows" :key="item.key">
                     <th scope="row">{{ item.label }}</th>
-                    <td>{{ formatPriceAmount(item.yuan, '缺价') }}</td>
-                    <td>{{ formatPriceAmount(item.settlement, item.yuan == null ? '缺价' : '倍率待核实') }}</td>
-                    <td :data-student-price="item.key">{{ formatPriceAmount(item.student,
+                    <td>{{ formatPriceDetail(item.yuan, '缺价') }}</td>
+                    <td>{{ formatPriceDetail(item.settlement, item.yuan == null ? '缺价' : '倍率待核实') }}</td>
+                    <td :data-student-price="item.key">{{ formatPriceDetail(item.student,
                       item.yuan == null ? '缺价' : item.settlement == null ? '倍率待核实' : '学校系数待同步') }}</td>
                   </tr>
                 </tbody>
@@ -392,10 +397,10 @@ async function save() {
             </tr>
             <tr v-for="field in quote.prices" :key="field.key">
               <th scope="row">{{ field.label }}</th>
-              <td>{{ formatPriceAmount(field.value == null ? null : shiftDecimal(field.value, -2), mode === 'follow' ? '缺价' : '—') }}</td>
-              <td>{{ formatPriceAmount(field.value, mode === 'follow' ? '缺价' : '—') }}</td>
+              <td>{{ formatPriceDetail(field.value == null ? null : shiftDecimal(field.value, -2), mode === 'follow' ? '缺价' : '—') }}</td>
+              <td>{{ formatPriceDetail(field.value, mode === 'follow' ? '缺价' : '—') }}</td>
               <td v-if="mode === 'follow'" :data-student-price="field.key">
-                {{ 'derived' in quote && quote.derived ? '反推价待核对' : formatPriceAmount(studentPriceAmount(field.value, quote.schoolMultiplier),
+                {{ 'derived' in quote && quote.derived ? '反推价待核对' : formatPriceDetail(studentPriceAmount(field.value, quote.schoolMultiplier),
                   field.value != null ? '学校系数待同步' : 'status' in quote && quote.status ? studentPriceLabels[quote.status.status] : '缺价') }}
               </td>
             </tr>

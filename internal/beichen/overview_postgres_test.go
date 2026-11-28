@@ -460,7 +460,7 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 	}
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil || cfg.Host != "127.0.0.1" || (cfg.User != "nebula_qa" && cfg.User != "nebula_test") ||
-		(cfg.Database != "nebula_test" && cfg.Database != "nebula_test_hjb") ||
+		(cfg.Database != "nebula_test" && cfg.Database != "nebula_test_hjb" && cfg.Database != "nebula_test_rev_b") ||
 		cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
 		t.Fatal("requires a loopback-only nebula_test database and test role with sslmode=disable")
 	}

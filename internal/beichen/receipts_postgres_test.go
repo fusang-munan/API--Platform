@@ -25,7 +25,7 @@ func TestReceiptSweepPostgresG3(t *testing.T) {
 		t.Skip("requires a disposable local nebula_test database")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || config.Database != "nebula_test" ||
+	if err != nil || config.Host != "127.0.0.1" || (config.Database != "nebula_test" && config.Database != "nebula_test_rev_b") ||
 		(config.User != "nebula_qa" && config.User != "nebula_test") || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal("requires the loopback nebula_test database with a test role and sslmode=disable")
 	}

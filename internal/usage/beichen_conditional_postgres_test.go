@@ -27,9 +27,9 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 	exec(`INSERT INTO beichen_panel_access(credential_id,group_id,upstream_key_id,token_ciphertext,updated_by,updated_at)
 		SELECT id,1,93,decode('09','hex'),$2,updated_at FROM provider_credentials WHERE id=$1`, credential, student)
 	exec(`INSERT INTO projects(id,organization_id,name,monthly_credit_quota_milli,created_at,updated_at)
-		VALUES($1,$2,'Conditional test',10000,now(),now())`, project, org)
+		VALUES($1,$2,'Conditional test',1000000,now(),now())`, project, org)
 	exec(`INSERT INTO project_members(id,project_id,user_id,monthly_credit_quota_milli,created_at)
-		VALUES(gen_random_uuid(),$1,$2,10000,now())`, project, student)
+		VALUES(gen_random_uuid(),$1,$2,1000000,now())`, project, student)
 	exec(`INSERT INTO api_keys(id,project_id,owner_user_id,name,status,key_hash,key_prefix,claimed_at,created_at,updated_at)
 		VALUES($1,$2,$3,'Conditional Key','active','conditional-test-hash','fixture',now(),now(),now())`, key, project, student)
 	exec(`INSERT INTO api_key_models(id,api_key_id,model_id,created_at) VALUES(gen_random_uuid(),$1,$2,now())`, key, model)
@@ -223,6 +223,22 @@ func TestBeichenConditionalLedgerPostgres(t *testing.T) {
 			t.Errorf("%s charge=%s state ok=%t: %v", table.name, total, ok, err)
 		}
 	}
+
+	t.Run("default medium effort and input ledger share one preview basis", func(t *testing.T) {
+		input, zero := int64(1_000_000), int64(0)
+		metrics := CallMetrics{State: UsageReported, PromptTokens: &input, CompletionTokens: &zero,
+			CacheHitTokens: &zero, CacheWriteTokens: &zero}
+		r, route := dispatch("conditional-model", "openai_compatible", nil, "", nil)
+		finalize(r, route, metrics)
+		checkCharge(r, "550.00000000000000055", "550.00000000000000055", "0",
+			"500.0000000000000005", "gateway_usage_price")
+		var ok bool
+		err := db.QueryRowContext(ctx, `SELECT pricing_detail @> '{"reasoning_effort":"medium",
+			"reasoning_multiplier":"2"}' FROM gateway_calls WHERE id=$1`, r.CallID).Scan(&ok)
+		if err != nil || !ok {
+			t.Fatalf("default medium effort evidence missing: %v", err)
+		}
+	})
 
 	t.Run("fixed quotes retain partial usage and book the unique amount once", func(t *testing.T) {
 		t.Setenv("NEBULA_PENDING_AUTO_SETTLE", "0") // Exercise the exact-only fallback.

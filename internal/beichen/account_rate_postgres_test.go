@@ -356,6 +356,80 @@ SELECT (SELECT upstream_input IS NOT NULL FROM beichen_price_at($1,$2,statement_
 	}
 }
 
+func TestAccountRateConflictBlocksGroupFallbackPostgres(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		rates  string
+		rate   string
+		group  int
+	}{
+		{name: "outage plus effective 0.8", status: http.StatusServiceUnavailable, rate: "0.8"},
+		{name: "invalid table plus effective 0.8", status: http.StatusOK, rates: "null", rate: "0.8"},
+		{name: "malformed other group plus effective 0.8", rates: `{"6":"invalid"}`, rate: "0.8"},
+		{name: "reverse effective 0.2", status: http.StatusServiceUnavailable, rate: "0.2"},
+		{name: "billing group 17 cannot use group 16", status: http.StatusServiceUnavailable, rate: "0.6", group: 17},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAccountRateJobFixture(t)
+			f.ratesStatus, f.rates = tc.status, tc.rates
+			f.billingEffective, f.billingGroup = tc.rate, tc.group
+			busy, err := f.service.runJob(f.ctx, f.job, true)
+			if busy || !errors.Is(err, errAccountRateConflict) {
+				t.Fatalf("conflicting account evidence must fail closed: busy=%t err=%v", busy, err)
+			}
+			item, card := f.readBilling()
+			if item.BillingState == "current" || item.AccountRate != nil || item.AccountRateSource != "" ||
+				item.LastError == nil || !strings.Contains(*item.LastError, "证据冲突") ||
+				!matchesAccountRate(card.WebsiteGroup, "", "", 0) {
+				t.Fatalf("conflict was not recorded or was replaced by the group default: %+v %+v", item, card.WebsiteGroup)
+			}
+			quote, priced := reviewCurrentQuote(f)
+			if quote != 0 || priced != 0 {
+				t.Fatalf("conflicting account evidence must retain no current quote, got group=%d priced=%d", quote, priced)
+			}
+		})
+	}
+
+	t.Run("peak-enabled group cannot use the outage fallback", func(t *testing.T) {
+		f := newAccountRateJobFixture(t)
+		f.ratesStatus = http.StatusServiceUnavailable
+		f.quote = strings.Replace(f.quote, `"peak_rate_enabled":false`,
+			`"peak_rate_enabled":true,"peak_start":"00:00","peak_end":"23:59","peak_rate_multiplier":2,"timezone":"UTC"`, 1)
+		busy, err := f.service.runJob(f.ctx, f.job, true)
+		if busy || err == nil {
+			t.Fatalf("peak-enabled fallback must remain blocked: busy=%t err=%v", busy, err)
+		}
+		item, card := f.readBilling()
+		if item.AccountRate != nil || item.AccountRateSource != "" ||
+			!matchesAccountRate(card.WebsiteGroup, "", "", 0) {
+			t.Fatalf("peak-enabled group published an account rate: %+v %+v", item, card.WebsiteGroup)
+		}
+		if quote, priced := reviewCurrentQuote(f); quote != 0 || priced != 0 {
+			t.Fatalf("peak-enabled fallback published a quote: group=%d priced=%d", quote, priced)
+		}
+	})
+
+	t.Run("all fallback conditions met uses group rate", func(t *testing.T) {
+		f := newAccountRateJobFixture(t)
+		f.ratesStatus = http.StatusServiceUnavailable
+		f.billingEffective = "0.6"
+		busy, err := f.service.runJob(f.ctx, f.job, true)
+		if busy || err != nil {
+			t.Fatalf("complete group evidence should support fallback: busy=%t err=%v", busy, err)
+		}
+		item, card := f.readBilling()
+		if item.BillingState != "current" || item.AccountRate == nil || item.AccountRate.String() != "0.6" ||
+			item.AccountRateSource != groupRateSource || item.LastError != nil ||
+			!matchesAccountRate(card.WebsiteGroup, "0.6", groupRateSource, 0) {
+			t.Fatalf("verified group fallback was not published: %+v %+v", item, card.WebsiteGroup)
+		}
+		if quote, _ := reviewCurrentQuote(f); quote != 16 {
+			t.Fatalf("verified group fallback did not publish its quote: group=%d", quote)
+		}
+	})
+}
+
 func TestBeichenDirectAccountRateFreshnessPostgres(t *testing.T) {
 	f := newAccountRateJobFixture(t)
 	zone := "UTC"
@@ -546,6 +620,9 @@ type accountRateJobFixture struct {
 	keyListUnavailable bool
 	quote              string
 	rates              string
+	ratesStatus        int
+	billingEffective   string
+	billingGroup       int
 }
 
 func newAccountRateJobFixture(t *testing.T) *accountRateJobFixture {
@@ -565,6 +642,7 @@ func newAccountRateJobFixture(t *testing.T) *accountRateJobFixture {
 	f := &accountRateJobFixture{t: t, ctx: ctx, db: db, service: service,
 		job: syncJob{provider: provider, credential: credential, kind: "billing"},
 		at:  time.Now().UTC().Truncate(time.Microsecond), keyID: 12094, groupID: 16, groupIDKnown: true, rates: `{}`,
+		ratesStatus: http.StatusOK, billingEffective: "0.6",
 		quote: websiteGroupFixture(16, "0.6", accountRateFixtureTerms)}
 	service.now = func() time.Time { return f.at }
 	service.client.Transport = panelTransport(func(req *http.Request) (*http.Response, error) {
@@ -583,6 +661,10 @@ func newAccountRateJobFixture(t *testing.T) *accountRateJobFixture {
 					body = strings.Replace(body, fmt.Sprintf(`"group_id":%d,`, f.groupID), "", 1)
 				}
 			case "/api/v1/groups/rates":
+				if f.ratesStatus != http.StatusOK {
+					return &http.Response{StatusCode: f.ratesStatus,
+						Body: io.NopCloser(strings.NewReader("fixture unavailable"))}, nil
+				}
 				body = `{"code":0,"data":` + f.rates + `}`
 			case "/api/v1/usage":
 				query := req.URL.Query()
@@ -602,9 +684,14 @@ func newAccountRateJobFixture(t *testing.T) *accountRateJobFixture {
 			case modelsPath:
 				body = fmt.Sprintf(`{"data":[{"id":%q,"supported_protocols":["anthropic"]}]}`, accountRateFixtureModel)
 			case billingPath:
+				group := f.billingGroup
+				if group == 0 {
+					group = f.groupID
+				}
 				body = fmt.Sprintf(`{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token",
-					"api_key_id":%d,"group_id":%d,"group_rate_multiplier":0.6,"effective_rate_multiplier":0.6,
-					"peak_rate_enabled":false,"observed_at":%q}`, f.keyID, f.groupID, f.at.Add(-time.Second).Format(time.RFC3339Nano))
+					"api_key_id":%d,"group_id":%d,"group_rate_multiplier":0.6,"effective_rate_multiplier":%s,
+					"peak_rate_enabled":false,"observed_at":%q}`,
+					f.keyID, group, f.billingEffective, f.at.Add(-time.Second).Format(time.RFC3339Nano))
 			}
 		}
 		if body == "" || req.Method != http.MethodGet {
@@ -832,16 +919,19 @@ func TestIndependentReviewGroupRatePeakPostgres(t *testing.T) {
 	}
 	f.quote = strings.Replace(f.quote, `"peak_rate_enabled":false`,
 		fmt.Sprintf(`"peak_rate_enabled":true,"peak_start":"00:00","peak_end":"23:59","peak_rate_multiplier":2,"timezone":%q`, zone), 1)
-	f.syncBilling()
+	busy, err := f.service.runJob(f.ctx, f.job, true)
+	if busy || !errors.Is(err, errWebsiteAccountRateUnverified) {
+		t.Fatalf("peak-on fallback requires review: busy=%t err=%v", busy, err)
+	}
 	item, key := f.readBilling()
-	var amountOK bool
-	err := f.db.QueryRowContext(f.ctx, `SELECT upstream_input=2400000 FROM beichen_price_at($1,$2,statement_timestamp())`,
-		f.job.credential, accountRateFixtureModel).Scan(&amountOK)
-	quote, priced := reviewCurrentQuote(f)
-	t.Logf("effective=%s; quote_group=%d; priced_channels=%d; amount_matches=%t", item.EffectiveMultiplierText, quote, priced, amountOK)
-	if err != nil || !amountOK || quote != 16 || priced != 1 || item.EffectiveMultiplierText != "1.2" ||
-		item.AccountRateSource != groupRateSource || !matchesAccountRate(key.WebsiteGroup, "0.6", groupRateSource, 0) {
-		t.Fatal("peak-on fallback must retain the base rate and apply the peak rate at settlement")
+	var priced bool
+	err = f.db.QueryRowContext(f.ctx, `SELECT upstream_input IS NOT NULL FROM beichen_price_at($1,$2,statement_timestamp())`,
+		f.job.credential, accountRateFixtureModel).Scan(&priced)
+	quote, pricedChannels := reviewCurrentQuote(f)
+	t.Logf("quote_group=%d; priced_channels=%d; priced=%t", quote, pricedChannels, priced)
+	if err != nil || priced || quote != 0 || pricedChannels != 0 || item.BillingState == "current" || item.AccountRate != nil ||
+		item.AccountRateSource != "" || !matchesAccountRate(key.WebsiteGroup, "", "", 0) {
+		t.Fatal("peak-on group must not publish the group default")
 	}
 }
 

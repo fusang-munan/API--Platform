@@ -70,7 +70,8 @@ func TestBeichenProvisionPostgres(t *testing.T) {
 		t.Skip("requires a disposable loopback nebula_test database")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || config.Database != "nebula_test" || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
+	if err != nil || config.Host != "127.0.0.1" || (config.Database != "nebula_test" && config.Database != "nebula_test_rev_b") ||
+		config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal("requires loopback nebula_test with sslmode=disable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)

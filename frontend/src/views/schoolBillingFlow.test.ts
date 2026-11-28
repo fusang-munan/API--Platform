@@ -243,13 +243,13 @@ it('教师在两个入口看到同一份按模型合并的首选报价，可启�
   expect(standard).toEqual([
     '每百万 Token 的积分 · 缓存写入（1 小时） 0 积分（0 元） · 缓存写入（12 小时） 400 积分（4 元）',
     '上下文分档（Token 下限 200000，上限 无上限）',
-    '每百万 Token 的积分 · 输入 800 积分（8 元）',
+    '每百万 Token 的积分 · 输入 800.0000000000000019 积分（8.000000000000000019 元）',
     '推理强度（低）倍率 0.5×',
   ].join('\n'))
   expect(actual).toEqual([
     '每百万 Token 的积分 · 缓存写入（1 小时） 0 积分（0 元） · 缓存写入（12 小时） 25 积分（0.25 元）',
     '上下文分档（Token 下限 200000，上限 无上限）',
-    '每百万 Token 的积分 · 输入 50 积分（0.5 元）',
+    '每百万 Token 的积分 · 输入 50.00000000000000011875 积分（0.5000000000000000011875 元）',
   ].join('\n'))
   await conditions.get('button[aria-label="关闭"]').trigger('click')
   expect(shared.find('details.catalog-evidence').exists()).toBe(true)

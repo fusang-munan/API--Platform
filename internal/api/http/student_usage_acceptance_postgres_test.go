@@ -65,7 +65,7 @@ func newUsageHTTPFixture(t *testing.T) *usageHTTPFixture {
 		t.Skip("requires a disposable local nebula_test database")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || config.Database != "nebula_test" ||
+	if err != nil || config.Host != "127.0.0.1" || (config.Database != "nebula_test" && config.Database != "nebula_test_rev_b") ||
 		config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal("requires a loopback-only nebula_test database with sslmode=disable")
 	}

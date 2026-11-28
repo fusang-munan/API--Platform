@@ -113,3 +113,9 @@ export function formatPriceAmount(value: string | null | undefined, empty = '—
   if (shown === '0' && /[1-9]/.test(value)) return '<0.' + '0'.repeat(digits - 1) + '1'
   return shown
 }
+
+export function formatPriceDetail(value: string | null | undefined, empty = '—'): string {
+  if (value == null) return empty
+  const shown = trimDecimal(value, 512)
+  return shown === '—' ? empty : shown
+}

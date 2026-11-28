@@ -29,7 +29,7 @@ func reportTestSetup(t *testing.T) (context.Context, *sql.DB, *sql.Tx) {
 		t.Skip("需要隔离的本机 nebula_test PostgreSQL")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || config.Database != "nebula_test" ||
+	if err != nil || config.Host != "127.0.0.1" || (config.Database != "nebula_test" && config.Database != "nebula_test_rev_b") ||
 		(config.User != "nebula_qa" && config.User != "nebula_test") || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal("仅允许本机隔离的 nebula_test 数据库、测试用户及 sslmode=disable")
 	}

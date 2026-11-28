@@ -284,7 +284,8 @@ func openIsolatedMigrationSchema(t *testing.T) (context.Context, *sql.DB) {
 	if err != nil {
 		t.Fatal("invalid test PostgreSQL URL")
 	}
-	if config.Host != "127.0.0.1" || config.Database != "nebula_test" || len(config.Fallbacks) != 0 {
+	if config.Host != "127.0.0.1" || (config.Database != "nebula_test" && config.Database != "nebula_test_rev_b") ||
+		len(config.Fallbacks) != 0 {
 		t.Fatal("migration test requires a loopback-only nebula_test database with sslmode=disable")
 	}
 	conn, err := sql.Open(DriverName, dsn)

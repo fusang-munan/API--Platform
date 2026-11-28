@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { creditsToYuan, formatCredits, formatPercent, formatPriceAmount, formatTokens, formatYuan, multiplyDecimal, shiftDecimal, trimDecimal } from './credits'
+import { creditsToYuan, formatCredits, formatPercent, formatPriceAmount, formatPriceDetail, formatTokens, formatYuan, multiplyDecimal, shiftDecimal, trimDecimal } from './credits'
 
 describe('credit display helpers', () => {
   it('trims and groups credit strings', () => {
@@ -40,5 +40,6 @@ describe('credit display helpers', () => {
     expect(formatPriceAmount('0.000000001')).toBe('<0.00000001')
     expect(formatPriceAmount('0.000000000')).toBe('0')
     expect(formatPriceAmount(null, '缺价')).toBe('缺价')
+    expect(formatPriceDetail('23.375000000000000000000011')).toBe('23.375000000000000000000011')
   })
 })

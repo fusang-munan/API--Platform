@@ -1,5 +1,5 @@
 import type { BeichenCatalogModel, BeichenDataset, BeichenModel, BeichenModelIdentity, BeichenOverview, BeichenPreferredRoute, BeichenPriceConditions, BeichenPriceTier, BeichenProtocolCapability, BeichenUsageTotals, BeichenWebsiteKey, BeichenWebsiteKeyInventory } from '../api/types'
-import { formatPriceAmount, formatTokens, shiftDecimal } from './credits'
+import { formatTokens, shiftDecimal } from './credits'
 
 export function isBeichenProvider(baseUrl: string) {
   const address = baseUrl.trim()
@@ -56,7 +56,13 @@ export type PriceDetailView = {
 
 type SchoolTokenPriceBand = {
   label: string
-  rows: Array<Pick<PriceDetailRow, 'key' | 'label' | 'yuan'> & { settlement: string | null; student: string | null }>
+  rows: Array<Pick<PriceDetailRow, 'label' | 'yuan'> & {
+    key: PriceDetailKey | 'cache_write_12h'
+    settlement: string | null
+    student: string | null
+  }>
+  effortLabel: string | null
+  effortMultiplier: string | null
 }
 type SchoolConditionalPrice = {
   base: SchoolTokenPriceBand | null
@@ -683,7 +689,7 @@ export function webPriceDetail(terms: BeichenPriceConditions | null | undefined,
   source: PriceSource, observedAt?: string | null): PriceDetailView {
   return {
     billingModeLabel: billingModeLabel(terms?.billing_mode),
-    rows: displayPriceDetailRows(priceDetailRows(terms, rateText)),
+    rows: priceDetailRows(terms, rateText),
     source,
     sourceLabel: priceSourceLabels[source],
     observedAt: observedAt ?? null,
@@ -708,7 +714,7 @@ export function ratesPriceDetail(rates: PriceRateValues | null | undefined, sour
   observedAt?: string | null, factor = '1'): PriceDetailView {
   return {
     billingModeLabel: '按 Token（已应用倍率）',
-    rows: displayPriceDetailRows(manualPriceDetailRows(rates, factor)),
+    rows: manualPriceDetailRows(rates, factor),
     source,
     sourceLabel: priceSourceLabels[source],
     observedAt: observedAt ?? null,
@@ -727,19 +733,12 @@ function textPriceDetail(text: string | null | undefined, source: PriceSource, o
   factor = '1'): PriceDetailView {
   return {
     billingModeLabel: '按 Token（报价明细）',
-    rows: displayPriceDetailRows(priceDetailRowsFromText(text, factor)),
+    rows: priceDetailRowsFromText(text, factor),
     source,
     sourceLabel: priceSourceLabels[source],
     observedAt: observedAt ?? null,
     observedLabel: formatObservedAt(observedAt) ?? '未记录',
   }
-}
-
-function displayPriceDetailRows(rows: PriceDetailRow[]) {
-  return rows.map(row => ({
-    ...row, yuan: row.yuan == null ? null : formatPriceAmount(row.yuan),
-    credits: row.credits == null ? null : formatPriceAmount(row.credits),
-  }))
 }
 
 export function schoolQuoteDetail(quote: SchoolQuote, student: boolean): PriceDetailView {
@@ -930,11 +929,27 @@ function schoolTokenPriceBand(terms: BeichenPriceTier, rate: string | null, fact
   label: string): SchoolTokenPriceBand | null {
   const base = priceDetailRows(terms)
   if (base[0].yuan == null || base[1].yuan == null) return null
-  const settlement = priceDetailRows(terms, rate)
-  return { label, rows: base.map(({ key, label, yuan }, index) => {
+  const effortMultipliers = (terms as BeichenPriceConditions).reasoning_effort_multipliers
+  const effort = effortMultipliers && Object.keys(effortMultipliers).length
+    ? 'medium' : null
+  const effortValue = effort ? nonNegativeDecimal(effortMultipliers?.[effort]) : null
+  if (effort && !effortValue) return null
+  const settlementRate = rate == null || !effortValue ? rate : scaleDecimal(rate, formatDecimal(effortValue))
+  const settlement = priceDetailRows(terms, settlementRate)
+  const rows: SchoolTokenPriceBand['rows'] = base.map(({ key, label, yuan }, index) => {
     const credits = rate == null ? null : settlement[index].credits
     return { key, label, yuan, settlement: credits, student: studentPriceAmount(credits, factor) }
-  }) }
+  })
+  if (terms.cache_write_12h_price != null) {
+    const twelve = { ...terms, cache_write_price: terms.cache_write_12h_price }
+    const official = priceDetailRows(twelve)[2]
+    const actual = priceDetailRows(twelve, settlementRate)[2]
+    const credits = rate == null ? null : actual.credits
+    rows.push({ key: 'cache_write_12h', label: '缓存写入(12h)', yuan: official.yuan,
+      settlement: credits, student: studentPriceAmount(credits, factor) })
+  }
+  return { label, rows, effortLabel: effort ? '中' : null,
+    effortMultiplier: effortValue ? formatDecimal(effortValue) : null }
 }
 
 function hasTierMultiplier(value: unknown) {
@@ -964,7 +979,13 @@ export function schoolConditionalPrice(terms: BeichenPriceConditions, rate: stri
     const to = max.tokens?.toLocaleString('zh-CN')
     const label = min.tokens === 0n && to ? `基础档 · 输入 Token < ${to}`
       : to ? `${from} ≤ 输入 Token < ${to}` : `输入 Token ≥ ${from}`
-    const band = schoolTokenPriceBand({ ...tier, billing_mode: tier.billing_mode ?? terms.billing_mode }, rate, factor, label)
+    const tierTerms = {
+      ...tier,
+      billing_mode: tier.billing_mode ?? terms.billing_mode,
+      cache_write_12h_price: tier.cache_write_12h_price ?? terms.cache_write_12h_price,
+      reasoning_effort_multipliers: terms.reasoning_effort_multipliers,
+    } as BeichenPriceConditions
+    const band = schoolTokenPriceBand(tierTerms, rate, factor, label)
     return band ? [{ ...band, minTokens: min.label, maxTokens: max.tokens == null ? null : max.label }] : []
   })
   const coversBase = intervals.some(tier => tier.minTokens === '0')

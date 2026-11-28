@@ -63,7 +63,7 @@ func (s *Service) fetchBillingCatalog(ctx context.Context, job syncJob, token, k
 		case err == nil:
 			directory.group.setKeyAccountRate(info)
 			directory.keyBillingSampleAt, directory.at = info.ObservedAt, at
-		case errors.Is(err, errKeyGroupNotAllowed):
+		case errors.Is(err, errKeyGroupNotAllowed), errors.Is(err, errAccountRateConflict):
 			directory.accountRateErr = err
 			return directory, nil
 		case !setGroupAccountRate(&directory.group, identity):
