@@ -230,6 +230,46 @@ func TestModelUsagePostgresRangeAndAttribution(t *testing.T) {
 	}
 }
 
+func TestModelUsageKeyBreakdownUsesRecordedOwnerAndProjectPostgres(t *testing.T) {
+	ctx, tx := reportTestTransaction(t)
+	provider, credential := uuid.New(), uuid.New()
+	execTestSQL(t, ctx, tx, "INSERT INTO providers VALUES($1,$2)", provider, origin)
+	execTestSQL(t, ctx, tx, "INSERT INTO provider_credentials VALUES($1,$2,'测试渠道','2026-10-01 00:00+08')", credential, provider)
+	projectA, projectB, student, other := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	keyA, keyB, keyC := uuid.New(), uuid.New(), uuid.New()
+	call := reportCallFixture{provider: provider, credential: credential, model: "shared-model",
+		protocol: "anthropic", state: "charged", usage: "reported", multiplier: "1",
+		sent: "2026-11-20T00:00:00+08:00", prompt: 10, output: 2, read: 0, write: 0}
+	type slice struct{ project, student, key uuid.UUID }
+	charges := map[slice]string{
+		{projectA, student, keyA}: "1.25",
+		{projectA, student, keyB}: "2.5",
+		{projectB, student, keyC}: "4.75",
+		// A historical row can carry a different recorded student or project
+		// even though the Key ID is shared.
+		{projectB, other, keyA}: "10",
+	}
+	for owner, charge := range charges {
+		call.project, call.user, call.key, call.credits = owner.project, owner.student, owner.key, charge
+		insertReportCall(t, ctx, tx, call)
+	}
+	period, _ := reportPeriod("month", time.Date(2026, 11, 20, 4, 0, 0, 0, beijing))
+	report, err := readModelUsage(ctx, tx, &provider, period)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Keys) != len(charges) || len(report.Models) != 1 || report.Models[0].Credits != "18.5" {
+		t.Fatalf("unexpected Key or model count: %+v", report)
+	}
+	for _, key := range report.Keys {
+		want := charges[slice{key.ProjectID, key.UserID, key.APIKeyID}]
+		if key.Credits != want || key.Calls != 1 || len(key.Models) != 1 ||
+			key.Models[0].Model != call.model || key.Models[0].Credits != want || key.Models[0].Calls != 1 {
+			t.Fatalf("Key model breakdown crossed recorded ownership: %+v, want %s", key, want)
+		}
+	}
+}
+
 func TestModelUsageLegacySettlementPostgres(t *testing.T) {
 	ctx, tx := reportTestTransaction(t)
 	provider, credential := uuid.New(), uuid.New()

@@ -2,6 +2,8 @@
 
 ## 1. 文档范围
 
+迁移按文件名顺序登记在 `schema_migrations`。0.28.6 基线的文件编号在 `0035` 和 `0037` 之间有历史空档。0.29.0 在 `0071` 后新增 `0072_beichen_channel_identity.sql`。
+
 学生北辰逐笔回执通过迁移 0038 新增的 `gateway_calls (user_id, request_id)` 索引定位。查询同时核对调用用户和 API Key 所有者，在本人范围最多读取两个候选，同编号有歧义时返回 404。精确扣分来自 `gateway_calls.beichen_credit_exact`，上游实扣和应用标记取关联的 `beichen_call_receipts`。查询只读。
 
 迁移 0039 在每笔北辰请求上保存发出时的学校系数、基础积分和计价依据，旧调用沿用原规则。上游流水保存原始实扣。学生月度额度和实际用量分别记录，教师直接分配的个人额度优先于后续 Key 审批的默认值。
@@ -370,7 +372,7 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 教师待核回放在 PostgreSQL 可重复读的只读事务中读取指定供应商的全部 pending_review 调用，按 created_at、id 升序分页。缺少 beichen_price_at 的调用列为 unknown，保留原预留。SHA-256 覆盖供应商、offset、有效 limit、全部有序调用 ID、本批逐笔报价和分类。确认时先重算令牌，再对本批调用逐笔开启事务，先锁学生再锁调用，重验报价并扣除其他待核预留计算可用额度。状态或报价变化的行跳过。已结算行清零预留，调用、月度桶和轮次在同一事务提交。不可扣款但能计算上界的行按上界覆盖原预留，并截到学生剩余额度；没有可靠上界的行保留原预留，完成后重新统计该供应商全部待核行。
 
-试算以 `max_yuan × 100 × COALESCE(beichen_school_multiplier, 2)` 为学生积分上界。派发报价已含北辰分组倍率。自动定价候选超过上界 `1e-9` 积分以上则待核，容差内最多扣到上界，月桶按实际学生扣款更新。已有教师价和唯一金额路径保持业务优先级，包括 `estimated_unique_amount`。Gemini 仍待核，不自动结算。
+试算以 `max_yuan × 100 × COALESCE(beichen_school_multiplier, 2)` 为学生积分上界。派发报价已含北辰分组倍率。自动定价候选超过上界 `1e-9` 积分以上则待核，容差内最多扣到上界，月桶按实际学生扣款更新。已有教师价和唯一金额路径保持业务优先级，包括 `estimated_unique_amount`。Gemini 原生文本按可确认的分项和派发时的有效报价结算。缺失的缓存写入保留为空，回执可用于差额核对或补记仍待核的调用。
 
 结束事务先锁学生行，再锁调用行，单独查询同学生其他待核行之和，得到剩余额度。默认预留、重放和上界预留均截到剩余额度，额度用完只挂待核状态、预留 0。已知上界先向上取整并限制在 1 至 1000 整积分。`NEBULA_UNRESOLVED_EXPOSURE=0` 将准入回退到旧的每学生待核笔数限制（默认 20），同时停用分项试算。仅 `NEBULA_PENDING_AUTO_SETTLE=0` 时保留新金额准入和上界预留。两种切换均只作用于之后的处理。
 
@@ -406,9 +408,9 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 型号和分组列表完整时，每个渠道下的平台独立确认缺席或缩水。连续三轮一致后采用本轮结果，已经确认下线的平台退出快照，仍待核验的平台保留上次数据。报价格式错误通过 `failures` 单独记录。若对应型号与分组仍存在，可以沿用它的历史报价。目录存在部分失败时保留上次 `last_success`。
 
-北辰定时账单扫描、定向目录重扫及 `providercatalog` 共用每把 Key 的 `beichen_datasets.kind='billing'` 90 秒租约。应用将租约 UUID 作为轮次编号，写入前在事务中校验租约和凭据版本。`kind='catalog'` 的 `last_success` 只随接受的目录前进。`maintenance_state` 的 `beichen_catalog_shrink/<credential_uuid>` 记录待核验清单的版本、型号集合指纹和一致次数，完整接受或读取失败后清除。`kind='billing'` 的 `website_group_observation.key_billing_missing_fields` 可记录 Key 账单原始响应缺少的字段。独立官网证据继续决定该 Key 的归属是否可核实。
+北辰定时账单扫描、定向目录重扫及 `providercatalog` 共用每把 Key 的 `beichen_datasets.kind='billing'` 90 秒租约。应用在写入事务中校验租约和凭据版本。`kind='catalog'` 的 `last_success` 只随采纳的目录结果前进。新读到的型号立即写入。每个缺席型号在同一凭据版本的三次完整扫描中都缺席后，目录行才标记为停用。进度按型号保存在 `maintenance_state` 的 `beichen_catalog_shrink/<credential_uuid>`，部分扫描和读取失败保留此前已核实的次数。限流时写入 `next_attempt` 供目录任务共同退避。`kind='billing'` 的 `website_group_observation.key_billing_missing_fields` 可记录 Key 账单原始响应缺少的字段。
 
-目录扫描收到明确的 `GROUP_NOT_ALLOWED` 时，在原扫描事务中写入 `maintenance_state` 的 `beichen_group_denial/<credential_uuid>`。其 `last_error` 保存 JSON 字段 `code` 和 `credential_revision`，`updated_at` 为数据库记录拒绝的时间。只采用版本与 `provider_credentials.updated_at` 一致的记录。普通 HTTP 403 和暂时失败沿用已有的拒绝证据。成功读到模型清单时，在同一事务清除目录扫描的拒绝记录。清单缩水待核验时仍保存上次目录和 `last_success`，并记录本轮确认进度。
+明确的 `GROUP_NOT_ALLOWED` 写入 `maintenance_state` 的 `beichen_group_denial/<credential_uuid>`，按当前凭据版本和已知分组使用。其 JSON 保存 `credential_revision`、`group_id` 及目录拒绝标记，探活拒绝按协议和模型写入 `probe_routes`。成功读取目录清除目录标记，对应线路的核验单独清除自身标记。普通 HTTP 401/403 的目录鉴权失败按凭据版本保存在 `beichen_catalog_auth/<credential_uuid>`，成功扫描后清除。
 
 教师覆盖、绑定重建和学生模型状态共用 Key 版本、分组变化时间、分组权限及目录采集时间校验。历史导入的 Key 条目可提供单模型的列出证据。判断型号缺席和重建绑定需要 `kind='catalog'` 有本凭据及当前分组的完整成功快照。目录、计费和 Key 核对在保存证据前取得按供应商划分的共享咨询事务锁，重建确认尝试取得同一把锁的排他模式。事务提交或回滚时自动释放锁。重建确认还持有供应商行锁，与别名、官网 Key 清单和凭据写入互斥。确认事务在提交前用新语句重读已提交的证据，出现锁冲突或证据变化时回滚本次全部绑定变更并返回 409。
 
@@ -427,6 +429,8 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 旧的学校本机授权由服务器随机生成。数据库仅保存 `local_grant_hash`、`local_granted_by` 和 `local_granted_at`。每个供应商保留一份授权，替换或清除网页登录配置会删除它。访问 Token 自动续期时保留授权。本机窗口保存的会话以系统用户目录下的加密文件持久化，由本机爬虫读取。
 
 迁移 `0055_beichen_website_keys.sql` 中的 `beichen_website_key_sync` 按供应商保存最近成功时间、同步状态和租约。`beichen_website_keys` 按供应商和北辰 Key ID 保存名称、最多 10 字符的前缀、官网分组 ID 和名称、精确分组倍率、上游状态及创建时间。唯一匹配的行关联 `provider_credentials.id` 和学校凭据密文的 SHA-256 摘要。密文轮换后，旧的匹配在读取时失效。同一事务替换完整清单、更新同步时间并写入变化的分组倍率版本。失败更新保留已有清单和最近成功时间，并在 `maintenance_state` 的 `beichen_key_inventory/<provider_uuid>` 记录失败原因或身份冲突。
+
+迁移 `0072_beichen_channel_identity.sql` 给 `beichen_provision_channels` 增加 `registration_provider_id` 与渠道联合唯一约束。状态和成员关系的触发器为每个供应商下的渠道选出当前登记凭据。`beichen_credential_retirements` 记录由 0065 退役证据确认的 Gemini 原凭据，用于原地恢复。`beichen_cleared_panel_keys` 保存迁移中因重复归属而清除的冲突映射。后续官网 Key 编号在同一供应商内按事务锁独占登记，已保存的调用归属和回执版本继续按原记录读取。
 
 多页清单以两次完整遍历结果为准，按 Key 编号核对集合、分组、状态与其他已读字段。任一遍历的分页校验失败且未在重读后恢复，或两次完整结果不一致时，记录 `unavailable` 和诊断，沿用上次已保存的清单和 `last_seen`。
 

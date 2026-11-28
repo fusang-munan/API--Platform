@@ -204,6 +204,15 @@ Vercel 项目必须将 Root Directory 设置为 `frontend`。前端部署完成�
 
 ### 北辰接入验收
 
+0.29.0 渠道回归需设置 `NEBULA_CHANNEL_TEST_POSTGRES`，指向隔离的本机 `nebula_test_*` 数据库。迁移包验证 0071 升到 0072 后的独立渠道登记、旧 Gemini 恢复和官网 Key 归属。从仓库根目录运行以下命令，使用 Go 的测试覆盖文件载入官网身份核对用例。
+
+```powershell
+go test -p 1 -overlay internal/infrastructure/db/migrations/testdata/beichen_channel_tests.overlay.json ./internal/beichen ./internal/infrastructure/db/migrations -run 'TestBeichen(Channel|TeacherPanel|IndependentChannel|Restores|UpgradeChain)' -count=1
+go test ./internal/dataplane ./internal/usage -run 'TestBeichenGemini' -count=1
+```
+
+若教师登记或更换 Key 被拒绝，先检查可信 HTTPS 入口，再核对该渠道是否已有活动登记，以及官网 Key 是否已经归属另一渠道。若 Gemini 有原生目录或探活证据却仍只有兼容线路，检查教师是否完成显式绑定；定时扫描只更新候选和线路状态。
+
 1. 在隔离的本机 PostgreSQL 测试库运行 `go test ./...`。设置 `NEBULA_TEST_POSTGRES` 指向回环地址上的 `nebula_test` 后，可验证报价快照、小数精度、重复流水、延迟结算及并发超额。前端运行 `npm run typecheck`、`npm run test` 和 `npm run build`。
 2. 从已核实的学校 HTTPS 入口核对镜像版本与收件公钥。教师页应直接显示同一模型的首选倍率和启用状态。目录有模型但暂缺倍率时要显示待同步。核对价格时查看同一把北辰 Key 的分组、基础输入输出价、缓存价格、倍率和适用时段。
 3. 校方准备好真实验收后，使用同一把学生 Key，四条渠道各发一笔短文本请求。依次记录学生可用额、学校请求编号、上游响应编号，以及北辰官网使用明细的数字 Key ID、模型、用量和实扣。收到响应但账单尚未出现时保留待核，继续读取相同编号。
@@ -325,7 +334,7 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 #### 重建预览过期或绑定 Key 无分组权限
 
 - 换组后确认旧预览应返回 409，并提示重新预览。对照教师概览的 `bound_catalog_pending`、`ready_count` 与新预览的 `evidence_versions`。同步持有事务锁时确认同样返回 409。测试使用数据库触发器，在确认已读取分组证据、即将插入 Responses 绑定时暂停，由另一连接提交从分组 10 到 12 的变化。恢复确认后应返回冲突，数据库中的 Responses 绑定数量应为 0。
-- 重扫明确返回 `GROUP_NOT_ALLOWED` 时，核对 `bound_routes[].group_status=not_allowed`、`binding_issue.code=group_not_allowed` 和教师行的恢复权限提示。在北辰恢复该 Key 的分组权限，再重扫。若成功读取的型号从 4 个减少到 2 个，分组拒绝应立即清除，目录显示待复核并保留原清单和 `last_success`。若仅 GM1 备用线路换组，仍就绪的 G3 继续显示可用及报价。两把 Key 都已绑定时，预期 Key 覆盖为 `1/2`。
+- 重扫明确返回 `GROUP_NOT_ALLOWED` 时，核对 `bound_routes[].group_status=not_allowed`、`binding_issue.code=group_not_allowed` 和教师行的恢复权限提示。恢复该 Key 的权限后重扫。成功扫描会清除目录拒绝，新读到的型号立即入库。旧型号在三轮完整扫描中都缺席才失去目录证据。若仅 GM1 备用线路换组，仍就绪的 G3 继续显示可用及报价。两把 Key 都已绑定时，预期 Key 覆盖为 `1/2`。
 - 在隔离测试库运行 `go test ./internal/beichen ./internal/dataplane -run 'Test(RebindRejectsGroupVersionChange|KeyCatalogGroupDenialRecovery|CatalogQualityAliasCRUDAndRebind|BeichenTeacherCoverage|StudentKeyModelAuthorization)Postgres' -count=1`，并在 `frontend` 运行 `npm test -- BeichenSchoolModels`。日志回归检查成功事件的操作人、供应商和变更数量，以及预览令牌和变更明细是否已移除。
 
 #### 核对一把 Key 的实际用量和分组
@@ -426,6 +435,8 @@ go test ./...
 ### 学生模型目录搜索
 
 运行 `go test ./internal/api/http -run 'TestStudentCatalog(Batch|Bounds)HTTPPostgres' -count=1 -v`。测试记录 PostgreSQL 实际执行的 SQL，比较 1 个匹配和 23 个匹配的第二页，检查排序、候选总数、绑定优先级、协议和探活证据。搜索被拒绝时，检查 `q` 的 128 字符上限、`page` 的 1 至 10000 范围、`page_size` 的 1 至 50 范围及 URL 编码。
+
+状态计数异常时，核对无搜索词的第一页返回的 `directory.models` 和本人 Key 授权。目录列表与统计都以 `addable` 为准。北辰 Key 下的型号明细按调用记录中的项目、学生和 Key 归属聚合。运行 `go test ./internal/beichen -run TestModelUsageKeyBreakdownUsesRecordedOwnerAndProjectPostgres -count=1` 核对同一 Key 的历史归属。
 
 ### 教师学生用量
 
@@ -538,7 +549,7 @@ ORDER BY j.channel;
 | 北辰返回 429 `unresolved_exposure_limit` | 同一学生待核预留加本笔默认预留达到上限 | 核对跨项目和 Key 的待核金额 | 按学生 ID 执行 `SELECT count(*), coalesce(sum(unresolved_credit_milli),0) FROM gateway_calls WHERE user_id=$1 AND beichen_state='pending_review'`；同一学生非北辰路由仍可受理 |
 | 网关返回 429 `student_concurrency_exceeded` | 同一学生派发中的调用已达上限，所有 Key 和项目共用名额 | 等已有调用结束后重试；直接运行或本地 Compose 可设置 `NEBULA_STUDENT_CONCURRENCY_LIMIT` 覆盖默认 5，生产 Compose 显式指定 5 | 设置本机测试库 `NEBULA_TEST_POSTGRES`，运行 `go test -p 1 ./internal/usage ./internal/dataplane -run 'TestGatewayQuotaPostgres\|TestStudentConcurrencyHTTPPostgres' -count=5`，核对第六笔被拒且未计费 |
 | 回退后返回 429 `pending_review_limit` | `NEBULA_UNRESOLVED_EXPOSURE=0`，待核笔数达到旧上限 | 核对待核行数，默认上限为 20 | 只想关闭推荐分项扣款时，保留额度开关默认值，设置 `NEBULA_PENDING_AUTO_SETTLE=0` |
-| 北辰响应成功但缓存明细缺失，仍显示待核 | 区间过宽、上界未知、定价超过上界容差，或为 Gemini 原生响应 | 用调用 ID 查询 `beichen_review_reason`、`unresolved_credit_milli`、`pricing_detail`，核对派发时费率及开关 | 设置本机测试库 `NEBULA_TEST_POSTGRES`，运行 `go test -p 1 ./internal/dataplane -run TestBeichenPending -count=1 -v`，覆盖并发封顶、倍率、模型身份、开关、教师价与上界 |
+| 北辰响应成功但缓存明细缺失，仍显示待核 | 区间过宽、上界未知、定价超过上界容差，或未获得可信终态用量 | 用调用 ID 查询 `beichen_review_reason`、`unresolved_credit_milli`、`pricing_detail`，核对派发时费率及终态用量 | 设置本机测试库 `NEBULA_TEST_POSTGRES`，运行 `go test -p 1 ./internal/dataplane -run 'TestBeichenPending\|TestBeichenGemini' -count=1 -v` |
 | 网关返回 model unavailable | 模型、binding 或 provider 被停用 | 老师启用完整路由链或添加 binding | 按 model -> binding -> provider 顺序排查状态和 priority |
 | 上游 429/5xx 后没有切换 | 没有下一个 ACTIVE binding，或流已经开始写出 | 添加低优先级候选；流开始后只能返回当前错误 | 查看候选排序、adapter、priority 和首字节是否已发送 |
 | multipart 请求失败 | Content-Type boundary 丢失、文件过大或客户端重复读取 body | 保留原始 Content-Type，调整允许大小 | 检查请求大小和 boundary；不要把文件内容写入日志 |

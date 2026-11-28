@@ -263,6 +263,8 @@ data: {"revision":"01K2..."}
 
 目录搜索的 `q` 可省略，最多接收 128 个 Unicode 字符。查询去除首尾空白并忽略大小写，在模型标识、显示名称和描述中做子串匹配。`page` 取 1 至 10000，缺省 1。`page_size` 取 1 至 50，缺省 20。超限、非法编码和非整数分页返回 `400 VALIDATION_ERROR`。响应的 `data` 包含 `items`、`total`、`page` 与 `page_size`，按模型标识排序。有效页码超出结果时返回空 `items` 和实际匹配总数。
 
+无搜索词的第一页还返回 `data.directory.models`，提供完整学校目录供状态统计。每行含 `with_grant`、`without_grant` 与 `addable`，由客户端按当前 Key 的本人授权计算展示状态。搜索项的 `raw_entry.addable` 使用同一资格规则。线路可用、近期降级仍可尝试或尚待验证时可新增授权，其他状态按已有授权显示原因。
+
 提交申请：
 
 ```json
@@ -460,7 +462,9 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `credential` 只作为写入字段；服务端加密后保存，所有读取响应只返回 `credential_configured: true/false`。
 
-北辰接口限老师访问，凭据必须属于指定的北辰供应商。更换北辰 Key 时新增一条凭据并重新绑定，以保留原 Key 的账单归属。手动同步接受空请求体或 `{}`。概览中的 `datasets`、`models`、`comparison` 分别提供同步状态、报价和当日对账。`models[].catalog_source` 返回该目录行的来源（`key` 或 `website`）。成本的 `_micros` 字段以百万分之一北辰余额单位表示。`trial_credits` 和 `charged_credits` 用十进制字符串分别返回试算与实际结算积分，`pending_review_calls` 给出待核账笔数。未知值为 `null`，可确认的零单独返回。原有 `trial_credit_milli` 保留千分之一积分精度。
+北辰接口限老师访问，凭据必须属于指定的北辰供应商。教师通过 `POST /api/v1/teacher/providers/{provider_id}/credentials` 新增凭据时，可提交 `channel` 登记独立的 `CC1`、`G3`、`GM1` 或 `Gemini` 渠道，或提交 `replaces_credential_id` 接替原渠道，两字段互斥。属于退役记录的 Gemini 凭据可通过 `PATCH .../credentials/{credential_id}` 一并提交新 `credential` 和 `status:"active"` 原地恢复。创建凭据及携带新 Key 的更新需要可信 HTTPS，请求响应设置 `Cache-Control: no-store`。有凭据的北辰供应商保留北辰接口地址。
+
+手动同步接受空请求体或 `{}`。概览中的 `datasets`、`models`、`comparison` 分别提供同步状态、报价和当日对账。`models[].catalog_source` 返回该目录行的来源（`key` 或 `website`）。成本的 `_micros` 字段以百万分之一北辰余额单位表示。`trial_credits` 和 `charged_credits` 用十进制字符串分别返回试算与实际结算积分，`pending_review_calls` 给出待核账笔数。未知值为 `null`，可确认的零单独返回。原有 `trial_credit_milli` 保留千分之一积分精度。
 
 `credentials[].health` 包含 `credential`、`catalog`、`pricing`、`probe` 四个维度，各返回 `state`（`available`、`unavailable` 或 `pending`）和说明 `message`。`available_dimensions` 统计可用项。报价维度按当前可计算报价数判断。探活维度按有至少一种协议通过的模型占可探活模型的比例判断。
 
@@ -472,7 +476,9 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 对 `/beichen/rebind` 发送 `{"preview":true}` 生成预览。返回的 `evidence_versions` 按 Key 排序，包含 `credential_id`、`credential_revision`、`group_id`、`catalog_observed_at` 和 `evidence_since`。`preview_token` 同时绑定这些版本和 `changes`。发送 `{"preview":false,"preview_token":"…"}` 确认。确认时遇到同步锁冲突、目录过期、权限失效或证据及计划变化，返回 `409 INVALID_STATE_TRANSITION` 并回滚全部绑定变更。教师需重新预览。成功日志记录操作人、供应商与变更数量。
 
-`/v1/models` 明确返回 `GROUP_NOT_ALLOWED` 后，当前凭据版本在 `bound_routes` 和能力记录中返回 `group_status=not_allowed` 和 `catalog_state=group_blocked`。这把 Key 的线路退出推荐及报价覆盖。如果已发布模型没有就绪线路，明确的分组拒绝通过 `binding_issue.code=group_not_allowed` 返回，`action_hint` 提示恢复该 Key 的分组权限后重扫。成功读到模型清单就会清除目录扫描的拒绝状态。若清单缩水待核验，教师概览仍会显示目录待复核。
+指定恢复线路时，在预览请求的 `preview_token` 传入 `restore/<school_model_id>/<credential_id>`。服务端仅检查这个校内模型和接替凭据，确认时提交服务端返回的完整令牌。定时扫描更新候选及线路证据。北辰 `POST .../reset-catalog` 返回 `409 INVALID_STATE_TRANSITION`，教师可通过启用或重绑调整线路。
+
+`/v1/models` 明确返回 `GROUP_NOT_ALLOWED` 后，当前凭据和分组在 `bound_routes` 和能力记录中返回 `group_status=not_allowed` 和 `catalog_state=group_blocked`。这把 Key 的线路退出推荐及报价覆盖。已发布模型没有就绪线路时，`binding_issue.code=group_not_allowed` 和 `action_hint` 会提示恢复权限后重扫。一次成功扫描会清除目录接口对当前分组的拒绝。模型探活的拒绝证据按该 Key、型号和协议分别保存，经对应线路复查后清除。
 
 `GET .../beichen/capabilities` 按 Key 和原始上游型号返回 `bindings`、`supported_protocols`、`available_protocols`、`responses_ready`、`recommended_protocol`、`availability` 和报价字段。`responses_ready` 表示存在当前已发布的 Responses 绑定。只有通过当轮探活的协议出现在 `available_protocols`。教师 `/api/v1/teacher/models` 的北辰线路复用同一协议判定。概览的 `route_availability` 汇总已发布线路，缺少当前绑定或探活证据时显示待核实。探活和报价都核对当前凭据版本及已知换组时间。陈旧目录保留供核对，`price_covered` 为 `false`，等待符合当前证据的探活。
 
@@ -575,7 +581,7 @@ Key 证据不足时，只有标准余额计费、分组默认倍率有效且高�
 
 这两个接口仅允许教师访问，使用控制面响应 envelope。不存在或非北辰的 `provider_id` 返回 `404 RESOURCE_NOT_FOUND`；未登录为 401，非教师为 403。JSON 未知字段、模型名无效、数组长度或价格格式错误返回 `400 VALIDATION_ERROR`，数据库不可用返回 503。
 
-`POST .../beichen/models/enable-batch` 请求为 `{"models":["model-a","model-b"]}`，每批 1 至 200 个模型，名称不超过 256 字符，重复名称忽略大小写去重。响应 `data` 为：
+`POST .../beichen/models/enable-batch` 接收 `models` 数组，每批 1 至 200 个模型。每项可传校内模型 UUID（`school_model_id`）或最长 256 字符的上游名称。教师页优先提交 UUID，旧客户端可提交唯一的上游名称。响应的 `model` 使用请求项，成功的 `model_id` 是校内 UUID。
 
 ```json
 {
@@ -626,6 +632,8 @@ Key 证据不足时，只有标准余额计费、分组默认倍率有效且高�
 | `models[]` | 型号身份与用量字段，按 `model`、`model_key` 排序 |
 | `students[]` | `user_id`、`user_name`、`project_id`、`project_name` 与用量字段；同一账号在不同项目分行，`models[]` 给出各模型积分、Token 和调用数 |
 | `keys[]` | `api_key_id`、`api_key_name`、`user_id`、`user_name`、`project_id`、`project_name` 与用量字段，另含该 Key 的 `models[]` |
+
+每行的 Key 用量和型号明细使用相同的项目、学生和 Key 归属。历史记录中的同一 Key 若关联不同学生或项目，会按记录分别返回。
 
 同一派发区间内，各层按查询时的状态统计以下指标。
 
@@ -805,7 +813,9 @@ Key 证据不足时，只有标准余额计费、分组默认倍率有效且高�
 
 笔数、额度和并发数接受正整数，缺省或无效时使用默认值。按默认值，已有 98 笔各 10 积分时，第 99 笔可发出。已有 99 笔各 10 积分时，下一笔北辰请求正好触顶，须等部分记录完成核账后再试。
 
-`NEBULA_PENDING_AUTO_SETTLE` 默认 `1`，单独设为 `0` 仍计算待核预留并执行金额准入，仅关闭推荐分项自动扣款。支持的纯文本协议为 OpenAI Chat、Responses 和 Anthropic Messages。Gemini 原生响应缺少缓存写入明细，仍待核，不自动结算。`NEBULA_PENDING_AUTO_SETTLE_YUAN`（默认 `0.001` 上游元）和 `NEBULA_PENDING_AUTO_SETTLE_RELATIVE`（默认 `0.01`，即 1%）可设为非负有限数，无效值使用默认值。区间宽度满足任一阈值或金额唯一时，按推荐分项交给原定价流程。成功后 `pricing_detail.auto_settled=true`，另存上下界、推荐金额、历史比例和策略版本。
+`NEBULA_PENDING_AUTO_SETTLE` 默认 `1`，单独设为 `0` 仍计算待核预留并执行金额准入，仅关闭推荐分项自动扣款。推荐分项适用于 OpenAI Chat、Responses 和 Anthropic Messages。`NEBULA_PENDING_AUTO_SETTLE_YUAN`（默认 `0.001` 上游元）和 `NEBULA_PENDING_AUTO_SETTLE_RELATIVE`（默认 `0.01`，即 1%）可设为非负有限数，无效值使用默认值。区间宽度满足任一阈值或金额唯一时，按推荐分项交给原定价流程。成功后 `pricing_detail.auto_settled=true`，另存上下界、推荐金额、历史比例和策略版本。
+
+Gemini 原生 `generateContent` 和 `streamGenerateContent` 的纯文本调用在终态用量、型号及报价可核对时按已确认的输入、输出和缓存读取计价。工具提示和思考 Token 分别计入输入和输出。缺少缓存写入回报时保留缺项供回执核对。未取得可信终态、媒体请求或有效单价缺失的调用进入待核。
 
 `MaxYuan` 已含北辰分组倍率。学生上界为 `MaxYuan × 100 × 学校倍率`，缺学校倍率按 2 换算。同一基础报价 0.250012 元，学校倍率 1.10，分组倍率 1、2 分别预留 28、56 整积分。已知上界向上取整并限制在 1 至 1000，首次未知上界取默认预留，两者均以学生剩余额度为限（可为 0）。候选扣款低于或等于未取整上界时按原值扣款。高出不超过 `0.000000001` 积分时只扣到上界，高出更多则继续待核。原有教师定价能确定唯一金额时优先入账，例如 `estimated_unique_amount` 的 0.03602500007040 积分沿用教师价。
 
