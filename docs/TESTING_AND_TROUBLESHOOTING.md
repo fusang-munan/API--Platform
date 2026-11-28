@@ -376,6 +376,8 @@ Group 16 的渠道目录缺少正式价时，查看模型页是否标记「反�
 
 已发布模型再次启用返回 400 或批量 `route_not_ready`、提示「原绑定线路尚未就绪」，而不是 `already_active` 时，查该绑定 Key 的 `beichen_datasets`（`kind='catalog'` 的 `last_success` 是否超过 30 分钟或存在 `last_error`）以及 `provider_model_catalog.catalog_source`。Key 证据过期且没有当前网站目录条目支撑的线路不再算已启用；`catalog_source='website'` 的已发布旧绑定仍返回 `already_active`，直到第一次 Key 同步替换证据。名称与 UUID 两种查询共用同一加载路径。运行 `go test ./internal/beichen -run '^(TestEnableRequiresCurrentKeyCatalogPostgres|TestEnableWebsiteOnlyPublishedRouteIsAlreadyActivePostgres)$' -count=1 -v`，用例覆盖按名称和 UUID 重复启用都返回 `already_active`、不写绑定和审计，以及 Key 证据过期仍阻断。
 
+网站目录豁免还要求该型号当前没有任何 Key 目录可接替。存在可接替的当前 Key 时，名称查询只报 `route_not_ready` / `no_candidate` 且不占批量去重位，随后同一校内 UUID 按 Key 候选修复两条绑定并保留原 ID 与优先级；运行 `go test ./internal/beichen -run '^TestEnableModelsBatchRepairsRepairableWebsiteRoutePostgres$' -count=1 -v` 核对。
+
 教师概览的同上游型号必须按校内模型分别显示。设置隔离的本机 `NEBULA_TEST_POSTGRES` 后运行 `go test -p 1 ./internal/beichen -run TestBeichenTeacherCoveragePostgres -count=1 -v`。用例构造 8 个目录行，断言每行都有非空且唯一的 `school_model_id`；其中同一上游名绑定两个校内模型时返回两行，两个 UUID 不同，专属 `preferred_routes` 不混入另一校内模型。两行都必须得到官网和 Key 目录证据，状态均为 `key_listed` 而不是 `published_unavailable`；各自只保留 CC1 或 G3 的 `catalog_keys` 和 `credential_ids`，不再出现两行共享全部 Key 的宽范围结果。其余 6 个现行型号的计数、价格、Key 覆盖和分组继续由同一用例核对。
 
 在 `frontend` 下运行 `npm test -- BeichenSchoolModels BeichenModelUsageDrawer`。现有用例核对目录按 `school_model_id` 精确取用同名上游的校内费用，也核对旧响应缺少该字段时使用校内名称和唯一线路回退，无法唯一确认时显示待确认。字段是新增的可空属性，旧接口响应仍可消费。
