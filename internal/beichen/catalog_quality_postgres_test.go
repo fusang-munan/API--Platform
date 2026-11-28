@@ -326,6 +326,37 @@ VALUES ($1,$4,$6,$7,'same-upstream','openai_responses','inactive',17,now(),now()
 	if _, err := s.Rebind(ctx, provider, actor, true, (bindingRestore{school, uuid.New()}).tokenPrefix()); domain.ErrorCode(err) != domain.CodeInvalidTransition {
 		t.Fatalf("confirmation scope accepted a Key outside this provider: %v", err)
 	}
+	checkBlockedPreview := func() {
+		t.Helper()
+		if _, err := s.Rebind(ctx, provider, actor, true, selector); domain.ErrorCode(err) != domain.CodeInvalidTransition || !before() {
+			t.Fatalf("blocked replacement was offered by a new preview: %v", err)
+		}
+		if _, err := s.Rebind(ctx, provider, actor, false, preview.PreviewToken); domain.ErrorCode(err) != domain.CodeInvalidTransition || !before() {
+			t.Fatalf("old confirmation activated a blocked replacement: %v", err)
+		}
+	}
+	for _, status := range []int{401, 403} {
+		exec(`INSERT INTO upstream_probes(provider_id,credential_id,model,protocol,status_code,error_code,duration_ms,checked_at)
+VALUES($1,$2,'same-upstream','openai_responses',$3,'http_error',1,clock_timestamp())
+ON CONFLICT(provider_id,credential_id,model,protocol) DO UPDATE
+SET status_code=excluded.status_code,checked_at=excluded.checked_at`, provider, keys[1], status)
+		checkBlockedPreview()
+	}
+	exec(`UPDATE upstream_probes SET status_code=200,error_code=NULL,checked_at=clock_timestamp(),last_passed_at=clock_timestamp()
+WHERE provider_id=$1 AND credential_id=$2`, provider, keys[1])
+	exec(`INSERT INTO maintenance_state(id,name,last_error,created_at,updated_at)
+SELECT gen_random_uuid(),'beichen_catalog_auth/'||id::text,jsonb_build_object('credential_revision',updated_at)::text,
+       clock_timestamp(),clock_timestamp() FROM provider_credentials WHERE id=$1`, keys[1])
+	checkBlockedPreview()
+	exec("DELETE FROM maintenance_state WHERE name='beichen_catalog_auth/'||$1::uuid::text", keys[1])
+	oldToken := preview.PreviewToken
+	preview, err = s.Rebind(ctx, provider, actor, true, selector)
+	if err != nil || len(preview.Changes) != 1 || preview.PreviewToken == oldToken {
+		t.Fatalf("healthy replacement was not offered: %+v %v", preview, err)
+	}
+	if _, err := s.Rebind(ctx, provider, actor, false, oldToken); domain.ErrorCode(err) != domain.CodeInvalidTransition || !before() {
+		t.Fatalf("reauthenticated replacement accepted a superseded preview: %v", err)
+	}
 	result, err := s.Rebind(ctx, provider, actor, false, preview.PreviewToken)
 	if err != nil || result.Preview || !reflect.DeepEqual(result.Changes, preview.Changes) {
 		t.Fatalf("restoration changed the approved plan: %+v %v", result, err)

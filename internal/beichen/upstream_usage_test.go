@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	dbstore "github.com/starprince1234/Nebula-api/internal/infrastructure/db"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 )
 
 func TestChannelMatchEvidence(t *testing.T) {
@@ -99,7 +100,7 @@ func TestUpstreamUsageWithoutSchoolCallsPostgres(t *testing.T) {
 		t.Skip("requires a disposable loopback nebula_test database")
 	}
 	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil || cfg.Host != "127.0.0.1" || !isIsolatedTestDatabase(cfg.Database) || cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
+	if err != nil || cfg.Host != "127.0.0.1" || !testutil.IsIsolatedPostgresDatabase(cfg.Database) || cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
 		t.Fatal("requires loopback nebula_test with sslmode=disable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

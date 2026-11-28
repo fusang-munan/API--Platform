@@ -462,7 +462,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 `credential` 只作为写入字段；服务端加密后保存，所有读取响应只返回 `credential_configured: true/false`。
 
-北辰接口限老师访问，凭据必须属于指定的北辰供应商。教师通过 `POST /api/v1/teacher/providers/{provider_id}/credentials` 新增凭据时，可提交 `channel` 登记独立的 `CC1`、`G3`、`GM1` 或 `Gemini` 渠道，或提交 `replaces_credential_id` 接替原渠道，两字段互斥。属于退役记录的 Gemini 凭据可通过 `PATCH .../credentials/{credential_id}` 一并提交新 `credential` 和 `status:"active"` 原地恢复。创建凭据及携带新 Key 的更新需要可信 HTTPS，请求响应设置 `Cache-Control: no-store`。有凭据的北辰供应商保留北辰接口地址。
+北辰接口限老师访问，凭据必须属于指定的北辰供应商。教师通过 `POST /api/v1/teacher/providers/{provider_id}/credentials` 新增凭据时，可提交 `channel` 登记独立的 `CC1`、`G3`、`GM1` 或 `Gemini` 渠道，或提交 `replaces_credential_id` 接替原渠道，两字段互斥。有官网 Key ID `12098`、Gemini 登记或 0065 实际退役记录的停用凭据，可通过 `PATCH .../credentials/{credential_id}` 一并提交新 `credential` 和 `status: "active"` 原地恢复。仅有退役时间窗线索时，教师核实后须加上 `"confirm_retired_channel": "Gemini"`，否则响应 `400 VALIDATION_ERROR` 并提示待确认。创建凭据及携带新 Key 的更新需要可信 HTTPS，响应设置 `Cache-Control: no-store`。有凭据的北辰供应商保留北辰接口地址。
 
 手动同步接受空请求体或 `{}`。概览中的 `datasets`、`models`、`comparison` 分别提供同步状态、报价和当日对账。`models[].catalog_source` 返回该目录行的来源（`key` 或 `website`）。成本的 `_micros` 字段以百万分之一北辰余额单位表示。`trial_credits` 和 `charged_credits` 用十进制字符串分别返回试算与实际结算积分，`pending_review_calls` 给出待核账笔数。未知值为 `null`，可确认的零单独返回。原有 `trial_credit_milli` 保留千分之一积分精度。
 
@@ -476,7 +476,7 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 
 对 `/beichen/rebind` 发送 `{"preview":true}` 生成预览。返回的 `evidence_versions` 按 Key 排序，包含 `credential_id`、`credential_revision`、`group_id`、`catalog_observed_at` 和 `evidence_since`。`preview_token` 同时绑定这些版本和 `changes`。发送 `{"preview":false,"preview_token":"…"}` 确认。确认时遇到同步锁冲突、目录过期、权限失效或证据及计划变化，返回 `409 INVALID_STATE_TRANSITION` 并回滚全部绑定变更。教师需重新预览。成功日志记录操作人、供应商与变更数量。
 
-指定恢复线路时，在预览请求的 `preview_token` 传入 `restore/<school_model_id>/<credential_id>`。服务端仅检查这个校内模型和接替凭据，确认时提交服务端返回的完整令牌。定时扫描更新候选及线路证据。北辰 `POST .../reset-catalog` 返回 `409 INVALID_STATE_TRANSITION`，教师可通过启用或重绑调整线路。
+指定恢复线路时，在预览请求的 `preview_token` 传入 `restore/<school_model_id>/<credential_id>`。服务端仅检查这个校内模型和接替凭据。预览和确认均使用网关的认证失败和探活判断。目标线路出现 401 或 403 时，需要恢复上游认证并重新预览。目标线路的探活证据更新也会使旧令牌失效。确认时提交服务端返回的完整令牌。定时扫描更新候选及线路证据。北辰 `POST .../reset-catalog` 返回 `409 INVALID_STATE_TRANSITION`，教师可通过启用或重绑调整线路。
 
 `/v1/models` 明确返回 `GROUP_NOT_ALLOWED` 后，当前凭据和分组在 `bound_routes` 和能力记录中返回 `group_status=not_allowed` 和 `catalog_state=group_blocked`。这把 Key 的线路退出推荐及报价覆盖。已发布模型没有就绪线路时，`binding_issue.code=group_not_allowed` 和 `action_hint` 会提示恢复权限后重扫。一次成功扫描会清除目录接口对当前分组的拒绝。模型探活的拒绝证据按该 Key、型号和协议分别保存，经对应线路复查后清除。
 
@@ -505,6 +505,8 @@ Key 列表和详情保留全部模型授权。Key 的授权模型和模型广场
 官网分组的 `account_rate_multiplier` 按来源优先级处理。`GET /api/v1/groups/rates` 直接返回该分组时，使用该表的账户倍率，优先级最高。该端点只返回分组 ID 和倍率，不提供来源或 Key 编号，因此直接命中时 JSON 省略 `account_rate_source` 和 `account_rate_key_id`。倍率表整表失败、缺少该组、只有其他组单条损坏或账单没有有效倍率时，才允许对该无冲突分组回退。Key 账单回退只适用于标准余额计费且高峰关闭的分组，并要求同一把活跃 Key、同一分组、账单分组号和 Key 编号明确、账单分组默认倍率与官网一致、采样仍有效，并与最近 30 分钟抓取的北京时间当天同 Key 同组完整用量精确匹配。完整用量需有请求，实付除以原价的比值必须等于账单生效倍率。共用官网目录只在该组只有一把活跃 Key 时发布 `key_billing`，并返回该 Key 的数字 `account_rate_key_id`。
 
 Key 证据不足时，只有标准余额计费、分组默认倍率有效且高峰开关明确关闭的分组才发布 `group_rate`。`account_rate_multiplier` 取分组默认倍率，`effective_multiplier` 仍为同一倍率，`account_rate_key_id` 省略。高峰开启或状态未知时不得回退，新跟随价保持待核。同一个官网分组存在多把 Key 时，任意一把 Key 的账单有效倍率与分组默认不同、账单分组号冲突、高峰状态冲突或明确 `GROUP_NOT_ALLOWED`，冲突优先于其他 Key 的 Key 账单或分组默认值，整个分组不发布新的回退倍率。该组已有同 Key、同组仍有效的旧报价时可以继续使用，否则新报价待核。官网目录没有列出该组时，通过该 Key 的账单与型号清单核实。目录抓取整表失败且没有冲突时，无冲突分组可以按上述条件回退，`website_directory.last_run.account_rate_error` 记录「官网账户倍率表读取失败」；存在冲突时记录「北辰账户倍率证据冲突」及具体原因。部分已检查渠道既没有 Key 账单证据、也不满足 `group_rate` 条件时，记录「部分北辰渠道的账户倍率未核实」。
+
+已核实 Key 的账单即使省略 `group_id`，有效倍率与官网默认倍率矛盾时仍记录为冲突。每把 Key 发布回退报价前会检查同组已有的账单冲突及近期目录中对应分组的冲突。
 
 `website_locations` 带官网原名、渠道、平台、分组、采集时间、缓存状态、`price_scope` 和报价存在标记。`price_scope=platform` 表示平台级共享基础价，可用于同一平台同名型号的跨组回退；`price_scope=group` 表示分组专属价，只能用于该分组本身；缺少该字段的旧数据按分组专属价处理。`price_complete` 表示该官网报价具备所声明计价方式的必要单价，`has_price` 表示至少找到一个数值单价。`catalog_keys` 带实际覆盖的 Key 及上游型号，或者给出需要核查的 Key。`state` 可为 `listed`、`missing`、`pending`、`failed` 或 `ambiguous`。已覆盖条目用 `match` 说明原名、名称归一或教师别名，并保留独立的 Key 型号 ID 供教师操作。弱匹配可以识别唯一的日期版本，保留型号数字和具有实际含义的变体。当前 Key 的报价待确认时，官网价栏显示已读到的完整报价及其所属分组。当前 Key 分组没有自己的完整官网价表时（如分组 16），上游基础价取同一平台公开的 `group_id=0` 同名型号报价，再乘当前 Key 生效倍率（测试样例为 0.60）；其他分组的专属报价不当作基础价。学生实价继续乘学校 1.10 系数。
 

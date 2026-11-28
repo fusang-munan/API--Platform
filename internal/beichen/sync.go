@@ -49,6 +49,7 @@ type credentialRecord struct {
 
 type fetchResult struct {
 	save                 func(context.Context, *sql.Tx) error
+	billing              *billingCatalogWrite
 	err                  error
 	partialErr           error
 	accountRate          *billingAccountRateObservation
@@ -333,20 +334,8 @@ func (s *Service) fetchBillingJob(ctx context.Context, job syncJob, revision tim
 		missing = directory.keyBilling.missingKeyBillingFields()
 	}
 	return fetchResult{err: billingErr, partialErr: partialErr, catalog: keyResult, accountRate: evidence,
-		billingMissingFields: missing, save: func(ctx context.Context, tx *sql.Tx) error {
-			accepted, err := saveBillingGroup(ctx, tx, job.credential, revision, startedAt, directory, billingErr, false)
-			if err != nil {
-				return err
-			}
-			if !accepted {
-				return errBillingKeyBindingChanged
-			}
-			if websiteErr == nil {
-				if err := saveWebsiteCatalog(ctx, tx, job.credential, revision, directory.catalogQuote()); err != nil {
-					return err
-				}
-			}
-			return saveBillingObservation(ctx, tx, job.credential, revision, info, billingErr, quote.groupID, quote)
+		billingMissingFields: missing, billing: &billingCatalogWrite{
+			startedAt: startedAt, directory: directory, info: info, quote: quote, websiteRead: websiteErr == nil,
 		}}
 }
 
@@ -523,17 +512,20 @@ func (s *Service) finishJob(ctx context.Context, job syncJob, lease uuid.UUID, c
 		}
 		return errors.Join(err, errors.New("同步期间北辰凭据或供应商已变化"))
 	}
-	if result.save != nil {
-		if err := result.save(ctx, tx); err != nil {
-			if !errors.Is(err, errBillingKeyBindingChanged) {
-				return err
-			}
-			releaseErr := catalog.ReleaseBeichenDatasetLease(ctx, tx, job.credential, job.leaseKind())
-			if releaseErr == nil {
-				releaseErr = tx.Commit()
-			}
-			return errors.Join(err, releaseErr)
+	if result.billing != nil {
+		err = result.billing.save(ctx, tx, job, credential.updatedAt, &result)
+	} else if result.save != nil {
+		err = result.save(ctx, tx)
+	}
+	if err != nil {
+		if !errors.Is(err, errBillingKeyBindingChanged) {
+			return err
 		}
+		releaseErr := catalog.ReleaseBeichenDatasetLease(ctx, tx, job.credential, job.leaseKind())
+		if releaseErr == nil {
+			releaseErr = tx.Commit()
+		}
+		return errors.Join(err, releaseErr)
 	}
 	if result.catalog != nil {
 		scan := result.catalog

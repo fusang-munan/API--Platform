@@ -225,7 +225,8 @@ SELECT c.id,c.label,c.credential_ciphertext,c.status,c.updated_at,
        COALESCE(j.channel,r.channel,''),r.credential_id IS NOT NULL
 FROM provider_credentials c LEFT JOIN beichen_panel_access a ON a.credential_id=c.id
 LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
-LEFT JOIN beichen_credential_retirements r ON r.credential_id=c.id
+LEFT JOIN beichen_credential_retirements r ON r.credential_id=c.id AND r.provider_id=c.provider_id
+  AND r.source_updated_at=c.updated_at AND r.evidence IN ('upstream_key_12098','0065_updated')
 WHERE c.provider_id=$1 ORDER BY c.id FOR UPDATE OF c`, provider)
 	if err != nil {
 		return nil, errors.New("读取北辰现有凭据失败")

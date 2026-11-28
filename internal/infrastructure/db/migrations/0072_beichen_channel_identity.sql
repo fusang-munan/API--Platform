@@ -2,51 +2,64 @@
 -- Only one active credential holds the registration for a provider and channel.
 -- This revision is intended for environments that have not yet applied 0072.
 -- If an earlier 0072 was already recorded, repair it with a forward 0073.
-ALTER TABLE beichen_provision_channels ADD COLUMN registration_provider_id uuid;
-ALTER TABLE beichen_provision_channels ADD CONSTRAINT beichen_one_channel_registration
-  UNIQUE (registration_provider_id, channel);
+ALTER TABLE beichen_provision_channels ADD COLUMN IF NOT EXISTS registration_provider_id uuid;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid='beichen_provision_channels'::regclass AND conname='beichen_one_channel_registration') THEN
+    ALTER TABLE beichen_provision_channels ADD CONSTRAINT beichen_one_channel_registration
+      UNIQUE (registration_provider_id, channel);
+  END IF;
+END $$;
 
 -- Preserve the credentials matched by migration 0065. Labels and group hints
 -- are not sufficient evidence for a later in-place restore on their own.
-CREATE TABLE beichen_credential_retirements (
+CREATE TABLE IF NOT EXISTS beichen_credential_retirements (
   credential_id uuid PRIMARY KEY REFERENCES provider_credentials(id) ON DELETE CASCADE,
   provider_id uuid NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
   channel text NOT NULL CHECK (channel IN ('Gemini')),
   reason text NOT NULL,
-  evidence text NOT NULL CHECK (evidence IN ('upstream_key_12098','0065_window')),
+  evidence text NOT NULL,
   retired_at timestamptz NOT NULL,
   source_updated_at timestamptz NOT NULL,
   source_retired_at timestamptz
 );
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid='beichen_credential_retirements'::regclass AND conname='beichen_retirement_evidence_known') THEN
+    ALTER TABLE beichen_credential_retirements DROP CONSTRAINT IF EXISTS beichen_credential_retirements_evidence_check;
+    ALTER TABLE beichen_credential_retirements ADD CONSTRAINT beichen_retirement_evidence_known
+      CHECK (evidence IN ('upstream_key_12098','0065_updated','0065_window'));
+  END IF;
+END $$;
+UPDATE beichen_credential_retirements SET reason='pending_confirmation'
+WHERE evidence='0065_window' AND reason='0065_beichen_gemini';
 
--- A live 12098 mapping is durable evidence even when 0067 has already
--- backfilled retired_at for the old row.
-WITH matched AS (
-  SELECT c.id, c.provider_id, c.updated_at
+-- The upstream ID and the 0065 UPDATE marker survive the 0067 backfill.
+WITH evidence AS (
+  SELECT c.id, c.provider_id, c.updated_at, c.retired_at, marker.created_at AS marked_at,
+    (EXISTS (SELECT 1 FROM beichen_panel_access a
+              WHERE a.credential_id=c.id AND a.upstream_key_id=12098)
+      OR EXISTS (SELECT 1 FROM beichen_website_keys k
+                 WHERE k.credential_id=c.id AND k.provider_id=c.provider_id AND k.upstream_key_id=12098)) AS known_key
   FROM provider_credentials c JOIN providers p ON p.id = c.provider_id
+  LEFT JOIN maintenance_state marker ON marker.name='beichen_0065_retirement/'||c.id::text
+    AND marker.created_at=COALESCE(c.retired_at,c.updated_at)
   WHERE lower(btrim(p.base_url)) IN ('https://api.beichenapi.com', 'https://api.beichenapi.com/',
                                      'https://api.beichenapi.com/v1', 'https://api.beichenapi.com/v1/')
-    AND (
-      EXISTS (SELECT 1 FROM beichen_panel_access a
-              WHERE a.credential_id = c.id AND a.upstream_key_id = 12098)
-      OR EXISTS (SELECT 1 FROM beichen_website_keys k
-                 WHERE k.credential_id = c.id AND k.provider_id = c.provider_id AND k.upstream_key_id = 12098)
-    )
-), targets AS (
-  SELECT m.id, m.provider_id FROM matched m
-  WHERE EXISTS (
-    SELECT 1 FROM provider_credentials c
-    WHERE c.provider_id = m.provider_id AND c.status = 'active'
-      AND NOT EXISTS (SELECT 1 FROM matched other WHERE other.id = c.id)
-  )
+    AND c.status='inactive'
 )
 INSERT INTO beichen_credential_retirements
   (credential_id,provider_id,channel,reason,evidence,retired_at,source_updated_at,source_retired_at)
-SELECT t.id,t.provider_id,'Gemini','0065_beichen_gemini','upstream_key_12098',
-  COALESCE(c.retired_at,c.updated_at),c.updated_at,c.retired_at
-FROM targets t JOIN provider_credentials c ON c.id=t.id
-WHERE c.status='inactive'
-ON CONFLICT (credential_id) DO NOTHING;
+SELECT id,provider_id,'Gemini','0065_beichen_gemini',
+  CASE WHEN known_key THEN 'upstream_key_12098' ELSE '0065_updated' END,
+  COALESCE(retired_at,updated_at),updated_at,retired_at
+FROM evidence WHERE known_key OR marked_at IS NOT NULL
+ON CONFLICT (credential_id) DO UPDATE
+SET evidence=EXCLUDED.evidence,reason=EXCLUDED.reason,retired_at=EXCLUDED.retired_at,
+    source_updated_at=EXCLUDED.source_updated_at,source_retired_at=EXCLUDED.source_retired_at
+WHERE beichen_credential_retirements.evidence='0065_window';
 
 -- Older databases always have schema_migrations. A few direct-SQL fixtures do
 -- not, so this branch is evaluated dynamically only when that ledger exists.
@@ -71,7 +84,7 @@ BEGIN
       )
       INSERT INTO beichen_credential_retirements
         (credential_id,provider_id,channel,reason,evidence,retired_at,source_updated_at,source_retired_at)
-      SELECT m.id,m.provider_id,'Gemini','0065_beichen_gemini','0065_window',
+      SELECT m.id,m.provider_id,'Gemini','pending_confirmation','0065_window',
              COALESCE(c.retired_at,c.updated_at),c.updated_at,c.retired_at
       FROM matched m JOIN provider_credentials c ON c.id=m.id
       WHERE c.status='inactive'
@@ -80,26 +93,30 @@ BEGIN
   END IF;
 END $$;
 
-CREATE FUNCTION keep_beichen_retirement_revision() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION keep_beichen_retirement_revision() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   UPDATE beichen_credential_retirements SET source_updated_at=NEW.updated_at
   WHERE credential_id=NEW.id;
   RETURN NEW;
 END $$;
 
+DROP TRIGGER IF EXISTS beichen_retirement_revision ON provider_credentials;
 CREATE TRIGGER beichen_retirement_revision AFTER UPDATE OF updated_at ON provider_credentials
 FOR EACH ROW EXECUTE FUNCTION keep_beichen_retirement_revision();
 
 WITH registrations AS (
   SELECT DISTINCT ON (c.provider_id, j.channel) c.id, c.provider_id
   FROM beichen_provision_channels j JOIN provider_credentials c ON c.id=j.credential_id
-  WHERE c.status='active'
+  WHERE c.status='active' AND NOT EXISTS (
+    SELECT 1 FROM beichen_provision_channels current
+    WHERE current.registration_provider_id=c.provider_id AND current.channel=j.channel
+  )
   ORDER BY c.provider_id, j.channel, c.created_at, c.id
 )
 UPDATE beichen_provision_channels j SET registration_provider_id=r.provider_id
 FROM registrations r WHERE r.id=j.credential_id;
 
-CREATE FUNCTION refresh_beichen_channel_registration() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION refresh_beichen_channel_registration() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
   owner_id uuid;
   school_channel text;
@@ -133,12 +150,14 @@ BEGIN
   RETURN NULL;
 END $$;
 
+DROP TRIGGER IF EXISTS beichen_channel_registration_status ON provider_credentials;
 CREATE TRIGGER beichen_channel_registration_status AFTER UPDATE OF status ON provider_credentials
 FOR EACH ROW WHEN (OLD.status IS DISTINCT FROM NEW.status) EXECUTE FUNCTION refresh_beichen_channel_registration();
+DROP TRIGGER IF EXISTS beichen_channel_registration_membership ON beichen_provision_channels;
 CREATE TRIGGER beichen_channel_registration_membership AFTER INSERT OR DELETE ON beichen_provision_channels
 FOR EACH ROW EXECUTE FUNCTION refresh_beichen_channel_registration();
 
-CREATE INDEX beichen_panel_access_upstream_key ON beichen_panel_access(upstream_key_id)
+CREATE INDEX IF NOT EXISTS beichen_panel_access_upstream_key ON beichen_panel_access(upstream_key_id)
   WHERE upstream_key_id IS NOT NULL;
 
 -- Old manual writes could give an ID to multiple credentials. Withhold all
@@ -146,7 +165,7 @@ CREATE INDEX beichen_panel_access_upstream_key ON beichen_panel_access(upstream_
 -- usage records keep the credential IDs and receipt revisions already pinned.
 -- A mapping is conflicting only while it is a valid Beichen binding. A unique
 -- mapping on a provider that was moved off Beichen remains untouched.
-CREATE TABLE beichen_cleared_panel_keys (
+CREATE TABLE IF NOT EXISTS beichen_cleared_panel_keys (
   credential_id uuid PRIMARY KEY REFERENCES provider_credentials(id) ON DELETE CASCADE,
   provider_id uuid NOT NULL,
   upstream_key_id bigint NOT NULL CHECK (upstream_key_id BETWEEN 1 AND 9007199254740991),
@@ -182,7 +201,7 @@ WITH competing AS (
 UPDATE beichen_provision_channels SET checked_at=NULL, upstream_user_id=NULL
 WHERE credential_id IN (SELECT credential_id FROM cleared);
 
-CREATE FUNCTION beichen_upstream_key_available(key_id bigint, claimant uuid) RETURNS boolean LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION beichen_upstream_key_available(key_id bigint, claimant uuid) RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE
   owner_provider uuid;
   claimant_active boolean;
@@ -201,7 +220,7 @@ BEGIN
   );
 END $$;
 
-CREATE FUNCTION check_beichen_upstream_key_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION check_beichen_upstream_key_claim() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF NOT beichen_upstream_key_available(NEW.upstream_key_id, NEW.credential_id) THEN
     RAISE EXCEPTION '北辰官网 Key 已绑定其他校内渠道' USING ERRCODE='23505', CONSTRAINT='beichen_panel_access_upstream_key_owner';
@@ -209,5 +228,6 @@ BEGIN
   RETURN NEW;
 END $$;
 
+DROP TRIGGER IF EXISTS beichen_panel_access_key_claim ON beichen_panel_access;
 CREATE TRIGGER beichen_panel_access_key_claim BEFORE INSERT OR UPDATE OF upstream_key_id, updated_at ON beichen_panel_access
 FOR EACH ROW WHEN (NEW.upstream_key_id IS NOT NULL) EXECUTE FUNCTION check_beichen_upstream_key_claim();

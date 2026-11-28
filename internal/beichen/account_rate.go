@@ -87,45 +87,39 @@ func (s *Service) fetchVerifiedKeyAccountRate(ctx context.Context, credential uu
 		}
 		return billingInfo{}, time.Time{}, err
 	}
-	// The standard response can omit group_id. This fallback still requires
-	// it as independent proof of the group.
-	if billingPanelGroup(info) == 0 {
-		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少分组号（group_id 未提供或为 0）")
-	}
 	if reason := keyBillingIdentityIssue(info, identity); reason != "" {
 		return billingInfo{}, time.Time{}, accountRateConflict(reason)
-	}
-	if info.APIKeyID == 0 {
-		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少 Key 编号（api_key_id 未提供或为 0）")
-	}
-	if info.GroupRate == "" {
-		// A standard response may omit the default while still naming the
-		// same group. Without an effective rate there is no account evidence.
-		if info.Multiplier == "" {
-			return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少分组默认倍率")
-		}
 	}
 	if info.GroupRate != "" && !samePanelRate(*group.Rate, info.GroupRate) {
 		return billingInfo{}, time.Time{}, accountRateConflict(keyBillingDefaultRateMismatch)
 	}
-	if info.Multiplier == "" {
-		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少生效倍率")
-	}
-	// A parsed billing response with a different effective rate is evidence,
-	// even when recent usage cannot independently confirm that sample. It
-	// cannot be replaced by the group default.
-	if !samePanelRate(*group.Rate, info.Multiplier) {
+	// The request used a Key already matched to the website group. A reported
+	// contradiction blocks fallback even if the response omits group_id.
+	if info.Multiplier != "" && !samePanelRate(*group.Rate, info.Multiplier) {
 		return billingInfo{}, time.Time{}, accountRateConflict(keyBillingEffectiveMismatch)
+	}
+	if (info.PeakEnabled != nil && *info.PeakEnabled) || (info.AppliedPeak != "" && !samePanelRate(info.AppliedPeak, "1")) {
+		return billingInfo{}, time.Time{}, accountRateConflict(keyBillingPeakMismatch)
+	}
+	if info.Multiplier != "" && ((info.UserRate != nil && !samePanelRate(*info.UserRate, info.Multiplier)) ||
+		(info.ResolvedRate != "" && !samePanelRate(info.ResolvedRate, info.Multiplier))) {
+		return billingInfo{}, time.Time{}, accountRateConflict("Key 账单的账户倍率与生效倍率不一致")
+	}
+	// Adopting the Key's rate still requires its independent group and ID.
+	if billingPanelGroup(info) == 0 {
+		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少分组号（group_id 未提供或为 0）")
+	}
+	if info.APIKeyID == 0 {
+		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少 Key 编号（api_key_id 未提供或为 0）")
+	}
+	if info.Multiplier == "" {
+		if info.GroupRate == "" {
+			return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少分组默认倍率")
+		}
+		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少生效倍率")
 	}
 	if info.PeakEnabled == nil {
 		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单缺少高峰状态")
-	}
-	if *info.PeakEnabled || (info.AppliedPeak != "" && !samePanelRate(info.AppliedPeak, "1")) {
-		return billingInfo{}, time.Time{}, accountRateConflict(keyBillingPeakMismatch)
-	}
-	if (info.UserRate != nil && !samePanelRate(*info.UserRate, info.Multiplier)) ||
-		(info.ResolvedRate != "" && !samePanelRate(info.ResolvedRate, info.Multiplier)) {
-		return billingInfo{}, time.Time{}, accountRateConflict("Key 账单的账户倍率与生效倍率不一致")
 	}
 	at, err := s.currentKeyBillingAt(ctx, info)
 	if errors.Is(err, errKeyBillingSampleExpired) {
@@ -134,10 +128,9 @@ func (s *Service) fetchVerifiedKeyAccountRate(ctx context.Context, credential uu
 	if err != nil {
 		return billingInfo{}, time.Time{}, accountRateUnverified("Key 账单采样时间无法核对")
 	}
-	if err := s.confirmRecentKeyUsageRate(ctx, credential, identity, info.Multiplier, at); err != nil {
-		return billingInfo{}, time.Time{}, err
-	}
-	return info, at, nil
+	// A fresh matching bill can clear its own contradiction. Adopting
+	// key_billing still needs the independent usage check.
+	return info, at, s.confirmRecentKeyUsageRate(ctx, credential, identity, info.Multiplier, at)
 }
 
 func (s *Service) confirmRecentKeyUsageRate(ctx context.Context, credential uuid.UUID, identity listedKey,

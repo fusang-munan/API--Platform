@@ -18,6 +18,7 @@ type CredentialEdit struct {
 	Ciphertext               []byte
 	Replaces                 *uuid.UUID
 	Fingerprint              []byte
+	ConfirmRetiredGemini     bool
 }
 
 func IsSchoolChannel(channel string) bool {
@@ -244,36 +245,37 @@ WHERE (beichen_provision_channels.key_fingerprint,beichen_provision_channels.dis
 // RestoreGeminiCredentialTx reuses the retired credential's billing identity.
 // Its old routes and receipts remain historical until the new Key is verified.
 func (s *Service) RestoreGeminiCredentialTx(ctx context.Context, tx *sql.Tx, provider, credential uuid.UUID, edit CredentialEdit) error {
-	var eligible bool
+	var status, channel string
+	var strong, pending bool
 	err := tx.QueryRowContext(ctx, `
-SELECT COALESCE(c.status='inactive' AND (
-   j.channel='Gemini'
-   OR EXISTS (SELECT 1 FROM beichen_credential_retirements r
-              WHERE r.credential_id=c.id AND r.provider_id=c.provider_id AND r.channel='Gemini'
-                AND r.source_updated_at=c.updated_at
-                AND (
-                  r.evidence='0065_window'
-                    AND (r.source_retired_at IS NULL OR r.source_retired_at=r.source_updated_at)
-                    AND EXISTS (
-                      SELECT 1 FROM schema_migrations applied
-                      WHERE applied.version='0065_retire_beichen_gemini_credential.sql'
-                        AND c.created_at < applied.applied_at
-                        AND c.updated_at BETWEEN applied.applied_at - interval '10 minutes'
-                                             AND applied.applied_at + interval '10 minutes'
-                    )
-                  OR r.evidence='upstream_key_12098'
-                ))
-   OR EXISTS (SELECT 1 FROM beichen_panel_access a WHERE a.credential_id=c.id AND a.upstream_key_id=12098)
-   OR EXISTS (SELECT 1 FROM beichen_website_keys k
-              WHERE k.credential_id=c.id AND k.provider_id=c.provider_id AND k.upstream_key_id=12098)
- ), false)
+SELECT c.status,COALESCE(j.channel,''),
+  COALESCE(r.evidence IN ('upstream_key_12098','0065_updated'),false)
+    OR EXISTS (SELECT 1 FROM beichen_panel_access a WHERE a.credential_id=c.id AND a.upstream_key_id=12098)
+    OR EXISTS (SELECT 1 FROM beichen_website_keys k
+               WHERE k.credential_id=c.id AND k.provider_id=c.provider_id AND k.upstream_key_id=12098),
+  COALESCE(r.evidence='0065_window'
+    AND c.retired_at IS NOT DISTINCT FROM r.source_retired_at
+    AND (r.source_retired_at IS NULL OR r.source_retired_at=r.retired_at)
+    AND EXISTS (
+      SELECT 1 FROM schema_migrations applied
+      WHERE applied.version='0065_retire_beichen_gemini_credential.sql'
+        AND c.created_at < applied.applied_at
+        AND r.retired_at BETWEEN applied.applied_at - interval '10 minutes'
+                             AND applied.applied_at + interval '10 minutes'
+    ),false)
 FROM provider_credentials c LEFT JOIN beichen_provision_channels j ON j.credential_id=c.id
-WHERE c.id=$1 AND c.provider_id=$2 FOR NO KEY UPDATE OF c`, credential, provider).Scan(&eligible)
+LEFT JOIN beichen_credential_retirements r ON r.credential_id=c.id AND r.provider_id=c.provider_id
+  AND r.channel='Gemini' AND r.source_updated_at=c.updated_at
+WHERE c.id=$1 AND c.provider_id=$2 FOR NO KEY UPDATE OF c`, credential, provider).Scan(&status, &channel, &strong, &pending)
 	if err != nil {
 		return credentialSaveError(err)
 	}
-	if !eligible {
+	if status != "inactive" || (channel != "" && channel != "Gemini") ||
+		(!strong && channel != "Gemini" && !pending) {
 		return invalid("仅允许为停用的 Gemini 渠道提交新 Key，其他渠道请使用接替向导")
+	}
+	if !strong && channel != "Gemini" && !edit.ConfirmRetiredGemini {
+		return invalid("旧 Gemini 渠道归属待确认，请核实后提交 confirm_retired_channel=Gemini")
 	}
 	if err := checkSchoolChannelAvailability(ctx, tx, provider, "Gemini", credential, nil); err != nil {
 		return err

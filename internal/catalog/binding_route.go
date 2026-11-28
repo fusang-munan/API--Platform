@@ -30,6 +30,18 @@ func normalizeUpstreamModelID(value string) string {
 const BeichenProbeBlocksRouteSQL = `(r.status_code IN (401,403) OR r.error_code='credential_unreadable'
  OR r.detail->>'failure_code' IN ('GROUP_NOT_ALLOWED','credential_invalid'))`
 
+// These predicates use the same Key evidence (e), catalog row (k), and probe
+// (r) in gateway routing and teacher rebind.
+const BeichenCatalogAuthReadySQL = `NOT EXISTS (
+  SELECT 1 FROM maintenance_state s
+  WHERE s.name='` + beichenCatalogAuthKey + `'||e.credential_id::text
+    AND (s.last_error::jsonb->>'credential_revision')::timestamptz=e.revision
+)`
+
+const BeichenCurrentCatalogProbeSQL = `r.provider_id=k.provider_id AND r.credential_id=k.credential_id
+  AND r.model=k.model_id::text AND k.status='active' AND k.catalog_source='key'
+  AND ` + BeichenCurrentProbeSQL
+
 // BindingRouteReady checks catalog coverage and confirmed upstream restrictions.
 func BindingRouteReady(ctx context.Context, client *ent.Client, binding *ent.ModelBinding) (bool, error) {
 	credential, err := bindingRouteCredential(ctx, client, binding)
@@ -86,18 +98,11 @@ func bindingRouteCredential(ctx context.Context, client *ent.Client, binding *en
 				b.WriteString("EXISTS (SELECT 1 FROM (" + BeichenKeyEvidenceSQL + " WHERE c.id=").
 					WriteString(s.C(providercredential.FieldID)).WriteString(`) e
 WHERE NOT (` + BeichenGroupUnavailableSQL + `)
+  AND ` + BeichenCatalogAuthReadySQL + `
   AND NOT EXISTS (
-    SELECT 1 FROM maintenance_state s
-    WHERE s.name='` + beichenCatalogAuthKey + `'||e.credential_id::text
-      AND (s.last_error::jsonb->>'credential_revision')::timestamptz=e.revision
-  )
-  AND NOT EXISTS (
-    SELECT 1 FROM upstream_probes r
-    JOIN provider_model_catalog k ON k.provider_id=r.provider_id AND k.credential_id=r.credential_id
-      AND k.model_id=r.model::citext AND k.model_id::text=r.model
-    WHERE r.provider_id=`).Arg(binding.ProviderID).WriteString(` AND r.credential_id=e.credential_id
+    SELECT 1 FROM provider_model_catalog k JOIN upstream_probes r ON ` + BeichenCurrentCatalogProbeSQL + `
+    WHERE k.provider_id=`).Arg(binding.ProviderID).WriteString(` AND k.credential_id=e.credential_id
       AND r.protocol=`).Arg(binding.Adapter).WriteString(` AND btrim(k.model_id::text)::citext=`).Arg(upstream).WriteString(`::citext
-      AND k.status='active' AND k.catalog_source='key' AND ` + BeichenCurrentProbeSQL + `
       AND ` + BeichenProbeBlocksRouteSQL + `
   ))`)
 			}))

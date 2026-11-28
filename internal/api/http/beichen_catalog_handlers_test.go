@@ -132,8 +132,8 @@ func TestBeichenCatalogMaintenanceAliasAndPreviewContracts(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"binding", "model", "school", "adapter", "key", "label", "upstream", "priority", "status"}).
 			AddRow(binding, school, "school", "openai_responses", uuid.New(), "old fixture", "one", 7, "inactive"))
 	mock.ExpectQuery("SELECT a.model,k.credential_id").WithArgs(provider, credential).
-		WillReturnRows(sqlmock.NewRows([]string{"upstream", "key", "label", "raw", "protocols", "current", "alias", "school", "name"}).
-			AddRow("one", credential, "new fixture", []byte("{}"), []byte(`["openai_responses"]`), true, false, nil, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"upstream", "key", "label", "raw", "protocols", "current", "probes", "alias", "school", "name"}).
+			AddRow("one", credential, "new fixture", []byte("{}"), []byte(`["openai_responses"]`), true, []byte("{}"), false, nil, nil))
 	mock.ExpectQuery("SELECT p.status='active' AND .*COALESCE").WithArgs(provider, credential).
 		WillReturnRows(sqlmock.NewRows([]string{"ready", "versions"}).AddRow(true, []byte(evidence)))
 	mock.ExpectCommit()

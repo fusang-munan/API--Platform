@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/starprince1234/Nebula-api/internal/domain"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 )
 
 func newBeichenLedgerTestDB(t *testing.T) (context.Context, *sql.DB) {
@@ -23,7 +24,7 @@ func newBeichenLedgerTestDB(t *testing.T) (context.Context, *sql.DB) {
 		t.Skip("requires a disposable local nebula_test database")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || !isIsolatedTestDatabase(config.Database) ||
+	if err != nil || config.Host != "127.0.0.1" || !testutil.IsIsolatedPostgresDatabase(config.Database) ||
 		config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal("requires a disposable loopback ledger test database with sslmode=disable")
 	}
@@ -407,13 +408,5 @@ func ledgerTestExec(t *testing.T, ctx context.Context, db *sql.DB, statement str
 	t.Helper()
 	if _, err := db.ExecContext(ctx, statement, args...); err != nil {
 		t.Fatal(err)
-	}
-}
-func isIsolatedTestDatabase(name string) bool {
-	switch name {
-	case "nebula_test", "nebula_test_rev_c1", "nebula_test_rev_c1_2", "nebula_test_hjc1", "nebula_test_rev_b":
-		return true
-	default:
-		return false
 	}
 }

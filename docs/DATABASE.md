@@ -430,7 +430,7 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 
 迁移 `0055_beichen_website_keys.sql` 中的 `beichen_website_key_sync` 按供应商保存最近成功时间、同步状态和租约。`beichen_website_keys` 按供应商和北辰 Key ID 保存名称、最多 10 字符的前缀、官网分组 ID 和名称、精确分组倍率、上游状态及创建时间。唯一匹配的行关联 `provider_credentials.id` 和学校凭据密文的 SHA-256 摘要。密文轮换后，旧的匹配在读取时失效。同一事务替换完整清单、更新同步时间并写入变化的分组倍率版本。失败更新保留已有清单和最近成功时间，并在 `maintenance_state` 的 `beichen_key_inventory/<provider_uuid>` 记录失败原因或身份冲突。
 
-迁移 `0072_beichen_channel_identity.sql` 给 `beichen_provision_channels` 增加 `registration_provider_id` 与渠道联合唯一约束。状态和成员关系的触发器为每个供应商下的渠道选出当前登记凭据。`beichen_credential_retirements` 记录由 0065 退役证据确认的 Gemini 原凭据，用于原地恢复。`beichen_cleared_panel_keys` 保存迁移中因重复归属而清除的冲突映射。后续官网 Key 编号在同一供应商内按事务锁独占登记，已保存的调用归属和回执版本继续按原记录读取。
+迁移 `0072_beichen_channel_identity.sql` 给 `beichen_provision_channels` 增加 `registration_provider_id` 与渠道联合唯一约束。状态和成员关系的触发器为每个供应商下的渠道选出当前登记凭据。执行本版本的 0065 时，只有实际更新为停用的凭据会在 `maintenance_state` 留下退役标记。0072 将该标记和官网 Key ID `12098` 作为强证据保存到 `beichen_credential_retirements`。仅命中时间窗的记录标为 `pending_confirmation`。曾执行旧 0065 的数据库沿用已保存的证据，缺少强证据的历史候选需教师确认。0072 SQL 可重复执行，回填保留现有活动渠道登记。`beichen_cleared_panel_keys` 保存因重复归属而清除的冲突映射。后续官网 Key 编号在同一供应商内按事务锁独占登记，已保存的调用归属和回执版本继续按原记录读取。
 
 多页清单以两次完整遍历结果为准，按 Key 编号核对集合、分组、状态与其他已读字段。任一遍历的分页校验失败且未在重读后恢复，或两次完整结果不一致时，记录 `unavailable` 和诊断，沿用上次已保存的清单和 `last_seen`。
 
@@ -463,6 +463,8 @@ Redis 不是业务权威数据源。客户端 SSE 断线重连后必须重新调
 迁移 `0057_beichen_group_price_observations.sql` 按 `provider_id`、`group_id`、模型原名和 `observed_at` 保存官网报价版本。`pricing` 保留原始报价结构，`group_rules` 保存分组默认倍率 `rate_multiplier`、账户倍率 `account_rate_multiplier`、来源 `account_rate_source`、Key 编号 `account_rate_key_id` 和高峰规则，`unit` 固定为「元（北辰余额单位）」。目录租约仍有效时，同一事务写入抓取结果和新版本。同一分组和模型的报价或规则改变时新增版本，重复观察只刷新最近抓取结果。部分失败时只记录本轮核实的分组。官网 `GET /api/v1/groups/rates` 直接命中时保存账户倍率，来源和 Key 编号省略。成功读表但缺组时，只有该组仅有一把活跃 Key 且 Key 账单与最近 30 分钟完整用量通过核验，才保存 `key_billing` 和 Key 编号；Key 证据不足时，标准分组只在默认倍率有效且高峰明确关闭时保存 `group_rate`，且不带 Key 编号。同一分组有多把 Key 时，任一 Key 的账单倍率、分组号或高峰冲突优先于其他 Key 的 `key_billing` 或 `group_rate`，冲突组不发布新的回退倍率。账户倍率表整张读取失败、缺组或单条损坏时，无冲突分组可按上述条件形成回退，已有有效分组历史可独立写入；存在冲突时保留旧历史并阻止该组回退。`beichen_crawl_runs.account_rate_error`（接口 `last_run.account_rate_error`）在无冲突整表失败时记录「官网账户倍率表读取失败」，存在冲突时记录「北辰账户倍率证据冲突」及具体原因。`key_model_comparisons` 保存最近一轮按凭据查到的 `/v1/models` 对照，`key_model_error` 保存整批读取错误。
 
 共用目录发布 `key_billing` 的前提是该组只有一把活跃 Key 且该 Key 通过回退核验；`group_rate` 是分组级来源，不要求单一 Key，也不保存个人 `account_rate_key_id`。官网目录未列出的分组继续使用既有 Key-only 路径，不写入共用 `group_rules` 的回退倍率。
+
+单 Key 采价把账单与官网分组规则的吻合或冲突写入 `website_group_observation.billing_rate_evidence`。该观测绑定 Key 编号、分组和凭据版本。同组采价在事务内串行核对当前 Key 观测和近期官网目录的分组冲突。发现冲突的刷新记录待核并停止写入回退报价，保留历史账务记录。
 
 迁移 `0058_beichen_usage_derived_prices.sql` 把 `source` 纳入分组报价观察的主键。官网抓取只追加 `source='website'`，历史流水证据为 `derived_from_usage`。Group 16 两条反推记录各来自 6 笔流水，取复核窗口结束时间 `2026-11-21 20:14 +08:00` 作为 `observed_at`。0.60× 保存为核对时观察到的倍率（测试样例）。输入和输出保存为每 Token 的基础元价，缓存单价缺省。
 

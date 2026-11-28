@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
 	"github.com/starprince1234/Nebula-api/internal/domain"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 )
 
 func newActionsPostgres(t *testing.T) (context.Context, *sql.DB, uuid.UUID, uuid.UUID, []uuid.UUID) {
@@ -25,8 +26,7 @@ func newActionsPostgres(t *testing.T) (context.Context, *sql.DB, uuid.UUID, uuid
 	}
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil || cfg.Host != "127.0.0.1" ||
-		(!isIsolatedTestDatabase(cfg.Database) && cfg.Database != "nebula_test_hjb" &&
-			!(cfg.Database == "nebula_test_hjc2" && cfg.User == "nebula_qa")) ||
+		!testutil.IsIsolatedPostgresDatabase(cfg.Database) || (cfg.Database == "nebula_test_hjc2" && cfg.User != "nebula_qa") ||
 		cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
 		t.Fatal("仅允许连接指定的本机 PostgreSQL 测试数据库，且须使用 sslmode=disable")
 	}

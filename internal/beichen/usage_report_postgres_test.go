@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 )
 
 func reportTestTransaction(t *testing.T) (context.Context, *sql.Tx) {
@@ -29,7 +30,7 @@ func reportTestSetup(t *testing.T) (context.Context, *sql.DB, *sql.Tx) {
 		t.Skip("需要隔离的本机 nebula_test PostgreSQL")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || !isIsolatedTestDatabase(config.Database) ||
+	if err != nil || config.Host != "127.0.0.1" || !testutil.IsIsolatedPostgresDatabase(config.Database) ||
 		(config.User != "nebula_qa" && config.User != "nebula_test") || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal("仅允许本机隔离的 nebula_test 数据库、测试用户及 sslmode=disable")
 	}

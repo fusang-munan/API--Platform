@@ -18,6 +18,7 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/controlplane"
 	security "github.com/starprince1234/Nebula-api/internal/infrastructure/crypto"
 	store "github.com/starprince1234/Nebula-api/internal/infrastructure/db"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 )
 
 const provisionFixture = `[
@@ -70,7 +71,7 @@ func TestBeichenProvisionPostgres(t *testing.T) {
 		t.Skip("requires a disposable loopback nebula_test database")
 	}
 	config, err := pgx.ParseConfig(dsn)
-	if err != nil || config.Host != "127.0.0.1" || !isIsolatedTestDatabase(config.Database) || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
+	if err != nil || config.Host != "127.0.0.1" || !testutil.IsIsolatedPostgresDatabase(config.Database) || config.TLSConfig != nil || len(config.Fallbacks) != 0 {
 		t.Fatal("requires loopback nebula_test with sslmode=disable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -339,12 +340,4 @@ VALUES ($1,'fixture','fixture@teacher.invalid','!','teacher','active',now(),now(
 		t.Fatal("identity or provider collision changed stored settings")
 	}
 	checkCount("SELECT count(*) FROM provider_credentials WHERE provider_id=$1 AND label='G3' AND status='inactive' AND credential_ciphertext=decode('FF','hex')", 1, other)
-}
-func isIsolatedTestDatabase(name string) bool {
-	switch name {
-	case "nebula_test", "nebula_test_rev_c1", "nebula_test_rev_c1_2", "nebula_test_hjc1", "nebula_test_rev_b":
-		return true
-	default:
-		return false
-	}
 }

@@ -211,7 +211,9 @@ go test -p 1 -overlay internal/infrastructure/db/migrations/testdata/beichen_cha
 go test ./internal/dataplane ./internal/usage -run 'TestBeichenGemini' -count=1
 ```
 
-若教师登记或更换 Key 被拒绝，先检查可信 HTTPS 入口，再核对该渠道是否已有活动登记，以及官网 Key 是否已经归属另一渠道。若 Gemini 有原生目录或探活证据却仍只有兼容线路，检查教师是否完成显式绑定；定时扫描只更新候选和线路状态。
+若教师登记或更换 Key 被拒绝，先检查可信 HTTPS 入口，再核对活动渠道登记和官网 Key 归属。收到 Gemini 归属待确认时，核实原凭据后在恢复请求中传入 `confirm_retired_channel`。若原生目录或探活已确认而仍只有兼容线路，检查教师是否完成显式绑定。定时扫描只更新候选和线路状态。
+
+运行 `go test -p 1 ./internal/infrastructure/db/migrations ./internal/beichen ./internal/controlplane -run 'Test(BeichenUpgradeChain|AccountRateConflictBlocks|PeerKeyConflict|RebindRestoresOnly|ScheduledBeichenMaterialization|GeminiCatalogMaterialization)' -count=1 -v` 复查回归。用例覆盖 0065 未改动的凭据经 0067 回填后仍需确认、0072 原 SQL 重放、账单缺分组号仍识别倍率冲突、两把 Key 顺序采价和 401/403 后旧重绑令牌失效。`NEBULA_TEST_POSTGRES` 支持白名单内的本机 `nebula_test_integration` 与 `nebula_test_rev_integration`。已配置却不合规的目录集成测试连接会报错。
 
 1. 在隔离的本机 PostgreSQL 测试库运行 `go test ./...`。设置 `NEBULA_TEST_POSTGRES` 指向回环地址上的 `nebula_test` 后，可验证报价快照、小数精度、重复流水、延迟结算及并发超额。前端运行 `npm run typecheck`、`npm run test` 和 `npm run build`。
 2. 从已核实的学校 HTTPS 入口核对镜像版本与收件公钥。教师页应直接显示同一模型的首选倍率和启用状态。目录有模型但暂缺倍率时要显示待同步。核对价格时查看同一把北辰 Key 的分组、基础输入输出价、缓存价格、倍率和适用时段。

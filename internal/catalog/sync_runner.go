@@ -181,11 +181,16 @@ func TryLockBeichenRebind(ctx context.Context, tx *sql.Tx, provider uuid.UUID) (
 	return locked, err
 }
 
+func LockBeichenRouteEvidence(ctx context.Context, tx *sql.Tx, provider uuid.UUID) error {
+	_, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock_shared(`+beichenRebindLockKey+`)`, provider)
+	return err
+}
+
 func LockBeichenScan(ctx context.Context, tx *sql.Tx, provider, credential uuid.UUID, kind string, lease uuid.UUID, revision time.Time) (bool, error) {
 	if kind == "billing" || kind == "prices" || kind == "key_usage" {
 		// Take the advisory lock before the provider and credential row locks.
 		// Shared holders can still persist observations for different Keys concurrently.
-		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock_shared(`+beichenRebindLockKey+`)`, provider); err != nil {
+		if err := LockBeichenRouteEvidence(ctx, tx, provider); err != nil {
 			return false, err
 		}
 	}

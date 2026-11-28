@@ -497,7 +497,7 @@ func newUpgradeChannelFixture(t *testing.T, before string) (context.Context, *en
 }
 
 func TestBeichenUpgradeChainSeparatesRetiredGemini(t *testing.T) {
-	ctx, client, db := newUpgradeChannelFixture(t, "0072_")
+	ctx, client, db := newUpgradeChannelFixture(t, "0065_")
 	material := bytes.Repeat([]byte{53}, 32)
 	manager, err := security.NewManager(material, material, material, material, time.Minute)
 	if err != nil {
@@ -523,6 +523,12 @@ func TestBeichenUpgradeChainSeparatesRetiredGemini(t *testing.T) {
 	exec(`INSERT INTO provider_credentials(id,provider_id,label,group_hint,credential_ciphertext,status,created_at,updated_at)
 VALUES ($1,$3,'哈吉米','5',$4,'active',now()-interval '1 day',now()),
        ($2,$3,'G3',NULL,'fixture','active',now()-interval '1 hour',now())`, legacy, survivor, provider, encrypted)
+	ordinaryCipher, err := manager.EncryptCredential("sk-upgrade-ordinary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(`INSERT INTO provider_credentials(id,provider_id,label,group_hint,credential_ciphertext,status,created_at,updated_at)
+VALUES ($1,$2,'普通凭据','5',$3,'inactive',now()-interval '1 day',now()-interval '1 minute')`, ordinary, provider, ordinaryCipher)
 	exec(`INSERT INTO beichen_upstream_usage_rows(upstream_user_id,row_id,upstream_key_id,provider_id,credential_id,
  channel,model,occurred_at,actual_cost,cost_details)
 VALUES (77,1,12098,$1,$2,'Gemini','gemini-upgrade',now()-interval '1 day',0.35,'{}')`, provider, legacy)
@@ -534,51 +540,37 @@ VALUES (77,1,12098,$1,$2,'Gemini','gemini-upgrade',now()-interval '1 day',0.35,'
 	exec(`INSERT INTO schema_migrations(version,applied_at)
 VALUES ('0065_retire_beichen_gemini_credential.sql',clock_timestamp())
 ON CONFLICT(version) DO UPDATE SET applied_at=excluded.applied_at`)
-	ordinaryKey := "sk-upgrade-ordinary"
-	ordinaryCipher, err := manager.EncryptCredential(ordinaryKey)
-	if err != nil {
+	db.SetMaxOpenConns(1)
+	if err := store.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
-	exec(`INSERT INTO provider_credentials(id,provider_id,label,group_hint,credential_ciphertext,status,created_at,updated_at)
-VALUES ($1,$2,'普通凭据','5',$3,'active',clock_timestamp(),clock_timestamp())`, ordinary, provider, ordinaryCipher)
-	exec(`UPDATE provider_credentials SET status='inactive',retired_at=clock_timestamp(),updated_at=clock_timestamp()
-WHERE id=$1`, ordinary)
-	upgrade, err := os.ReadFile("0072_beichen_channel_identity.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	exec(string(upgrade))
+	db.SetMaxOpenConns(6)
 
-	var retired, retiredCount, ordinaryRetired int
-	var retiredEvidence string
+	var retiredEvidence, ordinaryEvidence, ordinaryReason string
+	var ordinaryBackfilled, ordinaryMarked bool
 	err = db.QueryRowContext(ctx, `
 SELECT
-  (SELECT count(*) FROM beichen_credential_retirements WHERE credential_id=$1 AND evidence='0065_window'),
   (SELECT evidence FROM beichen_credential_retirements WHERE credential_id=$1),
-  (SELECT count(*) FROM beichen_credential_retirements),
-  (SELECT count(*) FROM beichen_credential_retirements WHERE credential_id=$2)`,
-		legacy, ordinary).Scan(&retired, &retiredEvidence, &retiredCount, &ordinaryRetired)
-	if err != nil || retired != 1 || retiredEvidence != "0065_window" || retiredCount != 1 || ordinaryRetired != 0 {
-		t.Fatalf("0072 退役种子误收普通凭据或漏掉旧 Gemini: legacy=%d evidence=%s total=%d ordinary=%d (%v)",
-			retired, retiredEvidence, retiredCount, ordinaryRetired, err)
+  (SELECT evidence FROM beichen_credential_retirements WHERE credential_id=$2),
+  (SELECT reason FROM beichen_credential_retirements WHERE credential_id=$2),
+  (SELECT status='inactive' AND retired_at=updated_at FROM provider_credentials WHERE id=$2),
+  EXISTS(SELECT 1 FROM maintenance_state WHERE name='beichen_0065_retirement/'||$2::uuid::text)`,
+		legacy, ordinary).Scan(&retiredEvidence, &ordinaryEvidence, &ordinaryReason, &ordinaryBackfilled, &ordinaryMarked)
+	if err != nil || retiredEvidence != "0065_updated" || ordinaryEvidence != "0065_window" ||
+		ordinaryReason != "pending_confirmation" || !ordinaryBackfilled || ordinaryMarked {
+		t.Fatalf("0065 实际更新和 0067 回填的普通凭据未区分: %s/%s/%s (%v)",
+			retiredEvidence, ordinaryEvidence, ordinaryReason, err)
 	}
 
 	service := controlplane.NewService(client, db, nil, manager, nil, controlplane.Config{})
 	active := "active"
 	inactive := "inactive"
 	replacement := "sk-upgrade-ordinary-new"
-	// Even a legacy bad row must not turn a teacher-retired credential into
-	// Gemini: its recorded source was already retired by the teacher.
-	exec(`INSERT INTO beichen_credential_retirements
-	  (credential_id,provider_id,channel,reason,evidence,retired_at,source_updated_at,source_retired_at)
-	SELECT id,provider_id,'Gemini','legacy_bad_row','0065_window',retired_at,updated_at,retired_at
-	FROM provider_credentials WHERE id=$1`, ordinary)
 	if _, err := service.UpdateProviderCredential(ctx, provider, ordinary,
 		controlplane.ProviderCredentialInput{Credential: &replacement, Status: &active}); err == nil ||
-		!strings.Contains(err.Error(), "停用的 Gemini") {
-		t.Fatal("普通凭据被旧的错误退役记录带入了 Gemini 恢复")
+		!strings.Contains(err.Error(), "confirm_retired_channel=Gemini") {
+		t.Fatal("时间窗内的普通凭据可未确认恢复，或返回错误未说明需确认")
 	}
-	exec("DELETE FROM beichen_credential_retirements WHERE credential_id=$1", ordinary)
 	if _, err := service.UpdateProviderCredential(ctx, provider, ordinary,
 		controlplane.ProviderCredentialInput{Status: &active}); err != nil {
 		t.Fatal(err)
@@ -690,6 +682,7 @@ VALUES($1,1,12098,'fixture',$2,$3)`, strong, user, appliedAt)
 		t.Fatal(err)
 	}
 	exec(string(upgrade))
+	exec(string(upgrade)) // Verify that executing the raw SQL twice is safe.
 	var weakEvidence, strongEvidence string
 	var retiredCount, ordinaryRetired int
 	err = db.QueryRowContext(ctx, `
@@ -739,10 +732,22 @@ FROM provider_credentials WHERE id=$1`, ordinary)
 	}
 
 	rotated := "sk-upgrade-backfilled-gemini-rotated"
-	view, err := service.UpdateProviderCredential(ctx, provider, legacy,
-		controlplane.ProviderCredentialInput{Credential: &rotated, Status: &active})
-	if err != nil || view.ID != legacy.String() {
-		t.Fatalf("回填形状的旧 Gemini 未复用原编号: %v", err)
+	token, _, err := manager.IssueAccessToken(user, "teacher")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := channelFixture{ctx: ctx, db: db, provider: provider, service: service, crypto: manager, token: token,
+		handler: httpapi.NewServer(service, manager, nil, nil, httpapi.HealthDependencies{},
+			httpapi.Config{AllowedOrigin: "https://school.example"}).Handler()}
+	path := "/credentials/" + legacy.String()
+	body := map[string]any{"credential": rotated, "status": active}
+	f.request(t, http.MethodPatch, path, "tls", body, http.StatusBadRequest, "confirm_retired_channel=Gemini")
+	body["confirm_retired_channel"] = "G3"
+	f.request(t, http.MethodPatch, path, "tls", body, http.StatusBadRequest, "设为 Gemini")
+	body["confirm_retired_channel"] = "Gemini"
+	f.request(t, http.MethodPatch, path, "plain", body, http.StatusBadRequest, "可信 HTTPS")
+	if view := f.request(t, http.MethodPatch, path, "tls", body, http.StatusOK, ""); view.ID != legacy.String() {
+		t.Fatal("教师确认的旧 Gemini 未复用原编号")
 	}
 	geminiCall := insertChannelCall(t, channelFixture{ctx: ctx, db: db}, "backfilled-gemini-dispatch")
 	if err := usage.NewStore(db).PrepareDispatch(ctx, geminiCall, usage.CallRoute{

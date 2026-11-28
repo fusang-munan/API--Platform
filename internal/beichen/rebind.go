@@ -68,6 +68,12 @@ type rebindCatalogEntry struct {
 	school                   rebindSchool
 	route                    RebindRoute
 	protocols                []string
+	probes                   map[string]rebindProbeEvidence
+}
+
+type rebindProbeEvidence struct {
+	CheckedAt time.Time `json:"checked_at"`
+	Blocked   bool      `json:"blocked"`
 }
 
 type bindingRestore struct {
@@ -130,18 +136,8 @@ func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview
 		if err := checkProvider(ctx, tx, provider); err != nil {
 			return RebindPlan{}, err
 		}
-	} else {
-		locked, err := catalog.TryLockBeichenRebind(ctx, tx, provider)
-		if err != nil {
-			return RebindPlan{}, unavailable("锁定北辰绑定重建证据失败", err)
-		}
-		if !locked {
-			return RebindPlan{}, domain.NewError(domain.CodeInvalidTransition, "北辰目录或绑定正在更新，请重新预览")
-		}
-		// Website Key inventory and alias writers also lock this provider row.
-		if err := lockAliasProvider(ctx, tx, provider); err != nil {
-			return RebindPlan{}, err
-		}
+	} else if err := lockRebindConfirmation(ctx, tx, provider); err != nil {
+		return RebindPlan{}, err
 	}
 	var school, credential *uuid.UUID
 	if restore != nil {
@@ -175,7 +171,8 @@ func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview
 	raw, err := json.Marshal(struct {
 		EvidenceVersions []RebindEvidenceVersion
 		Changes          []RebindChange
-	}{versions, changes})
+		TargetProbes     []time.Time
+	}{versions, changes, rebindTargetProbeTimes(entries, changes)})
 	if err != nil {
 		return RebindPlan{}, unavailable("生成北辰重建预览失败", err)
 	}
@@ -190,7 +187,7 @@ func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview
 	view := RebindPlan{Preview: preview, PreviewToken: fingerprint, EvidenceVersions: versions, Changes: changes}
 	if !preview {
 		if token != fingerprint {
-			return RebindPlan{}, domain.NewError(domain.CodeInvalidTransition, "凭据、分组、目录、别名或绑定已变化，请重新预览")
+			return RebindPlan{}, domain.NewError(domain.CodeInvalidTransition, "凭据、分组、探活、目录、别名或绑定已变化，请重新预览")
 		}
 		if err := applyRebind(ctx, tx, provider, changes); err != nil {
 			return RebindPlan{}, err
@@ -204,6 +201,9 @@ func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview
 		if !ready || !reflect.DeepEqual(versions, current) {
 			return RebindPlan{}, domain.NewError(domain.CodeInvalidTransition, "凭据、分组或目录已变化，请重新预览")
 		}
+		if err := checkRebindTargets(ctx, tx, provider, credential, changes); err != nil {
+			return RebindPlan{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return RebindPlan{}, unavailable("完成北辰绑定重建失败", err)
@@ -213,6 +213,56 @@ func (s *Service) rebind(ctx context.Context, provider, actor uuid.UUID, preview
 			"provider_id", provider, "change_count", len(changes))
 	}
 	return view, nil
+}
+
+func lockRebindConfirmation(ctx context.Context, tx *sql.Tx, provider uuid.UUID) error {
+	locked, err := catalog.TryLockBeichenRebind(ctx, tx, provider)
+	if err != nil {
+		return unavailable("锁定北辰绑定重建证据失败", err)
+	}
+	if !locked {
+		return domain.NewError(domain.CodeInvalidTransition, "北辰目录或绑定正在更新，请重新预览")
+	}
+	// Website Key inventory and alias writers also lock this provider row.
+	return lockAliasProvider(ctx, tx, provider)
+}
+
+func checkRebindTargets(ctx context.Context, tx *sql.Tx, provider uuid.UUID, credential *uuid.UUID, changes []RebindChange) error {
+	if len(changes) == 0 {
+		return nil
+	}
+	entries, err := readRebindCatalog(ctx, tx, provider, credential)
+	if err != nil {
+		return unavailable("重新核对北辰接替线路失败", err)
+	}
+	for _, change := range changes {
+		if change.After.Status == "active" && rebindTarget(entries, change) == nil {
+			return domain.NewError(domain.CodeInvalidTransition, "接替线路的目录或认证状态已变化，请重新预览")
+		}
+	}
+	return nil
+}
+
+func rebindTarget(entries []rebindCatalogEntry, change RebindChange) *rebindCatalogEntry {
+	for i := range entries {
+		entry := &entries[i]
+		if entry.catalogCurrent && sameRouteKey(entry.route.CredentialID, change.After.CredentialID) &&
+			strings.EqualFold(entry.route.UpstreamModel, strings.TrimSpace(change.After.UpstreamModel)) &&
+			slices.Contains(entry.protocols, change.Adapter) {
+			return entry
+		}
+	}
+	return nil
+}
+
+func rebindTargetProbeTimes(entries []rebindCatalogEntry, changes []RebindChange) []time.Time {
+	times := make([]time.Time, len(changes))
+	for i, change := range changes {
+		if entry := rebindTarget(entries, change); entry != nil {
+			times[i] = entry.probes[change.Adapter].CheckedAt.UTC()
+		}
+	}
+	return times
 }
 
 func readRebindEvidence(ctx context.Context, tx *sql.Tx, provider uuid.UUID, credential *uuid.UUID) ([]RebindEvidenceVersion, bool, error) {
@@ -265,7 +315,7 @@ func (s *Service) ConfirmCredentialSwitch(ctx context.Context, provider, actor u
 		return SwitchPreview{}, unavailable("开启北辰渠道切换失败", err)
 	}
 	defer tx.Rollback()
-	if err := lockAliasProvider(ctx, tx, provider); err != nil {
+	if err := lockRebindConfirmation(ctx, tx, provider); err != nil {
 		return SwitchPreview{}, err
 	}
 	keys, _, err := readSwitchCredentials(ctx, tx, provider)
@@ -287,6 +337,9 @@ func (s *Service) ConfirmCredentialSwitch(ctx context.Context, provider, actor u
 		return SwitchPreview{}, domain.NewError(domain.CodeInvalidTransition, "渠道、报价、协议或绑定已变化，请重新预览")
 	}
 	if err := applyRebind(ctx, tx, provider, plan.Changes); err != nil {
+		return SwitchPreview{}, err
+	}
+	if err := checkRebindTargets(ctx, tx, provider, &to.CredentialID, plan.Changes); err != nil {
 		return SwitchPreview{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -366,7 +419,10 @@ func readCredentialRebind(ctx context.Context, tx *sql.Tx, provider uuid.UUID, f
 	})
 	// Include both Key revisions and the blocked routes so an old confirmation
 	// cannot apply after the teacher's choices or the observed results change.
-	raw, err := json.Marshal(plan)
+	raw, err := json.Marshal(struct {
+		Plan         SwitchPreview
+		TargetProbes []time.Time
+	}{plan, rebindTargetProbeTimes(entries, plan.Changes)})
 	if err != nil {
 		return SwitchPreview{}, err
 	}
@@ -466,7 +522,10 @@ func readRebindCatalog(ctx context.Context, tx *sql.Tx, provider uuid.UUID, cred
 WITH `+catalog.BeichenKeyEvidenceCTE+`
 SELECT a.model,k.credential_id,c.label::text,k.raw_entry,to_json(k.supported_protocols),
   `+catalog.BeichenKeyListsModelSQL+` AND `+catalog.BeichenCatalogCurrentSQL+` AND `+catalog.BeichenGroupAllowsRouteSQL+`
-    AND octet_length(c.credential_ciphertext)>0,
+    AND octet_length(c.credential_ciphertext)>0 AND `+catalog.BeichenCatalogAuthReadySQL+`,
+  COALESCE((SELECT jsonb_object_agg(r.protocol,jsonb_build_object('checked_at',r.checked_at,
+    'blocked',COALESCE(`+catalog.BeichenProbeBlocksRouteSQL+`,false)))
+    FROM upstream_probes r WHERE `+catalog.BeichenCurrentCatalogProbeSQL+`),'{}'::jsonb),
   alias.school_model IS NOT NULL,m.id,m.model_id::text
 FROM provider_model_catalog k
 JOIN provider_credentials c ON c.id=k.credential_id AND c.provider_id=k.provider_id
@@ -485,9 +544,9 @@ WHERE k.provider_id=$1 AND k.status='active' AND c.status='active'
 		var entry rebindCatalogEntry
 		var schoolID *uuid.UUID
 		var schoolName *string
-		var raw, protocols []byte
+		var raw, protocols, probes []byte
 		if err := rows.Scan(&entry.route.UpstreamModel, &entry.route.CredentialID, &entry.route.CredentialLabel,
-			&raw, &protocols, &entry.catalogCurrent, &entry.explicit, &schoolID, &schoolName); err != nil {
+			&raw, &protocols, &entry.catalogCurrent, &probes, &entry.explicit, &schoolID, &schoolName); err != nil {
 			return nil, err
 		}
 		if schoolID != nil {
@@ -497,7 +556,12 @@ WHERE k.provider_id=$1 AND k.status='active' AND c.status='active'
 		if err != nil {
 			return nil, err
 		}
-		entry.protocols = catalog.RegisteredProtocols(stored)
+		if err := json.Unmarshal(probes, &entry.probes); err != nil {
+			return nil, err
+		}
+		entry.protocols = slices.DeleteFunc(catalog.RegisteredProtocols(stored), func(protocol string) bool {
+			return entry.probes[protocol].Blocked
+		})
 		entry.route.Status = "active"
 		entries = append(entries, entry)
 	}

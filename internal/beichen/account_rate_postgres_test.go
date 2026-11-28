@@ -358,22 +358,25 @@ SELECT (SELECT upstream_input IS NOT NULL FROM beichen_price_at($1,$2,statement_
 
 func TestAccountRateConflictBlocksGroupFallbackPostgres(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		status int
-		rates  string
-		rate   string
-		group  int
+		name      string
+		status    int
+		rates     string
+		rate      string
+		group     int
+		omitGroup bool
 	}{
 		{name: "outage plus effective 0.8", status: http.StatusServiceUnavailable, rate: "0.8"},
 		{name: "invalid table plus effective 0.8", status: http.StatusOK, rates: "null", rate: "0.8"},
 		{name: "malformed other group plus effective 0.8", rates: `{"6":"invalid"}`, rate: "0.8"},
 		{name: "reverse effective 0.2", status: http.StatusServiceUnavailable, rate: "0.2"},
 		{name: "billing group 17 cannot use group 16", status: http.StatusServiceUnavailable, rate: "0.6", group: 17},
+		{name: "effective 0.8 without group_id conflicts with the verified group", rate: "0.8", omitGroup: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAccountRateJobFixture(t)
 			f.ratesStatus, f.rates = tc.status, tc.rates
 			f.billingEffective, f.billingGroup = tc.rate, tc.group
+			f.omitBillingGroup = tc.omitGroup
 			busy, err := f.service.runJob(f.ctx, f.job, true)
 			if busy || !errors.Is(err, errAccountRateConflict) {
 				t.Fatalf("conflicting account evidence must fail closed: busy=%t err=%v", busy, err)
@@ -428,6 +431,88 @@ func TestAccountRateConflictBlocksGroupFallbackPostgres(t *testing.T) {
 			t.Fatalf("verified group fallback did not publish its quote: group=%d", quote)
 		}
 	})
+}
+
+func TestPeerKeyConflictBlocksBillingGroupFallbackPostgres(t *testing.T) {
+	f := newAccountRateJobFixture(t)
+	const peerSecret = "sk-fixture-second-account-rate"
+	const peerWebsiteID = 12093
+	peer := syncJob{provider: f.job.provider, credential: uuid.New(), kind: "billing"}
+	ciphertext, err := f.service.crypto.EncryptCredential(peerSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := func(query string, args ...any) { execCatalogTestSQL(t, f.ctx, f.db, query, args...) }
+	exec(`INSERT INTO provider_credentials(id,provider_id,label,credential_ciphertext,status,created_at,updated_at)
+VALUES($1,$2,'Peer fixture',$3,'active',now(),now())`, peer.credential, peer.provider, ciphertext)
+	transport := f.service.client.Transport
+	f.service.client.Transport = panelTransport(func(req *http.Request) (*http.Response, error) {
+		var body string
+		switch {
+		case req.URL.Host == publicKeyHost && req.URL.Path == "/api/v1/keys":
+			body = fmt.Sprintf(`{"code":0,"data":{"items":[
+{"id":%d,"user_id":13,"key":%q,"group_id":16,"name":"CC1","status":"active"},
+{"id":%d,"user_id":13,"key":%q,"group_id":16,"name":"Peer fixture","status":"active"}
+],"total":2,"page":1,"page_size":100,"pages":1}}`, f.keyID, accountRateFixtureSecret, peerWebsiteID, peerSecret)
+		case req.URL.Host == "api.beichenapi.com" && req.Header.Get("Authorization") == "Bearer "+peerSecret:
+			switch req.URL.Path {
+			case modelsPath:
+				body = fmt.Sprintf(`{"data":[{"id":%q,"supported_protocols":["anthropic"]}]}`, accountRateFixtureModel)
+			case billingPath:
+				body = fmt.Sprintf(`{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token",
+"api_key_id":%d,"group_id":16,"group_rate_multiplier":0.6,"effective_rate_multiplier":0.6,
+"peak_rate_enabled":false,"observed_at":%q}`, peerWebsiteID, f.at.Add(-time.Second).Format(time.RFC3339Nano))
+			}
+		}
+		if body == "" {
+			return transport.RoundTrip(req)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	run := func(job syncJob, conflict bool) {
+		t.Helper()
+		busy, err := f.service.runJob(f.ctx, job, true)
+		if busy || (conflict && !errors.Is(err, errAccountRateConflict)) || (!conflict && err != nil) {
+			t.Fatalf("billing sync expected conflict=%t: busy=%t err=%v", conflict, busy, err)
+		}
+	}
+	checkPeer := func(wantQuote bool) {
+		t.Helper()
+		var quote, fallback, reportedConflict bool
+		err := f.db.QueryRowContext(f.ctx, `SELECT
+  COALESCE((SELECT upstream_input IS NOT NULL FROM beichen_price_at($1,$2,statement_timestamp())),false),
+  EXISTS(SELECT 1 FROM beichen_multiplier_versions WHERE credential_id=$1 AND account_rate_source='group_rate' AND stale_at IS NULL),
+  EXISTS(SELECT 1 FROM beichen_datasets WHERE credential_id=$1 AND kind='billing' AND strpos(last_error,$3)>0)`,
+			peer.credential, accountRateFixtureModel, errAccountRateConflict.Error()).Scan(&quote, &fallback, &reportedConflict)
+		if err != nil || quote != wantQuote || fallback != wantQuote || reportedConflict == wantQuote {
+			t.Fatalf("peer quote=%t fallback=%t conflict=%t, want quote=%t (%v)", quote, fallback, reportedConflict, wantQuote, err)
+		}
+	}
+
+	// Each Key runs its own billing job and no website directory crawl has run.
+	f.billingEffective = "0.8"
+	run(f.job, true)
+	run(peer, true)
+	checkPeer(false)
+	f.billingEffective = "0.6"
+	run(f.job, false)
+	run(peer, false)
+	checkPeer(true)
+
+	// The directory can also capture a fresh, group-specific contradiction.
+	exec(`INSERT INTO beichen_provision_channels(credential_id,channel,key_fingerprint,discover_ids)
+SELECT id,'CC1',sha256(credential_ciphertext),false FROM provider_credentials WHERE id=$1`, f.job.credential)
+	exec(`INSERT INTO beichen_crawl_runs (provider_id,started_at,duration_ms,platform_count,group_count,
+  model_count,expected_model_count,failures,key_model_comparisons,account_rate_error)
+VALUES ($1,clock_timestamp(),0,1,1,1,1,'[]',
+  jsonb_build_array(jsonb_build_object('channel','CC1','group_id',16,'error',$2::text)),$2)`,
+		f.job.provider, errAccountRateConflict.Error())
+	run(peer, true)
+	checkPeer(false)
+	exec(`UPDATE beichen_crawl_runs SET key_model_comparisons=jsonb_set(key_model_comparisons,'{0,group_id}','17')
+WHERE provider_id=$1`, f.job.provider)
+	run(peer, false)
+	checkPeer(true)
 }
 
 func TestBeichenDirectAccountRateFreshnessPostgres(t *testing.T) {
@@ -623,6 +708,7 @@ type accountRateJobFixture struct {
 	ratesStatus        int
 	billingEffective   string
 	billingGroup       int
+	omitBillingGroup   bool
 }
 
 func newAccountRateJobFixture(t *testing.T) *accountRateJobFixture {
@@ -692,6 +778,9 @@ func newAccountRateJobFixture(t *testing.T) *accountRateJobFixture {
 					"api_key_id":%d,"group_id":%d,"group_rate_multiplier":0.6,"effective_rate_multiplier":%s,
 					"peak_rate_enabled":false,"observed_at":%q}`,
 					f.keyID, group, f.billingEffective, f.at.Add(-time.Second).Format(time.RFC3339Nano))
+				if f.omitBillingGroup {
+					body = strings.Replace(body, fmt.Sprintf(`"group_id":%d,`, group), "", 1)
+				}
 			}
 		}
 		if body == "" || req.Method != http.MethodGet {

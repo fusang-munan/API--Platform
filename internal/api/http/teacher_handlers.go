@@ -357,10 +357,11 @@ func (s *Server) updateProviderCredential(c *gin.Context) {
 		return
 	}
 	var input struct {
-		Label      string  `json:"label"`
-		GroupHint  *string `json:"group_hint"`
-		Credential *string `json:"credential"`
-		Status     *string `json:"status"`
+		Label                 string  `json:"label"`
+		GroupHint             *string `json:"group_hint"`
+		Credential            *string `json:"credential"`
+		Status                *string `json:"status"`
+		ConfirmRetiredChannel *string `json:"confirm_retired_channel"`
 	}
 	if !bindJSON(c, &input) {
 		return
@@ -374,6 +375,7 @@ func (s *Server) updateProviderCredential(c *gin.Context) {
 	}
 	view, err := s.service.UpdateProviderCredential(c.Request.Context(), providerID, credentialID, controlplane.ProviderCredentialInput{
 		Label: input.Label, GroupHint: input.GroupHint, Credential: input.Credential, Status: input.Status,
+		ConfirmRetiredChannel: input.ConfirmRetiredChannel,
 	})
 	if err != nil {
 		writeError(c, err)

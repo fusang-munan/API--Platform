@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/starprince1234/Nebula-api/internal/beichen"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 )
 
 func TestBeichenMigrationUpgrade(t *testing.T) {
@@ -284,7 +285,7 @@ func openIsolatedMigrationSchema(t *testing.T) (context.Context, *sql.DB) {
 	if err != nil {
 		t.Fatal("invalid test PostgreSQL URL")
 	}
-	if config.Host != "127.0.0.1" || !isIsolatedTestDatabase(config.Database) || len(config.Fallbacks) != 0 {
+	if config.Host != "127.0.0.1" || !testutil.IsIsolatedPostgresDatabase(config.Database) || len(config.Fallbacks) != 0 {
 		t.Fatal("migration test requires a loopback-only nebula_test database with sslmode=disable")
 	}
 	conn, err := sql.Open(DriverName, dsn)
@@ -459,13 +460,5 @@ func TestIndependentReview0071Scope(t *testing.T) {
 	t.Logf("0070 constraint name=%s; definition=%s; raw SQL ran twice; unrelated check retained=%t", oldName, oldDefinition, kept)
 	if !kept {
 		t.Fatal("0071 removed an unrelated check referencing account_rate_source")
-	}
-}
-func isIsolatedTestDatabase(name string) bool {
-	switch name {
-	case "nebula_test", "nebula_test_rev_c1", "nebula_test_rev_c1_2", "nebula_test_hjc1", "nebula_test_rev_b":
-		return true
-	default:
-		return false
 	}
 }

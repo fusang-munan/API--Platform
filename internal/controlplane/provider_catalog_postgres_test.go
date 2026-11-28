@@ -16,18 +16,19 @@ import (
 	"github.com/starprince1234/Nebula-api/internal/domain"
 	postgres "github.com/starprince1234/Nebula-api/internal/infrastructure/db"
 	"github.com/starprince1234/Nebula-api/internal/infrastructure/db/ent"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 )
 
 func newCatalogMaterializationService(t *testing.T) (context.Context, *Service) {
 	t.Helper()
 	dsn := os.Getenv("NEBULA_TEST_POSTGRES")
 	if dsn == "" {
-		t.Skip("requires the isolated local C2 test database")
+		t.Skip("NEBULA_TEST_POSTGRES opts in to catalog materialization tests")
 	}
 	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil || cfg.Host != "127.0.0.1" || cfg.Database != "nebula_test_hjc2" ||
+	if err != nil || cfg.Host != "127.0.0.1" || !testutil.IsIsolatedPostgresDatabase(cfg.Database) ||
 		cfg.User != "nebula_qa" || cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
-		t.Skip("requires loopback nebula_test_hjc2 as nebula_qa with sslmode=disable")
+		t.Fatal("requires a whitelisted loopback test database as nebula_qa with sslmode=disable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	t.Cleanup(cancel)

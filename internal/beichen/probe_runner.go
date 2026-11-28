@@ -427,6 +427,9 @@ func (s *Service) saveProbeBatch(ctx context.Context, job probeJob, observations
 		return err
 	}
 	defer tx.Rollback()
+	if err := catalog.LockBeichenRouteEvidence(ctx, tx, job.provider); err != nil {
+		return err
+	}
 	if err := renewProbeLease(ctx, tx, job); err != nil {
 		return err
 	}

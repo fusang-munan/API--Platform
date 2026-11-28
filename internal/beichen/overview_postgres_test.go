@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/starprince1234/Nebula-api/internal/catalog"
+	"github.com/starprince1234/Nebula-api/internal/testutil"
 	"github.com/starprince1234/Nebula-api/internal/usage"
 )
 
@@ -460,7 +461,7 @@ func TestBeichenPerKeyCatalogOverviewPostgres(t *testing.T) {
 	}
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil || cfg.Host != "127.0.0.1" || (cfg.User != "nebula_qa" && cfg.User != "nebula_test") ||
-		(!isIsolatedTestDatabase(cfg.Database) && cfg.Database != "nebula_test_hjb") ||
+		!testutil.IsIsolatedPostgresDatabase(cfg.Database) ||
 		cfg.TLSConfig != nil || len(cfg.Fallbacks) != 0 {
 		t.Fatal("requires a loopback-only nebula_test database and test role with sslmode=disable")
 	}

@@ -33,12 +33,13 @@ type ProviderCatalogSyncView struct {
 }
 
 type ProviderCredentialInput struct {
-	Label                string
-	GroupHint            *string
-	Credential           *string
-	Status               *string
-	Channel              *string
-	ReplacesCredentialID *uuid.UUID
+	Label                 string
+	GroupHint             *string
+	Credential            *string
+	Status                *string
+	Channel               *string
+	ReplacesCredentialID  *uuid.UUID
+	ConfirmRetiredChannel *string
 }
 
 type ProviderCredentialView struct {
@@ -190,8 +191,12 @@ func (s *Service) UpdateProviderCredential(ctx context.Context, providerID, cred
 	if err != nil {
 		return ProviderCredentialView{}, domain.WrapError(domain.CodeDependencyUnavailable, "query provider credential", err)
 	}
-	if row.Edges.Provider != nil && catalog.IsBeichenBaseURL(row.Edges.Provider.BaseURL) {
-		edit := beichen.CredentialEdit{GroupHint: input.GroupHint}
+	isBeichen := row.Edges.Provider != nil && catalog.IsBeichenBaseURL(row.Edges.Provider.BaseURL)
+	if input.ConfirmRetiredChannel != nil && (!isBeichen || input.Credential == nil || *input.ConfirmRetiredChannel != "Gemini") {
+		return ProviderCredentialView{}, domain.NewError(domain.CodeValidation, "confirm_retired_channel 仅可在为旧 Gemini 渠道提交新 Key 时设为 Gemini")
+	}
+	if isBeichen {
+		edit := beichen.CredentialEdit{GroupHint: input.GroupHint, ConfirmRetiredGemini: input.ConfirmRetiredChannel != nil}
 		if input.Label != "" {
 			label, err := ValidateName(input.Label, 128)
 			if err != nil {
